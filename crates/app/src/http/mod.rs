@@ -46,6 +46,8 @@ use handlers::{
 pub(crate) struct ServerState {
     pub app: Arc<App>,
     pub start_time: Instant,
+    /// ISO 8601 UTC timestamp of when the server started.
+    pub started_on: String,
     pub log_handle: Option<crate::logging::LogLevelHandle>,
 }
 
@@ -122,9 +124,11 @@ impl StatusServer {
 
     /// Start the server.
     pub async fn start(self) -> anyhow::Result<()> {
+        let started_on = format_utc_now();
         let state = Arc::new(ServerState {
             app: self.app,
             start_time: self.start_time,
+            started_on,
             log_handle: self.log_handle,
         });
 
@@ -144,5 +148,71 @@ impl StatusServer {
 
         tracing::info!("HTTP status server stopped");
         Ok(())
+    }
+}
+
+/// Format the current UTC time as ISO 8601 (e.g. "2026-01-15T12:34:56Z").
+fn format_utc_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format_unix_timestamp(secs)
+}
+
+/// Format a UNIX timestamp as ISO 8601 UTC.
+fn format_unix_timestamp(secs: u64) -> String {
+    let days = (secs / 86400) as i64;
+    let time_secs = secs % 86400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year,
+        month,
+        day,
+        time_secs / 3600,
+        (time_secs % 3600) / 60,
+        time_secs % 60,
+    )
+}
+
+/// Convert days since 1970-01-01 to `(year, month, day)`.
+/// Algorithm from Howard Hinnant's `civil_from_days`.
+#[allow(clippy::manual_range_contains)]
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_unix_timestamp() {
+        // 2024-01-01T00:00:00Z = 1704067200
+        assert_eq!(format_unix_timestamp(1704067200), "2024-01-01T00:00:00Z");
+        // Unix epoch
+        assert_eq!(format_unix_timestamp(0), "1970-01-01T00:00:00Z");
+        // 2026-03-03T15:30:45Z
+        assert_eq!(format_unix_timestamp(1772551845), "2026-03-03T15:30:45Z");
+    }
+
+    #[test]
+    fn test_civil_from_days() {
+        // Day 0 = 1970-01-01
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        // Day 19723 = 2024-01-01 (1704067200 / 86400 = 19723)
+        assert_eq!(civil_from_days(19723), (2024, 1, 1));
     }
 }

@@ -13,13 +13,50 @@ pub struct RootResponse {
 /// Response for the /info endpoint.
 #[derive(Serialize)]
 pub struct InfoResponse {
-    pub version: String,
-    pub node_name: String,
-    pub public_key: String,
-    pub network_passphrase: String,
-    pub is_validator: bool,
+    /// Build version string (e.g. "henyey-v0.1.0").
+    pub build: String,
+    /// Protocol version of the current ledger.
+    pub protocol_version: u32,
+    /// Current application state.
     pub state: String,
+    /// ISO 8601 UTC timestamp of when the node started.
+    pub started_on: String,
+    /// Node uptime in seconds.
     pub uptime_secs: u64,
+    /// Node name from configuration.
+    pub node_name: String,
+    /// Node public key (strkey).
+    pub public_key: String,
+    /// Network passphrase.
+    pub network_passphrase: String,
+    /// Whether this node is a validator.
+    pub is_validator: bool,
+    /// Current ledger summary.
+    pub ledger: InfoLedgerSummary,
+    /// Peer counts.
+    pub peers: InfoPeerSummary,
+}
+
+/// Ledger summary embedded in the /info response.
+#[derive(Serialize)]
+pub struct InfoLedgerSummary {
+    pub num: u32,
+    pub hash: String,
+    pub close_time: u64,
+    pub version: u32,
+    pub base_fee: u32,
+    pub base_reserve: u32,
+    pub max_tx_set_size: u32,
+    pub flags: u32,
+    /// Seconds since last ledger close.
+    pub age: u64,
+}
+
+/// Peer counts embedded in the /info response.
+#[derive(Serialize)]
+pub struct InfoPeerSummary {
+    pub pending_count: usize,
+    pub authenticated_count: usize,
 }
 
 /// Response for the /ledger endpoint.

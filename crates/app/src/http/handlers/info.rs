@@ -14,8 +14,9 @@ use crate::run_cmd::NodeStatus;
 
 use super::super::helpers::{map_upgrade_item, node_id_to_strkey};
 use super::super::types::{
-    DumpProposedSettingsParams, HealthResponse, InfoResponse, LedgerResponse, QuorumResponse,
-    QuorumSetResponse, RootResponse, SelfCheckResponse, UpgradeState, UpgradesResponse,
+    DumpProposedSettingsParams, HealthResponse, InfoLedgerSummary, InfoPeerSummary, InfoResponse,
+    LedgerResponse, QuorumResponse, QuorumSetResponse, RootResponse, SelfCheckResponse,
+    UpgradeState, UpgradesResponse,
 };
 use super::super::ServerState;
 
@@ -60,15 +61,34 @@ pub(crate) async fn info_handler(State(state): State<Arc<ServerState>>) -> Json<
     let info = state.app.info();
     let app_state = state.app.state().await;
     let uptime = state.start_time.elapsed().as_secs();
+    let ledger = state.app.ledger_summary();
+    let (pending_count, authenticated_count) = state.app.peer_counts().await;
 
     Json(InfoResponse {
-        version: info.version,
+        build: format!("henyey-{}", info.version),
+        protocol_version: ledger.version,
+        state: format!("{}", app_state),
+        started_on: state.started_on.clone(),
+        uptime_secs: uptime,
         node_name: info.node_name,
         public_key: info.public_key,
         network_passphrase: info.network_passphrase,
         is_validator: info.is_validator,
-        state: format!("{}", app_state),
-        uptime_secs: uptime,
+        ledger: InfoLedgerSummary {
+            num: ledger.num,
+            hash: ledger.hash.to_hex(),
+            close_time: ledger.close_time,
+            version: ledger.version,
+            base_fee: ledger.base_fee,
+            base_reserve: ledger.base_reserve,
+            max_tx_set_size: ledger.max_tx_set_size,
+            flags: ledger.flags,
+            age: ledger.age,
+        },
+        peers: InfoPeerSummary {
+            pending_count,
+            authenticated_count,
+        },
     })
 }
 

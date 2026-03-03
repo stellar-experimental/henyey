@@ -10,7 +10,7 @@ use axum::{
 use henyey_common::NetworkId;
 use henyey_tx::TransactionFrame;
 
-use super::super::types::{SubmitTxRequest, SubmitTxResponse};
+use super::super::types::{SubmitTxRequest, SubmitTxResponse, TxStatus};
 use super::super::ServerState;
 
 pub(crate) async fn submit_tx_handler(
@@ -27,7 +27,7 @@ pub(crate) async fn submit_tx_handler(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SubmitTxResponse {
-                    success: false,
+                    status: TxStatus::Error,
                     hash: None,
                     error: Some(format!("Invalid base64: {}", e)),
                 }),
@@ -42,7 +42,7 @@ pub(crate) async fn submit_tx_handler(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(SubmitTxResponse {
-                    success: false,
+                    status: TxStatus::Error,
                     hash: None,
                     error: Some(format!("Invalid XDR: {}", e)),
                 }),
@@ -55,41 +55,28 @@ pub(crate) async fn submit_tx_handler(
     let hash = frame.compute_hash(&network_id).ok();
     let result = state.app.submit_transaction(tx_env);
 
-    let (success, error) = match result {
-        henyey_herder::TxQueueResult::Added => (true, None),
-        henyey_herder::TxQueueResult::Duplicate => {
-            (true, Some("Transaction already in queue".to_string()))
-        }
-        henyey_herder::TxQueueResult::QueueFull => {
-            (false, Some("Transaction queue full".to_string()))
-        }
+    let (status, error) = match result {
+        henyey_herder::TxQueueResult::Added => (TxStatus::Pending, None),
+        henyey_herder::TxQueueResult::Duplicate => (TxStatus::Duplicate, None),
+        henyey_herder::TxQueueResult::QueueFull => (TxStatus::TryAgainLater, None),
         henyey_herder::TxQueueResult::FeeTooLow => {
-            (false, Some("Transaction fee too low".to_string()))
+            (TxStatus::Error, Some("txInsufficientFee".to_string()))
         }
         henyey_herder::TxQueueResult::Invalid(code) => {
-            let msg = match code {
-                Some(c) => format!("Transaction invalid: {}", c),
-                None => "Transaction invalid".to_string(),
-            };
-            (false, Some(msg))
+            let error_str = code.map_or("txInternalError".to_string(), |c| c.name().to_string());
+            (TxStatus::Error, Some(error_str))
         }
         henyey_herder::TxQueueResult::Banned => {
-            (false, Some("Transaction from banned source".to_string()))
+            (TxStatus::Error, Some("txBadAuth".to_string()))
         }
-        henyey_herder::TxQueueResult::Filtered => (
-            false,
-            Some("Transaction filtered by operation type".to_string()),
-        ),
-        henyey_herder::TxQueueResult::TryAgainLater => (
-            false,
-            Some("Account already has pending transaction".to_string()),
-        ),
+        henyey_herder::TxQueueResult::Filtered => (TxStatus::Filtered, None),
+        henyey_herder::TxQueueResult::TryAgainLater => (TxStatus::TryAgainLater, None),
     };
 
     (
         StatusCode::OK,
         Json(SubmitTxResponse {
-            success,
+            status,
             hash: hash.map(|value| value.to_hex()),
             error,
         }),

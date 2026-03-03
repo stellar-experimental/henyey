@@ -8,6 +8,14 @@ impl App {
         }
     }
 
+    /// Get peer counts: `(pending_count, authenticated_count)`.
+    pub async fn peer_counts(&self) -> (usize, usize) {
+        match self.overlay().await {
+            Some(overlay) => overlay.peer_counts(),
+            None => (0, 0),
+        }
+    }
+
     pub async fn connect_peer(&self, addr: PeerAddress) -> anyhow::Result<PeerId> {
         let overlay = self
             .overlay()

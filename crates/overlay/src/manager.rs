@@ -2267,6 +2267,17 @@ impl OverlayManager {
         self.running.load(Ordering::Relaxed)
     }
 
+    /// Get peer counts broken down by authentication state.
+    ///
+    /// Returns `(pending_count, authenticated_count)` summed across inbound
+    /// and outbound connection pools.
+    pub fn peer_counts(&self) -> (usize, usize) {
+        let pending = self.inbound_pool.pending_count() + self.outbound_pool.pending_count();
+        let authenticated =
+            self.inbound_pool.authenticated_count() + self.outbound_pool.authenticated_count();
+        (pending, authenticated)
+    }
+
     /// Get overlay statistics.
     pub fn stats(&self) -> OverlayStats {
         OverlayStats {

@@ -1207,6 +1207,39 @@ impl App {
         (header.ledger_seq, hash, close_time, header.ledger_version)
     }
 
+    /// Get a rich ledger summary with all header fields needed for the
+    /// `/info` endpoint.
+    pub fn ledger_summary(&self) -> LedgerSummary {
+        let header = self.ledger_manager.current_header();
+        let hash = self.ledger_manager.current_header_hash();
+        let close_time = ledger_close_time(&header);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let age = if close_time > 0 {
+            now.saturating_sub(close_time)
+        } else {
+            0
+        };
+        // Extract flags from LedgerHeaderExt::V1 if present.
+        let flags = match &header.ext {
+            stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+            stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+        };
+        LedgerSummary {
+            num: header.ledger_seq,
+            hash,
+            close_time,
+            version: header.ledger_version,
+            base_fee: header.base_fee,
+            base_reserve: header.base_reserve,
+            max_tx_set_size: header.max_tx_set_size,
+            flags,
+            age,
+        }
+    }
+
     pub fn target_ledger_close_time(&self) -> u32 {
         self.herder.ledger_close_time()
     }
@@ -1657,6 +1690,29 @@ impl std::fmt::Display for CatchupResult {
             self.ledgers_replayed
         )
     }
+}
+
+/// Rich ledger header summary for the `/info` endpoint.
+#[derive(Debug, Clone)]
+pub struct LedgerSummary {
+    /// Current ledger sequence number.
+    pub num: u32,
+    /// Hash of the current ledger header.
+    pub hash: henyey_common::Hash256,
+    /// Ledger close time (UNIX timestamp).
+    pub close_time: u64,
+    /// Protocol version.
+    pub version: u32,
+    /// Base fee in stroops.
+    pub base_fee: u32,
+    /// Base reserve in stroops.
+    pub base_reserve: u32,
+    /// Max classic transaction set size.
+    pub max_tx_set_size: u32,
+    /// Ledger header flags (0 if pre-v1 extension).
+    pub flags: u32,
+    /// Seconds since last ledger close.
+    pub age: u64,
 }
 
 /// Application info for the info command.
