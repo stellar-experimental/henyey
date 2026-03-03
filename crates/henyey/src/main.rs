@@ -78,8 +78,12 @@ use henyey_app::{
 #[command(author, version, about, long_about = None)]
 struct Cli {
     /// Path to configuration file
-    #[arg(short, long, value_name = "FILE", global = true)]
+    #[arg(short, long, alias = "conf", value_name = "FILE", global = true)]
     config: Option<PathBuf>,
+
+    /// Enable console logging (accepted for stellar-core compatibility; henyey logs to console by default)
+    #[arg(long, global = true)]
+    console: bool,
 
     /// Enable verbose logging (debug level)
     #[arg(short, long, global = true)]
@@ -321,6 +325,24 @@ enum Commands {
     /// significant time on large databases.
     SelfCheck,
 
+    /// Return information for an offline instance
+    ///
+    /// Opens the database without connecting to the network and prints
+    /// the node's state as JSON. This is used by stellar-rpc to check
+    /// if an existing captive-core database can be reused.
+    ///
+    /// Output format is compatible with stellar-core's `offline-info` command.
+    #[command(name = "offline-info")]
+    OfflineInfo,
+
+    /// Print version information (stellar-core compatible output)
+    ///
+    /// Prints the build version, protocol version, and other version info
+    /// in a format compatible with stellar-core's `version` subcommand.
+    /// stellar-rpc parses this output to detect protocol version support.
+    #[command(name = "version")]
+    Version,
+
     /// Write verified checkpoint ledger hashes to a file
     ///
     /// Downloads checkpoint headers from history archives, verifies the header
@@ -345,6 +367,12 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Handle commands that must run before logging/config initialization
+    if matches!(cli.command, Commands::Version) {
+        cmd_version();
+        return Ok(());
+    }
 
     // Initialize logging
     init_logging(&cli)?;
@@ -437,6 +465,13 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::SelfCheck => cmd_self_check(config).await,
+
+        Commands::OfflineInfo => cmd_offline_info(config),
+
+        Commands::Version => {
+            cmd_version();
+            Ok(())
+        }
 
         Commands::VerifyCheckpoints { output, from, to } => {
             cmd_verify_checkpoints(config, output, from, to).await
@@ -638,6 +673,123 @@ async fn cmd_upgrade_db(config: AppConfig) -> anyhow::Result<()> {
 }
 
 /// Generate keypair command handler.
+/// Version command handler.
+///
+/// Prints version info in a format compatible with stellar-core's `version` output.
+/// stellar-rpc parses this output for:
+/// - First line: build version string (e.g., "v25.0.1" or "henyey-v0.1.0")
+/// - Line matching "ledger protocol version: N": protocol version number
+fn cmd_version() {
+    use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+    println!("henyey-v{}", env!("CARGO_PKG_VERSION"));
+    println!("ledger protocol version: {CURRENT_LEDGER_PROTOCOL_VERSION}");
+}
+
+/// Offline info command handler.
+///
+/// Opens the database without connecting to the network and prints the node's
+/// state as JSON. Compatible with stellar-core's `offline-info` output format.
+///
+/// stellar-rpc uses this to check whether an existing captive-core database
+/// can be reused (by reading `info.ledger.num`).
+fn cmd_offline_info(config: AppConfig) -> anyhow::Result<()> {
+    use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+    use henyey_db::queries::StateQueries;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use stellar_xdr::curr::LedgerHeaderExt;
+
+    let db_path = &config.database.path;
+
+    if !db_path.exists() {
+        // stellar-core also fails if no DB exists; the Go code handles the error
+        // by setting createNewDB = true
+        anyhow::bail!("Database does not exist at {:?}", db_path);
+    }
+
+    let db = henyey_db::Database::open(db_path)?;
+
+    // Get last closed ledger sequence
+    let lcl_seq = db.with_connection(|conn| conn.get_last_closed_ledger())?;
+
+    let (num, hash, close_time, version, base_fee, base_reserve, max_tx_set_size, flags) =
+        if let Some(seq) = lcl_seq {
+            if let Some(header) = db.get_ledger_header(seq)? {
+                let hash = db
+                    .get_ledger_hash(seq)?
+                    .map(|h| h.to_hex())
+                    .unwrap_or_default();
+                let flags = match &header.ext {
+                    LedgerHeaderExt::V1(ext) => ext.flags as i64,
+                    LedgerHeaderExt::V0 => 0i64,
+                };
+                (
+                    seq as i64,
+                    hash,
+                    header.scp_value.close_time.0 as i64,
+                    header.ledger_version as i64,
+                    header.base_fee as i64,
+                    header.base_reserve as i64,
+                    header.max_tx_set_size as i64,
+                    flags,
+                )
+            } else {
+                (seq as i64, String::new(), 0i64, 0i64, 0i64, 0i64, 0i64, 0i64)
+            }
+        } else {
+            (0i64, String::new(), 0i64, 0i64, 0i64, 0i64, 0i64, 0i64)
+        };
+
+    // Calculate age (seconds since close time)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let age = if close_time > 0 {
+        now - close_time
+    } else {
+        0
+    };
+
+    // Build the JSON response matching stellar-core's format.
+    // The Go code only reads info.ledger.num, but we provide the full
+    // structure for compatibility with other tools.
+    let mut ledger = serde_json::json!({
+        "num": num,
+        "hash": hash,
+        "closeTime": close_time,
+        "version": version,
+        "baseFee": base_fee,
+        "baseReserve": base_reserve,
+        "maxTxSetSize": max_tx_set_size,
+        "age": age
+    });
+
+    // stellar-core only includes "flags" when non-zero
+    if flags != 0 {
+        ledger
+            .as_object_mut()
+            .unwrap()
+            .insert("flags".to_string(), serde_json::json!(flags));
+    }
+
+    let response = serde_json::json!({
+        "info": {
+            "build": format!("henyey-v{}", env!("CARGO_PKG_VERSION")),
+            "protocol_version": CURRENT_LEDGER_PROTOCOL_VERSION,
+            "state": "Booting",
+            "ledger": ledger,
+            "peers": {
+                "pending_count": 0,
+                "authenticated_count": 0
+            },
+            "network": config.network.passphrase
+        }
+    });
+
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
 fn cmd_new_keypair() -> anyhow::Result<()> {
     let keypair = henyey_crypto::SecretKey::generate();
 
