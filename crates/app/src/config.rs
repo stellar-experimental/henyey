@@ -55,9 +55,9 @@
 //! - `RS_STELLAR_CORE_LOG_LEVEL` - Log level (trace, debug, info, warn, error)
 
 use henyey_common::BucketListDbConfig;
+use henyey_history::CatchupMode;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use henyey_history::CatchupMode;
 
 /// Main application configuration.
 ///
@@ -130,6 +130,14 @@ pub struct AppConfig {
     /// Catchup behavior configuration.
     #[serde(default)]
     pub catchup: CatchupConfig,
+
+    /// HTTP query server configuration (for `/getledgerentryraw`, `/getledgerentry`).
+    #[serde(default)]
+    pub query: QueryConfig,
+
+    /// Diagnostic events configuration.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
 }
 
 /// Node identity and behavior configuration.
@@ -351,10 +359,95 @@ pub struct MetadataConfig {
     /// compression and segment rotation every 256 ledgers.
     #[serde(default = "default_metadata_debug_ledgers")]
     pub debug_ledgers: u32,
+
+    /// When true, include `SorobanTransactionMetaExtV1` in `TransactionMeta`.
+    /// Maps to stellar-core's `EMIT_SOROBAN_TRANSACTION_META_EXT_V1`.
+    #[serde(default)]
+    pub emit_soroban_tx_meta_ext_v1: bool,
+
+    /// When true, include `LedgerCloseMetaExtV1` in `LedgerCloseMeta`.
+    /// Maps to stellar-core's `EMIT_LEDGER_CLOSE_META_EXT_V1`.
+    #[serde(default)]
+    pub emit_ledger_close_meta_ext_v1: bool,
 }
 
 fn default_metadata_debug_ledgers() -> u32 {
     0
+}
+
+/// HTTP query server configuration.
+///
+/// The query server runs on a separate port and serves ledger entry
+/// lookups from the bucket list. Required by stellar-rpc for preflight
+/// simulation and state queries.
+///
+/// # Example
+///
+/// ```toml
+/// [query]
+/// port = 11627
+/// snapshot_ledgers = 5
+/// thread_pool_size = 4
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryConfig {
+    /// Port for the query server HTTP endpoint. `None` means disabled.
+    /// Maps to stellar-core's `HTTP_QUERY_PORT`.
+    #[serde(default)]
+    pub port: Option<u16>,
+
+    /// Number of historical ledger snapshots to retain for point-in-time queries.
+    /// Maps to stellar-core's `QUERY_SNAPSHOT_LEDGERS`.
+    #[serde(default = "default_query_snapshot_ledgers")]
+    pub snapshot_ledgers: u32,
+
+    /// Number of threads in the query server's blocking thread pool.
+    /// Maps to stellar-core's `QUERY_THREAD_POOL_SIZE`.
+    #[serde(default = "default_query_thread_pool_size")]
+    pub thread_pool_size: usize,
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        Self {
+            port: None,
+            snapshot_ledgers: default_query_snapshot_ledgers(),
+            thread_pool_size: default_query_thread_pool_size(),
+        }
+    }
+}
+
+fn default_query_snapshot_ledgers() -> u32 {
+    5
+}
+
+fn default_query_thread_pool_size() -> usize {
+    4
+}
+
+/// Diagnostic events configuration.
+///
+/// Controls whether diagnostic events are captured and included in
+/// metadata and transaction submission responses.
+///
+/// # Example
+///
+/// ```toml
+/// [diagnostics]
+/// soroban_diagnostic_events = true
+/// tx_submission_diagnostics = true
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiagnosticsConfig {
+    /// When true, include Soroban diagnostic events in `LedgerCloseMeta`.
+    /// Maps to stellar-core's `ENABLE_SOROBAN_DIAGNOSTIC_EVENTS`.
+    #[serde(default)]
+    pub soroban_diagnostic_events: bool,
+
+    /// When true, include diagnostic events in `/tx` error responses.
+    /// Maps to stellar-core's `ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION`.
+    #[serde(default)]
+    pub tx_submission_diagnostics: bool,
 }
 
 /// Catchup behavior configuration.
@@ -888,6 +981,8 @@ impl AppConfig {
             events: EventsConfig::default(),
             metadata: MetadataConfig::default(),
             catchup: CatchupConfig::default(),
+            query: QueryConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
         }
     }
 
@@ -953,6 +1048,8 @@ impl AppConfig {
             events: EventsConfig::default(),
             metadata: MetadataConfig::default(),
             catchup: CatchupConfig::default(),
+            query: QueryConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
         }
     }
 
@@ -1440,7 +1537,10 @@ recent = 5000
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.catchup.complete);
         assert_eq!(config.catchup.recent, 5000);
-        assert!(matches!(config.catchup.to_mode(), CatchupMode::Recent(5000)));
+        assert!(matches!(
+            config.catchup.to_mode(),
+            CatchupMode::Recent(5000)
+        ));
     }
 
     #[test]

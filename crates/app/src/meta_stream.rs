@@ -298,6 +298,7 @@ mod tests {
         let config = MetadataConfig {
             output_stream: Some(meta_path.to_str().unwrap().to_string()),
             debug_ledgers: 0,
+            ..Default::default()
         };
 
         let mut manager = MetaStreamManager::new(&config, dir.path()).unwrap();
@@ -320,11 +321,9 @@ mod tests {
             | ((data[1] as u32) << 16)
             | ((data[2] as u32) << 8)
             | (data[3] as u32);
-        let decoded = LedgerCloseMeta::from_xdr(
-            &data[4..4 + sz as usize],
-            stellar_xdr::curr::Limits::none(),
-        )
-        .unwrap();
+        let decoded =
+            LedgerCloseMeta::from_xdr(&data[4..4 + sz as usize], stellar_xdr::curr::Limits::none())
+                .unwrap();
         assert!(matches!(decoded, LedgerCloseMeta::V2(_)));
     }
 
@@ -341,6 +340,7 @@ mod tests {
         let config = MetadataConfig {
             output_stream: None,
             debug_ledgers: 100,
+            ..Default::default()
         };
 
         let mut manager = MetaStreamManager::new(&config, dir.path()).unwrap();
@@ -388,6 +388,7 @@ mod tests {
         let config = MetadataConfig {
             output_stream: Some(meta_path.to_str().unwrap().to_string()),
             debug_ledgers: 0,
+            ..Default::default()
         };
 
         let mut manager = MetaStreamManager::new(&config, dir.path()).unwrap();
