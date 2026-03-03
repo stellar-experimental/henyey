@@ -43,7 +43,7 @@ use tokio::sync::broadcast;
 
 use crate::app::{App, AppState, CatchupTarget};
 use crate::config::AppConfig;
-use crate::http::StatusServer;
+use crate::http::{QueryServer, StatusServer};
 
 /// Node running mode determining behavior and consensus participation.
 ///
@@ -149,6 +149,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     // Store HTTP config before moving config
     let http_enabled = config.http.enabled;
     let http_port = config.http.port;
+    let query_port = config.query.port;
 
     // Create the application
     let app = Arc::new(App::new(config).await?);
@@ -176,6 +177,18 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         None
     };
 
+    // Start the HTTP query server if configured
+    let query_handle = if let Some(port) = query_port {
+        let query_server = QueryServer::new(port, app.clone());
+        Some(tokio::spawn(async move {
+            if let Err(e) = query_server.start().await {
+                tracing::error!(error = %e, "HTTP query server error");
+            }
+        }))
+    } else {
+        None
+    };
+
     // Print startup info
     print_startup_info(&app, &options);
 
@@ -185,6 +198,9 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     // Clean up
     shutdown_handle.abort();
     if let Some(handle) = http_handle {
+        handle.abort();
+    }
+    if let Some(handle) = query_handle {
         handle.abort();
     }
 

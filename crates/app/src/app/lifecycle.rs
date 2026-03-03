@@ -37,6 +37,9 @@ impl App {
         self.herder.bootstrap(ledger_seq);
         tracing::info!(ledger_seq, "Herder bootstrapped");
 
+        // Populate the initial bucket snapshot for the query server.
+        self.update_bucket_snapshot();
+
         // Wait a short time for initial peer connections, then request SCP state
         tokio::time::sleep(Duration::from_millis(500)).await;
         self.request_scp_state_from_peers().await;

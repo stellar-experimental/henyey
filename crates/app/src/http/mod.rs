@@ -89,6 +89,65 @@ pub(crate) fn build_router(state: Arc<ServerState>) -> Router {
         .with_state(state)
 }
 
+/// HTTP query server for ledger entry lookups.
+///
+/// Runs on a separate port from the status server. Provides endpoints for
+/// querying the bucket list snapshots:
+///
+/// - `POST /getledgerentryraw` — Raw ledger entry lookup
+/// - `POST /getledgerentry` — Entry lookup with TTL state classification
+///
+/// Matches stellar-core's `QueryServer` behavior.
+pub struct QueryServer {
+    port: u16,
+    app: Arc<App>,
+}
+
+impl QueryServer {
+    /// Create a new query server on the given port.
+    pub fn new(port: u16, app: Arc<App>) -> Self {
+        Self { port, app }
+    }
+
+    /// Build the query server router.
+    fn build_router(state: Arc<handlers::query::QueryState>) -> Router {
+        Router::new()
+            .route(
+                "/getledgerentryraw",
+                post(handlers::query::getledgerentryraw_handler),
+            )
+            .route(
+                "/getledgerentry",
+                post(handlers::query::getledgerentry_handler),
+            )
+            .with_state(state)
+    }
+
+    /// Start the query server.
+    pub async fn start(self) -> anyhow::Result<()> {
+        let state = Arc::new(handlers::query::QueryState {
+            snapshot_manager: self.app.bucket_snapshot_manager().clone(),
+        });
+
+        let mut shutdown_rx = self.app.subscribe_shutdown();
+
+        let router = Self::build_router(state);
+
+        let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
+        tracing::info!(port = self.port, "Starting HTTP query server");
+
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await?;
+
+        tracing::info!("HTTP query server stopped");
+        Ok(())
+    }
+}
+
 /// HTTP server for node status and control.
 pub struct StatusServer {
     port: u16,

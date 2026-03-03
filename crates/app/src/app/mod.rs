@@ -54,7 +54,10 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::RwLock;
 
 use henyey_bucket::BucketManager;
-use henyey_bucket::{BucketList, HasNextState, HotArchiveBucketList};
+use henyey_bucket::{
+    BucketList, BucketListSnapshot, BucketSnapshotManager, HasNextState,
+    HotArchiveBucketList, HotArchiveBucketListSnapshot,
+};
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::{
     BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, ScpQueries,
@@ -333,6 +336,10 @@ pub struct App {
 
     /// Bucket manager for ledger state persistence.
     bucket_manager: Arc<BucketManager>,
+
+    /// Snapshot manager for thread-safe concurrent bucket list queries.
+    /// Used by the query server to serve `/getledgerentry` and `/getledgerentryraw`.
+    bucket_snapshot_manager: Arc<BucketSnapshotManager>,
 
     /// Ledger manager for ledger operations.
     ledger_manager: Arc<LedgerManager>,
@@ -862,6 +869,13 @@ impl App {
         let bucket_manager = Arc::new(BucketManager::new(bucket_dir.clone())?);
         tracing::info!("Bucket manager initialized");
 
+        // Initialize the bucket snapshot manager for concurrent query access.
+        // Starts empty; snapshots are populated after ledger state is restored
+        // and updated after each ledger close.
+        let num_historical = config.query.snapshot_ledgers;
+        let bucket_snapshot_manager =
+            Arc::new(BucketSnapshotManager::empty(num_historical));
+
         // Initialize ledger manager
         let mut ledger_manager = LedgerManager::new(
             config.network.passphrase.clone(),
@@ -966,6 +980,7 @@ impl App {
             _db_lock: Some(db_lock),
             keypair,
             bucket_manager,
+            bucket_snapshot_manager,
             ledger_manager,
             overlay: RwLock::new(None),
             herder,
@@ -1188,6 +1203,32 @@ impl App {
     /// Get the database.
     pub fn database(&self) -> &henyey_db::Database {
         &self.db
+    }
+
+    /// Get the bucket snapshot manager for concurrent query access.
+    pub fn bucket_snapshot_manager(&self) -> &Arc<BucketSnapshotManager> {
+        &self.bucket_snapshot_manager
+    }
+
+    /// Update the bucket snapshot manager with fresh snapshots from the
+    /// current bucket list state. Called after each ledger close and after
+    /// catchup completes to keep the query server's view current.
+    pub(crate) fn update_bucket_snapshot(&self) {
+        let header = self.ledger_manager.current_header();
+        let live_snap = BucketListSnapshot::new(&self.ledger_manager.bucket_list(), header.clone());
+        let hot_archive_snap = {
+            let guard = self.ledger_manager.hot_archive_bucket_list();
+            match guard.as_ref() {
+                Some(ha) => HotArchiveBucketListSnapshot::new(ha, header),
+                None => {
+                    // No hot archive yet (pre-protocol 23); create empty placeholder.
+                    // The snapshot manager will simply have no hot archive data.
+                    return;
+                }
+            }
+        };
+        self.bucket_snapshot_manager
+            .update_current_snapshot(live_snap, hot_archive_snap);
     }
 
     /// Get the node's public key.

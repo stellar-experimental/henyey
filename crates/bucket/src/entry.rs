@@ -563,6 +563,24 @@ pub fn is_persistent_entry(entry: &LedgerEntry) -> bool {
     }
 }
 
+/// Check if a ledger key is for a persistent Soroban entry.
+///
+/// This is the key-based counterpart to [`is_persistent_entry`]. It checks
+/// whether the key refers to a `ContractCode` entry (always persistent) or a
+/// `ContractData` entry with `Persistent` durability.
+///
+/// # Returns
+///
+/// `true` if the key is for a persistent Soroban entry, `false` otherwise.
+/// Returns `false` for `Temporary` contract data and all non-Soroban keys.
+pub fn is_persistent_key(key: &LedgerKey) -> bool {
+    match key {
+        LedgerKey::ContractCode(_) => true,
+        LedgerKey::ContractData(data) => data.durability == ContractDataDurability::Persistent,
+        _ => false,
+    }
+}
+
 /// Get the TTL key for a Soroban entry.
 ///
 /// Each Soroban entry has an associated TTL entry that tracks its expiration.

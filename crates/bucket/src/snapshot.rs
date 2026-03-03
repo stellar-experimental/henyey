@@ -59,8 +59,8 @@ use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use stellar_xdr::curr::{
-    AccountId, Asset, LedgerEntry, LedgerEntryData, LedgerEntryType, LedgerHeader, LedgerKey,
-    LedgerKeyTrustLine, Limits, PoolId, TrustLineAsset, WriteXdr,
+    AccountId, Asset, HotArchiveBucketEntry, LedgerEntry, LedgerEntryData, LedgerEntryType,
+    LedgerHeader, LedgerKey, LedgerKeyTrustLine, Limits, PoolId, TrustLineAsset, WriteXdr,
 };
 
 /// A read-only snapshot of a single bucket.
@@ -209,6 +209,40 @@ impl HotArchiveBucketSnapshot {
     /// Returns a reference to the underlying bucket.
     pub fn raw_bucket(&self) -> &HotArchiveBucket {
         &self.bucket
+    }
+
+    /// Loads hot archive entries for the given keys.
+    ///
+    /// For each key found, the entry is added to `result` and the key is removed
+    /// from `keys`. This allows efficient multi-key lookups across multiple buckets.
+    ///
+    /// Returns `HotArchiveBucketEntry` variants:
+    /// - `Archived(LedgerEntry)` — entry is in the archive
+    /// - `Live(LedgerKey)` — entry was restored (not in archive)
+    pub fn load_keys(
+        &self,
+        keys: &mut Vec<LedgerKey>,
+        result: &mut Vec<HotArchiveBucketEntry>,
+    ) {
+        keys.retain(|key| {
+            if let Ok(Some(entry)) = self.bucket.get(key) {
+                match &entry {
+                    HotArchiveBucketEntry::Archived(_) => {
+                        result.push(entry);
+                        false // Remove from keys
+                    }
+                    HotArchiveBucketEntry::Live(_) => {
+                        // Entry was restored — treat as "not in archive"
+                        false // Remove from keys, don't add to result
+                    }
+                    HotArchiveBucketEntry::Metaentry(_) => {
+                        true // Keep searching
+                    }
+                }
+            } else {
+                true // Keep in keys, continue searching
+            }
+        });
     }
 }
 
@@ -722,6 +756,30 @@ impl HotArchiveBucketListSnapshot {
     pub fn levels(&self) -> &[HotArchiveBucketLevelSnapshot] {
         &self.levels
     }
+
+    /// Batch-loads archived entries by their keys.
+    ///
+    /// Searches from level 0 (most recent) to the highest level, returning
+    /// `HotArchiveBucketEntry::Archived` entries found. Keys that resolve to
+    /// `Live` (restored) are removed without producing output.
+    pub fn load_keys(&self, keys: &[LedgerKey]) -> Vec<HotArchiveBucketEntry> {
+        let mut remaining = keys.to_vec();
+        let mut result = Vec::new();
+
+        for level in &self.levels {
+            if remaining.is_empty() {
+                break;
+            }
+            for bucket in [&level.curr, &level.snap] {
+                if remaining.is_empty() {
+                    break;
+                }
+                bucket.load_keys(&mut remaining, &mut result);
+            }
+        }
+
+        result
+    }
 }
 
 /// A searchable wrapper around a bucket list snapshot.
@@ -1121,6 +1179,29 @@ impl SearchableHotArchiveBucketListSnapshot {
     /// Returns the current ledger header.
     pub fn ledger_header(&self) -> &LedgerHeader {
         self.snapshot.ledger_header()
+    }
+
+    /// Loads archived entries by their keys from the current snapshot.
+    pub fn load_keys(&self, keys: &[LedgerKey]) -> Vec<HotArchiveBucketEntry> {
+        self.snapshot.load_keys(keys)
+    }
+
+    /// Loads archived entries from a specific historical ledger.
+    ///
+    /// Returns `None` if the requested ledger is not available in the
+    /// historical snapshots.
+    pub fn load_keys_from_ledger(
+        &self,
+        keys: &[LedgerKey],
+        ledger_seq: u32,
+    ) -> Option<Vec<HotArchiveBucketEntry>> {
+        if ledger_seq == self.snapshot.ledger_seq() {
+            return Some(self.snapshot.load_keys(keys));
+        }
+
+        self._historical_snapshots
+            .get(&ledger_seq)
+            .map(|snap| snap.load_keys(keys))
     }
 }
 

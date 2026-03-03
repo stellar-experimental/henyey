@@ -1502,6 +1502,11 @@ impl App {
                     }
 
                     self.restore_operational_state().await;
+
+                    // Refresh bucket snapshots so the query server sees
+                    // the state restored by catchup.
+                    self.update_bucket_snapshot();
+
                     tracing::info!(ledger_seq = result.ledger_seq, "{} catchup complete", label);
                     let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
                     let pending_count = self.herder.get_pending_tx_sets().len();

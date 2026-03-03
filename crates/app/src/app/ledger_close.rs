@@ -1301,6 +1301,9 @@ impl App {
         *self.last_processed_slot.write().await = pending.ledger_seq as u64;
         self.clear_tx_advert_history(pending.ledger_seq).await;
 
+        // Update bucket snapshots for the query server.
+        self.update_bucket_snapshot();
+
         // Clean up stale pending tx_set requests for slots we've now closed.
         // This prevents stale requests (from old SCP state responses) from
         // lingering and causing timeout → DontHave → recovery loops.
