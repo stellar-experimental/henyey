@@ -107,7 +107,12 @@ impl App {
                     .unwrap_or(&self.config.database.path)
                     .join("buckets");
                 for level in habl.levels() {
-                    for bucket in [&level.curr, &level.snap] {
+                    let mut buckets_to_check: Vec<&henyey_bucket::HotArchiveBucket> =
+                        vec![&level.curr, &level.snap];
+                    if let Some(next) = level.next() {
+                        buckets_to_check.push(next);
+                    }
+                    for bucket in buckets_to_check {
                         if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
                             let permanent = bucket_dir.join(format!("{}.bucket.xdr", bucket.hash().to_hex()));
                             if !permanent.exists() {

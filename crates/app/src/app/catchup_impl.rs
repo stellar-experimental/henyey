@@ -186,6 +186,41 @@ impl App {
             let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
             let default_hot_archive = HotArchiveBucketList::default();
             let hot_archive_ref = hot_archive_guard.as_ref().unwrap_or(&default_hot_archive);
+
+            // Ensure hot archive buckets are persisted to disk for restart recovery.
+            // Hot archive merges during catchup replay are all in-memory (via
+            // from_entries()), so after replay the curr/snap buckets have no
+            // backing file. Without this, a subsequent `run` command will fail to
+            // restore from the persisted HAS because the referenced bucket files
+            // don't exist on disk.
+            {
+                let bucket_dir = self.config.database.path
+                    .parent()
+                    .unwrap_or(&self.config.database.path)
+                    .join("buckets");
+                for level in hot_archive_ref.levels() {
+                    let mut buckets_to_check: Vec<&henyey_bucket::HotArchiveBucket> =
+                        vec![&level.curr, &level.snap];
+                    if let Some(next) = level.next() {
+                        buckets_to_check.push(next);
+                    }
+                    for bucket in buckets_to_check {
+                        if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
+                            let permanent = bucket_dir.join(format!("{}.bucket.xdr", bucket.hash().to_hex()));
+                            if !permanent.exists() {
+                                if let Err(e) = bucket.save_to_xdr_file(&permanent) {
+                                    tracing::warn!(
+                                        error = %e,
+                                        hash = %bucket.hash().to_hex(),
+                                        "Failed to persist in-memory hot archive bucket to disk after catchup"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             let has = build_history_archive_state(
                 final_header.ledger_seq,
                 &bucket_list,
