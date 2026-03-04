@@ -61,6 +61,7 @@ use henyey_common::{Hash256, NetworkId};
 use henyey_db::Database;
 
 use henyey_ledger::{LedgerCloseData, LedgerManager, TransactionSetVariant};
+use stellar_xdr::curr::LedgerCloseMeta;
 use henyey_tx::TransactionFrame;
 use stellar_xdr::curr::{
     GeneralizedTransactionSet, LedgerHeader, LedgerHeaderHistoryEntry,
@@ -242,6 +243,14 @@ pub struct ExistingBucketState {
 ///
 /// The `CatchupManager` is not `Send` or `Sync` due to its mutable progress
 /// tracking. Create a new manager for each catchup operation.
+/// Callback invoked for each replayed ledger's metadata.
+///
+/// When set on a [`CatchupManager`], this callback receives the
+/// `LedgerCloseMeta` produced by each replayed ledger during catchup.
+/// This enables streaming metadata to external consumers (e.g., the
+/// meta pipe used by stellar-rpc in bounded replay mode).
+pub type MetaCallback = Box<dyn Fn(LedgerCloseMeta) + Send + Sync>;
+
 pub struct CatchupManager {
     /// History archives to download from (tried in order with failover).
     archives: Vec<Arc<HistoryArchive>>,
@@ -264,6 +273,13 @@ pub struct CatchupManager {
     /// value during catchup (per stellar-core §8.2 step 2). If `None`,
     /// passphrase validation is skipped.
     network_passphrase: Option<String>,
+
+    /// Optional callback for streaming metadata from replayed ledgers.
+    ///
+    /// Called once per ledger during the replay phase with the `LedgerCloseMeta`
+    /// produced by `close_ledger`. Used by stellar-rpc's bounded replay mode
+    /// (`catchup --metadata-output-stream fd:3`).
+    meta_callback: Option<MetaCallback>,
 }
 
 impl CatchupManager {
@@ -282,6 +298,7 @@ impl CatchupManager {
             progress: CatchupProgress::default(),
             replay_config: ReplayConfig::default(),
             network_passphrase: None,
+            meta_callback: None,
         }
     }
 
@@ -298,6 +315,7 @@ impl CatchupManager {
             progress: CatchupProgress::default(),
             replay_config: ReplayConfig::default(),
             network_passphrase: None,
+            meta_callback: None,
         }
     }
 
@@ -318,6 +336,15 @@ impl CatchupManager {
     /// immediately (per stellar-core §8.2 step 2).
     pub fn set_network_passphrase(&mut self, passphrase: String) {
         self.network_passphrase = Some(passphrase);
+    }
+
+    /// Set a callback for streaming metadata from replayed ledgers.
+    ///
+    /// The callback receives `LedgerCloseMeta` for each ledger replayed
+    /// during catchup. This is used by stellar-rpc's bounded replay mode
+    /// to stream meta over the `--metadata-output-stream` pipe.
+    pub fn set_meta_callback(&mut self, callback: MetaCallback) {
+        self.meta_callback = Some(callback);
     }
 
     /// Catch up to a specific target ledger.
@@ -2113,6 +2140,14 @@ impl CatchupManager {
                         result.header_hash.to_hex(),
                         expected_hash.to_hex()
                     )));
+                }
+            }
+
+            // Stream metadata to external consumers (e.g., stellar-rpc's meta pipe
+            // in bounded replay mode: `catchup --metadata-output-stream fd:3`).
+            if let Some(ref callback) = self.meta_callback {
+                if let Some(meta) = result.meta {
+                    callback(meta);
                 }
             }
 

@@ -533,6 +533,30 @@ impl App {
         );
         catchup_manager.set_network_passphrase(self.config.network.passphrase.clone());
 
+        // Wire up meta streaming for catchup replay.
+        // When --metadata-output-stream is configured, replayed ledgers
+        // stream their LedgerCloseMeta to the pipe. This is required for
+        // stellar-rpc's bounded replay mode (`catchup --metadata-output-stream fd:3`).
+        //
+        // We temporarily move the MetaStreamManager into a shared Arc so the
+        // callback closure can use it. After catchup completes, we move it back.
+        let shared_meta_stream = {
+            let mut guard = self.meta_stream.lock().unwrap();
+            guard
+                .take()
+                .map(|stream| Arc::new(std::sync::Mutex::new(stream)))
+        };
+        if let Some(ref stream_arc) = shared_meta_stream {
+            let stream_for_callback = Arc::clone(stream_arc);
+            catchup_manager.set_meta_callback(Box::new(move |meta| {
+                let mut guard = stream_for_callback.lock().unwrap();
+                if let Err(e) = guard.emit_meta(&meta) {
+                    tracing::error!(error = %e, "Fatal: metadata stream write failed during catchup replay");
+                    std::process::abort();
+                }
+            }));
+        }
+
         // Run catchup
         progress.set_phase(CatchupPhase::DownloadingBuckets);
 
@@ -564,6 +588,27 @@ impl App {
             }
         }
         .map_err(|e| anyhow::anyhow!("Catchup failed: {}", e))?;
+
+        // Drop the catchup manager (and its meta callback) before restoring
+        // the MetaStreamManager. The callback holds an Arc clone.
+        drop(catchup_manager);
+
+        // Restore the MetaStreamManager back to self after catchup completes.
+        if let Some(stream_arc) = shared_meta_stream {
+            match Arc::try_unwrap(stream_arc) {
+                Ok(mutex) => {
+                    let stream = mutex.into_inner().unwrap();
+                    *self.meta_stream.lock().unwrap() = Some(stream);
+                }
+                Err(_arc) => {
+                    // Shouldn't happen: the callback was dropped with catchup_manager.
+                    tracing::warn!(
+                        "MetaStreamManager Arc still shared after catchup; \
+                         meta stream will not be available for live mode"
+                    );
+                }
+            }
+        }
 
         // Update progress with bucket count
         progress.set_total_buckets(output.result.buckets_downloaded);
