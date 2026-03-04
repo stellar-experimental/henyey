@@ -1559,24 +1559,31 @@ impl App {
                     }
                     self.reset_tx_set_tracking_after_catchup().await;
 
-                    // Clear stale syncing_ledgers entries above the catchup target.
-                    // These were created during pre-catchup SCP fast-forwarding and
-                    // have tx_set: None because peers had already evicted the tx_sets
-                    // for those slots (too old at the time). After catchup brings
-                    // current_ledger up to the target, these slots are now recent and
-                    // peers SHOULD have their tx_sets. Clearing forces fresh
-                    // process_externalized_slots() calls that will re-create entries
-                    // via check_ledger_close() with proper tx_set lookups.
+                    // Clear syncing_ledgers entries that are at or below the catchup
+                    // target (already applied) or that lack tx_sets (created during
+                    // pre-catchup fast-forwarding when peers had already evicted those
+                    // tx_sets).  KEEP entries above the target that have valid tx_sets —
+                    // these will be needed for rapid close after catchup.
                     {
                         let mut buffer = self.syncing_ledgers.write().await;
                         let stale_count = buffer.len();
-                        buffer.retain(|&seq, _| seq <= result.ledger_seq);
+                        buffer.retain(|&seq, entry| {
+                            if seq <= result.ledger_seq {
+                                return false; // Already applied by catchup
+                            }
+                            // Keep entries above catchup target only if they have a tx_set.
+                            // Entries without tx_sets will be re-created by
+                            // process_externalized_slots with fresh tx_set lookups.
+                            entry.tx_set.is_some()
+                        });
                         let removed = stale_count - buffer.len();
-                        if removed > 0 {
+                        let kept = buffer.len();
+                        if removed > 0 || kept > 0 {
                             tracing::info!(
                                 removed,
+                                kept,
                                 catchup_ledger = result.ledger_seq,
-                                "Cleared stale syncing_ledgers entries above catchup target"
+                                "Cleaned syncing_ledgers after catchup (kept entries with tx_sets)"
                             );
                         }
                     }
