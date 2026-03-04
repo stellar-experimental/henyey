@@ -57,6 +57,7 @@ pub fn is_stellar_core_format(raw: &toml::Value) -> bool {
         "ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION",
         "EMIT_SOROBAN_TRANSACTION_META_EXT_V1",
         "EMIT_LEDGER_CLOSE_META_EXT_V1",
+        "EMIT_CLASSIC_EVENTS",
         "CATCHUP_COMPLETE",
         "CATCHUP_RECENT",
         "FORCE_SCP",
@@ -168,6 +169,11 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
     if let Some(v) = get_bool(table, "EMIT_LEDGER_CLOSE_META_EXT_V1") {
         config.metadata.emit_ledger_close_meta_ext_v1 = v;
+    }
+
+    // --- Events ---
+    if let Some(v) = get_bool(table, "EMIT_CLASSIC_EVENTS") {
+        config.events.emit_classic_events = v;
     }
 
     // --- Diagnostics ---
@@ -382,6 +388,7 @@ mod tests {
             ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION = true
             EMIT_SOROBAN_TRANSACTION_META_EXT_V1 = true
             EMIT_LEDGER_CLOSE_META_EXT_V1 = true
+            EMIT_CLASSIC_EVENTS = true
             "#,
         )
         .unwrap();
@@ -406,6 +413,7 @@ mod tests {
         assert!(config.diagnostics.tx_submission_diagnostics);
         assert!(config.metadata.emit_soroban_tx_meta_ext_v1);
         assert!(config.metadata.emit_ledger_close_meta_ext_v1);
+        assert!(config.events.emit_classic_events);
 
         // Compat HTTP should be auto-enabled on HTTP_PORT
         assert!(config.compat_http.enabled);
