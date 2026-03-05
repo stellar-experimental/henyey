@@ -46,9 +46,9 @@ use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
 use henyey_scp::{BallotPhase, SlotIndex, SCP};
 use stellar_xdr::curr::{
-    EnvelopeType, LedgerCloseValueSignature, Limits, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet,
-    Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, TransactionEnvelope,
-    Uint256, UpgradeType, Value, WriteXdr,
+    EnvelopeType, LedgerCloseValueSignature, LedgerUpgrade, Limits, NodeId, ReadXdr,
+    ScpEnvelope, ScpQuorumSet, Signature as XdrSignature, StellarValue, StellarValueExt,
+    TimePoint, TransactionEnvelope, Uint256, UpgradeType, Value, WriteXdr,
 };
 
 use crate::error::HerderError;
@@ -58,6 +58,7 @@ use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStat
 use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig};
 use crate::state::HerderState;
+use crate::upgrades::{CurrentLedgerState, UpgradeParameters, Upgrades};
 use crate::tx_queue::{
     account_key_from_account_id, TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult,
     TxQueueStats,
@@ -172,6 +173,9 @@ pub struct HerderConfig {
 
     /// Protocol upgrades this validator proposes to include in nominations.
     pub proposed_upgrades: Vec<stellar_xdr::curr::LedgerUpgrade>,
+
+    /// Maximum supported protocol version for upgrade validation.
+    pub max_protocol_version: u32,
 }
 
 const DEFAULT_MAX_EXTERNALIZED_SLOTS: usize = 12;
@@ -190,6 +194,7 @@ impl Default for HerderConfig {
             local_quorum_set: None,
             max_tx_set_size: 1000,
             proposed_upgrades: Vec::new(),
+            max_protocol_version: 25,
         }
     }
 }
@@ -260,6 +265,8 @@ pub struct Herder {
     slot_quorum_tracker: RwLock<SlotQuorumTracker>,
     /// Transitive quorum tracker for the current quorum map.
     quorum_tracker: RwLock<QuorumTracker>,
+    /// Runtime-mutable upgrade scheduling (set via HTTP `/upgrades?mode=set`).
+    runtime_upgrades: RwLock<Upgrades>,
 }
 
 impl Herder {
@@ -369,7 +376,22 @@ impl Herder {
             prev_value: RwLock::new(Value::default()),
             slot_quorum_tracker: RwLock::new(slot_quorum_tracker),
             quorum_tracker: RwLock::new(quorum_tracker),
+            runtime_upgrades: RwLock::new(Upgrades::default()),
         }
+    }
+
+    /// Set runtime upgrade parameters (called from HTTP `/upgrades?mode=set`).
+    ///
+    /// Returns an error string if validation fails (e.g., protocol version too high).
+    pub fn set_upgrade_parameters(&self, params: UpgradeParameters) -> std::result::Result<(), String> {
+        let max_protocol = self.config.max_protocol_version;
+        let mut upgrades = self.runtime_upgrades.write();
+        upgrades.set_parameters(params, max_protocol)
+    }
+
+    /// Get current runtime upgrade parameters.
+    pub fn upgrade_parameters(&self) -> UpgradeParameters {
+        self.runtime_upgrades.read().parameters().clone()
     }
 
     /// Set the ledger manager reference.
@@ -1440,9 +1462,40 @@ impl Herder {
             close_time = lcl_close_time + 1;
         }
 
-        let upgrades: Vec<UpgradeType> = self
-            .config
-            .proposed_upgrades
+        // Combine static (config) and runtime (HTTP /upgrades?mode=set) upgrades.
+        // Runtime upgrades take precedence and are time-gated.
+        let mut upgrade_list: Vec<LedgerUpgrade> = self.config.proposed_upgrades.clone();
+
+        // Add runtime upgrades from the Upgrades scheduling system
+        let runtime_upgrades = {
+            let header = self.ledger_manager.read().as_ref()
+                .map(|lm| lm.current_header())
+                .unwrap_or_default();
+            let state = CurrentLedgerState {
+                close_time,
+                protocol_version: header.ledger_version,
+                base_fee: header.base_fee,
+                max_tx_set_size: header.max_tx_set_size,
+                base_reserve: header.base_reserve,
+                flags: match &header.ext {
+                    stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+                    stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+                },
+                max_soroban_tx_set_size: None, // TODO: read from config settings
+            };
+            self.runtime_upgrades.read().create_upgrades_for(&state)
+        };
+        for upgrade in runtime_upgrades {
+            // Don't duplicate upgrades of the same type
+            let dominated = upgrade_list.iter().any(|existing| {
+                std::mem::discriminant(existing) == std::mem::discriminant(&upgrade)
+            });
+            if !dominated {
+                upgrade_list.push(upgrade);
+            }
+        }
+
+        let upgrades: Vec<UpgradeType> = upgrade_list
             .iter()
             .filter_map(|upgrade| upgrade.to_xdr(Limits::none()).ok())
             .filter_map(|bytes| bytes.try_into().ok().map(UpgradeType))

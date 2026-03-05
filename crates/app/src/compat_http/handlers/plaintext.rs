@@ -182,18 +182,96 @@ pub(crate) async fn compat_scp_handler(
 }
 
 /// GET /upgrades
+///
+/// When called without `mode=set`, returns current ledger state.
+/// When called with `mode=set`, schedules upgrades for the given parameters.
+/// Parameters: mode, upgradetime, protocolversion, basefee, basereserve,
+///             maxtxsetsize, flags, configupgradesetkey
 pub(crate) async fn compat_upgrades_handler(
     State(state): State<Arc<CompatServerState>>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let (version, base_fee, base_reserve, max_tx_set_size) = state.app.current_upgrade_state();
-    Json(serde_json::json!({
-        "current": {
-            "ledgerVersion": version,
-            "baseFee": base_fee,
-            "baseReserve": base_reserve,
-            "maxTxSetSize": max_tx_set_size,
+    let mode = params.get("mode").map(|s| s.as_str()).unwrap_or("");
+
+    if mode == "set" {
+        // Parse upgrade parameters from query string
+        let mut upgrade_params = henyey_herder::upgrades::UpgradeParameters::default();
+
+        // Parse upgradetime (ISO 8601 or Unix timestamp).
+        // stellar-core accepts "1970-01-01T00:00:00Z" meaning "immediately".
+        if let Some(time_str) = params.get("upgradetime") {
+            if let Ok(ts) = time_str.parse::<u64>() {
+                upgrade_params.upgrade_time = ts;
+            } else {
+                // Parse ISO 8601 date: "YYYY-MM-DDTHH:MM:SSZ"
+                // For "1970-01-01T00:00:00Z" this gives 0 (epoch).
+                upgrade_params.upgrade_time = parse_iso8601_to_unix(time_str).unwrap_or(0);
+            }
         }
-    }))
+
+        if let Some(v) = params.get("protocolversion").and_then(|s| s.parse().ok()) {
+            upgrade_params.protocol_version = Some(v);
+        }
+        if let Some(v) = params.get("basefee").and_then(|s| s.parse().ok()) {
+            upgrade_params.base_fee = Some(v);
+        }
+        if let Some(v) = params.get("basereserve").and_then(|s| s.parse().ok()) {
+            upgrade_params.base_reserve = Some(v);
+        }
+        if let Some(v) = params.get("maxtxsetsize").and_then(|s| s.parse().ok()) {
+            upgrade_params.max_tx_set_size = Some(v);
+        }
+        if let Some(v) = params.get("flags").and_then(|s| s.parse().ok()) {
+            upgrade_params.flags = Some(v);
+        }
+        if let Some(key_str) = params.get("configupgradesetkey") {
+            // configupgradesetkey is a base64-encoded ConfigUpgradeSetKey XDR
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            use stellar_xdr::curr::{ConfigUpgradeSetKey, ReadXdr, Limits};
+            if let Ok(bytes) = STANDARD.decode(key_str) {
+                if let Ok(key) = ConfigUpgradeSetKey::from_xdr(&bytes, Limits::none()) {
+                    upgrade_params.config_upgrade_set_key =
+                        Some(henyey_herder::upgrades::ConfigUpgradeSetKeyJson::from_xdr(&key));
+                }
+            }
+        }
+
+        match state.app.set_upgrade_parameters(upgrade_params) {
+            Ok(()) => Json(serde_json::json!({
+                "status": "ok"
+            })).into_response(),
+            Err(e) => Json(serde_json::json!({
+                "status": "error",
+                "error": e
+            })).into_response(),
+        }
+    } else if mode == "clear" {
+        let _ = state.app.set_upgrade_parameters(
+            henyey_herder::upgrades::UpgradeParameters::default(),
+        );
+        Json(serde_json::json!({
+            "status": "ok"
+        })).into_response()
+    } else {
+        // Default: return current state + proposed upgrades
+        let (version, base_fee, base_reserve, max_tx_set_size) = state.app.current_upgrade_state();
+        let runtime_params = state.app.runtime_upgrade_parameters();
+        Json(serde_json::json!({
+            "current": {
+                "ledgerVersion": version,
+                "baseFee": base_fee,
+                "baseReserve": base_reserve,
+                "maxTxSetSize": max_tx_set_size,
+            },
+            "scheduled": {
+                "upgradetime": runtime_params.upgrade_time,
+                "protocolversion": runtime_params.protocol_version,
+                "basefee": runtime_params.base_fee,
+                "basereserve": runtime_params.base_reserve,
+                "maxtxsetsize": runtime_params.max_tx_set_size,
+            }
+        })).into_response()
+    }
 }
 
 /// GET /self-check?depth=...
@@ -292,4 +370,48 @@ pub(crate) async fn compat_stopreporting_handler(
     State(_state): State<Arc<CompatServerState>>,
 ) -> impl IntoResponse {
     "done\n"
+}
+
+/// Parse a simple ISO 8601 datetime string to Unix timestamp.
+///
+/// Supports format "YYYY-MM-DDTHH:MM:SSZ" (UTC only).
+/// Returns 0 for "1970-01-01T00:00:00Z".
+fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
+    let s = s.trim_end_matches('Z');
+    let parts: Vec<&str> = s.split('T').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let date_parts: Vec<u32> = parts[0].split('-').filter_map(|p| p.parse().ok()).collect();
+    let time_parts: Vec<u32> = parts[1].split(':').filter_map(|p| p.parse().ok()).collect();
+
+    if date_parts.len() != 3 || time_parts.len() != 3 {
+        return None;
+    }
+
+    let (year, month, day) = (date_parts[0], date_parts[1], date_parts[2]);
+    let (hour, min, sec) = (time_parts[0], time_parts[1], time_parts[2]);
+
+    // Days from Unix epoch (1970-01-01) to the given date
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap_year(y) { 366 } else { 365 };
+    }
+    let month_days = [31, 28 + if is_leap_year(year) { 1 } else { 0 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 0..(month.saturating_sub(1) as usize) {
+        days += month_days.get(m).copied().unwrap_or(30) as i64;
+    }
+    days += (day as i64) - 1;
+
+    let total_secs = days * 86400 + (hour as i64) * 3600 + (min as i64) * 60 + (sec as i64);
+    if total_secs < 0 {
+        Some(0)
+    } else {
+        Some(total_secs as u64)
+    }
+}
+
+fn is_leap_year(y: u32) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }

@@ -921,6 +921,7 @@ impl App {
             },
             local_quorum_set,
             proposed_upgrades: config.upgrades.to_ledger_upgrades(),
+            max_protocol_version: config.network.max_protocol_version,
         };
 
         // Create herder (with or without secret key for signing)
@@ -1412,6 +1413,19 @@ impl App {
 
     pub fn proposed_upgrades(&self) -> Vec<LedgerUpgrade> {
         self.config.upgrades.to_ledger_upgrades()
+    }
+
+    /// Set runtime upgrade parameters (from HTTP `/upgrades?mode=set`).
+    pub fn set_upgrade_parameters(
+        &self,
+        params: henyey_herder::upgrades::UpgradeParameters,
+    ) -> std::result::Result<(), String> {
+        self.herder.set_upgrade_parameters(params)
+    }
+
+    /// Get current runtime upgrade parameters.
+    pub fn runtime_upgrade_parameters(&self) -> henyey_herder::upgrades::UpgradeParameters {
+        self.herder.upgrade_parameters()
     }
 
     /// Get Soroban network configuration information.
