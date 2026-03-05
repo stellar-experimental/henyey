@@ -1,6 +1,6 @@
 # henyey
 
-A Rust reimplementation of [Stellar Core](https://github.com/stellar/stellar-core) focused on protocol v25 behavior and testnet sync. This is an educational experiment and **not** production-grade software.
+A Rust reimplementation of [Stellar Core](https://github.com/stellar/stellar-core) targeting protocol v25 parity. Supports testnet, mainnet, and local standalone networks. Can serve as a drop-in replacement for stellar-core inside the [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) Docker image. This is an educational experiment and **not** production-grade software.
 
 ## What is Stellar Core?
 
@@ -45,13 +45,29 @@ Supporting crates: `crypto`, `common`, `work`, `historywork`
 
 ## Status
 
-**Work in progress.** Core functionality is implemented:
+**Work in progress.** Core functionality is implemented and verified against testnet, mainnet, and local standalone networks.
 
-- Testnet catchup and sync (observer mode)
-- SCP consensus participation (validator mode)
-- Transaction execution (classic + Soroban)
-- History archive replay and verification
-- BucketList state management
+### Consensus & Networking
+- SCP consensus participation (validator and observer modes)
+- P2P overlay with pull-mode transaction flooding and flow control
+- Quorum intersection checking
+
+### Transaction Execution
+- Classic and Soroban transaction execution
+- Classic event emission (SAC events for classic operations)
+
+### State Management
+- BucketList state store (live + hot archive)
+- History archive catchup, replay, and verification
+- History archive publishing (checkpoints with XDR record marking)
+- Offline verify-execution against CDP metadata
+
+### stellar-core Compatibility
+- Drop-in replacement for stellar-core in [stellar-rpc](https://github.com/stellar/stellar-rpc) (captive core mode)
+- Drop-in replacement inside the [stellar/quickstart](https://github.com/stellar/docker-stellar-core-horizon) Docker image (testnet and local modes)
+- HTTP API compatible with stellar-core (info, tx submission, ledger queries, upgrades, surveys)
+- LedgerCloseMeta streaming for Horizon and stellar-rpc ingestion
+- CLI compatible with stellar-core subcommands (`new-db`, `run`, `catchup`, `force-scp`, `offline-info`, `version`)
 
 ## Requirements
 
@@ -349,7 +365,7 @@ henyey/
 | Crate | Purpose | Parity |
 |-------|---------|--------|
 | [`henyey`](crates/henyey/README.md) | CLI entrypoint, argument parsing, command dispatch | [43%](crates/henyey/PARITY_STATUS.md) |
-| [`henyey-app`](crates/henyey-app/README.md) | Application wiring, lifecycle management, run/catchup orchestration | [62%](crates/henyey-app/PARITY_STATUS.md) |
+| [`henyey-app`](crates/henyey-app/README.md) | Application wiring, lifecycle, HTTP APIs, meta streaming, history publishing | [62%](crates/henyey-app/PARITY_STATUS.md) |
 | [`henyey-common`](crates/henyey-common/README.md) | Shared types, config helpers, time utilities | [98%](crates/henyey-common/PARITY_STATUS.md) |
 | [`henyey-crypto`](crates/henyey-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [79%](crates/henyey-crypto/PARITY_STATUS.md) |
 | [`henyey-db`](crates/henyey-db/README.md) | SQLite schema, migrations, query layer | [94%](crates/henyey-db/PARITY_STATUS.md) |
@@ -360,7 +376,7 @@ henyey/
 |-------|---------|--------|
 | [`henyey-scp`](crates/henyey-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [100%](crates/henyey-scp/PARITY_STATUS.md) |
 | [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [77%](crates/henyey-herder/PARITY_STATUS.md) |
-| [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [100%](crates/henyey-overlay/PARITY_STATUS.md) |
+| [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [88%](crates/henyey-overlay/PARITY_STATUS.md) |
 
 ### Execution Layer
 
@@ -374,7 +390,7 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-history`](crates/henyey-history/README.md) | History archive I/O, catchup, replay, verification | [76%](crates/henyey-history/PARITY_STATUS.md) |
+| [`henyey-history`](crates/henyey-history/README.md) | History archive I/O, catchup, replay, verification, publishing | [76%](crates/henyey-history/PARITY_STATUS.md) |
 | [`henyey-historywork`](crates/henyey-historywork/README.md) | History work scheduling, publish/catchup task management | [56%](crates/henyey-historywork/PARITY_STATUS.md) |
 
 ### Utilities
