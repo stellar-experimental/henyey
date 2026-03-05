@@ -782,11 +782,12 @@ impl App {
     }
 
     pub(super) fn first_ledger_in_checkpoint(ledger: u32) -> u32 {
-        (ledger / CHECKPOINT_FREQUENCY) * CHECKPOINT_FREQUENCY
+        let freq = checkpoint_frequency();
+        (ledger / freq) * freq
     }
 
     pub(super) fn is_first_ledger_in_checkpoint(ledger: u32) -> bool {
-        ledger % CHECKPOINT_FREQUENCY == 0
+        ledger % checkpoint_frequency() == 0
     }
 
     pub(super) fn trim_syncing_ledgers(
@@ -814,7 +815,7 @@ impl App {
         let first_buffered = *buffer.keys().next().expect("checked non-empty above");
         let last_buffered = *buffer.keys().next_back().expect("checked non-empty above");
         let gap = first_buffered.saturating_sub(current_ledger);
-        if gap >= CHECKPOINT_FREQUENCY {
+        if gap >= checkpoint_frequency() {
             let trim_before = if Self::is_first_ledger_in_checkpoint(last_buffered) {
                 if last_buffered == 0 {
                     return;

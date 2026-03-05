@@ -39,8 +39,10 @@ pub const DEFAULT_MAINTENANCE_PERIOD: Duration = Duration::from_secs(4 * 60 * 60
 /// Default number of entries to delete per maintenance cycle.
 pub const DEFAULT_MAINTENANCE_COUNT: u32 = 50000;
 
-/// Checkpoint frequency (64 ledgers).
-pub const CHECKPOINT_FREQUENCY: u32 = 64;
+/// Checkpoint frequency — delegates to the runtime-configurable value.
+pub fn checkpoint_frequency() -> u32 {
+    henyey_history::checkpoint_frequency()
+}
 
 /// Configuration for automatic database maintenance.
 #[derive(Debug, Clone)]
@@ -190,7 +192,7 @@ impl Maintainer {
         // Calculate the minimum ledger we need to keep
         // We need to keep enough history to support checkpoint publishing
         let qmin = min_queued.unwrap_or(lcl).min(lcl);
-        let lmin = qmin.saturating_sub(CHECKPOINT_FREQUENCY);
+        let lmin = qmin.saturating_sub(checkpoint_frequency());
 
         debug!(
             lcl = lcl,
@@ -248,7 +250,7 @@ impl Maintainer {
     pub fn perform_maintenance_with_count(&self, count: u32) {
         let (lcl, min_queued) = (self.get_ledger_bounds)();
         let qmin = min_queued.unwrap_or(lcl).min(lcl);
-        let lmin = qmin.saturating_sub(CHECKPOINT_FREQUENCY);
+        let lmin = qmin.saturating_sub(checkpoint_frequency());
 
         info!(
             trim_below = lmin,
@@ -287,8 +289,8 @@ mod tests {
 
     #[test]
     fn test_checkpoint_frequency() {
-        // Verify checkpoint frequency matches Stellar standard
-        assert_eq!(CHECKPOINT_FREQUENCY, 64);
+        // Verify default checkpoint frequency matches Stellar standard
+        assert_eq!(checkpoint_frequency(), 64);
     }
 
     #[tokio::test]
@@ -329,10 +331,11 @@ mod tests {
     #[test]
     fn test_lmin_calculation() {
         // Test that lmin is calculated correctly
-        // If qmin is 128 and CHECKPOINT_FREQUENCY is 64, lmin should be 64
+        // If qmin is 128 and checkpoint_frequency() is 64, lmin should be 64
+        let freq = checkpoint_frequency();
         let qmin = 128u32;
-        let lmin = if qmin >= CHECKPOINT_FREQUENCY {
-            qmin - CHECKPOINT_FREQUENCY
+        let lmin = if qmin >= freq {
+            qmin - freq
         } else {
             0
         };
@@ -340,8 +343,8 @@ mod tests {
 
         // If qmin is 32 (less than checkpoint frequency), lmin should be 0
         let qmin = 32u32;
-        let lmin = if qmin >= CHECKPOINT_FREQUENCY {
-            qmin - CHECKPOINT_FREQUENCY
+        let lmin = if qmin >= freq {
+            qmin - freq
         } else {
             0
         };

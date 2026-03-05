@@ -144,6 +144,10 @@ pub struct AppConfig {
     /// Diagnostic events configuration.
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
+
+    /// Testing overrides (e.g., `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING`).
+    #[serde(default)]
+    pub testing: TestingConfig,
 }
 
 /// Node identity and behavior configuration.
@@ -454,6 +458,31 @@ pub struct DiagnosticsConfig {
     /// Maps to stellar-core's `ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION`.
     #[serde(default)]
     pub tx_submission_diagnostics: bool,
+}
+
+/// Testing overrides for accelerated or customized behavior.
+///
+/// Maps to stellar-core's `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING` and related
+/// testing knobs. These are primarily used for local standalone networks.
+///
+/// # Examples
+///
+/// ```toml
+/// [testing]
+/// accelerate_time = true  # 1s ledger close, checkpoint frequency 8
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TestingConfig {
+    /// When true, accelerate time for testing: 1-second ledger close and
+    /// checkpoint frequency of 8 (instead of 64).
+    /// Maps to `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING`.
+    #[serde(default)]
+    pub accelerate_time: bool,
+
+    /// Override the ledger close time (in seconds). Computed from `accelerate_time`
+    /// if not explicitly set. `None` means use default (5s, or 1s if accelerated).
+    #[serde(default)]
+    pub ledger_close_time: Option<u32>,
 }
 
 /// Catchup behavior configuration.
@@ -1022,6 +1051,7 @@ impl AppConfig {
             catchup: CatchupConfig::default(),
             query: QueryConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            testing: TestingConfig::default(),
         }
     }
 
@@ -1090,6 +1120,7 @@ impl AppConfig {
             catchup: CatchupConfig::default(),
             query: QueryConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
+            testing: TestingConfig::default(),
         }
     }
 

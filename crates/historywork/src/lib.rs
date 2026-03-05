@@ -1831,9 +1831,6 @@ pub struct CheckpointRange {
     pub last: u32,
 }
 
-/// The frequency of checkpoints in ledger sequences.
-pub const CHECKPOINT_FREQUENCY: u32 = 64;
-
 impl CheckpointRange {
     /// Creates a new checkpoint range.
     ///
@@ -1850,25 +1847,28 @@ impl CheckpointRange {
 
     /// Returns the number of checkpoints in this range.
     pub fn count(&self) -> usize {
-        let first_idx = self.first / CHECKPOINT_FREQUENCY;
-        let last_idx = self.last / CHECKPOINT_FREQUENCY;
+        let freq = henyey_history::checkpoint_frequency();
+        let first_idx = self.first / freq;
+        let last_idx = self.last / freq;
         (last_idx - first_idx + 1) as usize
     }
 
     /// Returns an iterator over all checkpoint ledger sequences in this range.
     pub fn iter(&self) -> impl Iterator<Item = u32> {
-        (self.first..=self.last).step_by(CHECKPOINT_FREQUENCY as usize)
+        let freq = henyey_history::checkpoint_frequency();
+        (self.first..=self.last).step_by(freq as usize)
     }
 
     /// Returns the ledger range covered by this checkpoint range.
     ///
-    /// The first ledger is `first - 63` (the start of the first checkpoint)
+    /// The first ledger is the start of the first checkpoint
     /// and the last ledger is `last` (the end of the last checkpoint).
     pub fn ledger_range(&self) -> (u32, u32) {
-        let first_ledger = if self.first <= CHECKPOINT_FREQUENCY {
+        let freq = henyey_history::checkpoint_frequency();
+        let first_ledger = if self.first <= freq {
             1
         } else {
-            self.first - CHECKPOINT_FREQUENCY + 1
+            self.first - freq + 1
         };
         (first_ledger, self.last)
     }

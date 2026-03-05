@@ -103,7 +103,7 @@ const LEDGER_VALIDITY_BRACKET: u64 = 100;
 const GENESIS_LEDGER_SEQ: u64 = 1;
 
 /// Default checkpoint frequency (64 ledgers).
-const CHECKPOINT_FREQUENCY: u64 = 64;
+const DEFAULT_CHECKPOINT_FREQUENCY: u64 = 64;
 
 /// Result of receiving an SCP envelope.
 ///
@@ -176,6 +176,9 @@ pub struct HerderConfig {
 
     /// Maximum supported protocol version for upgrade validation.
     pub max_protocol_version: u32,
+
+    /// Checkpoint frequency in ledgers (default 64, 8 for accelerated testing).
+    pub checkpoint_frequency: u64,
 }
 
 const DEFAULT_MAX_EXTERNALIZED_SLOTS: usize = 12;
@@ -195,6 +198,7 @@ impl Default for HerderConfig {
             max_tx_set_size: 1000,
             proposed_upgrades: Vec::new(),
             max_protocol_version: 25,
+            checkpoint_frequency: DEFAULT_CHECKPOINT_FREQUENCY,
         }
     }
 }
@@ -453,7 +457,7 @@ impl Herder {
     /// - ledger 128..191 → checkpoint starts at 128
     pub fn get_most_recent_checkpoint_seq(&self) -> u64 {
         let tracking_consensus_index = self.tracking_slot().saturating_sub(1);
-        let freq = CHECKPOINT_FREQUENCY;
+        let freq = self.config.checkpoint_frequency;
         // checkpointContainingLedger: ((ledger / freq + 1) * freq) - 1
         let last = ((tracking_consensus_index / freq) + 1) * freq - 1;
         // sizeOfCheckpointContaining: first checkpoint is special (size freq-1), rest are freq
@@ -636,8 +640,8 @@ impl Herder {
             info!(purge_slot, "Out-of-sync recovery: purging slots below");
 
             // Calculate slot_to_keep (for checkpoint preservation, keep last checkpoint)
-            let checkpoint_frequency = 64u64;
-            let last_checkpoint = (lcl / checkpoint_frequency) * checkpoint_frequency;
+            let freq = self.config.checkpoint_frequency;
+            let last_checkpoint = (lcl / freq) * freq;
 
             self.fetching_envelopes
                 .erase_below(purge_slot, last_checkpoint);

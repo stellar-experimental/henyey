@@ -1257,7 +1257,7 @@ impl App {
                 (first_buffered, first_buffered.saturating_add(1))
             } else {
                 let required_first = Self::first_ledger_in_checkpoint(first_buffered)
-                    .saturating_add(CHECKPOINT_FREQUENCY);
+                    .saturating_add(checkpoint_frequency());
                 (required_first, required_first.saturating_add(1))
             };
 
@@ -1936,7 +1936,7 @@ impl App {
         }
 
         let gap = first_buffered.saturating_sub(current_ledger);
-        if gap >= CHECKPOINT_FREQUENCY {
+        if gap >= checkpoint_frequency() {
             // When the gap is large enough to span a checkpoint boundary, target
             // the latest checkpoint before first_buffered. This ensures we catch
             // up to a known-good checkpoint state from the archive rather than
@@ -1949,7 +1949,7 @@ impl App {
         let required_first = if Self::is_first_ledger_in_checkpoint(first_buffered) {
             first_buffered
         } else {
-            Self::first_ledger_in_checkpoint(first_buffered).saturating_add(CHECKPOINT_FREQUENCY)
+            Self::first_ledger_in_checkpoint(first_buffered).saturating_add(checkpoint_frequency())
         };
         let trigger = required_first.saturating_add(1);
         if last_buffered < trigger {

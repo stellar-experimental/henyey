@@ -3,9 +3,38 @@
 //! History archives use a hierarchical path structure with hex-encoded
 //! ledger sequences for sharding across directories.
 
+use std::sync::OnceLock;
+
 use henyey_common::Hash256;
 
-/// Checkpoint frequency in ledgers.
+/// Default checkpoint frequency (production networks).
+pub const DEFAULT_CHECKPOINT_FREQUENCY: u32 = 64;
+
+/// Accelerated checkpoint frequency (for `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING`).
+pub const ACCELERATED_CHECKPOINT_FREQUENCY: u32 = 8;
+
+/// Global checkpoint frequency, initialized once at startup.
+///
+/// Defaults to 64 for production networks. Set to 8 when
+/// `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING=true`.
+static CHECKPOINT_FREQ: OnceLock<u32> = OnceLock::new();
+
+/// Set the global checkpoint frequency. Must be called once at startup before
+/// any checkpoint math is performed. Subsequent calls are ignored (first write wins).
+pub fn set_checkpoint_frequency(freq: u32) {
+    let _ = CHECKPOINT_FREQ.set(freq);
+}
+
+/// Get the current checkpoint frequency.
+#[inline]
+pub fn checkpoint_frequency() -> u32 {
+    *CHECKPOINT_FREQ
+        .get()
+        .unwrap_or(&DEFAULT_CHECKPOINT_FREQUENCY)
+}
+
+/// Legacy constant alias for compatibility — use `checkpoint_frequency()` for
+/// runtime-configurable behavior.
 pub const CHECKPOINT_FREQUENCY: u32 = 64;
 
 /// Calculate the checkpoint ledger for a given sequence.
@@ -26,7 +55,8 @@ pub const CHECKPOINT_FREQUENCY: u32 = 64;
 /// ```
 #[inline]
 pub fn checkpoint_ledger(seq: u32) -> u32 {
-    (seq / CHECKPOINT_FREQUENCY) * CHECKPOINT_FREQUENCY + (CHECKPOINT_FREQUENCY - 1)
+    let freq = checkpoint_frequency();
+    (seq / freq) * freq + (freq - 1)
 }
 
 /// Check if a ledger sequence is a checkpoint ledger.
@@ -43,7 +73,7 @@ pub fn checkpoint_ledger(seq: u32) -> u32 {
 /// ```
 #[inline]
 pub fn is_checkpoint_ledger(seq: u32) -> bool {
-    (seq + 1) % CHECKPOINT_FREQUENCY == 0
+    (seq + 1) % checkpoint_frequency() == 0
 }
 
 /// Generate the path for a checkpoint file.

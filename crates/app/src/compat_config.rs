@@ -192,6 +192,11 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         config.diagnostics.tx_submission_diagnostics = v;
     }
 
+    // --- Testing ---
+    if let Some(v) = get_bool(table, "ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING") {
+        config.testing.accelerate_time = v;
+    }
+
     // --- Catchup ---
     if let Some(v) = get_bool(table, "CATCHUP_COMPLETE") {
         config.catchup.complete = v;
@@ -693,5 +698,7 @@ mod tests {
         // Should not error on unknown keys
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert_eq!(config.compat_http.port, 11626);
+        // ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING should now be parsed
+        assert!(config.testing.accelerate_time);
     }
 }

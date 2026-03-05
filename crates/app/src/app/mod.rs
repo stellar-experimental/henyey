@@ -71,9 +71,9 @@ use henyey_herder::{
     EnvelopeState, Herder, HerderCallback, HerderConfig, HerderStats, TxQueueConfig,
 };
 use henyey_history::{
-    checkpoint_containing, is_checkpoint_ledger, latest_checkpoint_before_or_at,
-    CatchupManager, CatchupMode, CatchupOutput, CheckpointData, ExistingBucketState,
-    HistoryArchive, HistoryArchiveState, GENESIS_LEDGER_SEQ, CHECKPOINT_FREQUENCY,
+    checkpoint_containing, checkpoint_frequency, is_checkpoint_ledger,
+    latest_checkpoint_before_or_at, CatchupManager, CatchupMode, CatchupOutput, CheckpointData,
+    ExistingBucketState, HistoryArchive, HistoryArchiveState, GENESIS_LEDGER_SEQ,
     build_history_archive_state,
 };
 use henyey_historywork::{
@@ -814,6 +814,18 @@ impl ScpQueueCallback for HerderScpCallback {
 impl App {
     /// Create a new application instance.
     pub async fn new(config: AppConfig) -> anyhow::Result<Self> {
+        // Apply testing overrides early, before any checkpoint math is used.
+        if config.testing.accelerate_time {
+            henyey_history::set_checkpoint_frequency(
+                henyey_history::ACCELERATED_CHECKPOINT_FREQUENCY,
+            );
+            tracing::info!(
+                checkpoint_frequency = henyey_history::ACCELERATED_CHECKPOINT_FREQUENCY,
+                ledger_close_time = 1,
+                "Accelerated time for testing enabled"
+            );
+        }
+
         tracing::info!(
             node_name = %config.node.name,
             network = %config.network.passphrase,
@@ -903,13 +915,16 @@ impl App {
         tracing::info!("Ledger manager initialized");
 
         // Create herder configuration
+        let freq = checkpoint_frequency();
         let herder_config = HerderConfig {
             max_pending_transactions: 1000,
             is_validator: config.node.is_validator,
-            ledger_close_time: 5,
+            ledger_close_time: config.testing.ledger_close_time.unwrap_or(
+                if config.testing.accelerate_time { 1 } else { 5 }
+            ),
             node_public_key: keypair.public_key(),
             network_id: config.network_id(),
-            max_externalized_slots: CHECKPOINT_FREQUENCY as usize * 2,
+            max_externalized_slots: freq as usize * 2,
             max_tx_set_size: 1000,
             pending_config: Default::default(),
             tx_queue_config: TxQueueConfig {
@@ -922,6 +937,7 @@ impl App {
             local_quorum_set,
             proposed_upgrades: config.upgrades.to_ledger_upgrades(),
             max_protocol_version: config.network.max_protocol_version,
+            checkpoint_frequency: freq as u64,
         };
 
         // Create herder (with or without secret key for signing)
@@ -1562,8 +1578,6 @@ impl App {
     ///
     /// * `count` - Maximum number of entries to delete per table
     pub fn perform_maintenance(&self, count: u32) {
-        use crate::maintainer::CHECKPOINT_FREQUENCY;
-
         let (ledger_seq, _, _, _) = self.ledger_info();
         let lcl = ledger_seq;
 
@@ -1574,7 +1588,7 @@ impl App {
 
         // Calculate the minimum ledger we need to keep
         let qmin = min_queued.unwrap_or(lcl).min(lcl);
-        let lmin = qmin.saturating_sub(CHECKPOINT_FREQUENCY);
+        let lmin = qmin.saturating_sub(checkpoint_frequency());
 
         tracing::info!(
             trim_below = lmin,
@@ -2355,7 +2369,7 @@ mod tests {
     #[test]
     fn test_buffered_catchup_target_large_gap() {
         let current = 100;
-        let first_buffered = current + CHECKPOINT_FREQUENCY + 5; // 169
+        let first_buffered = current + checkpoint_frequency() + 5; // 169
         let target = App::buffered_catchup_target(current, first_buffered, first_buffered);
         // Target should be capped at the latest checkpoint (127) to avoid replaying
         // individual ledgers which can cause bucket list hash mismatches.

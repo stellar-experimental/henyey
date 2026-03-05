@@ -12,7 +12,8 @@
 //! - Checkpoint 191 contains ledgers 128-191
 
 pub use crate::paths::{
-    bucket_path, checkpoint_ledger, checkpoint_path, is_checkpoint_ledger, CHECKPOINT_FREQUENCY,
+    bucket_path, checkpoint_frequency, checkpoint_ledger, checkpoint_path, is_checkpoint_ledger,
+    CHECKPOINT_FREQUENCY,
 };
 
 /// Alias for checkpoint_ledger to match naming convention.
@@ -38,7 +39,8 @@ pub use checkpoint_ledger as checkpoint_containing;
 /// assert_eq!(latest_checkpoint_before_or_at(128), Some(127));
 /// ```
 pub fn latest_checkpoint_before_or_at(seq: u32) -> Option<u32> {
-    if seq < CHECKPOINT_FREQUENCY - 1 {
+    let freq = checkpoint_frequency();
+    if seq < freq - 1 {
         return None;
     }
 
@@ -50,7 +52,7 @@ pub fn latest_checkpoint_before_or_at(seq: u32) -> Option<u32> {
         Some(seq)
     } else {
         // Otherwise return the previous checkpoint
-        Some(containing - CHECKPOINT_FREQUENCY)
+        Some(containing - freq)
     }
 }
 
@@ -74,7 +76,7 @@ pub fn next_checkpoint(seq: u32) -> u32 {
     if seq < containing {
         containing
     } else {
-        containing + CHECKPOINT_FREQUENCY
+        containing + checkpoint_frequency()
     }
 }
 
@@ -94,10 +96,11 @@ pub fn next_checkpoint(seq: u32) -> u32 {
 /// Spec: CATCHUP_SPEC §4.3 — `firstInCheckpointContaining(L) = checkpointContaining(L) - sizeOf(L) + 1`.
 /// For the first checkpoint (L < 64): 63 - 63 + 1 = 1.
 pub fn checkpoint_start(seq: u32) -> u32 {
-    if seq < CHECKPOINT_FREQUENCY {
+    let freq = checkpoint_frequency();
+    if seq < freq {
         1
     } else {
-        (seq / CHECKPOINT_FREQUENCY) * CHECKPOINT_FREQUENCY
+        (seq / freq) * freq
     }
 }
 
@@ -149,10 +152,11 @@ pub fn last_ledger_before_checkpoint_containing(seq: u32) -> Option<u32> {
 /// assert_eq!(size_of_checkpoint_containing(127), 64);
 /// ```
 pub fn size_of_checkpoint_containing(seq: u32) -> u32 {
-    if seq < CHECKPOINT_FREQUENCY {
-        CHECKPOINT_FREQUENCY - 1
+    let freq = checkpoint_frequency();
+    if seq < freq {
+        freq - 1
     } else {
-        CHECKPOINT_FREQUENCY
+        freq
     }
 }
 
@@ -169,11 +173,12 @@ pub fn checkpoint_range(checkpoint_ledger_seq: u32) -> (u32, u32) {
         "not a checkpoint ledger: {}",
         checkpoint_ledger_seq
     );
-    // Handle first checkpoint (63) — starts at ledger 1 per CATCHUP_SPEC §4.3
-    let start = if checkpoint_ledger_seq < CHECKPOINT_FREQUENCY {
+    let freq = checkpoint_frequency();
+    // Handle first checkpoint — starts at ledger 1 per CATCHUP_SPEC §4.3
+    let start = if checkpoint_ledger_seq < freq {
         1
     } else {
-        checkpoint_ledger_seq - CHECKPOINT_FREQUENCY + 1
+        checkpoint_ledger_seq - freq + 1
     };
     (start, checkpoint_ledger_seq)
 }
@@ -200,7 +205,7 @@ pub fn checkpoint_range(checkpoint_ledger_seq: u32) -> (u32, u32) {
 /// ```
 pub fn ledger_to_trigger_catchup(first_ledger_of_buffered_checkpoint: u32) -> u32 {
     assert_eq!(
-        first_ledger_of_buffered_checkpoint % CHECKPOINT_FREQUENCY,
+        first_ledger_of_buffered_checkpoint % checkpoint_frequency(),
         0,
         "not a checkpoint start: {}",
         first_ledger_of_buffered_checkpoint

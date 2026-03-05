@@ -452,6 +452,13 @@ async fn main() -> anyhow::Result<()> {
     // Load or create configuration
     let config = load_config(&cli)?;
 
+    // Apply testing overrides early (before any checkpoint math).
+    if config.testing.accelerate_time {
+        henyey_history::set_checkpoint_frequency(
+            henyey_history::ACCELERATED_CHECKPOINT_FREQUENCY,
+        );
+    }
+
     // Execute command
     match cli.command {
         Commands::Run {
@@ -1466,7 +1473,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
         build_history_archive_state, PublishConfig, PublishManager,
     };
     use henyey_history::verify;
-    use henyey_history::CHECKPOINT_FREQUENCY;
+    use henyey_history::checkpoint_frequency;
     use henyey_ledger::compute_header_hash;
     use henyey_ledger::TransactionSetVariant;
     use stellar_xdr::curr::TransactionHistoryEntryExt;
@@ -1632,7 +1639,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     for checkpoint in checkpoints_to_publish {
         print!("  Publishing checkpoint {}... ", checkpoint);
 
-        let start_ledger = checkpoint.saturating_sub(CHECKPOINT_FREQUENCY - 1);
+        let start_ledger = checkpoint.saturating_sub(checkpoint_frequency() - 1);
         let start_ledger = if start_ledger == 0 { 1 } else { start_ledger };
         let mut headers = Vec::new();
         let mut tx_entries = Vec::new();
@@ -2274,13 +2281,13 @@ async fn cmd_verify_execution(
         checkpoint::latest_checkpoint_before_or_at(current_ledger).unwrap_or(current_ledger)
     });
     let start_ledger = from.unwrap_or_else(|| {
-        let freq = henyey_history::CHECKPOINT_FREQUENCY;
+        let freq = henyey_history::checkpoint_frequency();
         checkpoint::checkpoint_containing(end_ledger)
             .saturating_sub(4 * freq)
             .max(freq)
     });
 
-    let freq = henyey_history::CHECKPOINT_FREQUENCY;
+    let freq = henyey_history::checkpoint_frequency();
     let init_checkpoint =
         checkpoint::latest_checkpoint_before_or_at(start_ledger.saturating_sub(1))
             .unwrap_or(freq - 1);
