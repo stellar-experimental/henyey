@@ -901,7 +901,7 @@ fn default_base_reserve() -> u32 {
 }
 
 fn default_protocol_version() -> u32 {
-    22
+    25
 }
 
 fn default_db_path() -> PathBuf {
