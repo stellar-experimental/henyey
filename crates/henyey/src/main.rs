@@ -397,14 +397,14 @@ enum Commands {
     #[command(name = "force-scp")]
     ForceScp,
 
-    /// Initialize a named history archive (stellar-core compatible, no-op)
+    /// Initialize a named history archive.
     ///
-    /// In stellar-core, this creates the directory structure for a local
-    /// history archive. Henyey accepts this command for compatibility
-    /// but history archive initialization is handled automatically.
+    /// Creates the `.well-known/stellar-history.json` metadata file in the
+    /// named archive using its configured put/mkdir commands. Required for
+    /// local filesystem archives before they can be used for publishing.
     #[command(name = "new-hist")]
     NewHist {
-        /// Name of the history archive to initialize
+        /// Name of the history archive to initialize (must match config)
         name: String,
     },
 
@@ -565,8 +565,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::NewHist { name } => {
-            tracing::info!("new-hist: accepted for compatibility (no-op for archive '{name}')");
-            Ok(())
+            cmd_new_hist(&config, &name).await
         }
 
         Commands::VerifyCheckpoints { output, from, to } => {
@@ -944,6 +943,60 @@ fn cmd_force_scp(config: &AppConfig) -> anyhow::Result<()> {
 
     tracing::info!("force-scp: flag set, SCP will bootstrap on next run");
     println!("force-scp flag set successfully");
+    Ok(())
+}
+
+/// Initialize a named history archive.
+///
+/// Creates the `.well-known/stellar-history.json` file in the archive using
+/// the archive's configured put/mkdir commands. This matches stellar-core's
+/// `new-hist` command for local filesystem archives.
+async fn cmd_new_hist(config: &AppConfig, name: &str) -> anyhow::Result<()> {
+    use henyey_history::{
+        ArchiveEntry, HistoryArchiveManager, RemoteArchive,
+        remote_archive::RemoteArchiveConfig,
+    };
+
+    // Find the named archive in config
+    let archive_config = config
+        .history
+        .archives
+        .iter()
+        .find(|a| a.name == name)
+        .ok_or_else(|| anyhow::anyhow!("Archive '{}' not found in configuration", name))?;
+
+    if !archive_config.put_enabled {
+        anyhow::bail!(
+            "Archive '{}' is not writable (no put command configured)",
+            name
+        );
+    }
+
+    // Build remote archive config
+    let remote_config = RemoteArchiveConfig {
+        name: name.to_string(),
+        get_cmd: if archive_config.get_enabled {
+            // The get command is not stored directly in HistoryArchiveEntry,
+            // but for local archives it's typically a cp command.
+            // For new-hist, we only need the put/mkdir commands.
+            None
+        } else {
+            None
+        },
+        put_cmd: archive_config.put.clone(),
+        mkdir_cmd: archive_config.mkdir.clone(),
+    };
+    let remote = RemoteArchive::new(remote_config);
+
+    // Build archive manager with this archive
+    let mut manager = HistoryArchiveManager::new(config.network.passphrase.clone());
+    manager.add_archive(ArchiveEntry::write_only(name.to_string(), remote));
+
+    // Initialize the archive
+    manager.initialize_history_archive(name).await
+        .map_err(|e| anyhow::anyhow!("Failed to initialize archive '{}': {}", name, e))?;
+
+    println!("History archive '{}' initialized successfully", name);
     Ok(())
 }
 
