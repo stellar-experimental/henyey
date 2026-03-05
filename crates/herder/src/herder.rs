@@ -1429,13 +1429,15 @@ impl Herder {
             .and_then(|manager| self.build_starting_seq_map(manager));
 
         // Create transaction set from queue using the current ledger limit when available.
+        // Must use generalized format (protocol >= 20) so the hash matches what peers
+        // expect when they request the TxSet by hash from SCP StellarValue.
         let max_txs = self
             .ledger_manager
             .read()
             .as_ref()
             .map(|manager| manager.current_header().max_tx_set_size as usize)
             .unwrap_or(self.config.max_tx_set_size);
-        let tx_set = self.tx_queue.get_transaction_set_with_starting_seq(
+        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set_with_starting_seq(
             previous_hash,
             max_txs,
             starting_seq.as_ref(),

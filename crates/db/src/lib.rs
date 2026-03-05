@@ -439,14 +439,16 @@ impl Database {
     // History Publishing Queue
     // =========================================================================
 
-    /// Adds a checkpoint ledger to the publish queue.
+    /// Adds a checkpoint ledger to the publish queue with its HAS JSON.
     ///
     /// Checkpoint ledgers (every 64 ledgers) need to be published to history
     /// archives. This queue tracks which checkpoints are pending publication.
-    pub fn enqueue_publish(&self, ledger_seq: u32) -> Result<()> {
+    /// The HAS JSON is captured at checkpoint time to preserve the exact
+    /// bucket list state (including hot archive hashes) for publishing.
+    pub fn enqueue_publish(&self, ledger_seq: u32, has_json: &str) -> Result<()> {
         self.with_connection(|conn| {
             use queries::PublishQueueQueries;
-            conn.enqueue_publish(ledger_seq)
+            conn.enqueue_publish(ledger_seq, has_json)
         })
     }
 
@@ -479,6 +481,17 @@ impl Database {
         self.with_connection(|conn| {
             use queries::PublishQueueQueries;
             conn.load_publish_queue(limit)
+        })
+    }
+
+    /// Loads the HAS JSON for a specific queued checkpoint.
+    ///
+    /// Returns the History Archive State JSON that was stored at enqueue
+    /// time, or `None` if the checkpoint is not in the queue.
+    pub fn load_publish_has(&self, ledger_seq: u32) -> Result<Option<String>> {
+        self.with_connection(|conn| {
+            use queries::PublishQueueQueries;
+            conn.load_publish_has(ledger_seq)
         })
     }
 

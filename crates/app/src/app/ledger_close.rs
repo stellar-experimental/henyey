@@ -148,7 +148,7 @@ impl App {
                 let levels = self.ledger_manager.bucket_list_levels();
                 conn.store_bucket_list(header.ledger_seq, &levels)?;
                 if self.is_validator {
-                    conn.enqueue_publish(header.ledger_seq)?;
+                    conn.enqueue_publish(header.ledger_seq, &has_json)?;
                 }
             }
             for index in 0..tx_count {

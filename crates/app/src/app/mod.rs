@@ -1303,11 +1303,32 @@ impl App {
             ext: LedgerEntryExt::V0,
         };
 
+        let bucket_dir = self.config.database.path
+            .parent()
+            .unwrap_or(&self.config.database.path)
+            .join("buckets");
+        std::fs::create_dir_all(&bucket_dir)?;
+
         let mut bucket_list = BucketList::new();
+        bucket_list.set_bucket_dir(bucket_dir.clone());
         bucket_list.add_batch(
             1, 0, BucketListType::Live,
             vec![root_entry], vec![], vec![],
         ).map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
+
+        // Persist all non-empty buckets to disk so they're available for
+        // history publishing and restart recovery.
+        for level in bucket_list.levels() {
+            for bucket in [&level.curr, &level.snap] {
+                if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
+                    let path = bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
+                    if !path.exists() {
+                        bucket.save_to_xdr_file(&path)
+                            .map_err(|e| anyhow::anyhow!("Failed to save genesis bucket: {}", e))?;
+                    }
+                }
+            }
+        }
 
         // Verify hash matches
         let computed_hash = bucket_list.hash();
@@ -1537,11 +1558,17 @@ impl App {
         self.herder.stats().pending_transactions
     }
 
-    pub fn submit_transaction(
+    pub async fn submit_transaction(
         &self,
         tx: TransactionEnvelope,
     ) -> henyey_herder::TxQueueResult {
-        self.herder.receive_transaction(tx)
+        let result = self.herder.receive_transaction(tx.clone());
+        // Flood the transaction to peers so validators can include it.
+        // Without this, transactions submitted via HTTP /tx stay local.
+        if matches!(result, henyey_herder::TxQueueResult::Added) {
+            self.enqueue_tx_advert(&tx).await;
+        }
+        result
     }
 
     pub fn herder_stats(&self) -> HerderStats {

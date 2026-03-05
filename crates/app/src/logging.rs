@@ -335,6 +335,7 @@ pub fn init_with_handle(config: &LogConfig) -> anyhow::Result<LogLevelHandle> {
     match config.format {
         LogFormat::Text => {
             let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
                 .with_ansi(config.ansi_colors)
                 .with_target(true)
                 .with_thread_ids(config.with_thread_ids)
@@ -352,6 +353,7 @@ pub fn init_with_handle(config: &LogConfig) -> anyhow::Result<LogLevelHandle> {
         }
         LogFormat::Json => {
             let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
                 .json()
                 .with_span_list(true)
                 .with_current_span(true);

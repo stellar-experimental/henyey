@@ -205,6 +205,12 @@ impl PublishManager {
     /// - Transaction results for each ledger
     /// - Bucket files referenced by the bucket list
     /// - History Archive State (HAS) file
+    ///
+    /// If `prebuilt_has` is provided, it is used as the checkpoint HAS
+    /// instead of rebuilding from the bucket list. This is important for
+    /// protocol >= 23 where the HAS must include hot archive bucket hashes
+    /// that are only available at checkpoint close time.
+    ///
     pub async fn publish_checkpoint(
         &self,
         checkpoint_ledger: u32,
@@ -212,6 +218,7 @@ impl PublishManager {
         tx_entries: &[TransactionHistoryEntry],
         tx_results: &[TransactionHistoryResultEntry],
         bucket_list: &BucketList,
+        prebuilt_has: Option<&HistoryArchiveState>,
     ) -> Result<PublishState> {
         if !is_checkpoint_ledger(checkpoint_ledger) {
             return Err(HistoryError::NotCheckpointLedger(checkpoint_ledger));
@@ -241,6 +248,19 @@ impl PublishManager {
                     header.ledger_seq
                 ))
             })?;
+
+            // Skip tx set and result verification for ledger 1 (genesis).
+            // The genesis header uses all-zero sentinel hashes for both
+            // scp_value.tx_set_hash and tx_set_result_hash since no
+            // transactions are applied at genesis.  The stored empty
+            // TransactionSet hashes to a non-zero value, so verification
+            // would always fail.  stellar-core handles this implicitly
+            // because the genesis ledger is never published through the
+            // normal publish path.
+            if header.ledger_seq == 1 {
+                continue;
+            }
+
             let tx_set = match &entry.ext {
                 TransactionHistoryEntryExt::V0 => {
                     TransactionSetVariant::Classic(entry.tx_set.clone())
@@ -308,7 +328,10 @@ impl PublishManager {
         }
 
         // Write History Archive State
-        let has = self.create_has(checkpoint_ledger, headers, bucket_list)?;
+        let has = match prebuilt_has {
+            Some(h) => h.clone(),
+            None => self.create_has(checkpoint_ledger, headers, bucket_list)?,
+        };
 
         // Validate that all bucket hashes in the HAS are known (pre-publish check)
         let known_hashes: std::collections::HashSet<Hash256> =
@@ -373,6 +396,10 @@ impl PublishManager {
     }
 
     /// Write a slice of XDR-encodable items to a gzipped file.
+    ///
+    /// Uses RFC 5531 record-marked format: each XDR item is prefixed with a
+    /// 4-byte big-endian length with the high bit set ("last fragment" flag).
+    /// This matches stellar-core's `XDROutputFileStream::writeOne`.
     fn write_xdr_gz<T: WriteXdr>(
         &self,
         path: &Path,
@@ -390,6 +417,9 @@ impl PublishManager {
             let xdr = item
                 .to_xdr(stellar_xdr::curr::Limits::none())
                 .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
+            // Write record mark: length with high bit set (last fragment)
+            let marked_len = (xdr.len() as u32) | 0x8000_0000;
+            encoder.write_all(&marked_len.to_be_bytes())?;
             encoder.write_all(&xdr)?;
         }
 
@@ -398,7 +428,12 @@ impl PublishManager {
         Ok(())
     }
 
-    /// Write a bucket from a Bucket struct by serializing its entries.
+    /// Write a bucket to the history archive as a gzip-compressed file.
+    ///
+    /// If the bucket has a backing file on disk (`.bucket.xdr`), we gzip-compress
+    /// it directly — this preserves the exact record-marked format and avoids
+    /// re-serialization. For in-memory-only buckets, we serialize entries with
+    /// RFC 5531 record marks.
     fn write_bucket_from_entries(
         &self,
         path: &Path,
@@ -406,30 +441,51 @@ impl PublishManager {
     ) -> Result<()> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
-        use std::io::Write;
+        use std::io::{Read, Write};
 
-        // Skip if already exists
-        let gz_path = path.with_extension("xdr.gz");
-        if gz_path.exists() {
-            debug!("Bucket already exists: {:?}", gz_path);
+        // The path already includes the full filename with .xdr.gz extension
+        // (from paths::bucket_path).
+        if path.exists() {
+            debug!("Bucket already exists: {:?}", path);
             return Ok(());
         }
 
-        let file = std::fs::File::create(&gz_path)?;
+        // Ensure parent directories exist (bucket paths are 3 levels deep:
+        // bucket/xx/yy/zz/bucket-{hash}.xdr.gz)
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let file = std::fs::File::create(path)?;
         let mut encoder = GzEncoder::new(file, Compression::default());
 
-        // Serialize each bucket entry to XDR
-        // Note: use iter() instead of entries() to support disk-backed buckets
-        for entry in bucket.iter() {
-            let xdr_entry = entry.to_xdr_entry();
-            let xdr = xdr_entry
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-            encoder.write_all(&xdr)?;
+        if let Some(backing_path) = bucket.backing_file_path() {
+            // Fast path: gzip-compress the existing .bucket.xdr file directly.
+            // This preserves the exact record-marked format.
+            let mut src = std::fs::File::open(backing_path)?;
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = src.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                encoder.write_all(&buf[..n])?;
+            }
+        } else {
+            // Fallback: serialize entries with RFC 5531 record marks
+            for entry in bucket.iter() {
+                let xdr_entry = entry.to_xdr_entry();
+                let xdr = xdr_entry
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
+                let marked_len = (xdr.len() as u32) | 0x8000_0000;
+                encoder.write_all(&marked_len.to_be_bytes())?;
+                encoder.write_all(&xdr)?;
+            }
         }
 
         encoder.finish()?;
-        debug!("Wrote bucket to {:?}", gz_path);
+        debug!("Wrote bucket to {:?}", path);
         Ok(())
     }
 

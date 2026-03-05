@@ -20,7 +20,12 @@ pub trait PublishQueueQueries {
     /// Adds a checkpoint ledger to the publish queue.
     ///
     /// This is a no-op if the ledger is already in the queue.
-    fn enqueue_publish(&self, ledger_seq: u32) -> Result<(), DbError>;
+    /// The `has_json` parameter stores the History Archive State JSON
+    /// captured at checkpoint time, ensuring the publish path uses the
+    /// exact HAS (including hot archive bucket hashes) from the
+    /// checkpoint ledger rather than rebuilding it later when the state
+    /// may have advanced.
+    fn enqueue_publish(&self, ledger_seq: u32, has_json: &str) -> Result<(), DbError>;
 
     /// Removes a checkpoint ledger from the publish queue.
     ///
@@ -40,13 +45,19 @@ pub trait PublishQueueQueries {
     ///
     /// Optionally limited to a maximum count.
     fn load_publish_queue(&self, limit: Option<usize>) -> Result<Vec<u32>, DbError>;
+
+    /// Loads the HAS JSON for a specific queued checkpoint.
+    ///
+    /// Returns the History Archive State JSON that was stored at enqueue
+    /// time, or `None` if the checkpoint is not in the queue.
+    fn load_publish_has(&self, ledger_seq: u32) -> Result<Option<String>, DbError>;
 }
 
 impl PublishQueueQueries for Connection {
-    fn enqueue_publish(&self, ledger_seq: u32) -> Result<(), DbError> {
+    fn enqueue_publish(&self, ledger_seq: u32, has_json: &str) -> Result<(), DbError> {
         self.execute(
-            "INSERT OR IGNORE INTO publishqueue (ledgerseq, state) VALUES (?1, 'pending')",
-            params![ledger_seq as i64],
+            "INSERT OR IGNORE INTO publishqueue (ledgerseq, state) VALUES (?1, ?2)",
+            params![ledger_seq as i64, has_json],
         )?;
         Ok(())
     }
@@ -81,5 +92,16 @@ impl PublishQueueQueries for Connection {
         };
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DbError::from)
+    }
+
+    fn load_publish_has(&self, ledger_seq: u32) -> Result<Option<String>, DbError> {
+        use rusqlite::OptionalExtension;
+        self.query_row(
+            "SELECT state FROM publishqueue WHERE ledgerseq = ?1",
+            params![ledger_seq as i64],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)
     }
 }

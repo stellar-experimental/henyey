@@ -754,17 +754,14 @@ async fn cmd_new_db(
 
     let db_path = &config.database.path;
 
-    // Check if database already exists
+    // Check if database already exists.
+    // Always overwrite — stellar-core silently replaces the database,
+    // and captive core (Go SDK) expects this behavior.
     if db_path.exists() {
-        if force {
-            tracing::warn!(path = ?db_path, "Removing existing database");
-            std::fs::remove_file(db_path)?;
-        } else {
-            anyhow::bail!(
-                "Database already exists at {:?}. Use --force to overwrite.",
-                db_path
-            );
+        if !force {
+            tracing::info!(path = ?db_path, "Overwriting existing database");
         }
+        std::fs::remove_file(db_path)?;
     }
 
     tracing::info!(path = ?db_path, "Creating new database");
@@ -1779,7 +1776,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             };
             let manager = PublishManager::new(publish_config);
             manager
-                .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list)
+                .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list, None)
                 .await?;
 
             let has = build_history_archive_state(
@@ -1808,7 +1805,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
                 continue;
             }
             manager
-                .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list)
+                .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list, None)
                 .await?;
             write_scp_history_file(path, checkpoint, &scp_entries)?;
             let has = build_history_archive_state(

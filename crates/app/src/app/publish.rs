@@ -73,7 +73,7 @@ impl App {
     ) -> anyhow::Result<()> {
         use henyey_bucket::{BucketList, BucketManager};
         use henyey_history::paths::root_has_path;
-        use henyey_history::publish::{build_history_archive_state, PublishConfig, PublishManager};
+        use henyey_history::publish::{PublishConfig, PublishManager};
 
         let freq = checkpoint_frequency();
 
@@ -137,14 +137,14 @@ impl App {
             level.set_snap((*snap_bucket).clone());
         }
 
-        // Build HAS
-        let has = build_history_archive_state(
-            checkpoint,
-            &bucket_list,
-            None,
-            Some(self.config.network.passphrase.clone()),
-        )?;
-        let has_json = has.to_json()?;
+        // Load the HAS that was captured at checkpoint close time.
+        // This includes hot archive bucket hashes (protocol >= 23) which
+        // are only available at close time, not at publish time.
+        let has_json = self
+            .db
+            .load_publish_has(checkpoint)?
+            .ok_or_else(|| anyhow::anyhow!("Missing HAS for checkpoint {}", checkpoint))?;
+        let has: henyey_history::HistoryArchiveState = serde_json::from_str(&has_json)?;
 
         // Build checkpoint files in a temp directory
         let publish_dir = std::env::temp_dir().join(format!(
@@ -163,8 +163,57 @@ impl App {
         };
         let manager = PublishManager::new(publish_config);
         manager
-            .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list)
+            .publish_checkpoint(checkpoint, &headers, &tx_entries, &tx_results, &bucket_list, Some(&has))
             .await?;
+
+        // Write hot archive bucket files if the HAS includes them.
+        // These are written separately because publish_checkpoint only
+        // handles live bucket files (from the BucketList). Hot archive
+        // bucket files were persisted to disk during ledger close.
+        if let Some(ref hot_buckets) = has.hot_archive_buckets {
+            use henyey_history::paths::bucket_path as archive_bucket_path;
+            let bucket_dir = bucket_manager.bucket_dir();
+            for level in hot_buckets {
+                for hex_hash in [&level.curr, &level.snap] {
+                    let hash = henyey_common::Hash256::from_hex(hex_hash)
+                        .map_err(|e| anyhow::anyhow!("Invalid hot archive bucket hash: {}", e))?;
+                    if hash.is_zero() {
+                        continue;
+                    }
+                    let dest = publish_dir.join(archive_bucket_path(&hash));
+                    if dest.exists() {
+                        continue;
+                    }
+                    if let Some(parent) = dest.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    // Find the backing file on disk
+                    let src = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                    if src.exists() {
+                        use flate2::write::GzEncoder;
+                        use flate2::Compression;
+                        use std::io::{Read, Write};
+                        let file = std::fs::File::create(&dest)?;
+                        let mut encoder = GzEncoder::new(file, Compression::default());
+                        let mut src_file = std::fs::File::open(&src)?;
+                        let mut buf = [0u8; 64 * 1024];
+                        loop {
+                            let n = src_file.read(&mut buf)?;
+                            if n == 0 { break; }
+                            encoder.write_all(&buf[..n])?;
+                        }
+                        encoder.finish()?;
+                        tracing::debug!(hash = %hash.to_hex(), "Published hot archive bucket");
+                    } else {
+                        tracing::warn!(
+                            hash = %hash.to_hex(),
+                            path = %src.display(),
+                            "Hot archive bucket file not found on disk, skipping"
+                        );
+                    }
+                }
+            }
+        }
 
         // Write SCP history
         write_scp_history_file(&publish_dir, checkpoint, &scp_entries)?;
@@ -284,6 +333,9 @@ fn write_scp_history_file(
 
     for entry in entries {
         let xdr = entry.to_xdr(Limits::none())?;
+        // Write record mark: length with high bit set (RFC 5531 last fragment)
+        let marked_len = (xdr.len() as u32) | 0x8000_0000;
+        encoder.write_all(&marked_len.to_be_bytes())?;
         encoder.write_all(&xdr)?;
     }
     encoder.finish()?;
