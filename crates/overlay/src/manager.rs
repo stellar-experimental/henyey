@@ -271,6 +271,42 @@ fn is_fetch_message(message: &StellarMessage) -> bool {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeersValidation {
+    NotPeers,
+    AcceptFirst,
+    RejectWrongDirection,
+    RejectDuplicate,
+}
+
+fn validate_incoming_peers(
+    direction: ConnectionDirection,
+    received_peers: bool,
+    message: &StellarMessage,
+) -> PeersValidation {
+    if !matches!(message, StellarMessage::Peers(_)) {
+        return PeersValidation::NotPeers;
+    }
+
+    if direction == ConnectionDirection::Inbound {
+        return PeersValidation::RejectWrongDirection;
+    }
+
+    if received_peers {
+        return PeersValidation::RejectDuplicate;
+    }
+
+    PeersValidation::AcceptFirst
+}
+
+fn should_skip_generic_routing(message: &StellarMessage) -> bool {
+    helpers::is_handshake_message(message)
+        || matches!(
+            message,
+            StellarMessage::SendMore(_) | StellarMessage::SendMoreExtended(_)
+        )
+}
+
 /// A message received from a connected peer via the overlay network.
 ///
 /// These messages are delivered to subscribers of the overlay manager's
@@ -1258,24 +1294,28 @@ impl OverlayManager {
                             //   responder (Inbound direction) and receive PEERS from
                             //   the initiator, drop the connection.
                             // - At most one PEERS message per connection.
-                            if matches!(message, StellarMessage::Peers(_)) {
-                                if peer.direction() == ConnectionDirection::Inbound {
+                            match validate_incoming_peers(peer.direction(), received_peers, &message)
+                            {
+                                PeersValidation::NotPeers => {}
+                                PeersValidation::AcceptFirst => {
+                                    received_peers = true;
+                                    // PEERS messages are validated here and forwarded
+                                    // to app-layer discovery via the generic channel.
+                                }
+                                PeersValidation::RejectWrongDirection => {
                                     warn!(
                                         "Peer {} sent PEERS but we are the responder — dropping (OVERLAY_SPEC §7.2)",
                                         peer_id
                                     );
                                     break;
                                 }
-                                if received_peers {
+                                PeersValidation::RejectDuplicate => {
                                     warn!(
                                         "Peer {} sent duplicate PEERS — dropping (OVERLAY_SPEC §7.2)",
                                         peer_id
                                     );
                                     break;
                                 }
-                                received_peers = true;
-                                // PEERS messages are consumed here for peer discovery.
-                                // TODO: store peer addresses from the PEERS payload
                             }
 
                             'route: {
@@ -1284,16 +1324,8 @@ impl OverlayManager {
                                     break 'route;
                                 }
 
-                                // PEERS messages are consumed above, not routed
-                                if matches!(message, StellarMessage::Peers(_)) {
-                                    break 'route;
-                                }
-
-                                // Flow control messages are handled above, not routed
-                                if matches!(message,
-                                    StellarMessage::SendMore(_)
-                                    | StellarMessage::SendMoreExtended(_)
-                                ) {
+                                // Handshake and flow-control messages are handled locally, not routed.
+                                if should_skip_generic_routing(&message) {
                                     break 'route;
                                 }
 
@@ -2952,6 +2984,49 @@ mod tests {
             !is_ping_response(None, &ping_hash_val.0),
             "No outstanding ping should never match"
         );
+    }
+
+    #[test]
+    fn test_validate_incoming_peers_rules() {
+        let peers_msg = StellarMessage::Peers(stellar_xdr::curr::VecM::default());
+        let tx_msg = StellarMessage::GetScpState(0);
+
+        assert_eq!(
+            validate_incoming_peers(ConnectionDirection::Outbound, false, &peers_msg),
+            PeersValidation::AcceptFirst
+        );
+        assert_eq!(
+            validate_incoming_peers(ConnectionDirection::Outbound, true, &peers_msg),
+            PeersValidation::RejectDuplicate
+        );
+        assert_eq!(
+            validate_incoming_peers(ConnectionDirection::Inbound, false, &peers_msg),
+            PeersValidation::RejectWrongDirection
+        );
+        assert_eq!(
+            validate_incoming_peers(ConnectionDirection::Outbound, false, &tx_msg),
+            PeersValidation::NotPeers
+        );
+    }
+
+    #[test]
+    fn test_should_skip_generic_routing() {
+        assert!(should_skip_generic_routing(&StellarMessage::Hello(Default::default())));
+        assert!(should_skip_generic_routing(&StellarMessage::Auth(stellar_xdr::curr::Auth {
+            flags: 200,
+        })));
+        assert!(should_skip_generic_routing(&StellarMessage::SendMore(
+            stellar_xdr::curr::SendMore { num_messages: 1 }
+        )));
+        assert!(should_skip_generic_routing(&StellarMessage::SendMoreExtended(
+            stellar_xdr::curr::SendMoreExtended {
+                num_messages: 1,
+                num_bytes: 1,
+            }
+        )));
+        assert!(!should_skip_generic_routing(&StellarMessage::Peers(
+            stellar_xdr::curr::VecM::default()
+        )));
     }
 
     // ---- G8 tests: maybe_drop_random_peer ----
