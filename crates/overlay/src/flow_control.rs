@@ -1167,6 +1167,21 @@ mod tests {
     }
 
     #[test]
+    fn test_no_outbound_capacity_timeout_clears_after_send_more_extended() {
+        let fc = FlowControl::with_defaults();
+
+        assert!(fc.no_outbound_capacity_timeout(0));
+
+        let send_more = StellarMessage::SendMoreExtended(SendMoreExtended {
+            num_messages: 1,
+            num_bytes: 1,
+        });
+        fc.maybe_release_capacity(&send_more);
+
+        assert!(!fc.no_outbound_capacity_timeout(0));
+    }
+
+    #[test]
     fn test_begin_end_message_processing() {
         let fc = FlowControl::with_defaults();
         let tx = make_tx_message();
