@@ -34,72 +34,51 @@ pub(crate) struct QueryState {
 }
 
 /// Parsed form-encoded query request (supports repeated `key=` params).
+#[derive(Debug)]
 struct FormQueryParams {
     keys: Vec<String>,
     ledger_seq: Option<u32>,
 }
 
-/// Parse `key=<b64>&key=<b64>&ledgerSeq=N` from a URL-encoded form body.
+/// Parse `key=<b64>&key=<b64>&ledgerSeq=N` from a form body.
 ///
-/// stellar-core's QueryServer accepts `application/x-www-form-urlencoded`
-/// POST bodies with repeated `key` parameters and an optional `ledgerSeq`.
+/// This mirrors stellar-core's query parser behavior:
+/// - repeated `key=` fields are accepted
+/// - `ledgerSeq` must appear at most once and parse as `u32`
+/// - no URL percent-decoding is performed
 fn parse_form_query_params(body: &[u8]) -> Result<FormQueryParams, String> {
     let body_str = std::str::from_utf8(body).map_err(|e| format!("Invalid UTF-8 body: {}", e))?;
     let mut keys = Vec::new();
-    let mut ledger_seq = None;
+    let mut ledger_seq_values = Vec::new();
 
     for pair in body_str.split('&') {
         if pair.is_empty() {
             continue;
         }
         if let Some((k, v)) = pair.split_once('=') {
-            let key = url_decode(k);
-            let value = url_decode(v);
-            match key.as_str() {
-                "key" => keys.push(value),
-                "ledgerSeq" => {
-                    ledger_seq = value
-                        .parse::<u32>()
-                        .ok()
-                        .filter(|&seq| seq >= 2);
-                }
+            if v.is_empty() {
+                continue;
+            }
+
+            match k {
+                "key" => keys.push(v.to_string()),
+                "ledgerSeq" => ledger_seq_values.push(v),
                 _ => {} // ignore unknown params
             }
         }
     }
 
+    let ledger_seq = match ledger_seq_values.as_slice() {
+        [] => None,
+        [value] => Some(
+            value
+                .parse::<u32>()
+                .map_err(|_| "Failed to parse 'ledgerSeq' argument".to_string())?,
+        ),
+        _ => return Err("Expected exactly one 'ledgerSeq' argument".to_string()),
+    };
+
     Ok(FormQueryParams { keys, ledger_seq })
-}
-
-/// Minimal URL percent-decoding (handles `%XX` and `+` as space).
-fn url_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        match b {
-            b'+' => result.push(' '),
-            b'%' => {
-                let hi = chars.next().and_then(hex_digit);
-                let lo = chars.next().and_then(hex_digit);
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    result.push((h << 4 | l) as char);
-                } else {
-                    result.push('%');
-                }
-            }
-            _ => result.push(b as char),
-        }
-    }
-    result
-}
-
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
 }
 
 /// POST /getledgerentryraw
@@ -514,5 +493,36 @@ fn load_from_hot_archive(
         bl.load_keys_from_ledger(keys, ledger_seq).unwrap_or_default()
     } else {
         bl.load_keys(keys)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_form_query_params;
+
+    #[test]
+    fn test_parse_form_query_params_accepts_repeated_key_values() {
+        let params = parse_form_query_params(b"key=AAA=&key=BBB=&ledgerSeq=123").unwrap();
+        assert_eq!(params.keys, vec!["AAA=", "BBB="]);
+        assert_eq!(params.ledger_seq, Some(123));
+    }
+
+    #[test]
+    fn test_parse_form_query_params_preserves_plus_signs() {
+        let params = parse_form_query_params(b"key=Zm9vK2Jhcg==&key=abc+def").unwrap();
+        assert_eq!(params.keys, vec!["Zm9vK2Jhcg==", "abc+def"]);
+        assert_eq!(params.ledger_seq, None);
+    }
+
+    #[test]
+    fn test_parse_form_query_params_rejects_invalid_ledger_seq() {
+        let err = parse_form_query_params(b"key=AAA=&ledgerSeq=bad").unwrap_err();
+        assert_eq!(err, "Failed to parse 'ledgerSeq' argument");
+    }
+
+    #[test]
+    fn test_parse_form_query_params_rejects_duplicate_ledger_seq() {
+        let err = parse_form_query_params(b"key=AAA=&ledgerSeq=10&ledgerSeq=11").unwrap_err();
+        assert_eq!(err, "Expected exactly one 'ledgerSeq' argument");
     }
 }
