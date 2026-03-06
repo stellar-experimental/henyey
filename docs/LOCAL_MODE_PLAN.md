@@ -66,13 +66,13 @@ The quickstart `--limits default` flag skips the Soroban config upgrade entirely
 
 ## Implementation Order
 
-| Phase | Gap | Description | Effort |
-|-------|-----|-------------|--------|
-| 1 | Gap 1 | Genesis ledger in `new-db` | Medium |
-| 2 | Gap 2 | Real `force-scp` implementation | Small-Medium |
-| 3 | Gap 3 | Real `new-hist` implementation | Small |
-| 4 | Gap 4 | `/upgrades?mode=set` HTTP endpoint | Medium |
-| 5 | Gap 5 | `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING` | Small |
-| 6 | Gap 6 | Automatic history publishing in `run` | Medium |
+| Phase | Gap | Description | Effort | Status |
+|-------|-----|-------------|--------|--------|
+| 1 | Gap 1 | Genesis ledger in `new-db` | Medium | **Done** |
+| 2 | Gap 2 | Real `force-scp` implementation | Small-Medium | **Done** |
+| 3 | Gap 3 | Real `new-hist` implementation | Small | **Done** |
+| 4 | Gap 4 | `/upgrades?mode=set` HTTP endpoint | Medium | **Done** |
+| 5 | Gap 5 | `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING` | Small | **Done** |
+| 6 | Gap 6 | Automatic history publishing in `run` | Medium | **Done** |
 
-Phases 1-3 are the minimum to get a solo node producing ledgers from genesis. Phase 4 enables protocol upgrade. Phase 6 enables captive core catchup from the local archive. All 6 are needed for full quickstart local mode support.
+All phases complete. The quickstart `--local` mode is fully operational with henyey replacing stellar-core. Verified end-to-end: validator closes ledgers at 1/sec, checkpoints publish to local archive, captive core catches up, RPC and Horizon serve requests, Friendbot creates accounts, and transactions submitted via RPC are included in ledgers.
