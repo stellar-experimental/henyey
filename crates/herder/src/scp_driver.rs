@@ -3139,6 +3139,10 @@ mod tests {
 mod compare_tx_sets_tests {
     use super::*;
     use crate::tx_queue::TransactionSet;
+    use stellar_xdr::curr::{
+        GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase, TransactionSetV1,
+        TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+    };
 
     fn make_config() -> ScpDriverConfig {
         ScpDriverConfig::default()
@@ -3192,6 +3196,33 @@ mod compare_tx_sets_tests {
         let hash = tx_set.hash;
         driver.cache_tx_set(tx_set);
         hash
+    }
+
+    fn make_generalized_tx_set(
+        tx: stellar_xdr::curr::TransactionEnvelope,
+        base_fee: i64,
+    ) -> TransactionSet {
+        let component =
+            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
+                txs: vec![tx.clone()].try_into().unwrap(),
+                base_fee: Some(base_fee),
+            });
+
+        let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![
+                TransactionPhase::V0(vec![component].try_into().unwrap()),
+                TransactionPhase::V1(ParallelTxsComponent {
+                    base_fee: Some(base_fee),
+                    execution_stages: vec![].try_into().unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+
+        let hash = Hash256::hash_xdr(&gen).unwrap();
+        TransactionSet::with_generalized(Hash256::ZERO, hash, vec![tx], gen)
     }
 
     // =========================================================================
@@ -3250,6 +3281,32 @@ mod compare_tx_sets_tests {
         // A has higher fee → A > B
         let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
         assert_eq!(result, std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_compare_tx_sets_inclusion_fee_precedes_full_fee() {
+        let driver = make_driver();
+        let candidates_hash = [0u8; 32];
+
+        // Both sets have equal ops (1), but different inclusion/full-fee order:
+        // - A: full fee 1000, base_fee 100 -> inclusion fee 100
+        // - B: full fee 400,  base_fee 400 -> inclusion fee 400
+        // Criterion 2 (inclusion fee) must win over criterion 3 (full fee), so B > A.
+        let tx_a = make_tx(20, 1_000, 1);
+        let tx_b = make_tx(21, 400, 1);
+
+        let tx_set_a = make_generalized_tx_set(tx_a, 100);
+        let tx_set_b = make_generalized_tx_set(tx_b, 400);
+
+        let hash_a = cache_tx_set(&driver, tx_set_a);
+        let hash_b = cache_tx_set(&driver, tx_set_b);
+
+        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        assert_eq!(
+            result,
+            std::cmp::Ordering::Less,
+            "higher inclusion fees must outrank higher full fees"
+        );
     }
 
     #[test]
