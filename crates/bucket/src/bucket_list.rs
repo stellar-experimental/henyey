@@ -1082,8 +1082,51 @@ fn perform_merge(
                     Bucket::from_xdr_file_disk_backed(&permanent_path)
                 }
             } else {
-                let _ = std::fs::remove_file(&temp_path);
-                Bucket::from_xdr_file_disk_backed(&permanent_path)
+                // Permanent file already exists. Validate it before reuse: a prior
+                // partial write can leave a zero-byte/truncated file at this path.
+                match Bucket::from_xdr_file_disk_backed(&permanent_path) {
+                    Ok(existing) if existing.hash() == hash => {
+                        let _ = std::fs::remove_file(&temp_path);
+                        Ok(existing)
+                    }
+                    Ok(existing) => {
+                        tracing::warn!(
+                            expected_hash = %hash.to_hex(),
+                            actual_hash = %existing.hash().to_hex(),
+                            path = %permanent_path.display(),
+                            "perform_merge: permanent bucket file has wrong hash, replacing"
+                        );
+                        if let Err(rename_err) = durable_rename(&temp_path, &permanent_path) {
+                            tracing::warn!(
+                                error = %rename_err,
+                                temp = %temp_path.display(),
+                                dest = %permanent_path.display(),
+                                "perform_merge: failed to replace corrupt permanent file, using temp path"
+                            );
+                            Bucket::from_xdr_file_disk_backed(&temp_path)
+                        } else {
+                            Bucket::from_xdr_file_disk_backed(&permanent_path)
+                        }
+                    }
+                    Err(load_err) => {
+                        tracing::warn!(
+                            error = %load_err,
+                            path = %permanent_path.display(),
+                            "perform_merge: failed to load permanent bucket file, replacing"
+                        );
+                        if let Err(rename_err) = durable_rename(&temp_path, &permanent_path) {
+                            tracing::warn!(
+                                error = %rename_err,
+                                temp = %temp_path.display(),
+                                dest = %permanent_path.display(),
+                                "perform_merge: failed to replace unreadable permanent file, using temp path"
+                            );
+                            Bucket::from_xdr_file_disk_backed(&temp_path)
+                        } else {
+                            Bucket::from_xdr_file_disk_backed(&permanent_path)
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -4294,5 +4337,53 @@ mod tests {
             |_| unreachable!("should not call loader"),
         );
         assert!(result.is_err(), "should return error for wrong level count");
+    }
+
+    #[test]
+    fn test_perform_merge_replaces_corrupt_existing_permanent_file() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let bucket_dir = tmp.path().to_path_buf();
+
+        let snap_entries = vec![
+            BucketListEntry::Live(make_account_entry([1u8; 32], 100)),
+            BucketListEntry::Live(make_account_entry([2u8; 32], 200)),
+        ];
+        let snap_bucket = Bucket::from_entries(snap_entries).unwrap();
+        let empty_curr = Bucket::empty();
+
+        // First run creates a valid permanent file.
+        let first = perform_merge(
+            &empty_curr,
+            &snap_bucket,
+            Some(&bucket_dir),
+            true,
+            TEST_PROTOCOL,
+        )
+        .unwrap();
+        let expected_hash = first.hash();
+        assert!(!expected_hash.is_zero());
+
+        let permanent_path = bucket_dir.join(canonical_bucket_filename(&expected_hash));
+        assert!(permanent_path.exists());
+
+        // Corrupt the permanent file to simulate prior partial write.
+        std::fs::write(&permanent_path, b"").unwrap();
+        assert_eq!(std::fs::metadata(&permanent_path).unwrap().len(), 0);
+
+        // Second run should detect mismatch and replace the file, not trust it.
+        let second = perform_merge(
+            &empty_curr,
+            &snap_bucket,
+            Some(&bucket_dir),
+            true,
+            TEST_PROTOCOL,
+        )
+        .unwrap();
+        assert_eq!(second.hash(), expected_hash);
+
+        let reloaded = Bucket::from_xdr_file_disk_backed(&permanent_path).unwrap();
+        assert_eq!(reloaded.hash(), expected_hash);
     }
 }
