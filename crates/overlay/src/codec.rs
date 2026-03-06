@@ -655,4 +655,35 @@ mod tests {
             VecM::default()
         )));
     }
+
+    #[test]
+    fn test_watcher_droppable_keeps_tx_flooding_messages() {
+        assert!(!helpers::is_watcher_droppable(
+            &StellarMessage::Transaction(stellar_xdr::curr::TransactionEnvelope::TxV0(
+                Default::default()
+            ))
+        ));
+        assert!(!helpers::is_watcher_droppable(
+            &StellarMessage::FloodAdvert(Default::default())
+        ));
+        assert!(!helpers::is_watcher_droppable(
+            &StellarMessage::FloodDemand(Default::default())
+        ));
+    }
+
+    #[test]
+    fn test_watcher_droppable_still_drops_survey_messages() {
+        assert!(helpers::is_watcher_droppable(
+            &StellarMessage::TimeSlicedSurveyRequest(Default::default())
+        ));
+        assert!(helpers::is_watcher_droppable(
+            &StellarMessage::TimeSlicedSurveyResponse(Default::default())
+        ));
+        assert!(helpers::is_watcher_droppable(
+            &StellarMessage::TimeSlicedSurveyStartCollecting(Default::default())
+        ));
+        assert!(helpers::is_watcher_droppable(
+            &StellarMessage::TimeSlicedSurveyStopCollecting(Default::default())
+        ));
+    }
 }
