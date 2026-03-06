@@ -126,27 +126,6 @@ pub fn run_transactions_on_executor(
         );
     }
 
-    // Prefetch seller deps for top-N best offers in DEX asset pairs from this TX set.
-    // Mirrors stellar-core's demand-driven populateEntryCacheFromBestOffers but is
-    // upfront and scoped to only the pairs referenced by this ledger's TXs.
-    // With N=10 and ~50-200 pairs per ledger → ~500-2000 offers → ~1500-6000 keys.
-    {
-        const TOP_N_OFFERS_PER_PAIR: usize = 10;
-        let dex_pairs = collect_dex_asset_pairs(transactions);
-        if !dex_pairs.is_empty() {
-            let seller_keys = executor.collect_seller_keys_for_pairs(&dex_pairs, TOP_N_OFFERS_PER_PAIR);
-            if !seller_keys.is_empty() {
-                let stats = snapshot.prefetch(&seller_keys)?;
-                tracing::debug!(
-                    pairs = dex_pairs.len(),
-                    requested = stats.requested,
-                    loaded = stats.loaded,
-                    "Prefetched offer seller deps"
-                );
-            }
-        }
-    }
-
     // Pre-deduct fees before executing any TX body.
     // When external_pre_charged is provided (parallel path), fees were already
     // deducted on the delta by pre_deduct_all_fees_on_delta. Otherwise, deduct
@@ -1135,6 +1114,7 @@ pub fn compute_state_size_window_entry(
 ///
 /// Scans all TX operations for offer management and path payment operations
 /// to determine which order books will be accessed during execution.
+#[cfg(test)]
 fn collect_dex_asset_pairs(
     transactions: &[(TransactionEnvelope, Option<u32>)],
 ) -> HashSet<(Asset, Asset)> {
