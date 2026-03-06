@@ -2381,6 +2381,35 @@ mod tests {
         assert!(info.public_key.starts_with('G'));
     }
 
+    #[tokio::test]
+    async fn test_start_overlay_skips_default_peers_for_compat_config() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        let mut compat_config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("compat.db"))
+            .build();
+        compat_config.overlay.known_peers.clear();
+        compat_config.is_compat_config = true;
+
+        let compat_app = App::new(compat_config).await.unwrap();
+        compat_app.start_overlay().await.unwrap();
+        let compat_overlay = compat_app.overlay().await.unwrap();
+        assert!(compat_overlay.known_peers().is_empty());
+        compat_app.shutdown();
+
+        let mut regular_config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("regular.db"))
+            .build();
+        regular_config.overlay.known_peers.clear();
+        regular_config.is_compat_config = false;
+
+        let regular_app = App::new(regular_config).await.unwrap();
+        regular_app.start_overlay().await.unwrap();
+        let regular_overlay = regular_app.overlay().await.unwrap();
+        assert!(!regular_overlay.known_peers().is_empty());
+        regular_app.shutdown();
+    }
+
     #[test]
     fn test_catchup_result_display() {
         let result = CatchupResult {
