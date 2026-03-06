@@ -119,7 +119,7 @@ The original s32 run (started 2026-03-02 13:55 UTC) hit **disk full** at L613417
 
 | Status | PID | Started |
 |--------|-----|---------|
-| Live | 1818218 | 2026-03-04 00:35 UTC (restarted with VE-12-fixed binary + --force-catchup; 25 zero-byte mainnet bucket files deleted) |
+| Live | 2958934 | 2026-03-04 21:30 UTC (restarted with latest binary; HTTP port changed to 11727 to avoid conflict with quickstart stellar-core on 11626) |
 
 ## Cache scan benchmark (2026-03-01)
 

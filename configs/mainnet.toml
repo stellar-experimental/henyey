@@ -152,6 +152,9 @@ known_peers = [
 ]
 preferred_peers = []
 
+[http]
+port = 11727
+
 [logging]
 level = "info"
 format = "text"
