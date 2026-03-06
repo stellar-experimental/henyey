@@ -1088,6 +1088,32 @@ impl TransactionExecutor {
         Ok(())
     }
 
+    /// Collect LedgerKeys for all offer seller accounts and their non-native trustlines.
+    ///
+    /// Used to bulk-prefetch seller dependencies into the snapshot cache before
+    /// classic TX execution, mirroring stellar-core's `populateEntryCacheFromBestOffers`.
+    pub fn collect_offer_seller_keys(&self) -> Vec<LedgerKey> {
+        let mut keys: HashSet<LedgerKey> = HashSet::new();
+        for offer in self.state.iter_offers() {
+            keys.insert(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: offer.seller_id.clone(),
+            }));
+            if let Some(tl_asset) = asset_to_trustline_asset(&offer.selling) {
+                keys.insert(LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: offer.seller_id.clone(),
+                    asset: tl_asset,
+                }));
+            }
+            if let Some(tl_asset) = asset_to_trustline_asset(&offer.buying) {
+                keys.insert(LedgerKey::Trustline(LedgerKeyTrustLine {
+                    account_id: offer.seller_id.clone(),
+                    asset: tl_asset,
+                }));
+            }
+        }
+        keys.into_iter().collect()
+    }
+
     /// Load all orderbook offers from the snapshot into state.
     ///
     /// Called once per ledger during initialization, before any transactions execute.

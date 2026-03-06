@@ -406,16 +406,32 @@ impl SnapshotHandle {
             return Ok(result);
         }
 
-        // Use batch lookup if available
-        if let Some(ref batch_fn) = self.batch_lookup_fn {
-            result.extend(batch_fn(&remaining)?);
+        // Use batch lookup if available; cache all loaded entries for future callers
+        let loaded = if let Some(ref batch_fn) = self.batch_lookup_fn {
+            batch_fn(&remaining)?
         } else if let Some(ref lookup_fn) = self.lookup_fn {
+            let mut loaded = Vec::new();
             for key in &remaining {
                 if let Some(entry) = lookup_fn(key)? {
-                    result.push(entry);
+                    loaded.push(entry);
+                }
+            }
+            loaded
+        } else {
+            Vec::new()
+        };
+
+        if !loaded.is_empty() {
+            let mut cache = self.prefetch_cache.write();
+            for entry in &loaded {
+                if let Ok(key) = crate::delta::entry_to_key(entry) {
+                    if let Ok(key_bytes) = key_to_bytes(&key) {
+                        cache.insert(key_bytes, entry.clone());
+                    }
                 }
             }
         }
+        result.extend(loaded);
 
         Ok(result)
     }
@@ -462,9 +478,14 @@ impl SnapshotHandle {
             }
         }
 
-        // 3. Fall back to lookup function if available
+        // 3. Fall back to lookup function if available; cache the result for future callers
         if let Some(ref lookup_fn) = self.lookup_fn {
-            return lookup_fn(key);
+            let result = lookup_fn(key)?;
+            if let Some(ref entry) = result {
+                let key_bytes = key_to_bytes(key)?;
+                self.prefetch_cache.write().insert(key_bytes, entry.clone());
+            }
+            return Ok(result);
         }
 
         Ok(None)
@@ -815,6 +836,38 @@ mod tests {
         // Header should be identical on every read
         assert_eq!(h1.ledger_seq, h2.ledger_seq);
         assert_eq!(h1.ledger_seq, 42);
+    }
+
+    /// Verify that `get_entry()` caches bucket list results so subsequent lookups
+    /// do NOT re-invoke the `lookup_fn`.
+    #[test]
+    fn test_get_entry_caches_lookup_result() {
+        let (key, entry) = create_test_account(42);
+        let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+
+        let entry_clone = entry.clone();
+        let count = call_count.clone();
+        handle.set_lookup(Arc::new(move |_k| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(entry_clone.clone()))
+        }));
+
+        // First call: hits lookup_fn
+        let result1 = handle.get_entry(&key).unwrap();
+        assert!(result1.is_some());
+        assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Second call: served from prefetch_cache, lookup_fn not called again
+        let result2 = handle.get_entry(&key).unwrap();
+        assert!(result2.is_some());
+        assert_eq!(
+            call_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "lookup_fn invoked again after cache-through"
+        );
     }
 
     /// Regression test for catchup replay id_pool fix.

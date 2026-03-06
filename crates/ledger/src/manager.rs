@@ -3248,6 +3248,15 @@ impl<'a> LedgerCloseContext<'a> {
             }
         }
 
+        // Prefetch offer seller accounts and trustlines into the snapshot cache.
+        // Mirrors stellar-core's populateEntryCacheFromBestOffers: loading the orderbook
+        // triggers bulk loading of seller dependencies so TX execution finds them in-cache.
+        let seller_keys = executor_ref.collect_offer_seller_keys();
+        if !seller_keys.is_empty() {
+            tracing::debug!(num_keys = seller_keys.len(), "prefetching offer seller deps");
+            self.snapshot.prefetch(&seller_keys)?;
+        }
+
         // Configure meta extension flags from LedgerManagerConfig.
         executor_ref.set_meta_flags(
             self.manager.config.emit_soroban_tx_meta_ext_v1,

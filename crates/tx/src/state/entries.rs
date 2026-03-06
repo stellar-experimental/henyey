@@ -906,6 +906,11 @@ impl LedgerStateManager {
         self.remove_last_modified_key(&ledger_key);
     }
 
+    /// Iterate over all offers currently in state.
+    pub fn iter_offers(&self) -> impl Iterator<Item = &OfferEntry> {
+        self.offers.values()
+    }
+
     /// Get an offer by seller and offer ID (read-only).
     pub fn get_offer(&self, seller_id: &AccountId, offer_id: i64) -> Option<&OfferEntry> {
         let seller_key = account_id_to_bytes(seller_id);
