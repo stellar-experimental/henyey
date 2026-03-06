@@ -327,10 +327,14 @@ pub fn run_transactions_on_executor(
         delta.record_fee_pool_delta(total_fees);
     }
 
-    // Collect all hot archive restored keys across all transactions
+    // Collect hot archive restored keys from SUCCESSFUL transactions only.
+    // Failed transactions are rolled back and must not contribute
+    // HOT_ARCHIVE_LIVE tombstones.
     let mut all_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
     for result in &results {
-        all_hot_archive_restored_keys.extend(result.hot_archive_restored_keys.iter().cloned());
+        if result.success {
+            all_hot_archive_restored_keys.extend(result.hot_archive_restored_keys.iter().cloned());
+        }
     }
 
     Ok(TxSetResult {
@@ -1068,4 +1072,3 @@ pub fn compute_state_size_window_entry(
         ext: LedgerEntryExt::V0,
     })
 }
-
