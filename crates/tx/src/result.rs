@@ -1353,4 +1353,45 @@ mod tests {
         assert!(wrapper.is_success());
         assert_eq!(wrapper.result_code(), TxResultCode::TxFeeBumpInnerSuccess);
     }
+
+    #[test]
+    fn test_tx_result_code_to_xdr_result_maps_common_error_codes() {
+        assert!(matches!(
+            TxResultCode::TxBadSeq.to_xdr_result(),
+            TransactionResultResult::TxBadSeq
+        ));
+        assert!(matches!(
+            TxResultCode::TxInsufficientFee.to_xdr_result(),
+            TransactionResultResult::TxInsufficientFee
+        ));
+        assert!(matches!(
+            TxResultCode::TxMalformed.to_xdr_result(),
+            TransactionResultResult::TxMalformed
+        ));
+    }
+
+    #[test]
+    fn test_tx_result_code_to_xdr_result_maps_success_and_failed_with_empty_ops() {
+        match TxResultCode::TxSuccess.to_xdr_result() {
+            TransactionResultResult::TxSuccess(ops) => assert!(ops.is_empty()),
+            other => panic!("unexpected result for TxSuccess: {:?}", other),
+        }
+
+        match TxResultCode::TxFailed.to_xdr_result() {
+            TransactionResultResult::TxFailed(ops) => assert!(ops.is_empty()),
+            other => panic!("unexpected result for TxFailed: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_tx_result_code_to_xdr_result_fee_bump_variants_fallback_to_internal_error() {
+        assert!(matches!(
+            TxResultCode::TxFeeBumpInnerSuccess.to_xdr_result(),
+            TransactionResultResult::TxInternalError
+        ));
+        assert!(matches!(
+            TxResultCode::TxFeeBumpInnerFailed.to_xdr_result(),
+            TransactionResultResult::TxInternalError
+        ));
+    }
 }
