@@ -63,7 +63,141 @@ The plan is derived from stellar-core's simulation system (v25, submodule at `st
 - `tokio/test-util` feature not enabled
 - Main event loop (`App::run()` in `lifecycle.rs`) uses 14 `tokio::time::interval` timers in a `tokio::select!` loop — not directly "crankable"
 
-## Implementation Phases
+## Execution Plan (Authoritative)
+
+This section is the delivery runbook for executing the simulation work. The
+later phase breakdown remains as technical design reference, but execution
+priority, sequencing, and acceptance are defined here.
+
+### Stage 0: Baseline and Guardrails (1 day)
+
+**Objective:** Freeze a baseline before refactors and define pass/fail gates.
+
+**Tasks:**
+- Capture current workspace status: `cargo build --all`, `cargo test --all`.
+- Record current simulation baseline from `crates/scp/tests/multi_node_simulation.rs`.
+- Define deterministic acceptance criteria and store them in this document.
+
+**Exit criteria:**
+- Baseline build and tests are green.
+- Determinism criteria documented (same inputs => same final ledger hash).
+- Non-goals for v1 explicitly listed (no full chaos matrix, no custom scheduler).
+
+### Stage 1: Clock crate and minimal wiring (2-3 days)
+
+**Objective:** Introduce clock abstractions without changing runtime behavior.
+
+**Tasks:**
+- Add `crates/clock/` with `Clock`, `RealClock`, and `VirtualClock`.
+- Add workspace membership and dependencies.
+- Inject `Arc<dyn Clock>` into top-level `App` construction only.
+
+**Exit criteria:**
+- `cargo build --all` and `cargo test --all` pass.
+- Existing runtime behavior unchanged in non-simulation modes.
+
+### Stage 2: Behavioral time migration (4-6 days)
+
+**Objective:** Migrate consensus-relevant time paths to `Clock`.
+
+**Tasks:**
+- Migrate `app` and `herder` behavioral timers first.
+- Keep observational/perf-only timing on `std::time::Instant`.
+- Ensure all timeout/interval logic in consensus path uses injected clock.
+
+**Exit criteria:**
+- Full test suite passes.
+- No liveness regressions in validator/watcher startup and run flow.
+
+### Stage 3: Overlay transport abstraction (4-5 days)
+
+**Objective:** Make overlay transport pluggable while preserving TCP by default.
+
+**Tasks:**
+- Introduce `Transport`, `TransportListener`, `ConnectionFactory`.
+- Adapt existing TCP code into `TcpConnectionFactory`.
+- Refactor `OverlayManager` to use factory-based connect/bind/accept.
+
+**Exit criteria:**
+- Existing TCP integration tests pass without test changes.
+- Default behavior remains TCP unless simulation mode opts into loopback.
+
+### Stage 4: Loopback network and simulation harness (4-5 days)
+
+**Objective:** Build deterministic multi-node app-level simulation.
+
+**Tasks:**
+- Add `crates/simulation/` with `Simulation`, `SimNode`, and crank loop.
+- Add `LoopbackNetwork` and loopback connection factory.
+- Start with `core3` topology and deterministic seed/key generation.
+
+**Exit criteria:**
+- 3-node loopback simulation externalizes at least 10 ledgers deterministically.
+- Crank loop supports timeout-bound predicates.
+
+### Stage 5: Validation suite and reliability checks (3-4 days)
+
+**Objective:** Add high-signal tests validating convergence and determinism.
+
+**Tasks:**
+- Add tests for: basic consensus, degraded quorum, partition/heal, replay determinism.
+- Add one bounded message-loss scenario (drop probability) after stability.
+- Run repeated deterministic replay to catch flaky scheduling issues.
+
+**Exit criteria:**
+- New simulation test suite is stable across repeated runs.
+- Deterministic replay test passes consistently (no hash drift).
+
+### Stage 6: Documentation, parity tracking, and handoff (1 day)
+
+**Objective:** Make the work executable and maintainable for future contributors.
+
+**Tasks:**
+- Update crate-level docs for any new public simulation/clock APIs.
+- Update `PARITY_STATUS.md` where behavior parity status changed.
+- Add a short runbook: how to execute simulation tests locally and in CI.
+
+**Exit criteria:**
+- Documentation reflects delivered behavior and limitations.
+- CI/local commands are documented and verified.
+
+### PR Slicing and Merge Order
+
+To reduce risk, land changes in narrow PRs in this order:
+
+1. `clock` crate skeleton + workspace wiring.
+2. `App` constructor clock injection with no callsite migration.
+3. `app` + `herder` behavioral time migration.
+4. transport traits + TCP factory adapter.
+5. `OverlayManager` factory integration.
+6. loopback network + loopback factory.
+7. simulation harness crate (`core3` only).
+8. simulation validation tests.
+9. docs/parity updates.
+
+### Deterministic Definition of Done
+
+Simulation v1 is complete when all of the following are true:
+
+- `Topologies::core3(SimulationMode::OverLoopback)` closes 10 ledgers within virtual timeout.
+- Partition/heal scenario converges after recovery.
+- Running the same scenario twice yields identical final ledger hash across all nodes.
+- Default runtime mode remains TCP + real time with no regression in existing overlay tests.
+
+### Execution Commands (required at each stage boundary)
+
+```bash
+cargo build --all
+cargo test --all
+```
+
+For simulation stages, also run:
+
+```bash
+cargo test -p henyey-simulation --tests
+```
+
+## Detailed Design Phases (Reference)
 
 ### Phase 1: Clock Abstraction (3-5 days)
 
