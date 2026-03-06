@@ -3682,6 +3682,44 @@ mod tests {
     }
 
     #[test]
+    fn test_externalized_iteration_window_unpublished_checkpoint_processes_all() {
+        // current_ledger=129 => first_replay=130, checkpoint=128.
+        // latest_externalized=127 means the replay checkpoint is unpublished,
+        // so we must process all slots (no TX_SET_REQUEST_WINDOW trimming).
+        let last_processed = 90u64;
+        let current_ledger = 129u32;
+        let latest_externalized = 127u64;
+
+        let (iter_start, advance_to) = App::externalized_iteration_window(
+            last_processed,
+            current_ledger,
+            latest_externalized,
+        );
+
+        assert_eq!(iter_start, last_processed + 1);
+        assert_eq!(advance_to, last_processed);
+    }
+
+    #[test]
+    fn test_externalized_iteration_window_published_checkpoint_trims_to_window() {
+        // first_replay checkpoint is published, so large gaps should trim to
+        // the TX_SET_REQUEST_WINDOW tail.
+        let last_processed = 100u64;
+        let current_ledger = 110u32;
+        let latest_externalized = 150u64; // gap from last_processed is 50 > 12
+
+        let (iter_start, advance_to) = App::externalized_iteration_window(
+            last_processed,
+            current_ledger,
+            latest_externalized,
+        );
+
+        let expected_skip_to = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW);
+        assert_eq!(iter_start, expected_skip_to + 1);
+        assert_eq!(advance_to, expected_skip_to);
+    }
+
+    #[test]
     fn test_buffered_catchup_target_small_gap() {
         // When the gap between current_ledger and first_buffered is small (< 64),
         // the target should bridge the gap. This is the scenario where a single
