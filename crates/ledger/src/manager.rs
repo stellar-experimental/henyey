@@ -841,6 +841,9 @@ pub struct LedgerManagerConfig {
     /// Note: The Soroban host always captures diagnostic events (`enable_diagnostics: true`).
     /// This flag controls whether they are included in the metadata stream output.
     pub enable_soroban_diagnostic_events: bool,
+
+    /// Number of parallel threads for the startup bucket list cache scan.
+    pub scan_thread_count: usize,
 }
 
 impl Default for LedgerManagerConfig {
@@ -853,6 +856,7 @@ impl Default for LedgerManagerConfig {
             emit_ledger_close_meta_ext_v1: false,
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
+            scan_thread_count: 2,
         }
     }
 }
@@ -1358,7 +1362,7 @@ impl LedgerManager {
         let rss_before = get_rss_bytes();
 
         let bucket_list = self.bucket_list.read();
-        let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version, 1);
+        let cache_data = scan_bucket_list_for_caches(&bucket_list, protocol_version, self.config.scan_thread_count);
         let rss_after_scan = get_rss_bytes();
 
         // Initialize per-bucket caches for all DiskIndex buckets.

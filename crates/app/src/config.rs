@@ -648,7 +648,17 @@ pub struct BucketConfig {
     /// Set `memory_for_caching_mb` to a non-zero value to enable caching.
     #[serde(default)]
     pub bucket_list_db: BucketListDbConfig,
+
+    /// Number of parallel threads used to scan the bucket list on startup
+    /// (for populating the offer store, Soroban state, and TTL caches).
+    ///
+    /// Default is 2. Set to 1 on memory-constrained machines where two
+    /// concurrent scans would exceed available RAM.
+    #[serde(default = "default_scan_thread_count")]
+    pub scan_thread_count: usize,
 }
+
+fn default_scan_thread_count() -> usize { 2 }
 
 impl Default for BucketConfig {
     fn default() -> Self {
@@ -656,6 +666,7 @@ impl Default for BucketConfig {
             directory: default_bucket_dir(),
             cache_size: default_bucket_cache_size(),
             bucket_list_db: BucketListDbConfig::default(),
+            scan_thread_count: default_scan_thread_count(),
         }
     }
 }
