@@ -79,8 +79,8 @@ fn url_decode(s: &str) -> String {
         match b {
             b'+' => result.push(' '),
             b'%' => {
-                let hi = chars.next().and_then(|c| hex_digit(c));
-                let lo = chars.next().and_then(|c| hex_digit(c));
+                let hi = chars.next().and_then(hex_digit);
+                let lo = chars.next().and_then(hex_digit);
                 if let (Some(h), Some(l)) = (hi, lo) {
                     result.push((h << 4 | l) as char);
                 } else {

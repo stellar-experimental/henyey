@@ -224,7 +224,7 @@ impl App {
 
         for (peer, hash) in to_ping {
             let msg = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
-            if let Err(_) = overlay.try_send_to(&peer, msg) {
+            if overlay.try_send_to(&peer, msg).is_err() {
                 tracing::debug!(peer = %peer, "Failed to send ping");
                 let mut inflight = self.ping_inflight.write().await;
                 inflight.remove(&hash);

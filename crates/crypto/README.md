@@ -18,7 +18,6 @@ graph TD
     subgraph "henyey-crypto"
         keys[keys.rs<br>PublicKey / SecretKey / Signature]
         hash[hash.rs<br>SHA-256 / BLAKE2 / HMAC / HKDF / XDR hashing]
-        strkey[strkey.rs<br>StrKey encode/decode]
         signer_key[signer_key.rs<br>SignerKey construction]
         signature[signature.rs<br>Sign/verify helpers / SignedMessage]
         short_hash[short_hash.rs<br>SipHash-2-4]
@@ -26,9 +25,9 @@ graph TD
         sealed_box[sealed_box.rs<br>Sealed box encryption]
         hex_mod[hex.rs<br>Hex encode/decode]
         random[random.rs<br>Secure RNG]
+        error[error.rs<br>CryptoError]
     end
 
-    keys --> strkey
     signature --> keys
     signer_key --> hash
     sealed_box --> keys
@@ -49,8 +48,6 @@ graph TD
 | `Hash256` | 32-byte hash value (re-exported from `henyey-common`) |
 | `Sha256Hasher` | Streaming SHA-256 hasher |
 | `Blake2Hasher` | Streaming BLAKE2b-256 hasher |
-| `XdrSha256Hasher` | Streaming SHA-256 hasher for XDR serialization |
-| `XdrBlake2Hasher` | Streaming BLAKE2b-256 hasher for XDR serialization |
 | `CryptoError` | Error type for all cryptographic operations |
 
 ## Usage
@@ -115,7 +112,6 @@ assert_eq!(plaintext, b"secret");
 | `lib.rs` | Crate root; module declarations and public re-exports |
 | `keys.rs` | `PublicKey`, `SecretKey`, `Signature` types with Ed25519 operations and XDR conversions |
 | `hash.rs` | SHA-256, BLAKE2b-256, HMAC-SHA256, HKDF, and XDR hashing (single-shot and streaming) |
-| `strkey.rs` | Stellar StrKey base32 encoding/decoding for all key types (G, S, T, X, M, P, C) |
 | `signature.rs` | Signing/verification convenience functions, signature hints, and `SignedMessage` |
 | `signer_key.rs` | Construction and inspection of XDR `SignerKey` variants (Ed25519, PreAuthTx, HashX, SignedPayload) |
 | `short_hash.rs` | Process-global SipHash-2-4 for deterministic bucket list ordering |
@@ -139,6 +135,9 @@ assert_eq!(plaintext, b"secret");
   This is simpler and sufficient for current workloads.
 - **Constant-time HMAC verification**: `hmac_sha256_verify` delegates to the
   `hmac` crate's `verify_slice`, which performs constant-time comparison.
+- **StrKey encoding**: Delegated entirely to the `stellar-strkey` crate
+  (re-exported as `henyey_crypto::stellar_strkey`), with convenience methods
+  on `PublicKey` and `SecretKey` for the common encode/decode operations.
 
 ## stellar-core Mapping
 
@@ -146,7 +145,6 @@ assert_eq!(plaintext, b"secret");
 |------|--------------|
 | `keys.rs` | `src/crypto/SecretKey.h` / `SecretKey.cpp` |
 | `hash.rs` | `src/crypto/SHA.h` / `SHA.cpp`, `src/crypto/BLAKE2.h` / `BLAKE2.cpp` |
-| `strkey.rs` | `src/crypto/StrKey.h` / `StrKey.cpp` |
 | `signature.rs` | `src/crypto/SecretKey.h` (signing/verification helpers) |
 | `signer_key.rs` | `src/crypto/SignerKey.h` / `SignerKeyUtils.h` |
 | `short_hash.rs` | `src/crypto/ShortHash.h` / `ShortHash.cpp` |
@@ -155,6 +153,7 @@ assert_eq!(plaintext, b"secret");
 | `hex.rs` | `src/crypto/Hex.h` / `Hex.cpp` |
 | `random.rs` | `src/crypto/Random.h` / `Random.cpp` |
 | `error.rs` | (no direct equivalent; C++ uses exceptions) |
+| *(re-export)* `stellar_strkey` | `src/crypto/StrKey.h` / `StrKey.cpp`, `src/crypto/KeyUtils.h` / `KeyUtils.cpp` |
 
 ## Parity Status
 

@@ -1305,7 +1305,7 @@ impl AppConfig {
 
         // Bucket page size exponent must be in valid range (4-24)
         let exp = self.buckets.bucket_list_db.index_page_size_exponent;
-        if exp < 4 || exp > 24 {
+        if !(4..=24).contains(&exp) {
             anyhow::bail!(
                 "bucket_list_db.index_page_size_exponent must be between 4 and 24, got {}",
                 exp

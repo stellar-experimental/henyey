@@ -97,11 +97,26 @@ henyey --testnet verify-history --from 1 --to 100000
 # Publish history to archives (validators only)
 henyey --config validator.toml publish-history
 
+# Initialize a named history archive
+henyey --config validator.toml new-hist my_archive
+
 # Check quorum intersection from JSON
 henyey check-quorum-intersection network.json
 
 # Send command to running node
 henyey http-command info
+
+# Convert identifier between formats (hex/strkey)
+henyey convert-id GDKXE2OZM...
+
+# Force SCP to start on next run (single-node networks)
+henyey --testnet force-scp
+
+# Print offline node state (used by stellar-rpc)
+henyey --testnet offline-info
+
+# Print version and protocol info
+henyey version
 ```
 
 ## Module Layout
@@ -149,6 +164,11 @@ henyey http-command info
 | `main.rs` (`cmd_http_command`) | `src/main/CommandLine.cpp` (`httpCommand`) |
 | `main.rs` (`cmd_new_keypair`) | `src/main/CommandLine.cpp` (`genSeed`) |
 | `main.rs` (`cmd_verify_checkpoints`) | `src/main/CommandLine.cpp` (`writeVerifiedCheckpointHashes`) |
+| `main.rs` (`cmd_convert_id`) | `src/main/CommandLine.cpp` (`runConvertId`) |
+| `main.rs` (`cmd_force_scp`) | `src/main/CommandLine.cpp` (`runForceSCP`) |
+| `main.rs` (`cmd_offline_info`) | `src/main/CommandLine.cpp` (`runOfflineInfo`) |
+| `main.rs` (`cmd_version`) | `src/main/CommandLine.cpp` (`runVersion`) |
+| `main.rs` (`cmd_new_hist`) | `src/main/CommandLine.cpp` (`runNewHist`) |
 | `quorum_intersection.rs` | `src/herder/QuorumIntersectionChecker*` (v1 brute-force only) |
 | `bin/header_compare.rs` | No direct upstream equivalent (debugging tool) |
 

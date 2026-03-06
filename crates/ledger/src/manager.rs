@@ -1108,22 +1108,6 @@ impl LedgerManager {
         self.bucket_list.write().resolve_all_pending_merges();
     }
 
-    /// Get the current total Soroban state size (contract data + code).
-    ///
-    /// Used to carry the pre-computed value across catchup cycles, avoiding
-    /// an expensive bucket list scan (~80s on mainnet).
-    pub fn soroban_state_total_size(&self) -> u64 {
-        self.soroban_state.read().total_size()
-    }
-
-    /// Get a snapshot of all offers in the in-memory offer store.
-    ///
-    /// Used to provide the order book to the replay path, which needs the same
-    /// offer set as close_ledger for correct offer matching behavior.
-    pub fn offer_entries(&self) -> Vec<LedgerEntry> {
-        self.offer_store.read().values().cloned().collect()
-    }
-
     /// Get a read lock on the offer store for direct access.
     pub fn offer_store_read(&self) -> parking_lot::RwLockReadGuard<'_, HashMap<i64, LedgerEntry>> {
         self.offer_store.read()
@@ -3808,8 +3792,7 @@ impl<'a> LedgerCloseContext<'a> {
         Ok((new_header, header_hash))
     }
 
-    /// Commit the ledger close and produce the new header.
-    /// Commit the ledger close: finalize state, update bucket list, persist to DB.
+    /// Commit the ledger close: finalize state, update bucket list, build header.
     ///
     /// LEDGER_SPEC §6 defines an 8-step commit sequence:
     ///   1. Compute tx result hash
@@ -3818,7 +3801,7 @@ impl<'a> LedgerCloseContext<'a> {
     ///   4. Run eviction scan (protocol 23+)
     ///   5. Compute bucket list hash
     ///   6. Build new ledger header
-    ///   7. Persist header + history to DB
+    ///   7. Update in-memory state (offer index, Soroban cache)
     ///   8. Emit ledger close meta
     ///
     /// Henyey combines some of these steps (e.g., bucket list update and hash

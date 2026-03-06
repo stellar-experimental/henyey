@@ -104,7 +104,7 @@ scheduler.run_until_done_with_cancel(cancel).await;
 
 | Module | Description |
 |--------|-------------|
-| `lib.rs` | All public types, the `Work` trait, `WorkScheduler`, `WorkSequence`, `WorkWithCallback`, and internal helpers (`WorkEntry`, `EmptyWork`, `WorkCompletion`) |
+| `lib.rs` | All public types, the `Work` trait, `WorkScheduler`, `WorkSequence`, `WorkWithCallback`, and internal helpers (`WorkEntry`, `EmptyWork`, `WorkCompletion`, `CompletionAction`) |
 
 ## Design Notes
 

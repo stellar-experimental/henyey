@@ -121,7 +121,7 @@ db.transaction(|tx| {
 
 - **Schema migrations**: Fresh databases get the full schema from `CREATE_SCHEMA`; existing databases are migrated incrementally. Each migration runs in its own transaction for atomicity.
 
-- **SQLite tuning**: WAL journal mode, NORMAL synchronous, 64 MB cache, 30 s busy timeout, foreign keys ON, temp store in memory. The connection pool allows up to 10 concurrent connections for file-based databases and 1 for in-memory.
+- **SQLite tuning**: WAL journal mode, FULL synchronous (required for WAL power-loss safety), 64 MB cache, 30 s busy timeout, foreign keys ON, temp store in memory. The connection pool allows up to 10 concurrent connections for file-based databases and 1 for in-memory.
 
 - **XDR storage**: Unlike stellar-core which stores XDR as base64 TEXT, this crate stores XDR as raw BLOB for efficiency. The exception is SCP slot state and tx set data in the storestate table, which use base64 encoding since they share the TEXT-valued storestate table.
 

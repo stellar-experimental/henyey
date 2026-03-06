@@ -3,7 +3,7 @@
 **Crate**: `henyey-herder`
 **Upstream**: `stellar-core/src/herder/`
 **Overall Parity**: 77%
-**Last Updated**: 2026-02-17
+**Last Updated**: 2026-03-05
 
 ## Summary
 

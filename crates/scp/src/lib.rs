@@ -64,7 +64,7 @@ pub use format::{
     ballot_to_str, envelope_to_str, node_id_to_short_string, node_id_to_string, value_to_str,
 };
 pub use info::{
-    BallotInfo, BallotValue, CommitBounds, NominationInfo, NodeInfo, QuorumInfo, SlotInfo,
+    BallotInfo, BallotValue, CommitBounds, NodeInfo, NominationInfo, QuorumInfo, SlotInfo,
 };
 pub use quorum::{
     find_closest_v_blocking, get_all_nodes, hash_quorum_set, is_blocking_set, is_quorum,
@@ -207,7 +207,6 @@ pub use stellar_xdr::curr::{
 // Re-export Hash256 for quorum set hashing
 pub use henyey_common::Hash256;
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +308,4 @@ mod tests {
         assert!(!QuorumInfoNodeState::Preparing.is_externalized());
         assert!(QuorumInfoNodeState::Externalized.is_externalized());
     }
-
 }

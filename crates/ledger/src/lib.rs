@@ -159,27 +159,6 @@ impl From<&stellar_xdr::curr::LedgerHeader> for LedgerInfo {
     }
 }
 
-/// A simplified representation of a ledger entry change.
-///
-/// This enum represents the three types of modifications that can occur
-/// to ledger entries during transaction processing. It's a convenience
-/// wrapper around the more detailed [`EntryChange`] type.
-///
-/// # Variants
-///
-/// - `Create`: A new entry that didn't exist before
-/// - `Update`: An existing entry with modified values
-/// - `Delete`: An entry that has been removed
-#[derive(Debug, Clone)]
-pub enum LedgerChange {
-    /// A new entry was created (e.g., new account, trustline, or offer).
-    Create(stellar_xdr::curr::LedgerEntry),
-    /// An existing entry was modified (e.g., balance change, threshold update).
-    Update(stellar_xdr::curr::LedgerEntry),
-    /// An entry was deleted (e.g., account merge, offer fill, trustline removal).
-    Delete(stellar_xdr::curr::LedgerKey),
-}
-
 /// Fee calculation utilities for transaction processing.
 ///
 /// This module provides functions for computing transaction fees and checking
@@ -197,7 +176,7 @@ pub enum LedgerChange {
 /// The transaction's `fee` field represents the maximum the sender is willing
 /// to pay. The actual charged fee is the minimum of this and the required fee.
 pub mod fees {
-    use stellar_xdr::curr::{AccountEntry, Transaction, TransactionEnvelope};
+    use stellar_xdr::curr::{AccountEntry, Transaction};
 
     /// Calculate the fee for a transaction.
     ///
@@ -226,29 +205,6 @@ pub mod fees {
         // The transaction's fee field is the maximum the user is willing to pay.
         // The actual charge is min(declared_fee, num_ops * base_fee).
         std::cmp::min(tx.fee as u64, min_fee)
-    }
-
-    /// Calculate the fee for a transaction envelope.
-    ///
-    /// Handles all transaction envelope types (V0, V1, and fee bump).
-    /// For fee bump transactions, uses the outer transaction's fee.
-    ///
-    /// # Arguments
-    ///
-    /// * `env` - The transaction envelope
-    /// * `base_fee` - The network base fee per operation in stroops
-    pub fn calculate_envelope_fee(env: &TransactionEnvelope, base_fee: u32) -> u64 {
-        match env {
-            TransactionEnvelope::TxV0(tx) => {
-                let num_ops = tx.tx.operations.len() as u64;
-                num_ops * base_fee as u64
-            }
-            TransactionEnvelope::Tx(tx) => calculate_fee(&tx.tx, base_fee),
-            TransactionEnvelope::TxFeeBump(tx) => {
-                // For fee bump, use the outer fee
-                tx.tx.fee as u64
-            }
-        }
     }
 
     /// Check if an account can afford the fee.

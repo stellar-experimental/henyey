@@ -4,7 +4,7 @@ Common types and utilities shared across all henyey crates.
 
 ## Overview
 
-This crate provides the foundational types, traits, and utility functions used throughout the henyey workspace. It corresponds to the shared utilities found in stellar-core's `src/util/` directory and `src/main/` headers. The crate is deliberately dependency-light and contains mostly pure functions and data types with no I/O or side effects (except for configuration file loading), making it safe to depend on from every other crate in the workspace.
+This crate provides the foundational types, traits, and utility functions used throughout the henyey workspace. It corresponds to the shared utilities found in stellar-core's `src/util/` directory and `src/main/` headers. The crate is deliberately dependency-light and contains mostly pure functions and data types with no I/O or side effects (except for configuration file loading and filesystem utilities), making it safe to depend on from every other crate in the workspace.
 
 ## Architecture
 
@@ -21,6 +21,7 @@ graph TD
     A --> J[error]
     A --> K[time]
     A --> L[xdr_stream]
+    A --> M[fs_utils]
 
     E -->|uses| B
     E -->|uses| D
@@ -46,6 +47,7 @@ graph TD
 | `Rounding` | Rounding mode for 128-bit division operations (Down or Up) |
 | `MathError` | Error type for overflow, division-by-zero, and negative-input math failures |
 | `XdrOutputStream` | Size-prefixed XDR frame writer compatible with stellar-core wire format |
+| `DurableXdrOutputStream` | XDR frame writer with fsync-after-every-write for crash safety |
 | `XdrInputStream` | Size-prefixed XDR frame reader compatible with stellar-core wire format |
 | `BucketListDbConfig` | Configuration for BucketListDB indexing and caching behavior |
 | `NoIssuerError` | Error returned when requesting the issuer of a native asset |
@@ -110,14 +112,15 @@ assert!(r.leq(&limit));
 | `types.rs` | `Hash256` type: SHA-256 hashing, hex conversion, XDR interop |
 | `math.rs` | 128-bit arithmetic (`big_divide`, `big_square_root`), saturating ops, rounding modes |
 | `protocol.rs` | `ProtocolVersion` enum, version comparison functions, feature gate constants |
-| `asset.rs` | Asset validation, code conversion, issuer utilities, balance math, price comparison, hash XOR, ledger key extraction, and numeric helpers |
+| `asset.rs` | Asset validation, code conversion, issuer utilities, balance math, price comparison, hash XOR, ledger key extraction |
 | `resource.rs` | `Resource` vector type with arithmetic, comparison, scaling, and division operations |
 | `meta.rs` | Ledger metadata normalization (sorting changes by key, type, hash) for deterministic hashing |
 | `config.rs` | `Config` and sub-structs for TOML-based node configuration |
 | `network.rs` | `NetworkId` derived from network passphrase via SHA-256 |
 | `error.rs` | `Error` enum and `Result` type alias |
 | `time.rs` | Unix/Stellar epoch conversions, current timestamp helpers |
-| `xdr_stream.rs` | `XdrOutputStream` / `XdrInputStream` for reading and writing size-prefixed XDR frames (RFC 4506 record marking) |
+| `fs_utils.rs` | Crash-safe filesystem operations (`durable_rename` with parent directory fsync) |
+| `xdr_stream.rs` | `XdrOutputStream` / `DurableXdrOutputStream` / `XdrInputStream` for size-prefixed XDR frames (RFC 4506 record marking) |
 
 ## Design Notes
 
@@ -130,16 +133,17 @@ assert!(r.leq(&limit));
 | Rust | stellar-core |
 |------|--------------|
 | `types.rs` | `src/util/types.h`, `src/util/HashOfHash.h` |
-| `math.rs` | `src/util/numeric.h/.cpp` |
-| `protocol.rs` | `src/util/ProtocolVersion.h` |
+| `math.rs` | `src/util/numeric.h/.cpp`, `src/util/numeric128.h` |
+| `protocol.rs` | `src/util/ProtocolVersion.h/.cpp` |
 | `asset.rs` | `src/util/types.h/.cpp`, `src/transactions/TransactionUtils.h/.cpp` |
-| `resource.rs` | `src/herder/TxResource.h/.cpp` |
+| `resource.rs` | `src/util/TxResource.h/.cpp` |
 | `meta.rs` | `src/util/MetaUtils.h/.cpp` |
 | `network.rs` | `src/main/Config.h` (network passphrase hashing) |
 | `config.rs` | `src/main/Config.h/.cpp` (Rust-native TOML implementation) |
 | `error.rs` | Rust-native (no direct upstream equivalent) |
 | `time.rs` | `src/util/Timer.h/.cpp` (subset) |
-| `xdr_stream.rs` | `src/util/XDRStream.h` (output full, basic input) |
+| `fs_utils.rs` | `src/util/Fs.h/.cpp` (`durableRename` only) |
+| `xdr_stream.rs` | `src/util/XDRStream.h` (output + durable output + basic input) |
 
 ## Parity Status
 

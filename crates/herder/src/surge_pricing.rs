@@ -53,9 +53,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use henyey_common::NUM_CLASSIC_TX_RESOURCES;
-use henyey_common::{
-    any_greater, subtract_non_negative, Resource, NUM_CLASSIC_TX_BYTES_RESOURCES,
-};
+use henyey_common::{any_greater, subtract_non_negative, Resource, NUM_CLASSIC_TX_BYTES_RESOURCES};
 use henyey_tx::TransactionFrame;
 
 use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
@@ -364,24 +362,6 @@ impl SurgePricingPriorityQueue {
         self.lane_current_count[lane].clone()
     }
 
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn count_txs_resources(
-        &self,
-        txs: &[QueuedTransaction],
-        network_id: &henyey_common::NetworkId,
-        ledger_version: u32,
-    ) -> Vec<Resource> {
-        let mut lane_resources =
-            vec![Resource::make_empty(self.lane_limits[0].size()); self.lane_limits.len()];
-        for tx in txs {
-            let frame = TransactionFrame::with_network(tx.envelope.clone(), *network_id);
-            let lane = self.lane_config.get_lane(&frame);
-            lane_resources[lane] += self.lane_config.tx_resources(&frame, ledger_version);
-        }
-        lane_resources
-    }
-
     pub(crate) fn add(
         &mut self,
         tx: QueuedTransaction,
@@ -523,54 +503,6 @@ impl SurgePricingPriorityQueue {
             }
             self.erase(lane, &entry, ledger_version, network_id);
         }
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)]
-    fn get_most_top_txs_within_limits(
-        mut self,
-        txs: Vec<QueuedTransaction>,
-        network_id: &henyey_common::NetworkId,
-        ledger_version: u32,
-        had_tx_not_fitting_lane: &mut Vec<bool>,
-    ) -> Vec<QueuedTransaction> {
-        let lane_resources = self.count_txs_resources(&txs, network_id, ledger_version);
-        let mut total_resources = Resource::make_empty(self.lane_limits[0].size());
-        let mut all_fit = true;
-        for (lane, res) in lane_resources.iter().enumerate() {
-            if any_greater(res, &self.lane_limits[lane]) {
-                all_fit = false;
-                break;
-            }
-            total_resources += res.clone();
-            if any_greater(&total_resources, &self.lane_limits[GENERIC_LANE]) {
-                all_fit = false;
-                break;
-            }
-        }
-
-        if all_fit {
-            had_tx_not_fitting_lane.clear();
-            had_tx_not_fitting_lane.resize(self.lane_limits.len(), false);
-        }
-
-        for tx in txs {
-            self.add(tx, network_id, ledger_version);
-        }
-        let mut out = Vec::new();
-        let mut lane_left = Vec::new();
-        self.pop_top_txs(
-            true,
-            network_id,
-            ledger_version,
-            |tx| {
-                out.push(tx.clone());
-                VisitTxResult::Processed
-            },
-            &mut lane_left,
-            had_tx_not_fitting_lane,
-        );
-        out
     }
 
     pub(crate) fn can_fit_with_eviction(

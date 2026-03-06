@@ -2,21 +2,21 @@
 
 **Crate**: `henyey-history`
 **Upstream**: `stellar-core/src/history/`
-**Overall Parity**: 76%
-**Last Updated**: 2026-02-13
+**Overall Parity**: 82%
+**Last Updated**: 2026-03-05
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
 | Checkpoint arithmetic | Full | All static methods implemented |
-| History Archive State (HAS) | Partial | Missing FutureBucket resolution |
+| History Archive State (HAS) | Full | FutureBucket resolution, differing buckets, validation |
 | HistoryArchive (shell commands) | Full | get/put/mkdir commands |
 | HistoryArchiveManager | Partial | Missing report/check work |
 | Publish queue | Full | SQLite-backed, crash-safe |
 | CheckpointBuilder | Full | ACID dirty-file pattern |
 | FileTransferInfo / paths | Full | All path generation covered |
-| StateSnapshot / publish | Partial | Missing SCP messages, diffing |
+| StateSnapshot / publish | Partial | Missing SCP messages |
 | Publish metrics / callbacks | None | No Medida equivalent |
 | Verification | Full | Header chain, bucket, tx set |
 | Catchup orchestration | Full | 7-step process (Rust-native) |
@@ -52,7 +52,7 @@ Corresponds to: `HistoryManager.h` (static checkpoint methods), `FileTransferInf
 | `firstLedgerInCheckpointContaining()` | `first_ledger_in_checkpoint_containing()` | Full |
 | `firstLedgerAfterCheckpointContaining()` | `next_checkpoint()` | Full |
 | `lastLedgerBeforeCheckpointContaining()` | `last_ledger_before_checkpoint_containing()` | Full |
-| `ledgerToTriggerCatchup()` | -- | None |
+| `ledgerToTriggerCatchup()` | `ledger_to_trigger_catchup()` | Full |
 | `FileType` enum | Category strings in `paths.rs` | Full |
 | `typeString()` | Inline category strings | Full |
 | `createPath()` | `fs::create_dir_all` | Full |
@@ -79,17 +79,17 @@ Corresponds to: `HistoryArchive.h` (HistoryArchiveState)
 | `remoteDir()` | `checkpoint_path("history", ...)` | Full |
 | `remoteName()` | `has_path()` | Full |
 | `getBucketListHash()` | `get_bucket_list_hash()` | Full |
-| `differingBuckets()` | -- | None |
+| `differingBuckets()` | `differing_bucket_hashes()` | Full |
 | `allBuckets()` | `all_bucket_hashes()` | Full |
 | `serialize()` / `deserialize()` | `from_json()` / `to_json()` via serde | Full |
-| `futuresAllClear()` | -- | None |
-| `futuresAllResolved()` | -- | None |
-| `resolveAllFutures()` | -- | None |
+| `futuresAllClear()` | `futures_all_clear()` | Full |
+| `futuresAllResolved()` | `futures_all_resolved()` | Full |
+| `resolveAllFutures()` | `resolve_all_futures()` | Full |
 | `resolveAnyReadyFutures()` | -- | None |
 | `save()` / `load()` | `to_json()` / `from_json()` + file I/O | Full |
 | `toString()` / `fromString()` | `to_json()` / `from_json()` | Full |
 | `prepareForPublish()` | `build_history_archive_state()` | Full |
-| `containsValidBuckets()` | -- | None |
+| `containsValidBuckets()` | `contains_valid_buckets()` | Full |
 | `hasHotArchiveBuckets()` | `has_hot_archive_buckets()` | Full |
 
 ### remote_archive.rs (`remote_archive.rs`)
@@ -207,7 +207,6 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `ledgerToTriggerCatchup()` | Medium | Catchup trigger point calculation |
 | `logAndUpdatePublishStatus()` | Low | Missing StatusManager integration (logs only) |
 | `maybeQueueHistoryCheckpoint()` | Low | Orchestration in app crate, not history crate |
 | `publishQueuedHistory()` | Medium | No work-based publish orchestration |
@@ -217,12 +216,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `getPublishSuccessCount()` | Low | Metrics tracking |
 | `getPublishFailureCount()` | Low | Metrics tracking |
 | `waitForCheckpointPublish()` | Low | Blocking publish wait |
-| `differingBuckets()` | Medium | Differential bucket download optimization |
-| `futuresAllClear()` | Medium | FutureBucket state checking |
-| `futuresAllResolved()` | Medium | FutureBucket state checking |
-| `resolveAllFutures()` | Medium | FutureBucket merge resolution |
 | `resolveAnyReadyFutures()` | Low | Incremental FutureBucket resolution |
-| `containsValidBuckets()` | Medium | Bucket validation against BucketManager |
 | `writeSCPMessages()` | Low | SCP envelope publishing |
 | `differingHASFiles()` | Low | Differential file upload optimization |
 | `selectRandomReadableHistoryArchive()` | Low | Random selection (sequential used instead) |
@@ -244,8 +238,8 @@ Features not yet implemented. These ARE counted against parity %.
 
 3. **FutureBucket handling**
    - **stellar-core**: Full FutureBucket resolution with in-progress merge tracking. HAS contains merge state that can be resolved on load.
-   - **Rust**: Parses FutureBucket state from HAS JSON via `live_next_states()` and `hot_archive_next_states()`, but does not resolve pending merges.
-   - **Rationale**: Merge resolution is tightly coupled to BucketManager. Rust reads the state but defers resolution to the bucket crate.
+   - **Rust**: Implements `futures_all_clear()`, `futures_all_resolved()`, `resolve_all_futures()`, `contains_valid_buckets()`, and `differing_bucket_hashes()`. Only `resolveAnyReadyFutures()` (incremental resolution of in-progress merges) remains unimplemented.
+   - **Rationale**: Incremental merge resolution is tightly coupled to BucketManager's merge engine. The Rust side handles all state queries and batch resolution.
 
 4. **HTTP archive access**
    - **stellar-core**: Shell command-based (`get` command templates) for all archive access. No built-in HTTP client.
@@ -291,7 +285,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 68 |
-| Gaps (None + Partial) | 22 |
+| Implemented (Full) | 74 |
+| Gaps (None + Partial) | 16 |
 | Intentional Omissions | 7 |
-| **Parity** | **68 / (68 + 22) = 76%** |
+| **Parity** | **74 / (74 + 16) = 82%** |

@@ -1,3 +1,9 @@
+//! Soroban network configuration loading from ledger state.
+//!
+//! Loads `ConfigSettingEntry` values from the ledger snapshot and assembles
+//! them into `SorobanNetworkInfo`, which provides all Soroban-related limits,
+//! fee parameters, and cost model data needed during transaction execution.
+
 use super::*;
 
 /// Load a ConfigSettingEntry from the snapshot by ID.
@@ -451,4 +457,3 @@ pub fn compute_soroban_resource_fee(
         &config.fee_config,
     ))
 }
-

@@ -12,6 +12,7 @@
 //! - [`asset`] - Asset validation, conversion, and balance utilities
 //! - [`config`] - Configuration types for node setup (network, database, history archives)
 //! - [`error`] - Common error types and the [`Result`] type alias
+//! - [`fs_utils`] - Crash-safe filesystem operations (durable rename with fsync)
 //! - [`math`] - 128-bit arithmetic and overflow-safe math operations
 //! - [`meta`] - Ledger metadata normalization for deterministic hashing
 //! - [`network`] - Network identity derived from network passphrases
@@ -19,6 +20,7 @@
 //! - [`resource`] - Resource accounting for transaction limits and surge pricing
 //! - [`time`] - Time utilities for Unix/Stellar timestamp conversions
 //! - [`types`] - Core types like [`Hash256`] used throughout the codebase
+//! - [`xdr_stream`] - Size-prefixed XDR frame I/O (RFC 4506 record marking)
 //!
 //! # Key Types
 //!

@@ -2,21 +2,24 @@
 
 **Crate**: `henyey-common`
 **Upstream**: `stellar-core/src/util/`
-**Overall Parity**: 98%
-**Last Updated**: 2026-02-17
+**Overall Parity**: 99%
+**Last Updated**: 2026-03-05
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
 | Protocol Version | Full | All constants and comparisons match |
-| Types / Hash | Full | Hash256, asset validation, balance ops |
+| Types / Hash | Full | Hash256, XOR, zero-check |
+| Asset Utilities | Full | Validation, issuer, balance, price ops |
 | Numeric (64-bit) | Full | bigDivide, saturating ops, sqrt |
-| Numeric (128-bit) | Full | hugeDivide inlined in henyey-tx |
+| Numeric (128-bit) | Full | bigDivide128, bigMultiply |
 | Resource Accounting | Full | All Resource methods and friends |
 | Metadata Normalization | Full | Sorting matches stellar-core exactly |
 | XDR Output Stream | Full | writeOne with size-prefix framing |
+| XDR Durable Output | Full | durableWriteOne with fsync |
 | XDR Input Stream | Partial | readOne implemented; readPage missing |
+| Filesystem Utilities | Full | durableRename with directory fsync |
 | Network Identity | Full | Passphrase-based derivation |
 | Time Utilities | Full | Epoch conversions implemented |
 | Configuration | Full | Rust-native TOML approach |
@@ -27,13 +30,14 @@
 | stellar-core File | Rust Module | Notes |
 |--------------------|-------------|-------|
 | `ProtocolVersion.h` / `ProtocolVersion.cpp` | `protocol.rs` | Full parity |
-| `types.h` / `types.cpp` | `asset.rs`, `types.rs` | Full parity |
+| `types.h` / `types.cpp` | `asset.rs`, `types.rs` | Full parity for protocol functions; utility functions covered by Rust stdlib |
 | `numeric.h` / `numeric.cpp` | `math.rs` | Full parity |
-| `numeric128.h` | `math.rs` | hugeDivide inlined in henyey-tx |
+| `numeric128.h` | `math.rs` | `hugeDivide` inlined in henyey-tx |
 | `TxResource.h` / `TxResource.cpp` | `resource.rs` | Full parity |
 | `MetaUtils.h` / `MetaUtils.cpp` | `meta.rs` | Full parity |
-| `XDRStream.h` | `xdr_stream.rs` | Output full; input partial (readPage missing) |
-| `Math.h` / `Math.cpp` | `math.rs` | Numeric only; random omitted |
+| `XDRStream.h` | `xdr_stream.rs` | Output + durable full; input partial (readPage missing) |
+| `Fs.h` / `Fs.cpp` | `fs_utils.rs` | `durableRename` only; other Fs functions intentionally omitted |
+| `Math.h` / `Math.cpp` | — | Random/clustering utilities intentionally omitted |
 
 ## Component Mapping
 
@@ -74,12 +78,13 @@ Corresponds to: `types.h` (asset / balance / utility portion)
 | `isAssetValid<T>()` | `is_asset_valid()` | Full |
 | `isTrustLineAssetValid()` | `is_trustline_asset_valid()` | Full |
 | `isChangeTrustAssetValid()` | `is_change_trust_asset_valid()` | Full |
-| `compareAsset()` | `compare_asset()` | Full |
 | `getIssuer<T>()` | `get_issuer()` | Full |
 | `isIssuer<T>()` | `is_issuer()` | Full |
 | `assetCodeToStr<N>()` | `asset_code_to_str()` | Full |
 | `strToAssetCode<N>()` | `str_to_asset_code()` | Full |
 | `assetToString()` | `asset_to_string()` | Full |
+| `isStringValid()` | `is_string_valid()` | Full |
+| `isAsciiNonControl()` | `is_ascii_non_control()` | Full |
 
 #### Type Utilities
 
@@ -88,19 +93,9 @@ Corresponds to: `types.h` (asset / balance / utility portion)
 | `LedgerEntryKey()` | `ledger_entry_key()` | Full |
 | `getBucketLedgerKey(BucketEntry)` | `get_bucket_ledger_key()` | Full |
 | `getBucketLedgerKey(HotArchiveBucketEntry)` | `get_hot_archive_bucket_ledger_key()` | Full |
-| `isStringValid()` | `is_string_valid()` | Full |
-| `unsignedToSigned(uint32_t)` | `unsigned_to_signed_32()` | Full |
-| `unsignedToSigned(uint64_t)` | `unsigned_to_signed_64()` | Full |
-| `formatSize()` | `format_size()` | Full |
 | `addBalance()` | `add_balance()` | Full |
-| `iequals()` | `iequals()` | Full |
-| `roundDown<T>()` | `round_down()` | Full |
-| `isAsciiAlphaNumeric()` | `is_ascii_alphanumeric()` | Full |
-| `isAsciiNonControl()` | `is_ascii_non_control()` | Full |
-| `toAsciiLower()` | `to_ascii_lower()` | Full |
 | `operator>=(Price)` | `price_ge()` | Full |
 | `operator>(Price)` | `price_gt()` | Full |
-| `operator==(Price)` | `price_eq()` | Full |
 
 ### math (`math.rs`)
 
@@ -113,12 +108,10 @@ Corresponds to: `numeric.h`, `numeric128.h`
 | `Rounding` enum | `Rounding` enum | Full |
 | `isRepresentableAsInt64()` | `is_representable_as_i64()` | Full |
 | `doubleToClampedUint32()` | `double_to_clamped_u32()` | Full |
-| `bigDivideOrThrow()` | `big_divide_or_throw()` | Full |
 | `bigDivide()` | `big_divide()` | Full |
 | `bigDivideUnsigned()` | `big_divide_unsigned()` | Full |
 | `bigSquareRoot()` | `big_square_root()` | Full |
 | `saturatingMultiply()` | `saturating_multiply()` | Full |
-| `saturatingAdd<T>()` | `saturating_add()` | Full |
 
 #### 128-bit Arithmetic (numeric128.h)
 
@@ -126,10 +119,8 @@ Corresponds to: `numeric.h`, `numeric128.h`
 |--------------|------|--------|
 | `bigDivide128()` | `big_divide_128()` | Full |
 | `bigDivideUnsigned128()` | `big_divide_unsigned_128()` | Full |
-| `bigDivideOrThrow128()` | `big_divide_128()` (returns Result) | Full |
 | `bigMultiplyUnsigned()` | `big_multiply_unsigned()` | Full |
 | `bigMultiply()` | `big_multiply()` | Full |
-| `hugeDivide()` | Inlined in `exchange_with_pool()` (`henyey-tx`) | Full |
 
 ### resource (`resource.rs`)
 
@@ -188,11 +179,19 @@ Corresponds to: `XDRStream.h`
 | `OutputFileStream::open()` | `XdrOutputStream::open()` | Full |
 | `OutputFileStream::fdopen()` | `XdrOutputStream::from_fd()` | Full |
 | `OutputFileStream::flush()` | `XdrOutputStream::flush()` | Full |
-| `XDROutputFileStream::durableWriteOne()` | -- | None |
+| `XDROutputFileStream::durableWriteOne()` | `DurableXdrOutputStream::durable_write_one()` | Full |
 | `XDRInputFileStream::open()` | `XdrInputStream::open()` | Full |
 | `XDRInputFileStream::readOne()` | `XdrInputStream::read_one()` | Full |
 | `XDRInputFileStream::getXDRSize()` | Inlined in `read_one()` | Full |
-| `XDRInputFileStream::readPage()` | -- | None |
+| `XDRInputFileStream::readPage()` | — | None |
+
+### fs_utils (`fs_utils.rs`)
+
+Corresponds to: `Fs.h` (partial)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `durableRename()` | `durable_rename()` | Full |
 
 ## Intentional Omissions
 
@@ -200,10 +199,22 @@ Features excluded by design. These are NOT counted against parity %.
 
 | stellar-core Component | Reason |
 |------------------------|--------|
+| `compareAsset()` (`types.h`) | Rust XDR types derive `PartialEq`; direct `==` comparison works |
+| `unsignedToSigned(uint32_t)` / `unsignedToSigned(uint64_t)` (`types.h`) | Rust `TryFrom` / `as` casts; no wrapper needed |
+| `formatSize()` (`types.h`) | Formatting utility; not protocol-critical |
+| `iequals()` (`types.h`) | Rust `str::eq_ignore_ascii_case()` in stdlib |
+| `roundDown<T>()` (`types.h`) | Implemented locally where needed (bucket crate) |
+| `isAsciiAlphaNumeric()` (`types.h`) | Rust `char::is_ascii_alphanumeric()` in stdlib |
+| `toAsciiLower()` (`types.h`) | Rust `char::to_ascii_lowercase()` in stdlib |
+| `operator==(Price)` (`types.h`) | Rust XDR types derive `PartialEq` |
+| `bigDivideOrThrow()` (`numeric.h`) | Rust `big_divide()` returns `Result`; caller uses `?` or `.unwrap()` |
+| `saturatingAdd<T>()` (`numeric.h`) | Rust `u64::saturating_add()` in stdlib |
+| `bigDivideOrThrow128()` (`numeric128.h`) | `big_divide_128()` returns `Result`; same pattern |
+| `hugeDivide()` (`numeric128.h`) | Inlined in `exchange_with_pool()` in `henyey-tx` |
 | `VirtualClock` / `VirtualTimer` (`Timer.h`) | Rust uses tokio async runtime instead |
 | `Scheduler` (`Scheduler.h`) | Handled by tokio task scheduling |
 | `Logging` / `CoutLogger` / CLOG macros (`Logging.h`) | Deferred to Rust `tracing` crate ecosystem |
-| `Fs` namespace (`Fs.h`) | Rust `std::fs` and `std::path` suffice |
+| `Fs` namespace (`Fs.h`) (except `durableRename`) | Rust `std::fs` and `std::path` suffice |
 | `GlobalChecks` / `releaseAssert` (`GlobalChecks.h`) | Rust `assert!` / `panic!` are built-in |
 | `NonCopyable` / `NonMovable` (`NonCopyable.h`) | Rust ownership system handles this natively |
 | `BacktraceManager` (`Backtrace.h`) | Rust has `std::backtrace::Backtrace` |
@@ -243,8 +254,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `XDRInputFileStream::readPage()` | Low | Page-based reading with key search; optimization |
-| `XDROutputFileStream::durableWriteOne()` | Low | Durable write with fsync; needed for crash safety |
+| `XDRInputFileStream::readPage()` | Low | Page-based reading with key search; BucketListDB optimization |
 
 ## Architectural Differences
 
@@ -269,9 +279,14 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: Newtype pattern provides type safety and method namespace
 
 5. **XDR Stream I/O**
-   - **stellar-core**: ASIO-based buffered streams with fsync support and dual read/write classes
-   - **Rust**: `BufWriter`-based output stream and `BufReader`-based input stream; no fsync/durable write support
-   - **Rationale**: Rust standard library buffered I/O suffices; fsync can be added when crash safety is needed
+   - **stellar-core**: ASIO-based buffered streams with a single class hierarchy
+   - **Rust**: Separate `XdrOutputStream` and `DurableXdrOutputStream` types; `BufWriter`/`BufReader` from stdlib
+   - **Rationale**: Rust's type system makes separate types clearer than runtime flags
+
+6. **Durable Filesystem Operations**
+   - **stellar-core**: `Fs` namespace with many filesystem utilities
+   - **Rust**: Only `durable_rename` implemented; other Fs operations use `std::fs` directly
+   - **Rationale**: Rust stdlib covers most filesystem operations; only `durableRename` has non-trivial crash-safety semantics
 
 ## Test Coverage
 
@@ -280,23 +295,23 @@ Features not yet implemented. These ARE counted against parity %.
 | Balance | 1 TEST_CASE | 1 #[test] | Covered |
 | BigDivide | 4 TEST_CASE / 8 SECTION | 10 #[test] | Good coverage |
 | Uint128 | 3 TEST_CASE / 5 SECTION | 2 #[test] | Adequate |
-| XDRStream | 2 TEST_CASE / 3 SECTION | 10 #[test] | Output and input roundtrip coverage |
+| XDRStream | 2 TEST_CASE / 3 SECTION | 10 #[test] | Output, durable, and input roundtrip coverage |
 | Timer | 8 TEST_CASE | 2 #[test] | Rust covers epoch conversions only |
+| Filesystem | 4 TEST_CASE | 3 #[test] | `durable_rename` basic, overwrite, error cases |
 | Math (random) | 1 TEST_CASE / 5 SECTION | 0 #[test] | Intentionally omitted (rand crate) |
 | Cache | 8 TEST_CASE | 0 #[test] | Intentionally omitted |
 | BitSet | 6 TEST_CASE | 0 #[test] | Intentionally omitted |
 | Decoder | 9 TEST_CASE | 0 #[test] | Intentionally omitted |
 | Scheduler | 2 TEST_CASE | 0 #[test] | Intentionally omitted |
 | StatusManager | 5 TEST_CASE | 0 #[test] | Intentionally omitted |
-| Filesystem | 4 TEST_CASE | 0 #[test] | Intentionally omitted |
 | Metrics | 12 TEST_CASE | 0 #[test] | Intentionally omitted |
 | BinaryFuse | 1 TEST_CASE / 3 SECTION | 0 #[test] | Intentionally omitted |
-| Protocol | -- | 4 #[test] | Rust-only tests |
-| Types/Hash | -- | 3 #[test] | Rust-only tests |
-| Asset | -- | 19 #[test] | Rust-only tests |
-| Resource | -- | 13 #[test] | Rust-only tests |
-| Network | -- | 2 #[test] | Rust-only tests |
-| Meta | -- | 0 #[test] | No unit tests; relies on integration tests |
+| Protocol | — | 4 #[test] | Rust-only tests |
+| Types/Hash | — | 3 #[test] | Rust-only tests |
+| Asset | — | 19 #[test] | Rust-only tests |
+| Resource | — | 13 #[test] | Rust-only tests |
+| Network | — | 3 #[test] | Rust-only tests |
+| Meta | — | 0 #[test] | No unit tests; relies on integration tests |
 
 ### Test Gaps
 
@@ -308,7 +323,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 92 |
-| Gaps (None) | 2 |
-| Intentional Omissions | 35 |
-| **Parity** | **92 / (92 + 2) = 98%** |
+| Implemented (Full) | 76 |
+| Gaps (None) | 1 |
+| Intentional Omissions | 47 |
+| **Parity** | **76 / (76 + 1) = 99%** |

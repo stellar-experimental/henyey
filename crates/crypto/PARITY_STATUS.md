@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-crypto`
 **Upstream**: `stellar-core/src/crypto/`
-**Overall Parity**: 79%
-**Last Updated**: 2026-02-13
+**Overall Parity**: 78%
+**Last Updated**: 2026-03-05
 
 ## Summary
 
@@ -16,7 +16,7 @@
 | Curve25519 ECDH | Full | Key exchange, shared key derivation |
 | Sealed Box Encryption | Full | Encrypt/decrypt via crypto_box |
 | Ed25519 Keys & Signatures | Full | Generate, sign, verify, StrKey encode/decode |
-| StrKey Encoding | Full | All 7 key types supported |
+| StrKey Encoding | Full | Via re-exported `stellar_strkey` crate |
 | Short Hash (SipHash) | Full | computeHash, xdrComputeHash, seed management |
 | SignerKey Utilities | Full | preAuthTx, hashX, ed25519Payload |
 | Signature Verification Cache | None | Performance optimization, not correctness |
@@ -32,11 +32,11 @@
 | `Random.h` / `Random.cpp` | `random.rs` | CSPRNG |
 | `Curve25519.h` / `Curve25519.cpp` | `curve25519.rs`, `sealed_box.rs` | ECDH and sealed box split across two modules |
 | `SecretKey.h` / `SecretKey.cpp` | `keys.rs`, `signature.rs` | Key types and signing utilities |
-| `StrKey.h` / `StrKey.cpp` | `strkey.rs` | StrKey encoding/decoding |
+| `StrKey.h` / `StrKey.cpp` | *(re-export)* `stellar_strkey` | StrKey encoding/decoding delegated to external crate |
 | `ShortHash.h` / `ShortHash.cpp` | `short_hash.rs` | SipHash-2-4 |
 | `SignerKey.h` / `SignerKey.cpp` | `signer_key.rs` | KeyFunctions<SignerKey> specialization |
 | `SignerKeyUtils.h` / `SignerKeyUtils.cpp` | `signer_key.rs` | SignerKey construction utilities |
-| `KeyUtils.h` / `KeyUtils.cpp` | `strkey.rs`, `keys.rs` | Generic key encode/decode (split across modules) |
+| `KeyUtils.h` / `KeyUtils.cpp` | `keys.rs` | Generic key encode/decode via methods on key types |
 | `CryptoError.h` | `error.rs` | Error types |
 | `XDRHasher.h` | `hash.rs` | XDR hashing (different approach) |
 
@@ -55,7 +55,6 @@ Corresponds to: `SHA.h`, `BLAKE2.h`
 | `SHA256::add(ByteSlice)` | `Sha256Hasher::update(&[u8])` | Full |
 | `SHA256::finish()` | `Sha256Hasher::finalize()` | Full |
 | `xdrSha256<T>(T)` | `xdr_sha256<T: WriteXdr>(T)` | Full |
-| `XDRSHA256::hashBytes()` | `XdrSha256Hasher::hash_bytes()` | Full |
 | `hmacSha256(key, bin)` | `hmac_sha256(&[u8; 32], &[u8])` | Full |
 | `hmacSha256Verify(hmac, key, bin)` | `hmac_sha256_verify(&[u8; 32], &[u8; 32], &[u8])` | Full |
 | `hkdfExtract(bin)` | `hkdf_extract(&[u8])` | Full |
@@ -66,7 +65,6 @@ Corresponds to: `SHA.h`, `BLAKE2.h`
 | `BLAKE2::add(ByteSlice)` | `Blake2Hasher::update(&[u8])` | Full |
 | `BLAKE2::finish()` | `Blake2Hasher::finalize()` | Full |
 | `xdrBlake2<T>(T)` | `xdr_blake2<T: WriteXdr>(T)` | Full |
-| `XDRBLAKE2::hashBytes()` | `XdrBlake2Hasher::hash_bytes()` | Full |
 
 ### hex.rs (`hex.rs`)
 
@@ -135,17 +133,17 @@ Corresponds to: `SecretKey.h`
 | `HashUtils::random()` | -- | None |
 | `hash<PublicKey>::operator()` | `Hash for PublicKey` (derived) | Full |
 
-### strkey.rs (`strkey.rs`)
+### StrKey (via `stellar_strkey` re-export)
 
 Corresponds to: `StrKey.h`, `KeyUtils.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `strKey::toStrKey(ver, bin)` | `encode_check(version, &[u8])` (internal) | Full |
-| `strKey::fromStrKey(s, ver, decoded)` | `decode_and_verify(version, &str)` (internal) | Full |
+| `strKey::toStrKey(ver, bin)` | `stellar_strkey` crate (internal) | Full |
+| `strKey::fromStrKey(s, ver, decoded)` | `stellar_strkey` crate (internal) | Full |
 | `strKey::getStrKeySize(dataSize)` | -- | None |
-| `KeyUtils::toStrKey<T>(key)` | `encode_account_id()`, `encode_secret_seed()`, etc. | Full |
-| `KeyUtils::fromStrKey<T>(s)` | `decode_account_id()`, `decode_secret_seed()`, etc. | Full |
+| `KeyUtils::toStrKey<T>(key)` | `PublicKey::to_strkey()`, `SecretKey::to_strkey()` | Full |
+| `KeyUtils::fromStrKey<T>(s)` | `PublicKey::from_strkey()`, `SecretKey::from_strkey()` | Full |
 | `KeyUtils::toShortString<T>(key)` | -- | None |
 | `KeyUtils::getKeyVersionSize(ver)` | -- | None |
 | `KeyUtils::canConvert<T,F>(key)` | -- | None |
@@ -190,7 +188,10 @@ Features excluded by design. These are NOT counted against parity %.
 | stellar-core Component | Reason |
 |------------------------|--------|
 | `ByteSlice` adaptor class | Rust native `&[u8]` slices serve the same purpose |
-| `XDRHasher<T>` CRTP base class | Rust uses allocation-based XDR serialization; streaming XDR hashers exist but without the buffered CRTP pattern |
+| `XDRHasher<T>` CRTP base class | Rust uses allocation-based XDR serialization; the public `xdrSha256`/`xdrBlake2` functions are implemented differently |
+| `XDRSHA256::hashBytes()` | Internal CRTP implementation detail; public API `xdrSha256<T>` is fully implemented |
+| `XDRBLAKE2::hashBytes()` | Internal CRTP implementation detail; public API `xdrBlake2<T>` is fully implemented |
+| `XDRShortHasher` (zero-alloc streaming) | Performance optimization; `xdr_compute_hash()` provides equivalent functionality via allocation |
 | `KeyFunctions<PublicKey>` template specialization | Functionality covered by direct `PublicKey` method implementations |
 | `KeyFunctions<SignerKey>` (5 of 7 methods) | `getKeyTypeName`, `getKeyVersionIsSupported`, `toKeyType`, `toKeyVersion`, `getKeyValue`, `setKeyValue` are replaced by Rust match expressions and direct construction |
 | `SecretKey::benchmarkOpsPerSecond()` | Benchmark-only utility, not needed for correctness |
@@ -199,7 +200,6 @@ Features excluded by design. These are NOT counted against parity %.
 | `PubKeyUtils::pseudoRandomForTesting()` | Test-only (`BUILD_TESTS` guard) |
 | `HashUtils::pseudoRandomForTesting()` | Test-only (`BUILD_TESTS` guard) |
 | `PubKeyUtils::enableRustDalekVerify()` | Protocol migration helper; Rust implementation always uses ed25519-dalek |
-| `XDRShortHasher` (zero-alloc streaming) | Performance optimization; `xdr_compute_hash()` provides equivalent functionality via allocation |
 
 ## Gaps
 
@@ -242,7 +242,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 4. **Key type template system**
    - **stellar-core**: Uses `KeyFunctions<T>` template specializations to provide generic StrKey encode/decode for `PublicKey`, `SecretKey`, and `SignerKey`
-   - **Rust**: Provides separate typed functions (`encode_account_id`, `decode_secret_seed`, etc.) and dedicated methods on key types
+   - **Rust**: Provides separate typed functions and dedicated methods on key types; StrKey encoding delegated to `stellar_strkey` crate
    - **Rationale**: Rust's type system and trait implementations replace the need for C++ template specializations; the specific function names are more discoverable
 
 5. **Error handling**
@@ -263,7 +263,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Curve25519 / ECDH | -- | 9 #[test] | Upstream tests are in overlay |
 | Random | 1 TEST_CASE | 3 #[test] | Basic non-determinism checks |
 | SignerKey | Included in StrKey tests | 7 #[test] | Good coverage |
-| Sealed Box | -- | Covered via integration | Upstream tests in overlay |
+| Sealed Box | -- | 8 #[test] | Upstream tests in overlay |
 
 ### Test Gaps
 
@@ -275,7 +275,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 54 |
+| Implemented (Full) | 52 |
 | Gaps (None + Partial) | 15 |
-| Intentional Omissions | 11 |
-| **Parity** | **54 / (54 + 15) = 79%** |
+| Intentional Omissions | 13 |
+| **Parity** | **52 / (52 + 15) = 78%** |

@@ -440,7 +440,7 @@ impl App {
                     type_: MessageType::Transaction,
                     req_hash: stellar_xdr::curr::Uint256(hash.0),
                 };
-                if let Err(_) = overlay.try_send_to(peer_id, StellarMessage::DontHave(dont_have)) {
+                if overlay.try_send_to(peer_id, StellarMessage::DontHave(dont_have)).is_err() {
                     dropped += 1;
                     break;
                 }

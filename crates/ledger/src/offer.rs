@@ -158,20 +158,6 @@ pub fn is_better_offer(lhs: &OfferDescriptor, rhs: &OfferDescriptor) -> bool {
     lhs < rhs
 }
 
-/// Check if one offer entry is better than another.
-///
-/// This is a convenience function that extracts offer descriptors from
-/// ledger entries and compares them.
-///
-/// # Panics
-///
-/// Panics if either ledger entry does not contain an offer.
-pub fn is_better_offer_entry(lhs: &LedgerEntry, rhs: &LedgerEntry) -> bool {
-    let lhs_desc = OfferDescriptor::from_ledger_entry(lhs);
-    let rhs_desc = OfferDescriptor::from_ledger_entry(rhs);
-    is_better_offer(&lhs_desc, &rhs_desc)
-}
-
 /// A trading pair of assets.
 ///
 /// This struct represents a pair of assets being traded in the DEX:
@@ -225,23 +211,6 @@ impl IsBetterOfferComparator {
     pub fn compare(&self, lhs: &OfferDescriptor, rhs: &OfferDescriptor) -> bool {
         is_better_offer(lhs, rhs)
     }
-}
-
-/// Sort offers by their price and ID.
-///
-/// This sorts offers in ascending order by price, with ties broken by offer ID.
-/// The result is that better offers (lower price, or equal price with lower ID)
-/// come first.
-///
-/// # Panics
-///
-/// Panics if any ledger entry does not contain an offer.
-pub fn sort_offers(offers: &mut [LedgerEntry]) {
-    offers.sort_by(|a, b| {
-        let a_desc = OfferDescriptor::from_ledger_entry(a);
-        let b_desc = OfferDescriptor::from_ledger_entry(b);
-        a_desc.cmp(&b_desc)
-    });
 }
 
 /// Sort offer descriptors by price and ID.

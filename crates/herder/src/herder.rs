@@ -2306,42 +2306,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
-    fn make_signed_nomination_envelope(
-        slot: u64,
-        value: Value,
-        accepted: bool,
-        herder: &Herder,
-        secret: &SecretKey,
-    ) -> ScpEnvelope {
-        let quorum_set = herder
-            .scp_driver
-            .get_local_quorum_set()
-            .expect("local quorum set");
-
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256(*secret.public_key().as_bytes()),
-        ));
-
-        let accepted_values = if accepted {
-            vec![value.clone()].try_into().unwrap()
-        } else {
-            vec![].try_into().unwrap()
-        };
-
-        let statement = ScpStatement {
-            node_id,
-            slot_index: slot,
-            pledges: ScpStatementPledges::Nominate(ScpNomination {
-                quorum_set_hash: hash_quorum_set(&quorum_set).into(),
-                votes: vec![value].try_into().unwrap(),
-                accepted: accepted_values,
-            }),
-        };
-
-        sign_statement(&statement, herder, secret)
-    }
-
     /// Creates a test envelope with a valid signature for the given herder's network.
     fn make_signed_test_envelope(slot: u64, herder: &Herder) -> ScpEnvelope {
         // Generate a test keypair
@@ -2839,34 +2803,6 @@ mod tests {
                     quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
                     votes: vec![value].try_into().unwrap(),
                     accepted: vec![].try_into().unwrap(),
-                }),
-            },
-            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
-        }
-    }
-
-    /// Create an EXTERNALIZE envelope with a specific close time.
-    #[allow(dead_code)]
-    fn make_externalize_envelope_with_close_time(
-        slot: u64,
-        close_time: u64,
-    ) -> ScpEnvelope {
-        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-            stellar_xdr::curr::Uint256([1u8; 32]),
-        ));
-        let value = make_value_with_close_time(close_time);
-
-        ScpEnvelope {
-            statement: ScpStatement {
-                node_id,
-                slot_index: slot,
-                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
-                    commit: ScpBallot {
-                        counter: 1,
-                        value: value,
-                    },
-                    n_h: 1,
-                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
                 }),
             },
             signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),

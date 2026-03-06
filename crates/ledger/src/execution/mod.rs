@@ -871,37 +871,6 @@ impl TransactionExecutor {
         Ok(false)
     }
 
-    /// Load a data entry from the snapshot into the state manager.
-    pub fn load_data(
-        &mut self,
-        snapshot: &SnapshotHandle,
-        account_id: &AccountId,
-        data_name: &str,
-    ) -> Result<bool> {
-        // Check if already in state from previous transaction in this ledger
-        if self.state.get_data(account_id, data_name).is_some() {
-            return Ok(true);
-        }
-
-        // If the entry was loaded during this TX and then deleted, don't reload.
-        if self.state.is_data_tracked(account_id, data_name) {
-            return Ok(false);
-        }
-
-        let name_bytes = stellar_xdr::curr::String64::try_from(data_name.as_bytes().to_vec())
-            .map_err(|e| LedgerError::Internal(format!("Invalid data name: {}", e)))?;
-        let key = stellar_xdr::curr::LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
-            account_id: account_id.clone(),
-            data_name: name_bytes,
-        });
-
-        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
-            self.state.load_entry(entry);
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
     /// Load a data entry from the snapshot using the raw String64 key.
     /// This preserves non-UTF8 bytes in the data name.
     pub fn load_data_raw(
@@ -926,34 +895,6 @@ impl TransactionExecutor {
         let key = stellar_xdr::curr::LedgerKey::Data(stellar_xdr::curr::LedgerKeyData {
             account_id: account_id.clone(),
             data_name: data_name.clone(),
-        });
-
-        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
-            self.state.load_entry(entry);
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    /// Load an offer from the snapshot into the state manager.
-    pub fn load_offer(
-        &mut self,
-        snapshot: &SnapshotHandle,
-        seller_id: &AccountId,
-        offer_id: i64,
-    ) -> Result<bool> {
-        if self.state.get_offer(seller_id, offer_id).is_some() {
-            return Ok(true);
-        }
-
-        // If the entry was loaded during this TX and then deleted, don't reload.
-        if self.state.is_offer_tracked(seller_id, offer_id) {
-            return Ok(false);
-        }
-
-        let key = stellar_xdr::curr::LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
-            seller_id: seller_id.clone(),
-            offer_id,
         });
 
         if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {

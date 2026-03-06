@@ -129,8 +129,6 @@ pub mod max_config {
 pub struct ConfigUpgradeSetFrame {
     /// The upgrade set data.
     config_upgrade_set: ConfigUpgradeSet,
-    /// The key used to load this upgrade set.
-    key: ConfigUpgradeSetKey,
     /// Whether the XDR is valid (hash matches, sorted, no duplicates).
     valid_xdr: bool,
     /// The ledger version when this was loaded.
@@ -204,7 +202,6 @@ impl ConfigUpgradeSetFrame {
         let frame = Self {
             valid_xdr: Self::is_valid_xdr_static(&upgrade_set, key),
             config_upgrade_set: upgrade_set,
-            key: key.clone(),
             ledger_version,
         };
 
@@ -258,38 +255,6 @@ impl ConfigUpgradeSetFrame {
         &self.config_upgrade_set
     }
 
-    /// Get the key used to load this upgrade set.
-    pub fn get_key(&self) -> &ConfigUpgradeSetKey {
-        &self.key
-    }
-
-    /// Check if any upgrade is needed.
-    ///
-    /// Returns true if any entry in the upgrade set differs from the current
-    /// ledger state.
-    pub fn upgrade_needed(&self, snapshot: &SnapshotHandle) -> bool {
-        for entry in self.config_upgrade_set.updated_entry.iter() {
-            let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
-                config_setting_id: entry.discriminant(),
-            });
-
-            if let Ok(Some(current)) = snapshot.get_entry(&key) {
-                if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(current_entry) =
-                    &current.data
-                {
-                    if current_entry != entry {
-                        return true;
-                    }
-                }
-            } else {
-                // Entry doesn't exist, upgrade needed
-                return true;
-            }
-        }
-
-        false
-    }
-
     /// Validate the upgrade for application.
     ///
     /// Returns Valid if:
@@ -320,21 +285,6 @@ impl ConfigUpgradeSetFrame {
         }
 
         ConfigUpgradeValidity::Valid
-    }
-
-    /// Check if this upgrade is consistent with a scheduled upgrade.
-    pub fn is_consistent_with(&self, scheduled: Option<&ConfigUpgradeSetFrame>) -> bool {
-        match scheduled {
-            Some(other) => self.key == other.key,
-            None => false,
-        }
-    }
-
-    /// Get the XDR bytes of the upgrade set.
-    pub fn to_xdr_bytes(&self) -> Vec<u8> {
-        self.config_upgrade_set
-            .to_xdr(Limits::none())
-            .unwrap_or_default()
     }
 
     /// Apply the configuration upgrades to the ledger.

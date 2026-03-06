@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-overlay`
 **Upstream**: `stellar-core/src/overlay/`
-**Overall Parity**: 100%
-**Last Updated**: 2026-02-20
+**Overall Parity**: 92%
+**Last Updated**: 2026-03-05
 
 ## Summary
 
@@ -188,7 +188,7 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `drop()` | `close()` | Full |
 | `getRole()` | `direction()` | Full |
 | `getLifeTime()` | (via PeerStats.connected_at) | Full |
-| `getPing()` | N/A | None |
+| `getPing()` | RTT tracked via GetScpQuorumset ping | Full |
 | `getRemoteVersion()` | `info().remote_version` | Full |
 | `getRemoteOverlayVersion()` | `info().overlay_version` | Full |
 | `getAddress()` | `remote_addr()` | Full |
@@ -196,8 +196,8 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `toString()` | `Display` impl | Full |
 | `getJsonInfo()` | N/A | None |
 | `handleMaxTxSizeIncrease()` | `OverlayManager::handle_max_tx_size_increase()` | Full |
-| `pingPeer()` | N/A | None |
-| `maybeProcessPingResponse()` | N/A | None |
+| `pingPeer()` | GetScpQuorumset ping every 5s in `run_peer_loop()` | Full |
+| `maybeProcessPingResponse()` | DontHave response RTT tracking | Full |
 | `startRecurrentTimer()` | 5s check in `run_peer_loop()` | Full |
 | `recurrentTimerExpired()` | Idle/straggler timeout in `run_peer_loop()` | Full |
 | `getIOTimeout()` | Idle/straggler timeout in `run_peer_loop()` | Full |
@@ -213,7 +213,7 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `isAuthenticated()` | `is_ready()` | Full |
 | `PeerMetrics` struct | `PeerStats` struct | Full |
 | `TimestampedMessage` | (implicit in codec/connection) | Full |
-| `CapacityTrackedMessage` | N/A | None |
+| `CapacityTrackedMessage` | `CapacityGuard` RAII in `flow_control.rs` | Full |
 | `TCPPeer::initiate()` | `Peer::connect()` | Full |
 | `TCPPeer::accept()` | `Peer::accept()` | Full |
 | `TCPPeer::drop()` | `Peer::close()` | Full |
@@ -311,7 +311,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `clearLedgersBelow()` | `clear_ledgers_below()` | Full |
 | `broadcastMessage()` | (via broadcast channel + flood gate) | Full |
 | `recvFloodedMsgID()` | `FloodGate::record_seen()` | Full |
-| `recvTransaction()` | (via broadcast channel) | Partial |
+| `recvTransaction()` | (via broadcast channel + flood gate) | Full |
 | `forgetFloodedMsg()` | (TTL-based cleanup) | Full |
 | `recvTxDemand()` | `TxDemandsManager::recv_demand()` | Full |
 | `getRandomAuthenticatedPeers()` | (shuffled peer list) | Full |
@@ -344,13 +344,13 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `getFlowControlBytesTotal()` | N/A | None |
 | `checkScheduledAndCache()` | (via FloodGate.has_seen) | Full |
 | `getOverlayThreadSnapshot()` | N/A | None |
-| `tick()` | N/A | None |
-| `updateTimerAndMaybeDropRandomPeer()` | N/A | None |
-| `storeConfigPeers()` | N/A | None |
-| `purgeDeadPeers()` | N/A | None |
-| `triggerPeerResolution()` | N/A | None |
-| `resolvePeers()` | (DNS resolution inline) | Partial |
-| `storePeerList()` | N/A | None |
+| `tick()` | `start_tick_loop()` (3s interval) | Full |
+| `updateTimerAndMaybeDropRandomPeer()` | `maybe_drop_random_peer()` | Full |
+| `storeConfigPeers()` | In `start()` — stores known+preferred peers | Full |
+| `purgeDeadPeers()` | In `start()` — `remove_peers_with_many_failures(120)` | Full |
+| `triggerPeerResolution()` | DNS backoff in tick loop | Full |
+| `resolvePeers()` | DNS resolution with exponential backoff | Full |
+| `storePeerList()` | In `start()` and tick loop | Full |
 | `connectToImpl()` | (in connector flow) | Full |
 | `moveToAuthenticated()` | (in handshake completion) | Full |
 | `nonPreferredAuthenticatedCount()` | N/A | None |
@@ -499,19 +499,13 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `Peer::pingPeer()` / `maybeProcessPingResponse()` | Medium | Ping/pong for connection liveness |
 | `Peer::getJsonInfo()` | Low | JSON info for admin API |
 | `Peer::process()` (query throttle) | Low | Rate limiting GetTxSet/GetQuorumSet |
-| `CapacityTrackedMessage` (RAII tracker) | Medium | Automatic capacity release on drop |
-| `OverlayManagerImpl::tick()` | Low | Idle/straggler timeout now in `run_peer_loop()`; connect in connector task; remaining: cleanupPeers, random peer drop |
-| `OverlayManagerImpl::updateTimerAndMaybeDropRandomPeer()` | Low | Random peer rotation |
-| `OverlayManagerImpl::storeConfigPeers()` | Low | Persist config peers to DB |
-| `OverlayManagerImpl::purgeDeadPeers()` | Low | `remove_peers_with_many_failures()` exists; needs wiring at startup |
-| `OverlayManagerImpl::triggerPeerResolution()` / `resolvePeers()` | Low | Async DNS with retry |
 | `OverlayManagerImpl::getRandomInboundAuthenticatedPeers()` | Low | Separate inbound peer list |
 | `OverlayManagerImpl::getRandomOutboundAuthenticatedPeers()` | Low | Separate outbound peer list |
 | `OverlayManagerImpl::getInboundPendingPeers()` | Low | Pending peer tracking |
 | `OverlayManagerImpl::getOutboundPendingPeers()` | Low | Pending peer tracking |
+| `OverlayManagerImpl::getPendingPeers()` | Low | Combined pending peer list |
 | `OverlayManagerImpl::getPendingPeersCount()` | Low | Pending count |
 | `OverlayManagerImpl::getInboundAuthenticatedPeers()` | Low | Separate inbound map |
 | `OverlayManagerImpl::getOutboundAuthenticatedPeers()` | Low | Separate outbound map |
@@ -586,7 +580,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 271 |
-| Gaps (None + Partial) | 37 |
+| Implemented (Full) | 282 |
+| Gaps (None + Partial) | 24 |
 | Intentional Omissions | 11 |
-| **Parity** | **271 / (271 + 37) = 88%** |
+| **Parity** | **282 / (282 + 24) = 92%** |

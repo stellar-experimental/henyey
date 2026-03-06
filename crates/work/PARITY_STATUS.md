@@ -3,7 +3,7 @@
 **Crate**: `henyey-work`
 **Upstream**: `stellar-core/src/work/`
 **Overall Parity**: 39%
-**Last Updated**: 2026-02-17
+**Last Updated**: 2026-03-05
 
 ## Summary
 

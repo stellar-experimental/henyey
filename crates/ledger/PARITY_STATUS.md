@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-ledger`
 **Upstream**: `stellar-core/src/ledger/`
-**Overall Parity**: 66%
-**Last Updated**: 2026-02-23
+**Overall Parity**: 65%
+**Last Updated**: 2026-03-06
 
 ## Summary
 
@@ -262,7 +262,6 @@ Corresponds to: Fee/reserve logic in `LedgerManager.h`
 |--------------|------|--------|
 | `getLastMinBalance()` | `reserves::minimum_balance()` | Full |
 | Fee calculation | `fees::calculate_fee()` | Full |
-| Envelope fee calculation | `fees::calculate_envelope_fee()` | Full |
 | Available balance for fees | `fees::available_balance()` | Full |
 | Selling liabilities | `reserves::selling_liabilities()` | Full |
 | Buying liabilities | `reserves::buying_liabilities()` | Full |
@@ -402,12 +401,12 @@ The ledger crate has been verified against testnet for ledger close correctness.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 90 |
+| Implemented (Full) | 89 |
 | Gaps (None + Partial) | 46 |
 | Intentional Omissions | 30 |
-| **Parity** | **90 / (90 + 46) = 66%** |
+| **Parity** | **89 / (89 + 46) = 65%** |
 
-The 90 implemented items cover: LedgerManager core operations (30, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (21, including `commonPreApply`→`pre_apply`, `preParallelApply`→`pre_apply`, `parallelApply`→`apply_body`), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (9), trustline utilities (7). Note that some upstream items map to the same Rust function, so the Rust function count is lower.
+The 89 implemented items cover: LedgerManager core operations (30, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (21, including `commonPreApply`→`pre_apply`, `preParallelApply`→`pre_apply`, `parallelApply`→`apply_body`), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7). Note that some upstream items map to the same Rust function, so the Rust function count is lower.
 
 The 46 gap items include: LedgerManager threading/metrics methods (7 counted as gaps), NetworkConfig creation functions (5), ApplyState phase machine (1), module cache (1), nested transaction model (1), snapshot unification (1), timing utilities (2), metrics (1), prefetch (1), meta streaming (1), and the None items from each Component Mapping that are not classified as omissions.
 

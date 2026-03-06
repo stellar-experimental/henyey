@@ -949,89 +949,18 @@ impl WorkScheduler {
             let Some(completion) = completion else { break };
             running.remove(&completion.id);
 
-            let cancelled = completion.cancelled
-                || matches!(self.states.get(&completion.id), Some(WorkState::Cancelled));
-
-            match completion.outcome {
-                WorkOutcome::Cancelled => {
-                    self.fail_or_cancel(
-                        completion.id,
-                        WorkState::Cancelled,
-                        completion.attempt,
-                    );
-                    self.finalize_entry(completion.id, completion.work);
+            let action = self.handle_completion(completion);
+            match action {
+                CompletionAction::Done { completed_id } => {
+                    self.enqueue_dependents(completed_id, &mut queue, &mut queued, &running);
                 }
-                WorkOutcome::Success => {
-                    if cancelled {
-                        self.fail_or_cancel(
-                            completion.id,
-                            WorkState::Cancelled,
-                            completion.attempt,
-                        );
-                    } else {
-                        self.states.insert(completion.id, WorkState::Success);
-                        self.emit_event(completion.id, WorkState::Success, completion.attempt);
-                    }
-                    self.finalize_entry(completion.id, completion.work);
-                    self.enqueue_dependents(completion.id, &mut queue, &mut queued, &running);
-                }
-                WorkOutcome::Retry { delay } => {
-                    if cancelled {
-                        self.fail_or_cancel(
-                            completion.id,
-                            WorkState::Cancelled,
-                            completion.attempt,
-                        );
-                        continue;
-                    }
-                    let no_retries = self
-                        .entries
-                        .get(&completion.id)
-                        .is_some_and(|e| e.retries_left == 0);
-                    if no_retries {
-                        self.finalize_entry(completion.id, completion.work);
-                        self.fail_or_cancel(
-                            completion.id,
-                            WorkState::Failed,
-                            completion.attempt,
-                        );
-                        continue;
-                    }
-                    if let Some(entry) = self.entries.get_mut(&completion.id) {
-                        entry.retries_left -= 1;
-                    }
-                    self.finalize_entry(completion.id, completion.work);
-                    let retry_delay = if delay == Duration::ZERO {
-                        self.config.retry_delay
-                    } else {
-                        delay
-                    };
-                    self.emit_event(completion.id, WorkState::Pending, completion.attempt);
-                    tokio::time::sleep(retry_delay).await;
-                    if queued.insert(completion.id) {
-                        queue.push_back(completion.id);
+                CompletionAction::Retry { id, delay } => {
+                    tokio::time::sleep(delay).await;
+                    if queued.insert(id) {
+                        queue.push_back(id);
                     }
                 }
-                WorkOutcome::Failed(err) => {
-                    if cancelled {
-                        self.fail_or_cancel(
-                            completion.id,
-                            WorkState::Cancelled,
-                            completion.attempt,
-                        );
-                        continue;
-                    }
-                    warn!(work_id = completion.id, error = %err, "work failed");
-                    if let Some(entry) = self.entries.get_mut(&completion.id) {
-                        entry.last_error = Some(err);
-                    }
-                    self.finalize_entry(completion.id, completion.work);
-                    self.fail_or_cancel(
-                        completion.id,
-                        WorkState::Failed,
-                        completion.attempt,
-                    );
-                }
+                CompletionAction::None => {}
             }
         }
 
@@ -1140,6 +1069,77 @@ impl WorkScheduler {
         }
     }
 
+    /// Processes a completed work item and updates scheduler state.
+    ///
+    /// Returns a [`CompletionAction`] indicating what the main loop should do
+    /// next: enqueue dependents (on success), schedule a retry, or nothing.
+    fn handle_completion(&mut self, completion: WorkCompletion) -> CompletionAction {
+        let id = completion.id;
+        let attempt = completion.attempt;
+        let cancelled = completion.cancelled
+            || matches!(self.states.get(&id), Some(WorkState::Cancelled));
+
+        match completion.outcome {
+            WorkOutcome::Cancelled => {
+                self.fail_or_cancel(id, WorkState::Cancelled, attempt);
+                self.finalize_entry(id, completion.work);
+                CompletionAction::None
+            }
+            WorkOutcome::Success => {
+                if cancelled {
+                    self.fail_or_cancel(id, WorkState::Cancelled, attempt);
+                } else {
+                    self.states.insert(id, WorkState::Success);
+                    self.emit_event(id, WorkState::Success, attempt);
+                }
+                self.finalize_entry(id, completion.work);
+                CompletionAction::Done { completed_id: id }
+            }
+            WorkOutcome::Retry { delay } => {
+                if cancelled {
+                    self.fail_or_cancel(id, WorkState::Cancelled, attempt);
+                    return CompletionAction::None;
+                }
+                let no_retries = self
+                    .entries
+                    .get(&id)
+                    .is_some_and(|e| e.retries_left == 0);
+                if no_retries {
+                    self.finalize_entry(id, completion.work);
+                    self.fail_or_cancel(id, WorkState::Failed, attempt);
+                    return CompletionAction::None;
+                }
+                if let Some(entry) = self.entries.get_mut(&id) {
+                    entry.retries_left -= 1;
+                }
+                self.finalize_entry(id, completion.work);
+                let retry_delay = if delay == Duration::ZERO {
+                    self.config.retry_delay
+                } else {
+                    delay
+                };
+                self.emit_event(id, WorkState::Pending, attempt);
+                CompletionAction::Retry {
+                    id,
+                    delay: retry_delay,
+                }
+            }
+            WorkOutcome::Failed(err) => {
+                if cancelled {
+                    self.fail_or_cancel(id, WorkState::Cancelled, attempt);
+                    return CompletionAction::None;
+                }
+                warn!(work_id = id, error = %err, "work failed");
+                if let Some(entry) = self.entries.get_mut(&id) {
+                    entry.last_error = Some(err);
+                }
+                self.finalize_entry(id, completion.work);
+                self.fail_or_cancel(id, WorkState::Failed, attempt);
+                CompletionAction::None
+            }
+        }
+    }
+
     /// Sends a work event to the configured event channel, if any.
     ///
     /// Events are sent with `try_send` to avoid blocking the scheduler.
@@ -1159,6 +1159,18 @@ impl WorkScheduler {
             attempt,
         });
     }
+}
+
+/// Action returned by [`WorkScheduler::handle_completion`] to direct the
+/// main execution loop.
+enum CompletionAction {
+    /// A work item completed (successfully or via cancellation). The main
+    /// loop should check dependents of `completed_id` for readiness.
+    Done { completed_id: WorkId },
+    /// A work item should be retried after `delay`.
+    Retry { id: WorkId, delay: Duration },
+    /// No further action needed (failure or cancellation handled internally).
+    None,
 }
 
 /// Internal message sent when a spawned work task completes.

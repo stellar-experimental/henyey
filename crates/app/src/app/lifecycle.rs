@@ -51,12 +51,7 @@ impl App {
         self.start_sync_recovery_tracking();
 
         // Get message receiver from overlay
-        let message_rx = {
-            match self.overlay().await {
-                Some(o) => Some(o.subscribe()),
-                None => None,
-            }
-        };
+        let message_rx = self.overlay().await.map(|o| o.subscribe());
 
         let mut message_rx = match message_rx {
             Some(rx) => rx,
@@ -707,15 +702,16 @@ impl App {
         // compat config case where known_peers is intentionally cleared).
         let mut overlay_config = if !self.config.overlay.known_peers.is_empty() {
             // Explicit peers configured — start from empty defaults
-            let mut cfg = OverlayManagerConfig::default();
-            cfg.known_peers = self
-                .config
-                .overlay
-                .known_peers
-                .iter()
-                .filter_map(|s| Self::parse_peer_address(s))
-                .collect();
-            cfg
+            OverlayManagerConfig {
+                known_peers: self
+                    .config
+                    .overlay
+                    .known_peers
+                    .iter()
+                    .filter_map(|s| Self::parse_peer_address(s))
+                    .collect(),
+                ..OverlayManagerConfig::default()
+            }
         } else if self.config.is_compat_config {
             // Compat config with no known peers (e.g., local standalone mode) —
             // do NOT inject testnet/mainnet seed peers.

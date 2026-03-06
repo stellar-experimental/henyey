@@ -2,8 +2,8 @@
 
 **Crate**: `henyey`
 **Upstream**: `stellar-core/src/main/` (CLI subset only)
-**Overall Parity**: 43%
-**Last Updated**: 2026-02-17
+**Overall Parity**: 51%
+**Last Updated**: 2026-03-06
 
 ## Summary
 
@@ -20,7 +20,7 @@
 | Self-Check | Full | Header chain, bucket hash, crypto benchmark |
 | Dump Ledger | Full | `dump-ledger` with type/modified filters |
 | Quorum Intersection | Partial | V1 brute-force only; V2 SAT-solver not implemented |
-| Key/Crypto Utilities | None | `convert-id`, `sec-to-pub`, `sign-transaction` removed |
+| Key/Crypto Utilities | Partial | `convert-id` implemented; `sec-to-pub`, `sign-transaction` not yet |
 | XDR Tools | None | `decode-xdr`/`encode-xdr` removed; `dump-xdr` not implemented |
 | Diagnostic CLI Commands | None | `diag-bucket-stats`, `merge-bucketlist`, `dump-archival-stats` etc. |
 | Settings Upgrade Transactions | None | `get-settings-upgrade-txs` not implemented |
@@ -45,7 +45,7 @@ Corresponds to: `CommandLine.h`, `main.cpp`
 |--------------|------|--------|
 | `main()` | `main()` | Full |
 | `handleCommandLine()` | `main()` + clap dispatch | Full |
-| `runVersion()` | clap `--version` | Full |
+| `runVersion()` | `cmd_version()` | Full |
 | `writeWithTextFlow()` | clap help formatting | Full |
 | `checkXDRFileIdentity()` | -- | Omitted |
 | `checkStellarCoreMajorVersionProtocolIdentity()` | -- | Omitted |
@@ -63,7 +63,7 @@ Corresponds to: `CommandLine.cpp`
 | `runNewDB()` | `cmd_new_db()` | Full |
 | `runUpgradeDB()` | `cmd_upgrade_db()` | Full |
 | `runPublish()` | `cmd_publish_history()` | Full |
-| `runOfflineInfo()` | `cmd_info()` | Full |
+| `runOfflineInfo()` | `cmd_offline_info()` | Full |
 | `runSelfCheck()` | `cmd_self_check()` | Full |
 | `runHttpCommand()` | `cmd_http_command()` | Full |
 
@@ -73,16 +73,16 @@ Corresponds to: `CommandLine.cpp`
 |--------------|------|--------|
 | `runWriteVerifiedCheckpointHashes()` | `cmd_verify_checkpoints()` | Full |
 | `runCheckQuorumIntersection()` | `cmd_check_quorum_intersection()` | Partial |
+| `runNewHist()` | `cmd_new_hist()` | Full |
 | `runReportLastHistoryCheckpoint()` | -- | None |
 | `runPrintPublishQueue()` | -- | None |
-| `runNewHist()` | -- | None |
 
 #### Key and Crypto Utilities
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `runGenSeed()` | `cmd_new_keypair()` | Full |
-| `runConvertId()` | -- | None |
+| `runConvertId()` | `cmd_convert_id()` | Full |
 | `runSecToPub()` | -- | None |
 | `runSignTransaction()` | -- | None |
 
@@ -103,10 +103,9 @@ Corresponds to: `CommandLine.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
+| `runForceSCP()` | `cmd_force_scp()` | Full |
 | `runReplayDebugMeta()` | -- | None |
 | `getSettingsUpgradeTransactions()` | -- | None |
-| `runForceSCP()` | -- | Omitted |
-| `runVersion()` | clap `--version` + `info` | Full |
 
 ### Quorum Intersection (`quorum_intersection.rs`)
 
@@ -141,7 +140,6 @@ Features excluded by design. These are NOT counted against parity %.
 |------------------------|--------|
 | `checkXDRFileIdentity()` | Pure Rust implementation has no C++/Rust XDR bridge to validate |
 | `checkStellarCoreMajorVersionProtocolIdentity()` | Different versioning scheme; Rust uses Cargo.toml version |
-| `runForceSCP()` | Deprecated in stellar-core; `--wait-for-consensus` flag on `run` used instead |
 | `runLoadXDR()` (BUILD_TESTS) | Test-only; Rust test framework used instead |
 | `runRebuildLedgerFromBuckets()` (BUILD_TESTS) | Test-only infrastructure |
 | `runFuzz()` / `runGenFuzz()` (BUILD_TESTS) | Would use `cargo-fuzz` if needed |
@@ -156,7 +154,6 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `runConvertId()` | Medium | Convert between key formats (removed from Rust, should re-add) |
 | `runSecToPub()` / `priv2pub()` | Medium | Derive public key from secret (removed from Rust, should re-add) |
 | `runSignTransaction()` / `signtxn()` | Medium | Sign a transaction envelope (removed from Rust, should re-add) |
 | `runPrintXdr()` / `printXdr()` | Low | Decode and pretty-print XDR (removed from Rust) |
@@ -167,7 +164,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `diagBucketStats()` | Low | Per-account bucket statistics |
 | `runMergeBucketList()` | Low | Write diagnostic merged bucket list |
 | `runDumpStateArchivalStatistics()` | Low | Print state archival statistics |
-| `runNewHist()` | Low | Initialize history archive directory structure |
 | `runReportLastHistoryCheckpoint()` | Low | Report info about last archive checkpoint |
 | `getSettingsUpgradeTransactions()` | Low | Generate settings upgrade transaction set |
 | `runPrintPublishQueue()` | Low | Print scheduled publish checkpoints |
@@ -275,11 +271,11 @@ The `verify-execution` tool compares transaction execution against CDP (Crypto D
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 15 |
-| Gaps (None + Partial) | 20 |
-| Intentional Omissions | 10 |
-| **Parity** | **15 / (15 + 20) = 43%** |
+| Implemented (Full) | 18 |
+| Gaps (None + Partial) | 17 |
+| Intentional Omissions | 9 |
+| **Parity** | **18 / (18 + 17) = 51%** |
 
-Note: Parity decreased from the previous 61% because five previously-implemented key/XDR utility
-commands (`convert-id`, `sec-to-pub`, `sign-transaction`, `decode-xdr`, `encode-xdr`) were removed
-during a crate reorganization. These are medium-priority items to re-add.
+Note: Parity increased from 43% to 51% because `convert-id`, `force-scp`, and `new-hist` were
+implemented (previously listed as gaps or omissions). Two medium-priority gaps remain:
+`sec-to-pub` and `sign-transaction`.

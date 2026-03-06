@@ -1,3 +1,9 @@
+//! Transaction metadata construction for ledger close.
+//!
+//! Builds `TransactionMeta` and `LedgerCloseMeta` structures that record
+//! the before/after state of every entry touched by a transaction, including
+//! hot-archive restoration tracking and classic operation event emission.
+
 use super::*;
 
 pub(super) fn asset_to_trustline_asset(

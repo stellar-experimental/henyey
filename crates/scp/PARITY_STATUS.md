@@ -3,7 +3,7 @@
 **Crate**: `henyey-scp`
 **Upstream**: `stellar-core/src/scp/`
 **Overall Parity**: 100%
-**Last Updated**: 2026-02-17
+**Last Updated**: 2026-03-05
 
 ## Summary
 
@@ -241,8 +241,8 @@ Corresponds to: `LocalNode.h`, `QuorumSetUtils.h`
 | `isQuorum()` | `is_quorum()` | Full |
 | `findClosestVBlocking()` (set) | `find_closest_v_blocking()` | Full |
 | `findClosestVBlocking()` (map) | `find_closest_v_blocking()` | Full |
-| `toJson()` | `QuorumSetJson::from_xdr()` | Full |
-| `fromJson()` | `QuorumSetJson::to_xdr()` | Full |
+| `toJson()` | Inline in `get_info()` / `get_quorum_info()` via serde | Full |
+| `fromJson()` | Not needed (serde deserialization on info types) | Full |
 | `to_string()` | Via Debug trait | Full |
 | `buildSingletonQSet()` | `singleton_quorum_set()` | Full |
 | `isQuorumSliceInternal()` | `is_quorum_slice()` (combined) | Full |
@@ -373,7 +373,7 @@ No known gaps.
 |------|-------------------|------------|-------|
 | Quorum set validation | 1 TEST_CASE / 14 SECTION (`QuorumSetTests.cpp`) | 37 #[test] in `quorum.rs` | Comprehensive coverage |
 | Nomination weight/stats | 3 TEST_CASE / 10 SECTION (`SCPUnitTests.cpp`) | 24 #[test] in `nomination.rs` | Priority and hash tests |
-| Ballot protocol | 2 TEST_CASE / ~130 SECTION (`SCPTests.cpp`) | 50 #[test] in `ballot.rs` | All state transitions |
+| Ballot protocol | 2 TEST_CASE / ~130 SECTION (`SCPTests.cpp`) | 55 #[test] in `ballot/` | All state transitions |
 | Nomination protocol | 1 TEST_CASE / ~35 SECTION (`SCPTests.cpp`) | 24 #[test] in `nomination.rs` | Nomination flow |
 | V-blocking/quorum | 2 TEST_CASE / ~35 SECTION (`SCPTests.cpp`) | 37 #[test] in `quorum.rs` | Quorum operations |
 | Multi-node simulation | Covered within SCPTests.cpp | 50 #[test] in `tests/multi_node_simulation.rs` | End-to-end scenarios |
@@ -384,10 +384,11 @@ No known gaps.
 | Info/JSON types | N/A | 4 #[test] in `info.rs` | Serialization tests |
 | Slot management | Covered within SCPTests.cpp | 26 #[test] in `slot.rs` | Per-slot operations |
 | SCP coordinator | Covered within SCPTests.cpp | 14 #[test] in `scp.rs` | Top-level API tests |
+| Driver | N/A | 11 #[test] in `driver.rs` | Weight computation, timeout |
 | Quorum config | N/A | 5 #[test] in `quorum_config.rs` | Config parsing |
-| Lib-level helpers | N/A | 8 #[test] in `lib.rs` | Utility functions |
+| Lib-level helpers | N/A | 2 #[test] in `lib.rs` | EnvelopeState, QuorumInfoNodeState |
 
-**Totals**: Upstream: 9 TEST_CASE / 189 SECTION. Rust: 173 unit #[test] + 180 integration #[test] = 353 total.
+**Totals**: Upstream: 9 TEST_CASE / 189 SECTION. Rust: 183 unit #[test] + 180 integration #[test] = 363 total.
 
 ### Test Gaps
 

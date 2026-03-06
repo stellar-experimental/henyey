@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-app`
 **Upstream**: `stellar-core/src/main/`
-**Overall Parity**: 62%
-**Last Updated**: 2026-02-17
+**Overall Parity**: 65%
+**Last Updated**: 2026-03-05
 
 ## Summary
 
@@ -20,7 +20,7 @@
 | Metadata stream | Full | XDR output stream with debug rotation |
 | Logging and diagnostics | Full | Dynamic levels, partition mapping |
 | ApplicationUtils | Partial | Core utils present; several utility functions missing |
-| QueryServer | None | Not implemented |
+| QueryServer | Full | getledgerentryraw, getledgerentry with TTL/hot-archive |
 | AppConnector | None | Thread-isolation helper not needed (Tokio model) |
 | SettingsUpgradeUtils | None | Soroban upgrade transaction builders |
 | dumpxdr utilities | Partial | Basic XDR decode; full dump/sign suite incomplete |
@@ -39,7 +39,7 @@
 | `PersistentState.h` / `PersistentState.cpp` | `henyey-db` crate | Handled by database crate |
 | `Diagnostics.h` / `Diagnostics.cpp` | — | Not implemented |
 | `ErrorMessages.h` | — | Inline error strings |
-| `QueryServer.h` / `QueryServer.cpp` | — | Not implemented |
+| `QueryServer.h` / `QueryServer.cpp` | `http/mod.rs` (QueryServer), `http/handlers/query.rs` | Full implementation with both endpoints |
 | `AppConnector.h` / `AppConnector.cpp` | — | Not needed (Tokio model) |
 | `SettingsUpgradeUtils.h` / `SettingsUpgradeUtils.cpp` | — | Not implemented |
 | `dumpxdr.h` / `dumpxdr.cpp` | `henyey` crate (partial) | Partial decode-xdr support |
@@ -282,6 +282,16 @@ Corresponds to: Survey logic in `CommandHandler.cpp` and overlay
 | Latency histograms | `LatencyHistogram` | Full |
 | Phase timeout enforcement | `update_phase()` | Full |
 
+### QueryServer (`http/mod.rs`, `http/handlers/query.rs`)
+
+Corresponds to: `QueryServer.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `QueryServer()` constructor | `QueryServer::new()` | Full |
+| `getLedgerEntryRaw()` | `getledgerentryraw_handler()` | Full |
+| `getLedgerEntry()` | `getledgerentry_handler()` | Full |
+
 ### Catchup Command (`catchup_cmd.rs`)
 
 Corresponds to: `catchup()` in `ApplicationUtils.h`
@@ -337,7 +347,6 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `QueryServer` (getLedgerEntry, getLedgerEntryRaw) | Medium | RPC query endpoint for BucketListDB lookups |
 | `SettingsUpgradeUtils` (getWasmRestoreTx, getUploadTx, etc.) | Medium | Soroban config upgrade transaction builders |
 | `Diagnostics::bucketStats()` | Low | Bucket statistics diagnostic tool |
 | `dumpXdrStream()` / `printXdr()` full support | Low | Full XDR dump and print utilities |
@@ -406,7 +415,7 @@ Features not yet implemented. These ARE counted against parity %.
 | CommandHandler | 3 TEST_CASE / 25 SECTION | 6 `#[test]` | Rust tests cover run_cmd options; less endpoint testing |
 | ApplicationUtils | 4 TEST_CASE / 5 SECTION | 13 `#[test]` (catchup_cmd) | Catchup target parsing well tested |
 | SelfCheck | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No dedicated self-check tests |
-| QueryServer | 1 TEST_CASE / 9 SECTION | 0 `#[test]` | Not implemented |
+| QueryServer | 1 TEST_CASE / 9 SECTION | 0 `#[test]` | Implemented but no dedicated tests |
 | App core | — | 47 `#[test]` | Extensive app-level tests |
 | Maintainer | — | 7 `#[test]` | Good coverage |
 | Logging | — | 5 `#[test]` | Basic coverage |
@@ -415,7 +424,7 @@ Features not yet implemented. These ARE counted against parity %.
 ### Test Gaps
 
 - **HTTP endpoint integration tests**: stellar-core has 25 SECTION entries testing various command handler scenarios (manual close with different parameters, overlay-only mode toggle, transaction envelope bridge). The Rust crate lacks HTTP endpoint integration tests.
-- **QueryServer tests**: 1 TEST_CASE with 9 SECTION entries in stellar-core for getLedgerEntry; no equivalent in Rust (feature not implemented).
+- **QueryServer tests**: 1 TEST_CASE with 9 SECTION entries in stellar-core for getLedgerEntry; Rust has the implementation but no dedicated unit tests.
 - **Self-check scheduling tests**: stellar-core tests online self-check scheduling; Rust only has the self-check function, not its scheduling.
 - **Config edge cases**: stellar-core has extensive tests for validator config validation (bad validators, nesting levels, operation filters, domain quality). Rust tests are simpler.
 
@@ -430,7 +439,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 83 |
-| Gaps (None + Partial) | 50 |
+| Implemented (Full) | 86 |
+| Gaps (None + Partial) | 47 |
 | Intentional Omissions | 17 |
-| **Parity** | **83 / (83 + 50) = 62%** |
+| **Parity** | **86 / (86 + 47) = 65%** |

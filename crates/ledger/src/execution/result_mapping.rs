@@ -1,3 +1,8 @@
+//! Mapping from execution failures to XDR transaction result codes.
+//!
+//! Converts internal `ExecutionFailure` variants into their corresponding
+//! `TransactionResultResult` XDR codes for inclusion in ledger close metadata.
+
 use super::*;
 
 pub(super) fn map_failure_to_result(failure: &ExecutionFailure) -> TransactionResultResult {

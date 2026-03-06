@@ -1,3 +1,9 @@
+//! Signature verification and threshold checking.
+//!
+//! Implements the multi-signature verification pipeline that validates
+//! transaction signatures against account signers, checks weight thresholds
+//! for each operation type, and handles signed payload authentication.
+
 use super::*;
 
 /// Convert AccountId to key bytes.

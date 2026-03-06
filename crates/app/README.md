@@ -42,6 +42,8 @@ graph TD
 | `Maintainer` | Background scheduler for database cleanup |
 | `MaintenanceConfig` | Configuration for maintenance intervals and batch sizes |
 | `StatusServer` | HTTP server for monitoring and control endpoints |
+| `QueryServer` | HTTP server for bucket list ledger entry lookups (`/getledgerentryraw`, `/getledgerentry`) |
+| `CompatServer` | stellar-core wire-format compatible HTTP server for stellar-rpc integration |
 | `ConfigBuilder` | Builder API for programmatic configuration construction |
 | `LogLevelHandle` | Handle for dynamic runtime log level changes |
 | `ProgressTracker` | Progress reporter for long-running operations |
@@ -102,12 +104,15 @@ let config = ConfigBuilder::new()
 | `app/tx_flooding.rs` | Transaction set demand/fetch protocol: tx-set request scheduling, peer rotation, DontHave tracking, and exhaustion detection |
 | `app/peers.rs` | Peer management helpers: snapshot queries, connect/disconnect, ban/unban, preferred peer configuration |
 | `app/survey_impl.rs` | Survey message handling: processing survey requests/responses, building topology data, peer data collection |
+| `app/publish.rs` | History archive publishing: checkpoint queuing, file upload via command templates, local archive support |
 | `config.rs` | Configuration types (`AppConfig`, `NodeConfig`, `NetworkConfig`, etc.), TOML loading, environment variable overrides, and `ConfigBuilder` |
 | `run_cmd.rs` | `run_node` entry point, `NodeRunner` lifecycle, `StatusServer` HTTP API with axum handlers for all REST endpoints |
 | `catchup_cmd.rs` | `run_catchup` entry point, `CatchupOptions` parsing, progress callbacks |
 | `logging.rs` | Logging initialization, `ProgressTracker` for catchup/apply progress, dynamic `LogLevelHandle` |
 | `maintainer.rs` | `Maintainer` background scheduler for SCP history and ledger header cleanup |
 | `meta_stream.rs` | `MetaStreamManager` for emitting `LedgerCloseMeta` XDR frames to external consumers (main and debug streams) |
+| `compat_config.rs` | Translates stellar-core SCREAMING_CASE config format into henyey's nested TOML format |
+| `compat_http/` | stellar-core compatibility HTTP server with matching wire format for stellar-rpc integration |
 | `survey.rs` | `SurveyDataManager` for time-sliced overlay network surveys, `SurveyMessageLimiter` for rate limiting |
 
 ## Design Notes
@@ -158,6 +163,10 @@ All ledger-close and state-transition logic must be deterministic and match stel
 | `app/survey_impl.rs` | `src/overlay/SurveyManager.cpp` (message handling) |
 | `config.rs` | `src/main/Config.cpp`, `src/main/Config.h` |
 | `run_cmd.rs` | `src/main/CommandHandler.cpp`, `src/main/CommandLine.cpp` |
+| `http/handlers/query.rs` | `src/main/QueryServer.cpp` |
+| `compat_config.rs` | `src/main/Config.cpp` (stellar-core format translation) |
+| `compat_http/` | `src/main/CommandHandler.cpp` (wire-format compatibility) |
+| `app/publish.rs` | `src/history/HistoryManagerImpl.cpp` (checkpoint publishing) |
 | `catchup_cmd.rs` | `src/main/CommandLine.cpp` (catchup command) |
 | `logging.rs` | `src/util/Logging.cpp` |
 | `maintainer.rs` | `src/main/Maintainer.cpp`, `src/main/Maintainer.h` |

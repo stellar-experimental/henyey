@@ -318,10 +318,7 @@ impl NominationProtocol {
     }
 
     /// Adopt values from round leaders' nominations.
-    fn adopt_leader_values<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-    ) -> bool {
+    fn adopt_leader_values<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) -> bool {
         let mut updated = false;
         for leader in self.round_leaders.clone() {
             let Some(env) = self.latest_nominations.get(&leader) else {
@@ -426,8 +423,12 @@ impl NominationProtocol {
             // Collect the votes from the envelope for acceptance checks.
             let votes_to_check: Vec<Value> = nomination.votes.iter().cloned().collect();
 
-            let (mut modified, new_candidates) =
-                self.attempt_promote(&votes_to_check, ctx.local_quorum_set, ctx.driver, ctx.slot_index);
+            let (mut modified, new_candidates) = self.attempt_promote(
+                &votes_to_check,
+                ctx.local_quorum_set,
+                ctx.driver,
+                ctx.slot_index,
+            );
 
             // N13: Only take round leader votes if we're still looking for
             // candidates (stellar-core processEnvelope lines 476-489).
@@ -589,10 +590,7 @@ impl NominationProtocol {
     /// 3. AFTER processEnvelope returns, check `isNewerStatement` against
     ///    `mLastEnvelope` (which the recursive call may have already updated)
     /// 4. Only set `mLastEnvelope` and emit if still newer
-    fn emit_nomination<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-    ) {
+    fn emit_nomination<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) {
         let votes = self.sorted_values(&self.votes);
         let accepted = self.sorted_values(&self.accepted);
         let nomination = ScpNomination {
@@ -652,9 +650,7 @@ impl NominationProtocol {
 
         if is_newer {
             self.last_envelope = Some(envelope.clone());
-            if self.fully_validated
-                && self.last_envelope_emit.as_ref() != Some(&envelope)
-            {
+            if self.fully_validated && self.last_envelope_emit.as_ref() != Some(&envelope) {
                 self.last_envelope_emit = Some(envelope.clone());
                 ctx.driver.emit_envelope(&envelope);
             }
@@ -849,7 +845,10 @@ impl NominationProtocol {
         // stellar-core normalizes the quorum set, removing self and adjusting thresholds.
         // This ensures weight calculations and leader selection match stellar-core.
         let mut normalized_qs = ctx.local_quorum_set.clone();
-        crate::quorum::normalize_quorum_set_with_remove(&mut normalized_qs, Some(ctx.local_node_id));
+        crate::quorum::normalize_quorum_set_with_remove(
+            &mut normalized_qs,
+            Some(ctx.local_node_id),
+        );
 
         // maxLeaderCount = 1 (self) + all nodes in the normalized set
         let max_leader_count = 1 + Self::count_all_nodes(&normalized_qs);
@@ -1003,7 +1002,6 @@ impl Default for NominationProtocol {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,7 +1011,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use stellar_xdr::curr::{PublicKey, ScpBallot, Uint256};
-    
+
     /// Helper to construct a `SlotContext` from the old four-parameter pattern.
     macro_rules! ctx {
         ($node:expr, $qs:expr, $driver:expr, $slot:expr) => {
@@ -1025,12 +1023,12 @@ mod tests {
             }
         };
     }
-    
+
     fn is_near_weight(weight: u64, target: f64) -> bool {
         let ratio = weight as f64 / u64::MAX as f64;
         (ratio - target).abs() < 0.01
     }
-    
+
     #[test]
     fn test_nomination_weight() {
         let node0 = make_node_id(0);
@@ -1039,7 +1037,7 @@ mod tests {
         let node3 = make_node_id(3);
         let node4 = make_node_id(4);
         let node5 = make_node_id(5);
-    
+
         let mut qset = make_quorum_set(
             vec![node0.clone(), node1.clone(), node2.clone(), node3.clone()],
             3,
@@ -1056,7 +1054,7 @@ mod tests {
         let weight = crate::driver::base_get_node_weight(&node4, &qset, false);
         assert!(is_near_weight(weight, 0.6 * 0.5));
     }
-    
+
     #[test]
     fn test_nomination_new() {
         let nom = NominationProtocol::new();
@@ -1067,12 +1065,12 @@ mod tests {
         assert!(nom.accepted().is_empty());
         assert!(nom.latest_composite().is_none());
     }
-    
+
     struct MockDriver {
         quorum_set: ScpQuorumSet,
         emit_count: AtomicU32,
     }
-    
+
     impl MockDriver {
         fn new(quorum_set: ScpQuorumSet) -> Self {
             Self {
@@ -1081,7 +1079,7 @@ mod tests {
             }
         }
     }
-    
+
     impl SCPDriver for MockDriver {
         fn validate_value(
             &self,
@@ -1091,31 +1089,31 @@ mod tests {
         ) -> ValidationLevel {
             ValidationLevel::FullyValidated
         }
-    
+
         fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
             candidates.first().cloned()
         }
-    
+
         fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
             Some(value.clone())
         }
-    
+
         fn emit_envelope(&self, _envelope: &ScpEnvelope) {
             self.emit_count.fetch_add(1, Ordering::SeqCst);
         }
-    
+
         fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
             Some(self.quorum_set.clone())
         }
-    
+
         fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
-    
+
         fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
-    
+
         fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-    
+
         fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-    
+
         fn compute_hash_node(
             &self,
             _slot_index: u64,
@@ -1126,7 +1124,7 @@ mod tests {
         ) -> u64 {
             1
         }
-    
+
         fn compute_value_hash(
             &self,
             _slot_index: u64,
@@ -1136,24 +1134,24 @@ mod tests {
         ) -> u64 {
             value.iter().map(|b| *b as u64).sum()
         }
-    
+
         fn compute_timeout(&self, _round: u32, _is_nomination: bool) -> Duration {
             Duration::from_millis(1)
         }
-    
+
         fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
-    
+
         fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
             true
         }
     }
-    
+
     fn make_node_id(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
     }
-    
+
     fn make_quorum_set(validators: Vec<NodeId>, threshold: u32) -> ScpQuorumSet {
         ScpQuorumSet {
             threshold,
@@ -1161,11 +1159,11 @@ mod tests {
             inner_sets: vec![].try_into().unwrap(),
         }
     }
-    
+
     fn make_value(bytes: &[u8]) -> Value {
         bytes.to_vec().try_into().unwrap()
     }
-    
+
     fn make_nomination_envelope(
         node_id: NodeId,
         slot_index: u64,
@@ -1188,41 +1186,41 @@ mod tests {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         }
     }
-    
+
     #[test]
     fn test_nomination_rejects_unsorted_values() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let v1 = make_value(&[1]);
         let v2 = make_value(&[2]);
         let env = make_nomination_envelope(make_node_id(2), 7, &quorum_set, vec![v2, v1], vec![]);
         let state = nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 7));
         assert_eq!(state, EnvelopeState::Invalid);
     }
-    
+
     #[test]
     fn test_nomination_rejects_non_monotonic_statement() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let v1 = make_value(&[1]);
         let env =
             make_nomination_envelope(make_node_id(2), 8, &quorum_set, vec![v1.clone()], vec![]);
         let first = nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 8));
         let second = nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 8));
-    
+
         assert!(matches!(
             first,
             EnvelopeState::Valid | EnvelopeState::ValidNew
         ));
         assert_eq!(second, EnvelopeState::Invalid);
     }
-    
+
     #[test]
     fn test_nomination_accepts_and_ratifies_with_quorum() {
         let node = make_node_id(1);
@@ -1231,11 +1229,16 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node.clone(), node2.clone(), node3.clone()], 2);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value = make_value(&[9]);
         let prev = make_value(&[0]);
-        nom.nominate(&ctx!(&node, &quorum_set, &driver, 9), value.clone(), &prev, false);
-    
+        nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 9),
+            value.clone(),
+            &prev,
+            false,
+        );
+
         let env2 = make_nomination_envelope(
             node2,
             9,
@@ -1250,14 +1253,14 @@ mod tests {
             vec![value.clone()],
             vec![value.clone()],
         );
-    
+
         nom.process_envelope(&env2, &ctx!(&node, &quorum_set, &driver, 9));
         nom.process_envelope(&env3, &ctx!(&node, &quorum_set, &driver, 9));
-    
+
         assert!(nom.accepted().contains(&value));
         assert_eq!(nom.latest_composite(), Some(&value));
     }
-    
+
     #[test]
     fn test_nomination_timeout_requires_start() {
         let node = make_node_id(1);
@@ -1269,18 +1272,28 @@ mod tests {
         let mut nom = NominationProtocol::new();
         let value = make_value(&[4]);
         let prev = make_value(&[0]);
-    
-        let timed_out = nom.nominate(&ctx!(&node, &quorum_set, &driver, 10), value.clone(), &prev, true);
+
+        let timed_out = nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 10),
+            value.clone(),
+            &prev,
+            true,
+        );
         assert!(!timed_out);
         assert!(!nom.is_started());
-    
-        nom.nominate(&ctx!(&node, &quorum_set, &driver, 10), value.clone(), &prev, false);
+
+        nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 10),
+            value.clone(),
+            &prev,
+            false,
+        );
         let round_before = nom.round();
-    
+
         nom.nominate(&ctx!(&node, &quorum_set, &driver, 10), value, &prev, true);
         assert!(nom.round() > round_before);
     }
-    
+
     #[test]
     fn test_nomination_process_current_state_skips_self_when_not_validated() {
         let local = make_node_id(1);
@@ -1288,17 +1301,17 @@ mod tests {
         let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value_local = make_value(&[1]);
         let value_remote = make_value(&[2]);
         let env_local =
             make_nomination_envelope(local.clone(), 11, &quorum_set, vec![value_local], vec![]);
         let env_remote =
             make_nomination_envelope(remote.clone(), 11, &quorum_set, vec![value_remote], vec![]);
-    
+
         nom.process_envelope(&env_local, &ctx!(&local, &quorum_set, &driver, 11));
         nom.process_envelope(&env_remote, &ctx!(&local, &quorum_set, &driver, 11));
-    
+
         let mut seen = Vec::new();
         nom.process_current_state(
             |env| {
@@ -1309,24 +1322,24 @@ mod tests {
             false,
             false,
         );
-    
+
         assert!(seen.contains(&remote));
         assert!(!seen.contains(&local));
     }
-    
+
     #[test]
     fn test_nomination_process_current_state_includes_self_when_forced() {
         let local = make_node_id(1);
         let quorum_set = make_quorum_set(vec![local.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value_local = make_value(&[3]);
         let env_local =
             make_nomination_envelope(local.clone(), 12, &quorum_set, vec![value_local], vec![]);
-    
+
         nom.process_envelope(&env_local, &ctx!(&local, &quorum_set, &driver, 12));
-    
+
         let mut seen = Vec::new();
         nom.process_current_state(
             |env| {
@@ -1337,10 +1350,10 @@ mod tests {
             false,
             true,
         );
-    
+
         assert!(seen.contains(&local));
     }
-    
+
     #[test]
     fn test_nomination_process_current_state_orders_by_node_id() {
         let local = make_node_id(1);
@@ -1349,7 +1362,7 @@ mod tests {
         let quorum_set = make_quorum_set(vec![local.clone(), node_b.clone(), node_c.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let env_local = make_nomination_envelope(
             local.clone(),
             13,
@@ -1371,11 +1384,11 @@ mod tests {
             vec![make_value(&[3])],
             vec![],
         );
-    
+
         nom.process_envelope(&env_b, &ctx!(&local, &quorum_set, &driver, 13));
         nom.process_envelope(&env_c, &ctx!(&local, &quorum_set, &driver, 13));
         nom.process_envelope(&env_local, &ctx!(&local, &quorum_set, &driver, 13));
-    
+
         let mut seen = Vec::new();
         nom.process_current_state(
             |env| {
@@ -1386,10 +1399,10 @@ mod tests {
             true,
             false,
         );
-    
+
         assert_eq!(seen, vec![local, node_c, node_b]);
     }
-    
+
     #[test]
     fn test_nomination_newer_statement_accepts_accepted_growth() {
         let local = make_node_id(1);
@@ -1397,7 +1410,7 @@ mod tests {
         let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value = make_value(&[9]);
         let env_old =
             make_nomination_envelope(remote.clone(), 14, &quorum_set, vec![value.clone()], vec![]);
@@ -1408,10 +1421,10 @@ mod tests {
             vec![value.clone()],
             vec![value],
         );
-    
+
         nom.process_envelope(&env_old, &ctx!(&local, &quorum_set, &driver, 14));
         nom.process_envelope(&env_new, &ctx!(&local, &quorum_set, &driver, 14));
-    
+
         let mut accepted_counts = Vec::new();
         nom.process_current_state(
             |env| {
@@ -1424,10 +1437,10 @@ mod tests {
             true,
             false,
         );
-    
+
         assert_eq!(accepted_counts, vec![1]);
     }
-    
+
     #[test]
     fn test_nomination_rejects_shrinking_votes() {
         let local = make_node_id(1);
@@ -1435,7 +1448,7 @@ mod tests {
         let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value_a = make_value(&[1]);
         let value_b = make_value(&[2]);
         let env_old = make_nomination_envelope(
@@ -1447,17 +1460,17 @@ mod tests {
         );
         let env_new =
             make_nomination_envelope(remote.clone(), 15, &quorum_set, vec![value_a], vec![]);
-    
+
         let first = nom.process_envelope(&env_old, &ctx!(&local, &quorum_set, &driver, 15));
         let second = nom.process_envelope(&env_new, &ctx!(&local, &quorum_set, &driver, 15));
-    
+
         assert!(matches!(
             first,
             EnvelopeState::Valid | EnvelopeState::ValidNew
         ));
         assert_eq!(second, EnvelopeState::Invalid);
     }
-    
+
     #[test]
     fn test_nomination_process_current_state_short_circuits() {
         let local = make_node_id(1);
@@ -1465,7 +1478,7 @@ mod tests {
         let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let env_local = make_nomination_envelope(
             local.clone(),
             16,
@@ -1480,10 +1493,10 @@ mod tests {
             vec![make_value(&[2])],
             vec![],
         );
-    
+
         nom.process_envelope(&env_remote, &ctx!(&local, &quorum_set, &driver, 16));
         nom.process_envelope(&env_local, &ctx!(&local, &quorum_set, &driver, 16));
-    
+
         let mut seen = Vec::new();
         let ok = nom.process_current_state(
             |env| {
@@ -1494,22 +1507,22 @@ mod tests {
             true,
             false,
         );
-    
+
         assert!(!ok);
         assert_eq!(seen.len(), 1);
     }
-    
+
     // ==================== Tests for new parity features ====================
-    
+
     #[test]
     fn test_set_state_from_envelope_nomination() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let mut nom = NominationProtocol::new();
-    
+
         let votes = vec![make_value(&[1, 2, 3]), make_value(&[4, 5, 6])];
         let accepted = vec![make_value(&[7, 8, 9])];
-    
+
         let envelope = make_nomination_envelope(
             node.clone(),
             1,
@@ -1517,29 +1530,29 @@ mod tests {
             votes.clone(),
             accepted.clone(),
         );
-    
+
         assert!(!nom.is_started());
         assert!(nom.set_state_from_envelope(&envelope));
         // stellar-core does NOT set mNominationStarted = true in setStateFromEnvelope
         assert!(!nom.is_started());
-    
+
         // Verify votes were restored
         for vote in &votes {
             assert!(nom.votes().contains(vote));
         }
-    
+
         // Verify accepted values were restored
         for acc in &accepted {
             assert!(nom.accepted().contains(acc));
         }
     }
-    
+
     #[test]
     fn test_set_state_from_envelope_rejects_ballot_pledges() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let mut nom = NominationProtocol::new();
-    
+
         // Create a prepare envelope (ballot protocol, not nomination)
         let prep = stellar_xdr::curr::ScpStatementPrepare {
             quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
@@ -1561,21 +1574,21 @@ mod tests {
             statement,
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
-    
+
         assert!(!nom.set_state_from_envelope(&envelope));
         assert!(!nom.is_started());
     }
-    
+
     #[test]
     fn test_candidates_accessor() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         // Initially no candidates
         assert!(nom.candidates().is_empty());
-    
+
         // After nomination starts and values are confirmed, candidates should appear
         let value = make_value(&[1, 2, 3]);
         nom.nominate(
@@ -1584,7 +1597,7 @@ mod tests {
             &make_value(&[0]),
             false,
         );
-    
+
         // Create envelope from another node that accepts the value
         let other = make_node_id(2);
         let env = make_nomination_envelope(
@@ -1595,14 +1608,14 @@ mod tests {
             vec![value.clone()],
         );
         nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 1));
-    
+
         // Candidates may or may not be populated depending on quorum
         // This test mainly verifies the accessor works
         let _ = nom.candidates();
     }
-    
+
     // ==================== Nomination Parity Tests ====================
-    
+
     // Enhanced mock driver that tracks timer stops and supports upgrade logic
     struct ParityMockDriver {
         quorum_set: ScpQuorumSet,
@@ -1614,7 +1627,7 @@ mod tests {
         values_with_upgrades: std::sync::Mutex<HashSet<Vec<u8>>>,
         stripped_value: std::sync::Mutex<Option<Value>>,
     }
-    
+
     impl ParityMockDriver {
         fn new(quorum_set: ScpQuorumSet) -> Self {
             Self {
@@ -1628,31 +1641,31 @@ mod tests {
                 stripped_value: std::sync::Mutex::new(None),
             }
         }
-    
+
         fn set_validation_level(&self, level: ValidationLevel) {
             *self.validation_level.lock().unwrap() = level;
         }
-    
+
         fn set_extract_result(&self, value: Option<Value>) {
             *self.extract_result.lock().unwrap() = value;
         }
-    
+
         fn get_timer_stops(&self) -> Vec<(u64, crate::driver::SCPTimerType)> {
             self.timer_stops.lock().unwrap().clone()
         }
-    
+
         fn mark_has_upgrades(&self, value: &Value) {
             self.values_with_upgrades
                 .lock()
                 .unwrap()
                 .insert(value.to_vec());
         }
-    
+
         fn set_stripped_value(&self, value: Option<Value>) {
             *self.stripped_value.lock().unwrap() = value;
         }
     }
-    
+
     impl SCPDriver for ParityMockDriver {
         fn validate_value(
             &self,
@@ -1662,32 +1675,32 @@ mod tests {
         ) -> ValidationLevel {
             *self.validation_level.lock().unwrap()
         }
-    
+
         fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
             candidates.first().cloned()
         }
-    
+
         fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
             let result = self.extract_result.lock().unwrap();
             result.clone().or_else(|| Some(value.clone()))
         }
-    
+
         fn emit_envelope(&self, _envelope: &ScpEnvelope) {
             self.emit_count.fetch_add(1, Ordering::SeqCst);
         }
-    
+
         fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
             Some(self.quorum_set.clone())
         }
-    
+
         fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
-    
+
         fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
-    
+
         fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-    
+
         fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-    
+
         fn compute_hash_node(
             &self,
             _slot_index: u64,
@@ -1713,7 +1726,7 @@ mod tests {
                 1
             }
         }
-    
+
         fn compute_value_hash(
             &self,
             _slot_index: u64,
@@ -1723,40 +1736,40 @@ mod tests {
         ) -> u64 {
             value.iter().map(|b| *b as u64).sum()
         }
-    
+
         fn compute_timeout(&self, _round: u32, _is_nomination: bool) -> Duration {
             Duration::from_millis(1)
         }
-    
+
         fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
-    
+
         fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
             true
         }
-    
+
         fn stop_timer(&self, slot_index: u64, timer_type: crate::driver::SCPTimerType) {
             self.timer_stops
                 .lock()
                 .unwrap()
                 .push((slot_index, timer_type));
         }
-    
+
         fn has_upgrades(&self, value: &Value) -> bool {
             self.values_with_upgrades
                 .lock()
                 .unwrap()
                 .contains(value.as_slice())
         }
-    
+
         fn strip_all_upgrades(&self, _value: &Value) -> Option<Value> {
             self.stripped_value.lock().unwrap().clone()
         }
-    
+
         fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
             self.upgrade_timeout_limit.load(Ordering::SeqCst)
         }
     }
-    
+
     /// N3/15: After stop(), process_envelope should NOT do accept/ratify
     /// because `started` is set to false.
     ///
@@ -1771,19 +1784,24 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node.clone(), node2.clone(), node3.clone()], 2);
         let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value = make_value(&[5]);
         let prev = make_value(&[0]);
-    
+
         // Start nomination
-        nom.nominate(&ctx!(&node, &quorum_set, &driver, 1), value.clone(), &prev, false);
+        nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 1),
+            value.clone(),
+            &prev,
+            false,
+        );
         assert!(nom.is_started());
-    
+
         // Stop nomination (N3/15 fix: this should clear started)
         nom.stop();
         assert!(!nom.is_started());
         assert!(nom.is_stopped());
-    
+
         // Now process an envelope that would normally cause accept/ratify.
         // Since started=false, the accept/ratify block should be skipped.
         let env = make_nomination_envelope(
@@ -1794,13 +1812,13 @@ mod tests {
             vec![value.clone()],
         );
         let state = nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 1));
-    
+
         // Envelope is stored but no accept/ratify processing happens
         assert!(matches!(state, EnvelopeState::Valid));
         // Value should NOT have been accepted since started=false
         assert!(!nom.accepted().contains(&value));
     }
-    
+
     /// N7/8: update_round_leaders normalizes quorum set by removing self
     /// and adjusting thresholds before computing leaders.
     ///
@@ -1820,13 +1838,18 @@ mod tests {
         );
         let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value = make_value(&[10]);
         let prev = make_value(&[0]);
-    
+
         // Nominate to trigger update_round_leaders
-        nom.nominate(&ctx!(&node0, &quorum_set, &driver, 1), value.clone(), &prev, false);
-    
+        nom.nominate(
+            &ctx!(&node0, &quorum_set, &driver, 1),
+            value.clone(),
+            &prev,
+            false,
+        );
+
         // After normalization: node0 removed, threshold becomes 2, validators = [1,2,3]
         // Verify leaders were selected (at least one leader exists)
         let leaders = nom.get_round_leaders();
@@ -1834,7 +1857,7 @@ mod tests {
             !leaders.is_empty(),
             "Should have at least one round leader after normalization"
         );
-    
+
         // The key property: normalization means weight calculations use
         // threshold=2/total=3 (not 3/4). With the mock driver's hash function,
         // all nodes in the normalized set get weight > 0 and can become leaders.
@@ -1848,7 +1871,7 @@ mod tests {
             "At least one node should be a leader"
         );
     }
-    
+
     /// N13: process_envelope adopts values from round leaders when
     /// no candidates exist yet.
     ///
@@ -1862,24 +1885,29 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node.clone(), leader.clone()], 1);
         let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value = make_value(&[42]);
         let leader_value = make_value(&[99]);
         let prev = make_value(&[0]);
-    
+
         // Start nomination (this sets up round leaders)
-        nom.nominate(&ctx!(&node, &quorum_set, &driver, 1), value.clone(), &prev, false);
+        nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 1),
+            value.clone(),
+            &prev,
+            false,
+        );
         assert!(nom.is_started());
-    
+
         // Verify the leader is indeed a round leader
         let leaders = nom.get_round_leaders();
-    
+
         // If leader is not in the round leaders, this test isn't exercising N13.
         // The ParityMockDriver gives higher priority to higher node IDs, so
         // leader (node2) should be included.
         if leaders.contains(&leader) {
             let initial_votes = nom.votes().len();
-    
+
             // Process an envelope from the leader with a new value
             let env = make_nomination_envelope(
                 leader.clone(),
@@ -1889,7 +1917,7 @@ mod tests {
                 vec![],
             );
             nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 1));
-    
+
             // N13: Since candidates is empty and sender is a leader,
             // we should adopt their best value
             assert!(
@@ -1904,7 +1932,7 @@ mod tests {
             );
         }
     }
-    
+
     /// N14: foundValidValue is set for MaybeValid extracted values too.
     ///
     /// stellar-core sets foundValidValue=true for ANY value that produces a candidate
@@ -1918,16 +1946,16 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node.clone(), leader.clone()], 1);
         let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let accepted_value = make_value(&[50]);
         let vote_value = make_value(&[60]);
         let extracted = make_value(&[55]); // extracted from MaybeValid accepted_value
         let prev = make_value(&[0]);
-    
+
         // Set driver to return MaybeValid and extract a specific value
         driver.set_validation_level(ValidationLevel::MaybeValid);
         driver.set_extract_result(Some(extracted.clone()));
-    
+
         // Start nomination
         nom.nominate(
             &ctx!(&node, &quorum_set, &driver, 1),
@@ -1935,7 +1963,7 @@ mod tests {
             &prev,
             false,
         );
-    
+
         // Create an envelope from the leader with accepted_value in `accepted`
         // and vote_value in `votes`
         let env = make_nomination_envelope(
@@ -1945,14 +1973,14 @@ mod tests {
             vec![vote_value.clone()],
             vec![accepted_value.clone()],
         );
-    
+
         // If leader is a round leader, get_new_value_from_nomination will be called.
         // With N14 fix: if accepted_value extracts to a valid value, foundValidValue
         // becomes true and we skip scanning votes.
         let leaders = nom.get_round_leaders();
         if leaders.contains(&leader) {
             nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 1));
-    
+
             // The extracted value (from accepted) should be adopted, but NOT the
             // vote_value (because foundValidValue=true stops us from scanning votes)
             assert!(
@@ -1967,7 +1995,7 @@ mod tests {
             );
         }
     }
-    
+
     /// N18: set_state_from_envelope rejects if nomination is already started.
     ///
     /// stellar-core throws "Cannot set state after nomination is started" when
@@ -1978,13 +2006,18 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         // Start nomination
         let value = make_value(&[1]);
         let prev = make_value(&[0]);
-        nom.nominate(&ctx!(&node, &quorum_set, &driver, 1), value.clone(), &prev, false);
+        nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 1),
+            value.clone(),
+            &prev,
+            false,
+        );
         assert!(nom.is_started());
-    
+
         // Try to set state from envelope — should fail
         let env = make_nomination_envelope(node.clone(), 1, &quorum_set, vec![value], vec![]);
         assert!(
@@ -1992,7 +2025,7 @@ mod tests {
             "set_state_from_envelope should reject when nomination is already started"
         );
     }
-    
+
     /// N12: Nomination timer is stopped when candidates are confirmed.
     ///
     /// stellar-core (lines 471-472): When a value is ratified (promoted to candidate),
@@ -2006,20 +2039,25 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node.clone(), node2.clone(), node3.clone()], 2);
         let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value = make_value(&[7]);
         let prev = make_value(&[0]);
-    
+
         // Start nomination
-        nom.nominate(&ctx!(&node, &quorum_set, &driver, 1), value.clone(), &prev, false);
+        nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 1),
+            value.clone(),
+            &prev,
+            false,
+        );
         assert!(nom.is_started());
-    
+
         // No timer stops yet
         assert!(
             driver.get_timer_stops().is_empty(),
             "No timer stops before candidate confirmation"
         );
-    
+
         // Create envelopes from 2 other nodes that both accept the value.
         // With threshold=2, this forms a quorum for ratification.
         let env2 = make_nomination_envelope(
@@ -2036,16 +2074,16 @@ mod tests {
             vec![value.clone()],
             vec![value.clone()],
         );
-    
+
         nom.process_envelope(&env2, &ctx!(&node, &quorum_set, &driver, 1));
         nom.process_envelope(&env3, &ctx!(&node, &quorum_set, &driver, 1));
-    
+
         // Value should be a candidate now
         assert!(
             nom.candidates().contains(&value),
             "Value should be confirmed as candidate"
         );
-    
+
         // N12: Timer should have been stopped
         let stops = driver.get_timer_stops();
         assert!(
@@ -2059,7 +2097,7 @@ mod tests {
             "Should stop the Nomination timer for slot 1"
         );
     }
-    
+
     /// N5: Upgrade stripping when timer_exp_count exceeds the limit.
     ///
     /// stellar-core (lines 597-651): When the nomination timer has expired enough
@@ -2077,16 +2115,16 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node.clone(), node2.clone()], 2);
         let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value_with_upgrades = make_value(&[10, 20]); // has upgrades
         let stripped_value = make_value(&[10]); // stripped version
         let prev = make_value(&[0]);
-    
+
         // Configure driver: timeout limit = 2, value has upgrades, stripped version
         driver.upgrade_timeout_limit.store(2, Ordering::SeqCst);
         driver.mark_has_upgrades(&value_with_upgrades);
         driver.set_stripped_value(Some(stripped_value.clone()));
-    
+
         // First nomination: votes for value_with_upgrades, timer_exp_count=0
         nom.nominate(
             &ctx!(&node, &quorum_set, &driver, 1),
@@ -2099,7 +2137,7 @@ mod tests {
             !nom.votes().contains(&stripped_value),
             "Should not strip upgrades before timeout limit"
         );
-    
+
         // Timeout once (timer_exp_count becomes 1, still below limit=2)
         nom.nominate(
             &ctx!(&node, &quorum_set, &driver, 1),
@@ -2111,7 +2149,7 @@ mod tests {
             !nom.votes().contains(&stripped_value),
             "timer_exp_count=1 < limit=2, should not strip yet"
         );
-    
+
         // Timeout again (timer_exp_count becomes 2, meets limit=2)
         nom.nominate(
             &ctx!(&node, &quorum_set, &driver, 1),
@@ -2119,7 +2157,7 @@ mod tests {
             &prev,
             true,
         );
-    
+
         // Now all votes have upgrades and timer_exp_count >= limit,
         // so the stripped value should be voted for
         assert!(
@@ -2128,7 +2166,7 @@ mod tests {
             nom.votes()
         );
     }
-    
+
     /// N5: When not all votes have upgrades, stripping doesn't happen
     /// even after timeout limit.
     #[test]
@@ -2141,18 +2179,18 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node.clone(), node2.clone(), node3.clone()], 2);
         let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value_with_upgrades = make_value(&[10, 20]);
         let value_no_upgrades = make_value(&[30]);
         let stripped_value = make_value(&[10]);
         let prev = make_value(&[0]);
-    
+
         // Configure driver
         driver.upgrade_timeout_limit.store(1, Ordering::SeqCst);
         driver.mark_has_upgrades(&value_with_upgrades);
         // value_no_upgrades is NOT marked as having upgrades
         driver.set_stripped_value(Some(stripped_value.clone()));
-    
+
         // Start nomination
         nom.nominate(
             &ctx!(&node, &quorum_set, &driver, 1),
@@ -2160,7 +2198,7 @@ mod tests {
             &prev,
             false,
         );
-    
+
         // Add a vote without upgrades from a leader
         let env = make_nomination_envelope(
             node2.clone(),
@@ -2170,7 +2208,7 @@ mod tests {
             vec![],
         );
         nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 1));
-    
+
         // Now timeout past the limit — but not all votes have upgrades
         nom.nominate(
             &ctx!(&node, &quorum_set, &driver, 1),
@@ -2178,7 +2216,7 @@ mod tests {
             &prev,
             true,
         );
-    
+
         // Stripped value should NOT be added because value_no_upgrades
         // doesn't have upgrades
         assert!(
@@ -2186,7 +2224,7 @@ mod tests {
             "Should not strip when not all votes have upgrades"
         );
     }
-    
+
     /// N6: Timer is set up unconditionally in nominate() when nomination
     /// is active and no candidates exist yet.
     ///
@@ -2206,16 +2244,21 @@ mod tests {
         let quorum_set = make_quorum_set(vec![node.clone(), node2.clone()], 2);
         let driver = Arc::new(MockDriver::new(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
-    
+
         let value = make_value(&[5]);
         let prev = make_value(&[0]);
-    
+
         // First nomination starts it
-        nom.nominate(&ctx!(&node, &quorum_set, &driver, 1), value.clone(), &prev, false);
+        nom.nominate(
+            &ctx!(&node, &quorum_set, &driver, 1),
+            value.clone(),
+            &prev,
+            false,
+        );
         assert!(nom.is_started());
         assert!(!nom.is_stopped());
         assert!(nom.candidates().is_empty());
-    
+
         // Second call with same value — nominate returns false (no new votes)
         // but nomination should still be active
         let _updated = nom.nominate(&ctx!(&node, &quorum_set, &driver, 1), value, &prev, true);

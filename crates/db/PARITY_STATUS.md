@@ -3,7 +3,7 @@
 **Crate**: `henyey-db`
 **Upstream**: `stellar-core/src/database/`, plus SQL operations from `src/overlay/PeerManager.*`, `src/overlay/BanManager*.*`, `src/herder/HerderPersistence*.*`, `src/main/PersistentState.*`, `src/ledger/LedgerHeaderUtils.*`, `src/transactions/TransactionSQL.*`, `src/history/HistoryManager*.*`
 **Overall Parity**: 94%
-**Last Updated**: 2026-02-17
+**Last Updated**: 2026-03-05
 
 ## Summary
 

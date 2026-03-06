@@ -1,3 +1,10 @@
+//! Transaction set execution orchestration.
+//!
+//! Coordinates the execution of an entire transaction set within a ledger
+//! close, including parallel Soroban phase execution via `tokio::spawn_blocking`,
+//! fee pre-deduction for Soroban transactions, and sequential classic phase
+//! processing.
+
 use super::*;
 
 /// Execute a full transaction set.

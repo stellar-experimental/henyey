@@ -556,15 +556,8 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::OfflineInfo => cmd_offline_info(config),
 
-        Commands::Version => {
-            cmd_version();
-            Ok(())
-        }
-
-        Commands::ConvertId { id } => {
-            cmd_convert_id(&id);
-            Ok(())
-        }
+        // Handled by early return above; included for exhaustive match.
+        Commands::Version | Commands::ConvertId { .. } => unreachable!(),
 
         Commands::ForceScp => {
             cmd_force_scp(&config)?;
@@ -1039,7 +1032,6 @@ async fn cmd_upgrade_db(config: AppConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Generate keypair command handler.
 /// Version command handler.
 ///
 /// Prints version info in a format compatible with stellar-core's `version` output.
