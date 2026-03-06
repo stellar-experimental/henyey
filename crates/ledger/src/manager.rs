@@ -5300,6 +5300,60 @@ mod tests {
         assert!(result.offers.is_empty(), "dead entry should shadow live offer (thread_count=1)");
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_scan_level_pairs_for_caches_matches_scan_bucket_list() {
+        // scan_level_pairs_for_caches (used by the overlapped startup path) must
+        // produce results identical to scan_bucket_list_for_caches for the same data.
+        let mut bl = BucketList::new();
+
+        // Populate with offers and contract data across multiple ledgers so
+        // entries end up at different levels.
+        for i in 1u32..=8 {
+            let offer = make_offer_entry(i as i64, [i as u8; 32]);
+            bl.add_batch(
+                i,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![offer],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        // Scan via the BucketList reference path
+        let expected = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+
+        // Extract pairs and scan via scan_level_pairs_for_caches
+        let level_pairs: Vec<(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)> = bl
+            .levels()
+            .iter()
+            .map(|l| (l.curr.clone(), l.snap.clone()))
+            .collect();
+        let actual = scan_level_pairs_for_caches(level_pairs, TEST_PROTOCOL, 2);
+
+        assert_eq!(
+            actual.offers.len(),
+            expected.offers.len(),
+            "offer count must match between scan_level_pairs_for_caches and scan_bucket_list_for_caches"
+        );
+
+        // Same offer IDs must be present
+        for (offer_id, _) in &expected.offers {
+            assert!(
+                actual.offers.contains_key(offer_id),
+                "offer {} missing from scan_level_pairs_for_caches result",
+                offer_id
+            );
+        }
+
+        assert_eq!(
+            actual.soroban_state.contract_data_count(),
+            expected.soroban_state.contract_data_count(),
+            "contract data count must match"
+        );
+    }
+
     #[test]
     fn test_genesis_header() {
         let header = create_genesis_header();

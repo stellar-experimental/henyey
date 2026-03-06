@@ -4112,4 +4112,187 @@ mod tests {
             "permanent file must contain valid bucket content after fix"
         );
     }
+
+    // ============ restore_from_has_parallel tests ============
+
+    /// Build a HashMap-backed loader closure for tests.
+    fn make_loader(
+        buckets: Vec<Bucket>,
+    ) -> impl Fn(&Hash256) -> crate::Result<Bucket> + Send + Sync {
+        let map: std::collections::HashMap<Hash256, Bucket> =
+            buckets.into_iter().map(|b| (b.hash(), b)).collect();
+        let map = std::sync::Arc::new(map);
+        move |hash: &Hash256| {
+            map.get(hash)
+                .cloned()
+                .ok_or_else(|| BucketError::Serialization(format!("bucket not found: {}", hash.to_hex())))
+        }
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_basic_curr_snap() {
+        // Two levels have non-empty curr/snap; rest are empty.
+        // Verify entries are accessible via get() after parallel restore.
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+
+        let bucket0_curr = Bucket::from_entries(vec![BucketListEntry::Live(entry1)]).unwrap();
+        let bucket1_curr = Bucket::from_entries(vec![BucketListEntry::Live(entry2)]).unwrap();
+
+        let h0c = bucket0_curr.hash();
+        let h1c = bucket1_curr.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (h0c, Hash256::ZERO);
+        hashes[1] = (h1c, Hash256::ZERO);
+
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+
+        let loader = make_loader(vec![bucket0_curr, bucket1_curr]);
+        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+
+        assert_eq!(bl.levels().len(), BUCKET_LIST_LEVELS);
+
+        let key1 = make_account_key([1u8; 32]);
+        assert!(bl.get(&key1).unwrap().is_some(), "entry1 should be found after parallel restore");
+
+        let key2 = make_account_key([2u8; 32]);
+        assert!(bl.get(&key2).unwrap().is_some(), "entry2 should be found after parallel restore");
+
+        // Level 2 should be empty
+        assert!(bl.levels()[2].curr.is_empty());
+        assert!(bl.levels()[2].snap.is_empty());
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_output_bucket_loaded_as_next() {
+        // When a level has HAS_NEXT_STATE_OUTPUT, the output bucket must be
+        // loaded into level.next as PendingMerge::InMemory.
+        let entry_curr = make_account_entry([1u8; 32], 100);
+        let entry_out = make_account_entry([9u8; 32], 999);
+
+        let bucket_curr = Bucket::from_entries(vec![BucketListEntry::Live(entry_curr)]).unwrap();
+        let bucket_out = Bucket::from_entries(vec![BucketListEntry::Live(entry_out)]).unwrap();
+
+        let hc = bucket_curr.hash();
+        let ho = bucket_out.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (hc, Hash256::ZERO);
+
+        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        next_states[0] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(ho),
+            input_curr: None,
+            input_snap: None,
+        };
+
+        let loader = make_loader(vec![bucket_curr, bucket_out]);
+        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+
+        assert!(
+            bl.levels()[0].next.is_some(),
+            "level 0 should have a pending merge output (HAS_NEXT_STATE_OUTPUT)"
+        );
+        // Other levels have no next
+        for i in 1..BUCKET_LIST_LEVELS {
+            assert!(bl.levels()[i].next.is_none(), "level {} should have no next", i);
+        }
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_clear_state_no_next() {
+        // HAS_NEXT_STATE_CLEAR (default) means no level.next should be set.
+        let entry = make_account_entry([5u8; 32], 500);
+        let bucket = Bucket::from_entries(vec![BucketListEntry::Live(entry)]).unwrap();
+        let h = bucket.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[3] = (h, Hash256::ZERO);
+
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS]; // all CLEAR
+
+        let loader = make_loader(vec![bucket]);
+        let bl = BucketList::restore_from_has_parallel(&hashes, &next_states, loader).unwrap();
+
+        for i in 0..BUCKET_LIST_LEVELS {
+            assert!(bl.levels()[i].next.is_none(), "level {} should have no next for CLEAR state", i);
+        }
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_matches_sequential() {
+        // restore_from_has_parallel must produce results identical to restore_from_has
+        // for the same inputs: same entries retrievable, same level.next presence.
+        let entries: Vec<LedgerEntry> = (1u8..=4).map(|i| make_account_entry([i; 32], i as i64 * 100)).collect();
+
+        let b0c = Bucket::from_entries(vec![BucketListEntry::Live(entries[0].clone())]).unwrap();
+        let b0s = Bucket::from_entries(vec![BucketListEntry::Live(entries[1].clone())]).unwrap();
+        let b2c = Bucket::from_entries(vec![BucketListEntry::Live(entries[2].clone())]).unwrap();
+        let bout = Bucket::from_entries(vec![BucketListEntry::Live(entries[3].clone())]).unwrap();
+
+        let h0c = b0c.hash();
+        let h0s = b0s.hash();
+        let h2c = b2c.hash();
+        let hout = bout.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (h0c, h0s);
+        hashes[2] = (h2c, Hash256::ZERO);
+
+        // Level 1 has a completed merge output
+        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(hout),
+            input_curr: None,
+            input_snap: None,
+        };
+
+        let all_buckets = vec![b0c, b0s, b2c, bout];
+
+        let loader_seq = make_loader(all_buckets.clone());
+        let bl_seq = BucketList::restore_from_has(&hashes, &next_states, |h| loader_seq(h)).unwrap();
+
+        let loader_par = make_loader(all_buckets);
+        let bl_par = BucketList::restore_from_has_parallel(&hashes, &next_states, loader_par).unwrap();
+
+        // All entries should be reachable from both
+        for i in 1u8..=4 {
+            let key = make_account_key([i; 32]);
+            let seq_result = bl_seq.get(&key).unwrap();
+            let par_result = bl_par.get(&key).unwrap();
+            assert_eq!(
+                seq_result.is_some(),
+                par_result.is_some(),
+                "entry [{}; 32] presence mismatch between sequential and parallel restore",
+                i
+            );
+        }
+
+        // level.next presence must match
+        for i in 0..BUCKET_LIST_LEVELS {
+            assert_eq!(
+                bl_seq.levels()[i].next.is_some(),
+                bl_par.levels()[i].next.is_some(),
+                "level {} next presence mismatch between sequential and parallel restore",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_wrong_level_count_errors() {
+        // Passing wrong number of levels must return an error.
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        let too_short = vec![(Hash256::ZERO, Hash256::ZERO); 5]; // < BUCKET_LIST_LEVELS
+
+        let result = BucketList::restore_from_has_parallel(
+            &too_short,
+            &next_states,
+            |_| unreachable!("should not call loader"),
+        );
+        assert!(result.is_err(), "should return error for wrong level count");
+    }
 }
