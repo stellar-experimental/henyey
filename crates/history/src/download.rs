@@ -35,8 +35,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Retry count for operations that should retry a few times (e.g. HAS downloads).
 ///
-/// Spec: CATCHUP_SPEC §9.1 — HAS download: up to 10 retries with archive rotation.
-pub const RETRY_A_FEW: u32 = 10;
+/// Matches stellar-core's `RETRY_A_FEW = 5`.
+pub const RETRY_A_FEW: u32 = 5;
 
 /// Retry count for operations that should retry many times.
 ///
@@ -454,10 +454,10 @@ mod tests {
     // ── CATCHUP_SPEC §9.1: Retry constants ──────────────────────────
 
     #[test]
-    fn test_retry_a_few_is_10() {
+    fn test_retry_a_few_is_5() {
         assert_eq!(
-            RETRY_A_FEW, 10,
-            "CATCHUP_SPEC §9.1: RETRY_A_FEW must be 10"
+            RETRY_A_FEW, 5,
+            "CATCHUP_SPEC §9.1: RETRY_A_FEW must be 5"
         );
     }
 

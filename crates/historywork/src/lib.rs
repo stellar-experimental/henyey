@@ -2374,8 +2374,8 @@ mod tests {
     #[test]
     fn test_retry_a_few_constant() {
         assert_eq!(
-            RETRY_A_FEW, 10,
-            "RETRY_A_FEW must be 10 (matches stellar-core)"
+            RETRY_A_FEW, 5,
+            "RETRY_A_FEW must be 5 (matches stellar-core)"
         );
     }
 
