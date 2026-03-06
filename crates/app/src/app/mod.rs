@@ -3720,6 +3720,39 @@ mod tests {
     }
 
     #[test]
+    fn test_externalized_catchup_cooldown_skip_when_next_externalize_cached() {
+        // If the target checkpoint is not yet published and we already have
+        // EXTERNALIZE for current_ledger+1, archive catchup cooldown should be
+        // bypassed so sequential close can proceed immediately.
+        let target_checkpoint = 191u32;
+        let latest_externalized = 180u64;
+        let have_next_externalize = true;
+
+        assert!(App::should_skip_externalized_catchup_cooldown(
+            target_checkpoint,
+            latest_externalized,
+            have_next_externalize,
+        ));
+    }
+
+    #[test]
+    fn test_externalized_catchup_cooldown_not_skipped_without_cached_next_externalize() {
+        // Two negative cases:
+        // 1) target checkpoint unpublished, but next EXTERNALIZE missing.
+        // 2) target checkpoint published, regardless of cache state.
+        assert!(!App::should_skip_externalized_catchup_cooldown(
+            191,
+            180,
+            false,
+        ));
+        assert!(!App::should_skip_externalized_catchup_cooldown(
+            127,
+            180,
+            true,
+        ));
+    }
+
+    #[test]
     fn test_buffered_catchup_target_small_gap() {
         // When the gap between current_ledger and first_buffered is small (< 64),
         // the target should bridge the gap. This is the scenario where a single

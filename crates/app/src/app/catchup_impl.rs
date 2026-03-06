@@ -1,6 +1,14 @@
 use super::*;
 
 impl App {
+    pub(crate) fn should_skip_externalized_catchup_cooldown(
+        target_checkpoint: u32,
+        latest_externalized: u64,
+        have_next_externalize: bool,
+    ) -> bool {
+        target_checkpoint > latest_externalized as u32 && have_next_externalize
+    }
+
     /// Run catchup to a target ledger with minimal mode.
     ///
     /// This downloads history from archives and applies it to bring the
@@ -1818,6 +1826,30 @@ impl App {
             return;
         }
 
+        let target = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
+        if target == 0 || target <= current_ledger {
+            return;
+        }
+
+        let target_checkpoint = checkpoint_containing(target);
+        let first_replay = current_ledger as u64 + 1;
+        let have_next_externalize = self.herder.get_externalized(first_replay).is_some();
+
+        if Self::should_skip_externalized_catchup_cooldown(
+            target_checkpoint,
+            latest_externalized,
+            have_next_externalize,
+        ) {
+            tracing::debug!(
+                current_ledger,
+                target,
+                target_checkpoint,
+                latest_externalized,
+                "Skipping archive catchup: will close sequentially from cached EXTERNALIZE"
+            );
+            return;
+        }
+
         // Cooldown: don't retry immediately after a catchup attempt.
         // Failed catchups (e.g., archive checkpoint not yet published)
         // would otherwise trigger rapid-fire retries because
@@ -1844,12 +1876,6 @@ impl App {
             return;
         }
 
-        let target = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
-        if target == 0 || target <= current_ledger {
-            self.catchup_in_progress.store(false, Ordering::SeqCst);
-            return;
-        }
-
         // When the target checkpoint hasn't been published yet, check if we
         // can close sequentially from cached EXTERNALIZE. If not, fall through
         // to do CatchupTarget::Current which queries the archive for whatever
@@ -1857,23 +1883,7 @@ impl App {
         //   - The archive hasn't published the next checkpoint yet
         //   - Peers have evicted EXTERNALIZE for the slots right after our LCL
         //   - The node is stuck until the next checkpoint publishes (~5 min)
-        let target_checkpoint = checkpoint_containing(target);
         if target_checkpoint > latest_externalized as u32 {
-            let first_replay = current_ledger as u64 + 1;
-            let have_next_externalize = self.herder.get_externalized(first_replay).is_some();
-            if have_next_externalize {
-                // We have the EXTERNALIZE for the next ledger, so the
-                // sequential close path can handle this without archives.
-                self.catchup_in_progress.store(false, Ordering::SeqCst);
-                tracing::debug!(
-                    current_ledger,
-                    target,
-                    target_checkpoint,
-                    latest_externalized,
-                    "Skipping archive catchup: will close sequentially from cached EXTERNALIZE"
-                );
-                return;
-            }
             // Don't have EXTERNALIZE for the next slot, and peers likely
             // evicted it (too old). Fall through to CatchupTarget::Current
             // which will catch up to the latest available archive checkpoint.
