@@ -1077,6 +1077,81 @@ mod tests {
         }
     }
 
+    /// Driver that fully validates values and provides quorum set lookups.
+    struct QuorumAwareDriver {
+        quorum_set: ScpQuorumSet,
+    }
+
+    impl QuorumAwareDriver {
+        fn new(quorum_set: ScpQuorumSet) -> Self {
+            Self { quorum_set }
+        }
+    }
+
+    impl SCPDriver for QuorumAwareDriver {
+        fn validate_value(
+            &self,
+            _slot_index: u64,
+            _value: &Value,
+            _nomination: bool,
+        ) -> ValidationLevel {
+            ValidationLevel::FullyValidated
+        }
+
+        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
+            candidates.first().cloned()
+        }
+
+        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
+            Some(value.clone())
+        }
+
+        fn emit_envelope(&self, _envelope: &ScpEnvelope) {}
+
+        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
+            Some(self.quorum_set.clone())
+        }
+
+        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
+
+        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
+
+        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
+
+        fn compute_hash_node(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            _is_priority: bool,
+            _round: u32,
+            _node_id: &NodeId,
+        ) -> u64 {
+            1
+        }
+
+        fn compute_value_hash(
+            &self,
+            _slot_index: u64,
+            _prev_value: &Value,
+            _round: u32,
+            _value: &Value,
+        ) -> u64 {
+            1
+        }
+
+        fn compute_timeout(&self, round: u32, _is_nomination: bool) -> Duration {
+            Duration::from_secs(1 + round as u64)
+        }
+
+        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
+
+        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
+            true
+        }
+    }
+
     fn make_node_id(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
@@ -1214,6 +1289,24 @@ mod tests {
 
         let envelopes = scp.get_scp_state(1);
         assert!(envelopes.iter().any(|env| env.statement.node_id == node_a));
+    }
+
+    #[test]
+    fn test_nominate_solo_quorum_starts_ballot_without_peer_envelopes() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set_with(vec![node.clone()], 1);
+        let driver = Arc::new(QuorumAwareDriver::new(quorum_set.clone()));
+        let scp = SCP::new(node, true, quorum_set, driver);
+
+        let value = make_value(&[9, 9, 9]);
+        let prev = make_value(&[0]);
+
+        assert!(scp.nominate(1, value.clone(), &prev));
+        let slot_state = scp.get_slot_state(1).expect("slot should exist");
+        assert!(
+            slot_state.ballot_round.is_some(),
+            "solo quorum should transition to ballot after nominate"
+        );
     }
 
     #[test]
