@@ -56,7 +56,9 @@ pub trait PublishQueueQueries {
 impl PublishQueueQueries for Connection {
     fn enqueue_publish(&self, ledger_seq: u32, has_json: &str) -> Result<(), DbError> {
         self.execute(
-            "INSERT OR IGNORE INTO publishqueue (ledgerseq, state) VALUES (?1, ?2)",
+            "INSERT INTO publishqueue (ledgerseq, state) VALUES (?1, ?2) \
+             ON CONFLICT(ledgerseq) DO UPDATE SET state = excluded.state \
+             WHERE publishqueue.state = 'pending'",
             params![ledger_seq as i64, has_json],
         )?;
         Ok(())
@@ -103,5 +105,50 @@ impl PublishQueueQueries for Connection {
         )
         .optional()
         .map_err(DbError::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE publishqueue (ledgerseq INTEGER PRIMARY KEY, state TEXT NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_enqueue_publish_overwrites_existing_legacy_state() {
+        let conn = setup_db();
+
+        conn.execute(
+            "INSERT INTO publishqueue (ledgerseq, state) VALUES (?1, ?2)",
+            params![63_i64, "pending"],
+        )
+        .unwrap();
+
+        let has_json = r#"{"version":2,"currentLedger":63}"#;
+        conn.enqueue_publish(63, has_json).unwrap();
+
+        let stored = conn.load_publish_has(63).unwrap().unwrap();
+        assert_eq!(stored, has_json);
+    }
+
+    #[test]
+    fn test_enqueue_publish_keeps_existing_has_json() {
+        let conn = setup_db();
+
+        let first_has = r#"{"version":2,"currentLedger":63,"marker":"first"}"#;
+        let second_has = r#"{"version":2,"currentLedger":63,"marker":"second"}"#;
+
+        conn.enqueue_publish(63, first_has).unwrap();
+        conn.enqueue_publish(63, second_has).unwrap();
+
+        let stored = conn.load_publish_has(63).unwrap().unwrap();
+        assert_eq!(stored, first_has);
     }
 }
