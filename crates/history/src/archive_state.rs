@@ -67,6 +67,31 @@ fn parse_bucket_hash_pairs(levels: &[HASBucketLevel]) -> Vec<(Hash256, Hash256)>
         .collect()
 }
 
+/// Parse the next-merge states from a slice of bucket levels.
+fn parse_next_states(levels: &[HASBucketLevel]) -> Vec<LiveBucketNextState> {
+    levels
+        .iter()
+        .map(|level| LiveBucketNextState {
+            state: level.next.state,
+            output: level
+                .next
+                .output
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
+            input_curr: level
+                .next
+                .curr
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
+            input_snap: level
+                .next
+                .snap
+                .as_ref()
+                .and_then(|h| Hash256::from_hex(h).ok()),
+        })
+        .collect()
+}
+
 /// Parse bucket hashes at a specific level, returning (curr, snap) as Options.
 fn parse_level_hashes(level: &HASBucketLevel) -> (Option<Hash256>, Option<Hash256>) {
     (
@@ -377,27 +402,7 @@ impl HistoryArchiveState {
     /// This extracts the FutureBucket state from each level for use with
     /// `BucketList::restore_from_has` and `restart_merges_from_has`.
     pub fn live_next_states(&self) -> Vec<LiveBucketNextState> {
-        self.current_buckets
-            .iter()
-            .map(|level| LiveBucketNextState {
-                state: level.next.state,
-                output: level
-                    .next
-                    .output
-                    .as_ref()
-                    .and_then(|h| Hash256::from_hex(h).ok()),
-                input_curr: level
-                    .next
-                    .curr
-                    .as_ref()
-                    .and_then(|h| Hash256::from_hex(h).ok()),
-                input_snap: level
-                    .next
-                    .snap
-                    .as_ref()
-                    .and_then(|h| Hash256::from_hex(h).ok()),
-            })
-            .collect()
+        parse_next_states(&self.current_buckets)
     }
 
     /// Validate that all bucket hashes referenced in this HAS exist in the known set.
@@ -569,29 +574,9 @@ impl HistoryArchiveState {
 
     /// Get the next bucket merge states for hot archive bucket levels.
     pub fn hot_archive_next_states(&self) -> Option<Vec<LiveBucketNextState>> {
-        self.hot_archive_buckets.as_ref().map(|levels| {
-            levels
-                .iter()
-                .map(|level| LiveBucketNextState {
-                    state: level.next.state,
-                    output: level
-                        .next
-                        .output
-                        .as_ref()
-                        .and_then(|h| Hash256::from_hex(h).ok()),
-                    input_curr: level
-                        .next
-                        .curr
-                        .as_ref()
-                        .and_then(|h| Hash256::from_hex(h).ok()),
-                    input_snap: level
-                        .next
-                        .snap
-                        .as_ref()
-                        .and_then(|h| Hash256::from_hex(h).ok()),
-                })
-                .collect()
-        })
+        self.hot_archive_buckets
+            .as_ref()
+            .map(|levels| parse_next_states(levels))
     }
 }
 

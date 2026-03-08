@@ -72,6 +72,13 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info, warn};
 
+/// Maximum number of concurrent bucket downloads, mirroring stellar-core's
+/// `MAX_CONCURRENT_SUBPROCESSES`.
+const MAX_CONCURRENT_DOWNLOADS: usize = 16;
+
+/// Current protocol version used for merge restarts.
+const CURRENT_PROTOCOL_VERSION: u32 = 25;
+
 /// Read the current process RSS (Resident Set Size) in MB from `/proc/self/status`.
 /// Returns `None` on non-Linux platforms or if the file can't be read.
 fn rss_mb() -> Option<u64> {
@@ -930,7 +937,7 @@ impl CatchupManager {
         live_next_states: &[HasNextState],
         hot_next_states: &[HasNextState],
     ) -> Result<()> {
-        let protocol_version = 25u32;
+        let protocol_version = CURRENT_PROTOCOL_VERSION;
 
         // Run live bucket list merge restarts in parallel (all levels concurrently).
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
@@ -1085,7 +1092,7 @@ impl CatchupManager {
             "Pre-downloading {} buckets to disk ({} already cached) with {} parallel downloads",
             to_download.len(),
             hashes.len() - to_download.len(),
-            16 // MAX_CONCURRENT_SUBPROCESSES equivalent
+            MAX_CONCURRENT_DOWNLOADS
         );
 
         let archives = self.archives.clone();
@@ -1148,7 +1155,7 @@ impl CatchupManager {
                     Err(HistoryError::BucketNotFound(hash))
                 }
             })
-            .buffer_unordered(16) // MAX_CONCURRENT_SUBPROCESSES equivalent
+            .buffer_unordered(MAX_CONCURRENT_DOWNLOADS)
             .collect()
             .await;
 

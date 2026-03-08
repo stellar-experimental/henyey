@@ -702,6 +702,53 @@ fn compute_tx_hash(
     Some(result.into())
 }
 
+/// Common fields extracted from V1/V2 `TransactionResultMeta` variants.
+struct TxProcessingFields {
+    tx_hash: [u8; 32],
+    result: stellar_xdr::curr::TransactionResultPair,
+    meta: stellar_xdr::curr::TransactionMeta,
+    fee_meta: stellar_xdr::curr::LedgerEntryChanges,
+    post_fee_meta: stellar_xdr::curr::LedgerEntryChanges,
+}
+
+/// Shared extraction logic for V1/V2 `LedgerCloseMeta` (generalized tx set).
+fn extract_generalized_tx_processing(
+    tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
+    processing: impl Iterator<Item = TxProcessingFields>,
+    network_id: &[u8; 32],
+    version_label: &str,
+) -> Vec<TransactionProcessingInfo> {
+    let txs = extract_txs_from_generalized_set(tx_set);
+    let tx_map = build_tx_hash_map_with_network(&txs, network_id);
+    let base_fee_map = build_tx_hash_to_base_fee_map(tx_set, network_id);
+    let mut processing_count = 0usize;
+    let result: Vec<_> = processing
+        .inspect(|_| processing_count += 1)
+        .filter_map(|fields| {
+            tx_map
+                .get(&fields.tx_hash)
+                .map(|env| TransactionProcessingInfo {
+                    envelope: env.clone(),
+                    result: fields.result,
+                    meta: fields.meta,
+                    fee_meta: fields.fee_meta,
+                    post_fee_meta: fields.post_fee_meta,
+                    base_fee: base_fee_map.get(&fields.tx_hash).copied().flatten(),
+                })
+        })
+        .collect();
+    if result.len() != processing_count {
+        tracing::warn!(
+            processing_count = processing_count,
+            result_count = result.len(),
+            txs_in_set = txs.len(),
+            "Some transactions were not matched in {} LedgerCloseMeta",
+            version_label,
+        );
+    }
+    result
+}
+
 /// Extract complete transaction processing info in apply order.
 ///
 /// This function aligns transaction envelopes with their results and metadata,
@@ -757,69 +804,32 @@ pub fn extract_transaction_processing(
             result
         }
         LedgerCloseMeta::V1(v1) => {
-            // V1/V2: tx_processing contains the transactions in apply order
-            // We need to get the envelopes from tx_set but match them to processing
-            // The transaction_hash uses network-aware hashing
-            let txs = extract_txs_from_generalized_set(&v1.tx_set);
-            let tx_map = build_tx_hash_map_with_network(&txs, network_id);
-            let base_fee_map = build_tx_hash_to_base_fee_map(&v1.tx_set, network_id);
-            let processing_count = v1.tx_processing.len();
-
-            let result: Vec<_> = v1
-                .tx_processing
-                .iter()
-                .filter_map(|tp| {
-                    let tx_hash = tp.result.transaction_hash.0;
-                    tx_map.get(&tx_hash).map(|env| TransactionProcessingInfo {
-                        envelope: env.clone(),
-                        result: tp.result.clone(),
-                        meta: tp.tx_apply_processing.clone(),
-                        fee_meta: tp.fee_processing.clone(),
-                        post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
-                        base_fee: base_fee_map.get(&tx_hash).copied().flatten(),
-                    })
-                })
-                .collect();
-            if result.len() != processing_count {
-                tracing::warn!(
-                    processing_count = processing_count,
-                    result_count = result.len(),
-                    txs_in_set = txs.len(),
-                    "Some transactions were not matched in V1 LedgerCloseMeta"
-                );
-            }
-            result
+            extract_generalized_tx_processing(
+                &v1.tx_set,
+                v1.tx_processing.iter().map(|tp| TxProcessingFields {
+                    tx_hash: tp.result.transaction_hash.0,
+                    result: tp.result.clone(),
+                    meta: tp.tx_apply_processing.clone(),
+                    fee_meta: tp.fee_processing.clone(),
+                    post_fee_meta: stellar_xdr::curr::LedgerEntryChanges::default(),
+                }),
+                network_id,
+                "V1",
+            )
         }
         LedgerCloseMeta::V2(v2) => {
-            let txs = extract_txs_from_generalized_set(&v2.tx_set);
-            let tx_map = build_tx_hash_map_with_network(&txs, network_id);
-            let base_fee_map = build_tx_hash_to_base_fee_map(&v2.tx_set, network_id);
-            let processing_count = v2.tx_processing.len();
-
-            let result: Vec<_> = v2
-                .tx_processing
-                .iter()
-                .filter_map(|tp| {
-                    let tx_hash = tp.result.transaction_hash.0;
-                    tx_map.get(&tx_hash).map(|env| TransactionProcessingInfo {
-                        envelope: env.clone(),
-                        result: tp.result.clone(),
-                        meta: tp.tx_apply_processing.clone(),
-                        fee_meta: tp.fee_processing.clone(),
-                        post_fee_meta: tp.post_tx_apply_fee_processing.clone(),
-                        base_fee: base_fee_map.get(&tx_hash).copied().flatten(),
-                    })
-                })
-                .collect();
-            if result.len() != processing_count {
-                tracing::warn!(
-                    processing_count = processing_count,
-                    result_count = result.len(),
-                    txs_in_set = txs.len(),
-                    "Some transactions were not matched in V2 LedgerCloseMeta"
-                );
-            }
-            result
+            extract_generalized_tx_processing(
+                &v2.tx_set,
+                v2.tx_processing.iter().map(|tp| TxProcessingFields {
+                    tx_hash: tp.result.transaction_hash.0,
+                    result: tp.result.clone(),
+                    meta: tp.tx_apply_processing.clone(),
+                    fee_meta: tp.fee_processing.clone(),
+                    post_fee_meta: tp.post_tx_apply_fee_processing.clone(),
+                }),
+                network_id,
+                "V2",
+            )
         }
     }
 }

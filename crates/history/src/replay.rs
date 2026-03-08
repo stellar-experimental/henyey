@@ -81,6 +81,262 @@ fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchiv
     }
 }
 
+/// Compute a hex-encoded SHA-256 digest over the XDR encoding of a slice of
+/// `WriteXdr` items.  Used for debug logging only.
+fn debug_xdr_hash<T: WriteXdr>(items: &[T]) -> String {
+    let mut hasher = Sha256::new();
+    for item in items {
+        if let Ok(xdr) = item.to_xdr(stellar_xdr::curr::Limits::none()) {
+            hasher.update(&xdr);
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Result of running the incremental eviction scan for a single ledger.
+struct EvictionScanResult {
+    evicted_keys: Vec<LedgerKey>,
+    archived_entries: Vec<LedgerEntry>,
+    updated_iterator: Option<EvictionIterator>,
+    ran: bool,
+}
+
+/// Run incremental eviction scan for protocol 23+ and resolve candidates.
+///
+/// Returns evicted keys, archived entries, and the updated iterator position.
+/// If eviction is disabled or the protocol version is too low, returns an empty result.
+fn run_eviction_scan(
+    config: &ReplayConfig,
+    header: &LedgerHeader,
+    bucket_list: &mut henyey_bucket::BucketList,
+    eviction_iterator: Option<EvictionIterator>,
+    eviction_settings: &StateArchivalSettings,
+    init_entries: &[LedgerEntry],
+    live_entries: &[LedgerEntry],
+) -> Result<EvictionScanResult> {
+    if !config.run_eviction
+        || header.ledger_version < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+    {
+        return Ok(EvictionScanResult {
+            evicted_keys: Vec::new(),
+            archived_entries: Vec::new(),
+            updated_iterator: eviction_iterator,
+            ran: false,
+        });
+    }
+
+    let iter = eviction_iterator.unwrap_or_else(|| {
+        EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
+    });
+    let eviction_result = bucket_list
+        .scan_for_eviction_incremental(iter, header.ledger_seq, eviction_settings)
+        .map_err(HistoryError::Bucket)?;
+
+    tracing::info!(
+        ledger_seq = header.ledger_seq,
+        bytes_scanned = eviction_result.bytes_scanned,
+        candidates = eviction_result.candidates.len(),
+        end_level = eviction_result.end_iterator.bucket_list_level,
+        end_is_curr = eviction_result.end_iterator.is_curr_bucket,
+        "Incremental eviction scan results"
+    );
+
+    // Resolution phase: apply TTL filtering + max_entries limit.
+    // This matches stellar-core resolveBackgroundEvictionScan which:
+    // 1. Filters out entries whose TTL was modified by TXs in this ledger
+    // 2. Evicts up to maxEntriesToArchive entries
+    // 3. Sets iterator based on whether the limit was hit
+    let modified_ttl_keys: std::collections::HashSet<LedgerKey> = init_entries
+        .iter()
+        .chain(live_entries.iter())
+        .filter_map(|entry| {
+            if let LedgerEntryData::Ttl(ttl) = &entry.data {
+                Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                    key_hash: ttl.key_hash.clone(),
+                }))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let resolved = eviction_result.resolve(
+        eviction_settings.max_entries_to_archive,
+        &modified_ttl_keys,
+    );
+
+    Ok(EvictionScanResult {
+        evicted_keys: resolved.evicted_keys,
+        archived_entries: resolved.archived_entries,
+        updated_iterator: Some(resolved.end_iterator),
+        ran: true,
+    })
+}
+
+/// Verify the combined bucket list hash at checkpoint boundaries.
+///
+/// Verification is only reliable at checkpoints (ledger_seq % 64 == 63) because
+/// re-execution without TransactionMeta may produce slightly different entry values.
+/// For protocol 23+, eviction must also be running to get accurate results.
+fn verify_bucket_list_hash(
+    config: &ReplayConfig,
+    header: &LedgerHeader,
+    bucket_list: &henyey_bucket::BucketList,
+    hot_archive_bucket_list: &henyey_bucket::HotArchiveBucketList,
+    eviction_iterator: Option<EvictionIterator>,
+) -> Result<()> {
+    let is_checkpoint = header.ledger_seq % 64 == 63;
+    let eviction_running = config.run_eviction && eviction_iterator.is_some();
+    let can_verify = is_checkpoint
+        && (header.ledger_version < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
+            || eviction_running);
+
+    if !can_verify {
+        tracing::debug!(
+            ledger_seq = header.ledger_seq,
+            protocol_version = header.ledger_version,
+            is_checkpoint = is_checkpoint,
+            eviction_running = eviction_running,
+            "Skipping bucket list verification (only verified at checkpoints)"
+        );
+        return Ok(());
+    }
+
+    let expected = Hash256::from(header.bucket_list_hash.0);
+    tracing::info!(
+        ledger_seq = header.ledger_seq,
+        protocol_version = header.ledger_version,
+        expected_hash = %expected.to_hex(),
+        "Verifying bucket list hash"
+    );
+    let actual = combined_bucket_list_hash(
+        bucket_list,
+        hot_archive_bucket_list,
+        header.ledger_version,
+    );
+    if actual != expected {
+        tracing::error!(
+            ledger_seq = header.ledger_seq,
+            expected_hash = %expected.to_hex(),
+            actual_hash = %actual.to_hex(),
+            "Bucket list hash mismatch - logging detailed state"
+        );
+        for level in 0..henyey_bucket::BUCKET_LIST_LEVELS {
+            let level_ref = bucket_list.level(level).unwrap();
+            let curr_hash = level_ref.curr.hash();
+            let snap_hash = level_ref.snap.hash();
+            let level_hash = level_ref.hash();
+            tracing::error!(
+                level = level,
+                curr_hash = %curr_hash,
+                curr_entries = level_ref.curr.len(),
+                snap_hash = %snap_hash,
+                snap_entries = level_ref.snap.len(),
+                level_hash = %level_hash,
+                "Level state at mismatch"
+            );
+        }
+        return Err(HistoryError::VerificationFailed(format!(
+            "bucket list hash mismatch at ledger {} protocol {} (expected {}, got {})",
+            header.ledger_seq,
+            header.ledger_version,
+            expected.to_hex(),
+            actual.to_hex()
+        )));
+    }
+    Ok(())
+}
+
+/// Classify delta entries into INIT, LIVE, and DEAD categories.
+///
+/// Entries that the delta marks as INIT but that already exist in the live bucket
+/// list (e.g., shared WASM restored from hot archive) are moved to LIVE. Entries
+/// restored from hot archive are added to LIVE, and dead entries corresponding to
+/// restored keys are removed.
+fn classify_delta_entries(
+    header: &LedgerHeader,
+    bucket_list: &henyey_bucket::BucketList,
+    delta_init_entries: Vec<LedgerEntry>,
+    mut live_entries: Vec<LedgerEntry>,
+    mut dead_entries: Vec<LedgerKey>,
+    hot_archive_restored_keys: &[LedgerKey],
+) -> (Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>) {
+    let delta_init_count = delta_init_entries.len();
+    let delta_live_count = live_entries.len();
+
+    // Check if "init" entries already exist in the LIVE bucket list.
+    // This can happen when restoring from hot archive when another contract still uses
+    // the same ContractCode (shared WASM). Only check ContractCode and ContractData.
+    let mut init_entries: Vec<LedgerEntry> = Vec::new();
+    let mut moved_to_live_count = 0u32;
+    for entry in delta_init_entries {
+        let key = match henyey_ledger::entry_to_key(&entry) {
+            Ok(k) => k,
+            Err(_) => {
+                init_entries.push(entry);
+                continue;
+            }
+        };
+
+        let should_check = matches!(
+            &entry.data,
+            stellar_xdr::curr::LedgerEntryData::ContractCode(_)
+                | stellar_xdr::curr::LedgerEntryData::ContractData(_)
+        );
+
+        let already_in_bucket_list =
+            should_check && bucket_list.get(&key).ok().flatten().is_some();
+
+        if already_in_bucket_list {
+            tracing::debug!(
+                ledger_seq = header.ledger_seq,
+                key_type = ?std::mem::discriminant(&key),
+                "Moving INIT entry to LIVE - already exists in bucket list"
+            );
+            live_entries.push(entry);
+            moved_to_live_count += 1;
+        } else {
+            init_entries.push(entry);
+        }
+    }
+    if moved_to_live_count > 0 || is_checkpoint_ledger(header.ledger_seq) {
+        tracing::info!(
+            ledger_seq = header.ledger_seq,
+            delta_init_count = delta_init_count,
+            final_init_count = init_entries.len(),
+            moved_to_live_count = moved_to_live_count,
+            delta_live_count = delta_live_count,
+            final_live_count = live_entries.len(),
+            delta_dead_count = dead_entries.len(),
+            "Entry counts after INIT→LIVE check"
+        );
+    }
+
+    // Handle hot archive restored entries.
+    let init_entry_keys: std::collections::HashSet<_> = init_entries
+        .iter()
+        .filter_map(|e| henyey_ledger::entry_to_key(e).ok())
+        .collect();
+    for key in hot_archive_restored_keys {
+        if init_entry_keys.contains(key) {
+            continue;
+        }
+        if let Ok(Some(mut entry)) = bucket_list.get(key) {
+            entry.last_modified_ledger_seq = header.ledger_seq;
+            live_entries.push(entry);
+        }
+    }
+
+    // Remove restored entries from dead_entries.
+    if !hot_archive_restored_keys.is_empty() {
+        let restored_set: std::collections::HashSet<_> =
+            hot_archive_restored_keys.iter().collect();
+        dead_entries.retain(|k| !restored_set.contains(k));
+    }
+
+    (init_entries, live_entries, dead_entries)
+}
+
 /// Compute the size of a Soroban entry for state size tracking.
 ///
 /// Returns the entry size in bytes for ContractData/ContractCode entries,
@@ -674,174 +930,40 @@ pub fn replay_ledger_with_execution(
     };
     let total_coins_delta = delta.total_coins_delta();
     let changes = delta.changes().cloned().collect::<Vec<_>>();
-    let delta_init_entries = delta.init_entries();
-    let delta_init_count = delta_init_entries.len();
-    let mut live_entries = delta.live_entries();
-    let delta_live_count = live_entries.len();
-    let mut dead_entries = delta.dead_entries();
-
-    // Check if "init" entries already exist in the LIVE bucket list.
-    // This can happen when restoring from hot archive when another contract still uses
-    // the same ContractCode (shared WASM). In such cases, the entry should be treated
-    // as an update (LIVEENTRY) rather than a create (INITENTRY), otherwise the bucket
-    // list hash will diverge due to different entry type handling during merges.
-    //
-    // IMPORTANT: We must check only the LIVE bucket list, not the hot archive.
-    // Entries that exist only in hot archive should still be INITENTRY in the live list.
-    //
-    // NOTE: To match verify-execution behavior, we ONLY check ContractCode and ContractData
-    // entries. Other entry types should remain as INIT even if they exist in the bucket list.
-    let mut init_entries: Vec<LedgerEntry> = Vec::new();
-    let mut moved_to_live_count = 0u32;
-    for entry in delta_init_entries {
-        let key = match henyey_ledger::entry_to_key(&entry) {
-            Ok(k) => k,
-            Err(_) => {
-                init_entries.push(entry);
-                continue;
-            }
-        };
-
-        // Only check bucket list for ContractCode and ContractData (matching verify-exec)
-        let should_check_bucket_list = matches!(
-            &entry.data,
-            stellar_xdr::curr::LedgerEntryData::ContractCode(_)
-                | stellar_xdr::curr::LedgerEntryData::ContractData(_)
-        );
-
-        // Check if entry exists in the LIVE bucket list (not hot archive)
-        let already_in_bucket_list = if should_check_bucket_list {
-            bucket_list.get(&key).ok().flatten().is_some()
-        } else {
-            false
-        };
-
-        if already_in_bucket_list {
-            // Entry already exists in live bucket list - treat as update (LIVEENTRY)
-            tracing::debug!(
-                ledger_seq = header.ledger_seq,
-                key_type = ?std::mem::discriminant(&key),
-                "Moving INIT entry to LIVE - already exists in bucket list"
-            );
-            live_entries.push(entry);
-            moved_to_live_count += 1;
-        } else {
-            // Entry doesn't exist in live bucket list - keep as create (INITENTRY)
-            init_entries.push(entry);
-        }
-    }
-    if moved_to_live_count > 0 || is_checkpoint_ledger(header.ledger_seq) {
-        tracing::info!(
-            ledger_seq = header.ledger_seq,
-            delta_init_count = delta_init_count,
-            final_init_count = init_entries.len(),
-            moved_to_live_count = moved_to_live_count,
-            delta_live_count = delta_live_count,
-            final_live_count = live_entries.len(),
-            delta_dead_count = dead_entries.len(),
-            "Entry counts after INIT→LIVE check"
-        );
-    }
-
-    // Handle hot archive restored entries.
-    // These entries were loaded from hot archive during transaction execution but may not
-    // have been added to the delta if they already existed in the bucket list (e.g., shared
-    // contract code). We need to ensure they're included in the bucket list update.
-    let init_entry_keys: std::collections::HashSet<_> = init_entries
-        .iter()
-        .filter_map(|e| henyey_ledger::entry_to_key(e).ok())
-        .collect();
-    for key in &tx_set_result.hot_archive_restored_keys {
-        // Skip if already in init_entries (added from delta's created entries)
-        if init_entry_keys.contains(key) {
-            continue;
-        }
-        // Get the entry from the bucket list (pre-transaction state)
-        if let Ok(Some(mut entry)) = bucket_list.get(key) {
-            // Entry already exists in bucket list - treat as update (LIVE)
-            // Update last_modified_ledger_seq to current ledger
-            entry.last_modified_ledger_seq = header.ledger_seq;
-            live_entries.push(entry);
-        }
-        // If entry doesn't exist in bucket list and not in init_entries, it means the
-        // delta already handled it or there's nothing to restore. Skip.
-    }
-
-    // Remove restored entries from dead_entries - they shouldn't be deleted.
-    // When an entry is restored from hot archive, it might have been marked as deleted
-    // in the live bucket list when it was evicted. We need to ensure it's not re-deleted.
-    if !tx_set_result.hot_archive_restored_keys.is_empty() {
-        let restored_set: std::collections::HashSet<_> = tx_set_result.hot_archive_restored_keys.iter().collect();
-        dead_entries.retain(|k| !restored_set.contains(k));
-    }
+    // Classify delta entries: move INIT entries that already exist in the live
+    // bucket list to LIVE, and reconcile hot-archive restored entries.
+    let (init_entries, live_entries, dead_entries) = classify_delta_entries(
+        header,
+        bucket_list,
+        delta.init_entries(),
+        delta.live_entries(),
+        delta.dead_entries(),
+        &tx_set_result.hot_archive_restored_keys,
+    );
 
     // Run incremental eviction scan for protocol 23+ before applying transaction changes
     // This matches stellar-core's behavior: eviction is determined by TTL state
     // from the current bucket list, then evicted entries are added as DEAD entries
-    let mut updated_eviction_iterator = eviction_iterator;
-    let mut evicted_keys: Vec<LedgerKey> = Vec::new();
-    let mut archived_entries: Vec<LedgerEntry> = Vec::new();
-    let mut eviction_actually_ran = false;
-
-    if config.run_eviction
-        && header.ledger_version >= FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
-    {
-        let iter = updated_eviction_iterator.unwrap_or_else(|| {
-            EvictionIterator::new(eviction_settings.starting_eviction_scan_level)
-        });
-        let eviction_result = bucket_list
-            .scan_for_eviction_incremental(iter, header.ledger_seq, &eviction_settings)
-            .map_err(HistoryError::Bucket)?;
-
-        tracing::info!(
-            ledger_seq = header.ledger_seq,
-            bytes_scanned = eviction_result.bytes_scanned,
-            candidates = eviction_result.candidates.len(),
-            end_level = eviction_result.end_iterator.bucket_list_level,
-            end_is_curr = eviction_result.end_iterator.is_curr_bucket,
-            "Incremental eviction scan results"
-        );
-
-        // Resolution phase: apply TTL filtering + max_entries limit.
-        // This matches stellar-core resolveBackgroundEvictionScan which:
-        // 1. Filters out entries whose TTL was modified by TXs in this ledger
-        // 2. Evicts up to maxEntriesToArchive entries
-        // 3. Sets iterator based on whether the limit was hit
-        let modified_ttl_keys: std::collections::HashSet<LedgerKey> = init_entries
-            .iter()
-            .chain(live_entries.iter())
-            .filter_map(|entry| {
-                if let LedgerEntryData::Ttl(ttl) = &entry.data {
-                    Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                        key_hash: ttl.key_hash.clone(),
-                    }))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        let resolved = eviction_result.resolve(
-            eviction_settings.max_entries_to_archive,
-            &modified_ttl_keys,
-        );
-
-        evicted_keys = resolved.evicted_keys;
-        archived_entries = resolved.archived_entries;
-        updated_eviction_iterator = Some(resolved.end_iterator);
-        eviction_actually_ran = true;
-    }
+    let eviction = run_eviction_scan(
+        config,
+        header,
+        bucket_list,
+        eviction_iterator,
+        &eviction_settings,
+        &init_entries,
+        &live_entries,
+    )?;
 
     // Combine transaction dead entries with evicted entries
     let mut all_dead_entries = dead_entries.clone();
-    all_dead_entries.extend(evicted_keys);
+    all_dead_entries.extend(eviction.evicted_keys);
 
     // Build live entries including eviction iterator update.
     // stellar-core updates the EvictionIterator ConfigSettingEntry EVERY ledger
     // during eviction scan. We do the same for consistency.
     let mut all_live_entries = live_entries.clone();
-    if eviction_actually_ran {
-        if let Some(iter) = updated_eviction_iterator {
+    if eviction.ran {
+        if let Some(iter) = eviction.updated_iterator {
             let eviction_iter_entry = LedgerEntry {
                 last_modified_ledger_seq: header.ledger_seq,
                 data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
@@ -898,7 +1020,7 @@ pub fn replay_ledger_with_execution(
         tracing::info!(
             ledger_seq = header.ledger_seq,
             pre_hash = %pre_hash,
-            archived_count = archived_entries.len(),
+            archived_count = eviction.archived_entries.len(),
             "Hot archive add_batch - BEFORE"
         );
         // HotArchiveBucketList::add_batch takes (ledger_seq, protocol_version, archived_entries, restored_keys)
@@ -907,7 +1029,7 @@ pub fn replay_ledger_with_execution(
             .add_batch(
                 header.ledger_seq,
                 header.ledger_version,
-                archived_entries,
+                eviction.archived_entries,
                 tx_set_result.hot_archive_restored_keys.clone(),
             )
             .map_err(HistoryError::Bucket)?;
@@ -922,36 +1044,9 @@ pub fn replay_ledger_with_execution(
 
     // Apply changes to live bucket list SECOND (after hot archive update).
     // Debug: compute hash of entries for comparison with verify-execution
-    let init_hash = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        for e in &init_entries {
-            if let Ok(xdr) = e.to_xdr(stellar_xdr::curr::Limits::none()) {
-                hasher.update(&xdr);
-            }
-        }
-        hex::encode(hasher.finalize())
-    };
-    let live_hash = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        for e in &all_live_entries {
-            if let Ok(xdr) = e.to_xdr(stellar_xdr::curr::Limits::none()) {
-                hasher.update(&xdr);
-            }
-        }
-        hex::encode(hasher.finalize())
-    };
-    let dead_hash = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        for k in &all_dead_entries {
-            if let Ok(xdr) = k.to_xdr(stellar_xdr::curr::Limits::none()) {
-                hasher.update(&xdr);
-            }
-        }
-        hex::encode(hasher.finalize())
-    };
+    let init_hash = debug_xdr_hash(&init_entries);
+    let live_hash = debug_xdr_hash(&all_live_entries);
+    let dead_hash = debug_xdr_hash(&all_dead_entries);
     tracing::info!(
         ledger_seq = header.ledger_seq,
         init_count = init_entries.len(),
@@ -982,74 +1077,13 @@ pub fn replay_ledger_with_execution(
     );
 
     if config.verify_bucket_list {
-        // Bucket list verification during replay is only reliable at checkpoints.
-        // This is because we re-execute transactions without TransactionMeta,
-        // which may produce slightly different entry values than stellar-core.
-        // At checkpoints, we restore the bucket list from the archive, so verification
-        // is accurate. For per-ledger verification, we would need TransactionMeta
-        // from the archives (available via LedgerCloseMeta in streaming/CDP format).
-        //
-        // For protocol 23+, eviction must be running to get accurate results even
-        // at checkpoints, but verification is still only done at checkpoints.
-        let is_checkpoint = header.ledger_seq % 64 == 63;
-        let eviction_running = config.run_eviction && eviction_iterator.is_some();
-        let can_verify = is_checkpoint
-            && (header.ledger_version < FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION
-                || eviction_running);
-
-        if can_verify {
-            let expected = Hash256::from(header.bucket_list_hash.0);
-            tracing::info!(
-                ledger_seq = header.ledger_seq,
-                protocol_version = header.ledger_version,
-                expected_hash = %expected.to_hex(),
-                "Verifying bucket list hash"
-            );
-            let actual = combined_bucket_list_hash(
-                bucket_list,
-                hot_archive_bucket_list,
-                header.ledger_version,
-            );
-            if actual != expected {
-                // Log detailed bucket list state for debugging
-                tracing::error!(
-                    ledger_seq = header.ledger_seq,
-                    expected_hash = %expected.to_hex(),
-                    actual_hash = %actual.to_hex(),
-                    "Bucket list hash mismatch - logging detailed state"
-                );
-                for level in 0..henyey_bucket::BUCKET_LIST_LEVELS {
-                    let level_ref = bucket_list.level(level).unwrap();
-                    let curr_hash = level_ref.curr.hash();
-                    let snap_hash = level_ref.snap.hash();
-                    let level_hash = level_ref.hash();
-                    tracing::error!(
-                        level = level,
-                        curr_hash = %curr_hash,
-                        curr_entries = level_ref.curr.len(),
-                        snap_hash = %snap_hash,
-                        snap_entries = level_ref.snap.len(),
-                        level_hash = %level_hash,
-                        "Level state at mismatch"
-                    );
-                }
-                return Err(HistoryError::VerificationFailed(format!(
-                    "bucket list hash mismatch at ledger {} protocol {} (expected {}, got {})",
-                    header.ledger_seq,
-                    header.ledger_version,
-                    expected.to_hex(),
-                    actual.to_hex()
-                )));
-            }
-        } else {
-            tracing::debug!(
-                ledger_seq = header.ledger_seq,
-                protocol_version = header.ledger_version,
-                is_checkpoint = is_checkpoint,
-                eviction_running = eviction_running,
-                "Skipping bucket list verification (only verified at checkpoints)"
-            );
-        }
+        verify_bucket_list_hash(
+            config,
+            header,
+            bucket_list,
+            hot_archive_bucket_list,
+            eviction_iterator,
+        )?;
     }
 
     let tx_count = tx_set_result.results.len() as u32;
@@ -1078,7 +1112,7 @@ pub fn replay_ledger_with_execution(
         live_entries,
         dead_entries,
         changes,
-        eviction_iterator: updated_eviction_iterator,
+        eviction_iterator: eviction.updated_iterator,
         soroban_state_size_delta,
     })
 }
