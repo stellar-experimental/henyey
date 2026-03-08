@@ -19,12 +19,18 @@ use henyey_crypto::{sign_hash, SecretKey};
 use henyey_herder::TxQueueResult;
 use henyey_tx::TxResultCode;
 use stellar_xdr::curr::{
-    AccountId, Asset, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
-    PaymentOp, Preconditions, PublicKey, SequenceNumber, Signature, SignatureHint,
-    Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
-    CreateAccountOp,
+    AccountId, Asset, ContractDataDurability, ContractId, ContractIdPreimage,
+    ContractIdPreimageFromAddress, DecoratedSignature, Hash, LedgerKey,
+    LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
+    PublicKey, ScAddress, ScVal, SequenceNumber, Signature, SignatureHint, Transaction,
+    TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM, CreateAccountOp,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+use crate::loadgen_soroban::{
+    compute_contract_id, contract_code_key, contract_instance_key, make_account_address,
+    make_contract_address, make_u32, make_u64, SorobanTxBuilder,
+};
 
 // ---------------------------------------------------------------------------
 // Constants (matching stellar-core LoadGenerator.cpp)
@@ -39,18 +45,94 @@ const TX_SUBMIT_MAX_TRIES: u32 = 10;
 /// Sentinel account ID for the network root account.
 const ROOT_ACCOUNT_ID: u64 = u64::MAX;
 
+/// Number of ledgers to wait for Soroban state sync before timing out.
+#[allow(dead_code)]
+const TIMEOUT_NUM_LEDGERS: u32 = 20;
+
+/// Default WASM size for random upload transactions.
+const DEFAULT_WASM_SIZE: usize = 35_000;
+
+/// Default inclusion fee for Soroban transactions.
+const DEFAULT_SOROBAN_INCLUSION_FEE: u32 = 100;
+
+// ---------------------------------------------------------------------------
+// ContractInstance (Soroban)
+// ---------------------------------------------------------------------------
+
+/// Deployed contract instance metadata for load generation.
+///
+/// Matches stellar-core `TxGenerator::ContractInstance`.
+#[derive(Debug, Clone)]
+pub struct ContractInstance {
+    /// Read-only ledger keys: `[contract_code, contract_instance]`.
+    pub read_only_keys: Vec<LedgerKey>,
+    /// Contract address.
+    pub contract_id: Hash256,
+    /// Estimated size of contract entries in bytes.
+    pub contract_entries_size: u32,
+}
+
 // ---------------------------------------------------------------------------
 // LoadGenMode
 // ---------------------------------------------------------------------------
 
 /// Load generation mode.
 ///
-/// Matches stellar-core `LoadGenMode`. Only `Pay` is currently supported;
-/// Soroban modes are tracked as intentional omissions.
+/// Matches stellar-core `LoadGenMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadGenMode {
     /// Classic payment transactions (1 stroop per tx).
     Pay,
+    /// Deploy random Wasm blobs (overlay/herder stress testing).
+    SorobanUpload,
+    /// Two-phase setup: upload test Wasm, then deploy N contract instances.
+    /// Prerequisite for `SorobanInvoke`.
+    SorobanInvokeSetup,
+    /// Invoke resource-intensive contract transactions on instances created
+    /// by `SorobanInvokeSetup`.
+    SorobanInvoke,
+    /// Blend of Pay, SorobanUpload, and SorobanInvoke at configurable weights.
+    MixedClassicSoroban,
+}
+
+impl LoadGenMode {
+    /// Returns `true` for any Soroban mode.
+    pub fn is_soroban(self) -> bool {
+        matches!(
+            self,
+            Self::SorobanUpload
+                | Self::SorobanInvokeSetup
+                | Self::SorobanInvoke
+                | Self::MixedClassicSoroban
+        )
+    }
+
+    /// Returns `true` for setup-only modes (no ongoing tx submission).
+    pub fn is_soroban_setup(self) -> bool {
+        matches!(self, Self::SorobanInvokeSetup)
+    }
+
+    /// Returns `true` for modes that submit transactions in a continuous loop.
+    pub fn is_load(self) -> bool {
+        matches!(
+            self,
+            Self::Pay | Self::SorobanUpload | Self::SorobanInvoke | Self::MixedClassicSoroban
+        )
+    }
+
+    /// Returns `true` for modes that invoke previously deployed contracts.
+    ///
+    /// Matches stellar-core `modeSetsUpInvoke()` | `modeInvokes()` invoke check.
+    pub fn mode_invokes(self) -> bool {
+        matches!(self, Self::SorobanInvoke | Self::MixedClassicSoroban)
+    }
+
+    /// Returns `true` for modes that set up contract instances (upload + deploy).
+    ///
+    /// Matches stellar-core `modeSetsUpInvoke()`.
+    pub fn mode_sets_up_invoke(self) -> bool {
+        matches!(self, Self::SorobanInvokeSetup)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +158,28 @@ pub struct GeneratedLoadConfig {
     pub max_fee_rate: Option<u32>,
     /// Whether to skip transactions rejected for low fee instead of failing.
     pub skip_low_fee_txs: bool,
+    /// Spike interval in seconds (0 = no spikes). Every `spike_interval`
+    /// seconds, an additional burst of `spike_size` transactions is injected.
+    ///
+    /// Matches stellar-core `GeneratedLoadConfig::spikeInterval` / `spikeSize`.
+    pub spike_interval: u64,
+    /// Number of extra transactions per spike burst.
+    pub spike_size: u32,
+
+    // --- Soroban-specific fields ---
+
+    /// Number of contract instances to deploy (for `SorobanInvokeSetup`).
+    pub n_instances: u32,
+    /// Number of Wasm blobs to upload (for `SorobanInvokeSetup`).
+    pub n_wasms: u32,
+    /// Minimum Soroban success percentage (0-100).
+    pub min_soroban_percent_success: u32,
+    /// Weight for Pay mode in `MixedClassicSoroban`.
+    pub mix_pay_weight: u32,
+    /// Weight for SorobanUpload in `MixedClassicSoroban`.
+    pub mix_upload_weight: u32,
+    /// Weight for SorobanInvoke in `MixedClassicSoroban`.
+    pub mix_invoke_weight: u32,
 
     // --- Legacy simple-mode fields (backward compat) ---
 
@@ -101,6 +205,14 @@ impl Default for GeneratedLoadConfig {
             tx_rate: 10,
             max_fee_rate: None,
             skip_low_fee_txs: false,
+            spike_interval: 0,
+            spike_size: 0,
+            n_instances: 0,
+            n_wasms: 0,
+            min_soroban_percent_success: 0,
+            mix_pay_weight: 1,
+            mix_upload_weight: 1,
+            mix_invoke_weight: 1,
             accounts: Vec::new(),
             txs_per_step: 0,
             steps: 0,
@@ -134,7 +246,13 @@ impl GeneratedLoadConfig {
     ///
     /// Matches stellar-core `GeneratedLoadConfig::isDone()`.
     pub fn is_done(&self) -> bool {
-        self.n_txs == 0
+        if self.mode.is_load() {
+            self.n_txs == 0
+        } else if self.mode.is_soroban_setup() {
+            self.n_instances == 0
+        } else {
+            self.n_txs == 0
+        }
     }
 
     /// Returns `true` when there are still transactions to submit.
@@ -434,6 +552,220 @@ impl TxGenerator {
         self.accounts.get(&id)
     }
 
+    // --- Soroban transaction builders ---
+
+    /// Build a random WASM upload transaction.
+    ///
+    /// Matches stellar-core `TxGenerator::sorobanRandomWasmTransaction()`.
+    pub fn soroban_random_wasm_transaction(
+        &mut self,
+        ledger_num: u32,
+        account_id: u64,
+        inclusion_fee: u32,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let wasm_size = DEFAULT_WASM_SIZE;
+        let wasm = SorobanTxBuilder::random_wasm(wasm_size, deterministic_rand(account_id, ledger_num));
+        let source = self.find_account(account_id, ledger_num);
+        let seq = source.next_sequence_number();
+        let sk = source.secret_key.clone();
+        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let envelope = builder.upload_wasm_tx(&sk, seq, &wasm, inclusion_fee)?;
+        Ok((account_id, envelope))
+    }
+
+    /// Build a WASM upload transaction for the loadgen test contract.
+    ///
+    /// Matches stellar-core `TxGenerator::createUploadWasmTransaction()`.
+    pub fn create_upload_wasm_transaction(
+        &mut self,
+        ledger_num: u32,
+        account_id: u64,
+        wasm: &[u8],
+        max_fee_rate: Option<u32>,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let fee = self.generate_fee(max_fee_rate, 1, account_id);
+        let source = self.find_account(account_id, ledger_num);
+        let seq = source.next_sequence_number();
+        let sk = source.secret_key.clone();
+        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let envelope = builder.upload_wasm_tx(&sk, seq, wasm, fee)?;
+        Ok((account_id, envelope))
+    }
+
+    /// Build a contract creation transaction.
+    ///
+    /// Matches stellar-core `TxGenerator::createContractTransaction()`.
+    pub fn create_contract_transaction(
+        &mut self,
+        ledger_num: u32,
+        account_id: u64,
+        wasm_hash: &Hash256,
+        salt: &Uint256,
+        max_fee_rate: Option<u32>,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let fee = self.generate_fee(max_fee_rate, 1, account_id);
+        let source = self.find_account(account_id, ledger_num);
+        let seq = source.next_sequence_number();
+        let sk = source.secret_key.clone();
+        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let envelope = builder.create_contract_tx(&sk, seq, wasm_hash, salt, fee)?;
+        Ok((account_id, envelope))
+    }
+
+    /// Build a contract invocation transaction for load testing.
+    ///
+    /// Calls `do_work(guest_cycles, host_cycles, n_entries, kb_per_entry)` on the
+    /// loadgen contract. Matches stellar-core `TxGenerator::invokeSorobanLoadTransaction()`.
+    pub fn invoke_soroban_load_transaction(
+        &mut self,
+        ledger_num: u32,
+        account_id: u64,
+        instance: &ContractInstance,
+        max_fee_rate: Option<u32>,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let fee = self.generate_fee(max_fee_rate, 1, account_id);
+
+        // Sample workload parameters deterministically
+        let rand_val = deterministic_rand(account_id, ledger_num);
+        let target_instructions: u32 = 2_000_000 + (rand_val % 1_000_000) as u32;
+
+        // Split between guest and host cycles (matching stellar-core ratios)
+        let guest_cycles_per_instruction = 80u64;
+        let host_cycles_per_instruction = 5030u64;
+        let host_fraction = (rand_val >> 16) % 100;
+        let host_instructions = (target_instructions as u64 * host_fraction) / 100;
+        let guest_instructions = target_instructions as u64 - host_instructions;
+        let host_cycles = host_instructions / host_cycles_per_instruction;
+        let guest_cycles = guest_instructions / guest_cycles_per_instruction;
+
+        let n_entries = 1 + (rand_val >> 32) % 4; // 1-4 entries
+        let kb_per_entry = 1 + (rand_val >> 40) % 4; // 1-4 KB
+
+        let args = vec![
+            make_u64(guest_cycles),
+            make_u64(host_cycles),
+            make_u32(n_entries as u32),
+            make_u32(kb_per_entry as u32),
+        ];
+
+        // Build read-write keys for contract data entries
+        let mut rw_keys = Vec::new();
+        for i in 0..n_entries {
+            rw_keys.push(LedgerKey::ContractData(LedgerKeyContractData {
+                contract: ScAddress::Contract(ContractId(Hash(instance.contract_id.0))),
+                key: ScVal::U32(i as u32),
+                durability: ContractDataDurability::Persistent,
+            }));
+        }
+
+        // Refresh the account's sequence number before building (matching stellar-core)
+        self.load_account(account_id);
+        let source = self.find_account(account_id, ledger_num);
+        let seq = source.next_sequence_number();
+        let sk = source.secret_key.clone();
+
+        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let envelope = builder.invoke_contract_tx(
+            &sk,
+            seq,
+            &instance.contract_id,
+            "do_work",
+            args,
+            instance.read_only_keys.clone(),
+            rw_keys,
+            target_instructions,
+            5000 + instance.contract_entries_size,
+            (n_entries as u32) * (kb_per_entry as u32) * 1024,
+            fee,
+        )?;
+        Ok((account_id, envelope))
+    }
+
+    /// Build a SAC creation transaction.
+    ///
+    /// Matches stellar-core `TxGenerator::createSACTransaction()`.
+    pub fn create_sac_transaction(
+        &mut self,
+        ledger_num: u32,
+        account_id: Option<u64>,
+        asset: Asset,
+        max_fee_rate: Option<u32>,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let id = account_id.unwrap_or(ROOT_ACCOUNT_ID);
+        let fee = self.generate_fee(max_fee_rate, 1, id);
+        let source = self.find_account(id, ledger_num);
+        let seq = source.next_sequence_number();
+        let sk = source.secret_key.clone();
+        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let envelope = builder.create_sac_tx(&sk, seq, asset, fee)?;
+        Ok((id, envelope))
+    }
+
+    /// Build a SAC transfer invocation transaction.
+    ///
+    /// Matches stellar-core `TxGenerator::invokeSACPayment()`.
+    pub fn invoke_sac_payment(
+        &mut self,
+        ledger_num: u32,
+        from_account_id: u64,
+        to_address: ScAddress,
+        instance: &ContractInstance,
+        amount: u64,
+        max_fee_rate: Option<u32>,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let fee = self.generate_fee(max_fee_rate, 1, from_account_id);
+        let source = self.find_account(from_account_id, ledger_num);
+        let from_address = make_account_address(&source.secret_key.public_key());
+        let seq = source.next_sequence_number();
+        let sk = source.secret_key.clone();
+        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let envelope = builder.invoke_sac_transfer_tx(
+            &sk,
+            seq,
+            &instance.contract_id,
+            from_address,
+            to_address,
+            amount as i128,
+            instance.read_only_keys.clone(),
+            fee,
+        )?;
+        Ok((from_account_id, envelope))
+    }
+
+    /// Build a batch transfer invocation transaction.
+    ///
+    /// Matches stellar-core `TxGenerator::invokeBatchTransfer()`.
+    pub fn invoke_batch_transfer(
+        &mut self,
+        ledger_num: u32,
+        source_account_id: u64,
+        batch_instance: &ContractInstance,
+        sac_instance: &ContractInstance,
+        destinations: Vec<ScAddress>,
+        max_fee_rate: Option<u32>,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let fee = self.generate_fee(max_fee_rate, 1, source_account_id);
+        let sac_address = make_contract_address(&sac_instance.contract_id);
+        let dest_vals: Vec<ScVal> = destinations
+            .into_iter()
+            .map(|a| ScVal::Address(a))
+            .collect();
+        let source = self.find_account(source_account_id, ledger_num);
+        let seq = source.next_sequence_number();
+        let sk = source.secret_key.clone();
+        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let envelope = builder.invoke_batch_transfer_tx(
+            &sk,
+            seq,
+            &batch_instance.contract_id,
+            ScVal::Address(sac_address),
+            dest_vals,
+            batch_instance.read_only_keys.clone(),
+            fee,
+        )?;
+        Ok((source_account_id, envelope))
+    }
+
     // --- Legacy stateless API (backward compat) ---
 
     /// Generate a deterministic series of payment transactions.
@@ -482,6 +814,8 @@ pub struct LoadGenerator {
     tx_generator: TxGenerator,
     /// Reference to the app for submission.
     app: Arc<App>,
+    /// Network passphrase (needed for Soroban contract ID computation).
+    network_passphrase: String,
     /// Accounts available for use (not currently in-flight).
     accounts_available: HashSet<u64>,
     /// Accounts currently referenced by pending transactions.
@@ -496,14 +830,28 @@ pub struct LoadGenerator {
     failed: bool,
     /// Whether load generation has been stopped.
     stopped: bool,
+
+    // --- Soroban persistent state (survives across runs, reset by `reset_soroban_state()`) ---
+
+    /// WASM code ledger key (set during `SorobanInvokeSetup` upload phase).
+    code_key: Option<LedgerKey>,
+    /// Contract instance ledger keys (set during `SorobanInvokeSetup` deploy phase).
+    contract_instance_keys: HashSet<LedgerKey>,
+    /// WASM blob size + overhead (set during upload phase).
+    contract_overhead_bytes: u64,
+    /// Per-account contract instance assignments (rebuilt each `SorobanInvoke` run).
+    contract_instances: BTreeMap<u64, ContractInstance>,
+    /// Number of WASM uploads completed in current setup run.
+    wasms_uploaded: u32,
 }
 
 impl LoadGenerator {
     /// Create a new load generator for the given app.
     pub fn new(app: Arc<App>, network_passphrase: String) -> Self {
         Self {
-            tx_generator: TxGenerator::new(Arc::clone(&app), network_passphrase),
+            tx_generator: TxGenerator::new(Arc::clone(&app), network_passphrase.clone()),
             app,
+            network_passphrase,
             accounts_available: HashSet::new(),
             accounts_in_use: HashSet::new(),
             total_submitted: 0,
@@ -511,13 +859,23 @@ impl LoadGenerator {
             last_second: 0,
             failed: false,
             stopped: false,
+            // Soroban persistent state — initialized empty, populated during setup modes.
+            code_key: None,
+            contract_instance_keys: HashSet::new(),
+            contract_overhead_bytes: 0,
+            contract_instances: BTreeMap::new(),
+            wasms_uploaded: 0,
         }
     }
 
     /// Initialize the account pool for a load generation run.
     ///
     /// Populates `accounts_available` with account IDs `[offset, offset + n_accounts)`.
-    fn start(&mut self, config: &GeneratedLoadConfig) {
+    /// For Soroban invoke modes, builds the `contract_instances` map via round-robin
+    /// assignment of deployed contract instances to accounts.
+    ///
+    /// Matches stellar-core `LoadGenerator::start()`.
+    fn start(&mut self, config: &mut GeneratedLoadConfig) {
         self.start_time = Some(Instant::now());
         self.total_submitted = 0;
         self.last_second = 0;
@@ -525,9 +883,75 @@ impl LoadGenerator {
         self.stopped = false;
         self.accounts_available.clear();
         self.accounts_in_use.clear();
+        self.contract_instances.clear();
+
+        // Soroban config setup
+        if config.mode.is_soroban() && config.mode != LoadGenMode::SorobanUpload {
+            if config.n_wasms == 0 {
+                config.n_wasms = 1;
+            }
+
+            if config.mode.is_soroban_setup() {
+                self.reset_soroban_state();
+                config.n_txs = config.n_wasms;
+                config.skip_low_fee_txs = false;
+                config.spike_interval = 0;
+                config.spike_size = 0;
+            }
+
+            if config.mode.mode_sets_up_invoke() || config.mode.mode_invokes() {
+                if config.n_instances == 0 {
+                    config.n_instances = 1;
+                }
+            }
+        }
+
+        // Populate accounts_available
         for i in 0..config.n_accounts {
             self.accounts_available
                 .insert((i + config.offset) as u64);
+        }
+
+        // Build contract_instances for invoke modes (round-robin assignment)
+        if config.mode.mode_invokes() {
+            assert!(
+                self.code_key.is_some(),
+                "Must run SorobanInvokeSetup before SorobanInvoke"
+            );
+            assert!(
+                config.n_accounts as usize >= config.n_instances as usize,
+                "n_accounts must be >= n_instances"
+            );
+            assert!(
+                self.contract_instance_keys.len() >= config.n_instances as usize,
+                "Not enough contract instances deployed"
+            );
+
+            let instance_keys: Vec<&LedgerKey> = self.contract_instance_keys.iter().collect();
+            let code_key = self.code_key.clone().unwrap();
+
+            let mut account_iter = self.accounts_available.iter();
+            for i in 0..config.n_accounts as usize {
+                let instance_key = instance_keys[i % config.n_instances as usize];
+
+                // Extract contract ID from the instance key
+                let contract_id = match instance_key {
+                    LedgerKey::ContractData(cd) => match &cd.contract {
+                        ScAddress::Contract(ContractId(Hash(bytes))) => Hash256(*bytes),
+                        _ => panic!("unexpected contract address type"),
+                    },
+                    _ => panic!("unexpected instance key type"),
+                };
+
+                let instance = ContractInstance {
+                    read_only_keys: vec![code_key.clone(), instance_key.clone()],
+                    contract_id,
+                    contract_entries_size: self.contract_overhead_bytes as u32,
+                };
+
+                let account_id = *account_iter.next().expect("enough accounts");
+                self.contract_instances.insert(account_id, instance);
+            }
         }
     }
 
@@ -536,6 +960,10 @@ impl LoadGenerator {
     /// This is the main entry point matching stellar-core `LoadGenerator::generateLoad()`.
     /// It runs in a loop with `STEP_MSECS` intervals, using a cumulative-target
     /// rate limiter. Returns when all transactions have been submitted or on failure.
+    ///
+    /// For `SorobanInvokeSetup`, this implements a two-phase approach:
+    /// - Phase 1: Upload WASM (n_txs = n_wasms)
+    /// - Phase 2: Deploy contract instances (n_txs = n_instances)
     pub async fn generate_load(
         &mut self,
         config: &mut GeneratedLoadConfig,
@@ -551,10 +979,26 @@ impl LoadGenerator {
             if self.failed {
                 return LoadResult::Failed;
             }
-            if config.is_done() {
-                return LoadResult::Done {
-                    submitted: self.total_submitted,
-                };
+
+            // Check if all transactions for the current phase are submitted
+            if !config.are_txs_remaining() {
+                // For setup modes, transition from phase 1 (upload) to phase 2 (deploy)
+                if config.mode.is_soroban_setup() && !config.is_done() {
+                    // Phase 1 complete (wasm uploaded), start phase 2 (deploy instances)
+                    assert!(
+                        config.n_wasms == 0,
+                        "Expected all wasms to be uploaded before transitioning to phase 2"
+                    );
+                    config.n_txs = config.n_instances;
+                    info!(
+                        n_instances = config.n_instances,
+                        "Setup phase 1 complete, transitioning to instance deployment"
+                    );
+                } else {
+                    return LoadResult::Done {
+                        submitted: self.total_submitted,
+                    };
+                }
             }
 
             // Compute how many txs we should have submitted by now
@@ -604,12 +1048,22 @@ impl LoadGenerator {
     /// cumulative-target rate limiter.
     ///
     /// Matches stellar-core `LoadGenerator::getTxPerStep()`.
+    /// Includes spike interval logic: every `spike_interval` seconds, an
+    /// additional `spike_size` transactions are added to the target.
     fn get_tx_per_step(&self, config: &GeneratedLoadConfig) -> i64 {
         let Some(start) = self.start_time else {
             return 0;
         };
         let elapsed_ms = start.elapsed().as_millis() as i64;
-        let target = elapsed_ms * config.tx_rate as i64 / 1000;
+        let mut target = elapsed_ms * config.tx_rate as i64 / 1000;
+
+        // Add spike contribution
+        if config.spike_interval > 0 {
+            let elapsed_secs = (elapsed_ms / 1000) as u64;
+            let spikes = elapsed_secs / config.spike_interval;
+            target += (spikes * config.spike_size as u64) as i64;
+        }
+
         let deficit = target - self.total_submitted;
         deficit.max(0)
     }
@@ -679,29 +1133,24 @@ impl LoadGenerator {
     /// Submit a single transaction, retrying on `txBAD_SEQ` up to
     /// `TX_SUBMIT_MAX_TRIES` times.
     ///
-    /// Matches stellar-core `LoadGenerator::submitTx()`.
+    /// Dispatches to the appropriate transaction builder based on the load
+    /// generation mode. Matches stellar-core `LoadGenerator::submitTx()`.
     async fn submit_tx(
         &mut self,
-        config: &GeneratedLoadConfig,
+        config: &mut GeneratedLoadConfig,
         source_account_id: u64,
         ledger_num: u32,
     ) -> bool {
         let mut num_tries = 0u32;
 
         loop {
-            // Generate the transaction
-            let tx_result = self.tx_generator.payment_transaction(
-                config.n_accounts,
-                config.offset,
-                ledger_num,
-                source_account_id,
-                config.max_fee_rate,
-            );
+            // Generate the transaction based on mode
+            let tx_result = self.generate_tx(config, source_account_id, ledger_num);
 
             let envelope = match tx_result {
                 Ok((_source_id, env)) => env,
                 Err(e) => {
-                    warn!("Failed to build payment tx: {}", e);
+                    warn!("Failed to build tx (mode={:?}): {}", config.mode, e);
                     self.failed = true;
                     return false;
                 }
@@ -749,6 +1198,158 @@ impl LoadGenerator {
         }
     }
 
+    /// Generate a transaction based on the current load generation mode.
+    ///
+    /// This is the mode-dispatch logic that stellar-core implements as a lambda
+    /// in `generateLoad()`.
+    fn generate_tx(
+        &mut self,
+        config: &mut GeneratedLoadConfig,
+        source_account_id: u64,
+        ledger_num: u32,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        match config.mode {
+            LoadGenMode::Pay => {
+                self.tx_generator.payment_transaction(
+                    config.n_accounts,
+                    config.offset,
+                    ledger_num,
+                    source_account_id,
+                    config.max_fee_rate,
+                )
+            }
+            LoadGenMode::SorobanUpload => {
+                self.tx_generator.soroban_random_wasm_transaction(
+                    ledger_num,
+                    source_account_id,
+                    DEFAULT_SOROBAN_INCLUSION_FEE,
+                )
+            }
+            LoadGenMode::SorobanInvokeSetup => {
+                if config.n_wasms > 0 {
+                    // Phase 1: Upload the loadgen WASM
+                    let wasm = SorobanTxBuilder::loadgen_wasm();
+                    let result = self.tx_generator.create_upload_wasm_transaction(
+                        ledger_num,
+                        source_account_id,
+                        wasm,
+                        config.max_fee_rate,
+                    );
+                    if result.is_ok() {
+                        let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
+                        self.code_key = Some(contract_code_key(&wasm_hash));
+                        self.contract_overhead_bytes = wasm.len() as u64 + 160;
+                        self.wasms_uploaded += 1;
+                        config.n_wasms = config.n_wasms.saturating_sub(1);
+                    }
+                    result
+                } else {
+                    // Phase 2: Deploy a contract instance
+                    let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
+                    let salt = Uint256(
+                        Hash256::hash(
+                            &deterministic_rand(source_account_id, ledger_num)
+                                .to_le_bytes(),
+                        )
+                        .0,
+                    );
+                    let result = self.tx_generator.create_contract_transaction(
+                        ledger_num,
+                        source_account_id,
+                        &wasm_hash,
+                        &salt,
+                        config.max_fee_rate,
+                    );
+                    if result.is_ok() {
+                        // Compute the contract ID and store the instance key
+                        let source_account = self.tx_generator.get_account(source_account_id)
+                            .expect("source account must exist");
+                        let source_pk = source_account.account_id.clone();
+                        let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+                            address: ScAddress::Account(source_pk),
+                            salt: salt.clone(),
+                        });
+                        let contract_id = compute_contract_id(&preimage, &self.network_passphrase)
+                            .expect("contract ID computation");
+                        let instance_key = contract_instance_key(&contract_id);
+                        self.contract_instance_keys.insert(instance_key);
+                        config.n_instances = config.n_instances.saturating_sub(1);
+                    }
+                    result
+                }
+            }
+            LoadGenMode::SorobanInvoke => {
+                let instance = self.contract_instances.get(&source_account_id)
+                    .expect("contract instance must be assigned for SorobanInvoke")
+                    .clone();
+                self.tx_generator.invoke_soroban_load_transaction(
+                    ledger_num,
+                    source_account_id,
+                    &instance,
+                    config.max_fee_rate,
+                )
+            }
+            LoadGenMode::MixedClassicSoroban => {
+                self.create_mixed_classic_soroban_transaction(
+                    config,
+                    source_account_id,
+                    ledger_num,
+                )
+            }
+        }
+    }
+
+    /// Generate a transaction for `MixedClassicSoroban` mode using weighted
+    /// random selection among Pay, SorobanUpload, and SorobanInvoke.
+    ///
+    /// Matches stellar-core `LoadGenerator::createMixedClassicSorobanTransaction()`.
+    fn create_mixed_classic_soroban_transaction(
+        &mut self,
+        config: &GeneratedLoadConfig,
+        source_account_id: u64,
+        ledger_num: u32,
+    ) -> anyhow::Result<(u64, TransactionEnvelope)> {
+        let total_weight =
+            config.mix_pay_weight + config.mix_upload_weight + config.mix_invoke_weight;
+        if total_weight == 0 {
+            anyhow::bail!("MixedClassicSoroban weights sum to 0");
+        }
+
+        // Deterministic weighted selection
+        let rand_val = deterministic_rand(source_account_id, ledger_num) % total_weight as u64;
+        let pay_threshold = config.mix_pay_weight as u64;
+        let upload_threshold = pay_threshold + config.mix_upload_weight as u64;
+
+        if rand_val < pay_threshold {
+            // Pay mode
+            self.tx_generator.payment_transaction(
+                config.n_accounts,
+                config.offset,
+                ledger_num,
+                source_account_id,
+                config.max_fee_rate,
+            )
+        } else if rand_val < upload_threshold {
+            // SorobanUpload mode
+            self.tx_generator.soroban_random_wasm_transaction(
+                ledger_num,
+                source_account_id,
+                DEFAULT_SOROBAN_INCLUSION_FEE,
+            )
+        } else {
+            // SorobanInvoke mode
+            let instance = self.contract_instances.get(&source_account_id)
+                .expect("contract instance must be assigned for mixed invoke")
+                .clone();
+            self.tx_generator.invoke_soroban_load_transaction(
+                ledger_num,
+                source_account_id,
+                &instance,
+                config.max_fee_rate,
+            )
+        }
+    }
+
     /// Check if load generation is complete.
     ///
     /// Matches stellar-core `LoadGenerator::isDone()`.
@@ -764,6 +1365,70 @@ impl LoadGenerator {
     /// Whether load generation has failed.
     pub fn has_failed(&self) -> bool {
         self.failed
+    }
+
+    /// Clear persistent Soroban state (contract keys, code key, overhead).
+    ///
+    /// Called at the start of setup modes and on certain failures.
+    /// Matches stellar-core `LoadGenerator::resetSorobanState()`.
+    pub fn reset_soroban_state(&mut self) {
+        self.contract_instance_keys.clear();
+        self.code_key = None;
+        self.contract_overhead_bytes = 0;
+    }
+
+    /// Check that all deployed Soroban contract entries exist in the current
+    /// ledger state.
+    ///
+    /// Returns ledger keys that are missing from the ledger snapshot.
+    /// An empty return value means all state is synced.
+    ///
+    /// Matches stellar-core `LoadGenerator::checkSorobanStateSynced()`.
+    pub fn check_soroban_state_synced(&self, config: &GeneratedLoadConfig) -> Vec<LedgerKey> {
+        // Only applies to Soroban modes other than upload-only
+        if !config.mode.is_soroban() || config.mode == LoadGenMode::SorobanUpload {
+            return Vec::new();
+        }
+
+        let mut missing = Vec::new();
+
+        // Check all contract instance keys
+        for key in &self.contract_instance_keys {
+            if !self.app.has_ledger_entry(key) {
+                missing.push(key.clone());
+            }
+        }
+
+        // Check the WASM code key
+        if let Some(ref code_key) = self.code_key {
+            if !self.app.has_ledger_entry(code_key) {
+                missing.push(code_key.clone());
+            }
+        }
+
+        missing
+    }
+
+    /// Check that the Soroban success rate meets the configured minimum.
+    ///
+    /// Returns `true` if the success percentage is at or above
+    /// `min_soroban_percent_success`, or if the mode is not Soroban.
+    ///
+    /// Matches stellar-core `LoadGenerator::checkMinimumSorobanSuccess()`.
+    pub fn check_minimum_soroban_success(
+        &self,
+        config: &GeneratedLoadConfig,
+        success_count: u64,
+        failure_count: u64,
+    ) -> bool {
+        if !config.mode.is_soroban() {
+            return true;
+        }
+        let total = success_count + failure_count;
+        if total == 0 {
+            return true;
+        }
+        (success_count * 100) / total >= config.min_soroban_percent_success as u64
     }
 
     /// Total transactions submitted so far.

@@ -26,10 +26,13 @@ use tokio::task::JoinHandle;
 mod loopback;
 mod loadgen;
 use loopback::LoopbackNetwork;
+#[allow(dead_code)] // Helpers will be consumed by TxGenerator Soroban methods (Phase 3c)
+mod loadgen_soroban;
 pub use loadgen::{
     GeneratedLoadConfig, GeneratedTransaction, LoadGenMode, LoadGenerator, LoadReport, LoadResult,
     LoadStep, TestAccount, TxGenerator,
 };
+pub use loadgen_soroban::SorobanTxBuilder;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimulationMode {
@@ -75,6 +78,11 @@ pub struct Simulation {
     app_account_sequences: HashMap<String, i64>,
     root_sequence: i64,
     overlay_connection_factory: Option<Arc<dyn ConnectionFactory>>,
+    /// Whether Soroban upgrade setup has completed (set by `SorobanUpgradeSetup`
+    /// loadgen mode).
+    ///
+    /// Matches stellar-core `Simulation::mSetupForSorobanUpgrade`.
+    setup_for_soroban_upgrade: bool,
 }
 
 impl std::fmt::Debug for RunningAppNode {
@@ -113,6 +121,7 @@ impl Simulation {
             app_account_sequences: HashMap::new(),
             root_sequence: 1,
             overlay_connection_factory: None,
+            setup_for_soroban_upgrade: false,
         }
     }
 
@@ -459,6 +468,20 @@ impl Simulation {
     pub fn expected_ledger_close_time(&self, node_id: &str) -> Option<u64> {
         let app = self.running_apps.get(node_id)?;
         Some(app.app.expected_ledger_close_time())
+    }
+
+    /// Check whether Soroban upgrade setup has completed.
+    ///
+    /// Matches stellar-core `Simulation::isSetUpForSorobanUpgrade()`.
+    pub fn is_setup_for_soroban_upgrade(&self) -> bool {
+        self.setup_for_soroban_upgrade
+    }
+
+    /// Mark Soroban upgrade setup as complete.
+    ///
+    /// Matches stellar-core `Simulation::markReadyForSorobanUpgrade()`.
+    pub fn mark_ready_for_soroban_upgrade(&mut self) {
+        self.setup_for_soroban_upgrade = true;
     }
 
     pub async fn app_peer_count(&self, node_id: &str) -> Option<usize> {

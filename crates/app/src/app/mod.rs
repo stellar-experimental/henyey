@@ -1565,6 +1565,16 @@ impl App {
         Some(account.seq_num.0)
     }
 
+    /// Check whether a ledger entry exists in the current bucket list.
+    ///
+    /// Used by the simulation LoadGenerator to verify Soroban state is synced.
+    pub fn has_ledger_entry(&self, key: &stellar_xdr::curr::LedgerKey) -> bool {
+        let Ok(snapshot) = self.ledger_manager.create_snapshot() else {
+            return false;
+        };
+        matches!(snapshot.get_entry(key), Ok(Some(_)))
+    }
+
     /// Check whether the given account has any pending transactions in the
     /// herder's transaction queue.
     ///
