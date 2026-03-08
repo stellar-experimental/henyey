@@ -1415,7 +1415,7 @@ impl Herder {
         };
 
         let slot = ledger_seq as u64;
-        info!("Triggering consensus for ledger {}", ledger_seq);
+        tracing::debug!("Triggering consensus for ledger {}", ledger_seq);
 
         // Get the previous ledger hash
         let previous_hash = if let Some(manager) = self.ledger_manager.read().as_ref() {

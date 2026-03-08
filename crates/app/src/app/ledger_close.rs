@@ -62,7 +62,7 @@ impl App {
                 if let Some(qset) = self.herder.get_quorum_set_by_hash(hash256.as_bytes()) {
                     scp_quorum_sets.push((hash256, qset));
                 } else {
-                    tracing::warn!(hash = %hash256.to_hex(), "Missing quorum set for SCP history");
+                    tracing::debug!(hash = %hash256.to_hex(), "Missing quorum set for SCP history");
                 }
             }
         }

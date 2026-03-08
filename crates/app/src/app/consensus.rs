@@ -571,7 +571,7 @@ impl App {
             match self.herder.get_quorum_set_by_hash(hash.as_bytes()) {
                 Some(qset) => qsets.push(qset),
                 None => {
-                    tracing::warn!(hash = %hash.to_hex(), "Missing quorum set for SCP history entry");
+                    tracing::debug!(hash = %hash.to_hex(), "Missing quorum set for SCP history entry");
                     return None;
                 }
             }
