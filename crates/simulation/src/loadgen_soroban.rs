@@ -451,22 +451,7 @@ impl SorobanTxBuilder {
             signatures: VecM::default(),
         });
 
-        // Sign
-        let network_id = NetworkId::from_passphrase(&self.network_passphrase);
-        let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), network_id);
-        let hash = frame.hash(&network_id)?;
-        let signature = sign_hash(source, &hash);
-        let public_key = source.public_key();
-        let pk_bytes = public_key.as_bytes();
-        let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
-        let decorated = DecoratedSignature {
-            hint,
-            signature: Signature(signature.0.to_vec().try_into().unwrap_or_default()),
-        };
-        if let TransactionEnvelope::Tx(ref mut env) = envelope {
-            env.signatures = vec![decorated].try_into().unwrap_or_default();
-        }
-
+        sign_envelope(&mut envelope, source, &self.network_passphrase)?;
         Ok(envelope)
     }
 }
@@ -501,11 +486,6 @@ pub fn make_i128(value: i128) -> ScVal {
     })
 }
 
-/// Construct an `ScVal::Address` from an `ScAddress`.
-pub fn make_address_val(address: ScAddress) -> ScVal {
-    ScVal::Address(address)
-}
-
 /// Construct an `ScAddress::Account` from a public key.
 pub fn make_account_address(public_key: &henyey_crypto::PublicKey) -> ScAddress {
     ScAddress::Account(stellar_xdr::curr::AccountId(
@@ -516,11 +496,6 @@ pub fn make_account_address(public_key: &henyey_crypto::PublicKey) -> ScAddress 
 /// Construct an `ScAddress::Contract` from a contract hash.
 pub fn make_contract_address(contract_id: &Hash256) -> ScAddress {
     ScAddress::Contract(ContractId(Hash(contract_id.0)))
-}
-
-/// Construct an `ScVal::Symbol` from a string.
-pub fn make_symbol(name: &str) -> ScVal {
-    ScVal::Symbol(ScSymbol(name.try_into().unwrap_or_default()))
 }
 
 /// Construct an `ScVal::U32`.
@@ -547,6 +522,33 @@ pub fn contract_code_key(wasm_hash: &Hash256) -> LedgerKey {
     LedgerKey::ContractCode(LedgerKeyContractCode {
         hash: Hash(wasm_hash.0),
     })
+}
+
+/// Sign a `TransactionEnvelope` and attach the signature.
+///
+/// This is the shared signing logic used by `Simulation`, `TxGenerator`,
+/// and `SorobanTxBuilder` to avoid triple-duplicating the hash→sign→attach
+/// sequence.
+pub fn sign_envelope(
+    envelope: &mut TransactionEnvelope,
+    secret: &SecretKey,
+    network_passphrase: &str,
+) -> anyhow::Result<()> {
+    let network_id = NetworkId::from_passphrase(network_passphrase);
+    let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), network_id);
+    let hash = frame.hash(&network_id)?;
+    let signature = sign_hash(secret, &hash);
+    let public_key = secret.public_key();
+    let pk_bytes = public_key.as_bytes();
+    let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
+    let decorated = DecoratedSignature {
+        hint,
+        signature: Signature(signature.0.to_vec().try_into().unwrap_or_default()),
+    };
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap_or_default();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

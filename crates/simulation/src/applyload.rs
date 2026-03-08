@@ -978,10 +978,9 @@ impl ApplyLoad {
                     if let LedgerEntryData::ContractData(ref mut cd) = le.data {
                         cd.key = ScVal::U64(current_live_key);
                     }
-                    live_entries.push(le.clone());
                     current_live_key += 1;
 
-                    // Create TTL entry.
+                    // Create TTL entry (hash before moving `le`).
                     let ttl_key_hash =
                         Hash256::hash(&le.to_xdr(Limits::none()).unwrap_or_default());
                     let ttl_entry = LedgerEntry {
@@ -992,6 +991,7 @@ impl ApplyLoad {
                         }),
                         ext: LedgerEntryExt::V0,
                     };
+                    live_entries.push(le);
                     live_entries.push(ttl_entry);
                 }
 

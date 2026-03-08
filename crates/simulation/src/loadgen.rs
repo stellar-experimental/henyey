@@ -15,14 +15,14 @@ use std::time::{Duration, Instant};
 
 use henyey_app::App;
 use henyey_common::{Hash256, NetworkId};
-use henyey_crypto::{sign_hash, SecretKey};
+use henyey_crypto::SecretKey;
 use henyey_herder::TxQueueResult;
 use henyey_tx::TxResultCode;
 use stellar_xdr::curr::{
     AccountId, Asset, ContractDataDurability, ContractId, ContractIdPreimage,
-    ContractIdPreimageFromAddress, DecoratedSignature, Hash, LedgerKey,
+    ContractIdPreimageFromAddress, Hash, LedgerKey,
     LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody, PaymentOp, Preconditions,
-    PublicKey, ScAddress, ScVal, SequenceNumber, Signature, SignatureHint, Transaction,
+    PublicKey, ScAddress, ScVal, SequenceNumber, Transaction,
     TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM, CreateAccountOp,
 };
 use tracing::{debug, info, warn};
@@ -44,10 +44,6 @@ const TX_SUBMIT_MAX_TRIES: u32 = 10;
 
 /// Sentinel account ID for the network root account.
 const ROOT_ACCOUNT_ID: u64 = u64::MAX;
-
-/// Number of ledgers to wait for Soroban state sync before timing out.
-#[allow(dead_code)]
-const TIMEOUT_NUM_LEDGERS: u32 = 20;
 
 /// Default WASM size for random upload transactions.
 const DEFAULT_WASM_SIZE: usize = 35_000;
@@ -521,24 +517,7 @@ impl TxGenerator {
             signatures: VecM::default(),
         });
 
-        // Sign the envelope
-        let network_id = NetworkId::from_passphrase(&self.network_passphrase);
-        let frame =
-            henyey_tx::TransactionFrame::with_network(envelope.clone(), network_id);
-        let hash = frame.hash(&network_id)?;
-        let signature = sign_hash(&secret, &hash);
-        let public_key = secret.public_key();
-        let pk_bytes = public_key.as_bytes();
-        let hint =
-            SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
-        let decorated = DecoratedSignature {
-            hint,
-            signature: Signature(signature.0.to_vec().try_into().unwrap_or_default()),
-        };
-        if let TransactionEnvelope::Tx(ref mut env) = envelope {
-            env.signatures = vec![decorated].try_into().unwrap_or_default();
-        }
-
+        crate::loadgen_soroban::sign_envelope(&mut envelope, &secret, &self.network_passphrase)?;
         Ok(envelope)
     }
 
@@ -1111,7 +1090,6 @@ impl LoadGenerator {
     ///
     /// Matches stellar-core `LoadGenerator::cleanupAccounts()`.
     pub fn cleanup_accounts(&mut self) {
-        let ledger_num = self.app.current_ledger_seq();
         let mut to_return = Vec::new();
         for &id in &self.accounts_in_use {
             if let Some(account) = self.tx_generator.get_account(id) {
@@ -1127,7 +1105,6 @@ impl LoadGenerator {
             self.accounts_in_use.remove(&id);
             self.accounts_available.insert(id);
         }
-        let _ = ledger_num; // suppress unused warning
     }
 
     /// Submit a single transaction, retrying on `txBAD_SEQ` up to

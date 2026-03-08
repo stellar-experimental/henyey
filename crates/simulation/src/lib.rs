@@ -13,11 +13,11 @@ use henyey_app::{App, AppConfig, SimulationDebugStats};
 use henyey_clock::RealClock;
 use henyey_clock::VirtualClock;
 use henyey_common::{Hash256, NetworkId};
-use henyey_crypto::{sign_hash, SecretKey};
+use henyey_crypto::SecretKey;
 use henyey_overlay::{ConnectionFactory, LoopbackConnectionFactory, TcpConnectionFactory};
 use stellar_xdr::curr::{
-    AccountId, Asset, CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation,
-    OperationBody, Preconditions, PublicKey, SequenceNumber, Signature, SignatureHint,
+    AccountId, Asset, CreateAccountOp, Memo, MuxedAccount, Operation,
+    OperationBody, Preconditions, PublicKey, SequenceNumber,
     Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
 };
 use tempfile::TempDir;
@@ -26,7 +26,6 @@ use tokio::task::JoinHandle;
 mod loopback;
 mod loadgen;
 use loopback::LoopbackNetwork;
-#[allow(dead_code)] // Helpers will be consumed by TxGenerator Soroban methods (Phase 3c)
 mod loadgen_soroban;
 mod applyload;
 pub use loadgen::{
@@ -1120,21 +1119,7 @@ impl Simulation {
         mut envelope: TransactionEnvelope,
         secret: &SecretKey,
     ) -> anyhow::Result<TransactionEnvelope> {
-        let network_id = NetworkId::from_passphrase(&self.network_passphrase);
-        let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), network_id);
-        let hash = frame.hash(&network_id)?;
-        let signature = sign_hash(secret, &hash);
-        let public_key = secret.public_key();
-        let pk_bytes = public_key.as_bytes();
-        let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
-        let decorated = DecoratedSignature {
-            hint,
-            signature: Signature(signature.0.to_vec().try_into().unwrap_or_default()),
-        };
-
-        if let TransactionEnvelope::Tx(ref mut env) = envelope {
-            env.signatures = vec![decorated].try_into().unwrap_or_default();
-        }
+        loadgen_soroban::sign_envelope(&mut envelope, secret, &self.network_passphrase)?;
         Ok(envelope)
     }
 
