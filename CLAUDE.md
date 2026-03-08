@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-- `crates/` contains the Rust workspace crates. Each module is a crate (e.g., `crates/ledger`, `crates/tx`, `crates/history`).
+- `crates/` contains the Rust workspace crates. Each module is a crate (e.g., `crates/ledger/` → crate name `henyey-ledger`, `crates/tx/` → `henyey-tx`, `crates/history/` → `henyey-history`).
 - `crates/henyey/` is the main binary crate; other crates are libraries.
 - Tests live alongside code in `crates/*/src` and in `crates/*/tests` for integration tests.
 - Docs live in crate `README.md` files plus top-level `README.md` and `stellar-specs/` (git submodule).
@@ -37,7 +37,7 @@
 - Run focused tests when possible to speed iteration, then run `cargo test --all` before submitting.
 - No fuzz testing is required for this project.
 - No baseline transaction meta testing is required.
-- Perform testing on testnet, not mainnet.
+- Run unit and integration tests against testnet fixtures, not mainnet. Running a live validator node on mainnet is permitted for production operation (see `configs/validator-mainnet.toml`).
 - **Bug investigation workflow**: When investigating a bug, always start by writing a narrow unit test that reproduces the bug and fails. Then fix the code until the test passes. Do not skip the failing-test-first step.
 - **Hash mismatch debugging**: If you encounter a hash mismatch in an online node, attempt to recreate it in a targeted offline verify execution test.
 - **Unit test coverage**: When writing new code, ensure it is thoroughly covered by unit tests. Every public function and significant code path should have corresponding tests.
@@ -46,9 +46,10 @@
 
 - Commit messages are short, imperative, and sentence case (examples: "Implement disk-backed bucket storage", "Optimize memory usage").
 - **AI Agent Co-authorship**: Any commit that was authored or co-authored by an AI agent MUST include that agent (the tool/interface, not the underlying model) as a co-author using a Git trailer. Use the appropriate trailer for the agent involved:
+  - Claude Code: `Co-authored-by: Claude Code <claude-code@anthropic.com>`
   - GitHub Copilot (CLI or IDE): `Co-authored-by: GitHub Copilot <copilot@github.com>`
   - Codex: `Co-authored-by: Codex <codex@openai.com>`
-  - Other agents: Use the agent/tool name, not the model name
+  - Other agents: Use the agent/tool name, not the model name (e.g. not "Claude Sonnet 4.6")
 - **Bug fixes**: As soon as a bug is fixed and its regression test passes, commit and push immediately. Do not wait to be told.
 - **Other changes**: Commit and push when explicitly directed by the user.
 - PRs should include: a clear description, the tests run, and documentation updates when behavior changes.
