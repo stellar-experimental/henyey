@@ -1,3 +1,5 @@
+//! Clock abstractions for monotonic timing, async sleep, and periodic intervals.
+
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant, SystemTime};
@@ -12,9 +14,18 @@ pub trait Clock: Send + Sync + 'static {
 
     fn system_now(&self) -> SystemTime;
 
-    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()>;
+    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
+        Box::pin(tokio::time::sleep(duration))
+    }
 
-    fn interval(&self, period: Duration) -> BoxStream<'static, ()>;
+    fn interval(&self, period: Duration) -> BoxStream<'static, ()> {
+        let interval = tokio::time::interval(period);
+        let stream = unfold(interval, |mut interval| async move {
+            interval.tick().await;
+            Some(((), interval))
+        });
+        Box::pin(stream)
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -27,19 +38,6 @@ impl Clock for RealClock {
 
     fn system_now(&self) -> SystemTime {
         SystemTime::now()
-    }
-
-    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
-        Box::pin(tokio::time::sleep(duration))
-    }
-
-    fn interval(&self, period: Duration) -> BoxStream<'static, ()> {
-        let interval = tokio::time::interval(period);
-        let stream = unfold(interval, |mut interval| async move {
-            interval.tick().await;
-            Some(((), interval))
-        });
-        Box::pin(stream)
     }
 }
 
@@ -61,14 +59,6 @@ impl VirtualClock {
         Self::default()
     }
 
-    pub fn pause_tokio_time() {
-        tokio::time::pause();
-    }
-
-    pub async fn advance_tokio_time(duration: Duration) {
-        tokio::time::advance(duration).await;
-    }
-
     pub fn set_base_instant(&mut self, instant: Instant) {
         self.base_instant = instant;
     }
@@ -81,19 +71,6 @@ impl Clock for VirtualClock {
 
     fn system_now(&self) -> SystemTime {
         SystemTime::now()
-    }
-
-    fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
-        Box::pin(tokio::time::sleep(duration))
-    }
-
-    fn interval(&self, period: Duration) -> BoxStream<'static, ()> {
-        let interval = tokio::time::interval(period);
-        let stream = unfold(interval, |mut interval| async move {
-            interval.tick().await;
-            Some(((), interval))
-        });
-        Box::pin(stream)
     }
 }
 
