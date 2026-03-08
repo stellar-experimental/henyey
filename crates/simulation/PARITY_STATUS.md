@@ -2,7 +2,7 @@
 
 **Crate**: `henyey-simulation`
 **Upstream**: `stellar-core/src/simulation/`
-**Overall Parity**: 37%
+**Overall Parity**: 32%
 **Last Updated**: 2026-03-08
 
 ## Summary
@@ -151,8 +151,6 @@ Features excluded by design. These are NOT counted against parity %.
 | stellar-core Component | Reason |
 |------------------------|--------|
 | `LoopbackOverlayManager` / `ApplicationLoopbackOverlay` | Rust uses `LoopbackConnectionFactory` from henyey-overlay instead |
-| Soroban load generation modes (`SOROBAN_UPLOAD`, `SOROBAN_INVOKE`, etc.) | Soroban not yet supported in henyey |
-| `ApplyLoad` benchmark infrastructure | Soroban-focused benchmarking; not needed without Soroban |
 | Medida metrics integration | Rust uses different metrics approach |
 | `setCurrentVirtualTime()` | Not needed — Rust async model handles time differently |
 
@@ -174,8 +172,9 @@ Features not yet implemented. These ARE counted against parity %.
 | `dropConnection()` (directed) | Low | Only bulk disconnect implemented |
 | `separate()` numWatchers parameter | Low | Watcher nodes not supported in topology builder |
 | `LoadGenerator` full lifecycle | Medium | Only step plan / summarize implemented |
-| `TxGenerator` full API | Medium | Only payment_series implemented |
-| `LoadGenMode` enum | Medium | No mode-based dispatch |
+| `TxGenerator` full API | Medium | Only payment_series; no Soroban upload, invoke, SAC, or batch transfer |
+| `LoadGenMode` enum | Medium | No mode-based dispatch (PAY, Soroban modes, MIXED, etc.) |
+| `ApplyLoad` | Medium | Benchmark infrastructure not implemented |
 | Node restart/rejoin | Medium | Partially works but not fully stable (ignored tests) |
 
 ## Architectural Differences
@@ -220,7 +219,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 22 |
-| Gaps (None + Partial) | 37 |
-| Intentional Omissions | 5 |
-| **Parity** | **22 / (22 + 37) = 37%** |
+| Implemented (Full) | 24 |
+| Gaps (None + Partial) | 51 |
+| Intentional Omissions | 3 |
+| **Parity** | **24 / (24 + 51) = 32%** |
