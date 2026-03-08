@@ -1258,6 +1258,14 @@ impl App {
         &self.config
     }
 
+    /// Get a reference to the ledger manager.
+    ///
+    /// Used by the `ApplyLoad` benchmark harness to directly close ledgers
+    /// without going through consensus.
+    pub fn ledger_manager(&self) -> &Arc<LedgerManager> {
+        &self.ledger_manager
+    }
+
     /// Get the current application state.
     pub async fn state(&self) -> AppState {
         *self.state.read().await

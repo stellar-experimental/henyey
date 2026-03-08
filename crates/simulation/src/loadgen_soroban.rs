@@ -22,7 +22,7 @@ use stellar_xdr::curr::{
 ///
 /// This contract exposes `do_work(guest_cycles, host_cycles, n_entries, kb_per_entry)`
 /// for CPU and IO load generation.
-const LOADGEN_WASM: &[u8] = include_bytes!(
+pub(crate) const LOADGEN_WASM: &[u8] = include_bytes!(
     "../../../stellar-core/src/rust/soroban/p21/soroban-test-wasms/wasm-workspace/opt/curr/loadgen.wasm"
 );
 

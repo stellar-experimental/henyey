@@ -28,11 +28,13 @@ mod loadgen;
 use loopback::LoopbackNetwork;
 #[allow(dead_code)] // Helpers will be consumed by TxGenerator Soroban methods (Phase 3c)
 mod loadgen_soroban;
+mod applyload;
 pub use loadgen::{
     GeneratedLoadConfig, GeneratedTransaction, LoadGenMode, LoadGenerator, LoadReport, LoadResult,
     LoadStep, TestAccount, TxGenerator,
 };
 pub use loadgen_soroban::SorobanTxBuilder;
+pub use applyload::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode, Histogram};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimulationMode {

@@ -1128,6 +1128,18 @@ impl LedgerManager {
         state.header.ledger_version = version;
     }
 
+    /// Override the stored ledger header and header hash for testing.
+    ///
+    /// Used by the `ApplyLoad` benchmark harness after directly populating
+    /// the bucket list to advance the ledger state without going through
+    /// a full ledger close.
+    #[doc(hidden)]
+    pub fn set_header_for_test(&self, header: LedgerHeader, header_hash: Hash256) {
+        let mut state = self.state.write();
+        state.header = header;
+        state.header_hash = header_hash;
+    }
+
     /// Get bucket list level hashes (curr, snap) for persistence.
     pub fn bucket_list_levels(&self) -> Vec<(Hash256, Hash256)> {
         let bucket_list = self.bucket_list.read();
@@ -1144,6 +1156,14 @@ impl LedgerManager {
     /// state including pending merges.
     pub fn bucket_list(&self) -> parking_lot::RwLockReadGuard<'_, BucketList> {
         self.bucket_list.read()
+    }
+
+    /// Get a write guard to the live bucket list.
+    ///
+    /// Used by the `ApplyLoad` benchmark harness to directly populate the
+    /// bucket list with synthetic entries without closing ledgers.
+    pub fn bucket_list_mut(&self) -> parking_lot::RwLockWriteGuard<'_, BucketList> {
+        self.bucket_list.write()
     }
 
     /// Set the shared merge map for bucket merge deduplication.
@@ -1181,6 +1201,16 @@ impl LedgerManager {
         &self,
     ) -> parking_lot::RwLockReadGuard<'_, Option<HotArchiveBucketList>> {
         self.hot_archive_bucket_list.read()
+    }
+
+    /// Get a write guard to the hot archive bucket list.
+    ///
+    /// Used by the `ApplyLoad` benchmark harness to directly populate the
+    /// hot archive bucket list with synthetic entries.
+    pub fn hot_archive_bucket_list_mut(
+        &self,
+    ) -> parking_lot::RwLockWriteGuard<'_, Option<HotArchiveBucketList>> {
+        self.hot_archive_bucket_list.write()
     }
 
     /// Get all bucket hashes referenced by the live and hot archive bucket lists.
