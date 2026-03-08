@@ -33,12 +33,15 @@ graph TD
 | `SimNode` | Lightweight simulated node state (id, key, ledger sequence/hash) |
 | `Topologies` | Factory methods for standard network topologies (core, pair, cycle, etc.) |
 | `LoopbackNetwork` | Deterministic link model with partition and drop-probability controls |
-| `LoadGenerator` | Produces deterministic multi-step load plans from a `GeneratedLoadConfig` |
-| `TxGenerator` | Generates individual payment transaction series |
-| `GeneratedLoadConfig` | Configuration for load generation (accounts, rate, steps) |
-| `GeneratedTransaction` | A single generated transaction descriptor |
-| `LoadStep` | One step of a load plan containing a batch of transactions |
-| `LoadReport` | Summary statistics for a load plan |
+| `LoadGenerator` | Stateful load generator with account pool, rate limiter, and retry logic |
+| `TxGenerator` | Transaction generator with account cache, fee generation, and payment tx builder |
+| `LoadGenMode` | Load generation mode enum (Pay; Soroban modes deferred) |
+| `GeneratedLoadConfig` | Configuration for load generation (mode, accounts, rate, fee, etc.) |
+| `TestAccount` | Cached account with deterministic keypair and mutable sequence number |
+| `LoadResult` | Result of a load generation run (Done, Stopped, Failed) |
+| `GeneratedTransaction` | A single generated transaction descriptor (legacy API) |
+| `LoadStep` | One step of a load plan containing a batch of transactions (legacy API) |
+| `LoadReport` | Summary statistics for a load plan (legacy API) |
 
 ## Usage
 
@@ -107,6 +110,11 @@ sim.set_drop_prob("node0", "node1", 0.0);
 - **Genesis bootstrapping**: `initialize_genesis_ledger()` sets up a self-
   contained genesis ledger with a root account in each node's SQLite database,
   enabling app-backed nodes to start without external history archives.
+- **Load generation**: Two APIs are provided: (1) a simple stateless
+  `step_plan()` for manual-close tests, and (2) a rich stateful
+  `generate_load()` matching stellar-core's LoadGenerator with cumulative
+  rate limiting, account pool management (available/in-use), `txBAD_SEQ`
+  retry logic, and sequence number refresh from the bucket list.
 
 ## stellar-core Mapping
 

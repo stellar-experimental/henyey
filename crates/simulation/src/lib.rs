@@ -26,7 +26,10 @@ use tokio::task::JoinHandle;
 mod loopback;
 mod loadgen;
 use loopback::LoopbackNetwork;
-pub use loadgen::{GeneratedLoadConfig, GeneratedTransaction, LoadGenerator, LoadReport, LoadStep, TxGenerator};
+pub use loadgen::{
+    GeneratedLoadConfig, GeneratedTransaction, LoadGenMode, LoadGenerator, LoadReport, LoadResult,
+    LoadStep, TestAccount, TxGenerator,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SimulationMode {
@@ -405,6 +408,59 @@ impl Simulation {
         self.running_apps.get(node_id).map(|n| Arc::clone(&n.app))
     }
 
+    /// Return all running `App` instances.
+    ///
+    /// Matches stellar-core `Simulation::getNodes()`.
+    pub fn apps(&self) -> Vec<Arc<App>> {
+        let mut ids: Vec<&String> = self.running_apps.keys().collect();
+        ids.sort();
+        ids.into_iter()
+            .filter_map(|id| self.running_apps.get(id).map(|n| Arc::clone(&n.app)))
+            .collect()
+    }
+
+    /// Directed disconnect: tell `initiator` to drop its connection to `acceptor`.
+    ///
+    /// Matches stellar-core `Simulation::dropConnection(initiator, acceptor)`.
+    pub async fn drop_connection(&self, initiator: &str, acceptor: &str) -> anyhow::Result<()> {
+        let acceptor_secret = self.secret_for_node(acceptor)?;
+        let peer_id =
+            henyey_overlay::PeerId::from_bytes(*acceptor_secret.public_key().as_bytes());
+        let initiator_app = self
+            .running_apps
+            .get(initiator)
+            .with_context(|| format!("missing running app node {}", initiator))?;
+        let _ = initiator_app.app.disconnect_peer(&peer_id).await;
+        Ok(())
+    }
+
+    /// Look up a running app by its peer port.
+    ///
+    /// Matches stellar-core `Simulation::getAppFromPeerMap(peerPort)`.
+    pub fn app_by_port(&self, port: u16) -> Option<Arc<App>> {
+        self.running_apps
+            .values()
+            .find(|n| n.peer_port == port)
+            .map(|n| Arc::clone(&n.app))
+    }
+
+    /// Check whether a loopback link is active between two nodes.
+    ///
+    /// Exposes `LoopbackNetwork::link_active` for test assertions.
+    pub fn has_loopback_link(&self, a: &str, b: &str) -> bool {
+        self.loopback.link_active(a, b)
+    }
+
+    /// Get the expected next ledger close time for an app node.
+    ///
+    /// Returns `tracking_consensus_close_time + ledger_close_time`.
+    /// Matches stellar-core's expected close time calculation used in
+    /// various `crankUntil` calls.
+    pub fn expected_ledger_close_time(&self, node_id: &str) -> Option<u64> {
+        let app = self.running_apps.get(node_id)?;
+        Some(app.app.expected_ledger_close_time())
+    }
+
     pub async fn app_peer_count(&self, node_id: &str) -> Option<usize> {
         let app = self.running_apps.get(node_id)?;
         Some(app.app.peer_count().await)
@@ -502,6 +558,87 @@ impl Simulation {
         let min_seq = *seqs.iter().min().unwrap_or(&0);
         let max_seq = *seqs.iter().max().unwrap_or(&0);
         min_seq >= ledger_seq && max_seq.saturating_sub(min_seq) <= max_spread
+    }
+
+    /// Advance a single lightweight SimNode by one ledger (if possible).
+    ///
+    /// Returns `true` if the node advanced.
+    /// Matches stellar-core `Simulation::crankNode(id, timeout)` — the
+    /// timeout parameter is omitted because our lightweight SimNodes don't
+    /// use a real event loop.
+    pub fn crank_node(&mut self, node_id: &str) -> bool {
+        if self.loopback.is_partitioned(node_id) {
+            return false;
+        }
+
+        let current = match self.nodes.get(node_id) {
+            Some(n) => n.ledger_seq,
+            None => return false,
+        };
+
+        let max_seq = self
+            .nodes
+            .values()
+            .filter(|n| !self.loopback.is_partitioned(&n.node_id))
+            .map(|n| n.ledger_seq)
+            .max()
+            .unwrap_or(current);
+
+        if current >= max_seq {
+            return false;
+        }
+
+        let has_path = self.nodes.keys().any(|other| {
+            if other == node_id || self.loopback.is_partitioned(other) {
+                return false;
+            }
+            self.loopback.link_active(node_id, other)
+        });
+
+        if has_path {
+            let next = current + 1;
+            let hash_input = format!("{}:{}", node_id, next);
+            if let Some(node) = self.nodes.get_mut(node_id) {
+                node.ledger_seq = next;
+                node.ledger_hash = Hash256::hash(hash_input.as_bytes());
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Crank all lightweight SimNodes repeatedly for at most `duration`
+    /// (wall-clock time).
+    ///
+    /// Matches stellar-core `Simulation::crankForAtMost(duration, finalCrank)`.
+    pub async fn crank_for_at_most(&mut self, duration: Duration, final_crank: bool) {
+        let deadline = tokio::time::Instant::now() + duration;
+        while tokio::time::Instant::now() < deadline {
+            if !self.crank_all_nodes().await {
+                break;
+            }
+        }
+        if final_crank {
+            let _ = self.crank_all_nodes().await;
+        }
+    }
+
+    /// Crank all lightweight SimNodes repeatedly for at least `duration`
+    /// (wall-clock time).
+    ///
+    /// Matches stellar-core `Simulation::crankForAtLeast(duration, finalCrank)`.
+    pub async fn crank_for_at_least(&mut self, duration: Duration, final_crank: bool) {
+        let deadline = tokio::time::Instant::now() + duration;
+        loop {
+            let _ = self.crank_all_nodes().await;
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        if final_crank {
+            let _ = self.crank_all_nodes().await;
+        }
     }
 
     pub async fn crank_all_nodes(&mut self) -> bool {
@@ -704,6 +841,7 @@ impl Simulation {
             steps,
             fee_bid,
             amount,
+            ..Default::default()
         };
         LoadGenerator::step_plan(&config)
     }
@@ -1154,6 +1292,55 @@ impl Topologies {
 
         sim.add_pending_connection("node0", "node1");
         sim.add_pending_connection("node2", "node3");
+        sim
+    }
+
+    /// Create a split topology with `n` validators and `watchers` watcher
+    /// nodes, where watchers observe but do not participate in consensus.
+    ///
+    /// Matches stellar-core `Topologies::separate(n, watchers, mode)` overload
+    /// which adds extra (non-validator) nodes that connect to the first validator
+    /// partition.
+    pub fn separate_with_watchers(
+        n: usize,
+        watchers: usize,
+        mode: SimulationMode,
+    ) -> Simulation {
+        let mut sim = Simulation::new(mode);
+
+        // Create validator nodes in two partitions.
+        let half = n / 2;
+        for i in 0..n {
+            let id = format!("node{}", i);
+            let seed = Hash256::hash(format!("SIM_NODE_SEED_{}", i).as_bytes());
+            let sk = SecretKey::from_seed(&seed.0);
+            sim.add_node(id, sk);
+        }
+
+        // Partition A: nodes 0..half, Partition B: nodes half..n
+        for i in 0..half {
+            for j in (i + 1)..half {
+                sim.add_pending_connection(format!("node{}", i), format!("node{}", j));
+            }
+        }
+        for i in half..n {
+            for j in (i + 1)..n {
+                sim.add_pending_connection(format!("node{}", i), format!("node{}", j));
+            }
+        }
+
+        // Add watcher nodes connected to partition A.
+        for w in 0..watchers {
+            let id = format!("watcher{}", w);
+            let seed = Hash256::hash(format!("SIM_WATCHER_SEED_{}", w).as_bytes());
+            let sk = SecretKey::from_seed(&seed.0);
+            sim.add_node(id.clone(), sk);
+            // Connect watcher to all nodes in partition A.
+            for i in 0..half {
+                sim.add_pending_connection(id.clone(), format!("node{}", i));
+            }
+        }
+
         sim
     }
 }

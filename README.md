@@ -401,7 +401,7 @@ henyey/
 | Crate | Purpose | Parity |
 |-------|---------|--------|
 | [`henyey-work`](crates/henyey-work/README.md) | Generic DAG-based work scheduler | [39%](crates/henyey-work/PARITY_STATUS.md) |
-| [`henyey-simulation`](crates/simulation/README.md) | Deterministic multi-node simulation harness and topology/fault scenarios | [32%](crates/simulation/PARITY_STATUS.md) |
+| [`henyey-simulation`](crates/simulation/README.md) | Deterministic multi-node simulation harness and topology/fault scenarios | [72%](crates/simulation/PARITY_STATUS.md) |
 
 ## Design Constraints
 

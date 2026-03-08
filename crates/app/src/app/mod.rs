@@ -1524,6 +1524,15 @@ impl App {
         self.herder.ledger_close_time()
     }
 
+    /// Expected time of the next ledger close.
+    ///
+    /// Returns `tracking_consensus_close_time + ledger_close_time` (seconds).
+    /// Used by simulation to predict when the next close should occur.
+    pub fn expected_ledger_close_time(&self) -> u64 {
+        self.herder.tracking_consensus_close_time()
+            + self.herder.ledger_close_time() as u64
+    }
+
     pub async fn peer_count(&self) -> usize {
         self.overlay.read().await.as_ref().map(|o| o.peer_count()).unwrap_or(0)
     }
@@ -1541,6 +1550,40 @@ impl App {
 
     pub fn latest_externalized_slot(&self) -> Option<u64> {
         self.herder.latest_externalized_slot()
+    }
+
+    /// Load the current sequence number for an account from the bucket list.
+    ///
+    /// Returns `None` if the account does not exist.
+    /// Used by the simulation LoadGenerator to refresh cached sequence numbers.
+    pub fn load_account_sequence(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+    ) -> Option<i64> {
+        let snapshot = self.ledger_manager.create_snapshot().ok()?;
+        let account = snapshot.get_account(account_id).ok()??;
+        Some(account.seq_num.0)
+    }
+
+    /// Check whether the given account has any pending transactions in the
+    /// herder's transaction queue.
+    ///
+    /// Matches stellar-core `Herder::sourceAccountPending()`.
+    pub fn source_account_pending(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+    ) -> bool {
+        self.herder.source_account_pending(account_id)
+    }
+
+    /// Get the base fee from the current ledger header.
+    pub fn base_fee(&self) -> u32 {
+        self.ledger_manager.current_header().base_fee
+    }
+
+    /// Get the current ledger sequence number.
+    pub fn current_ledger_seq(&self) -> u32 {
+        self.ledger_manager.current_ledger_seq()
     }
 
     pub fn request_out_of_sync_recovery(&self) {

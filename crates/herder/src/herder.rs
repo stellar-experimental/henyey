@@ -1816,6 +1816,18 @@ impl Herder {
         &self.tx_queue
     }
 
+    /// Check whether the given account has any pending transactions in the
+    /// queue.
+    ///
+    /// Matches stellar-core `Herder::sourceAccountPending(AccountID const&)`.
+    pub fn source_account_pending(&self, account_id: &stellar_xdr::curr::AccountId) -> bool {
+        let key = account_key_from_account_id(account_id);
+        self.tx_queue
+            .pending_accounts()
+            .iter()
+            .any(|a| account_key_from_account_id(a) == key)
+    }
+
     /// Get the pending envelope manager.
     pub fn pending_envelopes(&self) -> &PendingEnvelopes {
         &self.pending_envelopes
