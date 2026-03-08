@@ -116,10 +116,7 @@ async fn resolve_peer_list(peers: &[PeerAddress]) -> (Vec<PeerAddress>, bool) {
                 // Take the first IPv4 address, matching stellar-core behavior.
                 let ipv4_addr = addrs.into_iter().find(|a| a.is_ipv4());
                 if let Some(socket_addr) = ipv4_addr {
-                    resolved.push(PeerAddress::new(
-                        socket_addr.ip().to_string(),
-                        socket_addr.port(),
-                    ));
+                    resolved.push(PeerAddress::from(socket_addr));
                     trace!(
                         "Resolved peer {} -> {}:{}",
                         peer,
@@ -388,6 +385,23 @@ struct SharedPeerState {
     is_tracking: Arc<AtomicBool>,
 }
 
+impl SharedPeerState {
+    /// Send a peer event if a subscriber is registered.
+    async fn send_peer_event(&self, event: PeerEvent) {
+        if let Some(tx) = self.peer_event_tx.clone() {
+            let _ = tx.send(event).await;
+        }
+    }
+
+    /// Clean up shared state after a peer disconnects.
+    /// Must be called after `run_peer_loop` completes for any authenticated peer.
+    fn cleanup_peer(&self, peer_id: &PeerId) {
+        self.peers.remove(peer_id);
+        self.peer_info_cache.remove(peer_id);
+        self.dropped_authenticated_peers
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
 /// Central manager for all peer connections in the overlay network.
 ///
 /// The overlay manager is the main entry point for networking operations.
@@ -617,6 +631,9 @@ impl OverlayManager {
         };
         shared.peers.insert(peer_id.clone(), peer_handle);
         shared.peer_info_cache.insert(peer_id.clone(), peer_info);
+        shared
+            .added_authenticated_peers
+            .fetch_add(1, Ordering::Relaxed);
         (outbound_rx, flow_control)
     }
 
@@ -746,29 +763,17 @@ impl OverlayManager {
                                             info!("Accepted peer: {}", peer_id);
 
                                             let peer_info = peer.info().clone();
-                                            if let Some(tx) = shared.peer_event_tx.clone() {
-                                                let addr = peer_info.address;
-                                                let peer_addr = PeerAddress::new(
-                                                    addr.ip().to_string(),
-                                                    addr.port(),
-                                                );
-                                                let _ = tx
-                                                    .send(PeerEvent::Connected(
-                                                        peer_addr,
-                                                        PeerType::Inbound,
-                                                    ))
-                                                    .await;
-                                            }
+                                            shared.send_peer_event(PeerEvent::Connected(
+                                                PeerAddress::from(peer_info.address),
+                                                PeerType::Inbound,
+                                            )).await;
 
                                             // Send Peers message directly (we still own the peer)
                                             let outbound_snapshot =
                                                 shared.advertised_outbound_peers.read().clone();
                                             let inbound_snapshot =
                                                 shared.advertised_inbound_peers.read().clone();
-                                            let exclude = PeerAddress::new(
-                                                peer_info.address.ip().to_string(),
-                                                peer_info.address.port(),
-                                            );
+                                            let exclude = PeerAddress::from(peer_info.address);
                                             if let Some(message) =
                                                 OverlayManager::build_peers_message(
                                                     &outbound_snapshot,
@@ -788,7 +793,6 @@ impl OverlayManager {
 
                                             let (outbound_rx, flow_control) =
                                                 Self::register_peer(&peer, &peer_id, peer_info, &shared);
-                                            shared.added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
 
                                             // Run peer loop (peer is moved, not locked)
                                             Self::run_peer_loop(
@@ -800,26 +804,15 @@ impl OverlayManager {
                                             ).await;
 
                                             // Cleanup
-                                            shared.peers.remove(&peer_id);
-                                            shared.peer_info_cache.remove(&peer_id);
-                                            shared.dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
+                                            shared.cleanup_peer(&peer_id);
                                             pool.release_authenticated();
                                         }
                                         Err(e) => {
                                             warn!("Failed to accept peer: {}", e);
-                                            if let Some(tx) = shared.peer_event_tx.clone() {
-                                                let addr = remote_addr;
-                                                let peer_addr = PeerAddress::new(
-                                                    addr.ip().to_string(),
-                                                    addr.port(),
-                                                );
-                                                let _ = tx
-                                                    .send(PeerEvent::Failed(
-                                                        peer_addr,
-                                                        PeerType::Inbound,
-                                                    ))
-                                                    .await;
-                                            }
+                                            shared.send_peer_event(PeerEvent::Failed(
+                                                PeerAddress::from(remote_addr),
+                                                PeerType::Inbound,
+                                            )).await;
                                             pool.release_pending();
                                         }
                                     }
@@ -1157,6 +1150,8 @@ impl OverlayManager {
         let mut last_write = Instant::now();
         const PEER_TIMEOUT: Duration = Duration::from_secs(30);
         const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
+        // OVERLAY_SPEC §8.5 — drop peer if no SEND_MORE_EXTENDED for this long.
+        const PEER_SEND_MODE_IDLE_TIMEOUT_SECS: u64 = 60;
 
         // Track message counts for periodic diagnostics
         let mut total_messages: u64 = 0;
@@ -1543,11 +1538,11 @@ impl OverlayManager {
                         warn!("Dropping peer {} due to straggler timeout (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
                         break;
                     }
-                    // Spec: OVERLAY_SPEC §8.5 — PEER_SEND_MODE_IDLE_TIMEOUT (60s):
-                    // if the peer has not sent SEND_MORE_EXTENDED for 60 seconds
-                    // while we have no outbound capacity, drop the connection.
-                    if flow_control.no_outbound_capacity_timeout(60) {
-                        warn!("Dropping peer {} due to PEER_SEND_MODE_IDLE_TIMEOUT (no SEND_MORE_EXTENDED for 60s)", peer_id);
+                    // Spec: OVERLAY_SPEC §8.5 — PEER_SEND_MODE_IDLE_TIMEOUT:
+                    // if the peer has not sent SEND_MORE_EXTENDED while we have
+                    // no outbound capacity, drop the connection.
+                    if flow_control.no_outbound_capacity_timeout(PEER_SEND_MODE_IDLE_TIMEOUT_SECS) {
+                        warn!("Dropping peer {} due to PEER_SEND_MODE_IDLE_TIMEOUT (no SEND_MORE_EXTENDED for {}s)", peer_id, PEER_SEND_MODE_IDLE_TIMEOUT_SECS);
                         break;
                     }
 
@@ -1780,6 +1775,26 @@ impl OverlayManager {
             .count()
     }
 
+    /// Returns true if a peer's connection info matches the given address,
+    /// checking the original hostname-based address first, then falling back
+    /// to resolved IP comparison.
+    fn peer_info_matches_address(info: &PeerInfo, addr: &PeerAddress) -> bool {
+        // Check by original address first (handles hostnames correctly)
+        if let Some(ref orig) = info.original_address {
+            if orig.host == addr.host && orig.port == addr.port {
+                return true;
+            }
+        }
+        // Fall back to IP comparison for backwards compatibility
+        if info.address.port() != addr.port {
+            return false;
+        }
+        addr.host
+            .parse::<IpAddr>()
+            .map(|ip| info.address.ip() == ip)
+            .unwrap_or(false)
+    }
+
     fn has_outbound_connection_to(
         peer_info_cache: &DashMap<PeerId, PeerInfo>,
         addr: &PeerAddress,
@@ -1790,21 +1805,7 @@ impl OverlayManager {
             if !info.direction.we_called_remote() {
                 return false;
             }
-            // Check by original address first (handles hostnames correctly)
-            if let Some(ref orig) = info.original_address {
-                if orig.host == addr.host && orig.port == addr.port {
-                    return true;
-                }
-            }
-            // Fall back to IP comparison for backwards compatibility
-            if info.address.port() != addr.port {
-                return false;
-            }
-            let ip = addr.host.parse::<IpAddr>().ok();
-            match ip {
-                Some(ip) => info.address.ip() == ip,
-                None => false,
-            }
+            Self::peer_info_matches_address(info, addr)
         })
     }
 
@@ -1825,21 +1826,9 @@ impl OverlayManager {
             if !info.direction.we_called_remote() {
                 continue;
             }
-            // Check if this peer is preferred (by original address or resolved IP)
-            let is_preferred = preferred_addrs.iter().any(|pref| {
-                if let Some(ref orig) = info.original_address {
-                    if orig.host == pref.host && orig.port == pref.port {
-                        return true;
-                    }
-                }
-                if info.address.port() != pref.port {
-                    return false;
-                }
-                pref.host
-                    .parse::<IpAddr>()
-                    .map(|ip| info.address.ip() == ip)
-                    .unwrap_or(false)
-            });
+            let is_preferred = preferred_addrs
+                .iter()
+                .any(|pref| Self::peer_info_matches_address(info, pref));
             if is_preferred {
                 continue;
             }
@@ -1932,20 +1921,9 @@ impl OverlayManager {
                     if !info.direction.we_called_remote() {
                         continue;
                     }
-                    let is_preferred = preferred_addrs.iter().any(|pref| {
-                        if let Some(ref orig) = info.original_address {
-                            if orig.host == pref.host && orig.port == pref.port {
-                                return true;
-                            }
-                        }
-                        if info.address.port() != pref.port {
-                            return false;
-                        }
-                        pref.host
-                            .parse::<IpAddr>()
-                            .map(|ip| info.address.ip() == ip)
-                            .unwrap_or(false)
-                    });
+                    let is_preferred = preferred_addrs
+                        .iter()
+                        .any(|pref| Self::peer_info_matches_address(info, pref));
                     if !is_preferred {
                         candidates.push(entry.key().clone());
                     }
@@ -1996,11 +1974,7 @@ impl OverlayManager {
             Ok(connection) => connection,
             Err(e) => {
                 pool.release_pending();
-                if let Some(tx) = shared.peer_event_tx.clone() {
-                    let _ = tx
-                        .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
-                        .await;
-                }
+                shared.send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound)).await;
                 return Err(e);
             }
         };
@@ -2009,11 +1983,7 @@ impl OverlayManager {
             Ok(peer) => peer,
             Err(e) => {
                 pool.release_pending();
-                if let Some(tx) = shared.peer_event_tx.clone() {
-                    let _ = tx
-                        .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
-                        .await;
-                }
+                shared.send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound)).await;
                 return Err(e);
             }
         };
@@ -2036,12 +2006,7 @@ impl OverlayManager {
         let peer_info = peer.info().clone();
         let (outbound_rx, flow_control) =
             Self::register_peer(&peer, &peer_id, peer_info, &shared);
-        shared.added_authenticated_peers.fetch_add(1, Ordering::Relaxed);
-        if let Some(tx) = shared.peer_event_tx.clone() {
-            let _ = tx
-                .send(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
-                .await;
-        }
+        shared.send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound)).await;
 
         // NOTE: Do NOT send PEERS to outbound peers (peers we connected to).
         // In stellar-core, only the acceptor (REMOTE_CALLED_US) sends PEERS during recvAuth().
@@ -2053,9 +2018,7 @@ impl OverlayManager {
         let pool_clone = Arc::clone(&pool);
         let handle = tokio::spawn(async move {
             Self::run_peer_loop(peer_id_clone.clone(), peer, outbound_rx, flow_control, shared_clone.clone()).await;
-            shared_clone.peers.remove(&peer_id_clone);
-            shared_clone.peer_info_cache.remove(&peer_id_clone);
-            shared_clone.dropped_authenticated_peers.fetch_add(1, Ordering::Relaxed);
+            shared_clone.cleanup_peer(&peer_id_clone);
             pool_clone.release_authenticated();
         });
 
@@ -2500,11 +2463,7 @@ impl OverlayManager {
                             // Handshake succeeded: promote from pending to authenticated
                             pool.mark_authenticated();
 
-                            if let Some(tx) = shared.peer_event_tx.clone() {
-                                let _ = tx
-                                    .send(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
-                                    .await;
-                            }
+                            shared.send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound)).await;
 
                             let peer_info = peer.info().clone();
                             let (outbound_rx, flow_control) =
@@ -2517,28 +2476,19 @@ impl OverlayManager {
                                 .await;
 
                             // Cleanup
-                            shared.peers.remove(&peer_id);
-                            shared.peer_info_cache.remove(&peer_id);
+                            shared.cleanup_peer(&peer_id);
                             pool.release_authenticated();
                         }
                         Err(e) => {
                             debug!("Failed to connect to discovered peer {}: {}", addr, e);
-                            if let Some(tx) = shared.peer_event_tx.clone() {
-                                let _ = tx
-                                    .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
-                                    .await;
-                            }
+                            shared.send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound)).await;
                             pool.release_pending();
                         }
                     }
                 }
                 Err(e) => {
                     debug!("Failed to connect to discovered peer {}: {}", addr, e);
-                    if let Some(tx) = shared.peer_event_tx.clone() {
-                        let _ = tx
-                            .send(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
-                            .await;
-                    }
+                    shared.send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound)).await;
                     pool.release_pending();
                 }
             }

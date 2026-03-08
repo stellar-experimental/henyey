@@ -428,6 +428,15 @@ impl std::fmt::Display for PeerAddress {
     }
 }
 
+impl From<std::net::SocketAddr> for PeerAddress {
+    fn from(addr: std::net::SocketAddr) -> Self {
+        Self {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+        }
+    }
+}
+
 /// Unique identifier for a peer based on their Ed25519 public key.
 ///
 /// Each Stellar node has a cryptographic identity derived from its secret key.
