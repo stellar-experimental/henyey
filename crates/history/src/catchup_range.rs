@@ -214,15 +214,17 @@ impl CatchupRange {
         let count = mode.count();
         let full_replay_count = target - lcl;
 
-        // Case 1: LCL is past genesis, replay from LCL+1
-        if lcl > GENESIS_LEDGER_SEQ {
+        // Case 1: LCL is past genesis AND mode is not Minimal — replay from LCL+1.
+        // For Minimal mode with a persisted LCL we fall through to the checkpoint-based
+        // logic so we download the latest checkpoint rather than replaying the full gap.
+        if lcl > GENESIS_LEDGER_SEQ && mode != CatchupMode::Minimal {
             let replay = LedgerRange::new(lcl + 1, full_replay_count);
             return Self::replay_only(replay);
         }
 
-        // All remaining cases have LCL == genesis
-        assert_eq!(lcl, GENESIS_LEDGER_SEQ);
-        let full_replay = LedgerRange::new(GENESIS_LEDGER_SEQ + 1, full_replay_count);
+        // Remaining cases: lcl == genesis, OR lcl > genesis with Minimal mode.
+        // full_replay covers from lcl+1 to target in both situations.
+        let full_replay = LedgerRange::new(lcl + 1, full_replay_count);
 
         // Case 2: count >= full replay count, do full replay
         if count >= full_replay_count {
@@ -371,13 +373,33 @@ mod tests {
     }
 
     #[test]
-    fn test_case1_lcl_past_genesis() {
-        // LCL is past genesis, should replay from LCL+1
-        let range = CatchupRange::calculate(100, 200, CatchupMode::Minimal);
+    fn test_case1_lcl_past_genesis_non_minimal() {
+        // LCL is past genesis with non-Minimal mode — replay from LCL+1
+        let range = CatchupRange::calculate(100, 200, CatchupMode::Complete);
         assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
         assert_eq!(range.replay_first(), 101);
         assert_eq!(range.replay_count(), 100);
+    }
+
+    #[test]
+    fn test_minimal_lcl_past_genesis_checkpoint_target() {
+        // Minimal mode with persisted LCL — should download checkpoint, not replay.
+        // target=127 is a checkpoint ledger.
+        let range = CatchupRange::calculate(100, 127, CatchupMode::Minimal);
+        assert!(range.apply_buckets());
+        assert!(!range.replay_ledgers());
+        assert_eq!(range.bucket_apply_ledger(), 127);
+    }
+
+    #[test]
+    fn test_minimal_mainnet_scenario() {
+        // Real-world scenario: persisted at L61529351, catchup target L61551615 (checkpoint).
+        // Should download checkpoint buckets, not replay 22k ledgers.
+        let range = CatchupRange::calculate(61529351, 61551615, CatchupMode::Minimal);
+        assert!(range.apply_buckets());
+        assert!(!range.replay_ledgers());
+        assert_eq!(range.bucket_apply_ledger(), 61551615);
     }
 
     #[test]
