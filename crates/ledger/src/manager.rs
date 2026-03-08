@@ -220,67 +220,88 @@ struct LevelScanResult {
     dead_ttl_keys: HashSet<[u8; 32]>,
 }
 
-/// Scan a single bucket level (curr + snap) for entries of the given types.
+/// Accumulator for scanning a single bucket level.
 ///
-/// Within a level, curr shadows snap: if the same key appears in both, only the
-/// curr version is kept. Dead entries are tracked in the seen set but not added
-/// to results (they shadow entries in higher-numbered levels during merge).
-/// Process a single scan-relevant entry, updating the level's result maps.
-///
-/// This is the core logic shared by both the fast path (pre-collected entries)
-/// and the fallback path (full bucket iteration).
-#[allow(clippy::too_many_arguments)]
-fn process_scan_entry(
-    entry: &BucketEntry,
-    key: LedgerKey,
-    seen_keys: &mut HashSet<LedgerKey>,
-    entries: &mut HashMap<LedgerKey, LedgerEntry>,
-    ttl_entries: &mut HashMap<[u8; 32], (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
-    dead_keys: &mut HashSet<LedgerKey>,
-    dead_ttl_keys: &mut HashSet<[u8; 32]>,
-    soroban_enabled: bool,
-    module_cache: &Option<Arc<PersistentModuleCache>>,
-    protocol_version: u32,
-) {
-    if seen_keys.contains(&key) {
-        return;
+/// Holds the mutable state built up during a scan of a level's curr+snap buckets.
+/// The `process_entry` method is the core logic shared by both the fast path
+/// (pre-collected entries) and the fallback path (full bucket iteration).
+struct LevelScanner {
+    entries: HashMap<LedgerKey, LedgerEntry>,
+    ttl_entries: HashMap<[u8; 32], (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)>,
+    seen_keys: HashSet<LedgerKey>,
+    dead_keys: HashSet<LedgerKey>,
+    dead_ttl_keys: HashSet<[u8; 32]>,
+}
+
+impl LevelScanner {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            ttl_entries: HashMap::new(),
+            seen_keys: HashSet::new(),
+            dead_keys: HashSet::new(),
+            dead_ttl_keys: HashSet::new(),
+        }
     }
 
-    // Skip soroban types if not enabled
-    if !soroban_enabled && !matches!(&key, LedgerKey::Offer(_)) {
-        return;
+    fn into_result(self) -> LevelScanResult {
+        LevelScanResult {
+            entries: self.entries,
+            ttl_entries: self.ttl_entries,
+            dead_keys: self.dead_keys,
+            dead_ttl_keys: self.dead_ttl_keys,
+        }
     }
 
-    seen_keys.insert(key.clone());
+    /// Process a single scan-relevant entry, updating the level's result maps.
+    fn process_entry(
+        &mut self,
+        entry: &BucketEntry,
+        key: LedgerKey,
+        soroban_enabled: bool,
+        module_cache: &Option<Arc<PersistentModuleCache>>,
+        protocol_version: u32,
+    ) {
+        if self.seen_keys.contains(&key) {
+            return;
+        }
 
-    if let BucketEntry::Live(ref le) | BucketEntry::Init(ref le) = entry {
-        // Compile contracts in parallel across levels via the shared module cache
-        if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
-            if let Some(ref cache) = module_cache {
-                cache.add_contract(contract_code.code.as_slice(), protocol_version);
+        // Skip soroban types if not enabled
+        if !soroban_enabled && !matches!(&key, LedgerKey::Offer(_)) {
+            return;
+        }
+
+        self.seen_keys.insert(key.clone());
+
+        if let BucketEntry::Live(ref le) | BucketEntry::Init(ref le) = entry {
+            // Compile contracts in parallel across levels via the shared module cache
+            if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
+                if let Some(ref cache) = module_cache {
+                    cache.add_contract(contract_code.code.as_slice(), protocol_version);
+                }
             }
-        }
 
-        // TTL entries go into a separate map keyed by hash
-        if let LedgerEntryData::Ttl(ref ttl) = le.data {
-            let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
-                key_hash: ttl.key_hash.clone(),
-            };
-            let ttl_data = crate::soroban_state::TtlData::new(
-                ttl.live_until_ledger_seq,
-                le.last_modified_ledger_seq,
-            );
-            ttl_entries.insert(ttl.key_hash.0, (ttl_key, ttl_data));
-        } else {
-            entries.insert(key, le.clone());
+            // TTL entries go into a separate map keyed by hash
+            if let LedgerEntryData::Ttl(ref ttl) = le.data {
+                let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+                    key_hash: ttl.key_hash.clone(),
+                };
+                let ttl_data = crate::soroban_state::TtlData::new(
+                    ttl.live_until_ledger_seq,
+                    le.last_modified_ledger_seq,
+                );
+                self.ttl_entries.insert(ttl.key_hash.0, (ttl_key, ttl_data));
+            } else {
+                self.entries.insert(key, le.clone());
+            }
+        } else if let BucketEntry::Dead(_) = entry {
+            // Track dead keys so they shadow live entries at higher (older) levels.
+            // For TTL entries, also track in the TTL-specific dead set.
+            if let LedgerKey::Ttl(ref ttl_key) = key {
+                self.dead_ttl_keys.insert(ttl_key.key_hash.0);
+            }
+            self.dead_keys.insert(key);
         }
-    } else if let BucketEntry::Dead(_) = entry {
-        // Track dead keys so they shadow live entries at higher (older) levels.
-        // For TTL entries, also track in the TTL-specific dead set.
-        if let LedgerKey::Ttl(ref ttl_key) = key {
-            dead_ttl_keys.insert(ttl_key.key_hash.0);
-        }
-        dead_keys.insert(key);
     }
 }
 
@@ -291,11 +312,7 @@ fn scan_single_level(
     module_cache: &Option<Arc<PersistentModuleCache>>,
     protocol_version: u32,
 ) -> LevelScanResult {
-    let mut entries: HashMap<LedgerKey, LedgerEntry> = HashMap::new();
-    let mut ttl_entries: HashMap<[u8; 32], (stellar_xdr::curr::LedgerKeyTtl, crate::soroban_state::TtlData)> = HashMap::new();
-    let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
-    let mut dead_keys: HashSet<LedgerKey> = HashSet::new();
-    let mut dead_ttl_keys: HashSet<[u8; 32]> = HashSet::new();
+    let mut scanner = LevelScanner::new();
 
     // Scan curr first, then snap (curr shadows snap within a level)
     for bucket in [curr, snap] {
@@ -319,14 +336,9 @@ fn scan_single_level(
                 continue;
             }
 
-            process_scan_entry(
+            scanner.process_entry(
                 &entry,
                 key,
-                &mut seen_keys,
-                &mut entries,
-                &mut ttl_entries,
-                &mut dead_keys,
-                &mut dead_ttl_keys,
                 soroban_enabled,
                 module_cache,
                 protocol_version,
@@ -334,12 +346,7 @@ fn scan_single_level(
         }
     }
 
-    LevelScanResult {
-        entries,
-        ttl_entries,
-        dead_keys,
-        dead_ttl_keys,
-    }
+    scanner.into_result()
 }
 
 /// Merge per-level scan results into a single `CacheInitResult`.
@@ -701,14 +708,17 @@ fn get_from_pairs(
     Ok(None)
 }
 
-/// Compute Soroban rent config from pre-extracted bucket level pairs via point lookups.
-fn compute_soroban_rent_config_from_pairs(
-    level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
+/// Build a `SorobanRentConfig` from a lookup function that retrieves ledger entries by key.
+///
+/// Both `compute_soroban_rent_config_from_pairs` and `LedgerManager::load_soroban_rent_config`
+/// perform the same 3-key extraction; this helper centralizes that logic.
+fn build_soroban_rent_config(
+    mut lookup: impl FnMut(&LedgerKey) -> Option<LedgerEntry>,
 ) -> Option<crate::soroban_state::SorobanRentConfig> {
     let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
     });
-    let cpu_params = get_from_pairs(level_pairs, &cpu_key).ok()?.and_then(|e| {
+    let cpu_params = lookup(&cpu_key).and_then(|e| {
         if let LedgerEntryData::ConfigSetting(
             ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
         ) = e.data
@@ -722,7 +732,7 @@ fn compute_soroban_rent_config_from_pairs(
     let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
     });
-    let mem_params = get_from_pairs(level_pairs, &mem_key).ok()?.and_then(|e| {
+    let mem_params = lookup(&mem_key).and_then(|e| {
         if let LedgerEntryData::ConfigSetting(
             ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
         ) = e.data
@@ -736,19 +746,18 @@ fn compute_soroban_rent_config_from_pairs(
     let compute_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
         config_setting_id: ConfigSettingId::ContractComputeV0,
     });
-    let (tx_max_instructions, tx_max_memory_bytes) =
-        get_from_pairs(level_pairs, &compute_key).ok()?.and_then(|e| {
-            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(compute)) =
-                e.data
-            {
-                Some((
-                    compute.tx_max_instructions as u64,
-                    compute.tx_memory_limit as u64,
-                ))
-            } else {
-                None
-            }
-        })?;
+    let (tx_max_instructions, tx_max_memory_bytes) = lookup(&compute_key).and_then(|e| {
+        if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(compute)) =
+            e.data
+        {
+            Some((
+                compute.tx_max_instructions as u64,
+                compute.tx_memory_limit as u64,
+            ))
+        } else {
+            None
+        }
+    })?;
 
     Some(crate::soroban_state::SorobanRentConfig {
         cpu_cost_params: cpu_params,
@@ -756,6 +765,13 @@ fn compute_soroban_rent_config_from_pairs(
         tx_max_instructions,
         tx_max_memory_bytes,
     })
+}
+
+/// Compute Soroban rent config from pre-extracted bucket level pairs via point lookups.
+fn compute_soroban_rent_config_from_pairs(
+    level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
+) -> Option<crate::soroban_state::SorobanRentConfig> {
+    build_soroban_rent_config(|key| get_from_pairs(level_pairs, key).ok().flatten())
 }
 
 /// Scan a set of bucket level pairs and extract all cache data.
@@ -1416,61 +1432,7 @@ impl LedgerManager {
         &self,
         bucket_list: &BucketList,
     ) -> Option<crate::soroban_state::SorobanRentConfig> {
-        // Load CPU cost params
-        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
-        });
-        let cpu_params = bucket_list.get(&cpu_key).ok()?.and_then(|e| {
-            if let LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
-            ) = e.data
-            {
-                Some(params)
-            } else {
-                None
-            }
-        })?;
-
-        // Load memory cost params
-        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
-        });
-        let mem_params = bucket_list.get(&mem_key).ok()?.and_then(|e| {
-            if let LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
-            ) = e.data
-            {
-                Some(params)
-            } else {
-                None
-            }
-        })?;
-
-        // Load compute settings for limits
-        let compute_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractComputeV0,
-        });
-        let (tx_max_instructions, tx_max_memory_bytes) =
-            bucket_list.get(&compute_key).ok()?.and_then(|e| {
-                if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractComputeV0(
-                    compute,
-                )) = e.data
-                {
-                    Some((
-                        compute.tx_max_instructions as u64,
-                        compute.tx_memory_limit as u64,
-                    ))
-                } else {
-                    None
-                }
-            })?;
-
-        Some(crate::soroban_state::SorobanRentConfig {
-            cpu_cost_params: cpu_params,
-            mem_cost_params: mem_params,
-            tx_max_instructions,
-            tx_max_memory_bytes,
-        })
+        build_soroban_rent_config(|key| bucket_list.get(key).ok().flatten())
     }
 
     /// Initialize all caches from the bucket list using a single-pass scan.

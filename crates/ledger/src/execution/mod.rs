@@ -711,45 +711,7 @@ impl TransactionExecutor {
         snapshot: &SnapshotHandle,
         account_id: &AccountId,
     ) -> Result<bool> {
-        // First check if the account was created/updated by a previous transaction in this ledger
-        // This is important for intra-ledger dependencies (e.g., TX0 creates account, TX1 uses it)
-        if self.state.get_account(account_id).is_some() {
-            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: found in state");
-            return Ok(true);
-        }
-
-        let key_bytes = account_id_to_key(account_id);
-
-        // Check if we've already tried to load from snapshot
-        if self.loaded_accounts.contains_key(&key_bytes) {
-            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account: already tried, not found");
-            return Ok(false); // Already tried and not found
-        }
-
-        // Mark as attempted
-        self.loaded_accounts.insert(key_bytes, true);
-
-        // Try to load from snapshot
-        let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: account_id.clone(),
-        });
-
-        if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
-            // Log signer info for debugging
-            if let stellar_xdr::curr::LedgerEntryData::Account(ref acct) = entry.data {
-                tracing::trace!(
-                    account = ?account_id,
-                    num_signers = acct.signers.len(),
-                    thresholds = ?acct.thresholds.0,
-                    "load_account: found in bucket list"
-                );
-            }
-            self.state.load_entry(entry);
-            return Ok(true);
-        }
-
-        tracing::debug!(account = %account_id_to_strkey(account_id), "load_account: NOT FOUND in bucket list");
-        Ok(false)
+        self.load_account_inner(snapshot, account_id, true)
     }
 
     /// Load an account from the snapshot into state WITHOUT recording it for transaction changes.
@@ -762,9 +724,24 @@ impl TransactionExecutor {
         snapshot: &SnapshotHandle,
         account_id: &AccountId,
     ) -> Result<bool> {
-        // First check if the account is already in state
+        self.load_account_inner(snapshot, account_id, false)
+    }
+
+    /// Shared implementation for loading an account from snapshot.
+    /// When `record` is true, uses `state.load_entry()` (captures a snapshot for change tracking).
+    /// When `record` is false, uses `state.load_entry_without_snapshot()`.
+    fn load_account_inner(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        account_id: &AccountId,
+        record: bool,
+    ) -> Result<bool> {
+        let label = if record { "load_account" } else { "load_account_without_record" };
+
+        // First check if the account was created/updated by a previous transaction in this ledger
+        // This is important for intra-ledger dependencies (e.g., TX0 creates account, TX1 uses it)
         if self.state.get_account(account_id).is_some() {
-            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account_without_record: found in state");
+            tracing::trace!(account = %account_id_to_strkey(account_id), "{}: found in state", label);
             return Ok(true);
         }
 
@@ -772,7 +749,7 @@ impl TransactionExecutor {
 
         // Check if we've already tried to load from snapshot
         if self.loaded_accounts.contains_key(&key_bytes) {
-            tracing::trace!(account = %account_id_to_strkey(account_id), "load_account_without_record: already tried, not found");
+            tracing::trace!(account = %account_id_to_strkey(account_id), "{}: already tried, not found", label);
             return Ok(false);
         }
 
@@ -785,17 +762,28 @@ impl TransactionExecutor {
         });
 
         if let Some(entry) = self.get_entry_from_snapshot(snapshot, &key)? {
-            tracing::trace!(
-                account = ?account_id,
-                "load_account_without_record: found in bucket list"
-            );
-            // Load entry WITHOUT recording - use load_entry_without_snapshot which doesn't
-            // capture a snapshot for change tracking
-            self.state.load_entry_without_snapshot(entry);
+            if record {
+                // Log signer info for debugging (only in record mode)
+                if let stellar_xdr::curr::LedgerEntryData::Account(ref acct) = entry.data {
+                    tracing::trace!(
+                        account = ?account_id,
+                        num_signers = acct.signers.len(),
+                        thresholds = ?acct.thresholds.0,
+                        "{}: found in bucket list", label
+                    );
+                }
+                self.state.load_entry(entry);
+            } else {
+                tracing::trace!(
+                    account = ?account_id,
+                    "{}: found in bucket list", label
+                );
+                self.state.load_entry_without_snapshot(entry);
+            }
             return Ok(true);
         }
 
-        tracing::debug!(account = %account_id_to_strkey(account_id), "load_account_without_record: NOT FOUND in bucket list");
+        tracing::debug!(account = %account_id_to_strkey(account_id), "{}: NOT FOUND in bucket list", label);
         Ok(false)
     }
 
@@ -1955,7 +1943,6 @@ impl TransactionExecutor {
     /// After this method returns `Ok(Ok(..))`, the executor's state has committed
     /// fee deduction, signer removal, and sequence bump. These changes persist
     /// even if the operation body later fails (matching stellar-core behavior).
-    #[allow(clippy::too_many_arguments)]
     fn pre_apply(
         &mut self,
         snapshot: &SnapshotHandle,
