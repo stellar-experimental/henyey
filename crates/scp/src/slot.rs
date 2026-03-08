@@ -39,6 +39,23 @@ use crate::nomination::NominationProtocol;
 use crate::EnvelopeState;
 use crate::SlotContext;
 
+/// Build a [`SlotContext`] from a `Slot` and a driver reference.
+///
+/// Using a macro instead of a method avoids whole-`self` borrows, so the
+/// caller can still mutably borrow individual fields (e.g. `self.ballot`)
+/// while the context holds shared references to `self.local_node_id` and
+/// `self.local_quorum_set`.
+macro_rules! slot_ctx {
+    ($self:expr, $driver:expr) => {
+        SlotContext {
+            local_node_id: &$self.local_node_id,
+            local_quorum_set: &$self.local_quorum_set,
+            driver: $driver,
+            slot_index: $self.slot_index,
+        }
+    };
+}
+
 /// Per-slot consensus state managing nomination and ballot protocols.
 ///
 /// A `Slot` encapsulates all the state needed to reach consensus on a single
@@ -153,6 +170,13 @@ impl Slot {
         self.fully_validated
     }
 
+    /// Propagate `fully_validated` to ballot and nomination sub-protocols.
+    fn set_fully_validated(&mut self, validated: bool) {
+        self.fully_validated = validated;
+        self.nomination.set_fully_validated(validated);
+        self.ballot.set_fully_validated(validated);
+    }
+
     /// Check if we've heard from quorum for the current ballot.
     pub fn heard_from_quorum(&self) -> bool {
         self.ballot.heard_from_quorum()
@@ -163,6 +187,25 @@ impl Slot {
     /// Matches stellar-core `Slot::gotVBlocking()`.
     pub fn got_v_blocking(&self) -> bool {
         self.got_v_blocking
+    }
+
+    /// Check if the ballot protocol has externalized and record the result.
+    ///
+    /// When the ballot protocol reaches externalization, this captures the
+    /// externalized value, marks the slot as fully validated, and stops all
+    /// consensus timers. No-op if already externalized or if the ballot
+    /// protocol hasn't reached externalization.
+    fn maybe_record_externalization<D: SCPDriver>(&mut self, driver: &Arc<D>) {
+        if !self.ballot.is_externalized() || self.externalized_value.is_some() {
+            return;
+        }
+        if let Some(value) = self.ballot.get_externalized_value() {
+            self.externalized_value = Some(value.clone());
+            self.set_fully_validated(true);
+
+            driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
+            driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Ballot);
+        }
     }
 
     /// Check and set `got_v_blocking` if v-blocking threshold is met.
@@ -220,10 +263,7 @@ impl Slot {
         };
 
         if result.is_valid() {
-            self.envelopes
-                .entry(node_id.clone())
-                .or_default()
-                .push(envelope.clone());
+            self.envelopes.entry(node_id).or_default().push(envelope);
 
             // If this is the first valid message from this node,
             // check if we now have a v-blocking set (matching stellar-core)
@@ -236,18 +276,7 @@ impl Slot {
         self.check_nomination_to_ballot(driver);
 
         // Check if we've externalized
-        if self.ballot.is_externalized() && self.externalized_value.is_none() {
-            if let Some(value) = self.ballot.get_externalized_value() {
-                self.externalized_value = Some(value.clone());
-                self.fully_validated = true;
-                self.nomination.set_fully_validated(true);
-                self.ballot.set_fully_validated(true);
-
-                // Stop all timers when externalized
-                driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
-                driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Ballot);
-            }
-        }
+        self.maybe_record_externalization(driver);
 
         result
     }
@@ -273,12 +302,7 @@ impl Slot {
 
         self.nomination_started = true;
 
-        let ctx = SlotContext {
-            local_node_id: &self.local_node_id,
-            local_quorum_set: &self.local_quorum_set,
-            driver,
-            slot_index: self.slot_index,
-        };
+        let ctx = slot_ctx!(self, driver);
         let result = self.nomination.nominate(&ctx, value, prev_value, timedout);
 
         // After nomination, check if we produced a composite value and should
@@ -290,17 +314,7 @@ impl Slot {
 
         // Check if the ballot protocol already externalized (possible for
         // solo validators where the entire SCP round completes synchronously).
-        if self.ballot.is_externalized() && self.externalized_value.is_none() {
-            if let Some(value) = self.ballot.get_externalized_value() {
-                self.externalized_value = Some(value.clone());
-                self.fully_validated = true;
-                self.nomination.set_fully_validated(true);
-                self.ballot.set_fully_validated(true);
-
-                driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
-                driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Ballot);
-            }
-        }
+        self.maybe_record_externalization(driver);
 
         // stellar-core always sets up the nomination timer after nominate() succeeds
         // in reaching the main logic (i.e., didn't return early due to
@@ -350,23 +364,13 @@ impl Slot {
         driver.timer_expired(self.slot_index, crate::driver::SCPTimerType::Ballot);
 
         let composite = self.nomination.latest_composite().cloned();
-        let ctx = SlotContext {
-            local_node_id: &self.local_node_id,
-            local_quorum_set: &self.local_quorum_set,
-            driver,
-            slot_index: self.slot_index,
-        };
+        let ctx = slot_ctx!(self, driver);
         self.ballot.bump_timeout(&ctx, composite.as_ref())
     }
 
     /// Get all envelopes received for this slot.
     pub fn get_envelopes(&self) -> &HashMap<NodeId, Vec<ScpEnvelope>> {
         &self.envelopes
-    }
-
-    /// Get the latest envelope from a specific node.
-    pub fn get_latest_nomination(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
-        self.envelopes.get(node_id).and_then(|v| v.last())
     }
 
     /// Get the current ballot counter for this slot, if any.
@@ -398,12 +402,7 @@ impl Slot {
         envelope: &ScpEnvelope,
         driver: &Arc<D>,
     ) -> EnvelopeState {
-        let ctx = SlotContext {
-            local_node_id: &self.local_node_id,
-            local_quorum_set: &self.local_quorum_set,
-            driver,
-            slot_index: self.slot_index,
-        };
+        let ctx = slot_ctx!(self, driver);
         self.nomination.process_envelope(envelope, &ctx)
     }
 
@@ -431,20 +430,13 @@ impl Slot {
         }
 
         if validation == crate::ValidationLevel::MaybeValid {
-            self.fully_validated = false;
-            self.nomination.set_fully_validated(false);
-            self.ballot.set_fully_validated(false);
+            self.set_fully_validated(false);
         }
 
         // Sync composite candidate so abandon_ballot can use it
         self.sync_composite_candidate();
 
-        let ctx = SlotContext {
-            local_node_id: &self.local_node_id,
-            local_quorum_set: &self.local_quorum_set,
-            driver,
-            slot_index: self.slot_index,
-        };
+        let ctx = slot_ctx!(self, driver);
         let result = self.ballot.process_envelope(envelope, &ctx);
 
         // Check if set_confirm_commit signaled that nomination should stop
@@ -477,12 +469,7 @@ impl Slot {
             driver.started_ballot_protocol(self.slot_index, &composite);
 
             // Start ballot protocol with the composite value
-            let ctx = SlotContext {
-                local_node_id: &self.local_node_id,
-                local_quorum_set: &self.local_quorum_set,
-                driver,
-                slot_index: self.slot_index,
-            };
+            let ctx = slot_ctx!(self, driver);
             self.ballot.bump(&ctx, composite.clone(), false);
         }
     }
@@ -494,11 +481,9 @@ impl Slot {
     /// fast-forwarding via EXTERNALIZE messages from the network.
     pub fn force_externalize(&mut self, value: Value) {
         self.externalized_value = Some(value.clone());
-        self.fully_validated = true;
+        self.set_fully_validated(true);
         self.nomination.stop();
-        self.nomination.set_fully_validated(true);
         self.ballot.force_externalize(value);
-        self.ballot.set_fully_validated(true);
     }
 
     /// Get the current ballot phase.
@@ -509,13 +494,6 @@ impl Slot {
     /// Check if we're in nomination phase.
     pub fn is_nominating(&self) -> bool {
         self.nomination_started && !self.nomination.is_stopped()
-    }
-
-    /// Get the set of nodes we've heard from for this slot.
-    ///
-    /// Returns all node IDs that have sent valid envelopes for this slot.
-    pub fn get_nodes_heard_from(&self) -> std::collections::HashSet<NodeId> {
-        self.envelopes.keys().cloned().collect()
     }
 
     /// Get the total count of statements recorded for this slot.
@@ -586,32 +564,6 @@ impl Slot {
             .get_externalizing_state(&self.local_node_id, self.fully_validated)
     }
 
-    /// Record a historical statement for this slot.
-    ///
-    /// Historical statements are used for debugging and analysis.
-    pub fn record_statement(&mut self, envelope: &ScpEnvelope) {
-        let node_id = envelope.statement.node_id.clone();
-        self.envelopes
-            .entry(node_id)
-            .or_default()
-            .push(envelope.clone());
-    }
-
-    /// Get the quorum set hash from a statement.
-    ///
-    /// Extracts the quorum set hash from the statement's pledges.
-    pub fn get_companion_quorum_set_hash_from_statement(
-        statement: &stellar_xdr::curr::ScpStatement,
-    ) -> Option<stellar_xdr::curr::Hash> {
-        use ScpStatementPledges::*;
-        match &statement.pledges {
-            Nominate(nom) => Some(nom.quorum_set_hash.clone()),
-            Prepare(prep) => Some(prep.quorum_set_hash.clone()),
-            Confirm(conf) => Some(conf.quorum_set_hash.clone()),
-            Externalize(ext) => Some(ext.commit_quorum_set_hash.clone()),
-        }
-    }
-
     /// Get values from a statement.
     ///
     /// Extracts all values referenced by a statement.
@@ -644,22 +596,6 @@ impl Slot {
         }
 
         values
-    }
-
-    /// Create an envelope from a statement.
-    ///
-    /// This is a helper for constructing envelopes with proper signing.
-    pub fn create_envelope<D: SCPDriver>(
-        &self,
-        statement: stellar_xdr::curr::ScpStatement,
-        driver: &Arc<D>,
-    ) -> ScpEnvelope {
-        let mut envelope = ScpEnvelope {
-            statement,
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
-        };
-        driver.sign_envelope(&mut envelope);
-        envelope
     }
 
     /// Restore state from a saved envelope (for crash recovery).
@@ -735,12 +671,7 @@ impl Slot {
     /// True if the ballot was abandoned successfully.
     pub fn abandon_ballot<D: SCPDriver>(&mut self, driver: &Arc<D>, counter: u32) -> bool {
         self.sync_composite_candidate();
-        let ctx = SlotContext {
-            local_node_id: &self.local_node_id,
-            local_quorum_set: &self.local_quorum_set,
-            driver,
-            slot_index: self.slot_index,
-        };
+        let ctx = slot_ctx!(self, driver);
         self.ballot.abandon_ballot_public(counter, &ctx)
     }
 
@@ -762,12 +693,7 @@ impl Slot {
         value: Value,
         counter: u32,
     ) -> bool {
-        let ctx = SlotContext {
-            local_node_id: &self.local_node_id,
-            local_quorum_set: &self.local_quorum_set,
-            driver,
-            slot_index: self.slot_index,
-        };
+        let ctx = slot_ctx!(self, driver);
         self.ballot.bump_state(&ctx, value, counter)
     }
 
@@ -776,12 +702,7 @@ impl Slot {
     /// This mirrors stellar-core `BallotProtocol::bumpState(value, force=true)`.
     /// Counter is `current_counter + 1`, or 1 if no current ballot.
     pub fn force_bump_state<D: SCPDriver>(&mut self, driver: &Arc<D>, value: Value) -> bool {
-        let ctx = SlotContext {
-            local_node_id: &self.local_node_id,
-            local_quorum_set: &self.local_quorum_set,
-            driver,
-            slot_index: self.slot_index,
-        };
+        let ctx = slot_ctx!(self, driver);
         self.ballot.bump(&ctx, value, true)
     }
 
@@ -808,17 +729,6 @@ impl Slot {
 
         // Fall back to nomination state
         self.nomination.get_node_state(node_id)
-    }
-
-    /// Get a summary string of the slot state for debugging.
-    pub fn get_state_string(&self) -> String {
-        format!(
-            "slot={} externalized={} nom=[{}] ballot=[{}]",
-            self.slot_index,
-            self.externalized_value.is_some(),
-            self.nomination.get_state_string(),
-            self.ballot.get_state_string()
-        )
     }
 
     /// Get states of all nodes in quorum set for this slot.

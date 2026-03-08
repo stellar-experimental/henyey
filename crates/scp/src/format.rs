@@ -13,26 +13,6 @@ pub fn node_id_to_short_string(node_id: &NodeId) -> String {
     }
 }
 
-/// Format a NodeId for display with optional full key.
-///
-/// # Arguments
-/// * `node_id` - The node ID to format
-/// * `full_keys` - If true, returns the full 64-character hex encoding.
-///   If false, returns the short 8-character format.
-///
-/// This matches the stellar-core `toStrKey(NodeID, bool fullKeys)` method.
-pub fn node_id_to_string(node_id: &NodeId, full_keys: bool) -> String {
-    match &node_id.0 {
-        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
-            if full_keys {
-                hex::encode(bytes)
-            } else {
-                hex::encode(&bytes[..4])
-            }
-        }
-    }
-}
-
 /// Format a ballot for display.
 pub fn ballot_to_str(ballot: &ScpBallot) -> String {
     format!(

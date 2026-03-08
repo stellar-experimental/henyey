@@ -306,11 +306,6 @@ impl BallotProtocol {
         self.last_envelope.as_ref()
     }
 
-    /// Get the latest envelope from a specific node.
-    pub fn get_latest_envelope(&self, node_id: &NodeId) -> Option<&ScpEnvelope> {
-        self.latest_envelopes.get(node_id)
-    }
-
     /// Get envelopes that contributed to externalization.
     ///
     /// Matches stellar-core `BallotProtocol::getExternalizingState()`:
@@ -352,11 +347,6 @@ impl BallotProtocol {
     /// Get the high ballot (highest confirmable).
     pub fn high_ballot(&self) -> Option<&ScpBallot> {
         self.high_ballot.as_ref()
-    }
-
-    /// Get the prepared' ballot.
-    pub fn prepared_prime(&self) -> Option<&ScpBallot> {
-        self.prepared_prime.as_ref()
     }
 
     /// Get the current consensus value.
@@ -464,11 +454,6 @@ impl BallotProtocol {
         &self.latest_envelopes
     }
 
-    /// Get the count of nodes we've heard from.
-    pub fn get_node_count(&self) -> usize {
-        self.latest_envelopes.len()
-    }
-
     /// Get the state of a node in the ballot protocol.
     ///
     /// Returns the QuorumInfoNodeState for a given node based on their
@@ -479,35 +464,6 @@ impl BallotProtocol {
         } else {
             crate::QuorumInfoNodeState::Missing
         }
-    }
-
-    /// Get a summary string of the ballot state for debugging.
-    pub fn get_state_string(&self) -> String {
-        let mut state = format!("phase={:?}", self.phase);
-
-        if let Some(b) = &self.current_ballot {
-            state.push_str(&format!(" b={}", b.counter));
-        }
-
-        if let Some(p) = &self.prepared {
-            state.push_str(&format!(" p={}", p.counter));
-        }
-
-        if let Some(h) = &self.high_ballot {
-            state.push_str(&format!(" h={}", h.counter));
-        }
-
-        if let Some(c) = &self.commit {
-            state.push_str(&format!(" c={}", c.counter));
-        }
-
-        state.push_str(&format!(
-            " heard={} nodes={}",
-            self.heard_from_quorum,
-            self.latest_envelopes.len()
-        ));
-
-        state
     }
 
     /// Get JSON-serializable ballot information.

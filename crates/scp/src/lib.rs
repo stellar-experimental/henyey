@@ -60,9 +60,7 @@ pub use ballot::{get_working_ballot, BallotPhase};
 pub use compare::is_newer_nomination_or_ballot_st;
 pub use driver::{SCPDriver, SCPTimerType, ValidationLevel};
 pub use error::ScpError;
-pub use format::{
-    ballot_to_str, envelope_to_str, node_id_to_short_string, node_id_to_string, value_to_str,
-};
+pub use format::{ballot_to_str, envelope_to_str, node_id_to_short_string, value_to_str};
 pub use info::{
     BallotInfo, BallotValue, CommitBounds, NodeInfo, NominationInfo, QuorumInfo, SlotInfo,
 };

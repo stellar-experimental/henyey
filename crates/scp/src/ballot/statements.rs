@@ -6,13 +6,13 @@ impl BallotProtocol {
     pub fn is_newer_statement(&self, node_id: &NodeId, statement: &ScpStatement) -> bool {
         match self.latest_envelopes.get(node_id) {
             None => true,
-            Some(existing) => self.is_newer_statement_pair(&existing.statement, statement),
+            Some(existing) => Self::is_newer_statement_pair(&existing.statement, statement),
         }
     }
 
-    fn is_newer_statement_pair(&self, old: &ScpStatement, new: &ScpStatement) -> bool {
-        let old_rank = self.pledge_rank(&old.pledges);
-        let new_rank = self.pledge_rank(&new.pledges);
+    fn is_newer_statement_pair(old: &ScpStatement, new: &ScpStatement) -> bool {
+        let old_rank = Self::pledge_rank(&old.pledges);
+        let new_rank = Self::pledge_rank(&new.pledges);
 
         if old_rank != new_rank {
             return old_rank < new_rank;
@@ -54,7 +54,7 @@ impl BallotProtocol {
         }
     }
 
-    fn pledge_rank(&self, pledges: &ScpStatementPledges) -> u8 {
+    fn pledge_rank(pledges: &ScpStatementPledges) -> u8 {
         match pledges {
             ScpStatementPledges::Prepare(_) => 0,
             ScpStatementPledges::Confirm(_) => 1,
@@ -147,7 +147,7 @@ impl BallotProtocol {
         driver: &Arc<D>,
         slot_index: u64,
     ) -> ValidationLevel {
-        let values = self.statement_values(statement);
+        let values = Self::statement_values(statement);
         if values.is_empty() {
             return ValidationLevel::Invalid;
         }
@@ -226,7 +226,7 @@ impl BallotProtocol {
         })
     }
 
-    fn statement_values(&self, statement: &ScpStatement) -> Vec<Value> {
+    fn statement_values(statement: &ScpStatement) -> Vec<Value> {
         crate::slot::Slot::get_statement_values(statement)
     }
 
@@ -242,16 +242,16 @@ impl BallotProtocol {
                 match &envelope.statement.pledges {
                     ScpStatementPledges::Prepare(prep) => {
                         if are_ballots_less_and_compatible(&prep.ballot, top_vote) {
-                            self.push_candidate(&mut candidates, &mut seen, prep.ballot.clone());
+                            Self::push_candidate(&mut candidates, &mut seen, prep.ballot.clone());
                         }
                         if let Some(prepared) = &prep.prepared {
                             if are_ballots_less_and_compatible(prepared, top_vote) {
-                                self.push_candidate(&mut candidates, &mut seen, prepared.clone());
+                                Self::push_candidate(&mut candidates, &mut seen, prepared.clone());
                             }
                         }
                         if let Some(prepared_prime) = &prep.prepared_prime {
                             if are_ballots_less_and_compatible(prepared_prime, top_vote) {
-                                self.push_candidate(
+                                Self::push_candidate(
                                     &mut candidates,
                                     &mut seen,
                                     prepared_prime.clone(),
@@ -261,9 +261,9 @@ impl BallotProtocol {
                     }
                     ScpStatementPledges::Confirm(conf) => {
                         if ballot_compatible(top_vote, &conf.ballot) {
-                            self.push_candidate(&mut candidates, &mut seen, top_vote.clone());
+                            Self::push_candidate(&mut candidates, &mut seen, top_vote.clone());
                             if conf.n_prepared < top_vote.counter {
-                                self.push_candidate(
+                                Self::push_candidate(
                                     &mut candidates,
                                     &mut seen,
                                     ScpBallot {
@@ -276,7 +276,7 @@ impl BallotProtocol {
                     }
                     ScpStatementPledges::Externalize(ext) => {
                         if ballot_compatible(top_vote, &ext.commit) {
-                            self.push_candidate(&mut candidates, &mut seen, top_vote.clone());
+                            Self::push_candidate(&mut candidates, &mut seen, top_vote.clone());
                         }
                     }
                     _ => {}
@@ -289,7 +289,6 @@ impl BallotProtocol {
     }
 
     fn push_candidate(
-        &self,
         candidates: &mut Vec<ScpBallot>,
         seen: &mut std::collections::HashSet<(u32, Vec<u8>)>,
         ballot: ScpBallot,
@@ -328,7 +327,7 @@ impl BallotProtocol {
         }
     }
 
-    pub(super) fn statement_ballot_counter(&self, statement: &ScpStatement) -> u32 {
+    pub(super) fn statement_ballot_counter(statement: &ScpStatement) -> u32 {
         match &statement.pledges {
             ScpStatementPledges::Prepare(prep) => prep.ballot.counter,
             ScpStatementPledges::Confirm(conf) => conf.ballot.counter,
@@ -346,7 +345,7 @@ impl BallotProtocol {
     ) -> bool {
         let mut nodes = HashSet::new();
         for (node_id, envelope) in &self.latest_envelopes {
-            if self.statement_ballot_counter(&envelope.statement) > counter {
+            if Self::statement_ballot_counter(&envelope.statement) > counter {
                 nodes.insert(node_id.clone());
             }
         }
@@ -473,7 +472,7 @@ impl BallotProtocol {
         }
     }
 
-    pub(super) fn has_prepared_ballot(&self, ballot: &ScpBallot, statement: &ScpStatement) -> bool {
+    pub(super) fn has_prepared_ballot(ballot: &ScpBallot, statement: &ScpStatement) -> bool {
         match &statement.pledges {
             ScpStatementPledges::Prepare(prep) => {
                 prep.prepared

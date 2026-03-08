@@ -217,20 +217,6 @@ impl NominationProtocol {
         }
     }
 
-    /// Get a summary string of the nomination state for debugging.
-    pub fn get_state_string(&self) -> String {
-        format!(
-            "round={} started={} stopped={} votes={} accepted={} candidates={} leaders={}",
-            self.round,
-            self.started,
-            self.stopped,
-            self.votes.len(),
-            self.accepted.len(),
-            self.candidates.len(),
-            self.round_leaders.len()
-        )
-    }
-
     /// Get JSON-serializable nomination information.
     ///
     /// Returns a NominationInfo struct that can be serialized to JSON
@@ -409,7 +395,7 @@ impl NominationProtocol {
             return EnvelopeState::Invalid;
         }
 
-        if !self.is_sane_statement(nomination) {
+        if !Self::is_sane_statement(nomination) {
             return EnvelopeState::Invalid;
         }
 
@@ -591,8 +577,8 @@ impl NominationProtocol {
     ///    `mLastEnvelope` (which the recursive call may have already updated)
     /// 4. Only set `mLastEnvelope` and emit if still newer
     fn emit_nomination<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) {
-        let votes = self.sorted_values(&self.votes);
-        let accepted = self.sorted_values(&self.accepted);
+        let votes = Self::sorted_values(&self.votes);
+        let accepted = Self::sorted_values(&self.accepted);
         let nomination = ScpNomination {
             quorum_set_hash: hash_quorum_set(ctx.local_quorum_set).into(),
             votes: votes.clone().try_into().unwrap_or_default(),
@@ -641,7 +627,7 @@ impl NominationProtocol {
             None => true,
             Some(last) => {
                 if let ScpStatementPledges::Nominate(last_nom) = &last.statement.pledges {
-                    self.is_newer_nomination(last_nom, &nomination)
+                    Self::is_newer_nomination(last_nom, &nomination)
                 } else {
                     true
                 }
@@ -689,7 +675,7 @@ impl NominationProtocol {
             None => true,
             Some(existing) => {
                 if let ScpStatementPledges::Nominate(existing_nom) = &existing.statement.pledges {
-                    self.is_newer_nomination(existing_nom, nomination)
+                    Self::is_newer_nomination(existing_nom, nomination)
                 } else {
                     true
                 }
@@ -697,11 +683,11 @@ impl NominationProtocol {
         }
     }
 
-    fn is_newer_nomination(&self, old_nom: &ScpNomination, new_nom: &ScpNomination) -> bool {
-        let old_votes = self.value_set(&old_nom.votes);
-        let old_accepted = self.value_set(&old_nom.accepted);
-        let new_votes = self.value_set(&new_nom.votes);
-        let new_accepted = self.value_set(&new_nom.accepted);
+    fn is_newer_nomination(old_nom: &ScpNomination, new_nom: &ScpNomination) -> bool {
+        let old_votes = Self::value_set(&old_nom.votes);
+        let old_accepted = Self::value_set(&old_nom.accepted);
+        let new_votes = Self::value_set(&new_nom.votes);
+        let new_accepted = Self::value_set(&new_nom.accepted);
 
         let votes_grew = old_votes.is_subset(&new_votes) && old_votes.len() < new_votes.len();
         let accepted_grew =
@@ -711,21 +697,21 @@ impl NominationProtocol {
             && (votes_grew || accepted_grew)
     }
 
-    fn is_sane_statement(&self, nomination: &ScpNomination) -> bool {
+    fn is_sane_statement(nomination: &ScpNomination) -> bool {
         if nomination.votes.is_empty() && nomination.accepted.is_empty() {
             return false;
         }
 
-        self.is_sorted_unique(&nomination.votes) && self.is_sorted_unique(&nomination.accepted)
+        Self::is_sorted_unique(&nomination.votes) && Self::is_sorted_unique(&nomination.accepted)
     }
 
-    fn is_sorted_unique(&self, values: &[Value]) -> bool {
+    fn is_sorted_unique(values: &[Value]) -> bool {
         if values.is_empty() {
             return true;
         }
-        let mut prev = self.value_key(&values[0]);
+        let mut prev = Self::value_key(&values[0]);
         for value in values.iter().skip(1) {
-            let key = self.value_key(value);
+            let key = Self::value_key(value);
             if key <= prev {
                 return false;
             }
@@ -734,18 +720,18 @@ impl NominationProtocol {
         true
     }
 
-    fn value_set(&self, values: &[Value]) -> HashSet<Vec<u8>> {
-        values.iter().map(|v| self.value_key(v)).collect()
+    fn value_set(values: &[Value]) -> HashSet<Vec<u8>> {
+        values.iter().map(|v| Self::value_key(v)).collect()
     }
 
-    fn value_key(&self, value: &Value) -> Vec<u8> {
+    fn value_key(value: &Value) -> Vec<u8> {
         value.to_xdr(Limits::none()).unwrap_or_default()
     }
 
-    fn sorted_values(&self, values: &[Value]) -> Vec<Value> {
+    fn sorted_values(values: &[Value]) -> Vec<Value> {
         let mut values = values.to_vec();
-        values.sort_by_key(|a| self.value_key(a));
-        values.dedup_by(|a, b| self.value_key(a) == self.value_key(b));
+        values.sort_by_key(|a| Self::value_key(a));
+        values.dedup_by(|a, b| Self::value_key(a) == Self::value_key(b));
         values
     }
 

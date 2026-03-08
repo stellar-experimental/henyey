@@ -82,7 +82,7 @@ impl BallotProtocol {
 
             let accepted = self.federated_accept(
                 |st| self.statement_votes_for_ballot(ballot, st),
-                |st| self.has_prepared_ballot(ballot, st),
+                |st| Self::has_prepared_ballot(ballot, st),
                 ctx.local_node_id,
                 ctx.local_quorum_set,
                 ctx.driver,
@@ -168,7 +168,7 @@ impl BallotProtocol {
             }
 
             if self.federated_ratify(
-                |st| self.has_prepared_ballot(ballot, st),
+                |st| Self::has_prepared_ballot(ballot, st),
                 ctx.local_node_id,
                 ctx.local_quorum_set,
                 ctx.driver,
@@ -218,7 +218,7 @@ impl BallotProtocol {
                     continue;
                 }
                 if self.federated_ratify(
-                    |st| self.has_prepared_ballot(ballot, st),
+                    |st| Self::has_prepared_ballot(ballot, st),
                     ctx.local_node_id,
                     ctx.local_quorum_set,
                     ctx.driver,
@@ -281,7 +281,7 @@ impl BallotProtocol {
             return false;
         }
 
-        let Some(ballot) = self.hint_ballot_for_commit(hint) else {
+        let Some(ballot) = Self::hint_ballot_for_commit(hint) else {
             return false;
         };
         if self.phase == BallotPhase::Confirm {
@@ -385,7 +385,7 @@ impl BallotProtocol {
             return false;
         }
 
-        let Some(ballot) = self.hint_ballot_for_commit(hint) else {
+        let Some(ballot) = Self::hint_ballot_for_commit(hint) else {
             return false;
         };
         if !ballot_compatible(&ballot, self.commit.as_ref().unwrap()) {
@@ -456,7 +456,7 @@ impl BallotProtocol {
 
         let mut counters = std::collections::BTreeSet::new();
         for envelope in self.latest_envelopes.values() {
-            let counter = self.statement_ballot_counter(&envelope.statement);
+            let counter = Self::statement_ballot_counter(&envelope.statement);
             if counter > local_counter {
                 counters.insert(counter);
             }
@@ -645,7 +645,7 @@ impl BallotProtocol {
         }
     }
 
-    fn hint_ballot_for_commit(&self, hint: &ScpStatement) -> Option<ScpBallot> {
+    fn hint_ballot_for_commit(hint: &ScpStatement) -> Option<ScpBallot> {
         match &hint.pledges {
             ScpStatementPledges::Prepare(prep) => {
                 if prep.n_c != 0 {
