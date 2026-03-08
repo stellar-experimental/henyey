@@ -83,7 +83,6 @@ impl std::fmt::Display for RunMode {
 /// Configuration options for the run command.
 ///
 /// Controls the running mode, synchronization behavior, and catchup policy.
-#[derive(Debug, Clone)]
 pub struct RunOptions {
     /// Running mode (full, validator, or watcher).
     pub mode: RunMode,
@@ -96,6 +95,37 @@ pub struct RunOptions {
     /// If the local ledger is more than this many ledgers behind, catchup
     /// will be triggered. Default is 300 (~25 minutes at 5s close time).
     pub max_ledger_age: u32,
+    /// Factory function for creating a load generation backend.
+    ///
+    /// When set and the `loadgen` feature is enabled, the HTTP server(s) will
+    /// expose the `/generateload` endpoint. The factory receives the `Arc<App>`
+    /// and returns a concrete `LoadGenRunner` implementation.
+    #[cfg(feature = "loadgen")]
+    pub loadgen_runner_factory: Option<crate::LoadGenRunnerFactory>,
+}
+
+impl std::fmt::Debug for RunOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunOptions")
+            .field("mode", &self.mode)
+            .field("force_catchup", &self.force_catchup)
+            .field("wait_for_sync", &self.wait_for_sync)
+            .field("max_ledger_age", &self.max_ledger_age)
+            .finish()
+    }
+}
+
+impl Clone for RunOptions {
+    fn clone(&self) -> Self {
+        Self {
+            mode: self.mode,
+            force_catchup: self.force_catchup,
+            wait_for_sync: self.wait_for_sync,
+            max_ledger_age: self.max_ledger_age,
+            #[cfg(feature = "loadgen")]
+            loadgen_runner_factory: self.loadgen_runner_factory.clone(),
+        }
+    }
 }
 
 impl Default for RunOptions {
@@ -105,6 +135,8 @@ impl Default for RunOptions {
             force_catchup: false,
             wait_for_sync: true,
             max_ledger_age: 300, // ~25 minutes of ledgers
+            #[cfg(feature = "loadgen")]
+            loadgen_runner_factory: None,
         }
     }
 }
@@ -170,7 +202,12 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
 
     // Start the HTTP status server if enabled
     let http_handle = if http_enabled {
-        let status_server = StatusServer::new(http_port, app.clone());
+        #[allow(unused_mut)]
+        let mut status_server = StatusServer::new(http_port, app.clone());
+        #[cfg(feature = "loadgen")]
+        if let Some(ref factory) = options.loadgen_runner_factory {
+            status_server.set_loadgen_runner(factory(app.clone()));
+        }
         Some(tokio::spawn(async move {
             if let Err(e) = status_server.start().await {
                 tracing::error!(error = %e, "HTTP status server error");
@@ -194,7 +231,12 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
 
     // Start the stellar-core compatibility HTTP server if enabled
     let compat_handle = if compat_http_enabled {
-        let compat_server = CompatServer::new(compat_http_port, app.clone());
+        #[allow(unused_mut)]
+        let mut compat_server = CompatServer::new(compat_http_port, app.clone());
+        #[cfg(feature = "loadgen")]
+        if let Some(ref factory) = options.loadgen_runner_factory {
+            compat_server.set_loadgen_runner(factory(app.clone()));
+        }
         Some(tokio::spawn(async move {
             if let Err(e) = compat_server.start().await {
                 tracing::error!(error = %e, "stellar-core compat HTTP server error");

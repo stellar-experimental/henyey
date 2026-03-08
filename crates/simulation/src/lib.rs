@@ -1355,7 +1355,7 @@ impl Topologies {
     }
 }
 
-fn initialize_genesis_ledger(config: &AppConfig, network_passphrase: &str) -> anyhow::Result<()> {
+pub fn initialize_genesis_ledger(config: &AppConfig, network_passphrase: &str) -> anyhow::Result<()> {
     use henyey_bucket::BucketList;
     use henyey_db::queries::{BucketListQueries, HistoryQueries, LedgerQueries, StateQueries};
     use henyey_db::schema::state_keys;

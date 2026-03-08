@@ -49,11 +49,14 @@ pub(crate) struct ServerState {
     /// ISO 8601 UTC timestamp of when the server started.
     pub started_on: String,
     pub log_handle: Option<crate::logging::LogLevelHandle>,
+    /// Load generation state (only present when `loadgen` feature is enabled).
+    #[cfg(feature = "loadgen")]
+    pub loadgen_state: Option<Arc<handlers::generateload::GenerateLoadState>>,
 }
 
 /// Build the axum router with all endpoints.
 pub(crate) fn build_router(state: Arc<ServerState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(root_handler))
         .route("/info", get(info_handler))
         .route("/status", get(status_handler))
@@ -85,8 +88,13 @@ pub(crate) fn build_router(state: Arc<ServerState>) -> Router {
         .route("/clearmetrics", post(clearmetrics_handler))
         .route("/logrotate", post(logrotate_handler))
         .route("/maintenance", post(maintenance_handler))
-        .route("/dumpproposedsettings", get(dumpproposedsettings_handler))
-        .with_state(state)
+        .route("/dumpproposedsettings", get(dumpproposedsettings_handler));
+    #[cfg(feature = "loadgen")]
+    let router = router.route(
+        "/generateload",
+        get(handlers::generateload::generateload_handler),
+    );
+    router.with_state(state)
 }
 
 /// HTTP query server for ledger entry lookups.
@@ -154,6 +162,8 @@ pub struct StatusServer {
     app: Arc<App>,
     start_time: Instant,
     log_handle: Option<crate::logging::LogLevelHandle>,
+    #[cfg(feature = "loadgen")]
+    loadgen_state: Option<Arc<handlers::generateload::GenerateLoadState>>,
 }
 
 impl StatusServer {
@@ -164,6 +174,8 @@ impl StatusServer {
             app,
             start_time: Instant::now(),
             log_handle: None,
+            #[cfg(feature = "loadgen")]
+            loadgen_state: None,
         }
     }
 
@@ -178,7 +190,20 @@ impl StatusServer {
             app,
             start_time: Instant::now(),
             log_handle: Some(log_handle),
+            #[cfg(feature = "loadgen")]
+            loadgen_state: None,
         }
+    }
+
+    /// Set the load generation backend (must be called before `start()`).
+    #[cfg(feature = "loadgen")]
+    pub fn set_loadgen_runner(
+        &mut self,
+        runner: Box<dyn handlers::generateload::LoadGenRunner>,
+    ) {
+        self.loadgen_state = Some(Arc::new(handlers::generateload::GenerateLoadState {
+            runner,
+        }));
     }
 
     /// Start the server.
@@ -189,6 +214,8 @@ impl StatusServer {
             start_time: self.start_time,
             started_on,
             log_handle: self.log_handle,
+            #[cfg(feature = "loadgen")]
+            loadgen_state: self.loadgen_state,
         });
 
         let mut shutdown_rx = state.app.subscribe_shutdown();

@@ -72,6 +72,195 @@ use henyey_app::{
     CatchupOptions, LogConfig, LogFormat, RunMode, RunOptions,
 };
 
+// ---------------------------------------------------------------------------
+// LoadGenRunner implementation (bridges henyey-simulation into henyey-app)
+// ---------------------------------------------------------------------------
+
+mod loadgen_runner {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    use henyey_app::{App, LoadGenRequest, LoadGenRunner};
+    use henyey_simulation::{GeneratedLoadConfig, LoadGenMode, LoadGenerator};
+    use tokio::sync::Mutex;
+
+    /// Shared inner state that can be referenced from spawned tasks.
+    struct Inner {
+        app: Arc<App>,
+        network_passphrase: String,
+        generator: Mutex<Option<LoadGenerator>>,
+        running: AtomicBool,
+    }
+
+    /// Concrete [`LoadGenRunner`] implementation backed by [`LoadGenerator`].
+    ///
+    /// Wraps inner state in an `Arc` so it can be shared with background tasks
+    /// spawned by `start_load`.
+    pub struct SimulationLoadGenRunner {
+        inner: Arc<Inner>,
+    }
+
+    impl SimulationLoadGenRunner {
+        pub fn new(app: Arc<App>) -> Self {
+            let network_passphrase = app.config().network.passphrase.clone();
+            Self {
+                inner: Arc::new(Inner {
+                    app,
+                    network_passphrase,
+                    generator: Mutex::new(None),
+                    running: AtomicBool::new(false),
+                }),
+            }
+        }
+
+        fn parse_mode(mode: &str) -> Option<LoadGenMode> {
+            match mode.to_lowercase().as_str() {
+                "pay" | "create" => Some(LoadGenMode::Pay),
+                "sorobanupload" => Some(LoadGenMode::SorobanUpload),
+                "sorobaninvokesetup" => Some(LoadGenMode::SorobanInvokeSetup),
+                "sorobaninvoke" => Some(LoadGenMode::SorobanInvoke),
+                "mixed" | "mixedclassicsoroban" => Some(LoadGenMode::MixedClassicSoroban),
+                _ => None,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use henyey_simulation::LoadGenMode;
+
+        #[test]
+        fn test_parse_mode_valid_modes() {
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("pay"),
+                Some(LoadGenMode::Pay)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("create"),
+                Some(LoadGenMode::Pay)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("sorobanupload"),
+                Some(LoadGenMode::SorobanUpload)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("sorobaninvokesetup"),
+                Some(LoadGenMode::SorobanInvokeSetup)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("sorobaninvoke"),
+                Some(LoadGenMode::SorobanInvoke)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("mixed"),
+                Some(LoadGenMode::MixedClassicSoroban)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("mixedclassicsoroban"),
+                Some(LoadGenMode::MixedClassicSoroban)
+            );
+        }
+
+        #[test]
+        fn test_parse_mode_case_insensitive() {
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("PAY"),
+                Some(LoadGenMode::Pay)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("SorobanUpload"),
+                Some(LoadGenMode::SorobanUpload)
+            );
+            assert_eq!(
+                SimulationLoadGenRunner::parse_mode("MIXED"),
+                Some(LoadGenMode::MixedClassicSoroban)
+            );
+        }
+
+        #[test]
+        fn test_parse_mode_invalid() {
+            assert_eq!(SimulationLoadGenRunner::parse_mode(""), None);
+            assert_eq!(SimulationLoadGenRunner::parse_mode("unknown"), None);
+            assert_eq!(SimulationLoadGenRunner::parse_mode("transfer"), None);
+        }
+    }
+
+    impl LoadGenRunner for SimulationLoadGenRunner {
+        fn start_load(&self, request: LoadGenRequest) -> Result<(), String> {
+            let mode = Self::parse_mode(&request.mode).ok_or_else(|| {
+                format!(
+                    "Unknown mode: '{}'. Use: create, pay, sorobanupload, \
+                     sorobaninvokesetup, sorobaninvoke, mixed.",
+                    request.mode
+                )
+            })?;
+
+            if self.inner.running.load(Ordering::SeqCst) {
+                return Err("Load generation is already running.".to_string());
+            }
+
+            let mut config = GeneratedLoadConfig {
+                mode,
+                n_accounts: request.accounts,
+                offset: request.offset,
+                n_txs: request.txs,
+                tx_rate: request.tx_rate,
+                max_fee_rate: if request.max_fee_rate > 0 {
+                    Some(request.max_fee_rate)
+                } else {
+                    None
+                },
+                skip_low_fee_txs: request.skip_low_fee_txs,
+                spike_interval: request.spike_interval,
+                spike_size: request.spike_size,
+                n_instances: request.instances,
+                n_wasms: request.wasms,
+                min_soroban_percent_success: request.min_percent_success,
+                ..Default::default()
+            };
+
+            let inner = Arc::clone(&self.inner);
+            inner.running.store(true, Ordering::SeqCst);
+
+            tokio::spawn(async move {
+                // Lazily create LoadGenerator or reuse existing (preserves
+                // Soroban state across setup → invoke runs).
+                let mut guard = inner.generator.lock().await;
+                if guard.is_none() {
+                    *guard = Some(LoadGenerator::new(
+                        Arc::clone(&inner.app),
+                        inner.network_passphrase.clone(),
+                    ));
+                }
+                let generator = guard.as_mut().unwrap();
+
+                let result = generator.generate_load(&mut config).await;
+
+                inner.running.store(false, Ordering::SeqCst);
+
+                match result {
+                    henyey_simulation::LoadResult::Done { submitted } => {
+                        tracing::info!(submitted, "Load generation complete");
+                    }
+                    henyey_simulation::LoadResult::Stopped => {
+                        tracing::info!("Load generation stopped");
+                    }
+                    henyey_simulation::LoadResult::Failed => {
+                        tracing::error!("Load generation failed");
+                    }
+                }
+            });
+
+            Ok(())
+        }
+
+        fn is_running(&self) -> bool {
+            self.inner.running.load(Ordering::SeqCst)
+        }
+    }
+}
+
 /// Pure Rust implementation of Stellar Core
 #[derive(Parser)]
 #[command(name = "rs-stellar-core")]
@@ -427,6 +616,28 @@ enum Commands {
         #[arg(long)]
         to: Option<u32>,
     },
+
+    /// Run apply-time load test (benchmarks raw transaction application)
+    ///
+    /// Creates a standalone node with genesis, deploys contracts, populates
+    /// the bucket list with synthetic data, and closes ledgers with maximally
+    /// filled transaction sets. Reports throughput and resource utilization.
+    ///
+    /// Matches stellar-core's `apply-load` CLI subcommand.
+    #[command(name = "apply-load")]
+    ApplyLoad {
+        /// Benchmark mode: "ledger-limits" (default) or "max-sac-tps"
+        #[arg(long, default_value = "ledger-limits")]
+        mode: String,
+
+        /// Number of benchmark ledgers to run (default: 10)
+        #[arg(long, default_value = "10")]
+        num_ledgers: u32,
+
+        /// Number of classic transactions per ledger (default: 10)
+        #[arg(long, default_value = "10")]
+        classic_txs_per_ledger: u32,
+    },
 }
 
 #[tokio::main]
@@ -571,6 +782,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::VerifyCheckpoints { output, from, to } => {
             cmd_verify_checkpoints(config, output, from, to).await
         }
+
+        Commands::ApplyLoad {
+            mode,
+            num_ledgers,
+            classic_txs_per_ledger,
+        } => cmd_apply_load(config, &mode, num_ledgers, classic_txs_per_ledger).await,
     }
 }
 
@@ -704,6 +921,9 @@ async fn cmd_run(
     let options = RunOptions {
         mode,
         force_catchup,
+        loadgen_runner_factory: Some(std::sync::Arc::new(|app| {
+            Box::new(loadgen_runner::SimulationLoadGenRunner::new(app))
+        })),
         ..Default::default()
     };
 
@@ -935,6 +1155,140 @@ fn initialize_genesis_ledger(
         bucket_list_hash = %bucket_list_hash,
         "Genesis ledger initialized with root account"
     );
+
+    Ok(())
+}
+
+/// Apply-load command handler.
+///
+/// Creates a standalone node with genesis ledger, deploys contracts,
+/// populates the bucket list with synthetic data, and closes ledgers with
+/// maximally-filled transaction sets. Reports throughput and resource
+/// utilization.
+///
+/// Matches stellar-core's `apply-load` CLI subcommand.
+async fn cmd_apply_load(
+    mut config: AppConfig,
+    mode_str: &str,
+    num_ledgers: u32,
+    classic_txs_per_ledger: u32,
+) -> anyhow::Result<()> {
+    use henyey_simulation::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode};
+
+    let mode = match mode_str {
+        "ledger-limits" => ApplyLoadMode::LimitBased,
+        "max-sac-tps" => ApplyLoadMode::MaxSacTps,
+        other => anyhow::bail!(
+            "Unknown apply-load mode '{}'. Valid modes: ledger-limits, max-sac-tps",
+            other
+        ),
+    };
+
+    // Configure for standalone benchmark operation.
+    // The node never connects to peers or runs consensus — ApplyLoad
+    // closes ledgers directly via LedgerManager.
+    config.node.manual_close = true;
+    config.node.is_validator = true;
+    config.http.enabled = false;
+    config.compat_http.enabled = false;
+
+    // Use a temporary directory for the database and buckets.
+    let data_dir = tempfile::tempdir()?;
+    config.database.path = data_dir.path().join("apply-load.db");
+    config.buckets.directory = data_dir.path().join("buckets");
+    std::fs::create_dir_all(&config.buckets.directory)?;
+
+    let network_passphrase = config.network.passphrase.clone();
+
+    // Initialize genesis ledger in the temporary database.
+    henyey_simulation::initialize_genesis_ledger(&config, &network_passphrase)?;
+
+    // Create the application.
+    let app = std::sync::Arc::new(henyey_app::App::new(config).await?);
+    app.set_self_arc().await;
+    app.bootstrap_from_db().await?;
+
+    // Build the ApplyLoad configuration.
+    let al_config = ApplyLoadConfig {
+        num_ledgers,
+        classic_txs_per_ledger,
+        ..ApplyLoadConfig::default()
+    };
+
+    println!("apply-load: mode={:?}, num_ledgers={}, classic_txs_per_ledger={}",
+        mode, num_ledgers, classic_txs_per_ledger);
+    println!();
+
+    // Construct the harness (performs full setup: accounts, contracts, bucket list).
+    println!("Setting up benchmark harness...");
+    let mut harness = ApplyLoad::new(app, al_config, mode)?;
+    println!("Setup complete.");
+    println!();
+
+    match mode {
+        ApplyLoadMode::LimitBased => {
+            println!("Running limit-based benchmark ({} ledgers)...", num_ledgers);
+            println!();
+
+            let start = std::time::Instant::now();
+            for i in 0..num_ledgers {
+                harness.benchmark()?;
+                println!("  Ledger {}/{} closed", i + 1, num_ledgers);
+            }
+            let elapsed = start.elapsed();
+
+            println!();
+            println!("=== Benchmark Results ===");
+            println!("Total time: {:.2}s", elapsed.as_secs_f64());
+            println!(
+                "Average close time: {:.2}ms",
+                elapsed.as_millis() as f64 / num_ledgers as f64
+            );
+            println!("Success rate: {:.1}%", harness.success_rate() * 100.0);
+            println!();
+            println!("Resource Utilization (mean % of limits):");
+            println!(
+                "  TX count:        {:.1}%",
+                harness.tx_count_utilization().mean() / 1000.0
+            );
+            println!(
+                "  Instructions:    {:.1}%",
+                harness.instruction_utilization().mean() / 1000.0
+            );
+            println!(
+                "  TX size:         {:.1}%",
+                harness.tx_size_utilization().mean() / 1000.0
+            );
+            println!(
+                "  Disk read bytes: {:.1}%",
+                harness.disk_read_byte_utilization().mean() / 1000.0
+            );
+            println!(
+                "  Write bytes:     {:.1}%",
+                harness.disk_write_byte_utilization().mean() / 1000.0
+            );
+            println!(
+                "  Read entries:    {:.1}%",
+                harness.disk_read_entry_utilization().mean() / 1000.0
+            );
+            println!(
+                "  Write entries:   {:.1}%",
+                harness.write_entry_utilization().mean() / 1000.0
+            );
+        }
+
+        ApplyLoadMode::MaxSacTps => {
+            println!("Searching for maximum sustainable SAC TPS...");
+            println!();
+
+            let max_tps = harness.find_max_sac_tps()?;
+
+            println!();
+            println!("=== Max SAC TPS Result ===");
+            println!("Maximum sustainable SAC payments/sec: {}", max_tps);
+            println!("Success rate: {:.1}%", harness.success_rate() * 100.0);
+        }
+    }
 
     Ok(())
 }

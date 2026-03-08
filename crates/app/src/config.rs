@@ -489,6 +489,11 @@ pub struct TestingConfig {
     /// if not explicitly set. `None` means use default (5s, or 1s if accelerated).
     #[serde(default)]
     pub ledger_close_time: Option<u32>,
+
+    /// When true, enable the `/generateload` HTTP endpoint for synthetic load
+    /// generation. Maps to `ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING`.
+    #[serde(default)]
+    pub generate_load_for_testing: bool,
 }
 
 /// Catchup behavior configuration.
@@ -658,7 +663,9 @@ pub struct BucketConfig {
     pub scan_thread_count: usize,
 }
 
-fn default_scan_thread_count() -> usize { 4 }
+fn default_scan_thread_count() -> usize {
+    4
+}
 
 impl Default for BucketConfig {
     fn default() -> Self {
@@ -1802,5 +1809,46 @@ memory_for_caching_mb = 256
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Query port"));
+    }
+
+    #[test]
+    fn test_testing_config_defaults() {
+        let config = TestingConfig::default();
+        assert!(!config.accelerate_time);
+        assert!(config.ledger_close_time.is_none());
+        assert!(!config.generate_load_for_testing);
+    }
+
+    #[test]
+    fn test_testing_config_from_toml() {
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[testing]
+accelerate_time = true
+generate_load_for_testing = true
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.testing.accelerate_time);
+        assert!(config.testing.generate_load_for_testing);
+    }
+
+    #[test]
+    fn test_testing_config_generate_load_false_by_default() {
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.testing.generate_load_for_testing);
     }
 }

@@ -36,6 +36,9 @@ pub(crate) struct CompatServerState {
     pub start_time: Instant,
     /// ISO 8601 UTC timestamp of when the server started.
     pub started_on: String,
+    /// Load generation state (only present when `loadgen` feature is enabled).
+    #[cfg(feature = "loadgen")]
+    pub loadgen_state: Option<Arc<crate::http::handlers::generateload::GenerateLoadState>>,
 }
 
 /// Build the stellar-core compatibility router.
@@ -44,7 +47,7 @@ pub(crate) struct CompatServerState {
 /// `CommandHandler` registration pattern. The `CatchPanicLayer` provides
 /// the `safeRouter` equivalent, catching panics and returning error JSON.
 pub(crate) fn build_compat_router(state: Arc<CompatServerState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/info", get(handlers::info::compat_info_handler))
         .route("/tx", get(handlers::tx::compat_tx_handler))
         .route("/peers", get(handlers::peers::compat_peers_handler))
@@ -108,8 +111,13 @@ pub(crate) fn build_compat_router(state: Arc<CompatServerState>) -> Router {
         .route(
             "/stopsurvey",
             get(handlers::plaintext::compat_stopreporting_handler),
-        )
-        .layer(
+        );
+    #[cfg(feature = "loadgen")]
+    let router = router.route(
+        "/generateload",
+        get(handlers::plaintext::compat_generateload_handler),
+    );
+    router.layer(
             ServiceBuilder::new()
                 .layer(CatchPanicLayer::custom(safe_router_panic_handler)),
         )
@@ -137,12 +145,32 @@ fn safe_router_panic_handler(
 pub struct CompatServer {
     port: u16,
     app: Arc<App>,
+    #[cfg(feature = "loadgen")]
+    loadgen_state: Option<Arc<crate::http::handlers::generateload::GenerateLoadState>>,
 }
 
 impl CompatServer {
     /// Create a new compatibility server.
     pub fn new(port: u16, app: Arc<App>) -> Self {
-        Self { port, app }
+        Self {
+            port,
+            app,
+            #[cfg(feature = "loadgen")]
+            loadgen_state: None,
+        }
+    }
+
+    /// Set the load generation backend (must be called before `start()`).
+    #[cfg(feature = "loadgen")]
+    pub fn set_loadgen_runner(
+        &mut self,
+        runner: Box<dyn crate::http::handlers::generateload::LoadGenRunner>,
+    ) {
+        self.loadgen_state = Some(Arc::new(
+            crate::http::handlers::generateload::GenerateLoadState {
+                runner,
+            },
+        ));
     }
 
     /// Start the compatibility server.
@@ -152,6 +180,8 @@ impl CompatServer {
             app: self.app.clone(),
             start_time: Instant::now(),
             started_on,
+            #[cfg(feature = "loadgen")]
+            loadgen_state: self.loadgen_state,
         });
 
         let mut shutdown_rx = self.app.subscribe_shutdown();

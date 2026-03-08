@@ -343,9 +343,17 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         // threshold from the validator count automatically.
     }
 
+    // --- Testing keys ---
+    if let Some(val) = table.get("ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING") {
+        if let Some(b) = val.as_bool() {
+            config.testing.generate_load_for_testing = b;
+        } else if let Some(s) = val.as_str() {
+            config.testing.generate_load_for_testing = s.eq_ignore_ascii_case("true");
+        }
+    }
+
     // --- Ignored keys (accepted silently for compatibility) ---
-    // UNSAFE_QUORUM, RUN_STANDALONE, FORCE_SCP, DISABLE_XDR_FSYNC,
-    // ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING, etc.
+    // UNSAFE_QUORUM, RUN_STANDALONE, FORCE_SCP, DISABLE_XDR_FSYNC, etc.
 
     Ok(config)
 }
@@ -726,6 +734,57 @@ mod tests {
         assert_eq!(config.compat_http.port, 11626);
         // ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING should now be parsed
         assert!(config.testing.accelerate_time);
+    }
+
+    #[test]
+    fn test_generate_load_for_testing_bool() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = true
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(config.testing.generate_load_for_testing);
+    }
+
+    #[test]
+    fn test_generate_load_for_testing_string() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = "true"
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(config.testing.generate_load_for_testing);
+    }
+
+    #[test]
+    fn test_generate_load_for_testing_false() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING = false
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(!config.testing.generate_load_for_testing);
+    }
+
+    #[test]
+    fn test_generate_load_for_testing_absent() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(!config.testing.generate_load_for_testing);
     }
 
     #[test]

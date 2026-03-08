@@ -76,3 +76,12 @@ pub use maintainer::{
     Maintainer, MaintenanceConfig, DEFAULT_MAINTENANCE_COUNT, DEFAULT_MAINTENANCE_PERIOD,
 };
 pub use run_cmd::{run_node, RunMode, RunOptions};
+
+// Load generation support (feature-gated).
+#[cfg(feature = "loadgen")]
+pub use http::handlers::generateload::{LoadGenRequest, LoadGenRunner};
+
+/// Factory function type for creating a [`LoadGenRunner`] from an `Arc<App>`.
+#[cfg(feature = "loadgen")]
+pub type LoadGenRunnerFactory =
+    std::sync::Arc<dyn Fn(std::sync::Arc<App>) -> Box<dyn LoadGenRunner> + Send + Sync>;

@@ -1,6 +1,8 @@
 //! HTTP handler functions for all endpoints.
 
 pub mod admin;
+#[cfg(feature = "loadgen")]
+pub mod generateload;
 pub mod info;
 pub mod metrics;
 pub mod peers;

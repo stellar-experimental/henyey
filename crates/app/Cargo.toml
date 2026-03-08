@@ -10,6 +10,10 @@ rust-version.workspace = true
 name = "henyey_app"
 path = "src/lib.rs"
 
+[features]
+default = []
+loadgen = []
+
 [dependencies]
 # Workspace crates
 henyey-common.workspace = true

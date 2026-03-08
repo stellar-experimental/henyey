@@ -415,3 +415,68 @@ fn parse_iso8601_to_unix(s: &str) -> Option<u64> {
 fn is_leap_year(y: u32) -> bool {
     (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
+
+// ── Load generation (feature-gated) ─────────────────────────────────────
+
+/// GET /generateload — compat handler using trait-object backend.
+///
+/// stellar-core returns a JSON response for generateload. We match that format,
+/// using `{"exception": "..."}` for errors (stellar-core compat convention).
+#[cfg(feature = "loadgen")]
+pub(crate) async fn compat_generateload_handler(
+    State(state): State<Arc<CompatServerState>>,
+    Query(params): Query<crate::http::types::generateload::GenerateLoadParams>,
+) -> impl IntoResponse {
+    use crate::http::handlers::generateload::LoadGenRequest;
+
+    // Gate: require generate_load_for_testing config flag
+    if !state.app.config().testing.generate_load_for_testing {
+        return Json(serde_json::json!({
+            "exception": "Set ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING=true in config to enable this endpoint."
+        }));
+    }
+
+    let loadgen_state = match &state.loadgen_state {
+        Some(s) => s,
+        None => {
+            return Json(serde_json::json!({
+                "exception": "Load generation not available."
+            }));
+        }
+    };
+
+    // Check if a run is already in progress
+    if loadgen_state.runner.is_running() {
+        return Json(serde_json::json!({
+            "exception": "Load generation is already running."
+        }));
+    }
+
+    let request = LoadGenRequest {
+        mode: params.mode.clone(),
+        accounts: params.accounts,
+        txs: params.txs,
+        tx_rate: params.txrate,
+        offset: params.offset,
+        spike_interval: params.spikeinterval,
+        spike_size: params.spikesize,
+        max_fee_rate: params.maxfeerate,
+        skip_low_fee_txs: params.skiplowfeetxs,
+        min_percent_success: params.minpercentsuccess,
+        instances: params.instances,
+        wasms: params.wasms,
+    };
+
+    match loadgen_state.runner.start_load(request) {
+        Ok(()) => Json(serde_json::json!({
+            "status": "ok",
+            "info": format!(
+                "Started {} load generation: accounts={}, txs={}, txrate={}",
+                params.mode, params.accounts, params.txs, params.txrate,
+            ),
+        })),
+        Err(e) => Json(serde_json::json!({
+            "exception": e
+        })),
+    }
+}
