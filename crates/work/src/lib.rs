@@ -913,16 +913,16 @@ impl WorkScheduler {
                     let ctx = WorkContext {
                         id,
                         attempt,
-                        cancel_token: cancel_token.clone(),
+                        cancel_token,
                     };
-                    let outcome = work.run(ctx).await;
+                    let outcome = work.run(ctx.clone()).await;
                     let _ = completion_tx
                         .send(WorkCompletion {
                             id,
                             outcome,
                             work: Some(work),
                             attempt,
-                            cancelled: cancel_token.is_cancelled(),
+                            cancelled: ctx.is_cancelled(),
                         })
                         .await;
                     debug!(work_id = id, name = %name, "work completed");
@@ -1033,13 +1033,15 @@ impl WorkScheduler {
         let Some(children) = self.dependents.get(&id) else {
             return;
         };
-        // Collect IDs to avoid holding an immutable borrow while mutating states.
-        let children: Vec<WorkId> = children.clone();
-        for child in children {
-            if matches!(self.states.get(&child), Some(WorkState::Pending)) {
-                self.states.insert(child, WorkState::Blocked);
-                self.emit_event(child, WorkState::Blocked, 0);
-            }
+        // Collect only pending IDs to avoid cloning the full dependents vec.
+        let pending: Vec<WorkId> = children
+            .iter()
+            .copied()
+            .filter(|child| matches!(self.states.get(child), Some(WorkState::Pending)))
+            .collect();
+        for child in pending {
+            self.states.insert(child, WorkState::Blocked);
+            self.emit_event(child, WorkState::Blocked, 0);
         }
     }
 
@@ -1079,21 +1081,23 @@ impl WorkScheduler {
         let cancelled = completion.cancelled
             || matches!(self.states.get(&id), Some(WorkState::Cancelled));
 
+        // Always restore the work item and record timing, regardless of outcome.
+        self.finalize_entry(id, completion.work);
+
         match completion.outcome {
             WorkOutcome::Cancelled => {
                 self.fail_or_cancel(id, WorkState::Cancelled, attempt);
-                self.finalize_entry(id, completion.work);
                 CompletionAction::None
             }
             WorkOutcome::Success => {
                 if cancelled {
                     self.fail_or_cancel(id, WorkState::Cancelled, attempt);
+                    CompletionAction::None
                 } else {
                     self.states.insert(id, WorkState::Success);
                     self.emit_event(id, WorkState::Success, attempt);
+                    CompletionAction::Done { completed_id: id }
                 }
-                self.finalize_entry(id, completion.work);
-                CompletionAction::Done { completed_id: id }
             }
             WorkOutcome::Retry { delay } => {
                 if cancelled {
@@ -1105,14 +1109,12 @@ impl WorkScheduler {
                     .get(&id)
                     .is_some_and(|e| e.retries_left == 0);
                 if no_retries {
-                    self.finalize_entry(id, completion.work);
                     self.fail_or_cancel(id, WorkState::Failed, attempt);
                     return CompletionAction::None;
                 }
                 if let Some(entry) = self.entries.get_mut(&id) {
                     entry.retries_left -= 1;
                 }
-                self.finalize_entry(id, completion.work);
                 let retry_delay = if delay == Duration::ZERO {
                     self.config.retry_delay
                 } else {
@@ -1133,7 +1135,6 @@ impl WorkScheduler {
                 if let Some(entry) = self.entries.get_mut(&id) {
                     entry.last_error = Some(err);
                 }
-                self.finalize_entry(id, completion.work);
                 self.fail_or_cancel(id, WorkState::Failed, attempt);
                 CompletionAction::None
             }
