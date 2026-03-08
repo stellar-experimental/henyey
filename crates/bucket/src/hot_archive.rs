@@ -37,7 +37,10 @@ use stellar_xdr::curr::{
 
 use henyey_common::Hash256;
 
-use crate::bucket_list::{HasNextState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
+use crate::bucket_list::{
+    bl_keep_tombstone_entries, bl_level_half, bl_level_should_spill, bl_round_down,
+    bl_should_merge_with_empty_curr, HasNextState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT,
+};
 use crate::entry::ledger_entry_to_key;
 use crate::{BucketError, Result};
 
@@ -1098,69 +1101,19 @@ impl HotArchiveBucketList {
         Ok(self.get(key)?.is_some())
     }
 
-    /// Round down helper.
-    fn round_down(value: u32, modulus: u32) -> u32 {
-        if modulus == 0 {
-            return 0;
-        }
-        value & !(modulus - 1)
-    }
-
-    /// Level half size (same formula as live bucket list).
-    fn level_half(level: usize) -> u32 {
-        1u32 << (2 * level + 1)
-    }
-
-    /// Level size (same formula as live bucket list).
-    fn level_size(level: usize) -> u32 {
-        1u32 << (2 * (level + 1))
-    }
-
     /// Returns true if a level should spill at a given ledger.
-    /// This matches stellar-core's `levelShouldSpill`:
-    ///   return (ledger == roundDown(ledger, levelHalf(level)) ||
-    ///           ledger == roundDown(ledger, levelSize(level)));
-    ///
-    /// Which simplifies to: ledger is a multiple of levelHalf(level).
-    /// For level 0 (half=2): spills at ledgers 0, 2, 4, 6, ...
-    /// For level 1 (half=8): spills at ledgers 0, 8, 16, 24, ...
-    /// For level 2 (half=32): spills at ledgers 0, 32, 64, 96, ...
     fn level_should_spill(ledger_seq: u32, level: usize) -> bool {
-        if level == HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1 {
-            // There's no level above the highest level, so it can't spill.
-            return false;
-        }
-
-        let half = Self::level_half(level);
-        let size = Self::level_size(level);
-        ledger_seq % half == 0 || ledger_seq % size == 0
+        bl_level_should_spill(ledger_seq, level, HOT_ARCHIVE_BUCKET_LIST_LEVELS)
     }
 
     /// Check if tombstone entries should be kept at a level.
     fn keep_tombstone_entries(level: usize) -> bool {
-        level < HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1
+        bl_keep_tombstone_entries(level, HOT_ARCHIVE_BUCKET_LIST_LEVELS)
     }
 
     /// Determines whether to merge with an empty curr bucket instead of the actual curr.
-    /// This happens when the level is about to snap its curr bucket - in that case,
-    /// we just propagate the snap from the previous level without merging with curr.
-    ///
-    /// Matches stellar-core's `shouldMergeWithEmptyCurr`.
     fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
-        if level == 0 {
-            // Level 0 always merges with its curr
-            return false;
-        }
-
-        // Round down to when the merge was started
-        let merge_start_ledger = Self::round_down(ledger_seq, Self::level_half(level - 1));
-
-        // Calculate when the next spill would happen
-        let next_change_ledger = merge_start_ledger + Self::level_half(level - 1);
-
-        // If the next spill would affect this level, use empty curr
-        // because curr is about to be snapped
-        Self::level_should_spill(next_change_ledger, level)
+        bl_should_merge_with_empty_curr(ledger_seq, level, HOT_ARCHIVE_BUCKET_LIST_LEVELS)
     }
 
     /// Get statistics about the bucket list.
@@ -1560,7 +1513,7 @@ impl HotArchiveBucketList {
             }
 
             // Calculate the ledger when this merge would have started
-            let merge_start_ledger = Self::round_down(ledger, Self::level_half(i - 1));
+            let merge_start_ledger = bl_round_down(ledger, bl_level_half(i - 1));
 
             tracing::debug!(
                 level = i,

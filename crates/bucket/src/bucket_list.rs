@@ -51,7 +51,6 @@ use stellar_xdr::curr::{
 };
 use tokio::sync::oneshot;
 
-use henyey_common::fs_utils::durable_rename;
 use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bucket::Bucket;
@@ -67,7 +66,7 @@ use crate::eviction::{
     StateArchivalSettings,
 };
 use crate::live_iterator::LiveEntriesIterator;
-use crate::manager::{canonical_bucket_filename, temp_merge_path};
+use crate::manager::{canonical_bucket_filename, promote_temp_to_canonical, temp_merge_path};
 use crate::merge::{
     merge_buckets_to_file, merge_buckets_to_file_with_counters,
     merge_buckets_with_options_and_shadows,
@@ -91,6 +90,87 @@ pub const BUCKET_LIST_LEVELS: usize = 11;
 pub const HAS_NEXT_STATE_CLEAR: u32 = 0;
 pub const HAS_NEXT_STATE_OUTPUT: u32 = 1;
 pub const HAS_NEXT_STATE_INPUTS: u32 = 2;
+
+// ============================================================================
+// Bucket list arithmetic helpers (shared by BucketList and HotArchiveBucketList)
+// ============================================================================
+
+/// Round down `value` to the nearest multiple of `modulus` (must be power-of-2).
+pub(crate) fn bl_round_down(value: u32, modulus: u32) -> u32 {
+    if modulus == 0 {
+        return 0;
+    }
+    value & !(modulus - 1)
+}
+
+/// Half the idealized size of a level (matches stellar-core's levelHalf).
+/// Level 0: 2, Level 1: 8, Level 2: 32, Level 3: 128, etc.
+pub(crate) fn bl_level_half(level: usize) -> u32 {
+    1u32 << (2 * level + 1)
+}
+
+/// Idealized size of a level for spill boundaries (matches stellar-core's levelSize).
+/// Level 0: 4, Level 1: 16, Level 2: 64, Level 3: 256, etc.
+pub(crate) fn bl_level_size(level: usize) -> u32 {
+    1u32 << (2 * (level + 1))
+}
+
+/// Returns true if a level should spill at a given ledger.
+///
+/// This matches stellar-core's `levelShouldSpill`:
+///   return (ledger == roundDown(ledger, levelHalf(level)) ||
+///           ledger == roundDown(ledger, levelSize(level)));
+///
+/// Which simplifies to: ledger is a multiple of levelHalf(level).
+/// For level 0 (half=2): spills at ledgers 0, 2, 4, 6, ...
+/// For level 1 (half=8): spills at ledgers 0, 8, 16, 24, ...
+/// For level 2 (half=32): spills at ledgers 0, 32, 64, 96, ...
+pub(crate) fn bl_level_should_spill(ledger_seq: u32, level: usize, num_levels: usize) -> bool {
+    if level == num_levels - 1 {
+        // There's no level above the highest level, so it can't spill.
+        return false;
+    }
+
+    let half = bl_level_half(level);
+    let size = bl_level_size(level);
+    ledger_seq % half == 0 || ledger_seq % size == 0
+}
+
+/// Returns true if tombstone (dead) entries should be kept at the given level.
+/// Tombstones are kept at all levels except the deepest, where they can be dropped
+/// because there is no deeper level for them to shadow.
+pub(crate) fn bl_keep_tombstone_entries(level: usize, num_levels: usize) -> bool {
+    level < num_levels - 1
+}
+
+/// Determines whether to merge with an empty curr bucket instead of the actual curr.
+///
+/// This is a critical piece of the bucket list merge algorithm that prevents data
+/// duplication. When a level is about to snap its curr bucket (because the next
+/// spill boundary will affect this level), we should NOT merge with curr. Instead,
+/// we merge with an empty bucket and let curr be preserved until it becomes snap.
+///
+/// Matches stellar-core's `shouldMergeWithEmptyCurr` in BucketListBase.cpp.
+pub(crate) fn bl_should_merge_with_empty_curr(
+    ledger_seq: u32,
+    level: usize,
+    num_levels: usize,
+) -> bool {
+    if level == 0 {
+        // Level 0 always merges with its curr
+        return false;
+    }
+
+    // Round down to when the merge was started
+    let merge_start_ledger = bl_round_down(ledger_seq, bl_level_half(level - 1));
+
+    // Calculate when the next spill would happen
+    let next_change_ledger = merge_start_ledger + bl_level_half(level - 1);
+
+    // If the next spill would affect this level, use empty curr
+    // because curr is about to be snapped
+    bl_level_should_spill(next_change_ledger, level, num_levels)
+}
 
 /// State of a pending bucket merge from History Archive State (HAS).
 ///
@@ -278,80 +358,12 @@ impl AsyncMergeHandle {
                             let _ = std::fs::remove_file(&temp_path);
                             Ok(Bucket::empty())
                         } else {
-                            // Rename the temp file to its permanent canonical path
-                            // ({hash}.bucket.xdr) so that restart recovery can find
-                            // it by hash. Without this rename the file stays at
-                            // merge-tmp-{pid}-{N}.xdr and is invisible to
-                            // load_last_known_ledger().
-                            let permanent_path = dir.join(canonical_bucket_filename(&hash));
-                            if !permanent_path.exists() {
-                                match durable_rename(&temp_path, &permanent_path) {
-                                    Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            error = %e,
-                                            temp = %temp_path.display(),
-                                            dest = %permanent_path.display(),
-                                            "Failed to rename merge output to permanent path, using temp path"
-                                        );
-                                        Bucket::from_xdr_file_disk_backed(&temp_path)
-                                    }
-                                }
-                            } else {
-                                // Permanent file already exists (e.g. from catchup).
-                                // Verify the file is valid before trusting it: a
-                                // previous write failure can leave a zero-byte or
-                                // truncated file at this path.  If the stored hash
-                                // does not match the expected hash, replace the file
-                                // with the freshly-computed temp file.
-                                match Bucket::from_xdr_file_disk_backed(&permanent_path) {
-                                    Ok(existing) if existing.hash() == hash => {
-                                        let _ = std::fs::remove_file(&temp_path);
-                                        Ok(existing)
-                                    }
-                                    Ok(existing) => {
-                                        tracing::warn!(
-                                            level,
-                                            expected_hash = %hash.to_hex(),
-                                            actual_hash = %existing.hash().to_hex(),
-                                            path = %permanent_path.display(),
-                                            "Permanent bucket file has wrong hash (corrupt), replacing with fresh merge output"
-                                        );
-                                        match durable_rename(&temp_path, &permanent_path) {
-                                            Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    error = %e,
-                                                    temp = %temp_path.display(),
-                                                    dest = %permanent_path.display(),
-                                                    "Failed to replace corrupt permanent file, using temp path"
-                                                );
-                                                Bucket::from_xdr_file_disk_backed(&temp_path)
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            level,
-                                            error = %e,
-                                            path = %permanent_path.display(),
-                                            "Failed to load existing permanent bucket file, replacing with fresh merge output"
-                                        );
-                                        match durable_rename(&temp_path, &permanent_path) {
-                                            Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
-                                            Err(rename_err) => {
-                                                tracing::warn!(
-                                                    error = %rename_err,
-                                                    temp = %temp_path.display(),
-                                                    dest = %permanent_path.display(),
-                                                    "Failed to replace unreadable permanent file, using temp path"
-                                                );
-                                                Bucket::from_xdr_file_disk_backed(&temp_path)
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            promote_temp_to_canonical(
+                                &temp_path,
+                                &dir,
+                                &hash,
+                                "start_merge",
+                            )
                         }
                     }
                     Err(e) => {
@@ -1070,64 +1082,7 @@ fn perform_merge(
             let _ = std::fs::remove_file(&temp_path);
             Ok(Bucket::empty())
         } else {
-            let permanent_path = dir.join(canonical_bucket_filename(&hash));
-            if !permanent_path.exists() {
-                if let Err(e) = durable_rename(&temp_path, &permanent_path) {
-                    tracing::warn!(
-                        error = %e,
-                        "Failed to rename merge output, using temp path"
-                    );
-                    Bucket::from_xdr_file_disk_backed(&temp_path)
-                } else {
-                    Bucket::from_xdr_file_disk_backed(&permanent_path)
-                }
-            } else {
-                // Permanent file already exists. Validate it before reuse: a prior
-                // partial write can leave a zero-byte/truncated file at this path.
-                match Bucket::from_xdr_file_disk_backed(&permanent_path) {
-                    Ok(existing) if existing.hash() == hash => {
-                        let _ = std::fs::remove_file(&temp_path);
-                        Ok(existing)
-                    }
-                    Ok(existing) => {
-                        tracing::warn!(
-                            expected_hash = %hash.to_hex(),
-                            actual_hash = %existing.hash().to_hex(),
-                            path = %permanent_path.display(),
-                            "perform_merge: permanent bucket file has wrong hash, replacing"
-                        );
-                        if let Err(rename_err) = durable_rename(&temp_path, &permanent_path) {
-                            tracing::warn!(
-                                error = %rename_err,
-                                temp = %temp_path.display(),
-                                dest = %permanent_path.display(),
-                                "perform_merge: failed to replace corrupt permanent file, using temp path"
-                            );
-                            Bucket::from_xdr_file_disk_backed(&temp_path)
-                        } else {
-                            Bucket::from_xdr_file_disk_backed(&permanent_path)
-                        }
-                    }
-                    Err(load_err) => {
-                        tracing::warn!(
-                            error = %load_err,
-                            path = %permanent_path.display(),
-                            "perform_merge: failed to load permanent bucket file, replacing"
-                        );
-                        if let Err(rename_err) = durable_rename(&temp_path, &permanent_path) {
-                            tracing::warn!(
-                                error = %rename_err,
-                                temp = %temp_path.display(),
-                                dest = %permanent_path.display(),
-                                "perform_merge: failed to replace unreadable permanent file, using temp path"
-                            );
-                            Bucket::from_xdr_file_disk_backed(&temp_path)
-                        } else {
-                            Bucket::from_xdr_file_disk_backed(&permanent_path)
-                        }
-                    }
-                }
-            }
+            promote_temp_to_canonical(&temp_path, dir, &hash, "perform_merge")
         }
     } else {
         merge_buckets_with_options_and_shadows(
@@ -1907,96 +1862,18 @@ impl BucketList {
         Ok(())
     }
 
-    /// Round down `value` to the nearest multiple of `modulus`.
-    fn round_down(value: u32, modulus: u32) -> u32 {
-        if modulus == 0 {
-            return 0;
-        }
-        value & !(modulus - 1)
-    }
-
-    /// Half the idealized size of a level (matches stellar-core's levelHalf).
-    /// Level 0: 2, Level 1: 8, Level 2: 32, Level 3: 128, etc.
-    fn level_half(level: usize) -> u32 {
-        1u32 << (2 * level + 1)
-    }
-
-    /// Idealized size of a level for spill boundaries (matches stellar-core's levelSize).
-    /// Level 0: 4, Level 1: 16, Level 2: 64, Level 3: 256, etc.
-    fn level_size(level: usize) -> u32 {
-        1u32 << (2 * (level + 1))
-    }
-
     /// Returns true if a level should spill at a given ledger.
-    /// This matches stellar-core's `levelShouldSpill`:
-    ///   return (ledger == roundDown(ledger, levelHalf(level)) ||
-    ///           ledger == roundDown(ledger, levelSize(level)));
-    ///
-    /// Which simplifies to: ledger is a multiple of levelHalf(level).
-    /// For level 0 (half=2): spills at ledgers 0, 2, 4, 6, ...
-    /// For level 1 (half=8): spills at ledgers 0, 8, 16, 24, ...
-    /// For level 2 (half=32): spills at ledgers 0, 32, 64, 96, ...
+    /// Delegates to [`bl_level_should_spill`].
     pub fn level_should_spill(ledger_seq: u32, level: usize) -> bool {
-        if level == BUCKET_LIST_LEVELS - 1 {
-            // There's no level above the highest level, so it can't spill.
-            return false;
-        }
-
-        let half = Self::level_half(level);
-        let size = Self::level_size(level);
-        ledger_seq % half == 0 || ledger_seq % size == 0
+        bl_level_should_spill(ledger_seq, level, BUCKET_LIST_LEVELS)
     }
 
     fn keep_tombstone_entries(level: usize) -> bool {
-        level < BUCKET_LIST_LEVELS - 1
+        bl_keep_tombstone_entries(level, BUCKET_LIST_LEVELS)
     }
 
-    /// Determines whether to merge with an empty curr bucket instead of the actual curr.
-    ///
-    /// This is a critical piece of the bucket list merge algorithm that prevents data
-    /// duplication. When a level is about to snap its curr bucket (because the next
-    /// spill boundary will affect this level), we should NOT merge with curr. Instead,
-    /// we merge with an empty bucket and let curr be preserved until it becomes snap.
-    ///
-    /// # Why This Matters
-    ///
-    /// Consider level 1 (half=8, size=16):
-    /// - At ledger 6: Level 0 spills, level 1 receives data. But ledger 8 is when
-    ///   level 1 itself will spill. If we merge with curr at ledger 6, and then at
-    ///   ledger 8 curr becomes snap, we'd have duplicated the data in curr.
-    /// - Solution: At ledger 6, we merge with empty instead of curr. Curr stays
-    ///   unchanged. At ledger 8, curr becomes snap (preserving its entries), and
-    ///   the merge result from ledger 6 becomes the new curr.
-    ///
-    /// # Algorithm
-    ///
-    /// 1. Calculate when the merge was started: `roundDown(ledger, levelHalf(level-1))`
-    /// 2. Calculate when the next change would happen: `mergeStart + levelHalf(level-1)`
-    /// 3. If the next change would cause this level to spill, use empty curr
-    ///
-    /// # Synchronous vs Asynchronous
-    ///
-    /// In stellar-core, merges are asynchronous and the result stays in `mNextCurr`
-    /// until committed. In our synchronous implementation, the result goes into `next`
-    /// and we check `next` during lookups to make entries accessible. The key invariant
-    /// is that `curr` is preserved until the level snaps.
-    ///
-    /// Matches stellar-core's `shouldMergeWithEmptyCurr` in BucketListBase.cpp.
     fn should_merge_with_empty_curr(ledger_seq: u32, level: usize) -> bool {
-        if level == 0 {
-            // Level 0 always merges with its curr
-            return false;
-        }
-
-        // Round down to when the merge was started
-        let merge_start_ledger = Self::round_down(ledger_seq, Self::level_half(level - 1));
-
-        // Calculate when the next spill would happen
-        let next_change_ledger = merge_start_ledger + Self::level_half(level - 1);
-
-        // If the next spill would affect this level, use empty curr
-        // because curr is about to be snapped
-        Self::level_should_spill(next_change_ledger, level)
+        bl_should_merge_with_empty_curr(ledger_seq, level, BUCKET_LIST_LEVELS)
     }
 
     /// Get all hashes in the bucket list (for serialization).
@@ -2576,7 +2453,7 @@ impl BucketList {
 
             // Calculate the ledger when this merge would have started
             // This is roundDown(ledger, levelHalf(i - 1))
-            let merge_start_ledger = Self::round_down(ledger, Self::level_half(i - 1));
+            let merge_start_ledger = bl_round_down(ledger, bl_level_half(i - 1));
 
             tracing::debug!(
                 level = i,
@@ -3271,14 +3148,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_level_sizes() {
-        assert_eq!(BucketList::level_size(0), 4);
-        assert_eq!(BucketList::level_size(1), 16);
-        assert_eq!(BucketList::level_size(2), 64);
-        assert_eq!(BucketList::level_size(3), 256);
-        assert_eq!(BucketList::level_half(0), 2);
-        assert_eq!(BucketList::level_half(1), 8);
-        assert_eq!(BucketList::level_half(2), 32);
-        assert_eq!(BucketList::level_half(3), 128);
+        assert_eq!(bl_level_size(0), 4);
+        assert_eq!(bl_level_size(1), 16);
+        assert_eq!(bl_level_size(2), 64);
+        assert_eq!(bl_level_size(3), 256);
+        assert_eq!(bl_level_half(0), 2);
+        assert_eq!(bl_level_half(1), 8);
+        assert_eq!(bl_level_half(2), 32);
+        assert_eq!(bl_level_half(3), 128);
     }
 
     #[tokio::test(flavor = "multi_thread")]

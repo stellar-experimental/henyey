@@ -79,6 +79,88 @@ pub(crate) fn temp_merge_path(bucket_dir: &Path) -> PathBuf {
     ))
 }
 
+/// Promote a temporary merge output file to its permanent canonical path.
+///
+/// Given a `temp_path` containing a freshly-merged bucket and the expected
+/// `hash`, this function attempts to place the file at `{dir}/{hash}.bucket.xdr`.
+///
+/// - If no file exists at the permanent path, renames temp → permanent.
+/// - If a file already exists, validates its hash. If valid, removes temp.
+///   If corrupt/unreadable, replaces it with the temp file.
+/// - Returns a disk-backed `Bucket` pointing to the final file location.
+///
+/// This is used by `AsyncMergeHandle::start_merge`, `perform_merge`, and
+/// `BucketManager::merge` to avoid duplicating the same promote-and-validate
+/// logic.
+pub(crate) fn promote_temp_to_canonical(
+    temp_path: &Path,
+    dir: &Path,
+    hash: &Hash256,
+    label: &str,
+) -> crate::Result<Bucket> {
+    let permanent_path = dir.join(canonical_bucket_filename(hash));
+    if !permanent_path.exists() {
+        match durable_rename(temp_path, &permanent_path) {
+            Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    temp = %temp_path.display(),
+                    dest = %permanent_path.display(),
+                    "{label}: failed to rename merge output to permanent path, using temp path"
+                );
+                Bucket::from_xdr_file_disk_backed(temp_path)
+            }
+        }
+    } else {
+        match Bucket::from_xdr_file_disk_backed(&permanent_path) {
+            Ok(existing) if existing.hash() == *hash => {
+                let _ = std::fs::remove_file(temp_path);
+                Ok(existing)
+            }
+            Ok(existing) => {
+                tracing::warn!(
+                    expected_hash = %hash.to_hex(),
+                    actual_hash = %existing.hash().to_hex(),
+                    path = %permanent_path.display(),
+                    "{label}: permanent bucket file has wrong hash, replacing"
+                );
+                match durable_rename(temp_path, &permanent_path) {
+                    Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            temp = %temp_path.display(),
+                            dest = %permanent_path.display(),
+                            "{label}: failed to replace corrupt permanent file, using temp path"
+                        );
+                        Bucket::from_xdr_file_disk_backed(temp_path)
+                    }
+                }
+            }
+            Err(load_err) => {
+                tracing::warn!(
+                    error = %load_err,
+                    path = %permanent_path.display(),
+                    "{label}: failed to load permanent bucket file, replacing"
+                );
+                match durable_rename(temp_path, &permanent_path) {
+                    Ok(()) => Bucket::from_xdr_file_disk_backed(&permanent_path),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            temp = %temp_path.display(),
+                            dest = %permanent_path.display(),
+                            "{label}: failed to replace unreadable permanent file, using temp path"
+                        );
+                        Bucket::from_xdr_file_disk_backed(temp_path)
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Manager for bucket files on disk.
 ///
 /// The `BucketManager` provides the main interface for working with buckets
@@ -451,53 +533,13 @@ impl BucketManager {
             }
         }
 
-        // Move to final canonical path
-        let final_path = self.bucket_path(&hash);
-        if !final_path.exists() {
-            durable_rename(&temp_path, &final_path)?;
-        } else {
-            // Canonical file already exists. Validate it before reuse: a prior
-            // partial write can leave a zero-byte/truncated file at this path.
-            match Bucket::from_xdr_file_disk_backed(&final_path) {
-                Ok(existing) if existing.hash() == hash => {
-                    let _ = std::fs::remove_file(&temp_path);
-                }
-                Ok(existing) => {
-                    tracing::warn!(
-                        expected_hash = %hash.to_hex(),
-                        actual_hash = %existing.hash().to_hex(),
-                        path = %final_path.display(),
-                        "merge: canonical bucket file has wrong hash, replacing"
-                    );
-                    if let Err(rename_err) = durable_rename(&temp_path, &final_path) {
-                        tracing::warn!(
-                            error = %rename_err,
-                            temp = %temp_path.display(),
-                            dest = %final_path.display(),
-                            "merge: failed to replace corrupt canonical file, using existing"
-                        );
-                    }
-                }
-                Err(load_err) => {
-                    tracing::warn!(
-                        error = %load_err,
-                        path = %final_path.display(),
-                        "merge: failed to load canonical bucket file, replacing"
-                    );
-                    if let Err(rename_err) = durable_rename(&temp_path, &final_path) {
-                        tracing::warn!(
-                            error = %rename_err,
-                            temp = %temp_path.display(),
-                            dest = %final_path.display(),
-                            "merge: failed to replace unreadable canonical file, using existing"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Load as DiskBacked (builds index, O(index_size) memory)
-        let bucket = Bucket::from_xdr_file_disk_backed(&final_path)?;
+        // Promote temp file to canonical path and load as disk-backed bucket
+        let bucket = promote_temp_to_canonical(
+            &temp_path,
+            &self.bucket_dir,
+            &hash,
+            "BucketManager::merge",
+        )?;
 
         // Persist the index for next time (only for DiskIndex, not InMemoryIndex)
         if let Some(crate::index::LiveBucketIndex::Disk(ref disk_idx)) = bucket.live_index() {
