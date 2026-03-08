@@ -303,13 +303,7 @@ impl QueuedTransaction {
     }
 
     fn sequence_number(&self) -> i64 {
-        match &self.envelope {
-            TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
-            TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
-            TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
-            },
-        }
+        envelope_seq_num(&self.envelope)
     }
 
     pub(crate) fn account_key(&self) -> Vec<u8> {
@@ -324,13 +318,6 @@ impl QueuedTransaction {
     fn is_better_than(&self, other: &QueuedTransaction) -> bool {
         better_fee_ratio(self, other)
     }
-}
-
-/// A transaction wrapper for per-account tracking.
-#[derive(Debug, Clone)]
-pub struct TimestampedTx {
-    /// The queued transaction.
-    pub tx: QueuedTransaction,
 }
 
 /// Per-account state in the transaction queue.
@@ -354,7 +341,7 @@ pub struct AccountState {
     pub age: u32,
     /// The single pending transaction for which this account is the sequence-number-source.
     /// stellar-core enforces one transaction per account (non-fee-bump) in the queue.
-    pub transaction: Option<TimestampedTx>,
+    pub transaction: Option<QueuedTransaction>,
 }
 
 impl AccountState {
@@ -475,8 +462,9 @@ pub(super) struct SelectedTxs {
     pub(super) classic_limited: bool,
 }
 
-fn account_key(envelope: &TransactionEnvelope) -> Vec<u8> {
-    let source = match envelope {
+/// Get the source account (inner for fee-bump) as a MuxedAccount.
+fn source_account_from_envelope(envelope: &TransactionEnvelope) -> stellar_xdr::curr::MuxedAccount {
+    match envelope {
         TransactionEnvelope::TxV0(env) => {
             stellar_xdr::curr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
         }
@@ -486,8 +474,11 @@ fn account_key(envelope: &TransactionEnvelope) -> Vec<u8> {
                 inner.tx.source_account.clone()
             }
         },
-    };
-    let account_id = henyey_tx::muxed_to_account_id(&source);
+    }
+}
+
+fn account_key(envelope: &TransactionEnvelope) -> Vec<u8> {
+    let account_id = henyey_tx::muxed_to_account_id(&source_account_from_envelope(envelope));
     account_id
         .to_xdr(stellar_xdr::curr::Limits::none())
         .unwrap_or_default()
@@ -500,18 +491,7 @@ pub(crate) fn account_key_from_account_id(account_id: &AccountId) -> Vec<u8> {
 }
 
 fn account_id_from_envelope(envelope: &TransactionEnvelope) -> AccountId {
-    let source = match envelope {
-        TransactionEnvelope::TxV0(env) => {
-            stellar_xdr::curr::MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
-        }
-        TransactionEnvelope::Tx(env) => env.tx.source_account.clone(),
-        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                inner.tx.source_account.clone()
-            }
-        },
-    };
-    henyey_tx::muxed_to_account_id(&source)
+    henyey_tx::muxed_to_account_id(&source_account_from_envelope(envelope))
 }
 
 /// Get the fee-source account key (for fee bump, this is the outer source; otherwise same as inner).
@@ -589,8 +569,6 @@ pub struct TransactionQueue {
     /// Each set represents one ledger's worth of banned transactions.
     /// The front is the oldest, the back is the newest.
     banned_transactions: RwLock<std::collections::VecDeque<HashSet<Hash256>>>,
-    /// Depth of the ban deque (number of ledgers transactions stay banned).
-    _ban_depth: u32,
     /// Per-account state tracking for one-tx-per-account limit.
     /// Key is the XDR-encoded AccountId bytes.
     account_states: RwLock<HashMap<Vec<u8>, AccountState>>,
@@ -644,7 +622,6 @@ impl TransactionQueue {
             soroban_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
             global_evicted_inclusion_fee: RwLock::new((0, 0)),
             banned_transactions: RwLock::new(banned),
-            _ban_depth: ban_depth,
             account_states: RwLock::new(HashMap::new()),
             pending_depth,
             fee_balance_provider: RwLock::new(None),
@@ -887,9 +864,7 @@ impl TransactionQueue {
     ) -> std::result::Result<Option<QueuedTransaction>, TxQueueResult> {
         let account_states = self.account_states.read();
         if let Some(state) = account_states.get(seq_source_key) {
-            if let Some(ref timestamped) = state.transaction {
-                let current_tx = &timestamped.tx;
-
+            if let Some(ref current_tx) = state.transaction {
                 if current_tx.hash == queued.hash {
                     return Err(TxQueueResult::Duplicate);
                 }
@@ -1360,7 +1335,7 @@ impl TransactionQueue {
                 new_fee as i64
             };
 
-            seq_state.transaction = Some(TimestampedTx { tx: queued.clone() });
+            seq_state.transaction = Some(queued.clone());
 
             // Update the fee-source account state (tracks total_fees)
             // Note: seq_source and fee_source may be the same account
@@ -1552,17 +1527,17 @@ impl TransactionQueue {
 
             // Process sequence-source account
             if let Some(state) = account_states.get_mut(&seq_source_key) {
-                if let Some(ref timestamped) = state.transaction {
+                if let Some(ref queued_tx) = state.transaction {
                     // Drop if queued tx has seq <= applied seq
-                    if timestamped.tx.sequence_number() <= *applied_seq {
+                    if queued_tx.sequence_number() <= *applied_seq {
                         // Remove from by_hash
-                        by_hash.remove(&timestamped.tx.hash);
+                        by_hash.remove(&queued_tx.hash);
 
                         // Collect fee release info
-                        let tx_fee = timestamped.tx.total_fee as i64;
+                        let tx_fee = queued_tx.total_fee as i64;
                         let tx_fee_source_id = henyey_tx::muxed_to_account_id(
                             &henyey_tx::TransactionFrame::with_network(
-                                timestamped.tx.envelope.clone(),
+                                queued_tx.envelope.clone(),
                                 self.config.network_id,
                             )
                             .fee_source_account(),
@@ -1641,17 +1616,17 @@ impl TransactionQueue {
 
                 // Auto-ban at pending_depth
                 if state.age >= self.pending_depth {
-                    if let Some(ref timestamped) = state.transaction {
+                    if let Some(ref queued_tx) = state.transaction {
                         // Add to banned set
                         if let Some(newest) = banned.back_mut() {
-                            newest.insert(timestamped.tx.hash);
+                            newest.insert(queued_tx.hash);
                         }
                         // Remove from by_hash
-                        by_hash.remove(&timestamped.tx.hash);
+                        by_hash.remove(&queued_tx.hash);
 
                         // Track fee release for the fee-source account
-                        let tx_fee_source_key = fee_source_key(&timestamped.tx.envelope);
-                        fee_releases.push((tx_fee_source_key, timestamped.tx.total_fee));
+                        let tx_fee_source_key = fee_source_key(&queued_tx.envelope);
+                        fee_releases.push((tx_fee_source_key, queued_tx.total_fee));
 
                         evicted_due_to_age += 1;
                     }
@@ -4650,7 +4625,12 @@ mod pending_depth_tests {
                 "Shift {} should not evict (age {} < pending_depth 4)",
                 i, i
             );
-            assert_eq!(queue.len(), 1, "TX should still be in queue after shift {}", i);
+            assert_eq!(
+                queue.len(),
+                1,
+                "TX should still be in queue after shift {}",
+                i
+            );
         }
 
         // TX should not be banned
@@ -4673,7 +4653,10 @@ mod pending_depth_tests {
             queue.shift();
         }
         let result = queue.shift();
-        assert_eq!(result.evicted_due_to_age, 1, "4th shift should auto-ban the TX");
+        assert_eq!(
+            result.evicted_due_to_age, 1,
+            "4th shift should auto-ban the TX"
+        );
         assert_eq!(queue.len(), 0, "Queue should be empty after auto-ban");
 
         // TX should be banned

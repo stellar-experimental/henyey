@@ -44,6 +44,23 @@ use crate::error::HerderError;
 use crate::tx_queue::TransactionSet;
 use crate::Result;
 
+/// Format a `StellarValueExt` for logging.
+fn describe_stellar_value_ext(ext: &StellarValueExt) -> String {
+    match ext {
+        StellarValueExt::Basic => "Basic".to_string(),
+        StellarValueExt::Signed(sig) => {
+            let node_id_bytes = match &sig.node_id.0 {
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
+            };
+            format!(
+                "Signed(node_id={}, sig_len={})",
+                Hash256::from_bytes(node_id_bytes).to_hex(),
+                sig.signature.len()
+            )
+        }
+    }
+}
+
 /// Result of validating an SCP value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValueValidation {
@@ -1260,15 +1277,7 @@ impl ScpDriver {
         tx_set
             .transactions
             .iter()
-            .map(|env| match env {
-                stellar_xdr::curr::TransactionEnvelope::TxV0(e) => e.tx.operations.len(),
-                stellar_xdr::curr::TransactionEnvelope::Tx(e) => e.tx.operations.len(),
-                stellar_xdr::curr::TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                        inner.tx.operations.len()
-                    }
-                },
-            })
+            .map(|env| Self::envelope_num_ops(env))
             .sum()
     }
 
@@ -1330,11 +1339,7 @@ impl ScpDriver {
         tx_set
             .transactions
             .iter()
-            .map(|env| match env {
-                stellar_xdr::curr::TransactionEnvelope::TxV0(e) => e.tx.fee as i64,
-                stellar_xdr::curr::TransactionEnvelope::Tx(e) => e.tx.fee as i64,
-                stellar_xdr::curr::TransactionEnvelope::TxFeeBump(e) => e.tx.fee,
-            })
+            .map(|env| Self::envelope_fee(env))
             .sum()
     }
 
@@ -1443,19 +1448,7 @@ impl ScpDriver {
         // Parse the StellarValue and extract stellar_value_ext for logging
         let (tx_set_hash, close_time, stellar_value_ext_desc) =
             if let Ok(sv) = StellarValue::from_xdr(&value, stellar_xdr::curr::Limits::none()) {
-                let ext_desc = match &sv.ext {
-                    stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
-                    stellar_xdr::curr::StellarValueExt::Signed(sig) => {
-                        let node_id_bytes = match &sig.node_id.0 {
-                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
-                        };
-                        format!(
-                            "Signed(node_id={}, sig_len={})",
-                            Hash256::from_bytes(node_id_bytes).to_hex(),
-                            sig.signature.len()
-                        )
-                    }
-                };
+                let ext_desc = describe_stellar_value_ext(&sv.ext);
                 (
                     Some(Hash256::from_bytes(sv.tx_set_hash.0)),
                     sv.close_time.0,
@@ -1474,21 +1467,7 @@ impl ScpDriver {
                     let old_ext_desc = if let Ok(old_sv) =
                         StellarValue::from_xdr(&old.value, stellar_xdr::curr::Limits::none())
                     {
-                        match &old_sv.ext {
-                            stellar_xdr::curr::StellarValueExt::Basic => "Basic".to_string(),
-                            stellar_xdr::curr::StellarValueExt::Signed(sig) => {
-                                let node_id_bytes = match &sig.node_id.0 {
-                                    stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
-                                        key.0
-                                    }
-                                };
-                                format!(
-                                    "Signed(node_id={}, sig_len={})",
-                                    Hash256::from_bytes(node_id_bytes).to_hex(),
-                                    sig.signature.len()
-                                )
-                            }
-                        }
+                        describe_stellar_value_ext(&old_sv.ext)
                     } else {
                         "Unknown".to_string()
                     };
