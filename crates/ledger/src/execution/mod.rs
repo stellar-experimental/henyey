@@ -2629,6 +2629,9 @@ impl TransactionExecutor {
             all_success = false;
             failure = Some(preflight_failure);
         } else if all_success {
+            // Clone memo once before the loop — it's constant for the entire TX.
+            let tx_memo = frame.memo().clone();
+
             for (op_index, op) in frame.operations().iter().enumerate() {
                 let op_type = OperationType::from_body(&op.body);
 
@@ -2673,7 +2676,7 @@ impl TransactionExecutor {
                     op_type.is_soroban(),
                     self.protocol_version,
                     self.network_id,
-                    frame.memo().clone(),
+                    tx_memo.clone(),
                     self.classic_events,
                 );
 
@@ -2699,7 +2702,7 @@ impl TransactionExecutor {
                 );
 
                 match result {
-                    Ok(op_exec) => {
+                    Ok(mut op_exec) => {
                         self.state.flush_modified_entries();
                         let mut op_result = op_exec.result;
 
@@ -2946,11 +2949,14 @@ impl TransactionExecutor {
 
                         let mut op_events_final = Vec::new();
                         if all_success && is_operation_success(&op_result) {
-                            if let Some(meta) = &op_exec.soroban_meta {
-                                op_event_manager.set_events(meta.events.clone());
-                                diagnostic_events.extend(meta.diagnostic_events.iter().cloned());
-                                soroban_return_value =
-                                    meta.return_value.clone().or(soroban_return_value);
+                            if let Some(meta) = op_exec.soroban_meta.as_mut() {
+                                op_event_manager
+                                    .set_events(std::mem::take(&mut meta.events));
+                                diagnostic_events.extend(
+                                    std::mem::take(&mut meta.diagnostic_events),
+                                );
+                                soroban_return_value = std::mem::take(&mut meta.return_value)
+                                    .or(soroban_return_value);
                             }
 
                             if !op_type.is_soroban() {
@@ -3703,29 +3709,33 @@ impl<'a> DeltaSlice<'a> {
     pub fn change_order(&self) -> Vec<henyey_tx::ChangeRef> {
         self.delta.change_order()[self.start.change_order..self.end.change_order]
             .iter()
-            .filter_map(|change_ref| {
-                match change_ref {
-                    henyey_tx::ChangeRef::Created(idx) => {
-                        if *idx >= self.start.created && *idx < self.end.created {
-                            Some(henyey_tx::ChangeRef::Created(*idx - self.start.created))
-                        } else {
-                            None
-                        }
-                    }
-                    henyey_tx::ChangeRef::Updated(idx) => {
-                        if *idx >= self.start.updated && *idx < self.end.updated {
-                            Some(henyey_tx::ChangeRef::Updated(*idx - self.start.updated))
-                        } else {
-                            None
-                        }
-                    }
-                    henyey_tx::ChangeRef::Deleted(idx) => {
-                        if *idx >= self.start.deleted && *idx < self.end.deleted {
-                            Some(henyey_tx::ChangeRef::Deleted(*idx - self.start.deleted))
-                        } else {
-                            None
-                        }
-                    }
+            .map(|change_ref| match change_ref {
+                henyey_tx::ChangeRef::Created(idx) => {
+                    debug_assert!(
+                        *idx >= self.start.created && *idx < self.end.created,
+                        "ChangeRef::Created({idx}) outside slice range [{}..{})",
+                        self.start.created,
+                        self.end.created
+                    );
+                    henyey_tx::ChangeRef::Created(*idx - self.start.created)
+                }
+                henyey_tx::ChangeRef::Updated(idx) => {
+                    debug_assert!(
+                        *idx >= self.start.updated && *idx < self.end.updated,
+                        "ChangeRef::Updated({idx}) outside slice range [{}..{})",
+                        self.start.updated,
+                        self.end.updated
+                    );
+                    henyey_tx::ChangeRef::Updated(*idx - self.start.updated)
+                }
+                henyey_tx::ChangeRef::Deleted(idx) => {
+                    debug_assert!(
+                        *idx >= self.start.deleted && *idx < self.end.deleted,
+                        "ChangeRef::Deleted({idx}) outside slice range [{}..{})",
+                        self.start.deleted,
+                        self.end.deleted
+                    );
+                    henyey_tx::ChangeRef::Deleted(*idx - self.start.deleted)
                 }
             })
             .collect()

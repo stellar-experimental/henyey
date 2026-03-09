@@ -3807,3 +3807,102 @@ fn test_pre_charged_fee_override_on_validation_failure() {
         "XDR fee_charged must equal the pre-charged fee"
     );
 }
+
+/// Regression test for the single-op savepoint skip optimization.
+///
+/// When a transaction has exactly one operation, the per-operation savepoint is
+/// skipped (since TX-level rollback handles cleanup). This test verifies that a
+/// single-op classic TX whose operation fails at execution time (not validation)
+/// correctly rolls back all state changes: the source account's balance should
+/// only reflect the fee deduction, and the destination should not exist.
+#[test]
+fn test_single_op_tx_failure_rolls_back_without_per_op_savepoint() {
+    let secret = SecretKey::from_seed(&[50u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+
+    let initial_balance: i64 = 20_000_000; // > 2 * base_reserve (5_000_000) + fee
+    let fee: u32 = 100;
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, initial_balance);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .expect("add entry")
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    // Single-op TX: Payment to a non-existent destination.
+    // This will fail at execution time with PAYMENT_NO_DESTINATION (not a
+    // precondition failure), exercising the code path where num_ops == 1 and
+    // the per-operation savepoint is None.
+    let nonexistent_dest = MuxedAccount::Ed25519(Uint256([99u8; 32]));
+    let op_payment = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: nonexistent_dest,
+            asset: Asset::Native,
+            amount: 1_000_000,
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![op_payment].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let classic_events = ClassicEventConfig {
+        emit_classic_events: true,
+        backfill_stellar_asset_events: false,
+    };
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        classic_events,
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    // TX should fail at the operation level.
+    assert!(!result.success);
+    assert_eq!(result.failure, Some(ExecutionFailure::OperationFailed));
+
+    // Source account: balance should reflect ONLY the fee deduction.
+    // The payment amount must NOT have been deducted (rolled back by TX-level rollback).
+    let source = executor
+        .state()
+        .get_account(&source_id)
+        .expect("source account must exist");
+    assert_eq!(
+        source.balance,
+        initial_balance - i64::from(fee),
+        "source balance should be initial minus fee only"
+    );
+
+    // Sequence number should be bumped even for failed TXs.
+    assert_eq!(source.seq_num.0, 2, "sequence number should be bumped to 2");
+
+    // The destination should not exist (payment was rolled back).
+    let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([99u8; 32])));
+    assert!(
+        executor.state().get_account(&dest_id).is_none(),
+        "destination account must not exist after rollback"
+    );
+}
