@@ -112,55 +112,49 @@ bottleneck. The profiling done after this step revealed the true cost structure
 
 ---
 
-### Step 2: Fast-Path Single-Op Soroban TXs (Expected: −30 to −50ms)
+### Step 2: Incremental Mutation Tracking ✅ DONE (below expectations)
 
-**Problem**: Every Soroban TX executes exactly 1 operation (InvokeHostFunction),
-but the per-operation bookkeeping loop treats it identically to multi-op classic
-TXs. This adds ~480μs of overhead per TX:
+**Commit**: `b74e111` | **Result**: −3.5ms (303.6ms)
 
-1. `delta_snapshot()` before op — clones delta state (~50-100μs)
-2. `begin_op_snapshot()` — sets up operation-level state tracking
-3. `load_operation_accounts()` — loads per-op source accounts from snapshot
-4. `create_savepoint()` — creates rollback savepoint
-5. (actual operation execution — already measured separately)
-6. `flush_modified_entries()` — synchronizes state
-7. `delta_snapshot()` after op — clones delta state again
-8. `delta_changes_between()` — diffs the two snapshots
-9. `end_op_snapshot()` — extracts per-op state snapshots
-10. Entry change building with state overrides
+Two sub-optimizations targeting per-op bookkeeping:
 
-For a single-op TX, the "operation-level changes" are identical to the
-"transaction-level changes". The before/after delta snapshots, the change diffing,
-and the savepoint (which is never rolled back for a 1-op TX) are all redundant.
+**A) Zero-copy DeltaSlice**: Replaced `DeltaChanges` (5 owned `Vec`s cloned per
+call via `.to_vec()`) with `DeltaSlice<'a>` holding range indices into the parent
+`LedgerDelta`, returning `&[T]` slices on demand. Eliminates allocations at the
+2 hot-path call sites (fee charging, per-op loop).
 
-**How stellar-core handles it**: In `doApply()`, single-op TXs take essentially
-the same path, but `LedgerTxn` is a lightweight stack-of-overlays — pushing/popping
-an overlay is O(1). The cost difference is that our delta snapshot cloning is O(n)
-where n = number of modified entries.
+**B) Skip savepoint for single-op TXs**: For TXs with exactly 1 operation (all
+Soroban, many classic), skip `create_savepoint()` since TX-level rollback handles
+failures. Guarded `rollback_to_savepoint()` with `Option`.
 
-**Solution**: Detect single-op Soroban TXs early and bypass the per-operation
-bookkeeping loop. Instead:
-- Skip `delta_snapshot()` before/after — derive operation changes directly from
-  the transaction-level delta
-- Skip `create_savepoint()` — single-op success/failure maps to TX success/failure
-- Skip `begin_op_snapshot()` / `end_op_snapshot()` — use TX-level state directly
-- Skip `delta_changes_between()` — the TX delta IS the op delta
+**Why it underperformed** (original estimate: −30 to −50ms):
 
-This is a code-path optimization, not a behavioral change. The resulting metadata
-must be identical.
+Targeted profiling with per-call instrumentation revealed the original sampled
+profiling grossly overestimated costs:
 
-**Files to modify**:
-- `crates/ledger/src/execution/mod.rs` — add fast-path in `execute_single_transaction`
-  for `frame.operations().len() == 1 && op_type.is_soroban()`
+| Operation | Estimated per-call | Actual per-call (Soroban) | Actual per-call (classic) |
+|-----------|-------------------|--------------------------|--------------------------|
+| `create_savepoint()` | 100-150μs | **~2μs** | 30-120μs |
+| `delta_changes_between()` | 30-50μs | **<1μs** | varies |
 
-**Constraints**:
-- Output metadata (tx_changes_before, operation changes, events) must be byte-identical
-- Rollback behavior for failed operations must be preserved
-- The fee_seq changes (fee deduction, seq bump, signer removal) happen BEFORE the
-  op loop and are unaffected
+Root cause: Soroban TXs have tiny state (few modified entries) → savepoint clones
+near-empty maps, `.to_vec()` copies 1-3 element vectors. The 480μs/TX estimate from
+sampling profiler was primarily attributable to `build_entry_changes_with_hot_archive`
+(60-100μs/TX, 15-25ms/ledger), not to delta cloning or savepoints.
 
-**Benchmark gate**: Run benchmark protocol. Expected: mean ≤ 267ms (−30 to −50ms
-from Step 1). If improvement < 15ms, investigate.
+Per-ledger phase breakdown (busy ledger, ~250 TXs, ~200 Soroban):
+
+| Phase | Per-ledger cost |
+|-------|----------------|
+| `create_savepoint` (Soroban, skippable) | 0.3-1.0ms |
+| `create_savepoint` (classic, required) | 2-5ms |
+| `flush_modified_entries` | 0.3-0.8ms |
+| `change_order` alloc | ~0ms |
+| `build_entry_changes_with_hot_archive` | **15-25ms** |
+
+The changes are correct and harmless but deliver only ~3.5ms of the estimated
+30-50ms. The real per-op bookkeeping bottleneck is meta construction
+(`build_entry_changes_with_hot_archive`).
 
 ---
 
@@ -280,7 +274,7 @@ For each step:
 |------|--------|------|-------------|-----------------|-------|
 | Baseline | `bd8f3f7` | 317.5ms | — | — | |
 | 1: TTL key hash caching | `a1db12f` | 307.1ms | −10.4ms | −10.4ms | SHA-256 was <1μs/call |
-| 2: Fast-path single-op | | | | | |
+| 2: Incremental mutation tracking | `b74e111` | 303.6ms | −3.5ms | −13.9ms | Savepoint ~2μs for Soroban (not 100-150μs) |
 | 3: Offer/non-offer maps | | | | | |
 | 4: Unified TX set parsing | | | | | |
 | 5: Streamline fee_seq | | | | | |
@@ -294,19 +288,22 @@ For each step:
 |------|--------------|------------|----------------------|
 | Baseline | — | 317.5ms | 1.88x |
 | 1: TTL key hash caching | −10ms | 307ms | 1.82x |
-| 2: Fast-path single-op | −30 to −50ms | 257–277ms | 1.53–1.64x |
-| 3: Offer/non-offer maps | −8 to −10ms | 247–269ms | 1.47–1.60x |
-| 4: Unified TX set parsing | −10 to −15ms | 232–259ms | 1.38–1.54x |
-| 5: Streamline fee_seq | −5 to −10ms | 222–254ms | 1.32–1.51x |
-| 6: Reduce apply_storage | −3 to −5ms | 217–251ms | 1.29–1.49x |
+| 2: Incremental mutation tracking | −3.5ms | 303.6ms | 1.80x |
+| 3: Offer/non-offer maps | −8 to −10ms | 294–296ms | 1.74–1.76x |
+| 4: Unified TX set parsing | −10 to −15ms | 279–286ms | 1.66–1.70x |
+| 5: Streamline fee_seq | −5 to −10ms | 269–281ms | 1.60–1.67x |
+| 6: Reduce apply_storage | −3 to −5ms | 264–278ms | 1.57–1.65x |
 
-**Projected best case: ~217ms (1.29x stellar-core)**
-**Projected worst case: ~251ms (1.49x stellar-core)**
+**Projected best case: ~264ms (1.57x stellar-core)**
+**Projected worst case: ~278ms (1.65x stellar-core)**
 
-The 220ms acceptance target is achievable in the best case. The stretch goal of 190ms
-is not reachable without either optimizing the upstream soroban-env-host crate or
-fundamentally restructuring the state management layer (replacing delta snapshot
-cloning with a lightweight overlay stack like stellar-core's LedgerTxn).
+Step 2's underperformance (−3.5ms vs expected −30 to −50ms) shifts the projections
+significantly. The 220ms acceptance target is not reachable with the remaining
+steps alone. New opportunities to investigate:
+- `build_entry_changes_with_hot_archive` (15-25ms/ledger): the actual per-op
+  bookkeeping bottleneck identified by Step 2 profiling
+- Upstream soroban-env-host optimization
+- Structural state management redesign (overlay stack vs delta cloning)
 
 ---
 

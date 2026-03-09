@@ -2682,6 +2682,7 @@ impl TransactionExecutor {
                 // subsequent operations see clean state (matching stellar-core LedgerTxn).
                 // For single-op TXs, skip savepoint creation — TX-level rollback handles failures.
                 let op_index = u32::try_from(op_index).unwrap_or(u32::MAX);
+
                 let op_savepoint = if num_ops == 1 {
                     None
                 } else {
@@ -3115,6 +3116,7 @@ impl TransactionExecutor {
 
         let total_us = tx_timing_start.elapsed().as_micros() as u64;
         let meta_us = total_us - validation_us - fee_seq_us - footprint_us - ops_us;
+
         if total_us > 5000 || frame.is_soroban() {
             // Build a compact string of per-op-type timings sorted by time desc
             let mut op_timing_vec: Vec<_> = op_type_timings.iter().collect();
