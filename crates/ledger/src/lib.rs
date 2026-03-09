@@ -77,7 +77,6 @@ pub mod execution;
 mod header;
 mod manager;
 pub mod offer;
-pub mod offer_seller_store;
 mod prepare_liabilities;
 mod snapshot;
 mod soroban_state;

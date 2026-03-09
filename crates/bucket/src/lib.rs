@@ -224,7 +224,7 @@ pub use index_persistence::{
 // Caching
 // ============================================================================
 
-pub use cache::{CacheStats, RandomEvictionCache, WarmCache, WarmCacheStats};
+pub use cache::{CacheStats, RandomEvictionCache};
 
 // ============================================================================
 // Merge deduplication

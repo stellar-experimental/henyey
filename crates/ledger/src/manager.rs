@@ -37,7 +37,6 @@ use crate::{
         TransactionExecutor, TxSetResult,
     },
     header::{compute_header_hash, create_next_header},
-    offer_seller_store::OfferSellerStore,
     snapshot::{LedgerSnapshot, SnapshotHandle},
     LedgerError, Result,
 };
@@ -46,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use henyey_bucket::{
     BucketEntry, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator, EvictionResult,
-    HotArchiveBucketList, StateArchivalSettings, WarmCache,
+    HotArchiveBucketList, StateArchivalSettings,
 };
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_tx::soroban::PersistentModuleCache;
@@ -57,9 +56,8 @@ use stellar_xdr::curr::{
     EvictionIterator as XdrEvictionIterator, ExtensionPoint, GeneralizedTransactionSet, Hash,
     LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1, LedgerCloseMetaV2, LedgerEntry,
     LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry,
-    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting,
-    TransactionEventStage, TransactionMeta, TransactionPhase,
-    TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
+    LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, TransactionEventStage,
+    TransactionMeta, TransactionPhase, TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
     TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM,
 };
 use tracing::{debug, info};
@@ -203,8 +201,6 @@ pub struct CacheInitResult {
     module_cache: Option<PersistentModuleCache>,
     /// In-memory Soroban state (contract data, code, TTLs, config).
     soroban_state: crate::soroban_state::InMemorySorobanState,
-    /// In-memory store of all offer seller accounts and trustlines.
-    offer_seller_store: OfferSellerStore,
 }
 
 /// Result of scanning a single bucket level's curr+snap buckets.
@@ -475,8 +471,6 @@ fn merge_level_results(
         pool_share_tl_account_index,
         module_cache,
         soroban_state,
-        // Test-only merge has no level_pairs for point lookups; build empty store.
-        offer_seller_store: OfferSellerStore::new(),
     }
 }
 
@@ -665,36 +659,12 @@ fn scan_and_merge(
         }
     }
 
-    // Build OfferSellerStore: derive seller keys from offers, batch-load
-    // accounts and trustlines from bucket level pairs via point lookups.
-    let seller_store_start = std::time::Instant::now();
-    let (account_keys, trustline_keys) =
-        crate::offer_seller_store::seller_keys_from_offers(&mem_offers);
-    let mut all_keys: Vec<LedgerKey> = Vec::with_capacity(account_keys.len() + trustline_keys.len());
-    all_keys.extend(account_keys);
-    all_keys.extend(trustline_keys);
-    let mut seller_entries = Vec::with_capacity(all_keys.len());
-    for key in &all_keys {
-        if let Ok(Some(entry)) = get_from_pairs(level_pairs, key) {
-            seller_entries.push(entry);
-        }
-    }
-    let offer_seller_store = OfferSellerStore::build(&mem_offers, seller_entries);
-    info!(
-        sellers = offer_seller_store.seller_count(),
-        entries = offer_seller_store.entry_count(),
-        keys_looked_up = all_keys.len(),
-        elapsed_ms = seller_store_start.elapsed().as_millis() as u64,
-        "OfferSellerStore built"
-    );
-
     CacheInitResult {
         offers: mem_offers,
         offer_index,
         pool_share_tl_account_index,
         module_cache,
         soroban_state,
-        offer_seller_store,
     }
 }
 
@@ -946,18 +916,6 @@ pub struct LedgerManagerConfig {
 
     /// Number of parallel threads for the startup bucket list cache scan.
     pub scan_thread_count: usize,
-
-    /// Maximum number of entries in the cross-ledger WarmCache.
-    ///
-    /// The WarmCache holds Account and Trustline entries between ledger closes,
-    /// converting repeated bucket list scans to O(1) lookups.  Set to 0 to
-    /// disable.  Default: 200 000 entries.
-    pub warm_cache_max_entries: usize,
-
-    /// Maximum memory for the cross-ledger WarmCache, in bytes.
-    ///
-    /// Default: 100 MiB.
-    pub warm_cache_max_bytes: usize,
 }
 
 impl Default for LedgerManagerConfig {
@@ -971,8 +929,6 @@ impl Default for LedgerManagerConfig {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
             scan_thread_count: 4,
-            warm_cache_max_entries: WarmCache::DEFAULT_MAX_ENTRIES,
-            warm_cache_max_bytes: WarmCache::DEFAULT_MAX_BYTES,
         }
     }
 }
@@ -1113,23 +1069,6 @@ pub struct LedgerManager {
     /// and `prepare_with_normalization` checks it before starting new merges.
     /// This avoids redundant merge computations across restarts and catchup.
     finished_merges: Option<Arc<std::sync::RwLock<BucketMergeMap>>>,
-
-    /// Cross-ledger warm cache for Account and Trustline entries.
-    ///
-    /// Converts repeated bucket list scans for hot classic entries (offer
-    /// seller accounts, trustlines) into O(1) RAM lookups.  Read during
-    /// transaction execution; updated from the committed ledger delta at
-    /// the end of each close.
-    warm_cache: Arc<WarmCache>,
-
-    /// In-memory store of ALL offer seller accounts and trustlines.
-    ///
-    /// Holds account and trustline entries for every account that currently has
-    /// at least one live offer (~150K sellers on mainnet).  Built at startup from
-    /// the bucket scan and updated incrementally alongside the offer store.
-    /// Provides O(1) lookups during DEX offer crossing, eliminating bucket list
-    /// scans for the most expensive classic operation.
-    offer_seller_store: Arc<RwLock<OfferSellerStore>>,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -1148,10 +1087,6 @@ impl LedgerManager {
     /// `initialize` before ledger close operations can begin.
     pub fn new(network_passphrase: String, config: LedgerManagerConfig) -> Self {
         let network_id = NetworkId::from_passphrase(&network_passphrase);
-        let warm_cache = Arc::new(WarmCache::with_limits(
-            config.warm_cache_max_bytes,
-            config.warm_cache_max_entries,
-        ));
 
         Self {
             bucket_list: Arc::new(RwLock::new(BucketList::default())),
@@ -1172,8 +1107,6 @@ impl LedgerManager {
             executor: Mutex::new(None),
             pending_eviction_scan: Mutex::new(None),
             finished_merges: None,
-            warm_cache,
-            offer_seller_store: Arc::new(RwLock::new(OfferSellerStore::new())),
         }
     }
 
@@ -1373,7 +1306,6 @@ impl LedgerManager {
         *self.pool_share_tl_account_index.write() = cache_data.pool_share_tl_account_index;
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
-        *self.offer_seller_store.write() = cache_data.offer_seller_store;
         *self.offers_initialized.write() = true;
 
         info!(
@@ -1478,7 +1410,6 @@ impl LedgerManager {
         let _ = self.module_cache.write().take();
 
         *self.offers_initialized.write() = false;
-        *self.offer_seller_store.write() = OfferSellerStore::new();
         self.soroban_state.write().clear();
 
         // Clear the persistent executor so offers are reloaded after re-initialization
@@ -1539,7 +1470,6 @@ impl LedgerManager {
         *self.pool_share_tl_account_index.write() = cache_data.pool_share_tl_account_index;
         *self.module_cache.write() = cache_data.module_cache;
         *self.soroban_state.write() = cache_data.soroban_state;
-        *self.offer_seller_store.write() = cache_data.offer_seller_store;
         *self.offers_initialized.write() = true;
         let rss_after_install = get_rss_bytes();
 
@@ -1829,8 +1759,6 @@ impl LedgerManager {
             henyey_bucket::BucketListSnapshot::new(&bl, state.header.clone())
         });
         let bls_for_lookup = bucket_list_snapshot.clone();
-        let warm_cache_lookup = self.warm_cache.clone();
-        let seller_store_lookup = self.offer_seller_store.clone();
         let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
             // For Soroban entry types, check in-memory state first (O(1)),
             // then fall back to bucket list if not found.
@@ -1840,33 +1768,8 @@ impl LedgerManager {
                 }
                 // Fall through to bucket list for entries not in in-memory state
             }
-            // For Account/Trustline types: check OfferSellerStore first (O(1) for
-            // ~150K offer sellers), then WarmCache, then bucket list.
-            match key {
-                LedgerKey::Account(ref acct_key) => {
-                    if let Some(entry) = seller_store_lookup.read().get_account(&acct_key.account_id) {
-                        return Ok(Some(entry.clone()));
-                    }
-                }
-                LedgerKey::Trustline(ref tl_key) => {
-                    if let Some(entry) = seller_store_lookup.read().get_trustline(&tl_key.account_id, &tl_key.asset) {
-                        return Ok(Some(entry.clone()));
-                    }
-                }
-                _ => {}
-            }
-            if WarmCache::is_warm_type(key) {
-                if let Some(entry) = warm_cache_lookup.get(key) {
-                    return Ok(Some((*entry).clone()));
-                }
-            }
-            // Non-Soroban types or cache miss: use bucket list snapshot
-            let result = bls_for_lookup.get(key);
-            // Populate WarmCache from authoritative bucket list reads (natural warmup)
-            if let Some(ref entry) = result {
-                warm_cache_lookup.insert(key.clone(), entry.clone());
-            }
-            Ok(result)
+            // Non-Soroban types or Soroban cache miss: use bucket list snapshot
+            Ok(bls_for_lookup.get(key))
         });
 
         // Batch lookup function for loading multiple entries in a single pass.
@@ -1876,49 +1779,25 @@ impl LedgerManager {
         // remaining non-Soroban keys from the bucket list in a single traversal.
         let soroban_state_batch = self.soroban_state.clone();
         let bls_for_batch = bucket_list_snapshot.clone();
-        let warm_cache_batch = self.warm_cache.clone();
-        let seller_store_batch = self.offer_seller_store.clone();
         let batch_lookup_fn: crate::snapshot::BatchEntryLookupFn =
             Arc::new(move |keys: &[LedgerKey]| {
                 let mut result = Vec::new();
                 let mut bucket_list_keys = Vec::new();
 
-                // Check soroban state cache for soroban types first (O(1)),
-                // then OfferSellerStore + WarmCache for Account/Trustline, then bucket list.
+                // Check soroban state cache for soroban types first (O(1))
                 {
                     let soroban = soroban_state_batch.read();
-                    let seller_store = seller_store_batch.read();
                     for key in keys {
                         if crate::soroban_state::InMemorySorobanState::is_in_memory_type(key) {
                             if let Some(entry) = soroban.get(key) {
                                 result.push((*entry).clone());
                             } else {
+                                // Fall through to bucket list for Soroban entries not
+                                // found in the in-memory state. This handles entries
+                                // that the initialization scan may have missed.
                                 bucket_list_keys.push(key.clone());
                             }
                             continue;
-                        }
-                        // Check OfferSellerStore for Account/Trustline of offer sellers
-                        match key {
-                            LedgerKey::Account(ref acct_key) => {
-                                if let Some(entry) = seller_store.get_account(&acct_key.account_id) {
-                                    result.push(entry.clone());
-                                    continue;
-                                }
-                            }
-                            LedgerKey::Trustline(ref tl_key) => {
-                                if let Some(entry) = seller_store.get_trustline(&tl_key.account_id, &tl_key.asset) {
-                                    result.push(entry.clone());
-                                    continue;
-                                }
-                            }
-                            _ => {}
-                        }
-                        // Check WarmCache for Account/Trustline before bucket list
-                        if WarmCache::is_warm_type(key) {
-                            if let Some(entry) = warm_cache_batch.get(key) {
-                                result.push((*entry).clone());
-                                continue;
-                            }
                         }
                         bucket_list_keys.push(key.clone());
                     }
@@ -1929,12 +1808,6 @@ impl LedgerManager {
                     let bucket_entries = bls_for_batch
                         .load_keys_result(&bucket_list_keys)
                         .map_err(LedgerError::Bucket)?;
-                    // Populate WarmCache from authoritative bucket list reads
-                    for entry in &bucket_entries {
-                        if let Ok(key) = crate::delta::entry_to_key(entry) {
-                            warm_cache_batch.insert(key, entry.clone());
-                        }
-                    }
                     result.extend(bucket_entries);
                 }
 
@@ -2111,59 +1984,6 @@ impl LedgerManager {
                     store.remove(offer_id);
                 }
             }
-
-            // Update OfferSellerStore: add/remove offers to track seller membership,
-            // then update seller account/trustline entries from the delta.
-            {
-                let mut seller_store = self.offer_seller_store.write();
-
-                // Track offer additions and removals for seller membership.
-                let new_offers: Vec<&LedgerEntry> = offer_upserts.iter()
-                    .filter(|e| matches!(&e.data, LedgerEntryData::Offer(_)))
-                    .collect();
-                if !new_offers.is_empty() {
-                    seller_store.add_offers(&new_offers);
-                }
-
-                // Collect deleted offer entries for removal.
-                let mut deleted_offer_entries: Vec<&LedgerEntry> = Vec::new();
-                for change in delta.changes() {
-                    if let EntryChange::Deleted { previous } = change {
-                        if matches!(previous.data, LedgerEntryData::Offer(_)) {
-                            deleted_offer_entries.push(previous);
-                        }
-                    }
-                }
-                if !deleted_offer_entries.is_empty() {
-                    seller_store.remove_offers(&deleted_offer_entries);
-                }
-
-                // Update Account and Trustline entries for known sellers.
-                for change in delta.changes() {
-                    if let Some(entry) = change.current_entry() {
-                        match &entry.data {
-                            LedgerEntryData::Account(acct) => {
-                                seller_store.update_account(&acct.account_id, entry);
-                            }
-                            LedgerEntryData::Trustline(tl) => {
-                                seller_store.update_trustline(&tl.account_id, &tl.asset, entry);
-                            }
-                            _ => {}
-                        }
-                    } else if let Some(prev) = change.previous_entry() {
-                        // Deleted entry
-                        match &prev.data {
-                            LedgerEntryData::Account(acct) => {
-                                seller_store.remove_account(&acct.account_id);
-                            }
-                            LedgerEntryData::Trustline(tl) => {
-                                seller_store.remove_trustline(&tl.account_id, &tl.asset);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
         }
 
         // Update pool share trustline secondary index with changes from this ledger.
@@ -2209,32 +2029,6 @@ impl LedgerManager {
                     }
                 }
                 _ => {} // Updated pool share trustlines: no index change needed
-            }
-        }
-
-        // Update WarmCache from committed delta: insert created/updated Account and
-        // Trustline entries; remove deleted ones.  This is the authoritative update
-        // that keeps the cross-ledger cache consistent with the bucket list.
-        if self.config.warm_cache_max_entries > 0 {
-            for change in delta.changes() {
-                if let Some(entry) = change.current_entry() {
-                    if let Ok(key) = crate::delta::entry_to_key(entry) {
-                        if WarmCache::is_warm_type(&key) {
-                            self.warm_cache.insert(key, entry.clone());
-                        }
-                    }
-                } else if let Some(prev) = change.previous_entry() {
-                    // Deleted entry — remove from cache
-                    if let Ok(key) = crate::delta::entry_to_key(prev) {
-                        if WarmCache::is_warm_type(&key) {
-                            self.warm_cache.remove(&key);
-                        }
-                    }
-                }
-            }
-            // Activate after first close so subsequent ledgers benefit.
-            if !self.warm_cache.is_active() {
-                self.warm_cache.activate();
             }
         }
 
@@ -4858,23 +4652,6 @@ impl<'a> LedgerCloseContext<'a> {
                 hit_rate: stats.hit_rate,
             }
         };
-
-        // Log WarmCache stats and reset per-ledger counters
-        {
-            let wc = self.manager.warm_cache.stats();
-            if wc.active {
-                tracing::debug!(
-                    ledger_seq = new_header.ledger_seq,
-                    warm_entries = wc.entry_count,
-                    warm_bytes = wc.size_bytes,
-                    warm_hits = wc.hits,
-                    warm_misses = wc.misses,
-                    warm_hit_rate = format!("{:.1}%", wc.hit_rate * 100.0),
-                    "WarmCache stats"
-                );
-            }
-            self.manager.warm_cache.reset_counters();
-        }
 
         // Compute average Soroban state size from the LiveSorobanStateSizeWindow.
         // Parity: NetworkConfig.cpp:1812 — average of all window entries.
