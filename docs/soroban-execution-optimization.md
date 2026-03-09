@@ -18,37 +18,48 @@ Linear regression on 136 mainnet ledgers (61349505–61349640) decomposes the ga
 
 **Soroban per-op cost is 3.5x slower, accounting for 152ms of the 149ms gap.**
 
-Mean workload per ledger: ~500 classic ops, ~257 soroban ops.
+Mean workload per ledger: ~500 classic ops, ~257 soroban ops (~130 soroban TXs).
 
-### Soroban Hot-Path Analysis
+## Profiling Breakdown
 
-Each Soroban TX performs repeated XDR serialization + SHA256 hashing on the same keys:
+Granular profiling (Step 1 commit `a1db12f`, `RUST_LOG=debug` on release build)
+reveals where per-Soroban-TX time goes:
 
-1. **`compute_key_hash()`** — called for every ContractData/ContractCode key in the
-   footprint, 5–10 times per key across different validation passes:
-   - `load_soroban_footprint` (mod.rs:1315–1318)
-   - `is_archived_contract_entry` (invoke_host_function.rs:1031)
-   - `disk_read_bytes_exceeded` (invoke_host_function.rs:494)
-   - `apply_soroban_storage_changes` (invoke_host_function.rs:681,689,813,887,928,933)
+### Per Soroban TX (~1100μs total, ~130 TXs/ledger = ~143ms)
 
-   Each call does: `key.to_xdr(Limits::none())` → heap alloc + serialize → `Sha256::digest()`.
+| Component | Avg (μs) | % | Per ledger | Optimizable? |
+|-----------|---------|---|------------|--------------|
+| e2e_invoke (WASM host) | 360 | 33% | 47ms | No (upstream soroban-env-host) |
+| Per-op bookkeeping | 480 | 44% | 62ms | **Yes** — delta snapshots, change tracking, savepoints |
+| fee_seq (fees, seq bump, signers) | 112 | 10% | 15ms | Partially |
+| apply_storage_changes | 69 | 6% | 9ms | Partially |
+| validation | 71 | 6% | 9ms | Partially |
+| footprint loading | 45 | 4% | 6ms | Minor |
+| XDR encode + extract | 45 | 4% | 6ms | Not worth it |
 
-2. **Entry XDR serialization for size measurement** — `disk_read_bytes_exceeded`
-   serializes the full `LedgerEntry` to `Vec<u8>` just to get `.len()`.
+**Per-op bookkeeping** is the per-operation overhead in `execute_single_transaction`:
+2× `delta_snapshot()`, `delta_changes_between()`, `flush_modified_entries()`,
+`begin_op_snapshot()` / `end_op_snapshot()`, savepoint management, entry change
+building with state overrides. For Soroban TXs with exactly 1 operation, much of
+this bookkeeping is redundant — the "operation changes" ARE the "transaction changes".
 
-3. **Entry XDR serialization for host setup** — `execute_host_function_p25`
-   encodes host_function, resources, source, auth entries, and every footprint entry
-   into XDR bytes before passing to the Soroban host.
+### Per-ledger setup/teardown (~36ms)
 
-### Setup/Teardown Overhead (31ms/ledger)
-
-| Sub-phase | Time | Description |
+| Component | Time | Optimizable? |
 |-----------|------|-------------|
-| tx_parse | 7.4ms | `transactions_with_base_fee()` XDR deserialization |
-| executor_setup | 10.5ms | `advance_to_ledger_preserving_offers()` + HashMap retain |
-| phase_parse | 4.4ms | `soroban_phase_structure()` XDR parsing |
-| post_exec | 7.9ms | Fee event generation + per-TX perf collection |
-| fee_deduct + preload | 5.0ms | `pre_deduct_all_fees_on_delta()` + account delta load |
+| executor_setup (HashMap retain for offers) | 10.5ms | **Yes** — offer/non-offer map split |
+| post_exec (fee event generation) | 7.9ms | **Yes** — reuse parsed TX data |
+| tx_parse (XDR deserialization) | 7.4ms | **Yes** — unified TX set parsing |
+| fee_deduct + preload | 5.0ms | Minor |
+| phase_parse (soroban phase structure) | 4.4ms | **Yes** — unified TX set parsing |
+
+### What's NOT the bottleneck
+
+- **XDR entry serialization** (encode + extract): Only 45μs/TX total (6ms/ledger).
+  For P25, `disk_read_bytes_exceeded` skips Soroban entries entirely — no duplicate
+  serialization. The original plan's Steps 2–3 targeted this, but they would yield <6ms.
+- **e2e_invoke host execution**: 360μs/TX (47ms/ledger). This is the upstream
+  soroban-env-host crate — same Rust code as stellar-core. Cannot be optimized here.
 
 ---
 
@@ -60,7 +71,7 @@ All measurements use:
 - **Cache**: `--cache-dir ~/data/<session>/cache` (pre-warmed from prior run)
 - **Logging**: `RUST_LOG=info` for timing, `RUST_LOG=debug` for phase breakdown
 - **Machine**: same host for all runs (no cross-machine comparisons)
-- **Repetitions**: 3 runs, report median of means (first ledger excluded as cold start)
+- **Repetitions**: 3 runs, report median of means
 
 ### Baseline
 
@@ -86,211 +97,163 @@ Stretch goal: ≤ 190ms mean (1.13x stellar-core).
 
 ## Optimization Steps
 
-### Step 1: Embed TTL Key Hash in LedgerKey (Expected: −60 to −80ms)
+### Step 1: TTL Key Hash Caching ✅ DONE
 
-**Problem**: `compute_key_hash()` does `key.to_xdr() + SHA256` for every
-ContractData/ContractCode key. A typical TX has ~20 footprint keys, and each key is
-hashed 5–10 times across validation passes. That's 100–200 XDR+SHA256 per TX, ~130
-Soroban TXs per ledger = ~15,000 redundant computations.
+**Commit**: `a1db12f` | **Result**: −10.4ms (307.1ms)
 
-**How stellar-core solves it**: `getTTLKey()` in `LedgerTypeUtils.cpp:30–38` computes
-`sha256(xdr::xdr_to_opaque(e))` **once per key** and embeds the result directly in the
-returned `LedgerKey::ttl().keyHash` field. In `InvokeHostFunctionOpFrame::addReads()`
-(lines 360–505), `getTTLKey(lk)` is called once per footprint key. The loaded TTL entry
-(with hash already inside the key) is cached in a local variable and reused for all
-subsequent operations — archive checks, size metering, host buffer preparation. The hash
-is never recomputed.
+Built `TtlKeyCache` (`HashMap<LedgerKey, Hash>`) during `load_soroban_footprint`,
+threaded it through all Soroban validation/execution functions. Eliminates ~15K
+redundant `key.to_xdr() + SHA256` computations per ledger.
 
-**Solution**: Match stellar-core's structural approach. During footprint loading in
-`load_soroban_footprint`, compute each key's TTL `LedgerKey` once (including the hash).
-Store the pre-built TTL key alongside the loaded entry. All downstream code
-(`is_archived_contract_entry`, `disk_read_bytes_exceeded`, `apply_soroban_storage_changes`,
-host setup) uses the pre-built TTL key instead of calling `compute_key_hash()`.
+Original estimate was −60 to −80ms. Actual: −10.4ms. SHA-256 of small keys
+(~100-200 bytes) takes <1μs each — the hash computation was never the real
+bottleneck. The profiling done after this step revealed the true cost structure
+(see Profiling Breakdown above).
 
-This means replacing the pattern:
-```rust
-let key_hash = compute_key_hash(key);  // called 5-10x per key
-let ttl_key = LedgerKey::Ttl(LedgerKeyTtl { key_hash });
-```
-with a single pre-computed TTL key stored per footprint entry and threaded through
-all call sites.
+---
+
+### Step 2: Fast-Path Single-Op Soroban TXs (Expected: −30 to −50ms)
+
+**Problem**: Every Soroban TX executes exactly 1 operation (InvokeHostFunction),
+but the per-operation bookkeeping loop treats it identically to multi-op classic
+TXs. This adds ~480μs of overhead per TX:
+
+1. `delta_snapshot()` before op — clones delta state (~50-100μs)
+2. `begin_op_snapshot()` — sets up operation-level state tracking
+3. `load_operation_accounts()` — loads per-op source accounts from snapshot
+4. `create_savepoint()` — creates rollback savepoint
+5. (actual operation execution — already measured separately)
+6. `flush_modified_entries()` — synchronizes state
+7. `delta_snapshot()` after op — clones delta state again
+8. `delta_changes_between()` — diffs the two snapshots
+9. `end_op_snapshot()` — extracts per-op state snapshots
+10. Entry change building with state overrides
+
+For a single-op TX, the "operation-level changes" are identical to the
+"transaction-level changes". The before/after delta snapshots, the change diffing,
+and the savepoint (which is never rolled back for a 1-op TX) are all redundant.
+
+**How stellar-core handles it**: In `doApply()`, single-op TXs take essentially
+the same path, but `LedgerTxn` is a lightweight stack-of-overlays — pushing/popping
+an overlay is O(1). The cost difference is that our delta snapshot cloning is O(n)
+where n = number of modified entries.
+
+**Solution**: Detect single-op Soroban TXs early and bypass the per-operation
+bookkeeping loop. Instead:
+- Skip `delta_snapshot()` before/after — derive operation changes directly from
+  the transaction-level delta
+- Skip `create_savepoint()` — single-op success/failure maps to TX success/failure
+- Skip `begin_op_snapshot()` / `end_op_snapshot()` — use TX-level state directly
+- Skip `delta_changes_between()` — the TX delta IS the op delta
+
+This is a code-path optimization, not a behavioral change. The resulting metadata
+must be identical.
 
 **Files to modify**:
-- `crates/tx/src/operations/execute/invoke_host_function.rs` — all 18 `compute_key_hash()`
-  call sites → use pre-built TTL key from footprint context
-- `crates/tx/src/soroban/host.rs` — all 8 `compute_key_hash()` call sites → same
-- `crates/ledger/src/execution/mod.rs` (`load_soroban_footprint`) — compute and store
-  TTL keys during footprint loading
+- `crates/ledger/src/execution/mod.rs` — add fast-path in `execute_single_transaction`
+  for `frame.operations().len() == 1 && op_type.is_soroban()`
 
 **Constraints**:
-- TTL key must be computed from the original `LedgerKey` as loaded, not a mutated version
-- Must not change observable behavior — only eliminates redundant computation
-- Pre-built TTL keys need to flow through `execute_contract_invocation()`,
-  `execute_host_function_p25()`, and `apply_soroban_storage_changes()`
+- Output metadata (tx_changes_before, operation changes, events) must be byte-identical
+- Rollback behavior for failed operations must be preserved
+- The fee_seq changes (fee deduction, seq bump, signer removal) happen BEFORE the
+  op loop and are unaffected
 
-**Benchmark gate**: Run benchmark protocol. Expected: −60 to −80ms (mean ≤ 258ms).
-If improvement < 30ms, investigate before proceeding. If not fixable, stop and alert.
-
-**Actual result**: −10.4ms (median close_ledger 307.1ms, 3 runs: 304.5/307.1/316.3).
-SHA-256 of small LedgerKey XDR (~100-200 bytes) takes <1μs each; even 15K redundant
-computations save only ~15ms. Original estimate was 4-5x too optimistic. Per-TX debug
-breakdown shows the real bottleneck is `ops_us` (host invocation): 700-1100μs/TX vs
-stellar-core's ~240μs — entry encoding and host setup, not hash computation.
-Proceeding to Step 2 which targets entry serialization redundancy.
+**Benchmark gate**: Run benchmark protocol. Expected: mean ≤ 267ms (−30 to −50ms
+from Step 1). If improvement < 15ms, investigate.
 
 ---
 
-### Step 2: Serialize Entries Once, Reuse for Metering and Host (Expected: −20 to −30ms)
-
-**Problem**: `disk_read_bytes_exceeded` (invoke_host_function.rs:428–431) serializes
-every `LedgerEntry` in the footprint to XDR just to measure byte count. Later,
-`execute_host_function_p25` serializes the same entries *again* to pass to the Soroban
-host. Each entry is serialized at least twice.
-
-**How stellar-core solves it**: In `addReads()` (lines 451–467), entries are serialized
-once into a `CxxBuf` via `toCxxBuf(xdr::xdr_to_opaque(*entryOpt))`. The buffer's
-`.data->size()` is read for disk read metering. The **same buffer** is stored in
-`mLedgerEntryCxxBufs` and passed directly to the Soroban host for execution. For keys,
-`xdr::xdr_size(lk)` computes size without full serialization. Zero redundant
-serializations — one buffer serves both metering and host invocation.
-
-**Solution**: During footprint loading, serialize each entry to `Vec<u8>` once and store
-the buffer alongside the entry. `disk_read_bytes_exceeded` reads `.len()` from the cached
-buffer. `execute_host_function_p25` passes the cached buffer to the host instead of
-re-serializing. This eliminates all redundant entry serialization.
-
-**Files to modify**:
-- `crates/tx/src/operations/execute/invoke_host_function.rs` — `disk_read_bytes_exceeded`
-  reads cached sizes; `execute_host_function_p25` uses cached buffers
-- `crates/ledger/src/execution/mod.rs` (`load_soroban_footprint`) or a new per-TX
-  footprint context struct — store `(LedgerEntry, Vec<u8>, u32)` tuples
-
-**Constraints**:
-- Size must be computed from the entry as loaded (pre-execution state), not after
-  modification — `disk_read_bytes_exceeded` measures pre-execution sizes
-- Buffers passed to the host must be the same bytes that `to_xdr()` would produce
-- Memory cost: ~20 footprint entries × ~500 bytes avg = ~10KB per TX (negligible)
-
-**Benchmark gate**: Run benchmark protocol. Expected: −20 to −30ms cumulative from
-baseline (mean ≤ 238ms). If improvement < 10ms over Step 1, investigate before
-proceeding. If not fixable, stop and alert.
-
----
-
-### Step 3: Single-Pass Footprint Validation (Expected: −10 to −15ms)
-
-**Problem**: Two separate loops iterate the full footprint before host invocation:
-1. `footprint_has_unrestored_archived_entries()` — loops all footprint keys, checks
-   archive status via `is_archived_contract_entry()` (which calls `compute_key_hash()`)
-2. `disk_read_bytes_exceeded()` — loops all footprint keys again, serializes entries
-   for size metering
-
-A third pass (`validate_and_compute_write_bytes()`) runs post-execution on storage
-changes — this one is inherently separate since it needs host output.
-
-**How stellar-core solves it**: `addReads()` (lines 360–505) is a **single pass** over
-the footprint. For each key in one iteration: loads the entry, computes `getTTLKey()`,
-checks archive status, calls `validateContractLedgerEntry()` for size limits, meters
-disk read bytes, and prepares the host buffer. Write bytes are validated separately
-post-execution in `recordStorageChanges()`.
-
-**Notable**: stellar-core calls `validateContractLedgerEntry()` on **every** footprint
-entry (read-only + read-write) during `addReads()`. Henyey only validates entry sizes
-on written entries post-execution. This is a potential parity issue to investigate.
-
-**Solution**: Merge the two pre-execution validation passes into a single
-`process_footprint()` function that, for each key:
-1. Loads the entry (already done in `load_soroban_footprint`)
-2. Checks archive status (using pre-built TTL key from Step 1)
-3. Meters disk read bytes (using cached buffer size from Step 2)
-4. Validates entry size limits (matching stellar-core's per-entry check)
-
-This naturally composes with Steps 1 and 2 — the pre-built TTL key and cached buffer
-are produced during the single pass and consumed by all checks.
-
-**Files to modify**:
-- `crates/tx/src/operations/execute/invoke_host_function.rs` — replace
-  `footprint_has_unrestored_archived_entries()` + `disk_read_bytes_exceeded()` with a
-  single `process_footprint()` that returns `(has_archived, read_bytes_exceeded,
-  entry_size_exceeded)`
-
-**Constraints**:
-- Error priority must match stellar-core: archived check → entry size → disk read bytes
-- Post-execution write validation remains a separate pass (needs host output)
-- Investigate the `validateContractLedgerEntry()` parity gap on read-only entries
-
-**Benchmark gate**: Run benchmark protocol. Expected: −10 to −15ms cumulative from
-Step 2 (mean ≤ 228ms). If improvement < 5ms over Step 2, investigate before proceeding.
-If not fixable, stop and alert.
-
----
-
-### Step 4: Unified TX Set Parsing (Expected: −10ms)
-
-**Problem**: `transactions_with_base_fee()` (7.4ms) and `soroban_phase_structure()`
-(4.4ms) each parse/iterate the `GeneralizedTransactionSet` XDR independently.
-Called on every `apply_transactions()` invocation. Post-execution fee event generation
-calls `transactions_with_base_fee()` a second time and constructs a new
-`TransactionFrame` per TX just to extract fee source accounts.
-
-**How stellar-core solves it**: TX set is parsed once in
-`ApplicableTxSetFrame::prepareForApply()`, which creates `TransactionFrame` objects
-and organizes them into phases/stages/clusters. The result is cached in the
-`ApplicableTxSetFrame`. `getPhasesInApplyOrder()` is lazy (mutable field, computed
-once on first access). Fee events are emitted during TX execution using the
-already-constructed `TransactionFrame` — no post-execution re-parsing.
-
-**Solution**: Parse the TX set once into a cached `PreparedTxSet` struct stored on
-`CloseData`. Contains pre-sorted classic TXs with base fees, pre-parsed Soroban
-phase structure, and pre-extracted fee source `AccountId` per TX. All consumers
-(`transactions_with_base_fee()`, `soroban_phase_structure()`, fee event generation)
-read from the cached data.
-
-**Files to modify**:
-- `crates/ledger/src/execution/tx_set.rs` — add `PreparedTxSet` with lazy
-  initialization; `transactions_with_base_fee()` and `soroban_phase_structure()`
-  delegate to it
-- `crates/ledger/src/manager.rs` — fee event generation uses cached fee source
-  accounts from `PreparedTxSet` instead of re-parsing
-
-**Benchmark gate**: Run benchmark protocol. Expected: −10ms cumulative from Step 3
-(mean ≤ 218ms). If improvement < 5ms over Step 3, investigate before proceeding.
-If not fixable, stop and alert.
-
----
-
-### Step 5: Separate Offer and Non-Offer Metadata Maps (Expected: −10ms)
+### Step 3: Executor Setup — Offer/Non-Offer Map Split (Expected: −8 to −10ms)
 
 **Problem**: `clear_cached_entries_preserving_offers()` calls `.retain()` on three
 maps (`entry_sponsorships`, `entry_sponsorship_ext`, `entry_last_modified`), iterating
-all entries to keep only Offer keys. These maps can contain entries for all types
-(accounts, trustlines, contracts, etc.) accumulated during a ledger. The `.retain()`
-cost is O(total entries) regardless of how many are offers.
+all entries to keep only Offer keys. These maps accumulate entries of all types
+(accounts, trustlines, contracts, etc.) during a ledger. The `.retain()` cost is
+O(total entries) regardless of how many are offers. Measured at 10.5ms per ledger.
 
-**How stellar-core solves it**: No equivalent cost. State is ephemeral per-ledger via
-scope-based `LedgerTxn`. No clearing or retention needed between ledgers. stellar-core
-pays for this with per-access SQL overhead instead.
+**How stellar-core solves it**: No equivalent cost. State is ephemeral per-ledger
+via scope-based `LedgerTxn`.
 
-**Solution**: Split each of the three maps into an offer-specific map and a non-offer
-map:
-```
-entry_sponsorships       → offer_sponsorships + non_offer_sponsorships
-entry_sponsorship_ext    → offer_sponsorship_ext + non_offer_sponsorship_ext
-entry_last_modified      → offer_last_modified + non_offer_last_modified
-```
-
-On insert, route to the correct map based on `LedgerKey::Offer(_)` match. On lookup,
-check both maps. On `clear_cached_entries_preserving_offers()`, drop the non-offer
-maps with `.clear()` (O(1) amortized) and leave the offer maps untouched. No
-`.retain()` iteration needed.
+**Solution**: Split each map into offer-specific and non-offer maps:
+- On insert, route based on `LedgerKey::Offer(_)` match
+- On lookup, check both maps
+- On `clear_cached_entries_preserving_offers()`, call `.clear()` on non-offer maps
+  (O(1) amortized) and leave offer maps untouched
 
 **Files to modify**:
-- `crates/tx/src/state/mod.rs` — split the three maps, update all insert/get/remove
-  sites, simplify `clear_cached_entries_inner()`
+- `crates/tx/src/state/mod.rs` — split the three maps, update insert/get/remove
 
-**Benchmark gate**: Run benchmark protocol. Expected: −10ms cumulative from Step 4
-(mean ≤ 213ms). If improvement < 5ms over Step 4, investigate before proceeding.
-If not fixable, stop and alert.
+**Benchmark gate**: Expected: mean ≤ 259ms. If improvement < 4ms, investigate.
+
+---
+
+### Step 4: Unified TX Set Parsing (Expected: −10 to −15ms)
+
+**Problem**: Three separate passes parse the `GeneralizedTransactionSet`:
+1. `transactions_with_base_fee()` (7.4ms) — parses all TXs, computes base fees
+2. `soroban_phase_structure()` (4.4ms) — re-parses for Soroban phase/stage/cluster
+3. Post-execution fee event generation (part of 7.9ms post_exec) — calls
+   `transactions_with_base_fee()` again, constructs new `TransactionFrame` per TX
+
+**How stellar-core solves it**: `prepareForApply()` parses once into cached
+`TransactionFrame` objects organized by phase/stage/cluster. Fee events are emitted
+during TX execution using the already-parsed frames.
+
+**Solution**: Parse TX set once into a `PreparedTxSet` struct:
+- Pre-sorted classic TXs with base fees
+- Pre-parsed Soroban phase structure (stages, clusters)
+- Pre-extracted fee source `AccountId` per TX
+- All consumers read from the cached data
+
+**Files to modify**:
+- `crates/ledger/src/execution/tx_set.rs` — add `PreparedTxSet`
+- `crates/ledger/src/manager.rs` — fee event generation uses cached data
+
+**Benchmark gate**: Expected: mean ≤ 247ms. If improvement < 5ms, investigate.
+
+---
+
+### Step 5: Streamline fee_seq Processing (Expected: −5 to −10ms)
+
+**Problem**: The pre-apply phase (`fee_seq_us`) takes 112μs per Soroban TX (15ms/ledger).
+This includes fee deduction, sequence bump, one-time signer removal, and 3 rounds of
+`delta_snapshot()` + `delta_changes_between()` + `build_entry_changes_with_state_overrides()`
+to track metadata changes for each sub-phase (fee, signers, seq).
+
+**How stellar-core handles it**: `LedgerTxn` sub-transactions are O(1) push/pop. Change
+tracking is implicit in the overlay stack. No explicit delta cloning.
+
+**Solution**: For Soroban TXs (which have no per-op source accounts and typically no
+PreAuthTx signers):
+- Combine the three delta-tracking phases into a single phase where possible
+- Skip signer removal iteration when the TX has no PreAuthTx signatures
+- Use direct state mutation tracking instead of before/after snapshot diffing
+
+**Files to modify**:
+- `crates/ledger/src/execution/mod.rs` — optimize `execute_single_transaction` pre-apply
+
+**Benchmark gate**: Expected: mean ≤ 240ms. If improvement < 3ms, investigate.
+
+---
+
+### Step 6: Reduce apply_storage_changes Overhead (Expected: −3 to −5ms)
+
+**Problem**: `apply_soroban_storage_changes()` takes 69μs per TX (9ms/ledger). For
+each storage change, it calls `get_or_compute_key_hash()` (now cached), looks up/mutates
+state, and handles TTL updates. The function also iterates the full read-write footprint
+to delete entries not returned by the host (the "erase-RW" loop).
+
+**Solution**:
+- The TTL key hash is already cached (Step 1)
+- Pre-build the "seen keys" HashSet outside the loop to avoid per-iteration allocation
+- Consider batch state mutations instead of per-change individual mutations
+
+**Files to modify**:
+- `crates/tx/src/operations/execute/invoke_host_function.rs` — optimize
+  `apply_soroban_storage_changes` and `apply_soroban_storage_change`
+
+**Benchmark gate**: Expected: mean ≤ 237ms. If improvement < 2ms, skip.
 
 ---
 
@@ -316,11 +279,12 @@ For each step:
 | Step | Commit | Mean | Δ from prev | Δ from baseline | Notes |
 |------|--------|------|-------------|-----------------|-------|
 | Baseline | `bd8f3f7` | 317.5ms | — | — | |
-| 1: TTL key embedding | | | | | |
-| 2: Entry buffer caching | | | | | |
-| 3: Single-pass validation | | | | | |
+| 1: TTL key hash caching | `a1db12f` | 307.1ms | −10.4ms | −10.4ms | SHA-256 was <1μs/call |
+| 2: Fast-path single-op | | | | | |
+| 3: Offer/non-offer maps | | | | | |
 | 4: Unified TX set parsing | | | | | |
-| 5: Offer/non-offer map split | | | | | |
+| 5: Streamline fee_seq | | | | | |
+| 6: Reduce apply_storage | | | | | |
 
 ---
 
@@ -329,11 +293,20 @@ For each step:
 | Step | Expected Gain | Cumulative | Ratio vs stellar-core |
 |------|--------------|------------|----------------------|
 | Baseline | — | 317.5ms | 1.88x |
-| 1: TTL key embedding | −60 to −80ms | ~240–258ms | 1.42–1.53x |
-| 2: Entry buffer caching | −20 to −30ms | ~210–238ms | 1.25–1.41x |
-| 3: Single-pass validation | −10 to −15ms | ~195–228ms | 1.16–1.35x |
-| 4: Unified TX set parsing | −10ms | ~185–218ms | 1.10–1.29x |
-| 5: Offer/non-offer map split | −10ms | ~175–213ms | 1.04–1.26x |
+| 1: TTL key hash caching | −10ms | 307ms | 1.82x |
+| 2: Fast-path single-op | −30 to −50ms | 257–277ms | 1.53–1.64x |
+| 3: Offer/non-offer maps | −8 to −10ms | 247–269ms | 1.47–1.60x |
+| 4: Unified TX set parsing | −10 to −15ms | 232–259ms | 1.38–1.54x |
+| 5: Streamline fee_seq | −5 to −10ms | 222–254ms | 1.32–1.51x |
+| 6: Reduce apply_storage | −3 to −5ms | 217–251ms | 1.29–1.49x |
+
+**Projected best case: ~217ms (1.29x stellar-core)**
+**Projected worst case: ~251ms (1.49x stellar-core)**
+
+The 220ms acceptance target is achievable in the best case. The stretch goal of 190ms
+is not reachable without either optimizing the upstream soroban-env-host crate or
+fundamentally restructuring the state management layer (replacing delta snapshot
+cloning with a lightweight overlay stack like stellar-core's LedgerTxn).
 
 ---
 
@@ -359,3 +332,10 @@ For each step:
 Fit `time = a * classic_ops + b * soroban_ops + c` for both stellar-core and henyey.
 Op counts from stellar-core's "applying ledger" log lines. Regression coefficients
 decompose the gap into per-classic-op, per-soroban-op, and fixed overhead components.
+
+### Profiling methodology (post-Step 1)
+
+Added `std::time::Instant` instrumentation inside `execute_host_function_p25`
+(encode/invoke/extract phases) and `execute_contract_invocation` (pre_checks/host/
+apply/hash phases). Aggregated across ~5400 Soroban TXs on the benchmark range.
+Instrumentation was temporary (reverted after data collection).
