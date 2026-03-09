@@ -488,133 +488,27 @@ pub(super) fn build_entry_changes_with_hot_archive(
         state_overrides,
         restored,
     } = changes;
-    // Debug: log all vectors sizes and entry types
-    fn entry_type_name(entry: &LedgerEntry) -> &'static str {
-        match &entry.data {
-            stellar_xdr::curr::LedgerEntryData::Account(_) => "Account",
-            stellar_xdr::curr::LedgerEntryData::Trustline(_) => "Trustline",
-            stellar_xdr::curr::LedgerEntryData::Offer(_) => "Offer",
-            stellar_xdr::curr::LedgerEntryData::Data(_) => "Data",
-            stellar_xdr::curr::LedgerEntryData::ClaimableBalance(_) => "ClaimableBalance",
-            stellar_xdr::curr::LedgerEntryData::LiquidityPool(_) => "LiquidityPool",
-            stellar_xdr::curr::LedgerEntryData::ContractData(_) => "ContractData",
-            stellar_xdr::curr::LedgerEntryData::ContractCode(_) => "ContractCode",
-            stellar_xdr::curr::LedgerEntryData::ConfigSetting(_) => "ConfigSetting",
-            stellar_xdr::curr::LedgerEntryData::Ttl(_) => "Ttl",
-        }
-    }
-
-    // Log all created entries
-    tracing::debug!(
-        "build_entry_changes: VECTORS created={}, updated={}, deleted={}, change_order={}",
-        created.len(),
-        updated.len(),
-        deleted.len(),
-        change_order.len()
-    );
-    for (i, entry) in created.iter().enumerate() {
-        tracing::debug!(
-            "build_entry_changes: created[{}] = {}",
-            i,
-            entry_type_name(entry)
-        );
-    }
-    for (i, entry) in updated.iter().enumerate() {
-        tracing::debug!(
-            "build_entry_changes: updated[{}] = {}",
-            i,
-            entry_type_name(entry)
-        );
-    }
-    // Log change_order
-    for (i, change_ref) in change_order.iter().enumerate() {
-        tracing::debug!(
-            "build_entry_changes: change_order[{}] = {:?}",
-            i,
-            change_ref
-        );
-    }
-
-    // Debug: log all created entries to see TTL
-    for (i, entry) in created.iter().enumerate() {
-        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
-            tracing::debug!(
-                "build_entry_changes: CREATED vector contains TTL at idx={}, key_hash={:x?}, live_until={}",
-                i,
-                &ttl.key_hash.0[..8],
-                ttl.live_until_ledger_seq
-            );
-        }
-    }
-    // Debug: log all updated entries to see if any are TTL
-    for (i, entry) in updated.iter().enumerate() {
-        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &entry.data {
-            tracing::debug!(
-                "build_entry_changes: UPDATED vector contains TTL at idx={}, key_hash={:x?}, live_until={}",
-                i,
-                &ttl.key_hash.0[..8],
-                ttl.live_until_ledger_seq
-            );
-        }
-    }
-    // Debug: log change_order
-    for (i, change_ref) in change_order.iter().enumerate() {
-        match change_ref {
-            henyey_tx::ChangeRef::Created(idx) => {
-                if *idx < created.len() {
-                    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &created[*idx].data {
-                        tracing::debug!(
-                            "build_entry_changes: change_order[{}] = Created({}) -> TTL key_hash={:x?}, live_until={}",
-                            i, idx, &ttl.key_hash.0[..8], ttl.live_until_ledger_seq
-                        );
-                    }
-                }
-            }
-            henyey_tx::ChangeRef::Updated(idx) => {
-                if *idx < updated.len() {
-                    if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &updated[*idx].data {
-                        tracing::debug!(
-                            "build_entry_changes: change_order[{}] = Updated({}) -> TTL key_hash={:x?}, live_until={}",
-                            i, idx, &ttl.key_hash.0[..8], ttl.live_until_ledger_seq
-                        );
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    fn entry_key_bytes(entry: &LedgerEntry) -> Vec<u8> {
-        crate::delta::entry_to_key(entry)
-            .ok()
-            .and_then(|key| key.to_xdr(Limits::none()).ok())
-            .unwrap_or_default()
-    }
 
     fn push_created_or_restored(
         changes: &mut Vec<LedgerEntryChange>,
         entry: &LedgerEntry,
+        key: &LedgerKey,
         restored: &RestoredEntries,
+        processed_keys: &mut HashSet<LedgerKey>,
     ) {
-        if let Ok(key) = crate::delta::entry_to_key(entry) {
-            // For hot archive restores and live bucket list restores (expired TTL),
-            // emit RESTORED instead of CREATED.
-            // This matches stellar-core's processOpLedgerEntryChanges behavior.
-            if restored.hot_archive.contains(&key) || restored.live_bucket_list.contains(&key) {
-                changes.push(LedgerEntryChange::Restored(entry.clone()));
-                return;
-            }
+        // For hot archive restores and live bucket list restores (expired TTL),
+        // emit RESTORED instead of CREATED.
+        // This matches stellar-core's processOpLedgerEntryChanges behavior.
+        if restored.hot_archive.contains(key) || restored.live_bucket_list.contains(key) {
+            changes.push(LedgerEntryChange::Restored(entry.clone()));
+        } else {
+            changes.push(LedgerEntryChange::Created(entry.clone()));
         }
-        changes.push(LedgerEntryChange::Created(entry.clone()));
+        processed_keys.insert(key.clone());
     }
 
     let mut changes: Vec<LedgerEntryChange> = Vec::new();
-
-    // Build final values for each updated key (used for Soroban deduplication)
-    let mut final_updated: HashMap<Vec<u8>, LedgerEntry> = HashMap::new();
-    for entry in updated {
-        let key_bytes = entry_key_bytes(entry);
-        final_updated.insert(key_bytes, entry.clone());
-    }
+    let mut processed_keys: HashSet<LedgerKey> = HashSet::new();
 
     // For Soroban operations with footprint, use change_order but sort consecutive Soroban creates by key_hash.
     // For classic operations, use change_order to preserve execution order.
@@ -622,8 +516,6 @@ pub(super) fn build_entry_changes_with_hot_archive(
     // the positions of classic entry changes (Account, Trustline) while sorting Soroban creates
     // (TTL, ContractData, ContractCode) by their associated key_hash to match stellar-core behavior.
     if footprint.is_some() {
-        use std::collections::HashSet;
-
         fn is_soroban_entry(entry: &LedgerEntry) -> bool {
             matches!(
                 &entry.data,
@@ -634,7 +526,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
         }
 
         // Track which keys have been created (for deduplication)
-        let mut created_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut created_keys: HashSet<LedgerKey> = HashSet::new();
 
         // Process change_order to preserve execution sequence
         // Collect groups of changes: either single updates/deletes or consecutive Soroban creates
@@ -733,31 +625,38 @@ pub(super) fn build_entry_changes_with_hot_archive(
 
                     for (idx, _) in entries_with_sort {
                         let entry = &created[idx];
-                        let key_bytes = entry_key_bytes(entry);
-                        if !created_keys.contains(&key_bytes) {
-                            created_keys.insert(key_bytes);
-                            push_created_or_restored(&mut changes, entry, restored);
+                        if let Ok(key) = crate::delta::entry_to_key(entry) {
+                            if !created_keys.contains(&key) {
+                                created_keys.insert(key.clone());
+                                push_created_or_restored(
+                                    &mut changes,
+                                    entry,
+                                    &key,
+                                    restored,
+                                    &mut processed_keys,
+                                );
+                            }
                         }
                     }
                 }
                 ChangeGroup::ClassicCreate { idx } => {
                     let entry = &created[idx];
-                    let key_bytes = entry_key_bytes(entry);
-                    if !created_keys.contains(&key_bytes) {
-                        created_keys.insert(key_bytes);
-                        push_created_or_restored(&mut changes, entry, restored);
+                    if let Ok(key) = crate::delta::entry_to_key(entry) {
+                        if !created_keys.contains(&key) {
+                            created_keys.insert(key.clone());
+                            push_created_or_restored(
+                                &mut changes,
+                                entry,
+                                &key,
+                                restored,
+                                &mut processed_keys,
+                            );
+                        }
                     }
                 }
                 ChangeGroup::SingleUpdate { idx } => {
                     if idx < updated.len() {
                         let post_state = &updated[idx];
-                        // Debug: trace when processing TTL update
-                        if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) = &post_state.data {
-                            tracing::debug!(
-                                "build_entry_changes: SingleUpdate processing TTL idx={}, key_hash={:x?}, live_until={}",
-                                idx, &ttl.key_hash.0[..8], ttl.live_until_ledger_seq
-                            );
-                        }
                         if let Ok(key) = crate::delta::entry_to_key(post_state) {
                             // NOTE: RO TTL bumps ARE included in transaction meta (per stellar-core
                             // setLedgerChangesFromSuccessfulOp which uses raw res.getModifiedEntryMap()).
@@ -767,6 +666,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                                 || restored.live_bucket_list.contains(&key)
                             {
                                 changes.push(LedgerEntryChange::Restored(post_state.clone()));
+                                processed_keys.insert(key);
                             } else {
                                 // Get pre-state from update_states or snapshot
                                 let pre_state = if idx < update_states.len() {
@@ -777,30 +677,11 @@ pub(super) fn build_entry_changes_with_hot_archive(
                                         .cloned()
                                         .or_else(|| state.snapshot_entry(&key))
                                 };
-                                // Debug: trace TTL pre_state
-                                if let stellar_xdr::curr::LedgerEntryData::Ttl(ttl) =
-                                    &post_state.data
-                                {
-                                    if let Some(ref state_entry) = pre_state {
-                                        if let stellar_xdr::curr::LedgerEntryData::Ttl(pre_ttl) =
-                                            &state_entry.data
-                                        {
-                                            tracing::debug!(
-                                                "build_entry_changes: TTL STATE+UPDATED: pre live_until={}, post live_until={}",
-                                                pre_ttl.live_until_ledger_seq, ttl.live_until_ledger_seq
-                                            );
-                                        }
-                                    } else {
-                                        tracing::debug!(
-                                            "build_entry_changes: TTL UPDATED without pre_state! key_hash={:x?}",
-                                            &ttl.key_hash.0[..8]
-                                        );
-                                    }
-                                }
                                 if let Some(state_entry) = pre_state {
                                     changes.push(LedgerEntryChange::State(state_entry));
                                 }
                                 changes.push(LedgerEntryChange::Updated(post_state.clone()));
+                                processed_keys.insert(key);
                             }
                         }
                     }
@@ -823,6 +704,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                                 changes.push(LedgerEntryChange::Restored(state_entry));
                             }
                             changes.push(LedgerEntryChange::Removed(key.clone()));
+                            processed_keys.insert(key.clone());
                         } else {
                             let pre_state = if idx < delete_states.len() {
                                 Some(delete_states[idx].clone())
@@ -836,6 +718,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                                 changes.push(LedgerEntryChange::State(state_entry));
                             }
                             changes.push(LedgerEntryChange::Removed(key.clone()));
+                            processed_keys.insert(key.clone());
                         }
                     }
                 }
@@ -845,21 +728,27 @@ pub(super) fn build_entry_changes_with_hot_archive(
         // For classic operations with change_order, use it to preserve execution order.
         // Only deduplicate creates - once an entry is created, subsequent references are updates.
         // Updates are NOT deduplicated - each update in change_order gets its own STATE/UPDATED pair.
-        use std::collections::HashSet;
 
         // Track which keys have been created to avoid duplicate creates
-        let mut created_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut created_keys: HashSet<LedgerKey> = HashSet::new();
 
         for change_ref in change_order {
             match change_ref {
                 henyey_tx::ChangeRef::Created(idx) => {
                     if *idx < created.len() {
                         let entry = &created[*idx];
-                        let key_bytes = entry_key_bytes(entry);
-                        // Only emit create once per key
-                        if !created_keys.contains(&key_bytes) {
-                            created_keys.insert(key_bytes);
-                            push_created_or_restored(&mut changes, entry, restored);
+                        if let Ok(key) = crate::delta::entry_to_key(entry) {
+                            // Only emit create once per key
+                            if !created_keys.contains(&key) {
+                                created_keys.insert(key.clone());
+                                push_created_or_restored(
+                                    &mut changes,
+                                    entry,
+                                    &key,
+                                    restored,
+                                    &mut processed_keys,
+                                );
+                            }
                         }
                     }
                 }
@@ -873,6 +762,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                             {
                                 // Use entry value for hot archive restored entries
                                 changes.push(LedgerEntryChange::Restored(post_state.clone()));
+                                processed_keys.insert(key);
                             } else {
                                 // Normal update: STATE (pre-state) then UPDATED (post-state)
                                 // Use the pre-state stored in the delta at the same index
@@ -889,6 +779,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                                     changes.push(LedgerEntryChange::State(state_entry));
                                 }
                                 changes.push(LedgerEntryChange::Updated(post_state.clone()));
+                                processed_keys.insert(key);
                             }
                         }
                     }
@@ -912,6 +803,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                                 changes.push(LedgerEntryChange::Restored(state_entry));
                             }
                             changes.push(LedgerEntryChange::Removed(key.clone()));
+                            processed_keys.insert(key.clone());
                         } else {
                             // Use the pre-state stored in the delta at the same index
                             let pre_state = if *idx < delete_states.len() {
@@ -926,6 +818,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                                 changes.push(LedgerEntryChange::State(state_entry));
                             }
                             changes.push(LedgerEntryChange::Removed(key.clone()));
+                            processed_keys.insert(key.clone());
                         }
                     }
                 }
@@ -933,6 +826,14 @@ pub(super) fn build_entry_changes_with_hot_archive(
         }
     } else {
         // Fallback: no change_order available (e.g., fee/seq changes)
+        // Build final values for each updated key (only needed in this branch)
+        let mut final_updated: HashMap<LedgerKey, LedgerEntry> = HashMap::new();
+        for entry in updated {
+            if let Ok(key) = crate::delta::entry_to_key(entry) {
+                final_updated.insert(key, entry.clone());
+            }
+        }
+
         // Use type-grouped order: deleted -> updated -> created
         for key in deleted {
             if restored.hot_archive.contains(key) || restored.live_bucket_list.contains(key) {
@@ -944,6 +845,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
                     changes.push(LedgerEntryChange::Restored(state_entry));
                 }
                 changes.push(LedgerEntryChange::Removed(key.clone()));
+                processed_keys.insert(key.clone());
             } else {
                 if let Some(state_entry) = state_overrides
                     .get(key)
@@ -953,22 +855,22 @@ pub(super) fn build_entry_changes_with_hot_archive(
                     changes.push(LedgerEntryChange::State(state_entry));
                 }
                 changes.push(LedgerEntryChange::Removed(key.clone()));
+                processed_keys.insert(key.clone());
             }
         }
 
         // Deduplicate updated entries
-        use std::collections::HashSet;
-        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
         for entry in updated {
-            let key_bytes = entry_key_bytes(entry);
-            if !seen_keys.contains(&key_bytes) {
-                seen_keys.insert(key_bytes.clone());
-                if let Some(final_entry) = final_updated.get(&key_bytes) {
-                    if let Ok(key) = crate::delta::entry_to_key(final_entry) {
+            if let Ok(key) = crate::delta::entry_to_key(entry) {
+                if !seen_keys.contains(&key) {
+                    seen_keys.insert(key.clone());
+                    if let Some(final_entry) = final_updated.get(&key) {
                         if restored.hot_archive.contains(&key)
                             || restored.live_bucket_list.contains(&key)
                         {
                             changes.push(LedgerEntryChange::Restored(final_entry.clone()));
+                            processed_keys.insert(key);
                         } else {
                             if let Some(state_entry) = state_overrides
                                 .get(&key)
@@ -978,16 +880,23 @@ pub(super) fn build_entry_changes_with_hot_archive(
                                 changes.push(LedgerEntryChange::State(state_entry));
                             }
                             changes.push(LedgerEntryChange::Updated(final_entry.clone()));
+                            processed_keys.insert(key);
                         }
-                    } else {
-                        changes.push(LedgerEntryChange::Updated(final_entry.clone()));
                     }
                 }
             }
         }
 
         for entry in created {
-            push_created_or_restored(&mut changes, entry, restored);
+            if let Ok(key) = crate::delta::entry_to_key(entry) {
+                push_created_or_restored(
+                    &mut changes,
+                    entry,
+                    &key,
+                    restored,
+                    &mut processed_keys,
+                );
+            }
         }
     }
 
@@ -997,23 +906,7 @@ pub(super) fn build_entry_changes_with_hot_archive(
     // However, when restoring from live BucketList, only the TTL value will be modified,
     // so we have to manually insert the RESTORED meta for the Code/Data entry here."
     for (key, entry) in &restored.live_bucket_list_entries {
-        // Skip if this key was already processed (appears in updated or created)
-        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
-        let already_processed = changes.iter().any(|change| {
-            let change_key = match change {
-                LedgerEntryChange::State(e)
-                | LedgerEntryChange::Created(e)
-                | LedgerEntryChange::Updated(e)
-                | LedgerEntryChange::Restored(e) => crate::delta::entry_to_key(e).ok(),
-                LedgerEntryChange::Removed(k) => Some(k.clone()),
-            };
-            change_key
-                .and_then(|k| k.to_xdr(Limits::none()).ok())
-                .map(|b| b == key_bytes)
-                .unwrap_or(false)
-        });
-
-        if !already_processed {
+        if !processed_keys.contains(key) {
             changes.push(LedgerEntryChange::Restored(entry.clone()));
         }
     }
@@ -1024,40 +917,12 @@ pub(super) fn build_entry_changes_with_hot_archive(
     // When emitting RESTORED, we must update last_modified_ledger_seq to the current ledger,
     // matching stellar-core behavior.
     for (key, entry) in &restored.hot_archive_entries {
-        // Skip if this key was already processed (appears in updated or created)
-        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
-        let already_processed = changes.iter().any(|change| {
-            let change_key = match change {
-                LedgerEntryChange::State(e)
-                | LedgerEntryChange::Created(e)
-                | LedgerEntryChange::Updated(e)
-                | LedgerEntryChange::Restored(e) => crate::delta::entry_to_key(e).ok(),
-                LedgerEntryChange::Removed(k) => Some(k.clone()),
-            };
-            change_key
-                .and_then(|k| k.to_xdr(Limits::none()).ok())
-                .map(|b| b == key_bytes)
-                .unwrap_or(false)
-        });
-
-        if !already_processed {
+        if !processed_keys.contains(key) {
             // Clone the entry and update last_modified_ledger_seq to current ledger
             let mut restored_entry = entry.clone();
             restored_entry.last_modified_ledger_seq = current_ledger_seq;
             changes.push(LedgerEntryChange::Restored(restored_entry));
         }
-    }
-
-    // Debug: log final output
-    for (i, change) in changes.iter().enumerate() {
-        let change_type = match change {
-            LedgerEntryChange::State(_) => "STATE",
-            LedgerEntryChange::Created(_) => "CREATED",
-            LedgerEntryChange::Updated(_) => "UPDATED",
-            LedgerEntryChange::Restored(_) => "RESTORED",
-            LedgerEntryChange::Removed(_) => "REMOVED",
-        };
-        tracing::debug!("build_entry_changes: OUTPUT[{}] = {}", i, change_type);
     }
 
     LedgerEntryChanges(changes.try_into().unwrap_or_default())
@@ -1079,15 +944,6 @@ pub(super) fn build_transaction_meta(
     emit_soroban_tx_meta_ext_v1: bool,
     enable_soroban_diagnostic_events: bool,
 ) -> TransactionMeta {
-    // Debug: log tx_changes_before and op_changes counts
-    let tx_before_count = tx_changes_before.len();
-    let op_counts: Vec<usize> = op_changes.iter().map(|c| c.len()).collect();
-    let total_op_changes: usize = op_counts.iter().sum();
-    tracing::debug!(
-        "build_transaction_meta: tx_changes_before={}, op_changes={:?}, total_op_changes={}, grand_total={}",
-        tx_before_count, op_counts, total_op_changes, tx_before_count + total_op_changes
-    );
-
     let operations: Vec<OperationMetaV2> = op_changes
         .into_iter()
         .zip(op_events)
