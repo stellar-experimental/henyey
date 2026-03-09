@@ -5,11 +5,10 @@
 Henyey's ledger close time is 1.88x slower than stellar-core v25.2.0 on the same
 hardware, same ledger range. The gap is **149ms** per ledger (317.5ms vs 168.5ms).
 
-**Current status**: After Steps 1–2 + 4. A/B benchmark on 1000 ledgers (61349000–61350000)
-shows Step 4 reduced mean from **586.9ms → 346.1ms** (−41%), a **240.8ms** improvement.
-The large delta suggests the baseline also includes gains from commit `6ecd777` (incremental
-mutation tracking refinement). Remaining optimization targets: executor setup (10.5ms),
-fee_seq (15ms), meta construction (15-25ms).
+**Current status**: Steps 1, 2, 2b, 3, and 4 are done. A/B benchmarks on 1000 ledgers
+confirm Step 4 (unified parsing) and Step 3 (offer map split) together save ~250ms.
+Remaining optimization targets: meta construction via Arc<LedgerEntry> (15-25ms),
+fee_seq streamlining (5-10ms), minor executor setup caching (2-5ms).
 
 ## Root Cause
 
@@ -343,8 +342,8 @@ For each step:
 **Projected worst case: ~281ms (1.67x stellar-core)**
 
 The 220ms acceptance target is not reachable with the remaining micro-optimization
-steps alone. Closing the gap further would require structural changes — see
-"Options for Further Optimization" below.
+steps alone. Closing the gap further would require structural changes like
+Arc<LedgerEntry> — see "Remaining Optimization Targets" below.
 
 ---
 
