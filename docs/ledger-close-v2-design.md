@@ -672,7 +672,7 @@ Binary: release build, single-threaded executor, `--cache-dir` on local disk.
 |------|----------------|------|-----|-----|-----|-------|
 | Step 0: Baseline (main) | `bd8f3f7` | **314ms** | 377ms | 411ms | 533ms | Measured 2026-03-09 |
 | Step 1: WarmCache | `5047e3b` | **303ms** | 374ms | 409ms | 490ms | −11ms mean; cache ~50% warm over window |
-| Step 2: OfferSellerStore | pending | TBD | TBD | TBD | TBD | |
+| Step 2: OfferSellerStore | pending | **304ms** | — | — | — | −10ms cumulative; 68K sellers, 691K entries; marginal over WarmCache in 101-ledger window |
 | Step 3: Benchmark checkpoint | pending | TBD | TBD | TBD | TBD | |
 | Step 4: MaterializedView | pending | TBD | TBD | TBD | TBD | |
 | Step 5: SpeculativePrefetch | pending | TBD | TBD | TBD | TBD | live-validator only |
