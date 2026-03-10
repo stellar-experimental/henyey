@@ -161,6 +161,7 @@ pub use signature_checker::{collect_signers_for_account, SignatureChecker};
 pub use validation::{
     validate_basic, validate_fee, validate_full, validate_ledger_bounds, validate_sequence,
     validate_signatures, validate_structure, validate_time_bounds, verify_signature_with_key,
+    verify_signature_with_raw_key,
     LedgerContext, ValidationError,
 };
 

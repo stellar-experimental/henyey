@@ -39,7 +39,7 @@
 //! ```
 
 use henyey_common::{Hash256, NetworkId};
-use henyey_crypto::{verify_hash, PublicKey, Signature};
+use henyey_crypto::{PublicKey, Signature};
 use stellar_xdr::curr::{
     AccountEntry, DecoratedSignature, Preconditions, SignerKey, TransactionEnvelope,
 };
@@ -828,17 +828,29 @@ pub fn verify_signature_with_key(
     sig: &DecoratedSignature,
     public_key: &PublicKey,
 ) -> bool {
+    verify_signature_with_raw_key(tx_hash, sig, public_key.as_bytes())
+}
+
+/// Like [`verify_signature_with_key`] but accepts raw 32-byte public key bytes.
+///
+/// Avoids ed25519 point decompression (~35μs) when the signature verification
+/// cache already contains the result. This matches stellar-core's approach where
+/// `PubKeyUtils::verifySig` checks the cache using raw bytes before any crypto.
+pub fn verify_signature_with_raw_key(
+    tx_hash: &henyey_common::Hash256,
+    sig: &DecoratedSignature,
+    key_bytes: &[u8; 32],
+) -> bool {
     // Check hint matches
-    let key_bytes = public_key.as_bytes();
     let expected_hint = [key_bytes[28], key_bytes[29], key_bytes[30], key_bytes[31]];
 
     if sig.hint.0 != expected_hint {
         return false;
     }
 
-    // Verify signature
+    // Verify signature (decompresses public key only on cache miss)
     if let Ok(signature) = Signature::try_from(&sig.signature) {
-        verify_hash(public_key, tx_hash, &signature).is_ok()
+        henyey_crypto::verify_hash_from_raw_key(key_bytes, tx_hash, &signature).is_ok()
     } else {
         false
     }

@@ -118,26 +118,25 @@ pub(super) fn has_sufficient_signer_weight(
     let mut counted: HashSet<Hash256> = HashSet::new();
 
     // Master key signer.
-    if let Ok(pk) = henyey_crypto::PublicKey::try_from(&account.account_id.0) {
-        let master_weight = account.thresholds.0[0] as u32;
-        tracing::trace!(
-            master_weight = master_weight,
-            required_weight = required_weight,
-            num_signatures = signatures.len(),
-            num_signers = account.signers.len(),
-            thresholds = ?account.thresholds.0,
-            "Checking signature weight"
-        );
-        if master_weight > 0 {
-            let has_sig = has_ed25519_signature(tx_hash, signatures, &pk);
-            tracing::trace!(has_master_sig = has_sig, "Master key signature check");
-            if has_sig {
-                let id = signer_key_id(&SignerKey::Ed25519(stellar_xdr::curr::Uint256(
-                    *pk.as_bytes(),
-                )));
-                if counted.insert(id) {
-                    total = total.saturating_add(master_weight);
-                }
+    let master_key_bytes = account_id_to_key(&account.account_id);
+    let master_weight = account.thresholds.0[0] as u32;
+    tracing::trace!(
+        master_weight = master_weight,
+        required_weight = required_weight,
+        num_signatures = signatures.len(),
+        num_signers = account.signers.len(),
+        thresholds = ?account.thresholds.0,
+        "Checking signature weight"
+    );
+    if master_weight > 0 {
+        let has_sig = has_ed25519_signature_raw(tx_hash, signatures, &master_key_bytes);
+        tracing::trace!(has_master_sig = has_sig, "Master key signature check");
+        if has_sig {
+            let id = signer_key_id(&SignerKey::Ed25519(stellar_xdr::curr::Uint256(
+                master_key_bytes,
+            )));
+            if counted.insert(id) {
+                total = total.saturating_add(master_weight);
             }
         }
     }
@@ -155,10 +154,8 @@ pub(super) fn has_sufficient_signer_weight(
 
         match key {
             SignerKey::Ed25519(key) => {
-                if let Ok(pk) = henyey_crypto::PublicKey::from_bytes(&key.0) {
-                    if has_ed25519_signature(tx_hash, signatures, &pk) && counted.insert(id) {
-                        total = total.saturating_add(signer.weight);
-                    }
+                if has_ed25519_signature_raw(tx_hash, signatures, &key.0) && counted.insert(id) {
+                    total = total.saturating_add(signer.weight);
                 }
             }
             SignerKey::PreAuthTx(key) => {
@@ -194,11 +191,7 @@ pub(super) fn has_required_extra_signers(
 ) -> bool {
     extra_signers.iter().all(|signer| match signer {
         SignerKey::Ed25519(key) => {
-            if let Ok(pk) = henyey_crypto::PublicKey::from_bytes(&key.0) {
-                has_ed25519_signature(tx_hash, signatures, &pk)
-            } else {
-                false
-            }
+            has_ed25519_signature_raw(tx_hash, signatures, &key.0)
         }
         SignerKey::PreAuthTx(key) => key.0 == tx_hash.0,
         SignerKey::HashX(key) => has_hashx_signature(signatures, key),
@@ -643,14 +636,14 @@ pub(super) fn signer_key_id(key: &SignerKey) -> Hash256 {
     Hash256::hash(&bytes)
 }
 
-pub(super) fn has_ed25519_signature(
+pub(super) fn has_ed25519_signature_raw(
     tx_hash: &Hash256,
     signatures: &[stellar_xdr::curr::DecoratedSignature],
-    pk: &henyey_crypto::PublicKey,
+    key_bytes: &[u8; 32],
 ) -> bool {
     signatures
         .iter()
-        .any(|sig| validation::verify_signature_with_key(tx_hash, sig, pk))
+        .any(|sig| validation::verify_signature_with_raw_key(tx_hash, sig, key_bytes))
 }
 
 pub(super) fn has_hashx_signature(

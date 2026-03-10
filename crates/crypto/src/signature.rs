@@ -222,6 +222,50 @@ pub fn verify_hash(
     result
 }
 
+/// Verifies a signature over a hash value from raw public key bytes.
+///
+/// Like [`verify_hash`], but accepts raw 32-byte public key bytes instead of a
+/// [`PublicKey`]. This avoids ed25519 point decompression (~35μs) on cache hits.
+/// Matches stellar-core's `PubKeyUtils::verifySig` which checks the signature
+/// cache using raw bytes before touching the crypto library.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::InvalidSignature`] if verification fails.
+/// Returns [`CryptoError::InvalidPublicKey`] if the raw bytes are not a valid
+/// ed25519 public key (only checked on cache miss).
+pub fn verify_hash_from_raw_key(
+    pubkey_bytes: &[u8; 32],
+    hash: &Hash256,
+    signature: &Signature,
+) -> Result<(), CryptoError> {
+    let cache_key = compute_cache_key(pubkey_bytes, signature.as_bytes(), hash.as_bytes());
+
+    // Check cache — no decompression needed
+    {
+        let cache = SIG_VERIFY_CACHE.lock().unwrap();
+        if let Some(result) = cache.get(&cache_key) {
+            return if result {
+                Ok(())
+            } else {
+                Err(CryptoError::InvalidSignature)
+            };
+        }
+    }
+
+    // Cache miss — decompress public key and verify
+    let public_key = PublicKey::from_bytes(pubkey_bytes)?;
+    let result = public_key.verify(hash.as_bytes(), signature);
+
+    // Store result in cache
+    {
+        let mut cache = SIG_VERIFY_CACHE.lock().unwrap();
+        cache.insert(cache_key, result.is_ok());
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

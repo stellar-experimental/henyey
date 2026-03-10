@@ -36,7 +36,7 @@
 //! ```
 
 use henyey_common::Hash256;
-use henyey_crypto::{verify_hash, PublicKey, Signature};
+use henyey_crypto::{PublicKey, Signature};
 use std::collections::HashMap;
 use stellar_xdr::curr::{DecoratedSignature, Signer, SignerKey, SignerKeyType};
 
@@ -284,16 +284,12 @@ fn verify_ed25519(sig: &DecoratedSignature, signer: &Signer, contents_hash: &Has
         return false;
     }
 
-    // Verify the cryptographic signature
-    let Ok(public_key) = PublicKey::from_bytes(&key_bytes.0) else {
-        return false;
-    };
-
+    // Verify the cryptographic signature (decompresses public key only on cache miss)
     let Ok(signature) = Signature::try_from(&sig.signature) else {
         return false;
     };
 
-    verify_hash(&public_key, contents_hash, &signature).is_ok()
+    henyey_crypto::verify_hash_from_raw_key(&key_bytes.0, contents_hash, &signature).is_ok()
 }
 
 /// Verify an Ed25519 signed payload signature.

@@ -3913,17 +3913,15 @@ impl<'a> SignatureTracker<'a> {
                     continue;
                 }
                 if let SignerKey::Ed25519(ed_key) = key {
-                    if let Ok(pk) = henyey_crypto::PublicKey::from_bytes(&ed_key.0) {
-                        if validation::verify_signature_with_key(self.tx_hash, sig, &pk) {
-                            self.used[sig_idx] = true;
-                            let w = std::cmp::min(*weight, 255) as i32;
-                            total_weight += w;
-                            consumed_ed25519.insert(*signer_idx);
-                            if total_weight >= needed_weight {
-                                return true;
-                            }
-                            break;
+                    if validation::verify_signature_with_raw_key(self.tx_hash, sig, &ed_key.0) {
+                        self.used[sig_idx] = true;
+                        let w = std::cmp::min(*weight, 255) as i32;
+                        total_weight += w;
+                        consumed_ed25519.insert(*signer_idx);
+                        if total_weight >= needed_weight {
+                            return true;
                         }
+                        break;
                     }
                 }
             }

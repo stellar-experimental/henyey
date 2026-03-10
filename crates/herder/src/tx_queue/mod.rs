@@ -1818,11 +1818,7 @@ fn extra_signers_satisfied(
 
     Ok(extra_signers.iter().all(|signer| match signer {
         SignerKey::Ed25519(key) => {
-            if let Ok(pk) = henyey_crypto::PublicKey::from_bytes(&key.0) {
-                has_ed25519_signature(&tx_hash, signatures, &pk)
-            } else {
-                false
-            }
+            has_ed25519_signature(&tx_hash, signatures, &key.0)
         }
         SignerKey::PreAuthTx(key) => key.0 == tx_hash.0,
         SignerKey::HashX(key) => has_hashx_signature(signatures, key),
@@ -1869,11 +1865,11 @@ fn precondition_hash_and_signatures<'a>(
 fn has_ed25519_signature(
     tx_hash: &Hash256,
     signatures: &[DecoratedSignature],
-    pk: &henyey_crypto::PublicKey,
+    key_bytes: &[u8; 32],
 ) -> bool {
     signatures
         .iter()
-        .any(|sig| henyey_tx::validation::verify_signature_with_key(tx_hash, sig, pk))
+        .any(|sig| henyey_tx::verify_signature_with_raw_key(tx_hash, sig, key_bytes))
 }
 
 fn has_hashx_signature(
