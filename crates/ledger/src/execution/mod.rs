@@ -321,6 +321,12 @@ pub struct TransactionExecutionResult {
     pub op_type_timings: HashMap<OperationType, (u64, u32)>,
     /// Total transaction execution time in microseconds.
     pub exec_time_us: u64,
+    /// Sub-phase timings (microseconds) for profiling.
+    pub validation_us: u64,
+    pub fee_seq_us: u64,
+    pub footprint_us: u64,
+    pub ops_us: u64,
+    pub meta_build_us: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +363,11 @@ fn failed_result(failure: ExecutionFailure, error: &str) -> TransactionExecution
         hot_archive_restored_keys: Vec::new(),
         op_type_timings: HashMap::new(),
         exec_time_us: 0,
+        validation_us: 0,
+        fee_seq_us: 0,
+        footprint_us: 0,
+        ops_us: 0,
+        meta_build_us: 0,
     }
 }
 
@@ -2393,6 +2404,11 @@ impl TransactionExecutor {
             hot_archive_restored_keys: Vec::new(),
             op_type_timings: HashMap::new(),
             exec_time_us: total_us,
+            validation_us: pre.validation_us,
+            fee_seq_us: pre.fee_seq_us,
+            footprint_us: 0,
+            ops_us: 0,
+            meta_build_us: 0,
         }
     }
 
@@ -3170,6 +3186,11 @@ impl TransactionExecutor {
             hot_archive_restored_keys: collected_hot_archive_keys.into_iter().collect(),
             op_type_timings,
             exec_time_us: total_us,
+            validation_us,
+            fee_seq_us,
+            footprint_us,
+            ops_us,
+            meta_build_us: meta_us,
         })
     }
 

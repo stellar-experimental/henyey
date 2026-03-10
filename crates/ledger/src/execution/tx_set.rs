@@ -393,6 +393,7 @@ pub fn execute_soroban_parallel_phase(
     // Soroban operations themselves return empty from collect_prefetch_keys (their
     // state is in-memory via InMemorySorobanState), but fee source account loading
     // in each cluster benefits from the prefetch cache.
+    let prefetch_us;
     {
         let prefetch_start = std::time::Instant::now();
         let mut all_keys = std::collections::HashSet::new();
@@ -409,16 +410,21 @@ pub fn execute_soroban_parallel_phase(
         }
         let keys_vec: Vec<LedgerKey> = all_keys.into_iter().collect();
         let stats = snapshot.prefetch(&keys_vec)?;
+        prefetch_us = prefetch_start.elapsed().as_micros() as u64;
         tracing::debug!(
             requested = stats.requested,
             loaded = stats.loaded,
-            elapsed_ms = prefetch_start.elapsed().as_millis() as u64,
+            prefetch_us,
             "Prefetched ledger keys for Soroban parallel phase"
         );
     }
 
     // Track position in the flattened pre_charged_fees vector.
     let mut pre_charge_offset: usize = 0;
+
+    let mut total_prior_stage_us: u64 = 0;
+    let mut total_stage_clusters_us: u64 = 0;
+    let mut total_result_merge_us: u64 = 0;
 
     for (stage_idx, stage) in phase.stages.iter().enumerate() {
         if stage.is_empty() {
@@ -432,7 +438,9 @@ pub fn execute_soroban_parallel_phase(
         // stage 0 clusters see classic modifications (e.g., fee deductions on
         // shared accounts).  PriorStageState::from_delta bundles both
         // current_entries() and dead_entries() to match this behavior.
+        let prior_stage_start = std::time::Instant::now();
         let prior_stage = PriorStageState::from_delta(delta);
+        total_prior_stage_us += prior_stage_start.elapsed().as_micros() as u64;
 
         // Slice pre_charged_fees for this stage's clusters.
         let stage_tx_count: usize = stage.iter().map(|c| c.len()).sum();
@@ -441,6 +449,7 @@ pub fn execute_soroban_parallel_phase(
         // Execute each cluster with its own executor, then merge results.
         // Clusters within a stage are independent (no footprint conflicts)
         // so they can be executed with isolated state.
+        let stage_clusters_start = std::time::Instant::now();
         let cluster_results = execute_stage_clusters(
             snapshot,
             stage,
@@ -464,8 +473,10 @@ pub fn execute_soroban_parallel_phase(
                 pre_charged_fees: stage_pre_charged,
             },
         )?;
+        total_stage_clusters_us += stage_clusters_start.elapsed().as_micros() as u64;
 
         // Merge cluster results. Use max id_pool across clusters.
+        let result_merge_start = std::time::Instant::now();
         for cr in &cluster_results {
             if cr.id_pool > id_pool {
                 id_pool = cr.id_pool;
@@ -476,6 +487,7 @@ pub fn execute_soroban_parallel_phase(
             all_hot_archive_restored_keys
                 .extend(cr.hot_archive_restored_keys.iter().cloned());
         }
+        total_result_merge_us += result_merge_start.elapsed().as_micros() as u64;
 
         // Advance global TX offset and pre_charge_offset for next stage.
         global_tx_offset += stage_tx_count;
@@ -493,6 +505,7 @@ pub fn execute_soroban_parallel_phase(
     // Apply fee refunds after ALL transactions (matching stellar-core processPostTxSetApply).
     // Account entries are already in the main delta from cluster merges, so we modify
     // them directly rather than using a separate executor.
+    let refund_start = std::time::Instant::now();
     let flat_txs: Vec<&TransactionEnvelope> = phase
         .stages
         .iter()
@@ -516,6 +529,18 @@ pub fn execute_soroban_parallel_phase(
     if total_refunds > 0 {
         delta.record_fee_pool_delta(-total_refunds);
     }
+    let refund_us = refund_start.elapsed().as_micros() as u64;
+
+    tracing::debug!(
+        ledger_seq = context.sequence,
+        stages = phase.stages.len(),
+        prefetch_us,
+        prior_stage_us = total_prior_stage_us,
+        stage_clusters_us = total_stage_clusters_us,
+        result_merge_us = total_result_merge_us,
+        refund_us,
+        "PROFILE soroban_phase"
+    );
 
     Ok(TxSetResult {
         results: all_results,
@@ -671,6 +696,9 @@ pub(super) fn execute_single_cluster(
     soroban: &SorobanContext<'_>,
     params: &ClusterParams<'_>,
 ) -> Result<(TxSetResult, LedgerDelta, i64)> {
+    let cluster_start = std::time::Instant::now();
+
+    let executor_setup_start = std::time::Instant::now();
     let mut executor = TransactionExecutor::new(
         context,
         params.id_pool,
@@ -690,18 +718,21 @@ pub(super) fn execute_single_cluster(
     if let Some(ref ss) = soroban.soroban_state {
         executor.set_soroban_state(ss.clone());
     }
+    let executor_setup_us = executor_setup_start.elapsed().as_micros() as u64;
 
     // Pre-load entries from prior stages so this cluster's executor sees
     // Pre-load entries and deletions from prior stages so this cluster's
     // executor sees restorations, modifications, and deletions made by
     // earlier stages.  This matches stellar-core
     // `collectClusterFootprintEntriesFromGlobal`.
+    let prior_load_start = std::time::Instant::now();
     for entry in &params.prior_stage.entries {
         executor.state.load_entry(entry.clone());
     }
     for key in &params.prior_stage.deleted_keys {
         executor.state.mark_entry_deleted(key);
     }
+    let prior_load_us = prior_load_start.elapsed().as_micros() as u64;
 
     let mut results = Vec::with_capacity(cluster.len());
     let mut tx_results = Vec::with_capacity(cluster.len());
@@ -714,19 +745,28 @@ pub(super) fn execute_single_cluster(
         "Starting cluster execution"
     );
 
+    let mut agg_flush_ttl_us: u64 = 0;
+    let mut agg_snapshot_delta_us: u64 = 0;
+    let mut agg_execute_us: u64 = 0;
+    let mut agg_result_build_us: u64 = 0;
+
     for (local_idx, (tx, tx_base_fee)) in cluster.iter().enumerate() {
         // Flush pending RO TTL bumps for keys in this TX's write footprint.
         // This matches stellar-core's flushRoTTLBumpsInTxWriteFootprint:
         // bumped TTL values from earlier TXs' read-only bumps must be visible
         // to write TXs for correct rent fee calculation. Must happen BEFORE
         // snapshot_delta so flushed values are not rolled back on TX failure.
+        let flush_start = std::time::Instant::now();
         if let Some(write_keys) = soroban_write_footprint(tx) {
             executor
                 .state_mut()
                 .flush_ro_ttl_bumps_for_write_footprint(&write_keys);
         }
+        agg_flush_ttl_us += flush_start.elapsed().as_micros() as u64;
 
+        let snap_start = std::time::Instant::now();
         executor.state.snapshot_delta();
+        agg_snapshot_delta_us += snap_start.elapsed().as_micros() as u64;
 
         let tx_fee = tx_base_fee.unwrap_or(context.base_fee);
         let global_idx = cluster_offset + local_idx;
@@ -742,6 +782,7 @@ pub(super) fn execute_single_cluster(
         // parallelApply which returns {false, {}} when !txResult.isSuccess()
         // after preParallelApply detected insufficient balance.
         let pre = &params.pre_charged_fees[local_idx];
+        let exec_start = std::time::Instant::now();
         let mut result = executor.execute_transaction_with_fee_mode_and_pre_state(
             snapshot,
             tx,
@@ -751,10 +792,12 @@ pub(super) fn execute_single_cluster(
             None,
             pre.should_apply,
         )?;
+        agg_execute_us += exec_start.elapsed().as_micros() as u64;
 
         // Override fee_charged and fee_changes from pre-deduction.
         // The executor computed fee_refund correctly (based on resource consumption),
         // but fee_charged=0 because deduct_fee=false. We use the pre-charged values.
+        let result_build_start = std::time::Instant::now();
         result.fee_charged = pre.charged_fee.saturating_sub(result.fee_refund);
         result.fee_changes = Some(pre.fee_changes.clone());
 
@@ -789,10 +832,13 @@ pub(super) fn execute_single_cluster(
         results.push(result);
         tx_results.push(tx_result);
         tx_result_metas.push(tx_result_meta);
+        agg_result_build_us += result_build_start.elapsed().as_micros() as u64;
     }
 
     // Flush deferred RO TTL bumps within this cluster.
+    let flush_final_start = std::time::Instant::now();
     executor.state_mut().flush_deferred_ro_ttl_bumps();
+    let flush_final_us = flush_final_start.elapsed().as_micros() as u64;
 
     // Collect hot archive restored keys from SUCCESSFUL transactions only.
     // With the should_apply early-exit fix, skipped TXs no longer produce hot
@@ -811,8 +857,27 @@ pub(super) fn execute_single_cluster(
     let final_id_pool = executor.id_pool();
 
     // Apply this cluster's state changes to a local delta.
+    let apply_delta_start = std::time::Instant::now();
     let mut cluster_delta = LedgerDelta::new(context.sequence);
     executor.apply_to_delta(snapshot, &mut cluster_delta)?;
+    let apply_delta_us = apply_delta_start.elapsed().as_micros() as u64;
+
+    let cluster_total_us = cluster_start.elapsed().as_micros() as u64;
+    tracing::debug!(
+        ledger_seq = context.sequence,
+        cluster_offset,
+        tx_count = cluster.len(),
+        cluster_total_us,
+        executor_setup_us,
+        prior_load_us,
+        flush_ttl_us = agg_flush_ttl_us,
+        snapshot_delta_us = agg_snapshot_delta_us,
+        execute_us = agg_execute_us,
+        result_build_us = agg_result_build_us,
+        flush_final_us,
+        apply_delta_us,
+        "PROFILE cluster"
+    );
 
     Ok((
         TxSetResult {
@@ -892,6 +957,7 @@ pub(super) fn execute_stage_clusters(
 
     // Multi-cluster: spawn one blocking task per cluster on Tokio's thread pool.
     // Clone shared data for 'static closures (all clones are cheap / Arc-based).
+    let clone_start = std::time::Instant::now();
     let snapshot = snapshot.clone();
     let context = context.clone();
     let soroban_config = soroban.config.clone();
@@ -930,8 +996,10 @@ pub(super) fn execute_stage_clusters(
         }
         result
     };
+    let clone_setup_us = clone_start.elapsed().as_micros() as u64;
 
     // Build the async future that spawns per-cluster tasks and collects results.
+    let spawn_start = std::time::Instant::now();
     let spawn_and_collect = async {
         let mut tasks = Vec::with_capacity(clusters.len());
         for idx in 0..clusters.len() {
@@ -993,8 +1061,10 @@ pub(super) fn execute_stage_clusters(
                 tokio::runtime::Handle::current().block_on(spawn_and_collect)
             })
         };
+    let spawn_collect_us = spawn_start.elapsed().as_micros() as u64;
 
     // Merge results in cluster order (deterministic).
+    let merge_start = std::time::Instant::now();
     let mut cluster_results = Vec::with_capacity(thread_results.len());
     for result in thread_results {
         let (cr, cluster_delta, total_fees) = result?;
@@ -1004,6 +1074,16 @@ pub(super) fn execute_stage_clusters(
         }
         cluster_results.push(cr);
     }
+    let delta_merge_us = merge_start.elapsed().as_micros() as u64;
+
+    tracing::debug!(
+        ledger_seq = context.sequence,
+        num_clusters = cluster_results.len(),
+        clone_setup_us,
+        spawn_collect_us,
+        delta_merge_us,
+        "PROFILE stage_clusters"
+    );
 
     Ok(cluster_results)
 }

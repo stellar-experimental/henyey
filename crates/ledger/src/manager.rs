@@ -3148,7 +3148,9 @@ impl<'a> LedgerCloseContext<'a> {
             protocol_version_starts_from, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
         };
 
+        let prepare_start = std::time::Instant::now();
         let prepared = self.close_data.tx_set.prepare();
+        let prepare_us = prepare_start.elapsed().as_micros() as u64;
 
         if prepared.all_txs.is_empty() {
             self.tx_results.clear();
@@ -3156,6 +3158,7 @@ impl<'a> LedgerCloseContext<'a> {
         }
 
         // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution
+        let config_load_start = std::time::Instant::now();
         let soroban_config =
             crate::execution::load_soroban_config(&self.snapshot, self.prev_header.ledger_version);
         // Cache fee_write_1kb for LedgerCloseMetaExtV1 (set during commit phase).
@@ -3187,9 +3190,12 @@ impl<'a> LedgerCloseContext<'a> {
         // phase structure exists, even for single-stage single-cluster sets.
         let has_parallel = prepared.soroban_phase.is_some();
 
+        let config_load_us = config_load_start.elapsed().as_micros() as u64;
+
         // Take the persistent executor from the manager, or create a new one.
         // The executor's offer cache is preserved across ledger closes to avoid
         // reloading ~911K offers each time.
+        let executor_setup_start = std::time::Instant::now();
         let mut executor = self.manager.executor.lock().take();
         let is_new_executor = executor.is_none();
         let id_pool = self.snapshot.header().id_pool;
@@ -3244,7 +3250,9 @@ impl<'a> LedgerCloseContext<'a> {
             self.manager.config.emit_soroban_tx_meta_ext_v1,
             self.manager.config.enable_soroban_diagnostic_events,
         );
+        let executor_setup_us = executor_setup_start.elapsed().as_micros() as u64;
 
+        let mut fee_pre_deduct_us: u64 = 0;
         let mut tx_set_result =
             if has_parallel
                 && protocol_version_starts_from(
@@ -3259,6 +3267,7 @@ impl<'a> LedgerCloseContext<'a> {
                 // any transaction body executes. This matches stellar-core's
                 // processFeesSeqNums() which processes all phases' fees in order
                 // before any transaction applies.
+                let fee_pre_deduct_start = std::time::Instant::now();
                 let (classic_pre_charged, soroban_pre_charged, total_fee_pool) =
                     pre_deduct_all_fees_on_delta(
                         classic_txs,
@@ -3279,6 +3288,8 @@ impl<'a> LedgerCloseContext<'a> {
                         executor_ref.state_mut().load_entry(entry);
                     }
                 }
+
+                fee_pre_deduct_us = fee_pre_deduct_start.elapsed().as_micros() as u64;
 
                 // Execute classic phase (fees already deducted on delta).
                 let classic_start = std::time::Instant::now();
@@ -3368,6 +3379,7 @@ impl<'a> LedgerCloseContext<'a> {
         // Store the executor back for reuse on the next ledger close
         *self.manager.executor.lock() = executor;
 
+        let post_exec_start = std::time::Instant::now();
         // Prepend fee events for classic event emission.
         if classic_events.events_enabled(self.prev_header.ledger_version) {
             for (idx, meta) in tx_set_result.tx_result_metas.iter_mut().enumerate() {
@@ -3402,7 +3414,9 @@ impl<'a> LedgerCloseContext<'a> {
             .record_transactions(tx_count, success_count, op_count);
         self.stats.record_fees(fees_collected);
 
-        // Collect per-transaction perf data
+        // Collect per-transaction perf data and aggregate sub-phase timings
+        let mut agg_op_type_timings: HashMap<henyey_tx::OperationType, (u64, u32)> = HashMap::new();
+        let (mut agg_validation_us, mut agg_fee_seq_us, mut agg_footprint_us, mut agg_ops_us, mut agg_meta_build_us) = (0u64, 0u64, 0u64, 0u64, 0u64);
         for (i, result) in tx_set_result.results.iter().enumerate() {
             let hash_hex = if i < self.tx_results.len() {
                 Hash256::from(self.tx_results[i].transaction_hash.clone()).to_hex()[..16].to_string()
@@ -3418,7 +3432,50 @@ impl<'a> LedgerCloseContext<'a> {
                 exec_us: result.exec_time_us,
                 is_soroban,
             });
+            // Aggregate per-TX sub-phase timings
+            agg_validation_us += result.validation_us;
+            agg_fee_seq_us += result.fee_seq_us;
+            agg_footprint_us += result.footprint_us;
+            agg_ops_us += result.ops_us;
+            agg_meta_build_us += result.meta_build_us;
+            // Aggregate per-op-type timings across all TXs
+            for (op_type, (us, count)) in &result.op_type_timings {
+                let entry = agg_op_type_timings.entry(*op_type).or_insert((0, 0));
+                entry.0 += us;
+                entry.1 += count;
+            }
         }
+        let post_exec_us = post_exec_start.elapsed().as_micros() as u64;
+
+        // Build per-op-type timing summary sorted by time desc
+        let mut op_timing_vec: Vec<_> = agg_op_type_timings.iter().collect();
+        op_timing_vec.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        let op_timing_str: String = op_timing_vec
+            .iter()
+            .map(|(op, (us, count))| format!("{:?}:{}us×{}", op, us, count))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        // Emit comprehensive profiling line at debug level
+        debug!(
+            ledger_seq = self.close_data.ledger_seq,
+            tx_count = tx_count,
+            op_count = op_count,
+            prepare_us,
+            config_load_us,
+            executor_setup_us,
+            fee_pre_deduct_us,
+            classic_exec_us = self.timing_classic_exec_us,
+            soroban_exec_us = self.timing_soroban_exec_us,
+            post_exec_us,
+            agg_validation_us,
+            agg_fee_seq_us,
+            agg_footprint_us,
+            agg_ops_us,
+            agg_meta_build_us,
+            op_timings = %op_timing_str,
+            "PROFILE apply_txs"
+        );
 
         Ok(tx_set_result.results)
     }
