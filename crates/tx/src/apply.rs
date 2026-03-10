@@ -267,6 +267,11 @@ impl LedgerDelta {
         self.fee_charged += fee;
     }
 
+    /// Set fee_charged to an exact value (used by delta snapshot rollback).
+    pub fn set_fee_charged(&mut self, fee: i64) {
+        self.fee_charged = fee;
+    }
+
     /// Get all created entries.
     pub fn created_entries(&self) -> &[LedgerEntry] {
         &self.created

@@ -207,6 +207,17 @@ fn rollback_entries<K, V>(
 
 pub use offer_index::{AssetPair, OfferDescriptor, OfferIndex, OfferKey};
 
+/// Lightweight delta snapshot for TX-level rollback.
+/// Instead of cloning the entire LedgerDelta (O(N) entries), we capture just
+/// the vector lengths and fee_charged value. Since the delta is append-only
+/// between snapshot and rollback, truncating to these lengths restores the
+/// pre-TX state in O(1).
+#[derive(Clone)]
+struct DeltaSnapshot {
+    lengths: DeltaLengths,
+    fee_charged: i64,
+}
+
 pub struct SorobanState {
     pub contract_data: HashMap<ContractDataKey, ContractDataEntry>,
     pub contract_code: HashMap<[u8; 32], ContractCodeEntry>,
@@ -512,9 +523,11 @@ pub struct LedgerStateManager {
     /// Snapshot of id_pool for rollback. When an ID is generated during a transaction
     /// that later fails, the id_pool must be restored to its pre-transaction value.
     id_pool_snapshot: Option<u64>,
-    /// Snapshot of delta for rollback. Preserves committed changes from previous
-    /// transactions so they're not lost when the current transaction fails.
-    delta_snapshot: Option<LedgerDelta>,
+    /// Lightweight snapshot of delta for rollback. Instead of cloning the entire
+    /// delta (which grows with each TX), we save just the vector lengths + fee.
+    /// On rollback, we truncate the delta vectors to these saved lengths.
+    /// This reduces snapshot cost from O(N entries) to O(1).
+    delta_snapshot: Option<DeltaSnapshot>,
     /// Index of offers by asset pair for efficient best-offer lookups.
     /// This mirrors stellar-core's MultiOrderBook structure.
     offer_index: OfferIndex,
@@ -1056,7 +1069,10 @@ impl LedgerStateManager {
     /// if the current transaction fails and rolls back. Call this at the start of each
     /// transaction before any modifications.
     pub fn snapshot_delta(&mut self) {
-        self.delta_snapshot = Some(self.delta.clone());
+        self.delta_snapshot = Some(DeltaSnapshot {
+            lengths: self.delta.snapshot_lengths(),
+            fee_charged: self.delta.fee_charged(),
+        });
         self.deferred_ro_ttl_bumps_snapshot = Some(self.deferred_ro_ttl_bumps.clone());
     }
 
@@ -1795,7 +1811,10 @@ impl LedgerStateManager {
         // phase (before operations ran) and is restored via restore_delta_entries()
         // in execution.rs after rollback() returns.
         if let Some(snapshot) = self.delta_snapshot.take() {
-            self.delta = snapshot;
+            // Truncate delta vectors back to pre-TX lengths (O(1) instead of clone).
+            self.delta.truncate_to(&snapshot.lengths);
+            // Restore fee_charged to pre-TX value.
+            self.delta.set_fee_charged(snapshot.fee_charged);
         } else {
             // No snapshot - reset delta but preserve fee_charged.
             let fee_charged = self.delta.fee_charged();
