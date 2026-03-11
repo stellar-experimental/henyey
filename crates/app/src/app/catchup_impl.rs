@@ -974,7 +974,7 @@ impl App {
                             // getting the tx_set before any single peer evicts it.
                             let overlay = self.overlay().await;
                             if let Some(overlay) = overlay {
-                                match overlay.request_tx_set(&tx_set_hash.0).await {
+                                match overlay.request_tx_set(&stellar_xdr::curr::Uint256(tx_set_hash.0)).await {
                                     Ok(peer_count) => {
                                         requested_tx_sets += 1;
                                         tracing::debug!(

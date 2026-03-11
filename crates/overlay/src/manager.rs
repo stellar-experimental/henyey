@@ -51,7 +51,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::{
-    ErrorCode, PeerAddress as XdrPeerAddress, PeerAddressIp, SError, StellarMessage, StringM, VecM,
+    ErrorCode, PeerAddress as XdrPeerAddress, PeerAddressIp, SError, StellarMessage, StringM,
+    Uint256, VecM,
 };
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
@@ -161,10 +162,10 @@ fn compute_ping_hash(nanos: u128) -> stellar_xdr::curr::Uint256 {
 /// Extracted from `run_peer_loop` ping response matching for testability (G4).
 fn is_ping_response(
     ping_hash: Option<&stellar_xdr::curr::Uint256>,
-    hash_bytes: &[u8; 32],
+    hash: &stellar_xdr::curr::Uint256,
 ) -> bool {
     match ping_hash {
-        Some(ph) => ph.0 == *hash_bytes,
+        Some(ph) => ph.0 == hash.0,
         None => false,
     }
 }
@@ -1409,7 +1410,7 @@ impl OverlayManager {
                                                 .unwrap_or(henyey_common::Hash256::ZERO);
                                             // G4: check if this is a ping response
                                             if let Some(sent) = ping_sent_time {
-                                                if is_ping_response(ping_hash.as_ref(), &hash.0) {
+                                                if is_ping_response(ping_hash.as_ref(), &Uint256(hash.0)) {
                                                     let rtt = sent.elapsed();
                                                     debug!("Latency {}: {} ms", peer_id, rtt.as_millis());
                                                     last_ping_rtt = Some(rtt);
@@ -1422,7 +1423,7 @@ impl OverlayManager {
                                         StellarMessage::DontHave(dh) => {
                                             // G4: check if this DontHave is a ping response
                                             if let Some(sent) = ping_sent_time {
-                                                if is_ping_response(ping_hash.as_ref(), &dh.req_hash.0) {
+                                                if is_ping_response(ping_hash.as_ref(), &dh.req_hash) {
                                                     let rtt = sent.elapsed();
                                                     debug!("Latency {}: {} ms", peer_id, rtt.as_millis());
                                                     last_ping_rtt = Some(rtt);
@@ -2379,10 +2380,10 @@ impl OverlayManager {
     }
 
     /// Request a transaction set by hash from all peers.
-    pub async fn request_tx_set(&self, hash: &[u8; 32]) -> Result<usize> {
-        let message = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(*hash));
+    pub async fn request_tx_set(&self, hash: &Uint256) -> Result<usize> {
+        let message = StellarMessage::GetTxSet(hash.clone());
         tracing::info!(
-            hash = hex::encode(hash),
+            hash = hex::encode(&hash.0),
             "Requesting transaction set from peers"
         );
         self.broadcast(message).await
@@ -2391,11 +2392,11 @@ impl OverlayManager {
     /// Request a transaction set by hash from a specific peer.
     ///
     /// Used by ItemFetcher to request TxSets from individual peers with retry logic.
-    pub async fn send_get_tx_set(&self, peer_id: &PeerId, hash: &[u8; 32]) -> Result<()> {
-        let message = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(*hash));
+    pub async fn send_get_tx_set(&self, peer_id: &PeerId, hash: &Uint256) -> Result<()> {
+        let message = StellarMessage::GetTxSet(hash.clone());
         tracing::debug!(
             peer = %peer_id,
-            hash = hex::encode(hash),
+            hash = hex::encode(&hash.0),
             "Requesting transaction set from peer"
         );
         self.send_to(peer_id, message).await
@@ -2404,11 +2405,11 @@ impl OverlayManager {
     /// Request a quorum set by hash from a specific peer.
     ///
     /// Used by ItemFetcher to request QuorumSets from individual peers with retry logic.
-    pub async fn send_get_quorum_set(&self, peer_id: &PeerId, hash: &[u8; 32]) -> Result<()> {
-        let message = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(*hash));
+    pub async fn send_get_quorum_set(&self, peer_id: &PeerId, hash: &Uint256) -> Result<()> {
+        let message = StellarMessage::GetScpQuorumset(hash.clone());
         tracing::debug!(
             peer = %peer_id,
-            hash = hex::encode(hash),
+            hash = hex::encode(&hash.0),
             "Requesting quorum set from peer"
         );
         self.send_to(peer_id, message).await
@@ -2972,19 +2973,19 @@ mod tests {
 
         // Matching hash should be recognized as a ping response
         assert!(
-            is_ping_response(Some(&ping_hash_val), &ping_hash_val.0),
+            is_ping_response(Some(&ping_hash_val), &ping_hash_val),
             "DontHave with matching hash should be recognized as ping response"
         );
 
         // Non-matching hash should not match
         assert!(
-            !is_ping_response(Some(&ping_hash_val), &[0xff; 32]),
+            !is_ping_response(Some(&ping_hash_val), &Uint256([0xff; 32])),
             "DontHave with wrong hash should not match"
         );
 
         // No outstanding ping → no match
         assert!(
-            !is_ping_response(None, &ping_hash_val.0),
+            !is_ping_response(None, &ping_hash_val),
             "No outstanding ping should never match"
         );
     }
