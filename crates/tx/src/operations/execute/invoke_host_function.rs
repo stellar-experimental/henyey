@@ -106,6 +106,108 @@ fn validate_contract_ledger_entry(
     true
 }
 
+/// Validate all footprint entries against network config size limits.
+///
+/// This matches stellar-core's `addReads()` in `InvokeHostFunctionOpFrame.cpp` lines 475-482,
+/// which calls `validateContractLedgerEntry()` for every footprint entry BEFORE running
+/// the host. If any entry exceeds the configured limits, the TX fails with
+/// RESOURCE_LIMIT_EXCEEDED.
+fn validate_footprint_entry_sizes(
+    state: &LedgerStateManager,
+    soroban_data: &SorobanTransactionData,
+    soroban_config: &SorobanConfig,
+    current_ledger: u32,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+) -> bool {
+    let max_contract_size = soroban_config.max_contract_size_bytes;
+    let max_data_entry_size = soroban_config.max_contract_data_entry_size_bytes;
+
+    // Check all read-only footprint entries
+    for key in soroban_data.resources.footprint.read_only.iter() {
+        if !validate_footprint_entry(state, key, current_ledger, max_contract_size, max_data_entry_size, ttl_key_cache) {
+            return false;
+        }
+    }
+    // Check all read-write footprint entries
+    for key in soroban_data.resources.footprint.read_write.iter() {
+        if !validate_footprint_entry(state, key, current_ledger, max_contract_size, max_data_entry_size, ttl_key_cache) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Validate a single footprint entry's size against network config limits.
+///
+/// Matches stellar-core's behavior: only validate entries that are live (for soroban entries)
+/// or exist (for classic entries). Non-existent entries have size 0 and pass validation.
+fn validate_footprint_entry(
+    state: &LedgerStateManager,
+    key: &LedgerKey,
+    current_ledger: u32,
+    max_contract_size_bytes: u32,
+    max_contract_data_entry_size_bytes: u32,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+) -> bool {
+    // Only CONTRACT_CODE and CONTRACT_DATA can fail validation
+    if !matches!(key, LedgerKey::ContractCode(_) | LedgerKey::ContractData(_)) {
+        return true;
+    }
+
+    // Check if entry is live (has non-expired TTL)
+    let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
+    let is_live = match state.get_ttl(&key_hash) {
+        Some(ttl) => ttl.live_until_ledger_seq >= current_ledger,
+        None => false,
+    };
+
+    if !is_live {
+        // Dead/non-existent entries have entrySize=0 in stellar-core, which passes validation
+        return true;
+    }
+
+    // Get entry and compute XDR size
+    let entry: Option<LedgerEntry> = match key {
+        LedgerKey::ContractData(cd_key) => state
+            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+            .map(|cd| LedgerEntry {
+                last_modified_ledger_seq: 0, // doesn't affect size
+                data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
+                ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            }),
+        LedgerKey::ContractCode(cc_key) => {
+            state.get_contract_code(&cc_key.hash).map(|cc| LedgerEntry {
+                last_modified_ledger_seq: 0,
+                data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
+                ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            })
+        }
+        _ => None,
+    };
+
+    if let Some(entry) = entry {
+        if let Ok(bytes) = entry.to_xdr(Limits::none()) {
+            let entry_size = bytes.len();
+            if !validate_contract_ledger_entry(
+                key,
+                entry_size,
+                max_contract_size_bytes,
+                max_contract_data_entry_size_bytes,
+            ) {
+                tracing::warn!(
+                    entry_size,
+                    max_contract_size_bytes,
+                    max_contract_data_entry_size_bytes,
+                    key_type = ?std::mem::discriminant(key),
+                    "Footprint entry size exceeds limit during read phase"
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
 use super::{OperationExecutionResult, SorobanOperationMeta};
 use crate::soroban::{PersistentModuleCache, SorobanConfig, SorobanContext};
 use crate::state::LedgerStateManager;
@@ -199,13 +301,17 @@ fn execute_contract_invocation(
         )));
     }
 
-    if disk_read_bytes_exceeded(
-        state,
-        soroban_data,
-        context.protocol_version,
-        context.sequence,
-        ttl_key_cache,
-    ) {
+    if disk_read_bytes_exceeded(state, soroban_data, context.protocol_version, context.sequence, ttl_key_cache) {
+        return Ok(OperationExecutionResult::new(make_result(
+            InvokeHostFunctionResultCode::ResourceLimitExceeded,
+            Hash([0u8; 32]),
+        )));
+    }
+
+    // Validate all footprint entries against network config size limits.
+    // This matches stellar-core's addReads() which calls validateContractLedgerEntry()
+    // for every footprint entry BEFORE running the host.
+    if !validate_footprint_entry_sizes(state, soroban_data, soroban_config, context.sequence, ttl_key_cache) {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::ResourceLimitExceeded,
             Hash([0u8; 32]),
@@ -226,8 +332,7 @@ fn execute_contract_invocation(
         ttl_key_cache,
     ) {
         Ok(result) => {
-            // stellar-core check: event size (done first in collectEvents before
-            // recordStorageChanges in doApply, but logically we need this check)
+            // stellar-core check: event size (collectEvents in doApply)
             if soroban_config.tx_max_contract_events_size_bytes > 0
                 && result.contract_events_and_return_value_size
                     > soroban_config.tx_max_contract_events_size_bytes
@@ -2492,6 +2597,208 @@ mod tests {
             state.delta().created_entries().len(),
             0,
             "No entries should be created for a hot archive read-only restore"
+        );
+    }
+
+    /// Regression test for VE-14 / L61593050: validate_footprint_entry_sizes rejects
+    /// live entries that exceed network config limits during the read phase.
+    ///
+    /// At L61593050 TX 166, a fee bump InvokeHostFunction with instruction_limit=20M had
+    /// 45 footprint entries. The typed Soroban API (`invoke_host_function_typed`) skipped
+    /// XDR deserialization budget metering (~3M CPU instructions), so the TX succeeded when
+    /// it should have exceeded the 20M limit and returned ResourceLimitExceeded.
+    ///
+    /// Part of the VE-14 fix was adding `validate_footprint_entry_sizes()` to match
+    /// stellar-core's `addReads()` → `validateContractLedgerEntry()` behavior, which
+    /// validates all footprint entries against `maxContractSizeBytes` and
+    /// `maxContractDataEntrySizeBytes` during the read phase.
+    ///
+    /// The primary fix was switching from the typed API to the non-typed API
+    /// (`invoke_host_function`) which meters XDR deserialization against the host budget.
+    #[test]
+    fn test_validate_footprint_entry_sizes_rejects_oversized_live_entry() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xEEu8; 32])));
+        let contract_key = ScVal::U32(14);
+        let durability = ContractDataDurability::Persistent;
+
+        // Create a large ContractData entry that exceeds the limit
+        let large_val: Vec<u8> = vec![0xAB; 70000]; // > 64 KB
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+            val: ScVal::Bytes(large_val.try_into().unwrap()),
+        };
+        state.create_contract_data(cd_entry);
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+
+        // Give the entry a live TTL so it's considered live
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence + 100,
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: vec![key.clone()].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                disk_read_bytes: 100_000,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let config = SorobanConfig {
+            max_contract_size_bytes: 65536,
+            max_contract_data_entry_size_bytes: 65536,
+            ..SorobanConfig::default()
+        };
+
+        // Should return false (validation fails) because the live entry exceeds the limit
+        assert!(
+            !validate_footprint_entry_sizes(&state, &soroban_data, &config, context.sequence, None),
+            "VE-14: validate_footprint_entry_sizes should reject oversized live entry"
+        );
+    }
+
+    /// VE-14: validate_footprint_entry_sizes passes when entry is dead (expired TTL).
+    ///
+    /// In stellar-core, dead entries have entrySize=0 which passes validation.
+    /// This matches the behavior where expired entries are not read from disk.
+    #[test]
+    fn test_validate_footprint_entry_sizes_passes_for_dead_entry() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xFFu8; 32])));
+        let contract_key = ScVal::U32(14);
+        let durability = ContractDataDurability::Persistent;
+
+        // Create a large entry that would fail validation if it were live
+        let large_val: Vec<u8> = vec![0xCD; 70000];
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+            val: ScVal::Bytes(large_val.try_into().unwrap()),
+        };
+        state.create_contract_data(cd_entry);
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+
+        // Give the entry an EXPIRED TTL
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence - 1, // Expired
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: vec![key.clone()].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                disk_read_bytes: 100_000,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let config = SorobanConfig {
+            max_contract_size_bytes: 65536,
+            max_contract_data_entry_size_bytes: 65536,
+            ..SorobanConfig::default()
+        };
+
+        // Should return true (validation passes) because the entry is dead
+        assert!(
+            validate_footprint_entry_sizes(&state, &soroban_data, &config, context.sequence, None),
+            "VE-14: validate_footprint_entry_sizes should pass for dead (expired) entry"
+        );
+    }
+
+    /// VE-14: validate_footprint_entry_sizes passes for within-limit live entries.
+    #[test]
+    fn test_validate_footprint_entry_sizes_passes_for_normal_entries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xDDu8; 32])));
+        let contract_key = ScVal::U32(14);
+        let durability = ContractDataDurability::Persistent;
+
+        // Create a small entry within limits
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability: durability.clone(),
+            val: ScVal::I32(42),
+        };
+        state.create_contract_data(cd_entry);
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+
+        // Give it a live TTL
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence + 100,
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: vec![key.clone()].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                disk_read_bytes: 100_000,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let config = SorobanConfig {
+            max_contract_size_bytes: 65536,
+            max_contract_data_entry_size_bytes: 65536,
+            ..SorobanConfig::default()
+        };
+
+        // Should pass since entry is small and live
+        assert!(
+            validate_footprint_entry_sizes(&state, &soroban_data, &config, context.sequence, None),
+            "VE-14: validate_footprint_entry_sizes should pass for normal-sized live entry"
         );
     }
 }
