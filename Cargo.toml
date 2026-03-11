@@ -148,6 +148,10 @@ xorf = { version = "0.11", default-features = false, features = ["binary-fuse", 
 tempfile = "3"
 criterion = "0.5"
 
+# Memory profiling (optional, feature-gated)
+tikv-jemallocator = "0.6"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

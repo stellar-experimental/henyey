@@ -2030,6 +2030,148 @@ impl LedgerManager {
         Ok(())
     }
 
+    /// Build a memory report with per-component heap estimates.
+    ///
+    /// Acquires read locks on each component and calls estimate_heap_bytes().
+    /// Total cost: <100μs.
+    pub fn build_memory_report(&self, ledger_seq: u32) -> crate::memory_report::MemoryReport {
+        use henyey_common::memory::ComponentMemory;
+
+        let mut components = Vec::new();
+
+        // Soroban state
+        {
+            let state = self.soroban_state.read();
+            let data_bytes = state.estimate_contract_data_heap_bytes();
+            let code_bytes = state.estimate_contract_code_heap_bytes();
+            components.push(ComponentMemory::new(
+                "soroban_data",
+                data_bytes as u64,
+                state.contract_data_count() as u64,
+            ));
+            components.push(ComponentMemory::new(
+                "soroban_code",
+                code_bytes as u64,
+                state.contract_code_count() as u64,
+            ));
+        }
+
+        // Offer store
+        {
+            let store = self.offer_store.read();
+            let offer_count = store.len();
+            // HashMap<i64, LedgerEntry>: i64 key + ~200 bytes avg entry
+            let offer_bytes = henyey_common::memory::hashmap_heap_bytes(
+                store.capacity(),
+                std::mem::size_of::<i64>(),
+                std::mem::size_of::<LedgerEntry>(),
+            );
+            components.push(ComponentMemory::new(
+                "offers",
+                offer_bytes as u64,
+                offer_count as u64,
+            ));
+        }
+
+        // Offer secondary index
+        {
+            let idx = self.offer_account_asset_index.read();
+            // Rough estimate: capacity * (key_size + nested HashSet avg overhead)
+            // Key is (AccountId, TrustLineAsset) tuple; estimate 100 bytes
+            // Value is HashSet<i64>; average ~4 offers per (account, asset) pair
+            let idx_bytes = henyey_common::memory::hashmap_heap_bytes(
+                idx.capacity(),
+                100,
+                64, // HashSet overhead per entry
+            );
+            components.push(ComponentMemory::new(
+                "offer_index",
+                idx_bytes as u64,
+                idx.len() as u64,
+            ));
+        }
+
+        // Bucket list
+        {
+            let bl = self.bucket_list.read();
+            let heap_bytes = bl.estimate_heap_bytes();
+            let mmap = bl.mmap_bytes();
+            let cache = bl.cache_bytes();
+            components.push(ComponentMemory::new(
+                "bucket_list_heap",
+                heap_bytes as u64,
+                0,
+            ));
+            components.push(ComponentMemory::new_non_heap(
+                "bucket_list_mmap",
+                mmap as u64,
+                0,
+            ));
+            components.push(ComponentMemory::new(
+                "bucket_list_cache",
+                cache as u64,
+                0,
+            ));
+        }
+
+        // Module cache
+        {
+            let mc = self.module_cache.read();
+            if mc.is_some() {
+                // Heuristic: compiled modules are ~4x their WASM size
+                let soroban = self.soroban_state.read();
+                let wasm_bytes = soroban.contract_code_state_size().max(0) as u64;
+                let code_count = soroban.contract_code_count() as u64;
+                let estimated_compiled = wasm_bytes * 4;
+                components.push(ComponentMemory::new(
+                    "module_cache",
+                    estimated_compiled,
+                    code_count,
+                ));
+            }
+        }
+
+        // Transaction executor state (LedgerStateManager with offers, accounts, etc.)
+        {
+            let executor_guard = self.executor.lock();
+            if let Some(ref executor) = *executor_guard {
+                let (total_bytes, offer_bytes) = executor.state().estimate_heap_bytes();
+                let offer_count = executor.state().offer_count() as u64;
+                components.push(ComponentMemory::new(
+                    "executor_state",
+                    total_bytes as u64,
+                    0,
+                ));
+                components.push(ComponentMemory::new(
+                    "executor_offers",
+                    offer_bytes as u64,
+                    offer_count,
+                ));
+            }
+        }
+
+        // Hot archive bucket list
+        {
+            let ha = self.hot_archive_bucket_list.read();
+            if let Some(ref hot_archive) = *ha {
+                let heap = hot_archive.estimate_heap_bytes();
+                let mmap = hot_archive.mmap_bytes();
+                components.push(ComponentMemory::new(
+                    "hot_archive_heap",
+                    heap as u64,
+                    0,
+                ));
+                components.push(ComponentMemory::new_non_heap(
+                    "hot_archive_mmap",
+                    mmap as u64,
+                    0,
+                ));
+            }
+        }
+
+        crate::memory_report::MemoryReport::new(ledger_seq, components)
+    }
+
     /// Get Soroban network configuration information.
     ///
     /// Returns the Soroban-related configuration settings from the current ledger
@@ -4748,6 +4890,12 @@ impl<'a> LedgerCloseContext<'a> {
             tx_count = self.stats.tx_count,
             "Ledger close timing"
         );
+
+        // Periodic memory report (every 64 ledgers, ~5 minutes)
+        if new_header.ledger_seq % 64 == 0 {
+            let report = self.manager.build_memory_report(new_header.ledger_seq);
+            report.log();
+        }
 
         let rss_after = get_rss_bytes();
 

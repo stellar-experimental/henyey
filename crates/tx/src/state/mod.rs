@@ -1207,6 +1207,105 @@ impl LedgerStateManager {
         self.delta.has_changes()
     }
 
+    /// Estimate total heap bytes used by this state manager.
+    ///
+    /// Returns (total_bytes, offer_bytes) where offer_bytes is the portion
+    /// from offer-related maps that are preserved across ledger closes.
+    pub fn estimate_heap_bytes(&self) -> (usize, usize) {
+        use henyey_common::memory::{hashmap_heap_bytes, hashset_heap_bytes, vec_heap_bytes};
+
+        // Sizes of key/value types (approximate for XDR types)
+        let account_id_size = 36; // PublicKey enum
+        let trustline_key_size = 100; // (AccountId, TrustLineAsset)
+        let offer_key_size = 44; // (AccountId, i64)
+        let hash_size = 32;
+        let ledger_key_size = 80; // enum with variants
+        let asset_pair_size = 120;
+
+        let account_entry_size = 200;
+        let trustline_entry_size = 150;
+        let offer_entry_size = 200;
+        let ttl_entry_size = 16;
+
+        // Core entry maps
+        let accounts = hashmap_heap_bytes(self.accounts.capacity(), account_id_size, account_entry_size);
+        let trustlines = hashmap_heap_bytes(self.trustlines.capacity(), trustline_key_size, trustline_entry_size);
+        let offers = hashmap_heap_bytes(self.offers.capacity(), offer_key_size, offer_entry_size);
+        let ttl_entries = hashmap_heap_bytes(self.ttl_entries.capacity(), hash_size, ttl_entry_size);
+        let ttl_snapshot = hashmap_heap_bytes(self.ttl_bucket_list_snapshot.capacity(), hash_size, 4);
+
+        // EntryStore-based maps
+        let data_entries = self.data_entries.estimate_heap_bytes(100, 200);
+        let contract_data = self.contract_data.estimate_heap_bytes(120, 300);
+        let contract_code = self.contract_code.estimate_heap_bytes(hash_size, 500);
+        let claimable_balances = self.claimable_balances.estimate_heap_bytes(hash_size, 300);
+        let liquidity_pools = self.liquidity_pools.estimate_heap_bytes(hash_size, 300);
+
+        // Sponsorship maps
+        let entry_sponsorships = hashmap_heap_bytes(self.entry_sponsorships.capacity(), ledger_key_size, account_id_size);
+        let offer_sponsorships = hashmap_heap_bytes(self.offer_sponsorships.capacity(), ledger_key_size, account_id_size);
+        let entry_sponsorship_ext = hashset_heap_bytes(self.entry_sponsorship_ext.capacity(), ledger_key_size);
+        let offer_sponsorship_ext = hashset_heap_bytes(self.offer_sponsorship_ext.capacity(), ledger_key_size);
+        let entry_last_modified = hashmap_heap_bytes(self.entry_last_modified.capacity(), ledger_key_size, 4);
+        let offer_last_modified = hashmap_heap_bytes(self.offer_last_modified.capacity(), ledger_key_size, 4);
+
+        // Snapshot maps (typically empty between TXs)
+        let op_entry_snapshots = hashmap_heap_bytes(self.op_entry_snapshots.capacity(), ledger_key_size, 200);
+        let account_snapshots = hashmap_heap_bytes(self.account_snapshots.capacity(), account_id_size, account_entry_size);
+        let trustline_snapshots = hashmap_heap_bytes(self.trustline_snapshots.capacity(), trustline_key_size, trustline_entry_size);
+        let offer_snapshots = hashmap_heap_bytes(self.offer_snapshots.capacity(), offer_key_size, offer_entry_size);
+        let ttl_snapshots = hashmap_heap_bytes(self.ttl_snapshots.capacity(), hash_size, ttl_entry_size);
+        let sponsorship_snapshots = hashmap_heap_bytes(self.entry_sponsorship_snapshots.capacity(), ledger_key_size, account_id_size);
+        let ext_snapshots = hashmap_heap_bytes(self.entry_sponsorship_ext_snapshots.capacity(), ledger_key_size, 1);
+        let lm_snapshots = hashmap_heap_bytes(self.entry_last_modified_snapshots.capacity(), ledger_key_size, 4);
+
+        // Tracking vecs and sets
+        let modified_accounts = vec_heap_bytes(self.modified_accounts.capacity(), account_id_size);
+        let modified_trustlines = vec_heap_bytes(self.modified_trustlines.capacity(), trustline_key_size);
+        let modified_offers = vec_heap_bytes(self.modified_offers.capacity(), offer_key_size);
+        let modified_ttl = vec_heap_bytes(self.modified_ttl.capacity(), hash_size);
+        let created_accounts = hashset_heap_bytes(self.created_accounts.capacity(), account_id_size);
+        let created_trustlines = hashset_heap_bytes(self.created_trustlines.capacity(), trustline_key_size);
+        let created_offers = hashset_heap_bytes(self.created_offers.capacity(), offer_key_size);
+        let created_ttl = hashset_heap_bytes(self.created_ttl.capacity(), hash_size);
+        let deleted_ttl = hashset_heap_bytes(self.deleted_ttl.capacity(), hash_size);
+
+        // Deferred TTL bumps
+        let deferred = hashmap_heap_bytes(self.deferred_ro_ttl_bumps.capacity(), hash_size, 4);
+
+        // Offer index
+        let offer_index_books = hashmap_heap_bytes(self.offer_index.order_book_capacity(), asset_pair_size, 200);
+        let offer_index_locs = hashmap_heap_bytes(self.offer_index.location_capacity(), offer_key_size, asset_pair_size + 24);
+        let account_asset_offers = hashmap_heap_bytes(self.account_asset_offers.capacity(), trustline_key_size, 64);
+        let max_seq = hashmap_heap_bytes(self.max_seq_num_to_apply.capacity(), account_id_size, 8);
+
+        // Offer-related bytes (preserved across ledger closes)
+        let offer_bytes = offers
+            + offer_sponsorships
+            + offer_sponsorship_ext
+            + offer_last_modified
+            + offer_index_books
+            + offer_index_locs
+            + account_asset_offers;
+
+        let total = accounts + trustlines + offers + ttl_entries + ttl_snapshot
+            + data_entries + contract_data + contract_code + claimable_balances + liquidity_pools
+            + entry_sponsorships + offer_sponsorships + entry_sponsorship_ext + offer_sponsorship_ext
+            + entry_last_modified + offer_last_modified
+            + op_entry_snapshots + account_snapshots + trustline_snapshots + offer_snapshots
+            + ttl_snapshots + sponsorship_snapshots + ext_snapshots + lm_snapshots
+            + modified_accounts + modified_trustlines + modified_offers + modified_ttl
+            + created_accounts + created_trustlines + created_offers + created_ttl + deleted_ttl
+            + deferred + offer_index_books + offer_index_locs + account_asset_offers + max_seq;
+
+        (total, offer_bytes)
+    }
+
+    /// Number of offers currently loaded.
+    pub fn offer_count(&self) -> usize {
+        self.offers.len()
+    }
+
     /// Apply a fee refund to the most recent account update in the delta.
     ///
     /// In stellar-core, fee refunds are NOT separate meta changes - they're

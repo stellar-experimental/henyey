@@ -337,6 +337,30 @@ where
             deleted.clear();
         }
     }
+
+    /// Estimate heap bytes used by this entry store.
+    ///
+    /// Uses capacity-based estimation for O(1) cost. `key_size` and `value_size`
+    /// are the estimated sizes of individual K and V instances.
+    pub fn estimate_heap_bytes(&self, key_size: usize, value_size: usize) -> usize {
+        use henyey_common::memory::{hashmap_heap_bytes, hashset_heap_bytes, vec_heap_bytes};
+        let entries = hashmap_heap_bytes(self.entries.capacity(), key_size, value_size);
+        // snapshots: HashMap<K, Option<V>> — Option<V> is same size as V for most types
+        let snapshots = hashmap_heap_bytes(self.snapshots.capacity(), key_size, value_size + 1);
+        let created = hashset_heap_bytes(self.created.capacity(), key_size);
+        let modified = vec_heap_bytes(self.modified.capacity(), key_size);
+        let deleted = self
+            .deleted
+            .as_ref()
+            .map(|d| hashset_heap_bytes(d.capacity(), key_size))
+            .unwrap_or(0);
+        entries + snapshots + created + modified + deleted
+    }
+
+    /// Number of live entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 #[cfg(test)]

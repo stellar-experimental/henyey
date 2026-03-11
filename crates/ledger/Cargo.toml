@@ -28,6 +28,12 @@ tokio.workspace = true
 parking_lot.workspace = true
 sha2.workspace = true
 
+# Memory profiling (optional, feature-gated)
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+
+[features]
+jemalloc = ["dep:tikv-jemalloc-ctl"]
+
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true

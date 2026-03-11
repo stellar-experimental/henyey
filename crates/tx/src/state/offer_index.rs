@@ -298,6 +298,16 @@ impl OfferIndex {
     pub fn num_asset_pairs(&self) -> usize {
         self.order_books.len()
     }
+
+    /// Capacity of the order books map (for memory estimation).
+    pub fn order_book_capacity(&self) -> usize {
+        self.order_books.capacity()
+    }
+
+    /// Capacity of the offer locations map (for memory estimation).
+    pub fn location_capacity(&self) -> usize {
+        self.offer_locations.capacity()
+    }
 }
 
 #[cfg(test)]

@@ -50,6 +50,7 @@ pub mod config;
 pub mod error;
 pub mod fs_utils;
 pub mod math;
+pub mod memory;
 pub mod meta;
 pub mod network;
 pub mod protocol;

@@ -62,4 +62,11 @@ tempfile.workspace = true
 # Directories
 dirs = "5"
 
+# Memory profiling (optional, feature-gated)
+tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
+
+[features]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl", "henyey-ledger/jemalloc"]
+
 [dev-dependencies]

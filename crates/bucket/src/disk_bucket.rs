@@ -457,6 +457,11 @@ impl DiskBucket {
         self.ensure_index().estimated_heap_bytes()
     }
 
+    /// Returns the size of the mmap'd region in bytes, or 0 if not yet mapped.
+    pub fn mmap_bytes(&self) -> usize {
+        self.mmap.get().map(|m| m.len()).unwrap_or(0)
+    }
+
     /// Initializes the per-bucket entry cache with proportional sizing.
     ///
     /// Matches stellar-core's `LiveBucketIndex::maybeInitializeCache`:

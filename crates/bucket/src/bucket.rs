@@ -755,6 +755,37 @@ impl Bucket {
         }
     }
 
+    /// Estimate heap bytes used by this bucket (index + cache, excluding mmap).
+    pub fn estimate_heap_bytes(&self) -> usize {
+        match &self.storage {
+            BucketStorage::InMemory { entries, key_index } => {
+                // entries Vec: BucketEntry structs on heap
+                let entries_cap = entries.capacity() * std::mem::size_of::<BucketEntry>();
+                // key_index: HashMap<Vec<u8>, usize> - keys are serialized ledger keys
+                let key_data_bytes: usize = key_index.keys().map(|k| k.len()).sum();
+                // Vec overhead per key (24 bytes) + value usize + hashmap bucket overhead
+                let map_overhead = key_index.len() * (24 + std::mem::size_of::<usize>() + 48);
+                entries_cap + key_data_bytes + map_overhead
+            }
+            BucketStorage::DiskBacked { disk_bucket } => {
+                let index_bytes = disk_bucket.index_heap_bytes();
+                let cache_bytes = disk_bucket
+                    .cache()
+                    .map(|c| c.size_bytes())
+                    .unwrap_or(0);
+                index_bytes + cache_bytes
+            }
+        }
+    }
+
+    /// Return mmap'd file-backed bytes (not heap, backed by OS page cache).
+    pub fn mmap_bytes(&self) -> usize {
+        match &self.storage {
+            BucketStorage::InMemory { .. } => 0,
+            BucketStorage::DiskBacked { disk_bucket } => disk_bucket.mmap_bytes(),
+        }
+    }
+
     /// Resets cache hit/miss counters for this bucket's per-bucket cache.
     pub fn reset_cache_counters(&self) {
         if let BucketStorage::DiskBacked { disk_bucket } = &self.storage {

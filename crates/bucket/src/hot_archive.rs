@@ -649,6 +649,39 @@ impl HotArchiveBucket {
             hash,
         })
     }
+
+    /// Estimate heap bytes used by this bucket.
+    pub fn estimate_heap_bytes(&self) -> usize {
+        match &self.storage {
+            HotArchiveStorage::InMemory { entries, ordered_entries } => {
+                // BTreeMap: key Vec<u8> heap + entry overhead
+                let key_data: usize = entries.keys().map(|k| k.len()).sum();
+                let entry_overhead = entries.len() * (std::mem::size_of::<HotArchiveBucketEntry>() + 64);
+                // ordered_entries Vec
+                let ordered = ordered_entries.capacity() * std::mem::size_of::<HotArchiveBucketEntry>();
+                key_data + entry_overhead + ordered
+            }
+            HotArchiveStorage::DiskBacked { index, .. } => {
+                // Index BTreeMap<Vec<u8>, u64> if initialized
+                if let Some(idx) = index.get() {
+                    let key_data: usize = idx.keys().map(|k| k.len()).sum();
+                    idx.len() * (8 + 64) + key_data
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    /// Return mmap'd / disk-backed file size in bytes.
+    pub fn mmap_bytes(&self) -> usize {
+        match &self.storage {
+            HotArchiveStorage::InMemory { .. } => 0,
+            HotArchiveStorage::DiskBacked { path, .. } => {
+                std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0)
+            }
+        }
+    }
 }
 
 /// Iterator over hot archive bucket entries.
@@ -1137,6 +1170,20 @@ impl HotArchiveBucketList {
             total_entries,
             total_buckets,
         }
+    }
+
+    /// Estimate total heap bytes across all hot archive buckets.
+    pub fn estimate_heap_bytes(&self) -> usize {
+        self.levels.iter().map(|l| {
+            l.curr.estimate_heap_bytes() + l.snap.estimate_heap_bytes()
+        }).sum()
+    }
+
+    /// Total mmap'd / disk-backed bytes across all hot archive buckets.
+    pub fn mmap_bytes(&self) -> usize {
+        self.levels.iter().map(|l| {
+            l.curr.mmap_bytes() + l.snap.mmap_bytes()
+        }).sum()
     }
 
     /// Debug print level state.

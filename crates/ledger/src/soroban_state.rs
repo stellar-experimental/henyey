@@ -979,6 +979,50 @@ impl InMemorySorobanState {
             pending_ttl_count: self.pending_ttls.len(),
         }
     }
+
+    /// Estimate heap bytes for contract data entries.
+    ///
+    /// Uses `contract_data_state_size` as a proxy for Arc<LedgerEntry> payload
+    /// sizes plus HashMap overhead for the key-to-entry mapping.
+    pub fn estimate_contract_data_heap_bytes(&self) -> usize {
+        use henyey_common::memory::hashmap_heap_bytes;
+        // HashMap<[u8;32], ContractDataMapEntry>
+        // ContractDataMapEntry: Arc<LedgerEntry>(8) + TtlData(8) = 16 inline
+        let map_bytes = hashmap_heap_bytes(
+            self.contract_data_entries.capacity(),
+            32,
+            std::mem::size_of::<ContractDataMapEntry>(),
+        );
+        // Arc payload sizes tracked by contract_data_state_size
+        let payload_bytes = self.contract_data_state_size.max(0) as usize;
+        map_bytes + payload_bytes
+    }
+
+    /// Estimate heap bytes for contract code entries.
+    pub fn estimate_contract_code_heap_bytes(&self) -> usize {
+        use henyey_common::memory::hashmap_heap_bytes;
+        let map_bytes = hashmap_heap_bytes(
+            self.contract_code_entries.capacity(),
+            32,
+            std::mem::size_of::<ContractCodeMapEntry>(),
+        );
+        let payload_bytes = self.contract_code_state_size.max(0) as usize;
+        map_bytes + payload_bytes
+    }
+
+    /// Estimate total heap bytes for all Soroban state.
+    pub fn estimate_heap_bytes(&self) -> usize {
+        use henyey_common::memory::hashmap_heap_bytes;
+        let data = self.estimate_contract_data_heap_bytes();
+        let code = self.estimate_contract_code_heap_bytes();
+        // config_settings: HashMap<i32, Arc<LedgerEntry>>
+        let config = hashmap_heap_bytes(
+            self.config_settings.capacity(),
+            std::mem::size_of::<i32>(),
+            std::mem::size_of::<Arc<LedgerEntry>>(),
+        );
+        data + code + config
+    }
 }
 
 /// Statistics about the Soroban state cache.

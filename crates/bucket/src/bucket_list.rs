@@ -1307,6 +1307,39 @@ impl BucketList {
         total
     }
 
+    /// Estimate total heap bytes across all bucket levels (indexes + caches).
+    pub fn estimate_heap_bytes(&self) -> usize {
+        let mut total = 0;
+        for level in &self.levels {
+            total += level.curr.estimate_heap_bytes();
+            total += level.snap.estimate_heap_bytes();
+        }
+        total
+    }
+
+    /// Total mmap'd (file-backed) bytes across all bucket levels.
+    pub fn mmap_bytes(&self) -> usize {
+        let mut total = 0;
+        for level in &self.levels {
+            total += level.curr.mmap_bytes();
+            total += level.snap.mmap_bytes();
+        }
+        total
+    }
+
+    /// Total cache bytes across all bucket levels.
+    pub fn cache_bytes(&self) -> usize {
+        let mut total = 0;
+        for level in &self.levels {
+            for bucket in [&level.curr, &level.snap] {
+                if let Some(stats) = bucket.cache_stats() {
+                    total += stats.size_bytes;
+                }
+            }
+        }
+        total
+    }
+
     /// Look up an entry by its key.
     ///
     /// Searches from the newest (level 0) to oldest levels.
