@@ -55,7 +55,7 @@
 
 use crate::{HistoryError, Result};
 use std::io::Read;
-use stellar_xdr::curr::{LedgerCloseMeta, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::curr::{Hash, LedgerCloseMeta, Limits, ReadXdr, WriteXdr};
 
 /// CDP data lake client for fetching `LedgerCloseMeta` from cloud object storage.
 ///
@@ -626,8 +626,8 @@ pub struct TransactionProcessingInfo {
 /// that differ from `header.base_fee` during surge pricing.
 fn build_tx_hash_to_base_fee_map(
     tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
-    network_id: &[u8; 32],
-) -> std::collections::HashMap<[u8; 32], Option<u32>> {
+    network_id: &Hash,
+) -> std::collections::HashMap<Hash, Option<u32>> {
     let mut map = std::collections::HashMap::new();
 
     let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = tx_set;
@@ -668,8 +668,8 @@ fn build_tx_hash_to_base_fee_map(
 /// Compute the network-aware transaction hash.
 fn compute_tx_hash(
     env: &stellar_xdr::curr::TransactionEnvelope,
-    network_id: &[u8; 32],
-) -> Option<[u8; 32]> {
+    network_id: &Hash,
+) -> Option<Hash> {
     use sha2::{Digest, Sha256};
     use stellar_xdr::curr::{EnvelopeType, Limits, WriteXdr};
 
@@ -698,13 +698,13 @@ fn compute_tx_hash(
         }
     }
 
-    let result = hasher.finalize();
-    Some(result.into())
+    let result: [u8; 32] = hasher.finalize().into();
+    Some(Hash(result))
 }
 
 /// Common fields extracted from V1/V2 `TransactionResultMeta` variants.
 struct TxProcessingFields {
-    tx_hash: [u8; 32],
+    tx_hash: Hash,
     result: stellar_xdr::curr::TransactionResultPair,
     meta: stellar_xdr::curr::TransactionMeta,
     fee_meta: stellar_xdr::curr::LedgerEntryChanges,
@@ -715,7 +715,7 @@ struct TxProcessingFields {
 fn extract_generalized_tx_processing(
     tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
     processing: impl Iterator<Item = TxProcessingFields>,
-    network_id: &[u8; 32],
+    network_id: &Hash,
     version_label: &str,
 ) -> Vec<TransactionProcessingInfo> {
     let txs = extract_txs_from_generalized_set(tx_set);
@@ -771,7 +771,7 @@ fn extract_generalized_tx_processing(
 /// is logged and those transactions are omitted.
 pub fn extract_transaction_processing(
     meta: &LedgerCloseMeta,
-    network_id: &[u8; 32],
+    network_id: &Hash,
 ) -> Vec<TransactionProcessingInfo> {
     match meta {
         LedgerCloseMeta::V0(v0) => {
@@ -807,7 +807,7 @@ pub fn extract_transaction_processing(
             extract_generalized_tx_processing(
                 &v1.tx_set,
                 v1.tx_processing.iter().map(|tp| TxProcessingFields {
-                    tx_hash: tp.result.transaction_hash.0,
+                    tx_hash: tp.result.transaction_hash.clone(),
                     result: tp.result.clone(),
                     meta: tp.tx_apply_processing.clone(),
                     fee_meta: tp.fee_processing.clone(),
@@ -821,7 +821,7 @@ pub fn extract_transaction_processing(
             extract_generalized_tx_processing(
                 &v2.tx_set,
                 v2.tx_processing.iter().map(|tp| TxProcessingFields {
-                    tx_hash: tp.result.transaction_hash.0,
+                    tx_hash: tp.result.transaction_hash.clone(),
                     result: tp.result.clone(),
                     meta: tp.tx_apply_processing.clone(),
                     fee_meta: tp.fee_processing.clone(),
@@ -838,8 +838,8 @@ pub fn extract_transaction_processing(
 /// This version uses the network-aware hash (network_id || ENVELOPE_TYPE || tx).
 pub fn build_tx_hash_map_with_network(
     txs: &[stellar_xdr::curr::TransactionEnvelope],
-    network_id: &[u8; 32],
-) -> std::collections::HashMap<[u8; 32], stellar_xdr::curr::TransactionEnvelope> {
+    network_id: &Hash,
+) -> std::collections::HashMap<Hash, stellar_xdr::curr::TransactionEnvelope> {
     txs.iter()
         .filter_map(|env| {
             let hash = compute_tx_hash(env, network_id)?;
