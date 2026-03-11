@@ -58,7 +58,7 @@
 //! use henyey_bucket::{EvictionIterator, StateArchivalSettings, update_starting_eviction_iterator};
 //!
 //! // Initialize iterator at default starting level (6)
-//! let mut iter = EvictionIterator::default();
+//! let mut iter = EvictionIterator::with_default_level();
 //!
 //! // Before scanning each ledger, check if the iterator needs to reset
 //! // (because the bucket received new data)
@@ -88,55 +88,27 @@ pub const DEFAULT_EVICTION_SCAN_SIZE: u64 = 100_000;
 /// Lower levels update too frequently, so we start from level 6.
 pub const DEFAULT_STARTING_EVICTION_SCAN_LEVEL: u32 = 6;
 
-/// Eviction iterator that tracks the current scan position in the bucket list.
+/// Re-export XDR EvictionIterator as the canonical type.
 ///
-/// The iterator maintains state between ledgers, allowing the eviction scan
-/// to resume where it left off. This enables incremental scanning without
-/// processing the entire bucket list in a single ledger.
-///
-/// # Persistence
-///
-/// The iterator state is typically stored in the ledger header or network
-/// config so it persists across restarts. This matches stellar-core's
-/// `EvictionIterator` from NetworkConfig.
+/// Tracks the current scan position in the bucket list. The iterator maintains
+/// state between ledgers, allowing the eviction scan to resume where it left off.
 ///
 /// # Scan Order
 ///
-/// The scan proceeds in this order:
-/// 1. Level N curr bucket
-/// 2. Level N snap bucket
-/// 3. Level N+1 curr bucket
-/// 4. ... (continues to top level, then wraps to starting level)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EvictionIterator {
-    /// Current byte offset within the bucket file.
-    pub bucket_file_offset: u64,
-    /// Current bucket list level being scanned (0 to NUM_LEVELS-1).
-    pub bucket_list_level: u32,
-    /// Whether scanning the curr bucket (true) or snap bucket (false).
-    pub is_curr_bucket: bool,
-}
+/// 1. Level N curr bucket → Level N snap bucket → Level N+1 curr bucket → ...
+/// 2. Wraps back to starting level when reaching the top.
+pub type EvictionIterator = stellar_xdr::curr::EvictionIterator;
 
-impl Default for EvictionIterator {
-    fn default() -> Self {
-        Self::new(DEFAULT_STARTING_EVICTION_SCAN_LEVEL)
-    }
-}
-
-impl EvictionIterator {
+/// Extension trait adding eviction-specific methods to the XDR `EvictionIterator`.
+pub trait EvictionIteratorExt {
     /// Create a new eviction iterator starting at the given level.
-    pub fn new(starting_level: u32) -> Self {
-        Self {
-            bucket_file_offset: 0,
-            bucket_list_level: starting_level,
-            is_curr_bucket: true,
-        }
-    }
+    fn new(starting_level: u32) -> Self;
+
+    /// Create a new eviction iterator at the default starting level (6).
+    fn with_default_level() -> Self;
 
     /// Reset the iterator to start of the current bucket.
-    pub fn reset_offset(&mut self) {
-        self.bucket_file_offset = 0;
-    }
+    fn reset_offset(&mut self);
 
     /// Move to the next bucket in the scan order.
     ///
@@ -144,7 +116,27 @@ impl EvictionIterator {
     /// Wraps back to starting level when reaching the top.
     ///
     /// Returns true if we've wrapped back to the starting position (completed a full cycle).
-    pub fn advance_to_next_bucket(&mut self, starting_level: u32) -> bool {
+    fn advance_to_next_bucket(&mut self, starting_level: u32) -> bool;
+}
+
+impl EvictionIteratorExt for EvictionIterator {
+    fn new(starting_level: u32) -> Self {
+        Self {
+            bucket_file_offset: 0,
+            bucket_list_level: starting_level,
+            is_curr_bucket: true,
+        }
+    }
+
+    fn with_default_level() -> Self {
+        Self::new(DEFAULT_STARTING_EVICTION_SCAN_LEVEL)
+    }
+
+    fn reset_offset(&mut self) {
+        self.bucket_file_offset = 0;
+    }
+
+    fn advance_to_next_bucket(&mut self, starting_level: u32) -> bool {
         let mut wrapped = false;
         let last_level = BUCKET_LIST_LEVELS as u32 - 1;
 
@@ -781,8 +773,8 @@ mod tests {
     }
 
     #[test]
-    fn test_eviction_iterator_default() {
-        let iter = EvictionIterator::default();
+    fn test_eviction_iterator_with_default_level() {
+        let iter = EvictionIterator::with_default_level();
         assert_eq!(iter.bucket_file_offset, 0);
         assert_eq!(iter.bucket_list_level, DEFAULT_STARTING_EVICTION_SCAN_LEVEL);
         assert!(iter.is_curr_bucket);

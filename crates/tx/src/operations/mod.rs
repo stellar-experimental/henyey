@@ -13,49 +13,26 @@ use stellar_xdr::curr::{
     ClaimClaimableBalanceOp, ClaimPredicate, Claimant, ClawbackClaimableBalanceOp, ClawbackOp,
     CreateAccountOp, CreateClaimableBalanceOp, CreatePassiveSellOfferOp, ExtendFootprintTtlOp,
     InvokeHostFunctionOp, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp,
-    ManageDataOp, ManageSellOfferOp, MuxedAccount, Operation, OperationBody,
+    ManageDataOp, ManageSellOfferOp, MuxedAccount, Operation, OperationBody, OperationType,
     PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, RestoreFootprintOp,
     SetOptionsOp, SetTrustLineFlagsOp,
 };
 
-/// Enumeration of all operation types in Stellar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum OperationType {
-    // Classic operations
-    CreateAccount,
-    Payment,
-    PathPaymentStrictReceive,
-    ManageSellOffer,
-    CreatePassiveSellOffer,
-    SetOptions,
-    ChangeTrust,
-    AllowTrust,
-    AccountMerge,
-    Inflation,
-    ManageData,
-    BumpSequence,
-    ManageBuyOffer,
-    PathPaymentStrictSend,
-    CreateClaimableBalance,
-    ClaimClaimableBalance,
-    BeginSponsoringFutureReserves,
-    EndSponsoringFutureReserves,
-    RevokeSponsorship,
-    Clawback,
-    ClawbackClaimableBalance,
-    SetTrustLineFlags,
-    LiquidityPoolDeposit,
-    LiquidityPoolWithdraw,
+/// Extension trait for `stellar_xdr::curr::OperationType` providing Soroban classification
+/// and body-to-type conversion.
+pub trait OperationTypeExt {
+    /// Check if this is a Soroban operation.
+    fn is_soroban(&self) -> bool;
 
-    // Soroban operations
-    InvokeHostFunction,
-    ExtendFootprintTtl,
-    RestoreFootprint,
+    /// Check if this is a classic operation.
+    fn is_classic(&self) -> bool;
+
+    /// Get the operation type from an operation body.
+    fn from_body(body: &OperationBody) -> Self;
 }
 
-impl OperationType {
-    /// Check if this is a Soroban operation.
-    pub fn is_soroban(&self) -> bool {
+impl OperationTypeExt for OperationType {
+    fn is_soroban(&self) -> bool {
         matches!(
             self,
             OperationType::InvokeHostFunction
@@ -64,85 +41,12 @@ impl OperationType {
         )
     }
 
-    /// Check if this is a classic operation.
-    pub fn is_classic(&self) -> bool {
+    fn is_classic(&self) -> bool {
         !self.is_soroban()
     }
 
-    /// Get the operation type from an operation body.
-    pub fn from_body(body: &OperationBody) -> Self {
-        match body {
-            OperationBody::CreateAccount(_) => OperationType::CreateAccount,
-            OperationBody::Payment(_) => OperationType::Payment,
-            OperationBody::PathPaymentStrictReceive(_) => OperationType::PathPaymentStrictReceive,
-            OperationBody::ManageSellOffer(_) => OperationType::ManageSellOffer,
-            OperationBody::CreatePassiveSellOffer(_) => OperationType::CreatePassiveSellOffer,
-            OperationBody::SetOptions(_) => OperationType::SetOptions,
-            OperationBody::ChangeTrust(_) => OperationType::ChangeTrust,
-            OperationBody::AllowTrust(_) => OperationType::AllowTrust,
-            OperationBody::AccountMerge(_) => OperationType::AccountMerge,
-            OperationBody::Inflation => OperationType::Inflation,
-            OperationBody::ManageData(_) => OperationType::ManageData,
-            OperationBody::BumpSequence(_) => OperationType::BumpSequence,
-            OperationBody::ManageBuyOffer(_) => OperationType::ManageBuyOffer,
-            OperationBody::PathPaymentStrictSend(_) => OperationType::PathPaymentStrictSend,
-            OperationBody::CreateClaimableBalance(_) => OperationType::CreateClaimableBalance,
-            OperationBody::ClaimClaimableBalance(_) => OperationType::ClaimClaimableBalance,
-            OperationBody::BeginSponsoringFutureReserves(_) => {
-                OperationType::BeginSponsoringFutureReserves
-            }
-            OperationBody::EndSponsoringFutureReserves => {
-                OperationType::EndSponsoringFutureReserves
-            }
-            OperationBody::RevokeSponsorship(_) => OperationType::RevokeSponsorship,
-            OperationBody::Clawback(_) => OperationType::Clawback,
-            OperationBody::ClawbackClaimableBalance(_) => OperationType::ClawbackClaimableBalance,
-            OperationBody::SetTrustLineFlags(_) => OperationType::SetTrustLineFlags,
-            OperationBody::LiquidityPoolDeposit(_) => OperationType::LiquidityPoolDeposit,
-            OperationBody::LiquidityPoolWithdraw(_) => OperationType::LiquidityPoolWithdraw,
-            OperationBody::InvokeHostFunction(_) => OperationType::InvokeHostFunction,
-            OperationBody::ExtendFootprintTtl(_) => OperationType::ExtendFootprintTtl,
-            OperationBody::RestoreFootprint(_) => OperationType::RestoreFootprint,
-        }
-    }
-
-    /// Get the name of this operation type.
-    pub fn name(&self) -> &'static str {
-        match self {
-            OperationType::CreateAccount => "CreateAccount",
-            OperationType::Payment => "Payment",
-            OperationType::PathPaymentStrictReceive => "PathPaymentStrictReceive",
-            OperationType::ManageSellOffer => "ManageSellOffer",
-            OperationType::CreatePassiveSellOffer => "CreatePassiveSellOffer",
-            OperationType::SetOptions => "SetOptions",
-            OperationType::ChangeTrust => "ChangeTrust",
-            OperationType::AllowTrust => "AllowTrust",
-            OperationType::AccountMerge => "AccountMerge",
-            OperationType::Inflation => "Inflation",
-            OperationType::ManageData => "ManageData",
-            OperationType::BumpSequence => "BumpSequence",
-            OperationType::ManageBuyOffer => "ManageBuyOffer",
-            OperationType::PathPaymentStrictSend => "PathPaymentStrictSend",
-            OperationType::CreateClaimableBalance => "CreateClaimableBalance",
-            OperationType::ClaimClaimableBalance => "ClaimClaimableBalance",
-            OperationType::BeginSponsoringFutureReserves => "BeginSponsoringFutureReserves",
-            OperationType::EndSponsoringFutureReserves => "EndSponsoringFutureReserves",
-            OperationType::RevokeSponsorship => "RevokeSponsorship",
-            OperationType::Clawback => "Clawback",
-            OperationType::ClawbackClaimableBalance => "ClawbackClaimableBalance",
-            OperationType::SetTrustLineFlags => "SetTrustLineFlags",
-            OperationType::LiquidityPoolDeposit => "LiquidityPoolDeposit",
-            OperationType::LiquidityPoolWithdraw => "LiquidityPoolWithdraw",
-            OperationType::InvokeHostFunction => "InvokeHostFunction",
-            OperationType::ExtendFootprintTtl => "ExtendFootprintTtl",
-            OperationType::RestoreFootprint => "RestoreFootprint",
-        }
-    }
-}
-
-impl std::fmt::Display for OperationType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.name())
+    fn from_body(body: &OperationBody) -> Self {
+        body.discriminant()
     }
 }
 
@@ -628,8 +532,7 @@ pub fn get_needed_threshold(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::OperationType;
-    use stellar_xdr::curr::*; // Re-import to shadow XDR's OperationType
+    use stellar_xdr::curr::*;
 
     #[test]
     fn test_operation_type_from_body() {

@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn test_future_bucket_from_output() {
         let entry = make_account_entry([1u8; 32], 100);
-        let bucket = Bucket::from_entries(vec![BucketEntry::Live(entry)]).unwrap();
+        let bucket = Bucket::from_entries(vec![BucketEntry::Liveentry(entry)]).unwrap();
         let hash = bucket.hash();
         let bucket = Arc::new(bucket);
 
@@ -648,7 +648,7 @@ mod tests {
 
         // Test HashOutput state
         let entry = make_account_entry([1u8; 32], 100);
-        let bucket = Bucket::from_entries(vec![BucketEntry::Live(entry)]).unwrap();
+        let bucket = Bucket::from_entries(vec![BucketEntry::Liveentry(entry)]).unwrap();
         let bucket = Arc::new(bucket);
         let fb = FutureBucket::from_output(bucket);
         let snapshot = fb.to_snapshot();
@@ -665,8 +665,8 @@ mod tests {
         let entry1 = make_account_entry([1u8; 32], 100);
         let entry2 = make_account_entry([2u8; 32], 200);
 
-        let bucket1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap());
-        let bucket2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry2)]).unwrap());
+        let bucket1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
+        let bucket2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
 
         let mut fb = FutureBucket {
             state: FutureBucketState::LiveInputs,
@@ -705,7 +705,7 @@ mod tests {
     #[test]
     fn test_get_hashes() {
         let entry = make_account_entry([1u8; 32], 100);
-        let bucket = Bucket::from_entries(vec![BucketEntry::Live(entry)]).unwrap();
+        let bucket = Bucket::from_entries(vec![BucketEntry::Liveentry(entry)]).unwrap();
         let bucket = Arc::new(bucket);
 
         let fb = FutureBucket::from_output(bucket);
@@ -727,11 +727,11 @@ mod tests {
         let entry3 = make_account_entry([3u8; 32], 300);
 
         let bucket1 =
-            Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap());
+            Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
         let bucket2 = Arc::new(
             Bucket::from_entries(vec![
-                BucketEntry::Live(entry2),
-                BucketEntry::Live(entry3),
+                BucketEntry::Liveentry(entry2),
+                BucketEntry::Liveentry(entry3),
             ])
             .unwrap(),
         );
@@ -807,9 +807,9 @@ mod tests {
         let entry2 = make_account_entry([2u8; 32], 200);
 
         let bucket1 =
-            Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap());
+            Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
         let bucket2 =
-            Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry2)]).unwrap());
+            Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
 
         let mut fb = FutureBucket::start_merge(
             bucket1.clone(),
@@ -861,7 +861,7 @@ mod tests {
 
         // HashOutput state
         let entry = make_account_entry([1u8; 32], 100);
-        let bucket = Bucket::from_entries(vec![BucketEntry::Live(entry)]).unwrap();
+        let bucket = Bucket::from_entries(vec![BucketEntry::Liveentry(entry)]).unwrap();
         let bucket = Arc::new(bucket);
         let fb = FutureBucket::from_output(bucket);
         let snap = fb.to_snapshot();
@@ -872,8 +872,8 @@ mod tests {
         // LiveInputs state -> serializes as HashInputs
         let entry1 = make_account_entry([1u8; 32], 100);
         let entry2 = make_account_entry([2u8; 32], 200);
-        let b1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap());
-        let b2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Live(entry2)]).unwrap());
+        let b1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
+        let b2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
         let fb = FutureBucket {
             state: FutureBucketState::LiveInputs,
             input_curr: Some(b1.clone()),
@@ -910,10 +910,10 @@ mod tests {
         let entry3 = make_account_entry([3u8; 32], 300);
 
         let bucket1 =
-            Bucket::from_entries(vec![BucketEntry::Live(entry1.clone())]).unwrap();
+            Bucket::from_entries(vec![BucketEntry::Liveentry(entry1.clone())]).unwrap();
         let bucket2 = Bucket::from_entries(vec![
-            BucketEntry::Live(entry2.clone()),
-            BucketEntry::Live(entry3.clone()),
+            BucketEntry::Liveentry(entry2.clone()),
+            BucketEntry::Liveentry(entry3.clone()),
         ])
         .unwrap();
 
@@ -955,10 +955,10 @@ mod tests {
         let entry2_new = make_account_entry([2u8; 32], 200);
         let entry3_new = make_account_entry([3u8; 32], 300);
 
-        let b1_new = Bucket::from_entries(vec![BucketEntry::Live(entry1_new)]).unwrap();
+        let b1_new = Bucket::from_entries(vec![BucketEntry::Liveentry(entry1_new)]).unwrap();
         let b2_new = Bucket::from_entries(vec![
-            BucketEntry::Live(entry2_new),
-            BucketEntry::Live(entry3_new),
+            BucketEntry::Liveentry(entry2_new),
+            BucketEntry::Liveentry(entry3_new),
         ])
         .unwrap();
 
@@ -1004,9 +1004,9 @@ mod tests {
         let entry2 = make_account_entry([2u8; 32], 200);
 
         let bucket1 =
-            Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap();
+            Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap();
         let bucket2 =
-            Bucket::from_entries(vec![BucketEntry::Live(entry2)]).unwrap();
+            Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap();
 
         let b1_hash = bucket1.hash();
         let b2_hash = bucket2.hash();
@@ -1040,8 +1040,8 @@ mod tests {
         // Test that snapshot preserves exact hash hex strings through roundtrip
         let entry1 = make_account_entry([1u8; 32], 100);
         let entry2 = make_account_entry([2u8; 32], 200);
-        let bucket1 = Bucket::from_entries(vec![BucketEntry::Live(entry1)]).unwrap();
-        let bucket2 = Bucket::from_entries(vec![BucketEntry::Live(entry2)]).unwrap();
+        let bucket1 = Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap();
+        let bucket2 = Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap();
         let hash1 = bucket1.hash();
         let hash2 = bucket2.hash();
 

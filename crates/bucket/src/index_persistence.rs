@@ -643,7 +643,7 @@ mod tests {
 
         // Create a DiskIndex with entries
         let entries: Vec<(BucketEntry, u64)> = (0..100u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| (BucketEntry::Liveentry(make_account_entry(i)), i as u64 * 100))
             .collect();
 
         let bloom_seed = [42u8; 16];
@@ -750,7 +750,7 @@ mod tests {
 
         // Create and save with page_size = 10
         let entries: Vec<(BucketEntry, u64)> = (0..50u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| (BucketEntry::Liveentry(make_account_entry(i)), i as u64 * 100))
             .collect();
 
         let index = DiskIndex::from_entries(entries.into_iter(), [0u8; 16], 10);
@@ -839,7 +839,7 @@ mod tests {
         }
 
         let entries: Vec<(BucketEntry, u64)> = (0..num_entries)
-            .map(|i| (BucketEntry::Live(make_account_entry_for(i)), i as u64 * 100))
+            .map(|i| (BucketEntry::Liveentry(make_account_entry_for(i)), i as u64 * 100))
             .collect();
 
         DiskIndex::from_entries(entries.into_iter(), bloom_seed, page_size)
@@ -941,8 +941,8 @@ mod tests {
         use crate::entry::BucketEntry;
 
         let entries = vec![
-            (BucketEntry::Live(account_entry), 0u64),
-            (BucketEntry::Live(pool_entry), 100u64),
+            (BucketEntry::Liveentry(account_entry), 0u64),
+            (BucketEntry::Liveentry(pool_entry), 100u64),
         ];
 
         let bloom_seed = [0u8; 16];

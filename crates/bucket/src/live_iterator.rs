@@ -213,7 +213,7 @@ impl<'a> Iterator for LiveEntriesIterator<'a> {
             match iter.next() {
                 Some(entry) => {
                     match entry {
-                        BucketEntry::Live(ref e) | BucketEntry::Init(ref e) => {
+                        BucketEntry::Liveentry(ref e) | BucketEntry::Initentry(ref e) => {
                             // Get the key for this entry
                             let key = match ledger_entry_to_key(e) {
                                 Some(k) => k,
@@ -230,12 +230,12 @@ impl<'a> Iterator for LiveEntriesIterator<'a> {
                             self.entries_yielded += 1;
                             return Some(Ok(e.clone()));
                         }
-                        BucketEntry::Dead(ref key) => {
+                        BucketEntry::Deadentry(ref key) => {
                             // Mark dead keys as seen (shadows older live entries)
                             self.seen_keys.insert(key.clone());
                             continue;
                         }
-                        BucketEntry::Metadata(_) => {
+                        BucketEntry::Metaentry(_) => {
                             // Skip metadata entries
                             continue;
                         }

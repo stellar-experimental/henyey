@@ -47,12 +47,12 @@ use crate::{
         ledger_entry_data_type, ledger_entry_to_key, ledger_key_type,
     },
     eviction::{
-        update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionResult,
-        StateArchivalSettings,
+        update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
+        EvictionResult, StateArchivalSettings,
     },
     index::LiveBucketIndex,
-    Bucket, BucketEntry, BucketLevel, BucketList, HotArchiveBucket, HotArchiveBucketLevel,
-    HotArchiveBucketList,
+    Bucket, BucketEntry, BucketEntryExt, BucketLevel, BucketList, HotArchiveBucket,
+    HotArchiveBucketLevel, HotArchiveBucketList,
 };
 use henyey_common::protocol::MIN_SOROBAN_PROTOCOL_VERSION;
 use parking_lot::RwLock;
@@ -147,14 +147,14 @@ impl BucketSnapshot {
         keys.retain(|key| {
             if let Some(entry) = self.bucket.get(key).ok().flatten() {
                 match entry {
-                    BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                    BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => {
                         result.push(e);
                         false // Remove from keys
                     }
-                    BucketEntry::Dead(_) => {
+                    BucketEntry::Deadentry(_) => {
                         false // Key is dead, remove from search but don't add to result
                     }
-                    BucketEntry::Metadata(_) => {
+                    BucketEntry::Metaentry(_) => {
                         true // Keep searching
                     }
                 }
@@ -352,9 +352,9 @@ impl BucketListSnapshot {
                 if let Some(entry) = bucket.get_result_by_key_bytes(key, &key_bytes).ok().flatten()
                 {
                     match entry {
-                        BucketEntry::Live(e) | BucketEntry::Init(e) => return Some(e),
-                        BucketEntry::Dead(_) => return None,
-                        BucketEntry::Metadata(_) => continue,
+                        BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => return Some(e),
+                        BucketEntry::Deadentry(_) => return None,
+                        BucketEntry::Metaentry(_) => continue,
                     }
                 }
             }
@@ -382,9 +382,9 @@ impl BucketListSnapshot {
             for bucket in [&level.curr, &level.snap] {
                 if let Some(entry) = bucket.get_result_by_key_bytes(key, &key_bytes)? {
                     match entry {
-                        BucketEntry::Live(e) | BucketEntry::Init(e) => return Ok(Some(e)),
-                        BucketEntry::Dead(_) => return Ok(None),
-                        BucketEntry::Metadata(_) => continue,
+                        BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => return Ok(Some(e)),
+                        BucketEntry::Deadentry(_) => return Ok(None),
+                        BucketEntry::Metaentry(_) => continue,
                     }
                 }
             }
@@ -440,12 +440,12 @@ impl BucketListSnapshot {
                 remaining.retain(|(key, key_bytes)| {
                     match bucket.get_result_by_key_bytes(key, key_bytes) {
                         Ok(Some(entry)) => match entry {
-                            BucketEntry::Live(ref e) | BucketEntry::Init(ref e) => {
+                            BucketEntry::Liveentry(ref e) | BucketEntry::Initentry(ref e) => {
                                 result.push(e.clone());
                                 false
                             }
-                            BucketEntry::Dead(_) => false,
-                            BucketEntry::Metadata(_) => true,
+                            BucketEntry::Deadentry(_) => false,
+                            BucketEntry::Metaentry(_) => true,
                         },
                         Ok(None) => true,
                         Err(_) => true,
@@ -497,7 +497,7 @@ impl BucketListSnapshot {
     ) -> crate::Result<EvictionResult> {
         let mut result = EvictionResult {
             candidates: Vec::new(),
-            end_iterator: iter,
+            end_iterator: iter.clone(),
             bytes_scanned: 0,
             scan_complete: false,
         };
@@ -509,7 +509,7 @@ impl BucketListSnapshot {
             current_ledger,
         );
 
-        let start_iter = iter;
+        let start_iter = iter.clone();
         let mut bytes_remaining = settings.eviction_scan_size;
 
         // Track keys we've seen to avoid duplicates (from shadowed entries)
@@ -599,8 +599,8 @@ impl BucketListSnapshot {
             entries_scanned += 1;
 
             let live_entry = match &entry {
-                BucketEntry::Live(e) | BucketEntry::Init(e) => e,
-                BucketEntry::Dead(key) => {
+                BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
+                BucketEntry::Deadentry(key) => {
                     if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
                         seen_keys.insert(key_bytes);
                     }
@@ -610,7 +610,7 @@ impl BucketListSnapshot {
                     }
                     continue;
                 }
-                BucketEntry::Metadata(_) => {
+                BucketEntry::Metaentry(_) => {
                     if bytes_used >= max_bytes {
                         iter.bucket_file_offset = start_offset + bytes_used;
                         return Ok((entries_scanned, bytes_used, false));
@@ -899,11 +899,11 @@ impl SearchableBucketListSnapshot {
 
                         // Check entry type
                         let matches_type = match &bucket_entry {
-                            BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                            BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => {
                                 ledger_entry_data_type(&e.data) == entry_type
                             }
-                            BucketEntry::Dead(k) => ledger_key_type(k) == entry_type,
-                            BucketEntry::Metadata(_) => false,
+                            BucketEntry::Deadentry(k) => ledger_key_type(k) == entry_type,
+                            BucketEntry::Metaentry(_) => false,
                         };
 
                         if matches_type {
@@ -957,7 +957,7 @@ impl SearchableBucketListSnapshot {
             for bucket in [&level.curr, &level.snap] {
                 for bucket_entry in bucket.raw_bucket().iter() {
                     match &bucket_entry {
-                        BucketEntry::Live(entry) | BucketEntry::Init(entry) => {
+                        BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => {
                             if let LedgerEntryData::Account(account) = &entry.data {
                                 // Skip if we've already seen this account
                                 if seen_accounts.contains(&account.account_id) {
@@ -978,13 +978,13 @@ impl SearchableBucketListSnapshot {
                                 }
                             }
                         }
-                        BucketEntry::Dead(key) => {
+                        BucketEntry::Deadentry(key) => {
                             // Mark account as seen (it's deleted)
                             if let LedgerKey::Account(k) = key {
                                 seen_accounts.insert(k.account_id.clone());
                             }
                         }
-                        BucketEntry::Metadata(_) => {}
+                        BucketEntry::Metaentry(_) => {}
                     }
                 }
             }
@@ -1067,7 +1067,7 @@ impl SearchableBucketListSnapshot {
             for bucket in [&level.curr, &level.snap] {
                 for bucket_entry in bucket.raw_bucket().iter() {
                     match &bucket_entry {
-                        BucketEntry::Live(entry) | BucketEntry::Init(entry) => {
+                        BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => {
                             if let LedgerEntryData::LiquidityPool(pool) = &entry.data {
                                 // Skip if already seen
                                 if seen_pools.contains(&pool.liquidity_pool_id) {
@@ -1084,13 +1084,13 @@ impl SearchableBucketListSnapshot {
                                 }
                             }
                         }
-                        BucketEntry::Dead(key) => {
+                        BucketEntry::Deadentry(key) => {
                             // Mark pool as seen if it's deleted
                             if let LedgerKey::LiquidityPool(k) = key {
                                 seen_pools.insert(k.liquidity_pool_id.clone());
                             }
                         }
-                        BucketEntry::Metadata(_) => {}
+                        BucketEntry::Metaentry(_) => {}
                     }
                 }
             }
@@ -1111,7 +1111,7 @@ impl SearchableBucketListSnapshot {
             for bucket in [&level.curr, &level.snap] {
                 for bucket_entry in bucket.raw_bucket().iter() {
                     match &bucket_entry {
-                        BucketEntry::Live(entry) | BucketEntry::Init(entry) => {
+                        BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => {
                             if let LedgerEntryData::Trustline(tl) = &entry.data {
                                 if &tl.account_id == account_id {
                                     let key = LedgerKey::Trustline(LedgerKeyTrustLine {
@@ -1125,14 +1125,14 @@ impl SearchableBucketListSnapshot {
                                 }
                             }
                         }
-                        BucketEntry::Dead(key) => {
+                        BucketEntry::Deadentry(key) => {
                             if let LedgerKey::Trustline(k) = key {
                                 if &k.account_id == account_id {
                                     seen_keys.insert(key.clone());
                                 }
                             }
                         }
-                        BucketEntry::Metadata(_) => {}
+                        BucketEntry::Metaentry(_) => {}
                     }
                 }
             }

@@ -4019,7 +4019,7 @@ async fn cmd_debug_bucket_entry(
         for (level, bucket_type, entry) in &occurrences {
             println!("  Level {} {}: ", level, bucket_type);
             match entry {
-                BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => {
                     if let LedgerEntryData::Account(acc) = &e.data {
                         println!("    Type: Live/Init");
                         println!("    Balance: {}", acc.balance);
@@ -4032,10 +4032,10 @@ async fn cmd_debug_bucket_entry(
                         }
                     }
                 }
-                BucketEntry::Dead(_) => {
+                BucketEntry::Deadentry(_) => {
                     println!("    Type: Dead (deleted)");
                 }
-                BucketEntry::Metadata(_) => {
+                BucketEntry::Metaentry(_) => {
                     println!("    Type: Metadata (unexpected)");
                 }
             }
@@ -4209,10 +4209,10 @@ async fn cmd_dump_ledger(
 
                 // Skip dead entries and metadata
                 let live_entry = match entry {
-                    henyey_bucket::BucketEntry::Live(e)
-                    | henyey_bucket::BucketEntry::Init(e) => e,
-                    henyey_bucket::BucketEntry::Dead(_)
-                    | henyey_bucket::BucketEntry::Metadata(_) => continue,
+                    henyey_bucket::BucketEntry::Liveentry(e)
+                    | henyey_bucket::BucketEntry::Initentry(e) => e,
+                    henyey_bucket::BucketEntry::Deadentry(_)
+                    | henyey_bucket::BucketEntry::Metaentry(_) => continue,
                 };
 
                 // Apply type filter

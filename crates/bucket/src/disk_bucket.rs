@@ -46,7 +46,7 @@ use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bloom_filter::HashSeed;
 use crate::cache::RandomEvictionCache;
-use crate::entry::BucketEntry;
+use crate::entry::{BucketEntry, BucketEntryExt};
 use crate::index::LiveBucketIndex;
 use crate::{BucketError, Result};
 
@@ -217,10 +217,8 @@ impl Iterator for StreamingXdrEntryIterator {
             if let Ok(xdr_entry) =
                 stellar_xdr::curr::BucketEntry::from_xdr(&self.buf[..record_len], Limits::none())
             {
-                if let Ok(bucket_entry) = BucketEntry::from_xdr_entry(xdr_entry) {
-                    if bucket_entry.key().is_some() {
-                        return Some((bucket_entry, record_start));
-                    }
+                if xdr_entry.key().is_some() {
+                    return Some((xdr_entry, record_start));
                 }
             }
         }
@@ -307,11 +305,8 @@ impl DiskBucket {
         // The iterator feeds raw record bytes to a SHA-256 hasher while also
         // parsing entries for the index, eliminating the previous two-pass approach.
         let iter = StreamingXdrEntryIterator::with_hasher(path, file_len, true)?;
-        let (live_index, iter) = LiveBucketIndex::from_entries_default_with_iter(
-            iter,
-            bloom_seed,
-            file_len,
-        );
+        let (live_index, iter) =
+            LiveBucketIndex::from_entries_default_with_iter(iter, bloom_seed, file_len);
         let (entry_count, hash) = iter.finalize();
         let hash = hash.expect("hasher was enabled");
 
@@ -498,8 +493,7 @@ impl DiskBucket {
             accounts_in_bucket as usize
         } else {
             // Proportional allocation (stellar-core formula)
-            let fraction =
-                account_bytes as f64 / total_bucket_list_account_size_bytes as f64;
+            let fraction = account_bytes as f64 / total_bucket_list_account_size_bytes as f64;
             let bytes_for_bucket = max_cache_bytes as f64 * fraction;
             let avg_size = account_bytes as f64 / accounts_in_bucket as f64;
             (bytes_for_bucket / avg_size) as usize
@@ -658,7 +652,7 @@ impl DiskBucket {
                 stellar_xdr::curr::BucketEntry::from_xdr(&data[offset..], Limits::none()).map_err(
                     |e| BucketError::Serialization(format!("Failed to parse entry: {}", e)),
                 )?;
-            return BucketEntry::from_xdr_entry(xdr_entry);
+            return Ok(xdr_entry);
         };
 
         if record_start + record_len > data.len() {
@@ -678,7 +672,7 @@ impl DiskBucket {
         let xdr_entry = stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none())
             .map_err(|e| BucketError::Serialization(format!("Failed to parse entry: {}", e)))?;
 
-        BucketEntry::from_xdr_entry(xdr_entry)
+        Ok(xdr_entry)
     }
 
     /// Scan a page starting at `page_offset` for a key, reading up to `page_size` bytes.
@@ -715,7 +709,7 @@ impl DiskBucket {
             if let Ok(xdr_entry) =
                 stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none())
             {
-                let entry = BucketEntry::from_xdr_entry(xdr_entry)?;
+                let entry = xdr_entry;
 
                 if let Some(entry_key) = entry.key() {
                     if &entry_key == key {
@@ -864,7 +858,7 @@ impl Iterator for DiskBucketIter {
             self.position += record_len as u64;
 
             match stellar_xdr::curr::BucketEntry::from_xdr(&record_data, Limits::none()) {
-                Ok(xdr_entry) => Some(BucketEntry::from_xdr_entry(xdr_entry)),
+                Ok(xdr_entry) => Some(Ok(xdr_entry)),
                 Err(e) => Some(Err(BucketError::Serialization(format!(
                     "Failed to parse: {}",
                     e
@@ -879,7 +873,7 @@ impl Iterator for DiskBucketIter {
                 Ok(xdr_entry) => {
                     // Update our position tracking
                     self.position = self.reader.stream_position().unwrap_or(self.file_len);
-                    Some(BucketEntry::from_xdr_entry(xdr_entry))
+                    Some(Ok(xdr_entry))
                 }
                 Err(_) => None,
             }
@@ -935,10 +929,7 @@ impl Iterator for DiskBucketOffsetIter {
         self.position += record_len as u64;
 
         match stellar_xdr::curr::BucketEntry::from_xdr(&record_data, Limits::none()) {
-            Ok(xdr_entry) => match BucketEntry::from_xdr_entry(xdr_entry) {
-                Ok(entry) => Some(Ok((entry, total_record_size))),
-                Err(e) => Some(Err(e)),
-            },
+            Ok(xdr_entry) => Some(Ok((xdr_entry, total_record_size))),
             Err(e) => Some(Err(BucketError::Serialization(format!(
                 "Failed to parse entry: {}",
                 e

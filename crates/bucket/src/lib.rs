@@ -140,7 +140,7 @@ pub use bloom_filter::{BucketBloomFilter, HashSeed, HASH_KEY_BYTES};
 pub use entry::{
     compare_entries, compare_keys, get_ttl_key, get_ttl_live_until, is_persistent_entry,
     is_persistent_key, is_soroban_entry, is_soroban_key, is_temporary_entry, is_ttl_expired,
-    ledger_entry_data_type, ledger_entry_to_key, ledger_key_type, BucketEntry,
+    ledger_entry_data_type, ledger_entry_to_key, ledger_key_type, BucketEntry, BucketEntryExt,
 };
 
 // ============================================================================
@@ -155,8 +155,8 @@ pub use error::BucketError;
 
 pub use eviction::{
     bucket_update_period, level_half, level_should_spill, level_size,
-    update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionResult,
-    ResolvedEviction, StateArchivalSettings,
+    update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
+    EvictionResult, ResolvedEviction, StateArchivalSettings,
     DEFAULT_EVICTION_SCAN_SIZE, DEFAULT_MAX_ENTRIES_TO_ARCHIVE, DEFAULT_STARTING_EVICTION_SCAN_LEVEL,
 };
 
@@ -318,8 +318,8 @@ mod tests {
 
         // Create entries
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         // Create bucket through manager
@@ -441,18 +441,18 @@ mod tests {
         let entry = make_account_entry([1u8; 32], 100);
         let key = make_account_key([1u8; 32]);
 
-        let live = BucketEntry::Live(entry.clone());
+        let live = BucketEntry::Liveentry(entry.clone());
         assert!(live.is_live());
         assert!(!live.is_dead());
         assert!(!live.is_init());
         assert!(!live.is_metadata());
 
-        let dead = BucketEntry::Dead(key);
+        let dead = BucketEntry::Deadentry(key);
         assert!(!dead.is_live());
         assert!(dead.is_dead());
         assert!(!dead.is_init());
 
-        let init = BucketEntry::Init(entry);
+        let init = BucketEntry::Initentry(entry);
         assert!(!init.is_live());
         assert!(!init.is_dead());
         assert!(init.is_init());

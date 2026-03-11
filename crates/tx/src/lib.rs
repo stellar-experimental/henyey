@@ -152,7 +152,8 @@ pub use apply::{
 // Re-export result types
 pub use result::{
     MutableTransactionResult, OpResultCode, OpResultWrapper, RefundableFeeError,
-    RefundableFeeTracker, TxApplyResult, TxResultCode, TxResultWrapper, TxSetResultSummary,
+    RefundableFeeTracker, TransactionResultCodeExt, TxApplyResult, TxResultCode, TxResultWrapper,
+    TxSetResultSummary,
 };
 
 // Re-export signature checker types
@@ -168,8 +169,9 @@ pub use validation::{
 // Re-export operation types
 pub use operations::{
     collect_prefetch_keys, get_needed_threshold, get_operation_source, get_threshold_level,
-    validate_operation, OperationType, OperationValidationError, ThresholdLevel,
+    validate_operation, OperationTypeExt, OperationValidationError, ThresholdLevel,
 };
+pub use stellar_xdr::curr::OperationType;
 
 // Re-export state types
 pub use state::{
@@ -484,8 +486,7 @@ pub enum OperationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::OperationType;
-    use stellar_xdr::curr::*; // Re-import to shadow XDR's OperationType
+    use stellar_xdr::curr::*;
 
     fn create_test_envelope() -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));

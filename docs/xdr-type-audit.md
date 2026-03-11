@@ -13,6 +13,42 @@ the henyey codebase that are redundant with types already defined in the `stella
 crate. The goal is to reduce conversion boilerplate, eliminate duplicate definitions,
 and improve type safety by using XDR types directly where possible.
 
+### Implementation Status
+
+All Tier 1 and Tier 2 high-priority items have been implemented. Build, clippy, and
+tests pass clean (excluding a pre-existing compile error in `preconditions.rs:631`).
+
+| Item | Description | Status |
+|------|-------------|--------|
+| **Tier 1** | | |
+| T1.1 | Replace `EventType` with `ContractEventType` | **Done** |
+| T1.2 | Replace `AUTH_*_FLAG` constants with `AccountFlags::* as u32` | **Done** |
+| T1.3 | Replace local `MAX_SIGNERS`, `MASK_LEDGER_HEADER_FLAGS`, `MAX_OPS_PER_TX` | **Done** |
+| T1.4 | Consolidate `OfferDescriptor` | **Done** |
+| T1.5 | Consolidate `ThresholdLevel` to `henyey_common` | **Done** |
+| T1.6 | Replace BN254 cost type index constants | **Done** |
+| T1.7 | Replace hardcoded `fee: 30` with `LIQUIDITY_POOL_FEE_V18` | **Done** |
+| T1.8 | Consolidate `FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION` | **Done** |
+| T1.9 | Consolidate `TRUSTLINE_CLAWBACK_ENABLED_FLAG` | **Done** |
+| **Tier 2** | | |
+| T2.1 | Merge `StorageKey` and `ContractDataKey` | Deferred |
+| T2.2 | Replace `OperationType` with XDR `OperationType` | **Done** |
+| T2.3 | Replace `ExecutionFailure` with `TransactionResultCode` | **Done** |
+| T2.4 | Replace `TxResultCode` with `TransactionResultCode` | **Done** |
+| T2.5 | Merge `AssetKey` definitions | Deferred |
+| T2.6 | Replace `EvictionIterator` with XDR `EvictionIterator` | **Done** |
+| T2.7 | Replace `BucketEntry` with XDR `BucketEntry` | **Done** |
+| T2.8 | Use `protocol_version_starts_from()` consistently | Deferred |
+| **Tier 3** | | |
+| T3.1 | Evaluate `Hash256` -> `xdr::Hash` migration | Not started |
+| T3.2 | Evaluate `PeerId` -> `NodeId` migration | Not started |
+| T3.3 | Introduce semantic type aliases | Not started |
+| T3.4 | Evaluate custom `ContractEvent` -> XDR `ContractEvent` | Not started |
+
+**Pattern used**: For each replacement, the custom type becomes a type alias
+(`pub type Foo = stellar_xdr::curr::Foo`) and custom methods move to an extension
+trait (`FooExt`). This preserves API ergonomics while eliminating conversion boilerplate.
+
 ### Key Findings
 
 | Category | High Redundancy | Medium | Low / Justified |

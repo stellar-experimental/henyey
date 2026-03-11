@@ -46,7 +46,7 @@ use henyey_crypto::account_id_to_strkey;
 
 use henyey_tx::{
     make_account_address, make_claimable_balance_address, make_muxed_account_address,
-    operations::OperationType,
+    operations::OperationTypeExt,
     soroban::{PersistentModuleCache, SorobanConfig},
     state::{get_account_seq_ledger, get_account_seq_time},
     validation::{self, LedgerContext as ValidationContext},
@@ -63,13 +63,13 @@ use stellar_xdr::curr::{
     LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyConfigSetting,
     LedgerKeyLiquidityPool, LedgerKeyTrustLine, Limits, LiquidityPoolEntry, LiquidityPoolEntryBody,
     ManageBuyOfferResult, ManageSellOfferResult, MuxedAccount, OfferEntry, Operation,
-    OperationBody, OperationMetaV2, OperationResult, OperationResultTr,
+    OperationBody, OperationMetaV2, OperationResult, OperationResultTr, OperationType,
     PathPaymentStrictReceiveResult, PathPaymentStrictSendResult, PoolId, Preconditions, ScAddress,
     SignerKey, SorobanTransactionData, SorobanTransactionMetaExt, SorobanTransactionMetaExtV1,
     SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent, TransactionEventStage,
-    TransactionMeta, TransactionMetaV4, TransactionResult, TransactionResultExt,
-    TransactionResultMetaV1, TransactionResultPair, TransactionResultResult, TrustLineAsset,
-    TrustLineFlags, VecM, WriteXdr,
+    TransactionMeta, TransactionMetaV4, TransactionResult, TransactionResultCode,
+    TransactionResultExt, TransactionResultMetaV1, TransactionResultPair,
+    TransactionResultResult, TrustLineAsset, TrustLineFlags, VecM, WriteXdr,
 };
 use tracing::{debug, warn};
 
@@ -329,27 +329,15 @@ pub struct TransactionExecutionResult {
     pub meta_build_us: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecutionFailure {
-    Malformed,
-    MissingOperation,
-    InvalidSignature,
-    BadAuthExtra,
-    BadMinSeqAgeOrGap,
-    BadSequence,
-    InsufficientFee,
-    InsufficientBalance,
-    NoAccount,
-    TooEarly,
-    TooLate,
-    NotSupported,
-    InternalError,
-    BadSponsorship,
-    OperationFailed,
-}
+/// Type alias: `ExecutionFailure` is now `TransactionResultCode` from the XDR crate.
+///
+/// Previously this was a custom enum with 15 variants that mapped 1:1 to
+/// `TransactionResultCode`. We now use the XDR type directly, eliminating
+/// the intermediate mapping layer.
+pub type ExecutionFailure = TransactionResultCode;
 
 /// Create a failed `TransactionExecutionResult` with no fee charged or meta.
-fn failed_result(failure: ExecutionFailure, error: &str) -> TransactionExecutionResult {
+fn failed_result(failure: TransactionResultCode, error: &str) -> TransactionExecutionResult {
     TransactionExecutionResult {
         success: false,
         fee_charged: 0,
@@ -1710,28 +1698,28 @@ impl TransactionExecutor {
         // Phase 1: Structure validation
         if !frame.is_valid_structure() {
             let failure = if frame.operations().is_empty() {
-                ExecutionFailure::MissingOperation
+                TransactionResultCode::TxMissingOperation
             } else {
-                ExecutionFailure::Malformed
+                TransactionResultCode::TxMalformed
             };
             return Ok(Err(pre_seq_fail(failure, "Invalid transaction structure")));
         }
 
         // Phase 2: Account loading
         if !self.load_account(snapshot, &fee_source_id)? {
-            return Ok(Err(pre_seq_fail(ExecutionFailure::NoAccount, "Source account not found")));
+            return Ok(Err(pre_seq_fail(TransactionResultCode::TxNoAccount, "Source account not found")));
         }
         if !self.load_account(snapshot, &inner_source_id)? {
-            return Ok(Err(pre_seq_fail(ExecutionFailure::NoAccount, "Source account not found")));
+            return Ok(Err(pre_seq_fail(TransactionResultCode::TxNoAccount, "Source account not found")));
         }
 
         let fee_source_account = match self.state.get_account(&fee_source_id) {
             Some(acc) => acc.clone(),
-            None => return Ok(Err(pre_seq_fail(ExecutionFailure::NoAccount, "Source account not found"))),
+            None => return Ok(Err(pre_seq_fail(TransactionResultCode::TxNoAccount, "Source account not found"))),
         };
         let source_account = match self.state.get_account(&inner_source_id) {
             Some(acc) => acc.clone(),
-            None => return Ok(Err(pre_seq_fail(ExecutionFailure::NoAccount, "Source account not found"))),
+            None => return Ok(Err(pre_seq_fail(TransactionResultCode::TxNoAccount, "Source account not found"))),
         };
 
         // Phase 3: Fee validation
@@ -1742,7 +1730,7 @@ impl TransactionExecutor {
             let outer_inclusion_fee = frame.inclusion_fee();
 
             if outer_inclusion_fee < outer_min_inclusion_fee {
-                return Ok(Err(pre_seq_fail(ExecutionFailure::InsufficientFee, "Insufficient fee")));
+                return Ok(Err(pre_seq_fail(TransactionResultCode::TxInsufficientFee, "Insufficient fee")));
             }
 
             let (inner_inclusion_fee, inner_is_soroban) = match frame.envelope() {
@@ -1762,18 +1750,18 @@ impl TransactionExecutor {
                 let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
                 let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
                 if v1 < v2 {
-                    return Ok(Err(pre_seq_fail(ExecutionFailure::InsufficientFee, "Insufficient fee")));
+                    return Ok(Err(pre_seq_fail(TransactionResultCode::TxInsufficientFee, "Insufficient fee")));
                 }
             } else {
                 let allow_negative_inner = inner_is_soroban;
                 if !allow_negative_inner {
-                    return Ok(Err(pre_seq_fail(ExecutionFailure::OperationFailed, "Fee bump inner transaction invalid")));
+                    return Ok(Err(pre_seq_fail(TransactionResultCode::TxFailed, "Fee bump inner transaction invalid")));
                 }
             }
         } else {
             let required_fee = frame.operation_count() as u32 * base_fee;
             if frame.fee() < required_fee {
-                return Ok(Err(pre_seq_fail(ExecutionFailure::InsufficientFee, "Insufficient fee")));
+                return Ok(Err(pre_seq_fail(TransactionResultCode::TxInsufficientFee, "Insufficient fee")));
             }
         }
 
@@ -1790,9 +1778,9 @@ impl TransactionExecutor {
         if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
             return Ok(Err(pre_seq_fail(
                 match e {
-                    validation::ValidationError::TooEarly { .. } => ExecutionFailure::TooEarly,
-                    validation::ValidationError::TooLate { .. } => ExecutionFailure::TooLate,
-                    _ => ExecutionFailure::OperationFailed,
+                    validation::ValidationError::TooEarly { .. } => TransactionResultCode::TxTooEarly,
+                    validation::ValidationError::TooLate { .. } => TransactionResultCode::TxTooLate,
+                    _ => TransactionResultCode::TxFailed,
                 },
                 "Time bounds invalid",
             )));
@@ -1803,14 +1791,14 @@ impl TransactionExecutor {
                 match e {
                     validation::ValidationError::BadLedgerBounds { min, max, current } => {
                         if max > 0 && current > max {
-                            ExecutionFailure::TooLate
+                            TransactionResultCode::TxTooLate
                         } else if min > 0 && current < min {
-                            ExecutionFailure::TooEarly
+                            TransactionResultCode::TxTooEarly
                         } else {
-                            ExecutionFailure::OperationFailed
+                            TransactionResultCode::TxFailed
                         }
                     }
-                    _ => ExecutionFailure::OperationFailed,
+                    _ => TransactionResultCode::TxFailed,
                 },
                 "Ledger bounds invalid",
             )));
@@ -1821,7 +1809,7 @@ impl TransactionExecutor {
         if self.ledger_seq <= i32::MAX as u32 {
             let starting_seq = (self.ledger_seq as i64) << 32;
             if frame.sequence_number() == starting_seq {
-                return Ok(Err(pre_seq_fail(ExecutionFailure::BadSequence, "Bad sequence: equals starting sequence")));
+                return Ok(Err(pre_seq_fail(TransactionResultCode::TxBadSeq, "Bad sequence: equals starting sequence")));
             }
         }
 
@@ -1860,7 +1848,7 @@ impl TransactionExecutor {
                     tx_seq
                 )
             };
-            return Ok(Err(pre_seq_fail(ExecutionFailure::BadSequence, &error_msg)));
+            return Ok(Err(pre_seq_fail(TransactionResultCode::TxBadSeq, &error_msg)));
         }
 
         // --- Past this point, the sequence check has passed ---
@@ -1873,7 +1861,7 @@ impl TransactionExecutor {
                 let acc_seq_time = get_account_seq_time(&source_account);
                 let min_seq_age = cond.min_seq_age.0;
                 if min_seq_age > self.close_time || self.close_time - min_seq_age < acc_seq_time {
-                    return Ok(Err(post_seq_fail(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence age not met")));
+                    return Ok(Err(post_seq_fail(TransactionResultCode::TxBadMinSeqAgeOrGap, "Minimum sequence age not met")));
                 }
             }
 
@@ -1883,14 +1871,14 @@ impl TransactionExecutor {
                 if min_seq_ledger_gap > self.ledger_seq
                     || self.ledger_seq - min_seq_ledger_gap < acc_seq_ledger
                 {
-                    return Ok(Err(post_seq_fail(ExecutionFailure::BadMinSeqAgeOrGap, "Minimum sequence ledger gap not met")));
+                    return Ok(Err(post_seq_fail(TransactionResultCode::TxBadMinSeqAgeOrGap, "Minimum sequence ledger gap not met")));
                 }
             }
         }
 
         // Phase 6: Signature validation
         if validation::validate_signatures(&frame, &validation_ctx).is_err() {
-            return Ok(Err(post_seq_fail(ExecutionFailure::InvalidSignature, "Invalid signature")));
+            return Ok(Err(post_seq_fail(TransactionResultCode::TxBadAuth, "Invalid signature")));
         }
 
         let outer_hash = frame
@@ -1904,7 +1892,7 @@ impl TransactionExecutor {
             outer_threshold,
         ) {
             tracing::debug!("Signature check failed: fee_source outer check");
-            return Ok(Err(post_seq_fail(ExecutionFailure::InvalidSignature, "Invalid signature")));
+            return Ok(Err(post_seq_fail(TransactionResultCode::TxBadAuth, "Invalid signature")));
         }
 
         // NOTE: For fee-bump transactions, we deliberately do NOT check the inner
@@ -1932,7 +1920,7 @@ impl TransactionExecutor {
                 thresholds = ?source_account.thresholds.0,
                 "Signature check failed: source outer check"
             );
-            return Ok(Err(post_seq_fail(ExecutionFailure::InvalidSignature, "Invalid signature")));
+            return Ok(Err(post_seq_fail(TransactionResultCode::TxBadAuth, "Invalid signature")));
         }
 
         if let Preconditions::V2(cond) = frame.preconditions() {
@@ -1948,7 +1936,7 @@ impl TransactionExecutor {
                     frame.signatures()
                 };
                 if !has_required_extra_signers(&extra_hash, extra_signatures, &cond.extra_signers) {
-                    return Ok(Err(post_seq_fail(ExecutionFailure::BadAuthExtra, "Missing extra signer")));
+                    return Ok(Err(post_seq_fail(TransactionResultCode::TxBadAuthExtra, "Missing extra signer")));
                 }
             }
         }
@@ -2076,7 +2064,7 @@ impl TransactionExecutor {
         if deduct_fee {
             if let Some(acc) = self.state.get_account(&fee_source_id) {
                 if self.available_balance_for_fee(acc)? < fee {
-                    preflight_failure = Some(ExecutionFailure::InsufficientBalance);
+                    preflight_failure = Some(TransactionResultCode::TxInsufficientBalance);
                 }
             }
         }
@@ -2397,7 +2385,7 @@ impl TransactionExecutor {
             fee_refund,
             operation_results: vec![],
             error: Some("Insufficient balance for fee".into()),
-            failure: Some(ExecutionFailure::InsufficientBalance),
+            failure: Some(TransactionResultCode::TxInsufficientBalance),
             tx_meta: Some(tx_meta),
             fee_changes: Some(pre.fee_changes),
             post_fee_changes: Some(empty_entry_changes()),
@@ -2762,7 +2750,7 @@ impl TransactionExecutor {
                                     );
                                     op_result = insufficient_refundable_fee_result(op);
                                     all_success = false;
-                                    failure = Some(ExecutionFailure::OperationFailed);
+                                    failure = Some(TransactionResultCode::TxFailed);
                                 }
                             }
                         }
@@ -2777,7 +2765,7 @@ impl TransactionExecutor {
                                 "Operation failed"
                             );
                             if matches!(op_result, OperationResult::OpNotSupported) {
-                                failure = Some(ExecutionFailure::NotSupported);
+                                failure = Some(TransactionResultCode::TxNotSupported);
                             }
                             // Roll back failed operation's state changes so subsequent
                             // operations see clean state (matches stellar-core nested LedgerTxn).
@@ -3016,7 +3004,7 @@ impl TransactionExecutor {
                         // stellar-core maps std::runtime_error during operation execution
                         // to txINTERNAL_ERROR (not txNOT_SUPPORTED). The exception
                         // aborts all remaining operations.
-                        failure = Some(ExecutionFailure::InternalError);
+                        failure = Some(TransactionResultCode::TxInternalError);
                         break;
                     }
                 }
@@ -3034,7 +3022,7 @@ impl TransactionExecutor {
 
         if all_success && self.state.has_pending_sponsorship() {
             all_success = false;
-            failure = Some(ExecutionFailure::BadSponsorship);
+            failure = Some(TransactionResultCode::TxBadSponsorship);
         }
 
         if !all_success {
@@ -3177,7 +3165,7 @@ impl TransactionExecutor {
             failure: if all_success {
                 None
             } else {
-                Some(failure.unwrap_or(ExecutionFailure::OperationFailed))
+                Some(failure.unwrap_or(TransactionResultCode::TxFailed))
             },
             tx_meta: Some(tx_meta),
             fee_changes: Some(fee_changes),

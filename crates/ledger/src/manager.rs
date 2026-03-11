@@ -44,8 +44,8 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use henyey_bucket::{
-    BucketEntry, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator, EvictionResult,
-    HotArchiveBucketList, StateArchivalSettings,
+    BucketEntry, BucketEntryExt, BucketList, BucketListSnapshot, BucketMergeMap, EvictionIterator,
+    EvictionIteratorExt, EvictionResult, HotArchiveBucketList, StateArchivalSettings,
 };
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_common::protocol::{
@@ -56,7 +56,7 @@ use henyey_tx::state::AssetKey;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use stellar_xdr::curr::{
     AccountId, BucketListType, ConfigSettingEntry, ConfigSettingId,
-    EvictionIterator as XdrEvictionIterator, ExtensionPoint, GeneralizedTransactionSet, Hash,
+    ExtensionPoint, GeneralizedTransactionSet, Hash,
     LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1, LedgerCloseMetaV2, LedgerEntry,
     LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry,
     LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, TransactionEventStage,
@@ -273,7 +273,7 @@ impl LevelScanner {
 
         self.seen_keys.insert(key.clone());
 
-        if let BucketEntry::Live(ref le) | BucketEntry::Init(ref le) = entry {
+        if let BucketEntry::Liveentry(ref le) | BucketEntry::Initentry(ref le) = entry {
             // Compile contracts in parallel across levels via the shared module cache
             if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
                 if let Some(ref cache) = module_cache {
@@ -294,7 +294,7 @@ impl LevelScanner {
             } else {
                 self.entries.insert(key, le.clone());
             }
-        } else if let BucketEntry::Dead(_) = entry {
+        } else if let BucketEntry::Deadentry(_) = entry {
             // Track dead keys so they shadow live entries at higher (older) levels.
             // For TTL entries, also track in the TTL-specific dead set.
             if let LedgerKey::Ttl(ref ttl_key) = key {
@@ -698,9 +698,9 @@ fn get_from_pairs(
         for bucket in [curr, snap] {
             if let Some(entry) = bucket.get(key)? {
                 match entry {
-                    BucketEntry::Live(e) | BucketEntry::Init(e) => return Ok(Some(e)),
-                    BucketEntry::Dead(_) => return Ok(None),
-                    BucketEntry::Metadata(_) => continue 'level,
+                    BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => return Ok(Some(e)),
+                    BucketEntry::Deadentry(_) => return Ok(None),
+                    BucketEntry::Metaentry(_) => continue 'level,
                 }
             }
         }
@@ -846,14 +846,10 @@ fn load_eviction_iterator_from_bucket_list(bucket_list: &BucketList) -> Option<E
 
     match bucket_list.get(&key) {
         Ok(Some(entry)) => {
-            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(xdr_iter)) =
+            if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(iter)) =
                 entry.data
             {
-                Some(EvictionIterator {
-                    bucket_file_offset: xdr_iter.bucket_file_offset,
-                    bucket_list_level: xdr_iter.bucket_list_level,
-                    is_curr_bucket: xdr_iter.is_curr_bucket,
-                })
+                Some(iter)
             } else {
                 None
             }
@@ -2087,8 +2083,8 @@ impl LedgerManager {
             for bucket in [level.curr.as_ref(), level.snap.as_ref()] {
                 for entry in bucket.iter() {
                     match &entry {
-                        henyey_bucket::BucketEntry::Live(le)
-                        | henyey_bucket::BucketEntry::Init(le) => {
+                        henyey_bucket::BucketEntry::Liveentry(le)
+                        | henyey_bucket::BucketEntry::Initentry(le) => {
                             if let LedgerEntryData::ContractCode(ref cc) = le.data {
                                 let hash: [u8; 32] =
                                     <sha2::Sha256 as sha2::Digest>::digest(cc.code.as_slice())
@@ -2102,8 +2098,8 @@ impl LedgerManager {
                                 }
                             }
                         }
-                        henyey_bucket::BucketEntry::Dead(_)
-                        | henyey_bucket::BucketEntry::Metadata(_) => {}
+                        henyey_bucket::BucketEntry::Deadentry(_)
+                        | henyey_bucket::BucketEntry::Metaentry(_) => {}
                     }
                 }
             }
@@ -2225,7 +2221,7 @@ impl<'a> LedgerCloseContext<'a> {
             ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
             ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
             ConfigSettingContractHistoricalDataV0, ConfigSettingContractLedgerCostV0,
-            ContractCostParams, EvictionIterator, StateArchivalSettings,
+            ContractCostParams, StateArchivalSettings,
         };
 
         let ledger_seq = self.close_data.ledger_seq;
@@ -4240,11 +4236,7 @@ impl<'a> LedgerCloseContext<'a> {
                     let eviction_iter_entry = LedgerEntry {
                         last_modified_ledger_seq: self.close_data.ledger_seq,
                         data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
-                            XdrEvictionIterator {
-                                bucket_file_offset: resolved.end_iterator.bucket_file_offset as u64,
-                                bucket_list_level: resolved.end_iterator.bucket_list_level,
-                                is_curr_bucket: resolved.end_iterator.is_curr_bucket,
-                            },
+                            resolved.end_iterator.clone(),
                         )),
                         ext: LedgerEntryExt::V0,
                     };
@@ -5137,8 +5129,8 @@ mod tests {
         }
 
         // curr has v2, snap has v1 → v2 should win
-        let curr = Bucket::from_entries(vec![BucketEntry::Live(entry_v2.clone())]).unwrap();
-        let snap = Bucket::from_entries(vec![BucketEntry::Live(entry_v1.clone())]).unwrap();
+        let curr = Bucket::from_entries(vec![BucketEntry::Liveentry(entry_v2.clone())]).unwrap();
+        let snap = Bucket::from_entries(vec![BucketEntry::Liveentry(entry_v1.clone())]).unwrap();
 
         let mc: Option<Arc<PersistentModuleCache>> = None;
         let result = scan_single_level(&curr, &snap, true, &mc, TEST_PROTOCOL);
@@ -5166,8 +5158,8 @@ mod tests {
         });
 
         // curr has a dead entry, snap has the live entry
-        let curr = Bucket::from_entries(vec![BucketEntry::Dead(dead_key)]).unwrap();
-        let snap = Bucket::from_entries(vec![BucketEntry::Live(entry)]).unwrap();
+        let curr = Bucket::from_entries(vec![BucketEntry::Deadentry(dead_key)]).unwrap();
+        let snap = Bucket::from_entries(vec![BucketEntry::Liveentry(entry)]).unwrap();
 
         let mc: Option<Arc<PersistentModuleCache>> = None;
         let result = scan_single_level(&curr, &snap, true, &mc, TEST_PROTOCOL);

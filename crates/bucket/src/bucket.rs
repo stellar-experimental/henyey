@@ -43,7 +43,7 @@ use henyey_common::BucketListDbConfig;
 
 use crate::cache::CacheStats;
 use crate::disk_bucket::DiskBucket;
-use crate::entry::{compare_entries, BucketEntry};
+use crate::entry::{compare_entries, BucketEntry, BucketEntryExt};
 use crate::index::BucketEntryCounters;
 use crate::{BucketError, Result};
 
@@ -173,8 +173,8 @@ impl Bucket {
     ///
     /// ```ignore
     /// let entries = vec![
-    ///     BucketEntry::Live(account_entry),
-    ///     BucketEntry::Dead(deleted_key),
+    ///     BucketEntry::Liveentry(account_entry),
+    ///     BucketEntry::Deadentry(deleted_key),
     /// ];
     /// let bucket = Bucket::from_entries(entries)?;
     /// ```
@@ -217,7 +217,7 @@ impl Bucket {
         // Single pass: serialize each entry once, use for both index and hash
         for (idx, entry) in entries.iter().enumerate() {
             // Serialize entry to XDR
-            let xdr_entry = entry.to_xdr_entry();
+            let xdr_entry = entry.clone();
             let mut entry_bytes = Vec::new();
             let mut limited = Limited::new(&mut entry_bytes, Limits::none());
             xdr_entry.write_xdr(&mut limited).map_err(|e| {
@@ -518,7 +518,7 @@ impl Bucket {
                 let record_data = &bytes[offset..offset + record_len];
                 match stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none()) {
                     Ok(xdr_entry) => {
-                        entries.push(BucketEntry::from_xdr_entry(xdr_entry)?);
+                        entries.push(xdr_entry);
                     }
                     Err(e) => {
                         debug!(
@@ -548,7 +548,7 @@ impl Bucket {
             while limited.inner.position() < bytes.len() as u64 {
                 match stellar_xdr::curr::BucketEntry::read_xdr(&mut limited) {
                     Ok(xdr_entry) => {
-                        entries.push(BucketEntry::from_xdr_entry(xdr_entry)?);
+                        entries.push(xdr_entry);
                     }
                     Err(_) => {
                         // End of stream or error
@@ -570,7 +570,7 @@ impl Bucket {
         let mut bytes = Vec::new();
 
         for entry in entries {
-            let xdr_entry = entry.to_xdr_entry();
+            let xdr_entry = entry.clone();
 
             // First serialize the entry to get its size
             let mut entry_bytes = Vec::new();
@@ -613,9 +613,7 @@ impl Bucket {
                 // at the canonical path would corrupt any future merge that
                 // produces the same content hash and tries to reuse the file.
                 let mut file = std::fs::File::create(&path)?;
-                let write_result = file
-                    .write_all(&uncompressed)
-                    .and_then(|_| file.sync_all());
+                let write_result = file.write_all(&uncompressed).and_then(|_| file.sync_all());
                 if let Err(e) = write_result {
                     let _ = std::fs::remove_file(&path);
                     return Err(BucketError::Io(e));
@@ -734,9 +732,7 @@ impl Bucket {
     /// In-memory buckets return `None`.
     pub fn entry_counters(&self) -> Option<&BucketEntryCounters> {
         match &self.storage {
-            BucketStorage::DiskBacked { disk_bucket } => {
-                Some(disk_bucket.live_index().counters())
-            }
+            BucketStorage::DiskBacked { disk_bucket } => Some(disk_bucket.live_index().counters()),
             BucketStorage::InMemory { .. } => None,
         }
     }
@@ -745,11 +741,7 @@ impl Bucket {
     ///
     /// Delegates to `DiskBucket::maybe_initialize_cache()`. Only disk-backed
     /// buckets get caches; in-memory buckets are no-ops.
-    pub fn maybe_initialize_cache(
-        &self,
-        total_account_bytes: u64,
-        config: &BucketListDbConfig,
-    ) {
+    pub fn maybe_initialize_cache(&self, total_account_bytes: u64, config: &BucketListDbConfig) {
         if let BucketStorage::DiskBacked { disk_bucket } = &self.storage {
             disk_bucket.maybe_initialize_cache(total_account_bytes, config);
         }
@@ -758,9 +750,7 @@ impl Bucket {
     /// Returns cache statistics for this bucket's per-bucket cache, if present.
     pub fn cache_stats(&self) -> Option<CacheStats> {
         match &self.storage {
-            BucketStorage::DiskBacked { disk_bucket } => {
-                disk_bucket.cache().map(|c| c.stats())
-            }
+            BucketStorage::DiskBacked { disk_bucket } => disk_bucket.cache().map(|c| c.stats()),
             BucketStorage::InMemory { .. } => None,
         }
     }
@@ -892,9 +882,11 @@ impl Bucket {
     /// Look up a ledger entry by key, returning None if dead or not found.
     pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         match self.get(key)? {
-            Some(BucketEntry::Live(entry)) | Some(BucketEntry::Init(entry)) => Ok(Some(entry)),
-            Some(BucketEntry::Dead(_)) => Ok(None), // Entry is deleted
-            Some(BucketEntry::Metadata(_)) => Ok(None),
+            Some(BucketEntry::Liveentry(entry)) | Some(BucketEntry::Initentry(entry)) => {
+                Ok(Some(entry))
+            }
+            Some(BucketEntry::Deadentry(_)) => Ok(None), // Entry is deleted
+            Some(BucketEntry::Metaentry(_)) => Ok(None),
             None => Ok(None),
         }
     }
@@ -902,7 +894,7 @@ impl Bucket {
     /// Get the protocol version from bucket metadata, if present.
     pub fn protocol_version(&self) -> Option<u32> {
         for entry in self.iter() {
-            if let BucketEntry::Metadata(meta) = entry {
+            if let BucketEntry::Metaentry(meta) = entry {
                 return Some(meta.ledger_version);
             }
         }
@@ -1005,7 +997,7 @@ impl Bucket {
         // Single pass: serialize each entry for hash and build key index
         for (idx, entry) in entries.iter().enumerate() {
             // Serialize entry to XDR for hash
-            let xdr_entry = entry.to_xdr_entry();
+            let xdr_entry = entry.clone();
             let mut entry_bytes = Vec::new();
             let mut limited = Limited::new(&mut entry_bytes, Limits::none());
             xdr_entry.write_xdr(&mut limited).map_err(|e| {
@@ -1112,7 +1104,7 @@ impl<'a> Iterator for BucketOffsetIter<'a> {
                     iter.index += 1;
 
                     // Compute the on-disk record size: 4-byte mark + XDR bytes
-                    let entry_size = match entry.to_xdr() {
+                    let entry_size = match entry.to_xdr_bytes() {
                         Ok(bytes) => bytes.len() as u64 + 4,
                         Err(_) => continue,
                     };
@@ -1200,8 +1192,8 @@ mod tests {
     #[test]
     fn test_bucket_from_entries() {
         let entries = vec![
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
         ];
 
         let bucket = Bucket::from_entries(entries).unwrap();
@@ -1210,7 +1202,7 @@ mod tests {
 
         // Entries should be sorted
         let entries: Vec<_> = bucket.iter().collect();
-        if let BucketEntry::Live(entry) = &entries[0] {
+        if let BucketEntry::Liveentry(entry) = &entries[0] {
             if let LedgerEntryData::Account(account) = &entry.data {
                 assert_eq!(account.balance, 100);
             }
@@ -1220,8 +1212,8 @@ mod tests {
     #[test]
     fn test_bucket_lookup() {
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         let bucket = Bucket::from_entries(entries).unwrap();
@@ -1244,7 +1236,7 @@ mod tests {
             account_id: make_account_id([1u8; 32]),
         });
 
-        let entries = vec![BucketEntry::Dead(key.clone())];
+        let entries = vec![BucketEntry::Deadentry(key.clone())];
         let bucket = Bucket::from_entries(entries).unwrap();
 
         // Looking up a dead entry should return None
@@ -1260,8 +1252,8 @@ mod tests {
     #[test]
     fn test_bucket_hash_consistency() {
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         let bucket1 = Bucket::from_entries(entries.clone()).unwrap();
@@ -1273,8 +1265,8 @@ mod tests {
     #[test]
     fn test_bucket_save_and_load() {
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         let bucket = Bucket::from_entries(entries).unwrap();
@@ -1294,8 +1286,8 @@ mod tests {
     fn test_bucket_roundtrip_entries() {
         // Create a bucket with entries
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
         let bucket = Bucket::from_entries(entries.clone()).unwrap();
         let original_hash = bucket.hash();
@@ -1319,8 +1311,8 @@ mod tests {
     fn test_bucket_entries_roundtrip() {
         // Create a bucket
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
         let bucket1 = Bucket::from_entries(entries).unwrap();
 
@@ -1340,9 +1332,9 @@ mod tests {
     fn test_disk_backed_bucket_roundtrip() {
         // Create entries
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
-            BucketEntry::Live(make_account_entry([3u8; 32], 300)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([3u8; 32], 300)),
         ];
 
         // Create an in-memory bucket first
@@ -1383,12 +1375,12 @@ mod tests {
 
         // Create entries with metadata (as stellar-core buckets would have)
         let entries = vec![
-            BucketEntry::Metadata(BucketMetadata {
+            BucketEntry::Metaentry(BucketMetadata {
                 ledger_version: 24,
                 ext: BucketMetadataExt::V0,
             }),
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         // Create an in-memory bucket
@@ -1421,8 +1413,8 @@ mod tests {
     fn test_xdr_serialization_roundtrip_produces_identical_bytes() {
         // Create entries
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         // Create bucket and get XDR bytes
@@ -1449,8 +1441,8 @@ mod tests {
     fn test_disk_backed_to_inmemory_xdr_roundtrip() {
         // Create entries
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         // Create bucket and serialize
@@ -1490,8 +1482,8 @@ mod tests {
     fn test_from_sorted_entries_preserves_hash() {
         // Create entries
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         // Create bucket (will sort)
@@ -1511,9 +1503,9 @@ mod tests {
     fn test_disk_bucket_from_sorted_entries_roundtrip() {
         // Create entries
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
-            BucketEntry::Live(make_account_entry([3u8; 32], 300)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([3u8; 32], 300)),
         ];
 
         // Create bucket and serialize
@@ -1586,13 +1578,13 @@ mod tests {
         // Create entries of different types (unsorted)
         let entries = vec![
             // Offer (type 2) with high account
-            BucketEntry::Live(make_offer_entry([255u8; 32], 1)),
+            BucketEntry::Liveentry(make_offer_entry([255u8; 32], 1)),
             // Account (type 0) with low account
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
             // Trustline (type 1) with mid account
-            BucketEntry::Live(make_trustline_entry([128u8; 32], [50u8; 32])),
+            BucketEntry::Liveentry(make_trustline_entry([128u8; 32], [50u8; 32])),
             // Another Account (type 0) with mid account
-            BucketEntry::Live(make_account_entry([128u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([128u8; 32], 200)),
         ];
 
         // Create bucket (will sort entries)
@@ -1661,8 +1653,8 @@ mod tests {
 
         // Create a non-trivial in-memory bucket
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
         let bucket = Bucket::from_entries(entries).unwrap();
         let original_hash = bucket.hash();
@@ -1702,8 +1694,7 @@ mod tests {
             "loading a zero-byte file must not produce the original hash"
         );
         // SHA-256("") is the hash of an empty byte stream.
-        let empty_hash_hex =
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let empty_hash_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
         assert_eq!(
             corrupt.hash().to_hex(),
             empty_hash_hex,

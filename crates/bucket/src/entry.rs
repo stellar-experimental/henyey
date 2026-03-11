@@ -37,138 +37,106 @@ use std::cmp::Ordering;
 
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
-    BucketEntry as XdrBucketEntry, BucketEntryType, BucketMetadata, ContractDataDurability, Hash,
-    LedgerEntry, LedgerEntryData, LedgerKey, LedgerKeyTtl, Limits, ReadXdr, WriteXdr,
+    BucketEntryType, ContractDataDurability, Hash, LedgerEntry, LedgerEntryData, LedgerKey,
+    LedgerKeyTtl, Limits, ReadXdr, WriteXdr,
 };
 
 use crate::{BucketError, Result};
 
-/// An entry stored in a bucket.
+/// Re-export XDR BucketEntry as the canonical type.
 ///
 /// Bucket entries wrap ledger entries with additional type information
 /// that controls merge semantics. Entries are sorted by key for efficient
 /// merging and binary search lookup.
 ///
-/// # Entry Types and Merge Semantics (CAP-0020)
+/// # Variants
 ///
-/// | Old Entry | New Entry | Result                           |
-/// |-----------|-----------|----------------------------------|
-/// | `Init`    | `Dead`    | Nothing (both annihilated)       |
-/// | `Dead`    | `Init`    | `Live` (recreation)              |
-/// | `Init`    | `Live`    | `Init` with new value            |
-/// | `Live`    | `Dead`    | `Dead` (if keeping tombstones)   |
-/// | `Live`    | `Live`    | Newer `Live` wins                |
-///
-/// The `Init` type is crucial for correctness: it marks entries created
-/// within a merge window so that subsequent deletions can be properly
-/// annihilated rather than leaving tombstones.
-///
-/// # Serialization
-///
-/// Bucket entries serialize to XDR's `BucketEntry` union type. The
-/// discriminant values are:
-/// - 0: `LIVEENTRY`
-/// - 1: `INITENTRY`
-/// - 2: `DEADENTRY`
-/// - 3: `METAENTRY`
-#[derive(Debug, Clone)]
-pub enum BucketEntry {
-    /// A live ledger entry (the current state of this key).
-    Live(LedgerEntry),
-    /// A tombstone marking that this key has been deleted.
-    Dead(LedgerKey),
-    /// An initialization entry with special CAP-0020 merge semantics.
-    ///
-    /// Init entries mark entries created within a merge window. When an
-    /// Init entry is followed by a Dead entry, both are annihilated
-    /// (removed entirely) rather than leaving a tombstone.
-    Init(LedgerEntry),
-    /// Bucket metadata (protocol version, bucket list type for p23+).
-    Metadata(BucketMetadata),
-}
+/// | Variant      | Description                                      | Merge Behavior              |
+/// |--------------|--------------------------------------------------|-----------------------------|
+/// | `Liveentry`  | An active ledger entry                           | Newer shadows older         |
+/// | `Deadentry`  | A tombstone marking deletion                     | Shadows any older entry     |
+/// | `Initentry`  | Entry created in this merge window (CAP-0020)    | Special annihilation rules  |
+/// | `Metaentry`  | Bucket metadata (protocol version, type)         | Merged by taking max version|
+pub type BucketEntry = stellar_xdr::curr::BucketEntry;
 
-impl BucketEntry {
+/// Extension trait adding bucket-specific convenience methods to the XDR `BucketEntry`.
+pub trait BucketEntryExt {
     /// Parse a BucketEntry from XDR bytes.
-    pub fn from_xdr(bytes: &[u8]) -> Result<Self> {
-        let xdr_entry = XdrBucketEntry::from_xdr(bytes, Limits::none())
-            .map_err(|e| BucketError::Serialization(format!("Failed to parse XDR: {}", e)))?;
-        Self::from_xdr_entry(xdr_entry)
-    }
-
-    /// Convert from XDR BucketEntry.
-    pub fn from_xdr_entry(xdr: XdrBucketEntry) -> Result<Self> {
-        match xdr {
-            XdrBucketEntry::Liveentry(entry) => Ok(BucketEntry::Live(entry)),
-            XdrBucketEntry::Initentry(entry) => Ok(BucketEntry::Init(entry)),
-            XdrBucketEntry::Deadentry(key) => Ok(BucketEntry::Dead(key)),
-            XdrBucketEntry::Metaentry(meta) => Ok(BucketEntry::Metadata(meta)),
-        }
-    }
-
-    /// Convert to XDR BucketEntry.
-    pub fn to_xdr_entry(&self) -> XdrBucketEntry {
-        match self {
-            BucketEntry::Live(entry) => XdrBucketEntry::Liveentry(entry.clone()),
-            BucketEntry::Init(entry) => XdrBucketEntry::Initentry(entry.clone()),
-            BucketEntry::Dead(key) => XdrBucketEntry::Deadentry(key.clone()),
-            BucketEntry::Metadata(meta) => XdrBucketEntry::Metaentry(meta.clone()),
-        }
-    }
+    fn from_xdr_bytes(bytes: &[u8]) -> Result<BucketEntry>;
 
     /// Serialize to XDR bytes.
-    pub fn to_xdr(&self) -> Result<Vec<u8>> {
-        self.to_xdr_entry()
-            .to_xdr(Limits::none())
-            .map_err(|e| BucketError::Serialization(format!("Failed to serialize XDR: {}", e)))
-    }
+    fn to_xdr_bytes(&self) -> Result<Vec<u8>>;
 
     /// Get the LedgerKey for this entry.
     ///
     /// Returns None for metadata entries since they don't have a key.
-    pub fn key(&self) -> Option<LedgerKey> {
+    fn key(&self) -> Option<LedgerKey>;
+
+    /// Check if this entry is a metadata entry.
+    fn is_metadata(&self) -> bool;
+
+    /// Check if this is a dead entry (tombstone).
+    fn is_dead(&self) -> bool;
+
+    /// Check if this is a live entry.
+    fn is_live(&self) -> bool;
+
+    /// Check if this is an init entry.
+    fn is_init(&self) -> bool;
+
+    /// Get the ledger entry if this is a live or init entry.
+    fn as_ledger_entry(&self) -> Option<&LedgerEntry>;
+
+    /// Get the bucket entry type.
+    fn entry_type(&self) -> BucketEntryType;
+}
+
+impl BucketEntryExt for BucketEntry {
+    fn from_xdr_bytes(bytes: &[u8]) -> Result<BucketEntry> {
+        BucketEntry::from_xdr(bytes, Limits::none())
+            .map_err(|e| BucketError::Serialization(format!("Failed to parse XDR: {}", e)))
+    }
+
+    fn to_xdr_bytes(&self) -> Result<Vec<u8>> {
+        self.to_xdr(Limits::none())
+            .map_err(|e| BucketError::Serialization(format!("Failed to serialize XDR: {}", e)))
+    }
+
+    fn key(&self) -> Option<LedgerKey> {
         match self {
-            BucketEntry::Live(entry) | BucketEntry::Init(entry) => ledger_entry_to_key(entry),
-            BucketEntry::Dead(key) => Some(key.clone()),
-            BucketEntry::Metadata(_) => None,
+            BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => {
+                ledger_entry_to_key(entry)
+            }
+            BucketEntry::Deadentry(key) => Some(key.clone()),
+            BucketEntry::Metaentry(_) => None,
         }
     }
 
-    /// Check if this entry is a metadata entry.
-    pub fn is_metadata(&self) -> bool {
-        matches!(self, BucketEntry::Metadata(_))
+    fn is_metadata(&self) -> bool {
+        matches!(self, BucketEntry::Metaentry(_))
     }
 
-    /// Check if this is a dead entry (tombstone).
-    pub fn is_dead(&self) -> bool {
-        matches!(self, BucketEntry::Dead(_))
+    fn is_dead(&self) -> bool {
+        matches!(self, BucketEntry::Deadentry(_))
     }
 
-    /// Check if this is a live entry.
-    pub fn is_live(&self) -> bool {
-        matches!(self, BucketEntry::Live(_))
+    fn is_live(&self) -> bool {
+        matches!(self, BucketEntry::Liveentry(_))
     }
 
-    /// Check if this is an init entry.
-    pub fn is_init(&self) -> bool {
-        matches!(self, BucketEntry::Init(_))
+    fn is_init(&self) -> bool {
+        matches!(self, BucketEntry::Initentry(_))
     }
 
-    /// Get the ledger entry if this is a live or init entry.
-    pub fn as_ledger_entry(&self) -> Option<&LedgerEntry> {
+    fn as_ledger_entry(&self) -> Option<&LedgerEntry> {
         match self {
-            BucketEntry::Live(entry) | BucketEntry::Init(entry) => Some(entry),
+            BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) => Some(entry),
             _ => None,
         }
     }
 
-    /// Get the bucket entry type.
-    pub fn entry_type(&self) -> BucketEntryType {
-        match self {
-            BucketEntry::Live(_) => BucketEntryType::Liveentry,
-            BucketEntry::Dead(_) => BucketEntryType::Deadentry,
-            BucketEntry::Init(_) => BucketEntryType::Initentry,
-            BucketEntry::Metadata(_) => BucketEntryType::Metaentry,
-        }
+    fn entry_type(&self) -> BucketEntryType {
+        self.discriminant()
     }
 }
 
@@ -637,8 +605,9 @@ pub fn get_ttl_live_until(ttl_entry: &LedgerEntry) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BucketEntry;
-    use stellar_xdr::curr::*; // Re-import to shadow XDR's BucketEntry
+    use stellar_xdr::curr::*;
+    // Disambiguate: super::BucketEntry (type alias) vs stellar_xdr::curr::BucketEntry
+    use super::BucketEntry;
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
@@ -666,7 +635,7 @@ mod tests {
     #[test]
     fn test_bucket_entry_key() {
         let entry = make_account_entry([1u8; 32]);
-        let bucket_entry = BucketEntry::Live(entry.clone());
+        let bucket_entry = BucketEntry::Liveentry(entry.clone());
 
         let key = bucket_entry.key().unwrap();
         if let LedgerKey::Account(account_key) = key {
@@ -681,7 +650,7 @@ mod tests {
         let key = LedgerKey::Account(LedgerKeyAccount {
             account_id: make_account_id([2u8; 32]),
         });
-        let bucket_entry = BucketEntry::Dead(key.clone());
+        let bucket_entry = BucketEntry::Deadentry(key.clone());
 
         assert!(bucket_entry.is_dead());
         assert!(!bucket_entry.is_live());
@@ -704,19 +673,19 @@ mod tests {
 
     #[test]
     fn test_compare_entries() {
-        let entry1 = BucketEntry::Live(make_account_entry([1u8; 32]));
-        let entry2 = BucketEntry::Live(make_account_entry([2u8; 32]));
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32]));
+        let entry2 = BucketEntry::Liveentry(make_account_entry([2u8; 32]));
 
         assert_eq!(compare_entries(&entry1, &entry2), Ordering::Less);
     }
 
     #[test]
     fn test_entry_type() {
-        let live = BucketEntry::Live(make_account_entry([1u8; 32]));
-        let dead = BucketEntry::Dead(LedgerKey::Account(LedgerKeyAccount {
+        let live = BucketEntry::Liveentry(make_account_entry([1u8; 32]));
+        let dead = BucketEntry::Deadentry(LedgerKey::Account(LedgerKeyAccount {
             account_id: make_account_id([1u8; 32]),
         }));
-        let init = BucketEntry::Init(make_account_entry([1u8; 32]));
+        let init = BucketEntry::Initentry(make_account_entry([1u8; 32]));
 
         assert_eq!(live.entry_type(), BucketEntryType::Liveentry);
         assert_eq!(dead.entry_type(), BucketEntryType::Deadentry);

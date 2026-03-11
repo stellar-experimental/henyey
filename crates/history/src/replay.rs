@@ -47,7 +47,7 @@
 
 use crate::{is_checkpoint_ledger, verify, HistoryError, Result};
 use sha2::{Digest, Sha256};
-use henyey_bucket::{EvictionIterator, StateArchivalSettings};
+use henyey_bucket::{EvictionIterator, EvictionIteratorExt, StateArchivalSettings};
 use henyey_common::protocol::{protocol_version_is_before, protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::{
@@ -58,7 +58,7 @@ use henyey_ledger::{
 use henyey_tx::soroban::PersistentModuleCache;
 use henyey_tx::{muxed_to_account_id, LedgerContext, TransactionFrame};
 use stellar_xdr::curr::{
-    BucketListType, ConfigSettingEntry, ConfigSettingId, EvictionIterator as XdrEvictionIterator,
+    BucketListType, ConfigSettingEntry, ConfigSettingId,
     LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyConfigSetting,
     TransactionEnvelope, TransactionMeta, TransactionResultPair, TransactionResultSet, WriteXdr,
 };
@@ -947,7 +947,7 @@ pub fn replay_ledger_with_execution(
         config,
         header,
         bucket_list,
-        eviction_iterator,
+        eviction_iterator.clone(),
         &eviction_settings,
         &init_entries,
         &live_entries,
@@ -962,15 +962,11 @@ pub fn replay_ledger_with_execution(
     // during eviction scan. We do the same for consistency.
     let mut all_live_entries = live_entries.clone();
     if eviction.ran {
-        if let Some(iter) = eviction.updated_iterator {
+        if let Some(ref iter) = eviction.updated_iterator {
             let eviction_iter_entry = LedgerEntry {
                 last_modified_ledger_seq: header.ledger_seq,
                 data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
-                    XdrEvictionIterator {
-                        bucket_file_offset: iter.bucket_file_offset,
-                        bucket_list_level: iter.bucket_list_level,
-                        is_curr_bucket: iter.is_curr_bucket,
-                    },
+                    iter.clone(),
                 )),
                 ext: LedgerEntryExt::V0,
             };

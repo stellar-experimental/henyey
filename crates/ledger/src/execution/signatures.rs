@@ -386,7 +386,7 @@ pub(super) fn check_operation_signatures(
         if !tracker.check_signature(source_account, tx_threshold) {
             // TX-level auth failed. Return InvalidSignature so the caller records
             // txBadAuth / txFeeBumpInnerFailed with the fee already charged.
-            return Some((Vec::new(), ExecutionFailure::InvalidSignature));
+            return Some((Vec::new(), TransactionResultCode::TxBadAuth));
         }
     } else {
         return None; // Source account gone — shouldn't happen after seq bump
@@ -466,12 +466,12 @@ pub(super) fn check_operation_signatures(
                 }
             })
             .collect();
-        return Some((final_results, ExecutionFailure::OperationFailed));
+        return Some((final_results, TransactionResultCode::TxFailed));
     }
 
     // Step 4: Check all signatures used (txBAD_AUTH_EXTRA)
     if !tracker.check_all_signatures_used() {
-        return Some((Vec::new(), ExecutionFailure::BadAuthExtra));
+        return Some((Vec::new(), TransactionResultCode::TxBadAuthExtra));
     }
 
     None

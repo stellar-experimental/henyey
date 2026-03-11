@@ -1,27 +1,35 @@
-//! Mapping from execution failures to XDR transaction result codes.
+//! Mapping from transaction result codes to XDR transaction result types.
 //!
-//! Converts internal `ExecutionFailure` variants into their corresponding
-//! `TransactionResultResult` XDR codes for inclusion in ledger close metadata.
+//! Converts `TransactionResultCode` values into their corresponding
+//! `TransactionResultResult` XDR types for inclusion in ledger close metadata.
 
 use super::*;
 
-pub(super) fn map_failure_to_result(failure: &ExecutionFailure) -> TransactionResultResult {
-    match failure {
-        ExecutionFailure::Malformed => TransactionResultResult::TxMalformed,
-        ExecutionFailure::MissingOperation => TransactionResultResult::TxMissingOperation,
-        ExecutionFailure::InvalidSignature => TransactionResultResult::TxBadAuth,
-        ExecutionFailure::BadAuthExtra => TransactionResultResult::TxBadAuthExtra,
-        ExecutionFailure::BadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
-        ExecutionFailure::TooEarly => TransactionResultResult::TxTooEarly,
-        ExecutionFailure::TooLate => TransactionResultResult::TxTooLate,
-        ExecutionFailure::BadSequence => TransactionResultResult::TxBadSeq,
-        ExecutionFailure::InsufficientFee => TransactionResultResult::TxInsufficientFee,
-        ExecutionFailure::InsufficientBalance => TransactionResultResult::TxInsufficientBalance,
-        ExecutionFailure::NoAccount => TransactionResultResult::TxNoAccount,
-        ExecutionFailure::NotSupported => TransactionResultResult::TxNotSupported,
-        ExecutionFailure::InternalError => TransactionResultResult::TxInternalError,
-        ExecutionFailure::BadSponsorship => TransactionResultResult::TxBadSponsorship,
-        ExecutionFailure::OperationFailed => {
+pub(super) fn failure_code_to_result(code: &TransactionResultCode) -> TransactionResultResult {
+    match code {
+        TransactionResultCode::TxMalformed => TransactionResultResult::TxMalformed,
+        TransactionResultCode::TxMissingOperation => TransactionResultResult::TxMissingOperation,
+        TransactionResultCode::TxBadAuth => TransactionResultResult::TxBadAuth,
+        TransactionResultCode::TxBadAuthExtra => TransactionResultResult::TxBadAuthExtra,
+        TransactionResultCode::TxBadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
+        TransactionResultCode::TxTooEarly => TransactionResultResult::TxTooEarly,
+        TransactionResultCode::TxTooLate => TransactionResultResult::TxTooLate,
+        TransactionResultCode::TxBadSeq => TransactionResultResult::TxBadSeq,
+        TransactionResultCode::TxInsufficientFee => TransactionResultResult::TxInsufficientFee,
+        TransactionResultCode::TxInsufficientBalance => {
+            TransactionResultResult::TxInsufficientBalance
+        }
+        TransactionResultCode::TxNoAccount => TransactionResultResult::TxNoAccount,
+        TransactionResultCode::TxNotSupported => TransactionResultResult::TxNotSupported,
+        TransactionResultCode::TxInternalError => TransactionResultResult::TxInternalError,
+        TransactionResultCode::TxBadSponsorship => TransactionResultResult::TxBadSponsorship,
+        TransactionResultCode::TxSorobanInvalid => TransactionResultResult::TxNotSupported,
+        // TxFailed, TxSuccess, TxFeeBumpInnerSuccess, TxFeeBumpInnerFailed carry payloads
+        // and are handled specially by build_tx_result_pair.
+        TransactionResultCode::TxFailed
+        | TransactionResultCode::TxSuccess
+        | TransactionResultCode::TxFeeBumpInnerSuccess
+        | TransactionResultCode::TxFeeBumpInnerFailed => {
             TransactionResultResult::TxFailed(Vec::new().try_into().unwrap())
         }
     }
@@ -48,28 +56,37 @@ pub(super) fn insufficient_refundable_fee_result(op: &Operation) -> OperationRes
     }
 }
 
-pub(super) fn map_failure_to_inner_result(
-    failure: &ExecutionFailure,
+pub(super) fn failure_code_to_inner_result(
+    code: &TransactionResultCode,
     op_results: &[OperationResult],
 ) -> InnerTransactionResultResult {
-    match failure {
-        ExecutionFailure::Malformed => InnerTransactionResultResult::TxMalformed,
-        ExecutionFailure::MissingOperation => InnerTransactionResultResult::TxMissingOperation,
-        ExecutionFailure::InvalidSignature => InnerTransactionResultResult::TxBadAuth,
-        ExecutionFailure::BadAuthExtra => InnerTransactionResultResult::TxBadAuthExtra,
-        ExecutionFailure::BadMinSeqAgeOrGap => InnerTransactionResultResult::TxBadMinSeqAgeOrGap,
-        ExecutionFailure::TooEarly => InnerTransactionResultResult::TxTooEarly,
-        ExecutionFailure::TooLate => InnerTransactionResultResult::TxTooLate,
-        ExecutionFailure::BadSequence => InnerTransactionResultResult::TxBadSeq,
-        ExecutionFailure::InsufficientFee => InnerTransactionResultResult::TxInsufficientFee,
-        ExecutionFailure::InsufficientBalance => {
+    match code {
+        TransactionResultCode::TxMalformed => InnerTransactionResultResult::TxMalformed,
+        TransactionResultCode::TxMissingOperation => {
+            InnerTransactionResultResult::TxMissingOperation
+        }
+        TransactionResultCode::TxBadAuth => InnerTransactionResultResult::TxBadAuth,
+        TransactionResultCode::TxBadAuthExtra => InnerTransactionResultResult::TxBadAuthExtra,
+        TransactionResultCode::TxBadMinSeqAgeOrGap => {
+            InnerTransactionResultResult::TxBadMinSeqAgeOrGap
+        }
+        TransactionResultCode::TxTooEarly => InnerTransactionResultResult::TxTooEarly,
+        TransactionResultCode::TxTooLate => InnerTransactionResultResult::TxTooLate,
+        TransactionResultCode::TxBadSeq => InnerTransactionResultResult::TxBadSeq,
+        TransactionResultCode::TxInsufficientFee => InnerTransactionResultResult::TxInsufficientFee,
+        TransactionResultCode::TxInsufficientBalance => {
             InnerTransactionResultResult::TxInsufficientBalance
         }
-        ExecutionFailure::NoAccount => InnerTransactionResultResult::TxNoAccount,
-        ExecutionFailure::NotSupported => InnerTransactionResultResult::TxNotSupported,
-        ExecutionFailure::InternalError => InnerTransactionResultResult::TxInternalError,
-        ExecutionFailure::BadSponsorship => InnerTransactionResultResult::TxBadSponsorship,
-        ExecutionFailure::OperationFailed => InnerTransactionResultResult::TxFailed(
+        TransactionResultCode::TxNoAccount => InnerTransactionResultResult::TxNoAccount,
+        TransactionResultCode::TxNotSupported => InnerTransactionResultResult::TxNotSupported,
+        TransactionResultCode::TxInternalError => InnerTransactionResultResult::TxInternalError,
+        TransactionResultCode::TxBadSponsorship => InnerTransactionResultResult::TxBadSponsorship,
+        TransactionResultCode::TxSorobanInvalid => InnerTransactionResultResult::TxNotSupported,
+        // TxFailed and success/fee-bump codes carry payloads.
+        TransactionResultCode::TxFailed
+        | TransactionResultCode::TxSuccess
+        | TransactionResultCode::TxFeeBumpInnerSuccess
+        | TransactionResultCode::TxFeeBumpInnerFailed => InnerTransactionResultResult::TxFailed(
             op_results.to_vec().try_into().unwrap_or_default(),
         ),
     }
@@ -94,7 +111,7 @@ pub fn build_tx_result_pair(
                 op_results.clone().try_into().unwrap_or_default(),
             )
         } else if let Some(failure) = &exec.failure {
-            map_failure_to_inner_result(failure, &op_results)
+            failure_code_to_inner_result(failure, &op_results)
         } else {
             InnerTransactionResultResult::TxFailed(
                 op_results.clone().try_into().unwrap_or_default(),
@@ -157,10 +174,10 @@ pub fn build_tx_result_pair(
         }
     } else if let Some(failure) = &exec.failure {
         let result = match failure {
-            ExecutionFailure::OperationFailed => {
+            TransactionResultCode::TxFailed => {
                 TransactionResultResult::TxFailed(op_results.try_into().unwrap_or_default())
             }
-            _ => map_failure_to_result(failure),
+            _ => failure_code_to_result(failure),
         };
         TransactionResult {
             fee_charged: exec.fee_charged,

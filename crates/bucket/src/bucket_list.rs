@@ -56,14 +56,14 @@ use henyey_common::{BucketListDbConfig, Hash256};
 use crate::bucket::Bucket;
 use crate::entry::{
     get_ttl_key, is_persistent_entry, is_soroban_entry, is_temporary_entry, is_ttl_expired,
-    ledger_entry_to_key, BucketEntry,
+    ledger_entry_to_key, BucketEntry, BucketEntryExt,
 };
 use crate::cache::CacheStats;
 use crate::future_bucket::MergeKey;
 use crate::index::BucketEntryCounters;
 use crate::eviction::{
-    update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionResult,
-    StateArchivalSettings,
+    update_starting_eviction_iterator, EvictionCandidate, EvictionIterator, EvictionIteratorExt,
+    EvictionResult, StateArchivalSettings,
 };
 use crate::live_iterator::LiveEntriesIterator;
 use crate::manager::{canonical_bucket_filename, promote_temp_to_canonical, temp_merge_path};
@@ -1334,9 +1334,9 @@ impl BucketList {
                     );
                 }
                 return match entry {
-                    BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
-                    BucketEntry::Dead(_) => Ok(None), // Entry is deleted
-                    BucketEntry::Metadata(_) => continue,
+                    BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => Ok(Some(e.clone())),
+                    BucketEntry::Deadentry(_) => Ok(None), // Entry is deleted
+                    BucketEntry::Metaentry(_) => continue,
                 };
             }
 
@@ -1351,9 +1351,9 @@ impl BucketList {
                     );
                 }
                 return match entry {
-                    BucketEntry::Live(e) | BucketEntry::Init(e) => Ok(Some(e.clone())),
-                    BucketEntry::Dead(_) => Ok(None), // Entry is deleted
-                    BucketEntry::Metadata(_) => continue,
+                    BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => Ok(Some(e.clone())),
+                    BucketEntry::Deadentry(_) => Ok(None), // Entry is deleted
+                    BucketEntry::Metaentry(_) => continue,
                 };
             }
         }
@@ -1480,11 +1480,11 @@ impl BucketList {
                         }
 
                         let entry_type = match &entry {
-                            BucketEntry::Live(e) | BucketEntry::Init(e) => {
+                            BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => {
                                 crate::entry::ledger_entry_data_type(&e.data)
                             }
-                            BucketEntry::Dead(k) => crate::entry::ledger_key_type(k),
-                            BucketEntry::Metadata(_) => continue,
+                            BucketEntry::Deadentry(k) => crate::entry::ledger_key_type(k),
+                            BucketEntry::Metaentry(_) => continue,
                         };
 
                         if type_set.contains(&entry_type) {
@@ -1525,7 +1525,7 @@ impl BucketList {
             for bucket in buckets {
                 for entry in bucket.iter() {
                     match entry {
-                        BucketEntry::Live(live) | BucketEntry::Init(live) => {
+                        BucketEntry::Liveentry(live) | BucketEntry::Initentry(live) => {
                             let Some(key) = crate::entry::ledger_entry_to_key(&live) else {
                                 continue;
                             };
@@ -1539,7 +1539,7 @@ impl BucketList {
                                 entries.push(live);
                             }
                         }
-                        BucketEntry::Dead(dead) => {
+                        BucketEntry::Deadentry(dead) => {
                             let key_bytes = dead.to_xdr(Limits::none()).map_err(|e| {
                                 BucketError::Serialization(format!(
                                     "failed to serialize ledger key: {}",
@@ -1548,7 +1548,7 @@ impl BucketList {
                             })?;
                             seen.insert(key_bytes);
                         }
-                        BucketEntry::Metadata(_) => {}
+                        BucketEntry::Metaentry(_) => {}
                     }
                 }
             }
@@ -1587,22 +1587,22 @@ impl BucketList {
             if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
                 meta.ext = BucketMetadataExt::V1(bucket_list_type);
             }
-            entries.push(BucketEntry::Metadata(meta));
+            entries.push(BucketEntry::Metaentry(meta));
         }
 
         // Deduplicate init_entries - keep only the last occurrence of each key
         // This handles the case where the same entry is created and updated in the same ledger
         let dedup_init = deduplicate_entries(init_entries);
         if use_init {
-            entries.extend(dedup_init.into_iter().map(BucketEntry::Init));
+            entries.extend(dedup_init.into_iter().map(BucketEntry::Initentry));
         } else {
-            entries.extend(dedup_init.into_iter().map(BucketEntry::Live));
+            entries.extend(dedup_init.into_iter().map(BucketEntry::Liveentry));
         }
 
         // Deduplicate live_entries - keep only the last occurrence of each key
         // This handles the case where the same entry is updated multiple times in the same ledger
         let dedup_live = deduplicate_entries(live_entries);
-        entries.extend(dedup_live.into_iter().map(BucketEntry::Live));
+        entries.extend(dedup_live.into_iter().map(BucketEntry::Liveentry));
 
         // Deduplicate dead_entries - keep only unique keys
         let mut seen_dead: HashSet<Vec<u8>> = HashSet::new();
@@ -1616,7 +1616,7 @@ impl BucketList {
                 }
             })
             .collect();
-        entries.extend(dedup_dead.into_iter().map(BucketEntry::Dead));
+        entries.extend(dedup_dead.into_iter().map(BucketEntry::Deadentry));
 
         // Create the new bucket with in-memory entries for level 0 optimization.
         // We use fresh_in_memory_only() which skips hash computation because:
@@ -2587,8 +2587,8 @@ impl BucketList {
                 for entry in bucket.iter() {
                     // Only process LIVE and INIT entries (not DEAD or Metadata)
                     let live_entry = match entry {
-                        BucketEntry::Live(e) | BucketEntry::Init(e) => e,
-                        BucketEntry::Dead(key) => {
+                        BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
+                        BucketEntry::Deadentry(key) => {
                             // Mark dead keys as seen so we don't process older versions
                             let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
                                 BucketError::Serialization(format!(
@@ -2599,7 +2599,7 @@ impl BucketList {
                             seen_keys.insert(key_bytes);
                             continue;
                         }
-                        BucketEntry::Metadata(_) => continue,
+                        BucketEntry::Metaentry(_) => continue,
                     };
 
                     // Only check Soroban entries (ContractData, ContractCode)
@@ -2684,7 +2684,7 @@ impl BucketList {
     ) -> Result<EvictionResult> {
         let mut result = EvictionResult {
             candidates: Vec::new(),
-            end_iterator: iter,
+            end_iterator: iter.clone(),
             bytes_scanned: 0,
             scan_complete: false,
         };
@@ -2696,7 +2696,7 @@ impl BucketList {
             current_ledger,
         );
 
-        let start_iter = iter;
+        let start_iter = iter.clone();
         let mut bytes_remaining = settings.eviction_scan_size;
 
         // Track keys we've seen to avoid duplicates (from shadowed entries)
@@ -2808,8 +2808,8 @@ impl BucketList {
 
             // Process the entry for eviction
             let live_entry = match &entry {
-                BucketEntry::Live(e) | BucketEntry::Init(e) => e,
-                BucketEntry::Dead(key) => {
+                BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
+                BucketEntry::Deadentry(key) => {
                     // Mark dead keys as seen
                     if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
                         seen_keys.insert(key_bytes);
@@ -2820,7 +2820,7 @@ impl BucketList {
                     }
                     continue;
                 }
-                BucketEntry::Metadata(_) => {
+                BucketEntry::Metaentry(_) => {
                     if bytes_used >= max_bytes {
                         iter.bucket_file_offset = start_offset + bytes_used;
                         return Ok((entries_scanned, bytes_used, false));
@@ -3192,8 +3192,8 @@ mod tests {
             ext: BucketMetadataExt::V1(BucketListType::Live),
         };
         let incoming = Bucket::from_entries(vec![
-            BucketListEntry::Metadata(meta),
-            BucketListEntry::Init(entry.clone()),
+            BucketListEntry::Metaentry(meta),
+            BucketListEntry::Initentry(entry.clone()),
         ])
         .unwrap();
 
@@ -3205,11 +3205,11 @@ mod tests {
         let mut saw_live = false;
         for entry in level.curr.iter() {
             match entry {
-                BucketListEntry::Live(live) => {
+                BucketListEntry::Liveentry(live) => {
                     saw_live = true;
                     assert!(matches!(live.data, LedgerEntryData::Account(_)));
                 }
-                BucketListEntry::Init(_) => panic!("init entry should be normalized"),
+                BucketListEntry::Initentry(_) => panic!("init entry should be normalized"),
                 _ => {}
             }
         }
@@ -3219,7 +3219,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_merge_drops_dead_when_keep_dead_false() {
         let key = make_account_key([1u8; 32]);
-        let bucket = Bucket::from_entries(vec![BucketListEntry::Dead(key)]).unwrap();
+        let bucket = Bucket::from_entries(vec![BucketListEntry::Deadentry(key)]).unwrap();
         let merged =
             merge_buckets_with_options(&Bucket::empty(), &bucket, false, TEST_PROTOCOL, true)
                 .unwrap();
@@ -3501,12 +3501,12 @@ mod tests {
         let entry2 = make_account_entry([2u8; 32], 200);
 
         // Create and save bucket 1
-        let bucket1_mem = Bucket::from_entries(vec![BucketListEntry::Live(entry1)]).unwrap();
+        let bucket1_mem = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry1)]).unwrap();
         let path1 = temp_dir.path().join("bucket1.xdr");
         bucket1_mem.save_to_xdr_file(&path1).unwrap();
 
         // Create and save bucket 2
-        let bucket2_mem = Bucket::from_entries(vec![BucketListEntry::Live(entry2)]).unwrap();
+        let bucket2_mem = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry2)]).unwrap();
         let path2 = temp_dir.path().join("bucket2.xdr");
         bucket2_mem.save_to_xdr_file(&path2).unwrap();
 
@@ -3936,8 +3936,8 @@ mod tests {
         // Step 1: Run an actual disk-backed merge to discover what hash
         // `merge(empty, snap_bucket)` produces, then corrupt that permanent file.
         let snap_entries = vec![
-            BucketListEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketListEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketListEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketListEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
         let snap_bucket = Arc::new(Bucket::from_entries(snap_entries).unwrap());
         assert!(!snap_bucket.is_empty());
@@ -4054,8 +4054,8 @@ mod tests {
         let entry1 = make_account_entry([1u8; 32], 100);
         let entry2 = make_account_entry([2u8; 32], 200);
 
-        let bucket0_curr = Bucket::from_entries(vec![BucketListEntry::Live(entry1)]).unwrap();
-        let bucket1_curr = Bucket::from_entries(vec![BucketListEntry::Live(entry2)]).unwrap();
+        let bucket0_curr = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry1)]).unwrap();
+        let bucket1_curr = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry2)]).unwrap();
 
         let h0c = bucket0_curr.hash();
         let h1c = bucket1_curr.hash();
@@ -4089,8 +4089,8 @@ mod tests {
         let entry_curr = make_account_entry([1u8; 32], 100);
         let entry_out = make_account_entry([9u8; 32], 999);
 
-        let bucket_curr = Bucket::from_entries(vec![BucketListEntry::Live(entry_curr)]).unwrap();
-        let bucket_out = Bucket::from_entries(vec![BucketListEntry::Live(entry_out)]).unwrap();
+        let bucket_curr = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_curr)]).unwrap();
+        let bucket_out = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_out)]).unwrap();
 
         let hc = bucket_curr.hash();
         let ho = bucket_out.hash();
@@ -4123,7 +4123,7 @@ mod tests {
     fn test_restore_from_has_parallel_clear_state_no_next() {
         // HAS_NEXT_STATE_CLEAR (default) means no level.next should be set.
         let entry = make_account_entry([5u8; 32], 500);
-        let bucket = Bucket::from_entries(vec![BucketListEntry::Live(entry)]).unwrap();
+        let bucket = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry)]).unwrap();
         let h = bucket.hash();
 
         let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
@@ -4145,10 +4145,10 @@ mod tests {
         // for the same inputs: same entries retrievable, same level.next presence.
         let entries: Vec<LedgerEntry> = (1u8..=4).map(|i| make_account_entry([i; 32], i as i64 * 100)).collect();
 
-        let b0c = Bucket::from_entries(vec![BucketListEntry::Live(entries[0].clone())]).unwrap();
-        let b0s = Bucket::from_entries(vec![BucketListEntry::Live(entries[1].clone())]).unwrap();
-        let b2c = Bucket::from_entries(vec![BucketListEntry::Live(entries[2].clone())]).unwrap();
-        let bout = Bucket::from_entries(vec![BucketListEntry::Live(entries[3].clone())]).unwrap();
+        let b0c = Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[0].clone())]).unwrap();
+        let b0s = Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[1].clone())]).unwrap();
+        let b2c = Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[2].clone())]).unwrap();
+        let bout = Bucket::from_entries(vec![BucketListEntry::Liveentry(entries[3].clone())]).unwrap();
 
         let h0c = b0c.hash();
         let h0s = b0s.hash();
@@ -4222,8 +4222,8 @@ mod tests {
         let bucket_dir = tmp.path().to_path_buf();
 
         let snap_entries = vec![
-            BucketListEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketListEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketListEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketListEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
         let snap_bucket = Bucket::from_entries(snap_entries).unwrap();
         let empty_curr = Bucket::empty();

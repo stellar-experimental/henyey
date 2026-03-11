@@ -31,7 +31,7 @@ use crate::entry::{ledger_entry_data_type, ledger_key_type};
 use henyey_common::BucketListDbConfig;
 
 use crate::bloom_filter::{BucketBloomFilter, HashSeed};
-use crate::entry::{compare_keys, BucketEntry};
+use crate::entry::{compare_keys, BucketEntry, BucketEntryExt};
 
 /// Default page size for disk index in bytes.
 ///
@@ -107,27 +107,27 @@ impl BucketEntryCounters {
     /// Records a bucket entry.
     pub fn record_entry(&mut self, entry: &BucketEntry) {
         // Compute XDR size of the full BucketEntry for type-size tracking.
-        let xdr_size = entry.to_xdr().map(|v| v.len() as u64).unwrap_or(0);
+        let xdr_size = entry.to_xdr_bytes().map(|v| v.len() as u64).unwrap_or(0);
 
         match entry {
-            BucketEntry::Live(e) => {
+            BucketEntry::Liveentry(e) => {
                 let entry_type = ledger_entry_data_type(&e.data);
                 *self.live_entries.entry(entry_type).or_insert(0) += 1;
                 *self.entry_type_sizes.entry(entry_type).or_insert(0) += xdr_size;
                 self.record_soroban_durability(e);
             }
-            BucketEntry::Init(e) => {
+            BucketEntry::Initentry(e) => {
                 let entry_type = ledger_entry_data_type(&e.data);
                 *self.init_entries.entry(entry_type).or_insert(0) += 1;
                 *self.entry_type_sizes.entry(entry_type).or_insert(0) += xdr_size;
                 self.record_soroban_durability(e);
             }
-            BucketEntry::Dead(k) => {
+            BucketEntry::Deadentry(k) => {
                 let entry_type = ledger_key_type(k);
                 *self.dead_entries.entry(entry_type).or_insert(0) += 1;
                 *self.entry_type_sizes.entry(entry_type).or_insert(0) += xdr_size;
             }
-            BucketEntry::Metadata(_) => {}
+            BucketEntry::Metaentry(_) => {}
         }
     }
 
@@ -337,10 +337,7 @@ impl InMemoryIndex {
     ///
     /// * `entries` - Iterator over (BucketEntry, offset) pairs
     /// * `bloom_seed` - Seed for bloom filter construction
-    pub fn from_entries<I>(
-        entries: I,
-        bloom_seed: HashSeed,
-    ) -> Self
+    pub fn from_entries<I>(entries: I, bloom_seed: HashSeed) -> Self
     where
         I: Iterator<Item = (BucketEntry, u64)>,
     {
@@ -378,7 +375,7 @@ impl InMemoryIndex {
                 bloom_key_hashes.push(BucketBloomFilter::hash_key(&key, &bloom_seed));
 
                 // Extract pool mappings from liquidity pool entries
-                if let BucketEntry::Live(e) | BucketEntry::Init(e) = &entry {
+                if let BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) = &entry {
                     if let LedgerEntryData::LiquidityPool(pool) = &e.data {
                         let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
                             cp,
@@ -554,11 +551,7 @@ impl DiskIndex {
     /// * `entries` - Iterator over (BucketEntry, offset) pairs
     /// * `bloom_seed` - Seed for bloom filter construction
     /// * `page_size` - Page size in bytes (must be a power of two)
-    pub fn from_entries<I>(
-        entries: I,
-        bloom_seed: HashSeed,
-        page_size: u64,
-    ) -> Self
+    pub fn from_entries<I>(entries: I, bloom_seed: HashSeed, page_size: u64) -> Self
     where
         I: Iterator<Item = (BucketEntry, u64)>,
     {
@@ -606,7 +599,7 @@ impl DiskIndex {
                 }
 
                 // Extract pool mappings
-                if let BucketEntry::Live(e) | BucketEntry::Init(e) = &entry {
+                if let BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) = &entry {
                     if let LedgerEntryData::LiquidityPool(pool) = &e.data {
                         let stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(
                             cp,
@@ -841,10 +834,7 @@ impl LiveBucketIndex {
         I: Iterator<Item = (BucketEntry, u64)>,
     {
         if file_size < config.index_cutoff_bytes() {
-            LiveBucketIndex::InMemory(InMemoryIndex::from_entries(
-                entries,
-                bloom_seed,
-            ))
+            LiveBucketIndex::InMemory(InMemoryIndex::from_entries(entries, bloom_seed))
         } else {
             LiveBucketIndex::Disk(DiskIndex::from_entries(
                 entries,
@@ -857,11 +847,7 @@ impl LiveBucketIndex {
     /// Creates a new index from bucket entries with default config.
     ///
     /// Convenience method that uses the default `BucketListDbConfig`.
-    pub fn from_entries_default<I>(
-        entries: I,
-        bloom_seed: HashSeed,
-        file_size: u64,
-    ) -> Self
+    pub fn from_entries_default<I>(entries: I, bloom_seed: HashSeed, file_size: u64) -> Self
     where
         I: Iterator<Item = (BucketEntry, u64)>,
     {
@@ -898,11 +884,7 @@ impl LiveBucketIndex {
             let index = InMemoryIndex::from_entries(&mut entries, bloom_seed);
             (LiveBucketIndex::InMemory(index), entries)
         } else {
-            let index = DiskIndex::from_entries(
-                &mut entries,
-                bloom_seed,
-                config.page_size_bytes(),
-            );
+            let index = DiskIndex::from_entries(&mut entries, bloom_seed, config.page_size_bytes());
             (LiveBucketIndex::Disk(index), entries)
         }
     }
@@ -1014,7 +996,7 @@ impl LiveBucketIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entry::BucketEntry; // Use our BucketEntry, not the XDR one
+    use crate::entry::BucketEntry;
     use stellar_xdr::curr::*;
 
     fn make_account_id(byte: u8) -> AccountId {
@@ -1049,7 +1031,12 @@ mod tests {
     #[test]
     fn test_in_memory_index() {
         let entries: Vec<(BucketEntry, u64)> = (0..10u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
 
         let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
@@ -1071,7 +1058,12 @@ mod tests {
         // With byte-based pages: entries are spaced 128 bytes apart in test data.
         // Using page_size=1024 (power of two) → 10 entries per page.
         let entries: Vec<(BucketEntry, u64)> = (0..100u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 128))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 128,
+                )
+            })
             .collect();
 
         // page_size=1024, offsets 0..12672 → pages at 0, 1024, 2048, ..., 11264, 12288
@@ -1092,9 +1084,9 @@ mod tests {
     fn test_entry_counters() {
         let mut counters = BucketEntryCounters::new();
 
-        counters.record_entry(&BucketEntry::Live(make_account_entry(1)));
-        counters.record_entry(&BucketEntry::Live(make_account_entry(2)));
-        counters.record_entry(&BucketEntry::Dead(make_account_key(3)));
+        counters.record_entry(&BucketEntry::Liveentry(make_account_entry(1)));
+        counters.record_entry(&BucketEntry::Liveentry(make_account_entry(2)));
+        counters.record_entry(&BucketEntry::Deadentry(make_account_key(3)));
 
         assert_eq!(counters.total_live(), 2);
         assert_eq!(counters.total_dead(), 1);
@@ -1119,7 +1111,12 @@ mod tests {
     fn test_live_bucket_index_selection() {
         // Small file (below default 20MB cutoff) should use in-memory
         let entries: Vec<(BucketEntry, u64)> = (0..100u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
 
         // file_size=10000 is well below the 20MB default cutoff
@@ -1133,7 +1130,12 @@ mod tests {
     fn test_live_bucket_index_file_size_threshold() {
         // Small file → InMemory
         let entries1: Vec<(BucketEntry, u64)> = (0..10u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
         let config = BucketListDbConfig::default();
         let index = LiveBucketIndex::from_entries(entries1.into_iter(), [0u8; 16], 1000, &config);
@@ -1141,11 +1143,17 @@ mod tests {
 
         // Custom config with cutoff_mb=0 → always DiskIndex
         let entries2: Vec<(BucketEntry, u64)> = (0..10u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
         let mut config_small = BucketListDbConfig::default();
         config_small.index_cutoff_mb = 0;
-        let index = LiveBucketIndex::from_entries(entries2.into_iter(), [0u8; 16], 1000, &config_small);
+        let index =
+            LiveBucketIndex::from_entries(entries2.into_iter(), [0u8; 16], 1000, &config_small);
         assert!(!index.is_in_memory());
     }
 
@@ -1200,7 +1208,12 @@ mod tests {
     fn test_index_with_no_offers() {
         // Index construction should work correctly with no offers
         let entries: Vec<(BucketEntry, u64)> = (0..20u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
 
         let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
@@ -1218,12 +1231,15 @@ mod tests {
 
         // Account entries first
         for i in 0..10u8 {
-            entries.push((BucketEntry::Live(make_account_entry(i)), i as u64 * 100));
+            entries.push((
+                BucketEntry::Liveentry(make_account_entry(i)),
+                i as u64 * 100,
+            ));
         }
         // Offer entries after
         for i in 0..5u8 {
             entries.push((
-                BucketEntry::Live(make_offer_entry(i, i as i64 + 1)),
+                BucketEntry::Liveentry(make_offer_entry(i, i as i64 + 1)),
                 (10 + i) as u64 * 100,
             ));
         }
@@ -1249,12 +1265,15 @@ mod tests {
 
         // Accounts (type discriminant comes first)
         for i in 0..5u8 {
-            entries.push((BucketEntry::Live(make_account_entry(i)), i as u64 * 100));
+            entries.push((
+                BucketEntry::Liveentry(make_account_entry(i)),
+                i as u64 * 100,
+            ));
         }
         // Offers (between accounts and contract data)
         for i in 0..5u8 {
             entries.push((
-                BucketEntry::Live(make_offer_entry(i, i as i64 + 1)),
+                BucketEntry::Liveentry(make_offer_entry(i, i as i64 + 1)),
                 (5 + i) as u64 * 100,
             ));
         }
@@ -1316,7 +1335,7 @@ mod tests {
         // Same ScVal key, different contract addresses
         let entries: Vec<(BucketEntry, u64)> = vec![
             (
-                BucketEntry::Live(make_contract_data_entry(
+                BucketEntry::Liveentry(make_contract_data_entry(
                     1,
                     42,
                     ContractDataDurability::Persistent,
@@ -1324,7 +1343,7 @@ mod tests {
                 0,
             ),
             (
-                BucketEntry::Live(make_contract_data_entry(
+                BucketEntry::Liveentry(make_contract_data_entry(
                     2,
                     42,
                     ContractDataDurability::Persistent,
@@ -1349,7 +1368,7 @@ mod tests {
         // Same contract and ScVal key, but different durability
         let entries: Vec<(BucketEntry, u64)> = vec![
             (
-                BucketEntry::Live(make_contract_data_entry(
+                BucketEntry::Liveentry(make_contract_data_entry(
                     1,
                     42,
                     ContractDataDurability::Persistent,
@@ -1357,7 +1376,7 @@ mod tests {
                 0,
             ),
             (
-                BucketEntry::Live(make_contract_data_entry(
+                BucketEntry::Liveentry(make_contract_data_entry(
                     1,
                     42,
                     ContractDataDurability::Temporary,
@@ -1387,7 +1406,12 @@ mod tests {
     #[test]
     fn test_account_lookup_by_id() {
         let entries: Vec<(BucketEntry, u64)> = (0..50u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
 
         let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
@@ -1414,7 +1438,12 @@ mod tests {
     #[test]
     fn test_account_lookup_with_bloom_filter() {
         let entries: Vec<(BucketEntry, u64)> = (0..100u8)
-            .map(|i| (BucketEntry::Live(make_account_entry(i)), i as u64 * 100))
+            .map(|i| {
+                (
+                    BucketEntry::Liveentry(make_account_entry(i)),
+                    i as u64 * 100,
+                )
+            })
             .collect();
 
         let index = InMemoryIndex::from_entries(entries.into_iter(), [0u8; 16]);
@@ -1463,7 +1492,7 @@ mod tests {
         // Add contract code entries
         for i in 0..5u8 {
             entries.push((
-                BucketEntry::Live(make_contract_code_entry(i)),
+                BucketEntry::Liveentry(make_contract_code_entry(i)),
                 i as u64 * 100,
             ));
         }
@@ -1471,7 +1500,7 @@ mod tests {
         // Add persistent contract data entries
         for i in 0..3u8 {
             entries.push((
-                BucketEntry::Live(make_contract_data_entry(
+                BucketEntry::Liveentry(make_contract_data_entry(
                     i,
                     i as i32,
                     ContractDataDurability::Persistent,
@@ -1483,7 +1512,7 @@ mod tests {
         // Add temporary contract data entries
         for i in 0..2u8 {
             entries.push((
-                BucketEntry::Live(make_contract_data_entry(
+                BucketEntry::Liveentry(make_contract_data_entry(
                     10 + i,
                     i as i32,
                     ContractDataDurability::Temporary,
@@ -1518,10 +1547,10 @@ mod tests {
     #[test]
     fn test_soroban_dead_entry_counters() {
         let entries: Vec<(BucketEntry, u64)> = vec![
-            (BucketEntry::Live(make_contract_code_entry(1)), 0),
-            (BucketEntry::Live(make_contract_code_entry(2)), 100),
+            (BucketEntry::Liveentry(make_contract_code_entry(1)), 0),
+            (BucketEntry::Liveentry(make_contract_code_entry(2)), 100),
             (
-                BucketEntry::Dead(LedgerKey::ContractCode(LedgerKeyContractCode {
+                BucketEntry::Deadentry(LedgerKey::ContractCode(LedgerKeyContractCode {
                     hash: Hash([3u8; 32]),
                 })),
                 200,
@@ -1540,10 +1569,10 @@ mod tests {
         let mut counters = BucketEntryCounters::new();
 
         // Record some entries of different types
-        counters.record_entry(&BucketEntry::Live(make_account_entry(1)));
-        counters.record_entry(&BucketEntry::Live(make_account_entry(2)));
-        counters.record_entry(&BucketEntry::Live(make_offer_entry(1, 1)));
-        counters.record_entry(&BucketEntry::Dead(make_account_key(3)));
+        counters.record_entry(&BucketEntry::Liveentry(make_account_entry(1)));
+        counters.record_entry(&BucketEntry::Liveentry(make_account_entry(2)));
+        counters.record_entry(&BucketEntry::Liveentry(make_offer_entry(1, 1)));
+        counters.record_entry(&BucketEntry::Deadentry(make_account_key(3)));
 
         // Verify sizes are accumulated for account type (2 live + 1 dead)
         let account_size = counters.size_for_type(LedgerEntryType::Account);
@@ -1563,13 +1592,13 @@ mod tests {
     #[test]
     fn test_entry_counters_merge() {
         let mut counters1 = BucketEntryCounters::new();
-        counters1.record_entry(&BucketEntry::Live(make_account_entry(1)));
-        counters1.record_entry(&BucketEntry::Live(make_account_entry(2)));
+        counters1.record_entry(&BucketEntry::Liveentry(make_account_entry(1)));
+        counters1.record_entry(&BucketEntry::Liveentry(make_account_entry(2)));
 
         let mut counters2 = BucketEntryCounters::new();
-        counters2.record_entry(&BucketEntry::Live(make_account_entry(3)));
-        counters2.record_entry(&BucketEntry::Live(make_offer_entry(1, 1)));
-        counters2.record_entry(&BucketEntry::Dead(make_account_key(4)));
+        counters2.record_entry(&BucketEntry::Liveentry(make_account_entry(3)));
+        counters2.record_entry(&BucketEntry::Liveentry(make_offer_entry(1, 1)));
+        counters2.record_entry(&BucketEntry::Deadentry(make_account_key(4)));
 
         let size1 = counters1.size_for_type(LedgerEntryType::Account);
         let size2 = counters2.size_for_type(LedgerEntryType::Account);

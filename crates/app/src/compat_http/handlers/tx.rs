@@ -14,6 +14,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use henyey_tx::TransactionResultCodeExt;
 use stellar_xdr::curr::{
     Limits, ReadXdr, TransactionEnvelope, TransactionResult, TransactionResultExt,
     TransactionResultResult, WriteXdr,

@@ -323,7 +323,7 @@ impl BucketApplicator {
             counters.record_processed();
 
             match entry {
-                BucketEntry::Live(ledger_entry) | BucketEntry::Init(ledger_entry) => {
+                BucketEntry::Liveentry(ledger_entry) | BucketEntry::Initentry(ledger_entry) => {
                     if let Some(key) = ledger_entry_to_key(ledger_entry) {
                         // Skip if already seen
                         if self.seen_keys.contains(&key) {
@@ -338,7 +338,7 @@ impl BucketApplicator {
                         batch.push(EntryToApply::Upsert(key, Box::new(ledger_entry.clone())));
                     }
                 }
-                BucketEntry::Dead(key) => {
+                BucketEntry::Deadentry(key) => {
                     if !self.apply_dead_entries {
                         continue;
                     }
@@ -355,7 +355,7 @@ impl BucketApplicator {
                     counters.record_delete(entry_type);
                     batch.push(EntryToApply::Delete(key.clone()));
                 }
-                BucketEntry::Metadata(_) => {
+                BucketEntry::Metaentry(_) => {
                     // Skip metadata entries
                 }
             }
@@ -468,9 +468,9 @@ mod tests {
     #[test]
     fn test_applicator_basic() {
         let entries = vec![
-            BucketEntry::Live(make_account_entry(1)),
-            BucketEntry::Live(make_account_entry(2)),
-            BucketEntry::Dead(make_account_key(3)),
+            BucketEntry::Liveentry(make_account_entry(1)),
+            BucketEntry::Liveentry(make_account_entry(2)),
+            BucketEntry::Deadentry(make_account_key(3)),
         ];
 
         let bucket = Arc::new(Bucket::from_entries(entries).unwrap());
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn test_applicator_chunked() {
         let entries: Vec<BucketEntry> = (0..100u8)
-            .map(|i| BucketEntry::Live(make_account_entry(i)))
+            .map(|i| BucketEntry::Liveentry(make_account_entry(i)))
             .collect();
 
         let bucket = Arc::new(Bucket::from_entries(entries).unwrap());
@@ -511,9 +511,9 @@ mod tests {
     #[test]
     fn test_applicator_deduplication() {
         let entries = vec![
-            BucketEntry::Live(make_account_entry(1)),
-            BucketEntry::Live(make_account_entry(1)), // Duplicate
-            BucketEntry::Live(make_account_entry(2)),
+            BucketEntry::Liveentry(make_account_entry(1)),
+            BucketEntry::Liveentry(make_account_entry(1)), // Duplicate
+            BucketEntry::Liveentry(make_account_entry(2)),
         ];
 
         let bucket = Arc::new(Bucket::from_entries(entries).unwrap());
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn test_applicator_progress() {
         let entries: Vec<BucketEntry> = (0..10u8)
-            .map(|i| BucketEntry::Live(make_account_entry(i)))
+            .map(|i| BucketEntry::Liveentry(make_account_entry(i)))
             .collect();
 
         let bucket = Arc::new(Bucket::from_entries(entries).unwrap());
@@ -556,8 +556,8 @@ mod tests {
     #[test]
     fn test_applicator_skip_dead() {
         let entries = vec![
-            BucketEntry::Live(make_account_entry(1)),
-            BucketEntry::Dead(make_account_key(2)),
+            BucketEntry::Liveentry(make_account_entry(1)),
+            BucketEntry::Deadentry(make_account_key(2)),
         ];
 
         let bucket = Arc::new(Bucket::from_entries(entries).unwrap());
@@ -574,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_applicator_reset() {
-        let entries = vec![BucketEntry::Live(make_account_entry(1))];
+        let entries = vec![BucketEntry::Liveentry(make_account_entry(1))];
 
         let bucket = Arc::new(Bucket::from_entries(entries).unwrap());
         let mut applicator = BucketApplicator::new(bucket, 25, 0);

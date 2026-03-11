@@ -1581,7 +1581,7 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
     // from negative subentry count). It should be a normal op failure.
     assert_ne!(
         result2.failure,
-        Some(ExecutionFailure::NotSupported),
+        Some(ExecutionFailure::TxNotSupported),
         "TX2 should NOT return NotSupported (which indicates the deleted trustline was reloaded from snapshot)"
     );
 
@@ -2058,8 +2058,8 @@ fn test_internal_error_maps_to_tx_internal_error() {
     assert!(!result.success, "TX should fail due to liabilities underflow");
     assert_eq!(
         result.failure,
-        Some(ExecutionFailure::InternalError),
-        "Internal errors must map to ExecutionFailure::InternalError, not NotSupported"
+        Some(ExecutionFailure::TxInternalError),
+        "Internal errors must map to ExecutionFailure::TxInternalError, not NotSupported"
     );
 }
 
@@ -2946,7 +2946,7 @@ fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
     assert!(!result2.success, "fee-bump should fail (inner auth invalid)");
     assert_eq!(
         result2.failure,
-        Some(ExecutionFailure::InvalidSignature),
+        Some(ExecutionFailure::TxBadAuth),
         "inner tx should fail with InvalidSignature (txBadAuth)"
     );
 
@@ -3497,7 +3497,7 @@ fn test_fee_bump_soroban_checks_inner_signatures() {
     );
     assert_eq!(
         result2.failure,
-        Some(ExecutionFailure::InvalidSignature),
+        Some(ExecutionFailure::TxBadAuth),
         "Failure must be InvalidSignature (TxBadAuth), not a Soroban execution error. \
          Before VE-08 fix, the `!frame.is_soroban()` guard skipped the sig check."
     );
@@ -3637,7 +3637,7 @@ fn test_should_apply_false_skips_operation_body() {
     assert!(!result.success, "TX must fail when should_apply=false");
     assert_eq!(
         result.failure,
-        Some(ExecutionFailure::InsufficientBalance),
+        Some(ExecutionFailure::TxInsufficientBalance),
         "failure reason must be InsufficientBalance"
     );
 
@@ -3790,7 +3790,7 @@ fn test_pre_charged_fee_override_on_validation_failure() {
     assert!(!result.results[0].success, "TX should fail");
     assert_eq!(
         result.results[0].failure,
-        Some(ExecutionFailure::NoAccount),
+        Some(ExecutionFailure::TxNoAccount),
         "Failure must be NoAccount"
     );
 
@@ -3882,7 +3882,7 @@ fn test_single_op_tx_failure_rolls_back_without_per_op_savepoint() {
 
     // TX should fail at the operation level.
     assert!(!result.success);
-    assert_eq!(result.failure, Some(ExecutionFailure::OperationFailed));
+    assert_eq!(result.failure, Some(ExecutionFailure::TxFailed));
 
     // Source account: balance should reflect ONLY the fee deduction.
     // The payment amount must NOT have been deducted (rolled back by TX-level rollback).

@@ -176,7 +176,7 @@ pub(crate) fn promote_temp_to_canonical(
 /// let manager = BucketManager::new("/path/to/buckets".into())?;
 ///
 /// // Create a bucket from entries
-/// let entries = vec![BucketEntry::Live(some_entry)];
+/// let entries = vec![BucketEntry::Liveentry(some_entry)];
 /// let bucket = manager.create_bucket(entries)?;
 ///
 /// // Later, load the bucket by hash
@@ -329,9 +329,9 @@ impl BucketManager {
         dead_entries: Vec<LedgerKey>,
     ) -> Result<Arc<Bucket>> {
         let mut entries: Vec<BucketEntry> =
-            live_entries.into_iter().map(BucketEntry::Live).collect();
+            live_entries.into_iter().map(BucketEntry::Liveentry).collect();
 
-        entries.extend(dead_entries.into_iter().map(BucketEntry::Dead));
+        entries.extend(dead_entries.into_iter().map(BucketEntry::Deadentry));
 
         self.create_bucket(entries)
     }
@@ -821,8 +821,8 @@ impl BucketManager {
 
             for entry in bucket.iter() {
                 match entry {
-                    crate::BucketEntry::Live(ref ledger_entry)
-                    | crate::BucketEntry::Init(ref ledger_entry) => {
+                    crate::BucketEntry::Liveentry(ref ledger_entry)
+                    | crate::BucketEntry::Initentry(ref ledger_entry) => {
                         // Check min_ledger filter
                         if let Some(min) = min_ledger {
                             if ledger_entry.last_modified_ledger_seq < min {
@@ -848,11 +848,11 @@ impl BucketManager {
                             return Ok(false);
                         }
                     }
-                    crate::BucketEntry::Dead(ref key) => {
+                    crate::BucketEntry::Deadentry(ref key) => {
                         // Mark key as seen (it's deleted)
                         seen_keys.insert(key.clone());
                     }
-                    crate::BucketEntry::Metadata(_) => {
+                    crate::BucketEntry::Metaentry(_) => {
                         // Skip metadata entries
                     }
                 }
@@ -923,8 +923,8 @@ impl BucketManager {
 
             for entry in bucket.iter() {
                 match entry {
-                    crate::BucketEntry::Live(ref ledger_entry)
-                    | crate::BucketEntry::Init(ref ledger_entry) => {
+                    crate::BucketEntry::Liveentry(ref ledger_entry)
+                    | crate::BucketEntry::Initentry(ref ledger_entry) => {
                         if let Some(key) = crate::entry::ledger_entry_to_key(ledger_entry) {
                             let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
                                 BucketError::Serialization(format!(
@@ -935,7 +935,7 @@ impl BucketManager {
                             state.insert(key_bytes, ledger_entry.clone());
                         }
                     }
-                    crate::BucketEntry::Dead(ref key) => {
+                    crate::BucketEntry::Deadentry(ref key) => {
                         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
                             BucketError::Serialization(format!(
                                 "failed to serialize ledger key: {}",
@@ -945,7 +945,7 @@ impl BucketManager {
                         // Remove the entry if it exists (dead shadows live)
                         state.remove(&key_bytes);
                     }
-                    crate::BucketEntry::Metadata(_) => {
+                    crate::BucketEntry::Metaentry(_) => {
                         // Skip metadata entries
                     }
                 }
@@ -1057,13 +1057,13 @@ impl BucketManager {
         let mut bucket_entries: Vec<crate::BucketEntry> = Vec::with_capacity(entries.len() + 1);
 
         // Add metadata
-        bucket_entries.push(crate::BucketEntry::Metadata(BucketMetadata {
+        bucket_entries.push(crate::BucketEntry::Metaentry(BucketMetadata {
             ledger_version: protocol_version,
             ext: stellar_xdr::curr::BucketMetadataExt::V0,
         }));
 
         // Add all entries as LIVE (not INIT since these are resolved entries)
-        bucket_entries.extend(entries.into_iter().map(crate::BucketEntry::Live));
+        bucket_entries.extend(entries.into_iter().map(crate::BucketEntry::Liveentry));
 
         // Create and save the merged bucket
         self.create_bucket(bucket_entries)
@@ -1447,8 +1447,8 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         let bucket = manager.create_bucket(entries).unwrap();
@@ -1460,7 +1460,7 @@ mod tests {
     fn test_load_bucket() {
         let (_temp_dir, manager) = create_manager();
 
-        let entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let entries = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
 
         let bucket = manager.create_bucket(entries).unwrap();
         let hash = bucket.hash();
@@ -1477,7 +1477,7 @@ mod tests {
     fn test_bucket_caching() {
         let (_temp_dir, manager) = create_manager();
 
-        let entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let entries = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
 
         let bucket = manager.create_bucket(entries).unwrap();
         let hash = bucket.hash();
@@ -1493,7 +1493,7 @@ mod tests {
     fn test_bucket_exists() {
         let (_temp_dir, manager) = create_manager();
 
-        let entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let entries = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
 
         let bucket = manager.create_bucket(entries).unwrap();
         let hash = bucket.hash();
@@ -1507,8 +1507,8 @@ mod tests {
     fn test_merge_buckets() {
         let (_temp_dir, manager) = create_manager();
 
-        let old_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
-        let new_entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 200))];
+        let old_entries = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
+        let new_entries = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 200))];
 
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
@@ -1527,8 +1527,8 @@ mod tests {
     fn test_list_and_delete_buckets() {
         let (_temp_dir, manager) = create_manager();
 
-        let entries1 = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
-        let entries2 = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
+        let entries1 = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
+        let entries2 = vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))];
 
         let bucket1 = manager.create_bucket(entries1).unwrap();
         let bucket2 = manager.create_bucket(entries2).unwrap();
@@ -1547,9 +1547,9 @@ mod tests {
     fn test_retain_buckets() {
         let (_temp_dir, manager) = create_manager();
 
-        let entries1 = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
-        let entries2 = vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))];
-        let entries3 = vec![BucketEntry::Live(make_account_entry([3u8; 32], 300))];
+        let entries1 = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
+        let entries2 = vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))];
+        let entries3 = vec![BucketEntry::Liveentry(make_account_entry([3u8; 32], 300))];
 
         let bucket1 = manager.create_bucket(entries1).unwrap();
         let bucket2 = manager.create_bucket(entries2).unwrap();
@@ -1570,8 +1570,8 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
 
         let original = manager.create_bucket(entries).unwrap();
@@ -1606,7 +1606,7 @@ mod tests {
     fn test_stats() {
         let (_temp_dir, manager) = create_manager();
 
-        let entries = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let entries = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
         manager.create_bucket(entries).unwrap();
 
         let stats = manager.stats();
@@ -1620,10 +1620,10 @@ mod tests {
 
         // Create two buckets - older has entry1, newer has entry2
         let bucket1 = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
         let bucket2 = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
             .unwrap();
 
         // Load complete state (bucket1 is older, bucket2 is newer)
@@ -1640,12 +1640,12 @@ mod tests {
 
         // Create older bucket with initial entry
         let bucket1 = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
 
         // Create newer bucket with updated entry
         let bucket2 = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 500))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 500))])
             .unwrap();
 
         // Load complete state - newer entry should win
@@ -1667,12 +1667,12 @@ mod tests {
 
         // Create older bucket with entry
         let bucket1 = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
 
         // Create newer bucket with deletion
         let bucket2 = manager
-            .create_bucket(vec![BucketEntry::Dead(make_account_key([1u8; 32]))])
+            .create_bucket(vec![BucketEntry::Deadentry(make_account_key([1u8; 32]))])
             .unwrap();
 
         // Load complete state - entry should be deleted
@@ -1690,14 +1690,14 @@ mod tests {
         // Create buckets with different entries
         let bucket1 = manager
             .create_bucket(vec![
-                BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-                BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+                BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+                BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
             ])
             .unwrap();
         let bucket2 = manager
             .create_bucket(vec![
-                BucketEntry::Live(make_account_entry([3u8; 32], 300)),
-                BucketEntry::Live(make_account_entry([1u8; 32], 150)), // Update entry 1
+                BucketEntry::Liveentry(make_account_entry([3u8; 32], 300)),
+                BucketEntry::Liveentry(make_account_entry([1u8; 32], 150)), // Update entry 1
             ])
             .unwrap();
 
@@ -1724,7 +1724,7 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let bucket = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
 
         let nonexistent = Hash256::hash(b"does not exist");
@@ -1741,7 +1741,7 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let bucket = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
 
         // Verify hash matches
@@ -1757,7 +1757,7 @@ mod tests {
         let temp_dir2 = TempDir::new().unwrap();
         let manager2 = BucketManager::new(temp_dir2.path().to_path_buf()).unwrap();
         let bucket = manager2
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
 
         let bucket_xdr = manager2.export_bucket(&bucket.hash()).unwrap();
@@ -1788,7 +1788,7 @@ mod tests {
 
         // Create a bucket
         let entries: Vec<BucketEntry> = (0..100u8)
-            .map(|i| BucketEntry::Live(make_account_entry([i; 32], i as i64 * 100)))
+            .map(|i| BucketEntry::Liveentry(make_account_entry([i; 32], i as i64 * 100)))
             .collect();
         let bucket = manager.create_bucket(entries.clone()).unwrap();
         let hash = bucket.hash();
@@ -1942,8 +1942,8 @@ mod tests {
 
         // Create a bucket - manager caches it
         let entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
         ];
         let b1 = manager.create_bucket(entries).unwrap();
         let hash = b1.hash();
@@ -1976,13 +1976,13 @@ mod tests {
 
         // Create 3 buckets
         let b1 = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
         let b2 = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
             .unwrap();
         let b3 = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([3u8; 32], 300))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([3u8; 32], 300))])
             .unwrap();
 
         let h1 = b1.hash();
@@ -2013,8 +2013,8 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         // Creating the same entries twice should return the same bucket (same hash)
-        let entries1 = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
-        let entries2 = vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))];
+        let entries1 = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
+        let entries2 = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
 
         let b1 = manager.create_bucket(entries1).unwrap();
         let b2 = manager.create_bucket(entries2).unwrap();
@@ -2034,7 +2034,7 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let bucket = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
         let hash = bucket.hash();
 
@@ -2055,7 +2055,7 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let bucket = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
         let hash = bucket.hash();
 
@@ -2080,10 +2080,10 @@ mod tests {
 
         // Create two buckets and merge them
         let old = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
         let new = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
             .unwrap();
 
         let merged = manager.merge(&old, &new, 25).unwrap();
@@ -2101,10 +2101,10 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let old = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
         let new = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
             .unwrap();
 
         // First merge creates a valid canonical file.
@@ -2133,10 +2133,10 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let old = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
         let new = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
             .unwrap();
         let old_hash = old.hash();
         let new_hash = new.hash();
@@ -2168,10 +2168,10 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
 
         let old = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([1u8; 32], 100))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))])
             .unwrap();
         let new = manager
-            .create_bucket(vec![BucketEntry::Live(make_account_entry([2u8; 32], 200))])
+            .create_bucket(vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))])
             .unwrap();
         let result = manager.merge(&old, &new, 25).unwrap();
 

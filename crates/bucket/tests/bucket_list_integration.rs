@@ -1001,7 +1001,7 @@ async fn test_snapshot_eviction_scan_matches_bucket_list() {
 
     // Run scan on the bucket list directly
     let bl_result = bl
-        .scan_for_eviction_incremental(iter, scan_ledger, &settings)
+        .scan_for_eviction_incremental(iter.clone(), scan_ledger, &settings)
         .unwrap();
 
     // Take a snapshot and run the same scan on it
@@ -1255,7 +1255,7 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
 
     // Scan at ledger 10: after original TTL (4) but before extended TTL (20)
     let result = snapshot
-        .scan_for_eviction_incremental(iter, 10, &settings)
+        .scan_for_eviction_incremental(iter.clone(), 10, &settings)
         .unwrap();
 
     // Entry should NOT be evicted because the snapshot sees the extended TTL
@@ -1398,7 +1398,7 @@ async fn test_bucket_manager_persistence() {
         // Create a bucket from entries (create_bucket handles saving to disk)
         let bucket_entries: Vec<BucketEntry> = entries
             .iter()
-            .map(|e| BucketEntry::Init(e.clone()))
+            .map(|e| BucketEntry::Initentry(e.clone()))
             .collect();
 
         let bucket = manager.create_bucket(bucket_entries).unwrap();
@@ -1440,7 +1440,7 @@ async fn test_bucket_manager_persistence() {
             let found = loaded_bucket.get(&key).unwrap();
             assert!(found.is_some(), "Entry {} should exist in loaded bucket", i);
 
-            if let Some(BucketEntry::Init(entry)) = found {
+            if let Some(BucketEntry::Initentry(entry)) = found {
                 if let LedgerEntryData::Account(account) = &entry.data {
                     assert_eq!(
                         account.balance,
@@ -1480,7 +1480,7 @@ async fn test_bucket_manager_load_by_hash() {
 
         let bucket_entries: Vec<BucketEntry> = entries
             .iter()
-            .map(|e| BucketEntry::Init(e.clone()))
+            .map(|e| BucketEntry::Initentry(e.clone()))
             .collect();
 
         let bucket = manager.create_bucket(bucket_entries).unwrap();
@@ -1561,7 +1561,7 @@ async fn test_bucket_manager_verify_buckets() {
 
     let bucket_entries: Vec<BucketEntry> = entries
         .iter()
-        .map(|e| BucketEntry::Init(e.clone()))
+        .map(|e| BucketEntry::Initentry(e.clone()))
         .collect();
 
     let bucket = manager.create_bucket(bucket_entries).unwrap();
@@ -1636,7 +1636,7 @@ async fn test_scan_for_entries_of_types_basic() {
     bl.scan_for_entries_of_types(
         &[LedgerEntryType::Offer, LedgerEntryType::ContractCode],
         |be| {
-            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+            if let BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) = be {
                 match &entry.data {
                     LedgerEntryData::Offer(_) => found_types.push("Offer"),
                     LedgerEntryData::ContractCode(_) => found_types.push("ContractCode"),
@@ -1686,7 +1686,7 @@ async fn test_scan_for_entries_of_types_deduplication() {
     bl.scan_for_entries_of_types(
         &[LedgerEntryType::Offer, LedgerEntryType::ContractCode],
         |be| {
-            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+            if let BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) = be {
                 match &entry.data {
                     LedgerEntryData::Offer(_) => offer_count += 1,
                     LedgerEntryData::ContractCode(_) => code_count += 1,
@@ -1746,7 +1746,7 @@ async fn test_scan_for_entries_of_types_excludes_dead_and_unmatched() {
     bl.scan_for_entries_of_types(
         &[LedgerEntryType::Offer, LedgerEntryType::Account],
         |be| {
-            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+            if let BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) = be {
                 match &entry.data {
                     LedgerEntryData::Offer(_) => found.push("Offer"),
                     LedgerEntryData::Account(_) => found.push("Account"),
@@ -1786,7 +1786,7 @@ async fn test_scan_for_entries_of_types_matches_single_type_variant() {
     // Collect results from single-type scan
     let mut single_type_offers = Vec::new();
     bl.scan_for_entries_of_type(LedgerEntryType::Offer, |be| {
-        if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+        if let BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) = be {
             if let LedgerEntryData::Offer(ref offer) = entry.data {
                 single_type_offers.push(offer.offer_id);
             }
@@ -1797,7 +1797,7 @@ async fn test_scan_for_entries_of_types_matches_single_type_variant() {
     // Collect results from multi-type scan (with only Offer)
     let mut multi_type_offers = Vec::new();
     bl.scan_for_entries_of_types(&[LedgerEntryType::Offer], |be| {
-        if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+        if let BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) = be {
             if let LedgerEntryData::Offer(ref offer) = entry.data {
                 multi_type_offers.push(offer.offer_id);
             }
@@ -1889,7 +1889,7 @@ async fn test_scan_for_entries_of_types_soroban_combined() {
             LedgerEntryType::ConfigSetting,
         ],
         |be| {
-            if let BucketEntry::Live(entry) | BucketEntry::Init(entry) = be {
+            if let BucketEntry::Liveentry(entry) | BucketEntry::Initentry(entry) = be {
                 match &entry.data {
                     LedgerEntryData::ContractCode(_) => code_count += 1,
                     LedgerEntryData::ContractData(_) => data_count += 1,

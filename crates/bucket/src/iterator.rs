@@ -41,7 +41,7 @@ use henyey_common::Hash256;
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::BucketMetadata;
 
-use crate::entry::{compare_entries, BucketEntry};
+use crate::entry::{compare_entries, BucketEntry, BucketEntryExt};
 use crate::{BucketError, Result};
 
 // ============================================================================
@@ -185,7 +185,7 @@ impl BucketInputIterator {
                     self.bytes_read += 4 + data.len();
 
                     // Parse entry
-                    let entry = BucketEntry::from_xdr(&data)?;
+                    let entry = BucketEntry::from_xdr_bytes(&data)?;
 
                     // Handle metadata
                     if entry.is_metadata() {
@@ -200,7 +200,7 @@ impl BucketInputIterator {
                             ));
                         }
                         self.seen_metadata = true;
-                        if let BucketEntry::Metadata(m) = entry {
+                        if let BucketEntry::Metaentry(m) = entry {
                             self.metadata = Some(m);
                         }
                         // Continue to load next entry
@@ -396,7 +396,7 @@ impl BucketOutputIterator {
                 ledger_version: self.protocol_version,
                 ext: stellar_xdr::curr::BucketMetadataExt::V0,
             };
-            let entry = BucketEntry::Metadata(metadata);
+            let entry = BucketEntry::Metaentry(metadata);
             self.write_entry_raw(&entry)?;
         }
 
@@ -405,7 +405,7 @@ impl BucketOutputIterator {
 
     /// Writes an entry directly to the file.
     fn write_entry_raw(&mut self, entry: &BucketEntry) -> Result<()> {
-        let data = entry.to_xdr()?;
+        let data = entry.to_xdr_bytes()?;
 
         // Update hash
         self.hasher.update((data.len() as u32).to_be_bytes());
@@ -751,8 +751,8 @@ mod tests {
         // Write entries
         let mut writer = BucketOutputIterator::new(&path, 25, true).unwrap();
 
-        let entry1 = BucketEntry::Live(make_account_entry([1u8; 32], 100));
-        let entry2 = BucketEntry::Live(make_account_entry([2u8; 32], 200));
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+        let entry2 = BucketEntry::Liveentry(make_account_entry([2u8; 32], 200));
 
         writer.put(entry1.clone()).unwrap();
         writer.put(entry2.clone()).unwrap();
@@ -769,8 +769,8 @@ mod tests {
 
         // Write entries
         let mut writer = BucketOutputIterator::new(&path, 25, true).unwrap();
-        let entry1 = BucketEntry::Live(make_account_entry([1u8; 32], 100));
-        let entry2 = BucketEntry::Live(make_account_entry([2u8; 32], 200));
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+        let entry2 = BucketEntry::Liveentry(make_account_entry([2u8; 32], 200));
         writer.put(entry1.clone()).unwrap();
         writer.put(entry2.clone()).unwrap();
         writer.finish().unwrap();
@@ -781,10 +781,10 @@ mod tests {
         assert!(reader.metadata().is_some());
 
         let read1 = reader.next_entry().unwrap().unwrap();
-        assert!(matches!(read1, BucketEntry::Live(_)));
+        assert!(matches!(read1, BucketEntry::Liveentry(_)));
 
         let read2 = reader.next_entry().unwrap().unwrap();
-        assert!(matches!(read2, BucketEntry::Live(_)));
+        assert!(matches!(read2, BucketEntry::Liveentry(_)));
 
         assert!(reader.next_entry().unwrap().is_none());
     }
@@ -796,8 +796,8 @@ mod tests {
 
         // Write entries with same key
         let mut writer = BucketOutputIterator::new(&path, 25, true).unwrap();
-        let entry1 = BucketEntry::Live(make_account_entry([1u8; 32], 100));
-        let entry2 = BucketEntry::Live(make_account_entry([1u8; 32], 200)); // Same key, different balance
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+        let entry2 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 200)); // Same key, different balance
 
         writer.put(entry1).unwrap();
         writer.put(entry2).unwrap();
@@ -806,7 +806,7 @@ mod tests {
         // Read and verify only one entry (the last one)
         let mut reader = BucketInputIterator::open(&path).unwrap();
         let entry = reader.next_entry().unwrap().unwrap();
-        if let BucketEntry::Live(le) = entry {
+        if let BucketEntry::Liveentry(le) = entry {
             if let LedgerEntryData::Account(acc) = le.data {
                 assert_eq!(acc.balance, 200); // Should be the second value
             }
@@ -821,9 +821,9 @@ mod tests {
 
         // Write with tombstone elision
         let mut writer = BucketOutputIterator::new(&path, 25, false).unwrap(); // keep_tombstones = false
-        let entry1 = BucketEntry::Live(make_account_entry([1u8; 32], 100));
-        let entry2 = BucketEntry::Dead(make_account_key([2u8; 32]));
-        let entry3 = BucketEntry::Live(make_account_entry([3u8; 32], 300));
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+        let entry2 = BucketEntry::Deadentry(make_account_key([2u8; 32]));
+        let entry3 = BucketEntry::Liveentry(make_account_entry([3u8; 32], 300));
 
         writer.put(entry1).unwrap();
         writer.put(entry2).unwrap(); // Should be dropped
@@ -843,8 +843,8 @@ mod tests {
 
         // Write with in-memory collection
         let mut writer = BucketOutputIterator::new_with_in_memory(&path, 25, true).unwrap();
-        let entry1 = BucketEntry::Live(make_account_entry([1u8; 32], 100));
-        let entry2 = BucketEntry::Live(make_account_entry([2u8; 32], 200));
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+        let entry2 = BucketEntry::Liveentry(make_account_entry([2u8; 32], 200));
 
         writer.put(entry1).unwrap();
         writer.put(entry2).unwrap();
@@ -857,12 +857,12 @@ mod tests {
     #[test]
     fn test_memory_merge_input() {
         let old_entries = vec![
-            BucketEntry::Live(make_account_entry([1u8; 32], 100)),
-            BucketEntry::Live(make_account_entry([3u8; 32], 300)),
+            BucketEntry::Liveentry(make_account_entry([1u8; 32], 100)),
+            BucketEntry::Liveentry(make_account_entry([3u8; 32], 300)),
         ];
         let new_entries = vec![
-            BucketEntry::Live(make_account_entry([2u8; 32], 200)),
-            BucketEntry::Live(make_account_entry([4u8; 32], 400)),
+            BucketEntry::Liveentry(make_account_entry([2u8; 32], 200)),
+            BucketEntry::Liveentry(make_account_entry([4u8; 32], 400)),
         ];
 
         let mut input = MemoryMergeInput::new(&old_entries, &new_entries);
@@ -891,7 +891,7 @@ mod tests {
         // Write entries
         let mut writer = BucketOutputIterator::new(&path, 25, true).unwrap();
         for i in 1..=10u8 {
-            let entry = BucketEntry::Live(make_account_entry([i; 32], i as i64 * 100));
+            let entry = BucketEntry::Liveentry(make_account_entry([i; 32], i as i64 * 100));
             writer.put(entry).unwrap();
         }
         writer.finish().unwrap();
@@ -910,7 +910,7 @@ mod tests {
         // Write entries
         let mut writer = BucketOutputIterator::new(&path, 25, true).unwrap();
         for i in 1..=5u8 {
-            let entry = BucketEntry::Live(make_account_entry([i; 32], i as i64 * 100));
+            let entry = BucketEntry::Liveentry(make_account_entry([i; 32], i as i64 * 100));
             writer.put(entry).unwrap();
         }
         let (_, _write_hash, _) = writer.finish().unwrap();

@@ -62,9 +62,9 @@ impl CacheEntry {
 
         // Add estimated size of contained data
         let data_size = match entry {
-            BucketEntry::Live(e) | BucketEntry::Init(e) => Self::estimate_ledger_entry_size(e),
-            BucketEntry::Dead(_) => 64, // LedgerKey is relatively small
-            BucketEntry::Metadata(_) => 32,
+            BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => Self::estimate_ledger_entry_size(e),
+            BucketEntry::Deadentry(_) => 64, // LedgerKey is relatively small
+            BucketEntry::Metaentry(_) => 32,
         };
 
         base_size + data_size
@@ -438,7 +438,7 @@ mod tests {
     }
 
     fn make_account_entry(byte: u8) -> BucketEntry {
-        BucketEntry::Live(LedgerEntry {
+        BucketEntry::Liveentry(LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Account(AccountEntry {
                 account_id: make_account_id(byte),
@@ -473,7 +473,7 @@ mod tests {
     }
 
     fn make_trustline_entry(account_byte: u8, asset_code: &[u8; 4]) -> BucketEntry {
-        BucketEntry::Live(LedgerEntry {
+        BucketEntry::Liveentry(LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Trustline(TrustLineEntry {
                 account_id: make_account_id(account_byte),

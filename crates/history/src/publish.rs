@@ -474,10 +474,9 @@ impl PublishManager {
         } else {
             // Fallback: serialize entries with RFC 5531 record marks
             for entry in bucket.iter() {
-                let xdr_entry = entry.to_xdr_entry();
-                let xdr = xdr_entry
+                let xdr = entry
                     .to_xdr(stellar_xdr::curr::Limits::none())
-                    .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
+                    .map_err(|e: stellar_xdr::curr::Error| HistoryError::VerificationFailed(e.to_string()))?;
                 let marked_len = (xdr.len() as u32) | 0x8000_0000;
                 encoder.write_all(&marked_len.to_be_bytes())?;
                 encoder.write_all(&xdr)?;

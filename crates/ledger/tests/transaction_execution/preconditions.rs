@@ -37,7 +37,7 @@ fn test_execute_transaction_missing_operation() {
     let result = executor
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
-    assert_eq!(result.failure, Some(ExecutionFailure::MissingOperation));
+    assert_eq!(result.failure, Some(ExecutionFailure::TxMissingOperation));
 }
 
 #[test]
@@ -107,7 +107,7 @@ fn test_execute_transaction_time_bounds_too_early() {
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
 
-    assert_eq!(result.failure, Some(ExecutionFailure::TooEarly));
+    assert_eq!(result.failure, Some(ExecutionFailure::TxTooEarly));
 }
 
 #[test]
@@ -185,7 +185,7 @@ fn test_execute_transaction_min_seq_num_precondition() {
 
     // When minSeqNum is set, isBadSeq checks: account_seq < minSeqNum || account_seq >= tx_seq.
     // Here account_seq (1) < minSeqNum (5) → txBAD_SEQ, matching stellar-core's isBadSeq.
-    assert_eq!(result.failure, Some(ExecutionFailure::BadSequence));
+    assert_eq!(result.failure, Some(ExecutionFailure::TxBadSeq));
 }
 
 /// Test that with minSeqNum set, sequence validation is relaxed.
@@ -269,7 +269,7 @@ fn test_execute_transaction_min_seq_num_relaxed_sequence() {
     // The tx might fail for other reasons (like destination doesn't exist),
     // but the sequence check should pass.
     assert!(
-        result.failure != Some(ExecutionFailure::BadSequence),
+        result.failure != Some(ExecutionFailure::TxBadSeq),
         "Transaction should not fail with BadSequence when minSeqNum is set and sequence is in valid range"
     );
 }
@@ -350,7 +350,7 @@ fn test_execute_transaction_strict_sequence_without_min_seq_num() {
     // Should fail with BadSequence because strict check: 100 + 1 != 105
     assert_eq!(
         result.failure,
-        Some(ExecutionFailure::BadSequence),
+        Some(ExecutionFailure::TxBadSeq),
         "Transaction should fail with BadSequence when minSeqNum is not set and sequence doesn't match"
     );
 }
@@ -430,7 +430,7 @@ fn test_execute_transaction_min_seq_age_precondition() {
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
 
-    assert_eq!(result.failure, Some(ExecutionFailure::BadMinSeqAgeOrGap));
+    assert_eq!(result.failure, Some(ExecutionFailure::TxBadMinSeqAgeOrGap));
 }
 
 #[test]
@@ -508,7 +508,7 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
 
-    assert_eq!(result.failure, Some(ExecutionFailure::BadMinSeqAgeOrGap));
+    assert_eq!(result.failure, Some(ExecutionFailure::TxBadMinSeqAgeOrGap));
 }
 
 #[test]
@@ -585,7 +585,7 @@ fn test_execute_transaction_extra_signers_missing() {
         .execute_transaction(&snapshot, &envelope, 100, None)
         .expect("execute");
 
-    assert_eq!(result.failure, Some(ExecutionFailure::BadAuthExtra));
+    assert_eq!(result.failure, Some(ExecutionFailure::TxBadAuthExtra));
 }
 
 #[test]
@@ -734,7 +734,7 @@ fn test_operation_failure_rolls_back_changes() {
         .expect("execute");
 
     assert!(!result.success);
-    assert_eq!(result.failure, Some(ExecutionFailure::InsufficientBalance));
+    assert_eq!(result.failure, Some(ExecutionFailure::TxInsufficientBalance));
 
     let state = executor.state();
     assert!(state.get_account(&destination).is_none());
@@ -858,7 +858,7 @@ fn test_fee_bump_inner_signature_uses_low_threshold() {
     // signature was checked against medium threshold instead of low
     assert_ne!(
         result.failure,
-        Some(ExecutionFailure::InvalidSignature),
+        Some(ExecutionFailure::TxBadAuth),
         "fee-bump inner TX signature should use THRESHOLD_LOW, not THRESHOLD_MEDIUM"
     );
 }
