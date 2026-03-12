@@ -583,6 +583,14 @@ fn test_fee_bump_result_encoding() {
         footprint_us: 0,
         ops_us: 0,
         meta_build_us: 0,
+        val_account_load_us: 0,
+        val_tx_hash_us: 0,
+        val_ed25519_us: 0,
+        val_other_us: 0,
+        fee_deduct_us: 0,
+        op_sig_check_us: 0,
+        signer_removal_us: 0,
+        seq_bump_us: 0,
     };
 
     let pair = build_tx_result_pair(

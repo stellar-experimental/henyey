@@ -325,6 +325,16 @@ pub struct TransactionExecutionResult {
     pub fee_seq_us: u64,
     pub footprint_us: u64,
     pub ops_us: u64,
+    // Validation sub-component timings (microseconds)
+    pub val_account_load_us: u64,
+    pub val_tx_hash_us: u64,
+    pub val_ed25519_us: u64,
+    pub val_other_us: u64,
+    // Fee/seq sub-component timings (microseconds)
+    pub fee_deduct_us: u64,
+    pub op_sig_check_us: u64,
+    pub signer_removal_us: u64,
+    pub seq_bump_us: u64,
     pub meta_build_us: u64,
 }
 
@@ -355,6 +365,14 @@ fn failed_result(failure: TransactionResultCode, error: &str) -> TransactionExec
         footprint_us: 0,
         ops_us: 0,
         meta_build_us: 0,
+        val_account_load_us: 0,
+        val_tx_hash_us: 0,
+        val_ed25519_us: 0,
+        val_other_us: 0,
+        fee_deduct_us: 0,
+        op_sig_check_us: 0,
+        signer_removal_us: 0,
+        seq_bump_us: 0,
     }
 }
 
@@ -364,6 +382,11 @@ struct ValidatedTransaction {
     fee_source_id: AccountId,
     inner_source_id: AccountId,
     outer_hash: Hash256,
+    // Sub-component timings from validation (microseconds)
+    val_account_load_us: u64,
+    val_tx_hash_us: u64,
+    val_ed25519_us: u64,
+    val_other_us: u64,
 }
 
 /// Validation failure with additional context about the validation level reached.
@@ -417,6 +440,16 @@ struct PreApplyResult {
     validation_us: u64,
     fee_seq_us: u64,
     tx_timing_start: std::time::Instant,
+    // Validation sub-component timings (microseconds)
+    val_account_load_us: u64,
+    val_tx_hash_us: u64,
+    val_ed25519_us: u64,
+    val_other_us: u64,
+    // Fee/seq sub-component timings (microseconds)
+    fee_deduct_us: u64,
+    op_sig_check_us: u64,
+    signer_removal_us: u64,
+    seq_bump_us: u64,
 }
 
 /// Snapshot of created/updated/deleted entries for a delta phase (fee, seq, signer).
@@ -1284,6 +1317,8 @@ impl TransactionExecutor {
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
 
+        let fp_start = std::time::Instant::now();
+
         // Build TTL key cache: pre-compute SHA-256 hashes for all ContractData/ContractCode keys.
         let mut ttl_key_cache = henyey_tx::soroban::TtlKeyCache::new();
 
@@ -1292,6 +1327,8 @@ impl TransactionExecutor {
         // entries built from the bucket list at startup and updated incrementally on each
         // ledger close. Lookups are O(1) vs O(22 × bloom_filter) for bucket list scans.
         let in_memory = self.soroban_state.as_ref().map(|s| s.read());
+        let mut ims_hits: u32 = 0;
+        let mut ims_ttl_hits: u32 = 0;
 
         // Collect footprint keys not yet in state, routing Soroban keys to InMemorySorobanState
         // and everything else to the bucket list.
@@ -1338,10 +1375,12 @@ impl TransactionExecutor {
                         if let Some(entry) = ims.get(key) {
                             // Found in IMS — load the entry, skipping bucket list.
                             self.state.load_entry((*entry).clone());
+                            ims_hits += 1;
                             // Load co-located TTL from IMS if not yet in state.
                             if !ttl_in_state {
                                 if let Some(ttl_entry) = ims.get(&ttl_key) {
                                     self.state.load_entry((*ttl_entry).clone());
+                                    ims_ttl_hits += 1;
                                 } else {
                                     // TTL absent from IMS despite entry present — fall through
                                     // to bucket list for TTL.
@@ -1360,6 +1399,7 @@ impl TransactionExecutor {
                         // Try IMS first (fast path).
                         if let Some(ttl_entry) = ims.get(&ttl_key) {
                             self.state.load_entry((*ttl_entry).clone());
+                            ims_ttl_hits += 1;
                         } else {
                             bucket_list_keys.push(ttl_key);
                         }
@@ -1383,6 +1423,10 @@ impl TransactionExecutor {
             }
         }
 
+        let route_us = fp_start.elapsed().as_micros() as u64;
+        let bl_key_count = bucket_list_keys.len() as u32;
+
+        let bl_load_start = std::time::Instant::now();
         if !bucket_list_keys.is_empty() {
             // Batch-load all remaining entries + TTLs in a single bucket list pass.
             let entries = snapshot.load_entries(&bucket_list_keys)?;
@@ -1390,6 +1434,7 @@ impl TransactionExecutor {
                 self.state.load_entry(entry);
             }
         }
+        let bl_load_us = bl_load_start.elapsed().as_micros() as u64;
 
         // NOTE: We do NOT auto-restore entries from the hot archive here.
         // In stellar-core, auto-restore is handled differently:
@@ -1405,6 +1450,21 @@ impl TransactionExecutor {
         } else {
             Some(ttl_key_cache)
         };
+
+        let total_keys = footprint.read_only.len() + footprint.read_write.len();
+        let total_us = fp_start.elapsed().as_micros() as u64;
+        if total_us > 50 {
+            tracing::debug!(
+                total_us,
+                route_us,
+                bl_load_us,
+                total_keys,
+                ims_hits,
+                ims_ttl_hits,
+                bl_key_count,
+                "PROFILE load_soroban_footprint"
+            );
+        }
 
         Ok(())
     }
@@ -1683,6 +1743,7 @@ impl TransactionExecutor {
         tx_envelope: &TransactionEnvelope,
         base_fee: u32,
     ) -> Result<std::result::Result<ValidatedTransaction, ValidationFailure>> {
+        let val_start = std::time::Instant::now();
         let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
         let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
@@ -1713,6 +1774,7 @@ impl TransactionExecutor {
         }
 
         // Phase 2: Account loading
+        let acct_load_start = std::time::Instant::now();
         if !self.load_account(snapshot, &fee_source_id)? {
             return Ok(Err(pre_seq_fail(TransactionResultCode::TxNoAccount, "Source account not found")));
         }
@@ -1728,6 +1790,7 @@ impl TransactionExecutor {
             Some(acc) => acc.clone(),
             None => return Ok(Err(pre_seq_fail(TransactionResultCode::TxNoAccount, "Source account not found"))),
         };
+        let val_account_load_us = acct_load_start.elapsed().as_micros() as u64;
 
         // Phase 3: Fee validation
         if frame.is_fee_bump() {
@@ -1884,13 +1947,18 @@ impl TransactionExecutor {
         }
 
         // Phase 6: Signature validation
+        let sig_start = std::time::Instant::now();
         if validation::validate_signatures(&frame, &validation_ctx).is_err() {
             return Ok(Err(post_seq_fail(TransactionResultCode::TxBadAuth, "Invalid signature")));
         }
 
+        let hash_start = std::time::Instant::now();
         let outer_hash = frame
             .hash(&self.network_id)
             .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
+        let val_tx_hash_us = hash_start.elapsed().as_micros() as u64;
+
+        let ed25519_start = std::time::Instant::now();
         let outer_threshold = threshold_low(&fee_source_account);
         if !has_sufficient_signer_weight(
             &outer_hash,
@@ -1948,11 +2016,20 @@ impl TransactionExecutor {
             }
         }
 
+        let val_ed25519_us = ed25519_start.elapsed().as_micros() as u64;
+        let val_sig_total_us = sig_start.elapsed().as_micros() as u64;
+        let val_total_us = val_start.elapsed().as_micros() as u64;
+        let val_other_us = val_total_us.saturating_sub(val_account_load_us + val_sig_total_us);
+
         Ok(Ok(ValidatedTransaction {
             frame,
             fee_source_id,
             inner_source_id,
             outer_hash,
+            val_account_load_us,
+            val_tx_hash_us,
+            val_ed25519_us,
+            val_other_us,
         }))
     }
 
@@ -2046,6 +2123,10 @@ impl TransactionExecutor {
             fee_source_id,
             inner_source_id,
             outer_hash,
+            val_account_load_us,
+            val_tx_hash_us,
+            val_ed25519_us,
+            val_other_us,
         } = validated;
 
         let validation_us = tx_timing_start.elapsed().as_micros() as u64;
@@ -2067,6 +2148,7 @@ impl TransactionExecutor {
             std::cmp::min(inclusion_fee, required_fee)
         };
 
+        let fee_deduct_start = std::time::Instant::now();
         let mut preflight_failure = None;
         if deduct_fee {
             if let Some(acc) = self.state.get_account(&fee_source_id) {
@@ -2143,6 +2225,8 @@ impl TransactionExecutor {
             fee_changes
         };
 
+        let fee_deduct_us = fee_deduct_start.elapsed().as_micros() as u64;
+
         let tx_changes_before: LedgerEntryChanges;
         let seq_created;
         let seq_updated;
@@ -2185,6 +2269,7 @@ impl TransactionExecutor {
         // removeOneTimeSignerFromAllSourceAccounts(). For fee-bump Soroban
         // transactions, a prior TX in the same ledger may modify the inner
         // source's signer set, making this check essential.
+        let op_sig_check_start = std::time::Instant::now();
         let mut sig_check_failure: Option<(Vec<OperationResult>, ExecutionFailure)> = None;
         if preflight_failure.is_none() {
             // Pre-load per-operation source accounts from snapshot so they're
@@ -2214,9 +2299,12 @@ impl TransactionExecutor {
             );
         }
 
+        let op_sig_check_us = op_sig_check_start.elapsed().as_micros() as u64;
+
         // Remove one-time (PreAuthTx) signers from all source accounts.
         // This must happen AFTER the signature check above so PreAuthTx signers
         // are still present when their weight is evaluated.
+        let signer_removal_start = std::time::Instant::now();
         let mut signer_changes = empty_entry_changes();
         if self.protocol_version != 7 {
             let mut source_accounts = Vec::new();
@@ -2263,7 +2351,9 @@ impl TransactionExecutor {
                 &signer_state_overrides,
             );
         }
+        let signer_removal_us = signer_removal_start.elapsed().as_micros() as u64;
 
+        let seq_bump_start = std::time::Instant::now();
         let delta_before_seq = delta_snapshot(&self.state);
         // Capture the current account state BEFORE modification for STATE entry.
         // We can't use snapshot_entry() here because the snapshot might not exist yet.
@@ -2317,6 +2407,7 @@ impl TransactionExecutor {
 
         // Commit pre-apply changes so rollback doesn't revert them.
         self.state.commit();
+        let seq_bump_us = seq_bump_start.elapsed().as_micros() as u64;
         let fee_seq_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us;
 
         Ok(Ok(PreApplyResult {
@@ -2351,6 +2442,14 @@ impl TransactionExecutor {
             validation_us,
             fee_seq_us,
             tx_timing_start,
+            val_account_load_us,
+            val_tx_hash_us,
+            val_ed25519_us,
+            val_other_us,
+            fee_deduct_us,
+            op_sig_check_us,
+            signer_removal_us,
+            seq_bump_us,
         }))
     }
 
@@ -2403,6 +2502,14 @@ impl TransactionExecutor {
             footprint_us: 0,
             ops_us: 0,
             meta_build_us: 0,
+            val_account_load_us: pre.val_account_load_us,
+            val_tx_hash_us: pre.val_tx_hash_us,
+            val_ed25519_us: pre.val_ed25519_us,
+            val_other_us: pre.val_other_us,
+            fee_deduct_us: pre.fee_deduct_us,
+            op_sig_check_us: pre.op_sig_check_us,
+            signer_removal_us: pre.signer_removal_us,
+            seq_bump_us: pre.seq_bump_us,
         }
     }
 
@@ -2492,6 +2599,14 @@ impl TransactionExecutor {
             validation_us,
             fee_seq_us,
             tx_timing_start,
+            val_account_load_us,
+            val_tx_hash_us,
+            val_ed25519_us,
+            val_other_us,
+            fee_deduct_us,
+            op_sig_check_us,
+            signer_removal_us,
+            seq_bump_us,
         } = pre;
 
         // Create ledger context for operation execution
@@ -3131,7 +3246,15 @@ impl TransactionExecutor {
                 ledger_seq = self.ledger_seq,
                 total_us,
                 validation_us,
+                val_account_load_us,
+                val_tx_hash_us,
+                val_ed25519_us,
+                val_other_us,
                 fee_seq_us,
+                fee_deduct_us,
+                op_sig_check_us,
+                signer_removal_us,
+                seq_bump_us,
                 footprint_us,
                 ops_us,
                 meta_us,
@@ -3170,6 +3293,14 @@ impl TransactionExecutor {
             footprint_us,
             ops_us,
             meta_build_us: meta_us,
+            val_account_load_us,
+            val_tx_hash_us,
+            val_ed25519_us,
+            val_other_us,
+            fee_deduct_us,
+            op_sig_check_us,
+            signer_removal_us,
+            seq_bump_us,
         })
     }
 

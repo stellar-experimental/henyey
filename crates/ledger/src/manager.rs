@@ -3412,6 +3412,8 @@ impl<'a> LedgerCloseContext<'a> {
         // Collect per-transaction perf data and aggregate sub-phase timings
         let mut agg_op_type_timings: HashMap<henyey_tx::OperationType, (u64, u32)> = HashMap::new();
         let (mut agg_validation_us, mut agg_fee_seq_us, mut agg_footprint_us, mut agg_ops_us, mut agg_meta_build_us) = (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut agg_val_account_load_us, mut agg_val_tx_hash_us, mut agg_val_ed25519_us, mut agg_val_other_us) = (0u64, 0u64, 0u64, 0u64);
+        let (mut agg_fee_deduct_us, mut agg_op_sig_check_us, mut agg_signer_removal_us, mut agg_seq_bump_us) = (0u64, 0u64, 0u64, 0u64);
         for (i, result) in tx_set_result.results.iter().enumerate() {
             let hash_hex = if i < self.tx_results.len() {
                 Hash256::from_bytes(self.tx_results[i].transaction_hash.0).to_hex()[..16].to_string()
@@ -3433,6 +3435,14 @@ impl<'a> LedgerCloseContext<'a> {
             agg_footprint_us += result.footprint_us;
             agg_ops_us += result.ops_us;
             agg_meta_build_us += result.meta_build_us;
+            agg_val_account_load_us += result.val_account_load_us;
+            agg_val_tx_hash_us += result.val_tx_hash_us;
+            agg_val_ed25519_us += result.val_ed25519_us;
+            agg_val_other_us += result.val_other_us;
+            agg_fee_deduct_us += result.fee_deduct_us;
+            agg_op_sig_check_us += result.op_sig_check_us;
+            agg_signer_removal_us += result.signer_removal_us;
+            agg_seq_bump_us += result.seq_bump_us;
             // Aggregate per-op-type timings across all TXs
             for (op_type, (us, count)) in &result.op_type_timings {
                 let entry = agg_op_type_timings.entry(*op_type).or_insert((0, 0));
@@ -3464,7 +3474,15 @@ impl<'a> LedgerCloseContext<'a> {
             soroban_exec_us = self.timing_soroban_exec_us,
             post_exec_us,
             agg_validation_us,
+            agg_val_account_load_us,
+            agg_val_tx_hash_us,
+            agg_val_ed25519_us,
+            agg_val_other_us,
             agg_fee_seq_us,
+            agg_fee_deduct_us,
+            agg_op_sig_check_us,
+            agg_signer_removal_us,
+            agg_seq_bump_us,
             agg_footprint_us,
             agg_ops_us,
             agg_meta_build_us,
