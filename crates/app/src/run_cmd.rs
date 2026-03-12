@@ -102,7 +102,16 @@ pub struct RunOptions {
     /// and returns a concrete `LoadGenRunner` implementation.
     #[cfg(feature = "loadgen")]
     pub loadgen_runner_factory: Option<crate::LoadGenRunnerFactory>,
+
+    /// Optional callback that spawns extra server tasks (e.g. JSON-RPC).
+    /// Receives `Arc<App>`, returns a vec of join handles to abort on shutdown.
+    pub extra_server_spawner: Option<ExtraServerSpawner>,
 }
+
+/// Callback type for spawning extra servers alongside the main node.
+pub type ExtraServerSpawner = Arc<
+    dyn Fn(&Arc<App>) -> Vec<tokio::task::JoinHandle<()>> + Send + Sync,
+>;
 
 impl std::fmt::Debug for RunOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -124,6 +133,7 @@ impl Clone for RunOptions {
             max_ledger_age: self.max_ledger_age,
             #[cfg(feature = "loadgen")]
             loadgen_runner_factory: self.loadgen_runner_factory.clone(),
+            extra_server_spawner: self.extra_server_spawner.clone(),
         }
     }
 }
@@ -137,6 +147,7 @@ impl Default for RunOptions {
             max_ledger_age: 300, // ~25 minutes of ledgers
             #[cfg(feature = "loadgen")]
             loadgen_runner_factory: None,
+            extra_server_spawner: None,
         }
     }
 }
@@ -246,6 +257,14 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         None
     };
 
+    // Start extra servers (e.g. JSON-RPC) if configured
+    let extra_handles: Vec<tokio::task::JoinHandle<()>> =
+        if let Some(ref spawner) = options.extra_server_spawner {
+            spawner(&app)
+        } else {
+            Vec::new()
+        };
+
     // Print startup info
     print_startup_info(&app, &options);
 
@@ -261,6 +280,9 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         handle.abort();
     }
     if let Some(handle) = compat_handle {
+        handle.abort();
+    }
+    for handle in extra_handles {
         handle.abort();
     }
 

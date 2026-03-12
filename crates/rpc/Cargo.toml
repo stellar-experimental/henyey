@@ -1,0 +1,55 @@
+[package]
+name = "henyey-rpc"
+description = "Stellar JSON-RPC 2.0 server for henyey"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "henyey_rpc"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace crates
+henyey-app.workspace = true
+henyey-common.workspace = true
+henyey-bucket.workspace = true
+henyey-herder.workspace = true
+henyey-db.workspace = true
+henyey-tx.workspace = true
+henyey-crypto.workspace = true
+henyey-ledger.workspace = true
+
+# Soroban host (recording mode for simulation)
+soroban-env-host-p25 = { workspace = true, features = ["recording_mode"] }
+
+# Stellar XDR
+stellar-xdr.workspace = true
+
+# HTTP server
+axum.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Encoding
+base64.workspace = true
+hex.workspace = true
+
+# Random number generation
+rand.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

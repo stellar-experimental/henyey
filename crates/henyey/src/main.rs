@@ -922,12 +922,27 @@ async fn cmd_run(
         RunMode::Full
     };
 
+    let rpc_enabled = config.rpc.enabled;
+    let rpc_port = config.rpc.port;
+
     let options = RunOptions {
         mode,
         force_catchup,
         loadgen_runner_factory: Some(std::sync::Arc::new(|app| {
             Box::new(loadgen_runner::SimulationLoadGenRunner::new(app))
         })),
+        extra_server_spawner: if rpc_enabled {
+            Some(std::sync::Arc::new(move |app: &std::sync::Arc<henyey_app::App>| {
+                let rpc_server = henyey_rpc::RpcServer::new(rpc_port, app.clone());
+                vec![tokio::spawn(async move {
+                    if let Err(e) = rpc_server.start().await {
+                        tracing::error!(error = %e, "JSON-RPC server error");
+                    }
+                })]
+            }))
+        } else {
+            None
+        },
         ..Default::default()
     };
 

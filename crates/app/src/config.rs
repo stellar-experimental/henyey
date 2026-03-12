@@ -149,6 +149,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub testing: TestingConfig,
 
+    /// JSON-RPC server configuration.
+    #[serde(default)]
+    pub rpc: RpcConfig,
+
     /// Whether this config was translated from stellar-core format.
     /// When true, the overlay layer will not inject default seed peers
     /// if no KNOWN_PEERS were specified in the original config.
@@ -894,6 +898,40 @@ impl Default for CompatHttpConfig {
     }
 }
 
+/// JSON-RPC server configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RpcConfig {
+    /// Whether to enable the JSON-RPC server.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Port for the JSON-RPC server.
+    #[serde(default = "default_rpc_port")]
+    pub port: u16,
+
+    /// Number of ledgers to retain for range queries (~1 day at 5s close).
+    #[serde(default = "default_rpc_retention_window")]
+    pub retention_window: u32,
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: default_rpc_port(),
+            retention_window: default_rpc_retention_window(),
+        }
+    }
+}
+
+fn default_rpc_port() -> u16 {
+    8000
+}
+
+fn default_rpc_retention_window() -> u32 {
+    2880
+}
+
 fn default_compat_http_port() -> u16 {
     11626
 }
@@ -1076,6 +1114,7 @@ impl AppConfig {
             query: QueryConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             testing: TestingConfig::default(),
+            rpc: RpcConfig::default(),
             is_compat_config: false,
         }
     }
@@ -1146,6 +1185,7 @@ impl AppConfig {
             query: QueryConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             testing: TestingConfig::default(),
+            rpc: RpcConfig::default(),
             is_compat_config: false,
         }
     }

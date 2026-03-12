@@ -21,6 +21,7 @@ henyey-history.workspace = true
 henyey-scp.workspace = true
 henyey-ledger.workspace = true
 henyey-simulation.workspace = true
+henyey-rpc.workspace = true
 
 # Stellar XDR
 stellar-xdr.workspace = true

@@ -75,7 +75,7 @@ pub use logging::{init_with_handle, LogConfig, LogFormat, LogLevelHandle, LOG_PA
 pub use maintainer::{
     Maintainer, MaintenanceConfig, DEFAULT_MAINTENANCE_COUNT, DEFAULT_MAINTENANCE_PERIOD,
 };
-pub use run_cmd::{run_node, RunMode, RunOptions};
+pub use run_cmd::{run_node, ExtraServerSpawner, RunMode, RunOptions};
 
 // Load generation support (feature-gated).
 #[cfg(feature = "loadgen")]
