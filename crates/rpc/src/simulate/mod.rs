@@ -18,14 +18,8 @@ use stellar_xdr::curr::{
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 
-/// Multiplicative adjustment factor for CPU instructions (soroban-simulation default).
-const INSTRUCTION_ADJUSTMENT_FACTOR: f64 = 1.04;
-/// Additive adjustment for CPU instructions (soroban-simulation default).
-const INSTRUCTION_ADJUSTMENT_ADDEND: u32 = 50_000;
 /// Multiplicative adjustment factor for refundable fees (soroban-simulation default).
 const REFUNDABLE_FEE_ADJUSTMENT_FACTOR: f64 = 1.15;
-/// Estimated transaction envelope size for fee computation.
-const DEFAULT_TX_SIZE_ESTIMATE: u32 = 300;
 
 pub async fn handle(
     ctx: &Arc<RpcContext>,
@@ -79,11 +73,15 @@ pub async fn handle(
     // Build the snapshot source from our bucket list snapshot
     let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger.num);
 
+    // Clone what we need before moving into the blocking task
+    let host_fn_clone = host_fn.clone();
+    let source_account_clone = source_account.clone();
+
     // Run simulation in a blocking task (soroban Host uses Rc, not Send)
     let result = tokio::task::spawn_blocking(move || {
         run_simulation(
-            host_fn,
-            source_account,
+            host_fn_clone,
+            source_account_clone,
             ledger_info,
             snapshot_source,
         )
@@ -92,7 +90,14 @@ pub async fn handle(
     .map_err(|e| JsonRpcError::internal(format!("simulation task failed: {}", e)))?;
 
     match result {
-        Ok(sim_result) => build_success_response(sim_result, &soroban_info, ledger.num),
+        Ok(sim_output) => build_success_response(
+            sim_output.recording_result,
+            sim_output.diagnostic_events,
+            &soroban_info,
+            ledger.num,
+            &host_fn,
+            &source_account,
+        ),
         Err(e) => build_error_response(e, ledger.num),
     }
 }
@@ -144,12 +149,17 @@ fn extract_host_function(
     }
 }
 
+struct SimulationOutput {
+    recording_result: soroban_host::e2e_invoke::InvokeHostFunctionRecordingModeResult,
+    diagnostic_events: Vec<stellar_xdr::curr::DiagnosticEvent>,
+}
+
 fn run_simulation(
     host_fn: HostFunction,
     source_account: stellar_xdr::curr::AccountId,
     ledger_info: soroban_host::LedgerInfo,
     snapshot_source: BucketListSnapshotSource,
-) -> Result<soroban_host::e2e_invoke::InvokeHostFunctionRecordingModeResult, String> {
+) -> Result<SimulationOutput, String> {
     use soroban_host::e2e_invoke::{
         invoke_host_function_in_recording_mode, RecordingInvocationAuthMode,
     };
@@ -175,7 +185,10 @@ fn run_simulation(
         Ok(recording_result) => {
             // Check if the invocation itself succeeded
             match &recording_result.invoke_result {
-                Ok(_) => Ok(recording_result),
+                Ok(_) => Ok(SimulationOutput {
+                    recording_result,
+                    diagnostic_events,
+                }),
                 Err(e) => Err(format!("host function invocation failed: {:?}", e)),
             }
         }
@@ -185,8 +198,11 @@ fn run_simulation(
 
 fn build_success_response(
     sim_result: soroban_host::e2e_invoke::InvokeHostFunctionRecordingModeResult,
+    diagnostic_events: Vec<stellar_xdr::curr::DiagnosticEvent>,
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
     latest_ledger: u32,
+    host_fn: &HostFunction,
+    source_account: &stellar_xdr::curr::AccountId,
 ) -> Result<serde_json::Value, JsonRpcError> {
     let resources = &sim_result.resources;
 
@@ -203,15 +219,30 @@ fn build_success_response(
         Err(_) => None,
     };
 
+    // Encode diagnostic events for the response (DiagnosticEvent XDR, not ContractEvent)
+    let events: Vec<String> = diagnostic_events
+        .iter()
+        .filter_map(|e| e.to_xdr(Limits::none()).ok().map(|b| BASE64.encode(&b)))
+        .collect();
+
     // Apply resource adjustments (mirrors soroban-simulation default_adjustment)
     let mut adjusted_resources = resources.clone();
     adjust_resources(&mut adjusted_resources);
+
+    // Estimate the transaction size for fee computation.
+    // Mirrors soroban-simulation: build a max-size synthetic envelope.
+    let tx_size = estimate_tx_size(host_fn, source_account, &adjusted_resources);
 
     // Build SorobanTransactionData
     let soroban_data = SorobanTransactionData {
         ext: stellar_xdr::curr::SorobanTransactionDataExt::V0,
         resources: adjusted_resources,
-        resource_fee: compute_resource_fee(resources, soroban_info),
+        resource_fee: compute_resource_fee(
+            resources,
+            soroban_info,
+            sim_result.contract_events_and_return_value_size,
+            tx_size,
+        ),
     };
 
     let soroban_data_xdr = soroban_data
@@ -229,6 +260,13 @@ fn build_success_response(
         },
         "latestLedger": latest_ledger
     });
+
+    if !events.is_empty() {
+        result
+            .as_object_mut()
+            .unwrap()
+            .insert("events".to_string(), json!(events));
+    }
 
     if !auth_entries.is_empty() {
         result
@@ -264,24 +302,112 @@ fn build_error_response(error: String, latest_ledger: u32) -> Result<serde_json:
     }))
 }
 
+/// Apply soroban-simulation default adjustment: max(x + additive, floor(x * mult)).
+fn sim_adjust(value: u32, multiplicative: f64, additive: u32) -> u32 {
+    if value == 0 {
+        return 0;
+    }
+    let mult_adjusted = (value as f64 * multiplicative).floor() as u32;
+    (value.saturating_add(additive)).max(mult_adjusted)
+}
+
 /// Apply resource adjustment factors matching soroban-simulation defaults.
 ///
-/// - instructions: 1.04x + 50,000
-/// - read_bytes / write_bytes: no adjustment
-///
-/// This ensures the transaction has enough headroom to execute on a network
-/// whose state may have advanced since the simulation snapshot.
+/// - instructions: max(x + 50_000, floor(x * 1.04))
+/// - disk_read_bytes: max(x + 2_000, floor(x * 1.0))
+/// - write_bytes: max(x + 2_000, floor(x * 1.0))
 fn adjust_resources(resources: &mut stellar_xdr::curr::SorobanResources) {
-    if resources.instructions > 0 {
-        let adjusted =
-            ((resources.instructions as f64) * INSTRUCTION_ADJUSTMENT_FACTOR).floor() as u32;
-        resources.instructions = adjusted.saturating_add(INSTRUCTION_ADJUSTMENT_ADDEND);
-    }
+    resources.instructions = sim_adjust(resources.instructions, 1.04, 50_000);
+    resources.disk_read_bytes = sim_adjust(resources.disk_read_bytes, 1.0, 2_000);
+    resources.write_bytes = sim_adjust(resources.write_bytes, 1.0, 2_000);
+}
+
+/// Estimate the XDR-encoded transaction size for fee computation.
+///
+/// Mirrors soroban-simulation: builds a max-size synthetic envelope with
+/// 20 signatures and full preconditions, then applies the tx_size adjustment.
+fn estimate_tx_size(
+    host_fn: &HostFunction,
+    source_account: &stellar_xdr::curr::AccountId,
+    adjusted_resources: &stellar_xdr::curr::SorobanResources,
+) -> u32 {
+    use stellar_xdr::curr::*;
+
+    // Build a synthetic envelope matching the worst-case size
+    let op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: host_fn.clone(),
+            auth: VecM::default(),
+        }),
+    };
+
+    // Minimal SorobanTransactionData with footprint but zero fees/instructions
+    let soroban_data = SorobanTransactionData {
+        ext: SorobanTransactionDataExt::V0,
+        resources: SorobanResources {
+            footprint: adjusted_resources.footprint.clone(),
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        },
+        resource_fee: 0,
+    };
+    // Build with 20 max-size signatures (matching soroban-simulation)
+    let sig = DecoratedSignature {
+        hint: SignatureHint([0u8; 4]),
+        signature: Signature::try_from(vec![0u8; 64]).unwrap_or_default(),
+    };
+    let sigs: Vec<DecoratedSignature> = (0..20).map(|_| sig.clone()).collect();
+
+    let source = MuxedAccount::Ed25519(match &source_account.0 {
+        PublicKey::PublicKeyTypeEd25519(k) => k.clone(),
+    });
+
+    let tx = Transaction {
+        source_account: source,
+        fee: u32::MAX,
+        seq_num: SequenceNumber(0),
+        cond: Preconditions::V2(PreconditionsV2 {
+            time_bounds: Some(TimeBounds {
+                min_time: TimePoint(0),
+                max_time: TimePoint(0),
+            }),
+            ledger_bounds: Some(LedgerBounds {
+                min_ledger: 0,
+                max_ledger: 0,
+            }),
+            min_seq_num: Some(SequenceNumber(0)),
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![
+                SignerKey::Ed25519(Uint256([0u8; 32])),
+                SignerKey::Ed25519(Uint256([0u8; 32])),
+            ]
+            .try_into()
+            .unwrap_or_default(),
+        }),
+        memo: Memo::None,
+        operations: vec![op].try_into().unwrap_or_default(),
+        ext: TransactionExt::V1(soroban_data),
+    };
+
+    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: sigs.try_into().unwrap_or_default(),
+    });
+
+    let raw_size = envelope.to_xdr(Limits::none()).map(|b| b.len() as u32).unwrap_or(300);
+
+    // Apply tx_size adjustment: max(x + 500, floor(x * 1.1))
+    sim_adjust(raw_size, 1.1, 500)
 }
 
 fn compute_resource_fee(
     resources: &stellar_xdr::curr::SorobanResources,
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
+    contract_events_and_return_value_size: u32,
+    tx_size: u32,
 ) -> i64 {
     use soroban_host::fees::{compute_transaction_resource_fee, FeeConfiguration, TransactionResources};
 
@@ -292,8 +418,8 @@ fn compute_resource_fee(
         write_entries: resources.footprint.read_write.len() as u32,
         disk_read_bytes: resources.disk_read_bytes,
         write_bytes: resources.write_bytes,
-        contract_events_size_bytes: 0,
-        transaction_size_bytes: DEFAULT_TX_SIZE_ESTIMATE,
+        contract_events_size_bytes: contract_events_and_return_value_size,
+        transaction_size_bytes: tx_size,
     };
 
     let fee_config = FeeConfiguration {
