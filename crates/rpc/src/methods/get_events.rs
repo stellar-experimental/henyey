@@ -289,3 +289,84 @@ fn extract_event_value_scval(event_xdr_b64: &str) -> Option<ScVal> {
         ContractEventBody::V0(body) => Some(body.data),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_filters(filters: serde_json::Value) -> Option<Vec<serde_json::Value>> {
+        filters.as_array().cloned()
+    }
+
+    #[test]
+    fn test_parse_filters_empty() {
+        let (event_type, contract_ids, topics) = parse_event_filters(None).unwrap();
+        assert!(event_type.is_none());
+        assert!(contract_ids.is_empty());
+        assert!(topics.is_empty());
+    }
+
+    #[test]
+    fn test_parse_filters_contract_id() {
+        let filters = json!([{"contractIds": ["CABC123"]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, contract_ids, _) = parse_event_filters(Some(&arr)).unwrap();
+        assert_eq!(contract_ids, vec!["CABC123"]);
+    }
+
+    #[test]
+    fn test_parse_filters_topic_wildcard() {
+        let filters = json!([{"topics": [["*"]]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, _, topics) = parse_event_filters(Some(&arr)).unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0], vec!["*"]);
+    }
+
+    #[test]
+    fn test_parse_filters_topic_double_star() {
+        // ** means "match all remaining" — parser should stop adding further segments
+        let filters = json!([{"topics": [["topic1"], ["**"], ["should_be_ignored"]]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, _, topics) = parse_event_filters(Some(&arr)).unwrap();
+        // Only the first segment before ** should be captured
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0], vec!["topic1"]);
+    }
+
+    #[test]
+    fn test_parse_filters_max_exceeded() {
+        // 6 filters > MAX_FILTERS (5)
+        let filters = json!([{}, {}, {}, {}, {}, {}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_max_contract_ids() {
+        // 6 contract IDs > MAX_CONTRACT_IDS_PER_FILTER (5)
+        let filters = json!([{"contractIds": ["a","b","c","d","e","f"]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_max_topics() {
+        // 6 topic segments > MAX_TOPICS_PER_FILTER (5) — should fail
+        let filters = json!([{"topics": [["a"],["b"],["c"],["d"],["e"],["f"]]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_diagnostic_rejected() {
+        let filters = json!([{"type": "diagnostic"}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+}
