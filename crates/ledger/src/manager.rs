@@ -2045,6 +2045,52 @@ impl LedgerManager {
     ///
     /// Returns the Soroban-related configuration settings from the current ledger
     /// state, or `None` if not available (pre-protocol 20 or not initialized).
+    /// Inject a synthetic CONTRACT_DATA entry directly into the in-memory Soroban state.
+    ///
+    /// This is intended for test/benchmark harnesses (e.g. ApplyLoad) that need to
+    /// inject data (such as a ConfigUpgradeSet) into the ledger without going through
+    /// a Soroban transaction. The entry and its TTL become visible to subsequent
+    /// `create_snapshot()` calls.
+    pub fn inject_synthetic_contract_data(
+        &self,
+        entry: LedgerEntry,
+        live_until_ledger: u32,
+    ) -> Result<()> {
+        use stellar_xdr::curr::LedgerEntryData;
+
+        // Verify it's a CONTRACT_DATA entry
+        let _cd = match &entry.data {
+            LedgerEntryData::ContractData(cd) => cd,
+            _ => {
+                return Err(LedgerError::Internal(
+                    "inject_synthetic_contract_data: not a CONTRACT_DATA entry".to_string(),
+                ))
+            }
+        };
+
+        let last_modified = entry.last_modified_ledger_seq;
+        let ttl_data = crate::soroban_state::TtlData::new(live_until_ledger, last_modified);
+
+        // Build the LedgerKey for TTL
+        let data_key = LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+            contract: _cd.contract.clone(),
+            key: _cd.key.clone(),
+            durability: _cd.durability,
+        });
+        let key_hash = Hash256::hash_xdr(&data_key).map_err(|e| {
+            LedgerError::Internal(format!("Failed to hash LedgerKey: {}", e))
+        })?;
+        let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+            key_hash: stellar_xdr::curr::Hash(key_hash.0),
+        };
+
+        let mut state = self.soroban_state.write();
+        state.create_contract_data(entry)?;
+        state.create_ttl(&ttl_key, ttl_data)?;
+
+        Ok(())
+    }
+
     pub fn soroban_network_info(&self) -> Option<SorobanNetworkInfo> {
         if !self.is_initialized() {
             return None;

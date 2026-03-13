@@ -641,6 +641,10 @@ enum Commands {
         /// Number of classic transactions per ledger (default: 10)
         #[arg(long, default_value = "10")]
         classic_txs_per_ledger: u32,
+
+        /// Max parallel Soroban execution clusters per stage (default: 16)
+        #[arg(long, default_value = "16")]
+        clusters: u32,
     },
 }
 
@@ -791,7 +795,8 @@ async fn main() -> anyhow::Result<()> {
             mode,
             num_ledgers,
             classic_txs_per_ledger,
-        } => cmd_apply_load(config, &mode, num_ledgers, classic_txs_per_ledger).await,
+            clusters,
+        } => cmd_apply_load(config, &mode, num_ledgers, classic_txs_per_ledger, clusters).await,
     }
 }
 
@@ -1191,6 +1196,7 @@ async fn cmd_apply_load(
     mode_str: &str,
     num_ledgers: u32,
     classic_txs_per_ledger: u32,
+    clusters: u32,
 ) -> anyhow::Result<()> {
     use henyey_simulation::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode};
 
@@ -1231,11 +1237,12 @@ async fn cmd_apply_load(
     let al_config = ApplyLoadConfig {
         num_ledgers,
         classic_txs_per_ledger,
+        ledger_max_dependent_tx_clusters: clusters,
         ..ApplyLoadConfig::default()
     };
 
-    println!("apply-load: mode={:?}, num_ledgers={}, classic_txs_per_ledger={}",
-        mode, num_ledgers, classic_txs_per_ledger);
+    println!("apply-load: mode={:?}, num_ledgers={}, classic_txs_per_ledger={}, clusters={}",
+        mode, num_ledgers, classic_txs_per_ledger, clusters);
     println!();
 
     // Construct the harness (performs full setup: accounts, contracts, bucket list).

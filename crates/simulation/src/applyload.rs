@@ -22,13 +22,12 @@ use henyey_app::App;
 use henyey_common::Hash256;
 use henyey_ledger::{LedgerCloseData, TransactionSetVariant};
 use stellar_xdr::curr::{
-    ContractDataDurability, ContractId, ContractIdPreimage, ContractIdPreimageFromAddress,
-    ExtensionPoint, GeneralizedTransactionSet, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt,
-    LedgerKey, LedgerKeyContractData, LedgerUpgrade, Limits, ScAddress, ScVal, TransactionEnvelope,
-    TransactionExt, TransactionPhase, TransactionSetV1, TxSetComponent,
-    TxSetComponentTxsMaybeDiscountedFee, Uint256, VecM, WriteXdr,
+    ConfigSettingEntry, ContractDataDurability, ContractId, ContractIdPreimage,
+    ContractIdPreimageFromAddress, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
+    LedgerEntryExt, LedgerKey, LedgerKeyContractData, LedgerUpgrade, Limits, OperationBody,
+    ScAddress, ScVal, TransactionEnvelope, TransactionExt, Uint256, WriteXdr,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::loadgen::{ContractInstance, TxGenerator};
 
@@ -56,6 +55,29 @@ const BATCH_TRANSFER_TX_INSTRUCTIONS: u64 = 100_000_000;
 /// Values are multiplied by this factor so that `0.18` (18%) is stored as
 /// `18_000`. Matches stellar-core convention.
 const UTILIZATION_SCALE: f64 = 100_000.0;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Check if a `TransactionEnvelope` contains a Soroban operation.
+fn is_soroban_envelope(env: &TransactionEnvelope) -> bool {
+    let ops = match env {
+        TransactionEnvelope::Tx(v1) => &v1.tx.operations,
+        TransactionEnvelope::TxFeeBump(fb) => match &fb.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(v1) => &v1.tx.operations,
+        },
+        _ => return false,
+    };
+    ops.iter().any(|op| {
+        matches!(
+            op.body,
+            OperationBody::InvokeHostFunction(_)
+                | OperationBody::ExtendFootprintTtl(_)
+                | OperationBody::RestoreFootprint(_)
+        )
+    })
+}
 
 // ---------------------------------------------------------------------------
 // ApplyLoadMode
@@ -357,7 +379,7 @@ impl ApplyLoad {
         let header_hash = self.app.ledger_manager().current_header_hash();
 
         // Build a GeneralizedTransactionSet from the envelopes.
-        let tx_set = Self::build_tx_set_from_envelopes(&txs, &header_hash);
+        let tx_set = self.build_tx_set_from_envelopes(&txs, &header_hash);
 
         if record_soroban_utilization {
             ensure!(
@@ -385,8 +407,13 @@ impl ApplyLoad {
                 | stellar_xdr::curr::TransactionResultResult::TxFeeBumpInnerSuccess(_) => {
                     self.apply_soroban_success += 1;
                 }
-                _ => {
+                other => {
                     self.apply_soroban_failure += 1;
+                    debug!(
+                        "ApplyLoad: tx failure at ledger {}: {:?}",
+                        self.app.ledger_manager().current_ledger_seq(),
+                        other
+                    );
                 }
             }
         }
@@ -505,7 +532,7 @@ impl ApplyLoad {
         warn!("Target close time: {}ms", target_close_time);
         warn!("Num parallel clusters: {}", num_clusters);
 
-        while min_tps <= max_tps {
+        while min_tps + 10 < max_tps {
             let test_tps = (min_tps + max_tps) / 2;
 
             // Calculate transactions per ledger based on target close time.
@@ -652,6 +679,16 @@ impl ApplyLoad {
             "failed to load root account"
         );
 
+        // Upgrade protocol to 25 to create all Soroban configuration entries.
+        // The genesis ledger starts at protocol 0, so this triggers
+        // create_ledger_entries_for_v20 through create_cost_types_for_v25,
+        // populating all 14+ CONFIG_SETTING entries needed for Soroban.
+        let header = self.app.ledger_manager().current_header();
+        if header.ledger_version < 25 {
+            info!("ApplyLoad: upgrading protocol {} -> 25", header.ledger_version);
+            self.close_ledger(Vec::new(), vec![LedgerUpgrade::Version(25)], false)?;
+        }
+
         // If maxTxSetSize < classic_txs_per_ledger, upgrade it.
         let header = self.app.ledger_manager().current_header();
         if header.max_tx_set_size < self.config.classic_txs_per_ledger {
@@ -695,8 +732,11 @@ impl ApplyLoad {
     fn setup_accounts(&mut self) -> Result<()> {
         let ledger_num = self.app.ledger_manager().current_ledger_seq() + 1;
 
-        // Use low balance to allow creating many accounts.
-        let balance = 100_000_000i64; // 10 XLM
+        // Matches stellar-core: balance = mMinBalance * 100 (initialAccounts=false).
+        // mMinBalance = getLastMinBalance(0) = 2 * base_reserve.
+        let base_reserve = self.app.ledger_manager().current_header().base_reserve as i64;
+        let min_balance = 2 * base_reserve; // min balance for 0 sub-entries
+        let balance = min_balance * 100;
         let creation_ops =
             self.tx_gen
                 .create_accounts(0, self.num_accounts as u64, ledger_num, balance);
@@ -1073,6 +1113,27 @@ impl ApplyLoad {
     // Max SAC TPS helpers
     // =======================================================================
 
+    /// Reload all account sequence numbers from the ledger.
+    ///
+    /// Matches stellar-core `ApplyLoad::warmAccountCache()`.
+    fn warm_account_cache(&mut self) {
+        // Collect account IDs and their ledger account IDs to avoid borrow conflict
+        let account_info: Vec<(u64, stellar_xdr::curr::AccountId)> = self
+            .tx_gen
+            .accounts()
+            .iter()
+            .map(|(&id, acct)| (id, acct.account_id.clone()))
+            .collect();
+
+        for (id, aid) in &account_info {
+            if let Some(seq) = self.app.load_account_sequence(aid) {
+                if let Some(account) = self.tx_gen.accounts_mut().get_mut(id) {
+                    account.sequence_number = seq;
+                }
+            }
+        }
+    }
+
     /// Run iterations at the given TPS and report average close time.
     ///
     /// Matches stellar-core `ApplyLoad::benchmarkSacTps()`.
@@ -1081,6 +1142,7 @@ impl ApplyLoad {
         let mut total_time_ms = 0.0;
 
         for iter in 0..num_ledgers {
+            self.warm_account_cache();
             let initial_success = self.apply_soroban_success;
 
             let mut txs = Vec::with_capacity(txs_per_ledger as usize);
@@ -1233,19 +1295,22 @@ impl ApplyLoad {
     ///
     /// Matches stellar-core `ApplyLoad::upgradeSettings()`.
     ///
-    /// Since henyey does not have the config-upgrade contract mechanism,
-    /// we apply the Soroban config via a `ConfigUpgrade` LedgerUpgrade
-    /// directly.
+    /// Apply Soroban config upgrades for LimitBased mode.
+    ///
+    /// Matches stellar-core `ApplyLoad::upgradeSettings()`.
     fn upgrade_settings(&mut self) -> Result<()> {
         ensure!(
             self.mode != ApplyLoadMode::MaxSacTps,
             "upgradeSettings() not applicable in MaxSacTps mode"
         );
 
-        // Apply Soroban config limits via the upgrade mechanism.
-        // In a full port, this would invoke the config-upgrade contract.
-        // For now, we apply relevant limits through the max_tx_set_size upgrade
-        // which is the most impactful for benchmarking.
+        // Apply generous limits matching stellar-core's getUpgradeConfig()
+        let entries = self.build_generous_config_entries(
+            self.config.ledger_max_instructions,
+            self.config.ledger_max_instructions,
+            self.config.max_soroban_tx_count,
+        );
+        self.apply_config_upgrade_direct(entries)?;
         info!("ApplyLoad: Soroban settings upgraded (limit-based)");
         Ok(())
     }
@@ -1267,7 +1332,168 @@ impl ApplyLoad {
             txs_to_generate, instructions_per_cluster
         );
 
-        // In a full port, this would apply the upgrade via the config contract.
+        let entries = self.build_generous_config_entries(
+            instructions_per_cluster,
+            instructions_per_cluster,
+            txs_to_generate,
+        );
+        self.apply_config_upgrade_direct(entries)
+    }
+
+    /// Build generous ConfigSettingEntry values matching stellar-core's
+    /// `getUpgradeConfigForMaxTPS()`.
+    ///
+    /// Sets all resource limits very high to avoid constraints during
+    /// benchmarking, while setting instruction limits and tx count to the
+    /// specified values for parallelism control.
+    fn build_generous_config_entries(
+        &self,
+        ledger_max_instructions: u64,
+        tx_max_instructions: u64,
+        ledger_max_tx_count: u32,
+    ) -> Vec<ConfigSettingEntry> {
+        use stellar_xdr::curr::{
+            ConfigSettingContractBandwidthV0, ConfigSettingContractComputeV0,
+            ConfigSettingContractEventsV0, ConfigSettingContractExecutionLanesV0,
+            ConfigSettingContractLedgerCostV0, ConfigSettingContractParallelComputeV0,
+            StateArchivalSettings,
+        };
+
+        const LEDGER_MAX: u32 = u32::MAX / 2;
+        const TX_MAX: u32 = u32::MAX / 4;
+
+        // Entries MUST be sorted by ConfigSettingId discriminant value.
+        // See Stellar-contract-config-setting.x for the numeric order.
+        vec![
+            // 0: CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES
+            ConfigSettingEntry::ContractMaxSizeBytes(LEDGER_MAX),
+            // 1: CONFIG_SETTING_CONTRACT_COMPUTE_V0
+            ConfigSettingEntry::ContractComputeV0(ConfigSettingContractComputeV0 {
+                ledger_max_instructions: ledger_max_instructions as i64,
+                tx_max_instructions: tx_max_instructions as i64,
+                fee_rate_per_instructions_increment: 100,
+                tx_memory_limit: LEDGER_MAX,
+            }),
+            // 2: CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
+            ConfigSettingEntry::ContractLedgerCostV0(ConfigSettingContractLedgerCostV0 {
+                ledger_max_disk_read_entries: LEDGER_MAX,
+                ledger_max_disk_read_bytes: LEDGER_MAX,
+                ledger_max_write_ledger_entries: LEDGER_MAX,
+                ledger_max_write_bytes: LEDGER_MAX,
+                tx_max_disk_read_entries: TX_MAX,
+                tx_max_disk_read_bytes: TX_MAX,
+                tx_max_write_ledger_entries: TX_MAX,
+                tx_max_write_bytes: TX_MAX,
+                fee_disk_read_ledger_entry: 5_000,
+                fee_write_ledger_entry: 20_000,
+                fee_disk_read1_kb: 1_000,
+                soroban_state_target_size_bytes: 30 * 1024 * 1024 * 1024_i64,
+                rent_fee1_kb_soroban_state_size_low: 1_000,
+                rent_fee1_kb_soroban_state_size_high: 10_000,
+                soroban_state_rent_fee_growth_factor: 1,
+            }),
+            // 4: CONFIG_SETTING_CONTRACT_EVENTS_V0
+            ConfigSettingEntry::ContractEventsV0(ConfigSettingContractEventsV0 {
+                tx_max_contract_events_size_bytes: TX_MAX,
+                fee_contract_events1_kb: 200,
+            }),
+            // 5: CONFIG_SETTING_CONTRACT_BANDWIDTH_V0
+            ConfigSettingEntry::ContractBandwidthV0(ConfigSettingContractBandwidthV0 {
+                ledger_max_txs_size_bytes: LEDGER_MAX,
+                tx_max_size_bytes: TX_MAX,
+                fee_tx_size1_kb: 2_000,
+            }),
+            // 8: CONFIG_SETTING_CONTRACT_DATA_KEY_SIZE_BYTES
+            ConfigSettingEntry::ContractDataKeySizeBytes(LEDGER_MAX),
+            // 9: CONFIG_SETTING_CONTRACT_DATA_ENTRY_SIZE_BYTES
+            ConfigSettingEntry::ContractDataEntrySizeBytes(LEDGER_MAX),
+            // 10: CONFIG_SETTING_STATE_ARCHIVAL
+            ConfigSettingEntry::StateArchival(StateArchivalSettings {
+                max_entry_ttl: 1_000_000_001,
+                min_persistent_ttl: 1_000_000_000,
+                min_temporary_ttl: 1_000_000_000,
+                persistent_rent_rate_denominator: 1_000_000_000_000,
+                temp_rent_rate_denominator: 1_000_000_000_000,
+                max_entries_to_archive: 100,
+                live_soroban_state_size_window_sample_size: 30,
+                live_soroban_state_size_window_sample_period: 64,
+                eviction_scan_size: 100,
+                starting_eviction_scan_level: 7,
+            }),
+            // 11: CONFIG_SETTING_CONTRACT_EXECUTION_LANES
+            ConfigSettingEntry::ContractExecutionLanes(ConfigSettingContractExecutionLanesV0 {
+                ledger_max_tx_count: ledger_max_tx_count,
+            }),
+            // 14: CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0
+            ConfigSettingEntry::ContractParallelComputeV0(
+                ConfigSettingContractParallelComputeV0 {
+                    ledger_max_dependent_tx_clusters: self
+                        .config
+                        .ledger_max_dependent_tx_clusters,
+                },
+            ),
+        ]
+    }
+
+    /// Apply a config upgrade by directly injecting a ConfigUpgradeSet into
+    /// the ledger state and closing a ledger with `LedgerUpgrade::Config`.
+    ///
+    /// This bypasses the config-upgrade contract (which henyey doesn't have)
+    /// by writing the ConfigUpgradeSet as a synthetic TEMPORARY CONTRACT_DATA
+    /// entry directly into the LedgerManager's in-memory Soroban state.
+    fn apply_config_upgrade_direct(&mut self, entries: Vec<ConfigSettingEntry>) -> Result<()> {
+        use stellar_xdr::curr::{
+            ConfigUpgradeSet, ConfigUpgradeSetKey, ContractDataEntry,
+        };
+
+        // Build the ConfigUpgradeSet
+        let num_entries = entries.len();
+        let upgrade_set = ConfigUpgradeSet {
+            updated_entry: entries.try_into().context("too many config entries")?,
+        };
+        let upgrade_bytes = upgrade_set.to_xdr(Limits::none())?;
+        let content_hash = Hash256::hash(&upgrade_bytes);
+
+        // Use a synthetic contract ID for the upgrade set
+        let contract_id = Hash256::hash(b"apply-load-config-upgrade");
+
+        // Build the CONTRACT_DATA entry
+        let ledger_seq = self.app.ledger_manager().current_ledger_seq();
+        let contract_data_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(contract_id.0))),
+                key: ScVal::Bytes(
+                    content_hash.0.to_vec().try_into().expect("32 bytes"),
+                ),
+                durability: ContractDataDurability::Temporary,
+                val: ScVal::Bytes(
+                    upgrade_bytes.try_into().expect("config upgrade bytes"),
+                ),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Inject the entry directly into the LedgerManager's in-memory state
+        // with a generous TTL so it doesn't expire during the benchmark.
+        self.app.ledger_manager().inject_synthetic_contract_data(
+            contract_data_entry,
+            ledger_seq + 1_000_000,
+        )?;
+
+        // Close a ledger with the config upgrade
+        let upgrade_key = ConfigUpgradeSetKey {
+            contract_id: ContractId(Hash(contract_id.0)),
+            content_hash: Hash(content_hash.0),
+        };
+        self.close_ledger(
+            Vec::new(),
+            vec![LedgerUpgrade::Config(upgrade_key)],
+            false,
+        )?;
+
+        info!("ApplyLoad: config upgrade applied ({} settings)", num_entries);
         Ok(())
     }
 
@@ -1277,39 +1503,27 @@ impl ApplyLoad {
 
     /// Build a `TransactionSetVariant` from a list of envelopes.
     ///
-    /// Creates a `GeneralizedTransactionSet` with a single classic phase
-    /// containing all transactions. This matches what
-    /// `makeTxSetFromTransactions` produces in stellar-core.
+    /// Separates classic and Soroban transactions and builds a two-phase
+    /// `GeneralizedTransactionSet`: V0 classic phase + V1 parallel Soroban
+    /// phase. The parallel phase uses `build_parallel_soroban_phase` from the
+    /// herder to partition Soroban TXs into stages and clusters.
     fn build_tx_set_from_envelopes(
+        &self,
         txs: &[TransactionEnvelope],
         prev_ledger_hash: &Hash256,
     ) -> TransactionSetVariant {
-        if txs.is_empty() {
-            return TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(
-                TransactionSetV1 {
-                    previous_ledger_hash: Hash(prev_ledger_hash.0),
-                    phases: VecM::default(),
-                },
-            ));
-        }
+        let (classic_txs, soroban_txs): (Vec<_>, Vec<_>) =
+            txs.iter().cloned().partition(|env| !is_soroban_envelope(env));
 
-        // Package all transactions in a single V0 phase (classic ordering).
-        let component =
-            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
-                base_fee: None,
-                txs: txs
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .unwrap_or_default(),
-            });
-        let phase = TransactionPhase::V0(vec![component].try_into().unwrap_or_default());
+        let gen_tx_set = henyey_herder::build_two_phase_tx_set(
+            &classic_txs,
+            &soroban_txs,
+            prev_ledger_hash,
+            None,
+            self.config.ledger_max_dependent_tx_clusters,
+        );
 
-        TransactionSetVariant::Generalized(GeneralizedTransactionSet::V1(TransactionSetV1 {
-            previous_ledger_hash: Hash(prev_ledger_hash.0),
-            phases: vec![phase].try_into().unwrap_or_default(),
-        }))
+        TransactionSetVariant::Generalized(gen_tx_set)
     }
 
     /// Estimate generation resource limits.
@@ -1533,13 +1747,6 @@ mod tests {
         assert_eq!(config.max_soroban_tx_count, 100);
         assert_eq!(config.ledger_max_dependent_tx_clusters, 16);
         assert_eq!(config.num_ledgers, 10);
-    }
-
-    #[test]
-    fn test_build_tx_set_empty() {
-        let hash = Hash256::hash(b"test");
-        let tx_set = ApplyLoad::build_tx_set_from_envelopes(&[], &hash);
-        assert_eq!(tx_set.num_transactions(), 0);
     }
 
     #[test]

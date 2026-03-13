@@ -164,6 +164,9 @@ pub use tx_set_utils::{
     get_invalid_tx_list, trim_invalid, CloseTimeBounds, TxSetValidationContext,
 };
 
+// Parallel tx set builder
+pub use parallel_tx_set_builder::build_two_phase_tx_set;
+
 // TxQueueLimiter and surge pricing
 pub use surge_pricing::VisitTxResult;
 pub use tx_queue_limiter::TxQueueLimiter;

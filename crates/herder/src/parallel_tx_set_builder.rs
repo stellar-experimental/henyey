@@ -19,8 +19,9 @@ use henyey_common::types::Hash256;
 use henyey_common::NetworkId;
 use henyey_tx::TransactionFrame;
 use stellar_xdr::curr::{
-    DependentTxCluster, LedgerKey, Limits, ParallelTxExecutionStage, ParallelTxsComponent,
-    TransactionEnvelope, TransactionPhase, WriteXdr,
+    DependentTxCluster, GeneralizedTransactionSet, Hash, LedgerKey, Limits,
+    ParallelTxExecutionStage, ParallelTxsComponent, TransactionEnvelope, TransactionPhase,
+    TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, VecM, WriteXdr,
 };
 
 // ---------------------------------------------------------------------------
@@ -677,6 +678,72 @@ pub fn stages_to_xdr_phase(
 
 // ---------------------------------------------------------------------------
 // Tests
+// ---------------------------------------------------------------------------
+// Two-phase tx set builder (classic V0 + parallel Soroban V1)
+// ---------------------------------------------------------------------------
+
+/// Build a `GeneralizedTransactionSet` with a V0 classic phase and a V1
+/// parallel Soroban phase.
+///
+/// This is the simplified variant used by the simulation harness. Soroban TXs
+/// are round-robin distributed into `ledger_max_dependent_tx_clusters` clusters
+/// in a single stage. All TXs are included (no surge-pricing drops).
+pub fn build_two_phase_tx_set(
+    classic_txs: &[TransactionEnvelope],
+    soroban_txs: &[TransactionEnvelope],
+    previous_ledger_hash: &Hash256,
+    soroban_base_fee: Option<i64>,
+    ledger_max_dependent_tx_clusters: u32,
+) -> GeneralizedTransactionSet {
+    // Classic V0 phase: single component, no base_fee discount.
+    let classic_phase = if classic_txs.is_empty() {
+        TransactionPhase::V0(VecM::default())
+    } else {
+        let component =
+            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
+                base_fee: None,
+                txs: classic_txs
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .try_into()
+                    .unwrap_or_default(),
+            });
+        TransactionPhase::V0(vec![component].try_into().unwrap_or_default())
+    };
+
+    // Soroban V1 phase: round-robin TXs into N clusters in a single stage.
+    // This simple partitioning is appropriate for the simulation harness where
+    // all TXs must be included (no surge-pricing drops). The herder's own
+    // build_parallel_soroban_phase() has instruction-limit-based capacity
+    // constraints that would drop TXs exceeding cluster capacity.
+    let soroban_phase = if soroban_txs.is_empty() {
+        TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: soroban_base_fee,
+            execution_stages: VecM::default(),
+        })
+    } else {
+        let num_clusters = ledger_max_dependent_tx_clusters.max(1) as usize;
+        let mut cluster_txs: Vec<Vec<TransactionEnvelope>> =
+            (0..num_clusters).map(|_| Vec::new()).collect();
+        for (i, tx) in soroban_txs.iter().enumerate() {
+            cluster_txs[i % num_clusters].push(tx.clone());
+        }
+        let stages = vec![cluster_txs
+            .into_iter()
+            .filter(|c| !c.is_empty())
+            .collect::<Vec<_>>()];
+        stages_to_xdr_phase(stages, soroban_base_fee)
+    };
+
+    GeneralizedTransactionSet::V1(TransactionSetV1 {
+        previous_ledger_hash: Hash(previous_ledger_hash.0),
+        phases: vec![classic_phase, soroban_phase]
+            .try_into()
+            .unwrap_or_default(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

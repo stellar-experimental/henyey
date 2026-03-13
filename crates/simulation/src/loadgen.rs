@@ -526,6 +526,11 @@ impl TxGenerator {
         &self.accounts
     }
 
+    /// Mutable access to the accounts map (for cache warming).
+    pub fn accounts_mut(&mut self) -> &mut BTreeMap<u64, TestAccount> {
+        &mut self.accounts
+    }
+
     /// Access a cached account by ID.
     pub fn get_account(&self, id: u64) -> Option<&TestAccount> {
         self.accounts.get(&id)

@@ -280,8 +280,8 @@ impl SorobanTxBuilder {
         inclusion_fee: u32,
     ) -> anyhow::Result<TransactionEnvelope> {
         let args = vec![
-            ScVal::Address(from_address),
-            ScVal::Address(to_address),
+            ScVal::Address(from_address.clone()),
+            ScVal::Address(to_address.clone()),
             make_i128(amount),
         ];
 
@@ -313,14 +313,59 @@ impl SorobanTxBuilder {
             }),
         };
 
+        // Build read_write footprint entries matching stellar-core:
+        // 1. Source account entry (for balance deduction)
+        // 2. Destination balance CONTRACT_DATA entry (for SAC balance tracking)
+        let mut read_write_keys = Vec::new();
+
+        // Source account key
+        if let ScAddress::Account(ref aid) = from_address {
+            read_write_keys.push(LedgerKey::Account(
+                stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: aid.clone(),
+                },
+            ));
+        }
+
+        // Destination balance key (CONTRACT_DATA with Balance + to_address)
+        match &to_address {
+            ScAddress::Contract(_) => {
+                read_write_keys.push(LedgerKey::ContractData(
+                    stellar_xdr::curr::LedgerKeyContractData {
+                        contract: ScAddress::Contract(ContractId(Hash(sac_contract_id.0))),
+                        key: ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+                            vec![
+                                ScVal::Symbol(ScSymbol("Balance".try_into().unwrap())),
+                                ScVal::Address(to_address),
+                            ]
+                            .try_into()
+                            .unwrap_or_default(),
+                        ))),
+                        durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+                    },
+                ));
+            }
+            ScAddress::Account(ref aid) => {
+                read_write_keys.push(LedgerKey::Account(
+                    stellar_xdr::curr::LedgerKeyAccount {
+                        account_id: aid.clone(),
+                    },
+                ));
+            }
+            _ => {} // MuxedAccount, ClaimableBalance, LiquidityPool not used in load test
+        }
+
         let resources = SorobanResources {
             footprint: LedgerFootprint {
                 read_only: instance_keys.try_into().unwrap_or_default(),
-                read_write: VecM::default(),
+                read_write: read_write_keys.try_into().unwrap_or_default(),
             },
-            instructions: 250_000,
-            disk_read_bytes: 800,
-            write_bytes: 800,
+            // stellar-core uses 250K instructions but our non-typed host API (P25)
+            // meters XDR deserialization, consuming ~263K+ for a SAC transfer.
+            // Use 2M with generous I/O limits to avoid ResourceLimitExceeded in load tests.
+            instructions: 2_000_000,
+            disk_read_bytes: 10_000,
+            write_bytes: 10_000,
         };
 
         let resource_fee = 10_000_000i64;
