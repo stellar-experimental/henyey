@@ -35,7 +35,7 @@ pub(crate) async fn compat_maintenance_handler(
         return "No work performed\n".to_string();
     }
 
-    let count = params.count.unwrap_or(50000);
+    let count = params.count.unwrap_or(state.app.config().maintenance.count);
     state.app.perform_maintenance(count);
     "Done\n".to_string()
 }

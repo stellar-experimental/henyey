@@ -60,6 +60,8 @@ use henyey_history::CatchupMode;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::maintainer;
+
 /// Main application configuration.
 ///
 /// This struct represents the complete configuration for a Stellar Core node.
@@ -949,11 +951,11 @@ impl Default for MaintenanceAppConfig {
 }
 
 fn default_maintenance_period_secs() -> u64 {
-    4 * 60 * 60 // 4 hours
+    maintainer::DEFAULT_MAINTENANCE_PERIOD.as_secs()
 }
 
 fn default_maintenance_count() -> u32 {
-    50_000
+    maintainer::DEFAULT_MAINTENANCE_COUNT
 }
 
 /// JSON-RPC server configuration.

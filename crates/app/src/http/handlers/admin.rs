@@ -170,7 +170,7 @@ pub(crate) async fn maintenance_handler(
         });
     }
 
-    let count = params.count.unwrap_or(50000);
+    let count = params.count.unwrap_or(state.app.config().maintenance.count);
     state.app.perform_maintenance(count);
 
     Json(MaintenanceResponse {
