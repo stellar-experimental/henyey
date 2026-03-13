@@ -231,12 +231,15 @@ impl Maintainer {
         }
 
         // Delete old ledger headers.
-        // When RPC retention is configured, headers must be retained at least
-        // as long as the RPC data so that oldest_ledger (MIN of ledgerheaders)
-        // never reports a value newer than the actual oldest RPC data.
+        // When RPC retention is configured, use rpc_lmin directly so that
+        // oldest_ledger (MIN of ledgerheaders) tracks the retention window.
+        // Without RPC, fall back to the checkpoint-based lmin.
+        //
+        // Note: we intentionally ignore the publish queue for header pruning
+        // when RPC is active — a stale publish queue (e.g. put_enabled=false)
+        // must not prevent RPC data from being pruned.
         let header_lmin = if let Some(retention_window) = self.config.rpc_retention_window {
-            let rpc_lmin = lcl.saturating_sub(retention_window);
-            lmin.min(rpc_lmin)
+            lcl.saturating_sub(retention_window)
         } else {
             lmin
         };
@@ -334,8 +337,7 @@ impl Maintainer {
         }
 
         let header_lmin = if let Some(retention_window) = self.config.rpc_retention_window {
-            let rpc_lmin = lcl.saturating_sub(retention_window);
-            lmin.min(rpc_lmin)
+            lcl.saturating_sub(retention_window)
         } else {
             lmin
         };
@@ -616,14 +618,12 @@ mod tests {
     #[test]
     fn test_headers_retained_to_rpc_window_when_rpc_enabled() {
         // When RPC retention is configured, ledger headers should be pruned at
-        // min(lmin, rpc_lmin) so they are retained at least as long as RPC data.
+        // rpc_lmin (ignoring the publish queue) so that oldest_ledger tracks
+        // the retention window.
         //
         // Scenario: lcl=1000, min_queued=1000, checkpoint_freq=64, retention=200
-        //   lmin = 936, rpc_lmin = 800
-        //   header_lmin = min(936, 800) = 800
-        //
-        // This means headers are kept longer (down to 800) even though the core
-        // checkpoint threshold would allow pruning to 936.
+        //   rpc_lmin = 800
+        //   header_lmin = rpc_lmin = 800
         let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -694,9 +694,52 @@ mod tests {
     }
 
     #[test]
+    fn test_headers_pruned_despite_stale_publish_queue() {
+        // Regression test: when the publish queue has stale entries (e.g.
+        // put_enabled=false), lmin is dragged down to near the oldest queued
+        // checkpoint. With the old min(lmin, rpc_lmin) logic, header_lmin
+        // would be below all headers, preventing any pruning. The fix uses
+        // rpc_lmin directly when RPC is active.
+        //
+        // Scenario: lcl=1000, min_queued=100 (stale), retention=200
+        //   lmin = 100 - 64 = 36
+        //   rpc_lmin = 1000 - 200 = 800
+        //   OLD: header_lmin = min(36, 800) = 36 → nothing pruned (oldest header > 36)
+        //   NEW: header_lmin = rpc_lmin = 800 → headers below 800 pruned
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_ledger_headers(&db, &(790..=810).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "ledgerheaders"), 21); // 790..=810
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: Some(200),
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            // min_queued=100 simulates a stale publish queue
+            move || (1000, Some(100)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // Headers at ledgerseq <= 800 should be deleted (790..=800 = 11 rows)
+        // Headers at ledgerseq > 800 should remain (801..=810 = 10 rows)
+        assert_eq!(count_rows(&db_clone, "ledgerheaders"), 10);
+        assert_eq!(
+            min_ledger(&db_clone, "ledgerheaders", "ledgerseq"),
+            Some(801)
+        );
+    }
+
+    #[test]
     fn test_perform_maintenance_with_count_uses_correct_thresholds() {
         // Verify that perform_maintenance_with_count also uses the correct
-        // thresholds (rpc_lmin for events, min(lmin, rpc_lmin) for headers).
+        // thresholds (rpc_lmin for events, rpc_lmin for headers).
         let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
