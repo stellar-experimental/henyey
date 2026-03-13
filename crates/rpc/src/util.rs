@@ -484,4 +484,179 @@ mod tests {
     fn test_determine_tx_status_invalid() {
         assert_eq!(determine_tx_status(&[0, 1, 2]), "FAILED");
     }
+
+    // -----------------------------------------------------------------------
+    // Category C: util.rs Gaps
+    // -----------------------------------------------------------------------
+
+    // C1-C3: parse_format tests
+
+    #[test]
+    fn test_parse_format_none() {
+        let params = serde_json::json!({});
+        assert_eq!(parse_format(&params).unwrap(), XdrFormat::Base64);
+    }
+
+    #[test]
+    fn test_parse_format_json() {
+        let params = serde_json::json!({"xdrFormat": "json"});
+        assert_eq!(parse_format(&params).unwrap(), XdrFormat::Json);
+    }
+
+    #[test]
+    fn test_parse_format_invalid() {
+        let params = serde_json::json!({"xdrFormat": "xml"});
+        assert!(parse_format(&params).is_err());
+    }
+
+    // C4-C7: determine_tx_status tests
+
+    #[test]
+    fn test_determine_tx_status_success() {
+        use stellar_xdr::curr::{
+            TransactionResult, TransactionResultExt, TransactionResultResult, WriteXdr,
+        };
+        let result = TransactionResult {
+            fee_charged: 100,
+            result: TransactionResultResult::TxSuccess(Default::default()),
+            ext: TransactionResultExt::V0,
+        };
+        let pair = TransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            result,
+        };
+        let bytes = pair.to_xdr(Limits::none()).unwrap();
+        assert_eq!(determine_tx_status(&bytes), "SUCCESS");
+    }
+
+    #[test]
+    fn test_determine_tx_status_failed() {
+        use stellar_xdr::curr::{
+            TransactionResult, TransactionResultExt, TransactionResultResult, WriteXdr,
+        };
+        let result = TransactionResult {
+            fee_charged: 100,
+            result: TransactionResultResult::TxFailed(Default::default()),
+            ext: TransactionResultExt::V0,
+        };
+        let pair = TransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            result,
+        };
+        let bytes = pair.to_xdr(Limits::none()).unwrap();
+        assert_eq!(determine_tx_status(&bytes), "FAILED");
+    }
+
+    #[test]
+    fn test_determine_tx_status_fee_bump_success() {
+        use stellar_xdr::curr::{
+            InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
+            InnerTransactionResultResult, TransactionResult, TransactionResultExt,
+            TransactionResultResult, WriteXdr,
+        };
+        let inner_result = InnerTransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            result: InnerTransactionResult {
+                fee_charged: 50,
+                result: InnerTransactionResultResult::TxSuccess(Default::default()),
+                ext: InnerTransactionResultExt::V0,
+            },
+        };
+        let result = TransactionResult {
+            fee_charged: 100,
+            result: TransactionResultResult::TxFeeBumpInnerSuccess(inner_result),
+            ext: TransactionResultExt::V0,
+        };
+        let pair = TransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            result,
+        };
+        let bytes = pair.to_xdr(Limits::none()).unwrap();
+        assert_eq!(determine_tx_status(&bytes), "SUCCESS");
+    }
+
+    #[test]
+    fn test_determine_tx_status_fee_bump_failed() {
+        use stellar_xdr::curr::{
+            InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
+            InnerTransactionResultResult, TransactionResult, TransactionResultExt,
+            TransactionResultResult, WriteXdr,
+        };
+        let inner_result = InnerTransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            result: InnerTransactionResult {
+                fee_charged: 50,
+                result: InnerTransactionResultResult::TxFailed(Default::default()),
+                ext: InnerTransactionResultExt::V0,
+            },
+        };
+        let result = TransactionResult {
+            fee_charged: 100,
+            result: TransactionResultResult::TxFeeBumpInnerFailed(inner_result),
+            ext: TransactionResultExt::V0,
+        };
+        let pair = TransactionResultPair {
+            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            result,
+        };
+        let bytes = pair.to_xdr(Limits::none()).unwrap();
+        assert_eq!(determine_tx_status(&bytes), "FAILED");
+    }
+
+    // C8-C10: format_unix_timestamp_utc tests
+
+    #[test]
+    fn test_format_unix_epoch() {
+        assert_eq!(format_unix_timestamp_utc(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_format_known_date() {
+        assert_eq!(
+            format_unix_timestamp_utc(1704067200),
+            "2024-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn test_format_leap_year() {
+        assert_eq!(
+            format_unix_timestamp_utc(1709164800),
+            "2024-02-29T00:00:00Z"
+        );
+    }
+
+    // C11-C12: ttl_key_for_ledger_key tests
+
+    #[test]
+    fn test_ttl_key_for_contract_data() {
+        let key = LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
+            contract: stellar_xdr::curr::ScAddress::Contract(stellar_xdr::curr::ContractId(
+                stellar_xdr::curr::Hash([0xAA; 32]),
+            )),
+            key: stellar_xdr::curr::ScVal::LedgerKeyContractInstance,
+            durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+        });
+        let ttl_key = ttl_key_for_ledger_key(&key);
+        assert!(ttl_key.is_some());
+        match ttl_key.unwrap() {
+            LedgerKey::Ttl(ttl) => {
+                // Should be a hash of the original key
+                assert_ne!(ttl.key_hash.0, [0u8; 32]);
+            }
+            _ => panic!("expected Ttl key"),
+        }
+    }
+
+    #[test]
+    fn test_ttl_key_for_account() {
+        let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: stellar_xdr::curr::AccountId(
+                stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                    [1u8; 32],
+                )),
+            ),
+        });
+        assert!(ttl_key_for_ledger_key(&key).is_none());
+    }
 }
