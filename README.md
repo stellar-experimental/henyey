@@ -68,7 +68,7 @@ Supporting crates: `crypto`, `common`, `work`, `historywork`
 - Offline verify-execution against CDP metadata
 
 ### JSON-RPC Server
-- Native Stellar JSON-RPC 2.0 server (SEP-35) with all 12 methods
+- Native Stellar JSON-RPC 2.0 server with all 12 methods
 - Transaction simulation (InvokeHostFunction, ExtendTTL, Restore) via soroban-env-host
 - No external `stellar-rpc` process required
 
@@ -137,9 +137,9 @@ A validator participates in consensus. Requires a secret key and quorum configur
 ./target/release/henyey --config configs/mainnet.toml run
 ```
 
-## Native JSON-RPC Server
+## Henyey RPC Server
 
-Henyey includes a built-in Stellar JSON-RPC 2.0 server ([SEP-35](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0035.md)) that can replace the standalone `stellar-rpc` service entirely. Enable it by adding a `[rpc]` section to your config:
+Henyey includes a built-in Stellar JSON-RPC 2.0 server that can replace the standalone `stellar-rpc` service entirely. Enable it by adding a `[rpc]` section to your config:
 
 ```toml
 [rpc]
@@ -396,7 +396,7 @@ henyey/
 │   ├── historywork/    # History work scheduling
 │   ├── ledger/         # Ledger close pipeline
 │   ├── overlay/        # P2P networking
-│   ├── rpc/            # JSON-RPC 2.0 server (SEP-35)
+│   ├── rpc/            # JSON-RPC 2.0 server
 │   ├── scp/            # Consensus protocol
 │   ├── simulation/     # Multi-node simulation harness
 │   ├── tx/             # Transaction execution
@@ -444,7 +444,7 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-rpc`](crates/rpc/README.md) | Stellar JSON-RPC 2.0 server (SEP-35), transaction simulation | [100%](crates/rpc/PARITY_STATUS.md) |
+| [`henyey-rpc`](crates/rpc/README.md) | Stellar JSON-RPC 2.0 server, transaction simulation | [100%](crates/rpc/PARITY_STATUS.md) |
 
 ### Utilities
 
