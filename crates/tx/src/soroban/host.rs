@@ -986,7 +986,7 @@ pub fn execute_host_function_with_cache(
             context.protocol_version
         )
     });
-    tracing::info!("Dispatching to P24 path");
+    tracing::debug!("Dispatching to P24 path");
     execute_host_function_p24(
         host_function,
         auth_entries,
@@ -1187,7 +1187,7 @@ fn execute_host_function_p24(
                 if is_actually_archived {
                     let restored_live_until =
                         Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
-                    tracing::info!(
+                    tracing::debug!(
                         idx = idx,
                         key_type = ?std::mem::discriminant(key),
                         old_live_until = ?live_until,
@@ -1255,7 +1255,7 @@ fn execute_host_function_p24(
         module_cache,
     ) {
         Ok(r) => {
-            tracing::info!(
+            tracing::debug!(
                 cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
                 mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
                 "P24: e2e_invoke_typed completed successfully"
@@ -1568,7 +1568,7 @@ fn execute_host_function_p25(
                 if is_actually_archived {
                     let restored_live_until =
                         Some(context.sequence + soroban_config.min_persistent_entry_ttl - 1);
-                    tracing::info!(
+                    tracing::debug!(
                         idx = idx,
                         key_type = ?std::mem::discriminant(key),
                         old_live_until = ?live_until,
@@ -1635,7 +1635,7 @@ fn execute_host_function_p25(
         module_cache,
     ) {
         Ok(r) => {
-            tracing::info!(
+            tracing::debug!(
                 cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
                 mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
                 "P25: e2e_invoke_typed completed successfully"
