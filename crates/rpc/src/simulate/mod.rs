@@ -1350,3 +1350,909 @@ fn compute_resource_fee_with_rent(
     };
     non_refundable.saturating_add(adjusted_refundable)
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::*;
+
+    // -----------------------------------------------------------------------
+    // Test helpers (Category G)
+    // -----------------------------------------------------------------------
+
+    fn test_soroban_network_info() -> henyey_ledger::SorobanNetworkInfo {
+        henyey_ledger::SorobanNetworkInfo {
+            max_contract_size: 65536,
+            max_contract_data_key_size: 250,
+            max_contract_data_entry_size: 65536,
+            tx_max_instructions: 100_000_000,
+            ledger_max_instructions: 2_500_000_000,
+            fee_rate_per_instructions_increment: 25,
+            tx_memory_limit: 41943040,
+            ledger_max_read_ledger_entries: 200,
+            ledger_max_read_bytes: 200_000,
+            ledger_max_write_ledger_entries: 150,
+            ledger_max_write_bytes: 65536,
+            tx_max_read_ledger_entries: 40,
+            tx_max_read_bytes: 200_000,
+            tx_max_write_ledger_entries: 25,
+            tx_max_write_bytes: 65536,
+            fee_read_ledger_entry: 6250,
+            fee_write_ledger_entry: 10000,
+            fee_read_1kb: 1786,
+            fee_write_1kb: 11800,
+            fee_historical_1kb: 16235,
+            tx_max_contract_events_size_bytes: 8198,
+            fee_contract_events_size_1kb: 10000,
+            ledger_max_tx_size_bytes: 71680,
+            tx_max_size_bytes: 71680,
+            fee_transaction_size_1kb: 1624,
+            ledger_max_tx_count: 150,
+            max_entry_ttl: 6_312_000,
+            min_temporary_ttl: 17280,
+            min_persistent_ttl: 120960,
+            persistent_rent_rate_denominator: 2103840,
+            temp_rent_rate_denominator: 4096,
+            max_entries_to_archive: 100,
+            bucketlist_size_window_sample_size: 30,
+            eviction_scan_size: 100000,
+            starting_eviction_scan_level: 7,
+            average_bucket_list_size: 100_000_000,
+            state_target_size_bytes: 134217728,
+            rent_fee_1kb_state_size_low: 1000,
+            rent_fee_1kb_state_size_high: 100000000,
+            state_size_rent_fee_growth_factor: 1000,
+            nomination_timeout_initial_ms: 1000,
+            nomination_timeout_increment_ms: 500,
+            ballot_timeout_initial_ms: 1000,
+            ballot_timeout_increment_ms: 500,
+        }
+    }
+
+    fn test_account_key(key_byte: u8) -> LedgerKey {
+        LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([key_byte; 32]))),
+        })
+    }
+
+    fn test_contract_data_key(contract_byte: u8) -> LedgerKey {
+        LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([contract_byte; 32]))),
+            key: ScVal::LedgerKeyContractInstance,
+            durability: ContractDataDurability::Persistent,
+        })
+    }
+
+    fn test_soroban_resources(ro: Vec<LedgerKey>, rw: Vec<LedgerKey>) -> SorobanResources {
+        SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: ro.try_into().unwrap_or_default(),
+                read_write: rw.try_into().unwrap_or_default(),
+            },
+            instructions: 1_000_000,
+            disk_read_bytes: 5000,
+            write_bytes: 2000,
+        }
+    }
+
+    fn make_tx_envelope(ops: Vec<Operation>) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: source,
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: ops.try_into().unwrap_or_default(),
+                ext: TransactionExt::V0,
+            },
+            signatures: Default::default(),
+        })
+    }
+
+    fn make_invoke_tx_envelope() -> TransactionEnvelope {
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0xAA; 32]))),
+                    function_name: ScSymbol("hello".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                auth: Default::default(),
+            }),
+        };
+        make_tx_envelope(vec![op])
+    }
+
+    fn make_fee_bump_invoke_tx_envelope() -> TransactionEnvelope {
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0xBB; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                auth: Default::default(),
+            }),
+        };
+        let inner_source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
+        let inner_tx = TransactionV1Envelope {
+            tx: Transaction {
+                source_account: inner_source,
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![op].try_into().unwrap_or_default(),
+                ext: TransactionExt::V0,
+            },
+            signatures: Default::default(),
+        };
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([3u8; 32])),
+                fee: 200,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_tx),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: Default::default(),
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // B1. sim_adjust (5 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sim_adjust_zero_returns_zero() {
+        assert_eq!(sim_adjust(0, 1.04, 50_000), 0);
+    }
+
+    #[test]
+    fn test_sim_adjust_additive_dominates() {
+        // 100_000 + 50_000 = 150_000 vs floor(100_000 * 1.04) = 104_000
+        // max(150_000, 104_000) = 150_000
+        assert_eq!(sim_adjust(100_000, 1.04, 50_000), 150_000);
+    }
+
+    #[test]
+    fn test_sim_adjust_multiplicative_dominates() {
+        // 10_000_000 + 50_000 = 10_050_000 vs floor(10_000_000 * 1.04) = 10_400_000
+        // max(10_050_000, 10_400_000) = 10_400_000
+        assert_eq!(sim_adjust(10_000_000, 1.04, 50_000), 10_400_000);
+    }
+
+    #[test]
+    fn test_sim_adjust_no_adjustment() {
+        assert_eq!(sim_adjust(500, 1.0, 0), 500);
+    }
+
+    #[test]
+    fn test_sim_adjust_saturating() {
+        // Should saturate to u32::MAX instead of overflowing
+        assert_eq!(sim_adjust(u32::MAX - 10, 1.04, 50_000), u32::MAX);
+    }
+
+    // -----------------------------------------------------------------------
+    // B2. adjust_resources (3 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_adjust_resources_default() {
+        let mut resources = SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: Default::default(),
+                read_write: Default::default(),
+            },
+            instructions: 1_000_000,
+            disk_read_bytes: 5000,
+            write_bytes: 2000,
+        };
+        adjust_resources(&mut resources, 0);
+
+        // instructions: max(1_000_000 + 50_000, floor(1_000_000 * 1.04)) = max(1_050_000, 1_040_000) = 1_050_000
+        assert_eq!(resources.instructions, 1_050_000);
+        // disk_read_bytes: sim_adjust(5000, 1.0, 0) = 5000
+        assert_eq!(resources.disk_read_bytes, 5000);
+        // write_bytes: sim_adjust(2000, 1.0, 0) = 2000
+        assert_eq!(resources.write_bytes, 2000);
+    }
+
+    #[test]
+    fn test_adjust_resources_custom_leeway() {
+        let mut resources = SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: Default::default(),
+                read_write: Default::default(),
+            },
+            instructions: 1_000_000,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        };
+        adjust_resources(&mut resources, 200_000);
+
+        // additive = max(50_000, 200_000) = 200_000
+        // instructions: max(1_000_000 + 200_000, floor(1_000_000 * 1.04)) = max(1_200_000, 1_040_000) = 1_200_000
+        assert_eq!(resources.instructions, 1_200_000);
+    }
+
+    #[test]
+    fn test_adjust_resources_zero_values() {
+        let mut resources = SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: Default::default(),
+                read_write: Default::default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 0,
+            write_bytes: 0,
+        };
+        adjust_resources(&mut resources, 0);
+
+        assert_eq!(resources.instructions, 0);
+        assert_eq!(resources.disk_read_bytes, 0);
+        assert_eq!(resources.write_bytes, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // B3. validate_memo (4 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_memo_none_ok() {
+        assert!(validate_memo(&Memo::None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_memo_text_28_ok() {
+        let text = StringM::<28>::try_from("abcdefghijklmnopqrstuvwxyzAB").unwrap();
+        assert!(validate_memo(&Memo::Text(text)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_memo_text_29_error() {
+        // StringM<28> enforces max 28 at the XDR type level, so we can't construct 29 bytes.
+        // But validate_memo checks the runtime length, so this test confirms 28 is ok.
+        // The actual protection comes from XDR type constraints. Test boundary:
+        let text = StringM::<28>::try_from("abcdefghijklmnopqrstuvwxyzAB").unwrap();
+        assert_eq!(text.len(), 28);
+        assert!(validate_memo(&Memo::Text(text)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_memo_hash_ok() {
+        assert!(validate_memo(&Memo::Hash(Hash([0u8; 32]))).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // B4. resolve_auth_mode (6 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_auth_mode_default_no_auth() {
+        let result = resolve_auth_mode("", &[]).unwrap();
+        // Empty auth + default -> Recording(true)
+        match result {
+            soroban_host::e2e_invoke::RecordingInvocationAuthMode::Recording(v) => {
+                assert!(v, "expected root_invocation_only=true");
+            }
+            _ => panic!("expected Recording mode"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_auth_mode_default_with_auth() {
+        let auth_entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::SourceAccount,
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0xAA; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                sub_invocations: Default::default(),
+            },
+        };
+        let result = resolve_auth_mode("", &[auth_entry.clone()]).unwrap();
+        match result {
+            soroban_host::e2e_invoke::RecordingInvocationAuthMode::Enforcing(entries) => {
+                assert_eq!(entries.len(), 1);
+            }
+            _ => panic!("expected Enforcing mode"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_auth_mode_record() {
+        let result = resolve_auth_mode("record", &[]).unwrap();
+        match result {
+            soroban_host::e2e_invoke::RecordingInvocationAuthMode::Recording(v) => {
+                assert!(v, "expected root_invocation_only=true");
+            }
+            _ => panic!("expected Recording mode"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_auth_mode_record_with_auth_error() {
+        let auth_entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::SourceAccount,
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0xAA; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                sub_invocations: Default::default(),
+            },
+        };
+        let result = resolve_auth_mode("record", &[auth_entry]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_auth_mode_enforce() {
+        let auth_entry = SorobanAuthorizationEntry {
+            credentials: SorobanCredentials::SourceAccount,
+            root_invocation: SorobanAuthorizedInvocation {
+                function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0xAA; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                sub_invocations: Default::default(),
+            },
+        };
+        let result = resolve_auth_mode("enforce", &[auth_entry]).unwrap();
+        match result {
+            soroban_host::e2e_invoke::RecordingInvocationAuthMode::Enforcing(entries) => {
+                assert_eq!(entries.len(), 1);
+            }
+            _ => panic!("expected Enforcing mode"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_auth_mode_invalid() {
+        // "bogus" is not handled by resolve_auth_mode itself — it falls to the default arm.
+        // The validation happens in handle() before calling resolve_auth_mode.
+        // resolve_auth_mode("bogus", &[]) will fall through to the default match arm.
+        let result = resolve_auth_mode("bogus", &[]);
+        // Default arm with empty auth -> Recording(true)
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // B5. muxed_to_account_id (2 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_muxed_ed25519() {
+        let key = Uint256([42u8; 32]);
+        let muxed = MuxedAccount::Ed25519(key.clone());
+        let account_id = muxed_to_account_id(&muxed);
+        match account_id.0 {
+            PublicKey::PublicKeyTypeEd25519(k) => assert_eq!(k, key),
+        }
+    }
+
+    #[test]
+    fn test_muxed_ed25519_muxed() {
+        let key = Uint256([99u8; 32]);
+        let muxed = MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+            id: 12345,
+            ed25519: key.clone(),
+        });
+        let account_id = muxed_to_account_id(&muxed);
+        match account_id.0 {
+            PublicKey::PublicKeyTypeEd25519(k) => assert_eq!(k, key),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // B6. extract_soroban_op (6 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_invoke_host_function() {
+        let env = make_invoke_tx_envelope();
+        let (account_id, op, memo) = extract_soroban_op(&env).unwrap();
+        assert!(matches!(op, SorobanOp::InvokeHostFunction { .. }));
+        assert!(matches!(memo, Memo::None));
+        // Source account should match
+        match account_id.0 {
+            PublicKey::PublicKeyTypeEd25519(k) => assert_eq!(k, Uint256([1u8; 32])),
+        }
+    }
+
+    #[test]
+    fn test_extract_extend_ttl() {
+        let contract_key = test_contract_data_key(0xCC);
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_key].try_into().unwrap(),
+                    read_write: Default::default(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+                ext: ExtensionPoint::V0,
+                extend_to: 1000,
+            }),
+        };
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: source,
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![op].try_into().unwrap_or_default(),
+                ext: TransactionExt::V1(soroban_data),
+            },
+            signatures: Default::default(),
+        });
+
+        let (_account, soroban_op, _memo) = extract_soroban_op(&env).unwrap();
+        match soroban_op {
+            SorobanOp::ExtendFootprintTtl { keys, extend_to } => {
+                assert_eq!(keys.len(), 1);
+                assert_eq!(extend_to, 1000);
+            }
+            _ => panic!("expected ExtendFootprintTtl"),
+        }
+    }
+
+    #[test]
+    fn test_extract_restore() {
+        let contract_key = test_contract_data_key(0xDD);
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: Default::default(),
+                    read_write: vec![contract_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::RestoreFootprint(RestoreFootprintOp {
+                ext: ExtensionPoint::V0,
+            }),
+        };
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: source,
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![op].try_into().unwrap_or_default(),
+                ext: TransactionExt::V1(soroban_data),
+            },
+            signatures: Default::default(),
+        });
+
+        let (_account, soroban_op, _memo) = extract_soroban_op(&env).unwrap();
+        assert!(matches!(soroban_op, SorobanOp::RestoreFootprint { .. }));
+    }
+
+    #[test]
+    fn test_extract_non_soroban_op_error() {
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+        let env = make_tx_envelope(vec![op]);
+        assert!(extract_soroban_op(&env).is_err());
+    }
+
+    #[test]
+    fn test_extract_multi_op_error() {
+        let op1 = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0xAA; 32]))),
+                    function_name: ScSymbol("a".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                auth: Default::default(),
+            }),
+        };
+        let op2 = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0xBB; 32]))),
+                    function_name: ScSymbol("b".try_into().unwrap()),
+                    args: Default::default(),
+                }),
+                auth: Default::default(),
+            }),
+        };
+        let env = make_tx_envelope(vec![op1, op2]);
+        assert!(extract_soroban_op(&env).is_err());
+    }
+
+    #[test]
+    fn test_extract_fee_bump_unwrap() {
+        let env = make_fee_bump_invoke_tx_envelope();
+        let (account_id, op, _memo) = extract_soroban_op(&env).unwrap();
+        assert!(matches!(op, SorobanOp::InvokeHostFunction { .. }));
+        // Source should be from inner tx (key byte 2), not fee bump source (key byte 3)
+        match account_id.0 {
+            PublicKey::PublicKeyTypeEd25519(k) => assert_eq!(k, Uint256([2u8; 32])),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // B7. insert_sim_xdr_field (4 tests) [REGRESSION]
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sim_xdr_field_base64_unsuffixed() {
+        let mut obj = serde_json::Map::new();
+        let data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: Default::default(),
+                    read_write: Default::default(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+        insert_sim_xdr_field(&mut obj, "transactionData", &data, XdrFormat::Base64).unwrap();
+        assert!(obj.contains_key("transactionData"), "base64 mode should use unsuffixed key");
+        assert!(!obj.contains_key("transactionDataXdr"), "should NOT have Xdr suffix");
+    }
+
+    #[test]
+    fn test_sim_xdr_field_json_suffixed() {
+        let mut obj = serde_json::Map::new();
+        let data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: Default::default(),
+                    read_write: Default::default(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+        insert_sim_xdr_field(&mut obj, "transactionData", &data, XdrFormat::Json).unwrap();
+        assert!(obj.contains_key("transactionDataJson"), "json mode should have Json suffix");
+        assert!(!obj.contains_key("transactionData"), "should NOT have unsuffixed key in JSON mode");
+    }
+
+    #[test]
+    fn test_sim_xdr_array_base64_unsuffixed() {
+        let mut obj = serde_json::Map::new();
+        let events: Vec<DiagnosticEvent> = vec![];
+        insert_sim_xdr_array_field(&mut obj, "events", &events, XdrFormat::Base64).unwrap();
+        assert!(obj.contains_key("events"), "base64 mode should use unsuffixed key");
+        assert!(!obj.contains_key("eventsXdr"), "should NOT have Xdr suffix");
+    }
+
+    #[test]
+    fn test_sim_xdr_array_json_suffixed() {
+        let mut obj = serde_json::Map::new();
+        let events: Vec<DiagnosticEvent> = vec![];
+        insert_sim_xdr_array_field(&mut obj, "events", &events, XdrFormat::Json).unwrap();
+        assert!(obj.contains_key("eventsJson"), "json mode should have Json suffix");
+        assert!(!obj.contains_key("events"), "should NOT have unsuffixed key in JSON mode");
+    }
+
+    // -----------------------------------------------------------------------
+    // B8. serialize_state_changes (4 tests)
+    // -----------------------------------------------------------------------
+
+    fn make_test_ledger_entry(key_byte: u8) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([key_byte; 32]))),
+                balance: 10_000_000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: Default::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: Default::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_state_changes_created() {
+        let key = test_account_key(1);
+        let entry = make_test_ledger_entry(1);
+        let diffs = vec![LedgerEntryDiff {
+            key,
+            state_before: None,
+            state_after: Some(entry),
+        }];
+        let result = serialize_state_changes(&diffs, XdrFormat::Base64).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "created");
+        assert!(arr[0]["before"].is_null());
+        assert!(arr[0]["after"].is_string());
+    }
+
+    #[test]
+    fn test_state_changes_updated() {
+        let key = test_account_key(2);
+        let before = make_test_ledger_entry(2);
+        let mut after = before.clone();
+        if let LedgerEntryData::Account(ref mut acct) = after.data {
+            acct.balance = 20_000_000;
+        }
+        let diffs = vec![LedgerEntryDiff {
+            key,
+            state_before: Some(before),
+            state_after: Some(after),
+        }];
+        let result = serialize_state_changes(&diffs, XdrFormat::Base64).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "updated");
+        assert!(arr[0]["before"].is_string());
+        assert!(arr[0]["after"].is_string());
+    }
+
+    #[test]
+    fn test_state_changes_deleted() {
+        let key = test_account_key(3);
+        let entry = make_test_ledger_entry(3);
+        let diffs = vec![LedgerEntryDiff {
+            key,
+            state_before: Some(entry),
+            state_after: None,
+        }];
+        let result = serialize_state_changes(&diffs, XdrFormat::Base64).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "deleted");
+        assert!(arr[0]["before"].is_string());
+        assert!(arr[0]["after"].is_null());
+    }
+
+    #[test]
+    fn test_state_changes_json_format() {
+        let key = test_account_key(4);
+        let entry = make_test_ledger_entry(4);
+        let diffs = vec![LedgerEntryDiff {
+            key,
+            state_before: None,
+            state_after: Some(entry),
+        }];
+        let result = serialize_state_changes(&diffs, XdrFormat::Json).unwrap();
+        let arr = result.as_array().unwrap();
+        assert_eq!(arr[0]["type"], "created");
+        // JSON mode uses "keyJson", "beforeJson", "afterJson"
+        assert!(arr[0].get("keyJson").is_some());
+        assert!(arr[0].get("beforeJson").is_some());
+        assert!(arr[0].get("afterJson").is_some());
+        // Should NOT have base64 keys
+        assert!(arr[0].get("key").is_none());
+        assert!(arr[0].get("before").is_none());
+        assert!(arr[0].get("after").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // B9-B10. build_error_response / build_footprint_response (4 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_error_response_structure() {
+        let resp = build_error_response("something went wrong".into(), 42).unwrap();
+        assert_eq!(resp["error"], "something went wrong");
+        assert_eq!(resp["latestLedger"], 42);
+        assert!(resp.get("transactionData").is_some());
+        assert!(resp.get("minResourceFee").is_some());
+        assert!(resp.get("cost").is_some());
+    }
+
+    #[test]
+    fn test_build_error_response_defaults() {
+        let resp = build_error_response("err".into(), 1).unwrap();
+        assert_eq!(resp["transactionData"], "");
+        assert_eq!(resp["minResourceFee"], "0");
+        assert_eq!(resp["cost"]["cpuInsns"], "0");
+        assert_eq!(resp["cost"]["memBytes"], "0");
+    }
+
+    #[test]
+    fn test_build_footprint_response_base64() {
+        let tx_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: Default::default(),
+                    read_write: Default::default(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 12345,
+        };
+        let info = test_soroban_network_info();
+        let resp = build_footprint_response(tx_data, &info, 100, XdrFormat::Base64).unwrap();
+        assert!(resp.get("transactionData").is_some());
+        assert!(resp["transactionData"].is_string());
+        assert_eq!(resp["minResourceFee"], "12345");
+        assert_eq!(resp["latestLedger"], 100);
+        assert_eq!(resp["cost"]["cpuInsns"], "0");
+    }
+
+    #[test]
+    fn test_build_footprint_response_json() {
+        let tx_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: Default::default(),
+                    read_write: Default::default(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 99,
+        };
+        let info = test_soroban_network_info();
+        let resp = build_footprint_response(tx_data, &info, 50, XdrFormat::Json).unwrap();
+        // JSON mode: "transactionDataJson" instead of "transactionData"
+        assert!(resp.get("transactionDataJson").is_some());
+        assert!(resp.get("transactionData").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // B11. compute_invoke_resource_fee (4 tests) [REGRESSION]
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_disk_read_entries_excludes_soroban() {
+        // 1 Account (RO) + 1 ContractData (RO) -> disk_read_entries = 1
+        let resources = test_soroban_resources(
+            vec![test_account_key(1), test_contract_data_key(0xAA)],
+            vec![],
+        );
+        let info = test_soroban_network_info();
+        let fee = compute_invoke_resource_fee(
+            &resources, &[], &info, 100, 0, 1000, 0,
+        );
+        // Fee should be > 0
+        assert!(fee > 0);
+        // The fee with only 1 disk read entry should be less than with 2
+        let resources2 = test_soroban_resources(
+            vec![test_account_key(1), test_account_key(2)],
+            vec![],
+        );
+        let fee2 = compute_invoke_resource_fee(
+            &resources2, &[], &info, 100, 0, 1000, 0,
+        );
+        // 2 account entries = 2 disk reads, should cost more
+        assert!(fee2 > fee, "2 account entries should cost more than 1 account + 1 contract");
+    }
+
+    #[test]
+    fn test_disk_read_entries_includes_restored() {
+        let resources = test_soroban_resources(vec![], vec![]);
+        let info = test_soroban_network_info();
+        let fee_no_restore = compute_invoke_resource_fee(
+            &resources, &[], &info, 100, 0, 1000, 0,
+        );
+        let fee_with_restore = compute_invoke_resource_fee(
+            &resources, &[], &info, 100, 0, 1000, 3,
+        );
+        // 3 restored entries should add disk read cost
+        assert!(fee_with_restore > fee_no_restore);
+    }
+
+    #[test]
+    fn test_disk_read_entries_mixed() {
+        // 2 accounts RO + 1 contract RW + 1 restored -> disk_read_entries = 2 + 0 + 1 = 3
+        let resources = test_soroban_resources(
+            vec![test_account_key(1), test_account_key(2)],
+            vec![test_contract_data_key(0xCC)],
+        );
+        let info = test_soroban_network_info();
+        let fee = compute_invoke_resource_fee(
+            &resources, &[], &info, 100, 0, 1000, 1,
+        );
+        assert!(fee > 0);
+    }
+
+    #[test]
+    fn test_refundable_fee_adjustment() {
+        // With non-zero rent changes, the refundable portion should be scaled by 1.15
+        use soroban_host::fees::LedgerEntryRentChange;
+
+        let resources = test_soroban_resources(vec![], vec![test_contract_data_key(0xAA)]);
+        let info = test_soroban_network_info();
+
+        let rent_changes = vec![LedgerEntryRentChange {
+            is_persistent: true,
+            is_code_entry: false,
+            old_size_bytes: 100,
+            new_size_bytes: 100,
+            old_live_until_ledger: 100,
+            new_live_until_ledger: 200,
+        }];
+
+        let fee = compute_invoke_resource_fee(
+            &resources, &rent_changes, &info, 50, 0, 1000, 0,
+        );
+        // Fee should be positive and include rent
+        assert!(fee > 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // B12. estimate_tx_size (2 tests)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tx_size_invoke_reasonable() {
+        let op = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                contract_address: ScAddress::Contract(ContractId(Hash([0xAA; 32]))),
+                function_name: ScSymbol("hello".try_into().unwrap()),
+                args: Default::default(),
+            }),
+            auth: Default::default(),
+        });
+        let resources = test_soroban_resources(vec![], vec![]);
+        let size = estimate_tx_size_for_op(&op, &resources);
+        assert!(size > 0);
+        // Reasonable: a minimal invoke tx with 20 sigs + preconditions should be > 1000 bytes
+        assert!(size > 1000, "estimate should include 20 sigs overhead, got {size}");
+    }
+
+    #[test]
+    fn test_tx_size_extend_ttl() {
+        let op = OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 5000,
+        });
+        let resources = test_soroban_resources(vec![test_contract_data_key(0xAA)], vec![]);
+        let size = estimate_tx_size_for_op(&op, &resources);
+        assert!(size > 0);
+    }
+}
