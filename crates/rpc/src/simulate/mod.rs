@@ -753,7 +753,13 @@ fn build_invoke_response(
     format: XdrFormat,
     instruction_leeway: u32,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let resources = &sim_result.resources;
+    // Use the host's resource estimates directly. The host computes:
+    //   - instructions: CPU insns consumed during simulation
+    //   - disk_read_bytes: non-Soroban entries + auto-restored entries from initial footprint
+    //   - write_bytes: sum of encoded_new_value sizes for RW entries
+    // This matches how upstream soroban-simulation passes recording_result.resources
+    // through to compute_adjusted_transaction_resources.
+    let resources = sim_result.resources.clone();
 
     // Apply resource adjustments (mirrors soroban-simulation default_adjustment)
     let mut adjusted_resources = resources.clone();
@@ -774,16 +780,31 @@ fn build_invoke_response(
     let tx_size = estimate_tx_size_for_op(&op, &adjusted_resources);
 
     // Build SorobanTransactionData
+    // Build the extension: V1 with archived entry indices when entries were
+    // auto-restored during simulation, V0 otherwise.
+    let ext = if sim_result.restored_rw_entry_indices.is_empty() {
+        SorobanTransactionDataExt::V0
+    } else {
+        SorobanTransactionDataExt::V1(stellar_xdr::curr::SorobanResourcesExtV0 {
+            archived_soroban_entries: sim_result
+                .restored_rw_entry_indices
+                .clone()
+                .try_into()
+                .unwrap_or_default(),
+        })
+    };
+
     let soroban_data = SorobanTransactionData {
-        ext: SorobanTransactionDataExt::V0,
+        ext,
         resources: adjusted_resources,
         resource_fee: compute_invoke_resource_fee(
-            resources,
+            &resources,
             &rent_changes,
             soroban_info,
             latest_ledger,
             sim_result.contract_events_and_return_value_size,
             tx_size,
+            sim_result.restored_rw_entry_indices.len() as u32,
         ),
     };
 
@@ -791,8 +812,8 @@ fn build_invoke_response(
 
     let mut obj = serde_json::Map::new();
 
-    // transactionData XDR
-    util::insert_xdr_field(&mut obj, "transactionData", &soroban_data, format)?;
+    // transactionData — upstream uses unsuffixed "transactionData" for base64
+    insert_sim_xdr_field(&mut obj, "transactionData", &soroban_data, format)?;
 
     obj.insert("minResourceFee".into(), json!(min_resource_fee.to_string()));
     obj.insert(
@@ -804,9 +825,9 @@ fn build_invoke_response(
     );
     obj.insert("latestLedger".into(), json!(latest_ledger));
 
-    // Diagnostic events
+    // Diagnostic events — upstream uses unsuffixed "events" for base64
     if !diagnostic_events.is_empty() {
-        util::insert_xdr_array_field(&mut obj, "events", &diagnostic_events, format)?;
+        insert_sim_xdr_array_field(&mut obj, "events", &diagnostic_events, format)?;
     }
 
     // Encode auth entries and return value
@@ -969,7 +990,7 @@ fn build_footprint_response(
     let min_resource_fee = tx_data.resource_fee;
     let mut obj = serde_json::Map::new();
 
-    util::insert_xdr_field(&mut obj, "transactionData", &tx_data, format)?;
+    insert_sim_xdr_field(&mut obj, "transactionData", &tx_data, format)?;
     obj.insert("minResourceFee".into(), json!(min_resource_fee.to_string()));
     obj.insert(
         "cost".into(),
@@ -997,6 +1018,80 @@ fn build_error_response(
         },
         "latestLedger": latest_ledger
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Simulate-specific XDR field helpers
+// ---------------------------------------------------------------------------
+
+/// Insert a single XDR value with simulate-specific naming.
+///
+/// Unlike `util::insert_xdr_field` (which appends `Xdr`/`Json` suffixes),
+/// the `simulateTransaction` upstream response uses **unsuffixed** field names
+/// for base64 mode (e.g. `transactionData`, `events`) and appends `Json` only
+/// in JSON mode.
+fn insert_sim_xdr_field<T: WriteXdr + serde::Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base_name: &str,
+    val: &T,
+    format: XdrFormat,
+) -> Result<(), JsonRpcError> {
+    match format {
+        XdrFormat::Base64 => {
+            let bytes = val
+                .to_xdr(Limits::none())
+                .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
+            obj.insert(
+                base_name.to_string(),
+                serde_json::Value::String(BASE64.encode(&bytes)),
+            );
+        }
+        XdrFormat::Json => {
+            let json_val = serde_json::to_value(val)
+                .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
+            obj.insert(format!("{base_name}Json"), json_val);
+        }
+    }
+    Ok(())
+}
+
+/// Insert an array of XDR values with simulate-specific naming.
+///
+/// Base64: `"{base_name}": ["<b64>", ...]`
+/// Json: `"{base_name}Json": [{...}, ...]`
+fn insert_sim_xdr_array_field<T: WriteXdr + serde::Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base_name: &str,
+    items: &[T],
+    format: XdrFormat,
+) -> Result<(), JsonRpcError> {
+    match format {
+        XdrFormat::Base64 => {
+            let encoded: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| {
+                    item.to_xdr(Limits::none())
+                        .map(|b| serde_json::Value::String(BASE64.encode(&b)))
+                        .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))
+                })
+                .collect::<Result<_, _>>()?;
+            obj.insert(base_name.to_string(), serde_json::Value::Array(encoded));
+        }
+        XdrFormat::Json => {
+            let json_items: Vec<serde_json::Value> = items
+                .iter()
+                .map(|item| {
+                    serde_json::to_value(item)
+                        .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))
+                })
+                .collect::<Result<_, _>>()?;
+            obj.insert(
+                format!("{base_name}Json"),
+                serde_json::Value::Array(json_items),
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1161,13 +1256,32 @@ fn compute_invoke_resource_fee(
     current_ledger_seq: u32,
     contract_events_and_return_value_size: u32,
     tx_size: u32,
+    restored_entry_count: u32,
 ) -> i64 {
     use soroban_host::fees::{compute_rent_fee, compute_transaction_resource_fee, TransactionResources};
 
+    // Compute disk_read_entries the same way as upstream soroban-simulation:
+    // only non-Soroban entries (accounts, trustlines etc.) count, since Soroban
+    // entries (ContractData/ContractCode) are cached in memory and don't require
+    // disk reads. Auto-restored entries also count.
+    let mut disk_read_entries = 0u32;
+    for k in resources.footprint.read_only.iter() {
+        match k {
+            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => (),
+            _ => disk_read_entries += 1,
+        }
+    }
+    for k in resources.footprint.read_write.iter() {
+        match k {
+            LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => (),
+            _ => disk_read_entries += 1,
+        }
+    }
+    disk_read_entries += restored_entry_count;
+
     let tx_resources = TransactionResources {
         instructions: resources.instructions,
-        disk_read_entries: resources.footprint.read_only.len() as u32
-            + resources.footprint.read_write.len() as u32,
+        disk_read_entries,
         write_entries: resources.footprint.read_write.len() as u32,
         disk_read_bytes: resources.disk_read_bytes,
         write_bytes: resources.write_bytes,
