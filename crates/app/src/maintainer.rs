@@ -230,10 +230,19 @@ impl Maintainer {
             }
         }
 
-        // Delete old ledger headers
+        // Delete old ledger headers.
+        // When RPC retention is configured, headers must be retained at least
+        // as long as the RPC data so that oldest_ledger (MIN of ledgerheaders)
+        // never reports a value newer than the actual oldest RPC data.
+        let header_lmin = if let Some(retention_window) = self.config.rpc_retention_window {
+            let rpc_lmin = lcl.saturating_sub(retention_window);
+            lmin.min(rpc_lmin)
+        } else {
+            lmin
+        };
         match self
             .database
-            .delete_old_ledger_headers(lmin, self.config.count)
+            .delete_old_ledger_headers(header_lmin, self.config.count)
         {
             Ok(deleted) => {
                 if deleted > 0 {
@@ -245,24 +254,25 @@ impl Maintainer {
             }
         }
 
-        // Delete old contract events
-        match self
-            .database
-            .delete_old_events(lmin, self.config.count)
-        {
-            Ok(deleted) => {
-                if deleted > 0 {
-                    debug!(deleted = deleted, "Deleted old contract events");
-                }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to delete old events");
-            }
-        }
-
-        // Clean up RPC-specific tables if retention window is configured
+        // Clean up RPC-specific tables if retention window is configured.
+        // Events are RPC-only data and should be pruned at the RPC retention
+        // window, not the core checkpoint threshold.
         if let Some(retention_window) = self.config.rpc_retention_window {
             let rpc_lmin = lcl.saturating_sub(retention_window);
+
+            match self
+                .database
+                .delete_old_events(rpc_lmin, self.config.count)
+            {
+                Ok(deleted) => {
+                    if deleted > 0 {
+                        debug!(deleted = deleted, "Deleted old contract events");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to delete old events");
+                }
+            }
 
             match self
                 .database
@@ -323,17 +333,24 @@ impl Maintainer {
             warn!(error = %e, "Failed to delete old SCP entries");
         }
 
-        if let Err(e) = self.database.delete_old_ledger_headers(lmin, count) {
+        let header_lmin = if let Some(retention_window) = self.config.rpc_retention_window {
+            let rpc_lmin = lcl.saturating_sub(retention_window);
+            lmin.min(rpc_lmin)
+        } else {
+            lmin
+        };
+        if let Err(e) = self.database.delete_old_ledger_headers(header_lmin, count) {
             warn!(error = %e, "Failed to delete old ledger headers");
         }
 
-        if let Err(e) = self.database.delete_old_events(lmin, count) {
-            warn!(error = %e, "Failed to delete old events");
-        }
-
-        // Clean up RPC-specific tables if retention window is configured
+        // Clean up RPC-specific tables if retention window is configured.
+        // Events are RPC-only data and belong in this block.
         if let Some(retention_window) = self.config.rpc_retention_window {
             let rpc_lmin = lcl.saturating_sub(retention_window);
+
+            if let Err(e) = self.database.delete_old_events(rpc_lmin, count) {
+                warn!(error = %e, "Failed to delete old events");
+            }
 
             if let Err(e) = self.database.delete_old_ledger_close_meta(rpc_lmin, count) {
                 warn!(error = %e, "Failed to delete old ledger close meta");
@@ -427,5 +444,287 @@ mod tests {
             0
         };
         assert_eq!(lmin, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Threshold correctness tests — verify that the maintainer uses the right
+    // thresholds for events, headers, and RPC tables.
+    // -----------------------------------------------------------------------
+
+    /// Insert synthetic events into the database at the given ledger sequences.
+    fn insert_events(db: &henyey_db::Database, ledger_seqs: &[u32]) {
+        use henyey_db::queries::EventQueries;
+        db.with_connection(|conn| {
+            for &seq in ledger_seqs {
+                let event = henyey_db::queries::events::EventRecord {
+                    id: format!("{seq}-0"),
+                    ledger_seq: seq,
+                    tx_index: 0,
+                    op_index: 0,
+                    tx_hash: "aabb".to_string(),
+                    contract_id: Some("CABC".to_string()),
+                    event_type: 0,
+                    topics: vec!["t1".to_string()],
+                    event_xdr: "deadbeef".to_string(),
+                    in_successful_contract_call: true,
+                };
+                conn.store_events(&[event]).unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Insert synthetic ledger close meta into the database at the given sequences.
+    fn insert_ledger_close_meta(db: &henyey_db::Database, ledger_seqs: &[u32]) {
+        use henyey_db::queries::LedgerCloseMetaQueries;
+        db.with_connection(|conn| {
+            for &seq in ledger_seqs {
+                conn.store_ledger_close_meta(seq, b"meta")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Insert synthetic ledger headers (raw SQL, minimal fields).
+    fn insert_ledger_headers(db: &henyey_db::Database, ledger_seqs: &[u32]) {
+        db.with_connection(|conn| {
+            for &seq in ledger_seqs {
+                let sql = format!(
+                    "INSERT INTO ledgerheaders (ledgerhash, prevhash, bucketlisthash, ledgerseq, closetime, data) \
+                     VALUES ('hash{seq}', 'prev{seq}', 'bucket{seq}', {seq}, 0, X'00')"
+                );
+                conn.execute(&sql, [])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Count rows in a table.
+    fn count_rows(db: &henyey_db::Database, table: &str) -> u32 {
+        db.with_connection(|conn| {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            conn.query_row(&sql, [], |r| r.get::<_, u32>(0))
+                .map_err(Into::into)
+        })
+        .unwrap()
+    }
+
+    /// Get the minimum ledger sequence in a table.
+    fn min_ledger(db: &henyey_db::Database, table: &str, col: &str) -> Option<u32> {
+        db.with_connection(|conn| {
+            let sql = format!("SELECT MIN({col}) FROM {table}");
+            conn.query_row(&sql, [], |r| r.get::<_, Option<u32>>(0))
+                .map_err(Into::into)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn test_events_pruned_at_rpc_lmin_not_core_lmin() {
+        // Scenario: lcl=1000, min_queued=1000, checkpoint_freq=64, retention_window=200
+        //   lmin = 1000 - 64 = 936
+        //   rpc_lmin = 1000 - 200 = 800
+        // Events should be pruned at rpc_lmin=800, NOT lmin=936.
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Insert events at ledgers 790..=810 (spans the rpc_lmin=800 boundary)
+        insert_events(&db, &(790..=810).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "events"), 21);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: Some(200),
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, Some(1000)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // Events at ledger <= 800 should be deleted (790..=800 = 11 events)
+        // Events at ledger > 800 should remain (801..=810 = 10 events)
+        assert_eq!(count_rows(&db_clone, "events"), 10);
+        assert_eq!(min_ledger(&db_clone, "events", "ledgerseq"), Some(801));
+    }
+
+    #[test]
+    fn test_events_not_pruned_without_rpc() {
+        // When rpc_retention_window is None, events should NOT be pruned at all.
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_events(&db, &(10..=20).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "events"), 11);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, Some(1000)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // All events should remain
+        assert_eq!(count_rows(&db_clone, "events"), 11);
+    }
+
+    #[test]
+    fn test_ledger_close_meta_pruned_at_rpc_lmin() {
+        // ledger_close_meta is RPC-only and should be pruned at rpc_lmin.
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_ledger_close_meta(&db, &(790..=810).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "ledger_close_meta"), 21);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: Some(200),
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, Some(1000)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // Entries at sequence <= 800 should be deleted
+        assert_eq!(count_rows(&db_clone, "ledger_close_meta"), 10);
+        assert_eq!(
+            min_ledger(&db_clone, "ledger_close_meta", "sequence"),
+            Some(801)
+        );
+    }
+
+    #[test]
+    fn test_headers_retained_to_rpc_window_when_rpc_enabled() {
+        // When RPC retention is configured, ledger headers should be pruned at
+        // min(lmin, rpc_lmin) so they are retained at least as long as RPC data.
+        //
+        // Scenario: lcl=1000, min_queued=1000, checkpoint_freq=64, retention=200
+        //   lmin = 936, rpc_lmin = 800
+        //   header_lmin = min(936, 800) = 800
+        //
+        // This means headers are kept longer (down to 800) even though the core
+        // checkpoint threshold would allow pruning to 936.
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // We can't easily insert ledger headers without building XDR, so we
+        // verify indirectly by checking that delete_old_ledger_headers was
+        // called with the right threshold. Insert ledger_close_meta as a proxy
+        // (both use the same pattern) and check the header threshold by
+        // inserting raw rows into ledgerheaders.
+        insert_ledger_headers(&db, &(790..=940).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "ledgerheaders"), 151); // 790..=940
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: Some(200),
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, Some(1000)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // Headers at ledgerseq <= 800 should be deleted (790..=800 = 11 rows)
+        // Headers at ledgerseq > 800 should remain (801..=940 = 140 rows)
+        assert_eq!(count_rows(&db_clone, "ledgerheaders"), 140);
+        assert_eq!(
+            min_ledger(&db_clone, "ledgerheaders", "ledgerseq"),
+            Some(801)
+        );
+    }
+
+    #[test]
+    fn test_headers_pruned_at_lmin_without_rpc() {
+        // Without RPC, headers should be pruned at lmin (the core checkpoint threshold).
+        //
+        // Scenario: lcl=1000, min_queued=1000, checkpoint_freq=64
+        //   lmin = 936
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_ledger_headers(&db, &(930..=940).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "ledgerheaders"), 11); // 930..=940
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, Some(1000)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // Headers at ledgerseq <= 936 should be deleted (930..=936 = 7 rows)
+        // Headers at ledgerseq > 936 should remain (937..=940 = 4 rows)
+        assert_eq!(count_rows(&db_clone, "ledgerheaders"), 4);
+        assert_eq!(
+            min_ledger(&db_clone, "ledgerheaders", "ledgerseq"),
+            Some(937)
+        );
+    }
+
+    #[test]
+    fn test_perform_maintenance_with_count_uses_correct_thresholds() {
+        // Verify that perform_maintenance_with_count also uses the correct
+        // thresholds (rpc_lmin for events, min(lmin, rpc_lmin) for headers).
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_events(&db, &(790..=810).collect::<Vec<_>>());
+        insert_ledger_close_meta(&db, &(790..=810).collect::<Vec<_>>());
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: Some(200),
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, Some(1000)),
+        );
+
+        // Use a custom count
+        maintainer.perform_maintenance_with_count(100_000);
+
+        // Same thresholds as the main perform_maintenance
+        assert_eq!(count_rows(&db_clone, "events"), 10);
+        assert_eq!(min_ledger(&db_clone, "events", "ledgerseq"), Some(801));
+        assert_eq!(count_rows(&db_clone, "ledger_close_meta"), 10);
+        assert_eq!(
+            min_ledger(&db_clone, "ledger_close_meta", "sequence"),
+            Some(801)
+        );
     }
 }

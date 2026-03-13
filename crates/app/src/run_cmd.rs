@@ -405,6 +405,9 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     // Start the sync recovery manager for consensus stuck detection
     app.start_sync_recovery();
 
+    // Start the background database maintainer
+    let maintainer_handle = app.start_maintainer();
+
     // Start the main run loop in the background so we can optionally wait for sync.
     tracing::info!("Starting main run loop");
     let run_app = Arc::clone(&app);
@@ -415,6 +418,12 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
     match run_handle.await {
         Ok(result) => result?,
         Err(err) => anyhow::bail!("run loop task failed: {}", err),
+    }
+
+    // Clean up the maintainer task (it also listens for shutdown, but
+    // abort ensures prompt cleanup).
+    if let Some(handle) = maintainer_handle {
+        handle.abort();
     }
 
     Ok(())

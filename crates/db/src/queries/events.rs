@@ -49,7 +49,7 @@ pub trait EventQueries {
         limit: u32,
     ) -> Result<Vec<EventRecord>, DbError>;
 
-    /// Deletes events older than the given ledger sequence.
+    /// Deletes events at or below the given ledger sequence.
     fn delete_old_events(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
 }
 
@@ -221,9 +221,106 @@ impl EventQueries for Connection {
 
     fn delete_old_events(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
         let deleted = self.execute(
-            "DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE ledgerseq < ?1 LIMIT ?2)",
+            "DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE ledgerseq <= ?1 LIMIT ?2)",
             params![max_ledger, count],
         )?;
         Ok(deleted as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn setup_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE events (
+                id TEXT PRIMARY KEY NOT NULL,
+                ledgerseq INTEGER NOT NULL,
+                tx_index INTEGER NOT NULL,
+                op_index INTEGER NOT NULL,
+                tx_hash TEXT NOT NULL,
+                contract_id TEXT,
+                event_type INTEGER NOT NULL,
+                topic1 TEXT,
+                topic2 TEXT,
+                topic3 TEXT,
+                topic4 TEXT,
+                event_xdr TEXT NOT NULL,
+                in_successful_contract_call INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX events_ledger ON events(ledgerseq);
+            "#,
+        )
+        .unwrap();
+        conn
+    }
+
+    fn make_event(ledger_seq: u32, index: u32) -> EventRecord {
+        EventRecord {
+            id: format!("{ledger_seq}-{index}"),
+            ledger_seq,
+            tx_index: 0,
+            op_index: index,
+            tx_hash: "aabb".to_string(),
+            contract_id: Some("CABC".to_string()),
+            event_type: 0,
+            topics: vec!["t1".to_string()],
+            event_xdr: "deadbeef".to_string(),
+            in_successful_contract_call: true,
+        }
+    }
+
+    fn count_events(conn: &Connection) -> u32 {
+        conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, u32>(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_delete_old_events_inclusive_boundary() {
+        // Regression: delete_old_events must use <= (not <) so events at
+        // exactly max_ledger are deleted, matching all other delete functions.
+        let conn = setup_db();
+        let events: Vec<EventRecord> = (10..=14).map(|s| make_event(s, 0)).collect();
+        conn.store_events(&events).unwrap();
+        assert_eq!(count_events(&conn), 5);
+
+        // Delete events at or below ledger 12
+        let deleted = conn.delete_old_events(12, 1000).unwrap();
+        assert_eq!(deleted, 3); // ledgers 10, 11, 12
+        assert_eq!(count_events(&conn), 2); // ledgers 13, 14 remain
+    }
+
+    #[test]
+    fn test_delete_old_events_respects_limit() {
+        let conn = setup_db();
+        let events: Vec<EventRecord> = (1..=10).map(|s| make_event(s, 0)).collect();
+        conn.store_events(&events).unwrap();
+
+        // Delete at most 3 events
+        let deleted = conn.delete_old_events(10, 3).unwrap();
+        assert_eq!(deleted, 3);
+        assert_eq!(count_events(&conn), 7);
+    }
+
+    #[test]
+    fn test_delete_old_events_empty_table() {
+        let conn = setup_db();
+        let deleted = conn.delete_old_events(100, 1000).unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_delete_old_events_none_below_threshold() {
+        let conn = setup_db();
+        let events: Vec<EventRecord> = (100..=105).map(|s| make_event(s, 0)).collect();
+        conn.store_events(&events).unwrap();
+
+        let deleted = conn.delete_old_events(50, 1000).unwrap();
+        assert_eq!(deleted, 0);
+        assert_eq!(count_events(&conn), 6);
     }
 }

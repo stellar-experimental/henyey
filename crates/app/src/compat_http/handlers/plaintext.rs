@@ -17,12 +17,27 @@ use crate::compat_http::CompatServerState;
 
 // ── Admin endpoints (plain text) ─────────────────────────────────────────
 
-/// GET /maintenance
+/// GET /maintenance?queue=true&count=50000
+#[derive(Deserialize, Default)]
+pub(crate) struct CompatMaintenanceParams {
+    #[serde(default)]
+    queue: Option<String>,
+    #[serde(default)]
+    count: Option<u32>,
+}
+
 pub(crate) async fn compat_maintenance_handler(
-    State(_state): State<Arc<CompatServerState>>,
+    State(state): State<Arc<CompatServerState>>,
+    Query(params): Query<CompatMaintenanceParams>,
 ) -> impl IntoResponse {
-    // stellar-core returns "Done\n" or "No work performed\n"
-    "Done\n"
+    // stellar-core returns "No work performed\n" when queue!=true
+    if params.queue.as_deref() != Some("true") {
+        return "No work performed\n".to_string();
+    }
+
+    let count = params.count.unwrap_or(50000);
+    state.app.perform_maintenance(count);
+    "Done\n".to_string()
 }
 
 /// GET /manualclose

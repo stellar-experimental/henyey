@@ -109,7 +109,7 @@ let config = ConfigBuilder::new()
 | `run_cmd.rs` | `run_node` entry point, `NodeRunner` lifecycle, `StatusServer` HTTP API with axum handlers for all REST endpoints |
 | `catchup_cmd.rs` | `run_catchup` entry point, `CatchupOptions` parsing, progress callbacks |
 | `logging.rs` | Logging initialization, `ProgressTracker` for catchup/apply progress, dynamic `LogLevelHandle` |
-| `maintainer.rs` | `Maintainer` background scheduler for SCP history and ledger header cleanup |
+| `maintainer.rs` | `Maintainer` background scheduler for database cleanup (SCP history, ledger headers, events, ledger close meta, tx history) |
 | `meta_stream.rs` | `MetaStreamManager` for emitting `LedgerCloseMeta` XDR frames to external consumers (main and debug streams) |
 | `compat_config.rs` | Translates stellar-core SCREAMING_CASE config format into henyey's nested TOML format |
 | `compat_http/` | stellar-core compatibility HTTP server with matching wire format for stellar-rpc integration |

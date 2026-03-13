@@ -70,7 +70,7 @@ pub use app::{
     SurveyReport,
 };
 pub use catchup_cmd::{run_catchup, CatchupMode, CatchupOptions};
-pub use config::{AppConfig, BuildMetadata};
+pub use config::{AppConfig, BuildMetadata, MaintenanceAppConfig};
 pub use logging::{init_with_handle, LogConfig, LogFormat, LogLevelHandle, LOG_PARTITIONS};
 pub use maintainer::{
     Maintainer, MaintenanceConfig, DEFAULT_MAINTENANCE_COUNT, DEFAULT_MAINTENANCE_PERIOD,

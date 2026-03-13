@@ -1904,14 +1904,30 @@ impl App {
             tracing::warn!(error = %e, "Failed to delete old SCP entries");
         }
 
-        // Delete old ledger headers
-        if let Err(e) = self.db.delete_old_ledger_headers(lmin, count) {
+        // Delete old ledger headers.
+        // When RPC is enabled, headers must be retained at least as long as
+        // the RPC data so that oldest_ledger (MIN of ledgerheaders) never
+        // reports a value newer than the actual oldest RPC data.
+        let header_lmin = if self.config.rpc.enabled {
+            let rpc_lmin = lcl.saturating_sub(self.config.rpc.retention_window);
+            lmin.min(rpc_lmin)
+        } else {
+            lmin
+        };
+        if let Err(e) = self.db.delete_old_ledger_headers(header_lmin, count) {
             tracing::warn!(error = %e, "Failed to delete old ledger headers");
         }
 
-        // Clean up RPC-specific tables if RPC is enabled
+        // Clean up RPC-specific tables if RPC is enabled.
+        // Events, ledger close meta, and tx history are all RPC-only data
+        // and should be pruned at the RPC retention window, not the core
+        // checkpoint threshold.
         if self.config.rpc.enabled {
             let rpc_lmin = lcl.saturating_sub(self.config.rpc.retention_window);
+
+            if let Err(e) = self.db.delete_old_events(rpc_lmin, count) {
+                tracing::warn!(error = %e, "Failed to delete old contract events");
+            }
 
             if let Err(e) = self.db.delete_old_ledger_close_meta(rpc_lmin, count) {
                 tracing::warn!(error = %e, "Failed to delete old ledger close meta");
@@ -2505,6 +2521,74 @@ impl App {
         *self.sync_recovery_handle.write() = Some(handle);
         tokio::spawn(manager.run());
         tracing::info!("Sync recovery manager started");
+    }
+
+    /// Start the background database maintainer.
+    ///
+    /// Spawns a tokio task that periodically cleans up old ledger headers,
+    /// SCP history, contract events, and (if RPC is enabled) RPC-specific
+    /// tables. Mirrors stellar-core's `Maintainer::start()` called from
+    /// `ApplicationImpl::startServices()`.
+    ///
+    /// Returns the JoinHandle so the caller can abort it on shutdown.
+    pub fn start_maintainer(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        use crate::maintainer::{Maintainer, MaintenanceConfig};
+
+        let maint_cfg = &self.config.maintenance;
+        if !maint_cfg.enabled {
+            tracing::info!("Database maintenance disabled by configuration");
+            return None;
+        }
+
+        // Build the MaintenanceConfig from AppConfig.
+        let rpc_retention = if self.config.rpc.enabled {
+            Some(self.config.rpc.retention_window)
+        } else {
+            None
+        };
+        let config = MaintenanceConfig {
+            period: Duration::from_secs(maint_cfg.period_secs),
+            count: maint_cfg.count,
+            enabled: true,
+            rpc_retention_window: rpc_retention,
+        };
+
+        // Create a shutdown watch channel driven by the app's broadcast channel.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut broadcast_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let _ = broadcast_rx.recv().await;
+            let _ = shutdown_tx.send(true);
+        });
+
+        // Clone the database for the maintainer (Database is cheap to clone —
+        // it wraps a connection pool).
+        let db = Arc::new(self.db.clone());
+
+        // Provide ledger bounds via Arc<App>.
+        let app = Arc::clone(self);
+        let get_ledger_bounds = move || -> (u32, Option<u32>) {
+            let (lcl, _, _, _) = app.ledger_info();
+            let min_queued = app
+                .database()
+                .load_publish_queue(Some(1))
+                .ok()
+                .and_then(|queue| queue.first().copied());
+            (lcl, min_queued)
+        };
+
+        let maintainer = Maintainer::with_config(db, config, shutdown_rx, get_ledger_bounds);
+        let handle = tokio::spawn(async move {
+            maintainer.start().await;
+        });
+
+        tracing::info!(
+            period_secs = maint_cfg.period_secs,
+            count = maint_cfg.count,
+            "Database maintainer started"
+        );
+
+        Some(handle)
     }
 
     /// Send a heartbeat to the sync recovery manager.

@@ -417,7 +417,7 @@ Features not yet implemented. These ARE counted against parity %.
 | SelfCheck | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No dedicated self-check tests |
 | QueryServer | 1 TEST_CASE / 9 SECTION | 0 `#[test]` | Implemented but no dedicated tests |
 | App core | — | 47 `#[test]` | Extensive app-level tests |
-| Maintainer | — | 7 `#[test]` | Good coverage |
+| Maintainer | — | 13 `#[test]` | Good coverage (threshold correctness, RPC retention, config) |
 | Logging | — | 5 `#[test]` | Basic coverage |
 | Meta stream | — | 5 `#[test]` | Covers emit, rotation, error handling |
 

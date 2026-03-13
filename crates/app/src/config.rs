@@ -24,6 +24,7 @@
 //! | `http` | HTTP status server configuration |
 //! | `surge_pricing` | Transaction lane byte allowances |
 //! | `events` | Classic event emission settings |
+//! | `maintenance` | Automatic database maintenance settings |
 //!
 //! # Example Configuration
 //!
@@ -148,6 +149,10 @@ pub struct AppConfig {
     /// Testing overrides (e.g., `ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING`).
     #[serde(default)]
     pub testing: TestingConfig,
+
+    /// Database maintenance configuration.
+    #[serde(default)]
+    pub maintenance: MaintenanceAppConfig,
 
     /// JSON-RPC server configuration.
     #[serde(default)]
@@ -902,6 +907,55 @@ impl Default for CompatHttpConfig {
     }
 }
 
+/// Database maintenance configuration.
+///
+/// Controls automatic background cleanup of old ledger headers, SCP history,
+/// and other accumulated data. Maps to stellar-core's
+/// `AUTOMATIC_MAINTENANCE_PERIOD` and `AUTOMATIC_MAINTENANCE_COUNT`.
+///
+/// # Example
+///
+/// ```toml
+/// [maintenance]
+/// enabled = true
+/// period_secs = 14400   # 4 hours
+/// count = 50000
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceAppConfig {
+    /// Whether automatic maintenance is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// How often to run maintenance, in seconds.
+    /// Default: 14400 (4 hours). Maps to `AUTOMATIC_MAINTENANCE_PERIOD`.
+    #[serde(default = "default_maintenance_period_secs")]
+    pub period_secs: u64,
+
+    /// Maximum entries to delete per maintenance cycle.
+    /// Default: 50000. Maps to `AUTOMATIC_MAINTENANCE_COUNT`.
+    #[serde(default = "default_maintenance_count")]
+    pub count: u32,
+}
+
+impl Default for MaintenanceAppConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            period_secs: default_maintenance_period_secs(),
+            count: default_maintenance_count(),
+        }
+    }
+}
+
+fn default_maintenance_period_secs() -> u64 {
+    4 * 60 * 60 // 4 hours
+}
+
+fn default_maintenance_count() -> u32 {
+    50_000
+}
+
 /// JSON-RPC server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RpcConfig {
@@ -1140,6 +1194,7 @@ impl AppConfig {
             query: QueryConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             testing: TestingConfig::default(),
+            maintenance: MaintenanceAppConfig::default(),
             rpc: RpcConfig::default(),
             build: BuildMetadata::default(),
             is_compat_config: false,
@@ -1212,6 +1267,7 @@ impl AppConfig {
             query: QueryConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             testing: TestingConfig::default(),
+            maintenance: MaintenanceAppConfig::default(),
             rpc: RpcConfig::default(),
             build: BuildMetadata::default(),
             is_compat_config: false,
@@ -1877,6 +1933,74 @@ memory_for_caching_mb = 256
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Query port"));
+    }
+
+    // --- Maintenance config tests ---
+
+    #[test]
+    fn test_maintenance_config_defaults() {
+        let config = AppConfig::default();
+        assert!(config.maintenance.enabled);
+        assert_eq!(config.maintenance.period_secs, 4 * 60 * 60);
+        assert_eq!(config.maintenance.count, 50_000);
+    }
+
+    #[test]
+    fn test_maintenance_config_from_toml() {
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[maintenance]
+enabled = false
+period_secs = 7200
+count = 10000
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(!config.maintenance.enabled);
+        assert_eq!(config.maintenance.period_secs, 7200);
+        assert_eq!(config.maintenance.count, 10_000);
+    }
+
+    #[test]
+    fn test_maintenance_config_partial_toml() {
+        // Only set count; enabled and period_secs should get defaults
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[maintenance]
+count = 100000
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.maintenance.enabled);
+        assert_eq!(config.maintenance.period_secs, 4 * 60 * 60);
+        assert_eq!(config.maintenance.count, 100_000);
+    }
+
+    #[test]
+    fn test_maintenance_config_omitted_uses_defaults() {
+        // No [maintenance] section at all
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.maintenance.enabled);
+        assert_eq!(config.maintenance.period_secs, 4 * 60 * 60);
+        assert_eq!(config.maintenance.count, 50_000);
     }
 
     #[test]

@@ -73,3 +73,12 @@ level = "info"
 
 # Log format: "text", "json"
 format = "text"
+
+[maintenance]
+# Automatic database maintenance
+# Prunes old ledger headers, SCP history, events, ledger close meta, and tx history
+enabled = true
+# How often to run (seconds). Default: 14400 (4 hours)
+period_secs = 14400
+# Max entries to delete per cycle. Default: 50000
+count = 50000

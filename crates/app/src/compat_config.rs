@@ -208,6 +208,20 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         config.catchup.recent = v;
     }
 
+    // --- Maintenance ---
+    if let Some(v) = get_u32(table, "AUTOMATIC_MAINTENANCE_PERIOD") {
+        config.maintenance.period_secs = v as u64;
+        if v == 0 {
+            config.maintenance.enabled = false;
+        }
+    }
+    if let Some(v) = get_u32(table, "AUTOMATIC_MAINTENANCE_COUNT") {
+        config.maintenance.count = v;
+        if v == 0 {
+            config.maintenance.enabled = false;
+        }
+    }
+
     // --- History archives ---
     // stellar-core format: [HISTORY.name] with get="cmd {0}" sub-tables
     if let Some(history_table) = table.get("HISTORY").and_then(|v| v.as_table()) {
@@ -785,6 +799,67 @@ mod tests {
         .unwrap();
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert!(!config.testing.generate_load_for_testing);
+    }
+
+    #[test]
+    fn test_maintenance_config_translation() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            AUTOMATIC_MAINTENANCE_PERIOD = 3600
+            AUTOMATIC_MAINTENANCE_COUNT = 25000
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(config.maintenance.enabled);
+        assert_eq!(config.maintenance.period_secs, 3600);
+        assert_eq!(config.maintenance.count, 25000);
+    }
+
+    #[test]
+    fn test_maintenance_config_disabled_by_zero_period() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            AUTOMATIC_MAINTENANCE_PERIOD = 0
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(!config.maintenance.enabled);
+    }
+
+    #[test]
+    fn test_maintenance_config_disabled_by_zero_count() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            AUTOMATIC_MAINTENANCE_COUNT = 0
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(!config.maintenance.enabled);
+    }
+
+    #[test]
+    fn test_maintenance_config_defaults_when_absent() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        // Should get defaults when not specified in compat config
+        assert!(config.maintenance.enabled);
+        assert_eq!(config.maintenance.period_secs, 4 * 60 * 60);
+        assert_eq!(config.maintenance.count, 50_000);
     }
 
     #[test]
