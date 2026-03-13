@@ -123,3 +123,56 @@ fn build_error_result(
         ext: TransactionResultExt::V0,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{TransactionResultResult, WriteXdr};
+
+    #[test]
+    fn test_build_error_result_structure() {
+        let result = build_error_result(Some(TransactionResultCode::TxFailed));
+        assert_eq!(result.fee_charged, 0);
+        assert!(matches!(
+            result.result,
+            TransactionResultResult::TxFailed(_)
+        ));
+        // Should be serializable to XDR
+        assert!(result.to_xdr(Limits::none()).is_ok());
+    }
+
+    #[test]
+    fn test_insert_empty_diagnostic_events() {
+        let mut obj = serde_json::Map::new();
+        insert_empty_diagnostic_events(&mut obj, XdrFormat::Base64);
+        assert_eq!(obj["diagnosticEventsXdr"], json!([]));
+
+        let mut obj2 = serde_json::Map::new();
+        insert_empty_diagnostic_events(&mut obj2, XdrFormat::Json);
+        assert_eq!(obj2["diagnosticEventsJson"], json!([]));
+    }
+
+    #[test]
+    fn test_build_error_result_codes() {
+        // TxTooLate
+        let result = build_error_result(Some(TransactionResultCode::TxTooLate));
+        assert!(matches!(
+            result.result,
+            TransactionResultResult::TxTooLate
+        ));
+
+        // TxInsufficientFee
+        let result = build_error_result(Some(TransactionResultCode::TxInsufficientFee));
+        assert!(matches!(
+            result.result,
+            TransactionResultResult::TxInsufficientFee
+        ));
+
+        // None -> TxInternalError
+        let result = build_error_result(None);
+        assert!(matches!(
+            result.result,
+            TransactionResultResult::TxInternalError
+        ));
+    }
+}
