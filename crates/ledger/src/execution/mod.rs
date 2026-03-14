@@ -1324,8 +1324,9 @@ impl TransactionExecutor {
 
         let fp_start = std::time::Instant::now();
 
-        // Build TTL key cache: pre-compute SHA-256 hashes for all ContractData/ContractCode keys.
-        let mut ttl_key_cache = henyey_tx::soroban::TtlKeyCache::new();
+        // Reuse the executor's TTL key cache across TXs to avoid redundant SHA-256
+        // computations for the same keys (common when TXs share footprint entries).
+        let mut ttl_key_cache = self.ttl_key_cache.take().unwrap_or_default();
 
         // Acquire a read lock on InMemorySorobanState if available (O1 optimization).
         // InMemorySorobanState is a HashMap mirror of all live ContractData/ContractCode/TTL
