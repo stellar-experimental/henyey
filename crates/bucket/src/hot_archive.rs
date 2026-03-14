@@ -41,7 +41,6 @@ use crate::bucket_list::{
     bl_keep_tombstone_entries, bl_level_half, bl_level_should_spill, bl_round_down,
     bl_should_merge_with_empty_curr, HasNextState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT,
 };
-use crate::entry::{compare_sc_address, compare_sc_val};
 use crate::{BucketError, Result};
 use henyey_common::protocol::{
     protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
@@ -1699,95 +1698,10 @@ pub fn compare_hot_archive_entries(
 
 /// Compare two LedgerKeys using the same order as stellar-core's `LedgerEntryIdCmp`.
 ///
-/// This matches the comparison order used in bucket files.
+/// Delegates to `LedgerKey`'s derived `Ord`, which matches xdrpp's comparison:
+/// discriminant first, then fields in XDR declaration order.
 fn compare_ledger_keys(a: &LedgerKey, b: &LedgerKey) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    use stellar_xdr::curr::LedgerKey::*;
-
-    // Compare by type first (uses XDR-defined LedgerEntryType values)
-    let type_a = i32::from(a.discriminant());
-    let type_b = i32::from(b.discriminant());
-    if type_a != type_b {
-        return type_a.cmp(&type_b);
-    }
-
-    // Same type, compare by type-specific fields
-    match (a, b) {
-        (Account(a), Account(b)) => a.account_id.cmp(&b.account_id),
-        (Trustline(a), Trustline(b)) => match a.account_id.cmp(&b.account_id) {
-            Ordering::Equal => compare_trust_line_asset(&a.asset, &b.asset),
-            other => other,
-        },
-        (Offer(a), Offer(b)) => match a.seller_id.cmp(&b.seller_id) {
-            Ordering::Equal => a.offer_id.cmp(&b.offer_id),
-            other => other,
-        },
-        (Data(a), Data(b)) => match a.account_id.cmp(&b.account_id) {
-            Ordering::Equal => a.data_name.as_slice().cmp(b.data_name.as_slice()),
-            other => other,
-        },
-        (ClaimableBalance(a), ClaimableBalance(b)) => {
-            compare_claimable_balance_id(&a.balance_id, &b.balance_id)
-        }
-        (LiquidityPool(a), LiquidityPool(b)) => a.liquidity_pool_id.0.cmp(&b.liquidity_pool_id.0),
-        (ContractData(a), ContractData(b)) => {
-            let addr_cmp = compare_sc_address(&a.contract, &b.contract);
-            if addr_cmp != Ordering::Equal {
-                return addr_cmp;
-            }
-            let key_cmp = compare_sc_val(&a.key, &b.key);
-            if key_cmp != Ordering::Equal {
-                return key_cmp;
-            }
-            (a.durability as i32).cmp(&(b.durability as i32))
-        }
-        (ContractCode(a), ContractCode(b)) => a.hash.0.cmp(&b.hash.0),
-        (ConfigSetting(a), ConfigSetting(b)) => {
-            (a.config_setting_id as i32).cmp(&(b.config_setting_id as i32))
-        }
-        (Ttl(a), Ttl(b)) => a.key_hash.0.cmp(&b.key_hash.0),
-        _ => Ordering::Equal, // Different types should not reach here
-    }
-}
-
-fn compare_trust_line_asset(
-    a: &stellar_xdr::curr::TrustLineAsset,
-    b: &stellar_xdr::curr::TrustLineAsset,
-) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    use stellar_xdr::curr::TrustLineAsset::*;
-
-    // Compare by type discriminant first (uses XDR-defined AssetType values)
-    let type_a = i32::from(a.discriminant());
-    let type_b = i32::from(b.discriminant());
-
-    if type_a != type_b {
-        return type_a.cmp(&type_b);
-    }
-
-    match (a, b) {
-        (Native, Native) => Ordering::Equal,
-        (CreditAlphanum4(a), CreditAlphanum4(b)) => match a.asset_code.cmp(&b.asset_code) {
-            Ordering::Equal => a.issuer.cmp(&b.issuer),
-            other => other,
-        },
-        (CreditAlphanum12(a), CreditAlphanum12(b)) => match a.asset_code.cmp(&b.asset_code) {
-            Ordering::Equal => a.issuer.cmp(&b.issuer),
-            other => other,
-        },
-        (PoolShare(a), PoolShare(b)) => a.0.cmp(&b.0),
-        _ => Ordering::Equal,
-    }
-}
-
-fn compare_claimable_balance_id(
-    a: &stellar_xdr::curr::ClaimableBalanceId,
-    b: &stellar_xdr::curr::ClaimableBalanceId,
-) -> std::cmp::Ordering {
-    use stellar_xdr::curr::ClaimableBalanceId::*;
-    match (a, b) {
-        (ClaimableBalanceIdTypeV0(a), ClaimableBalanceIdTypeV0(b)) => a.0.cmp(&b.0),
-    }
+    a.cmp(b)
 }
 
 /// Check if a hot archive entry is a tombstone (Live marker).
