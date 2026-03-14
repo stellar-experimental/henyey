@@ -199,7 +199,7 @@ pub(super) fn fee_bump_inner_hash(
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
             stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 let inner_env = TransactionEnvelope::Tx(inner.clone());
-                let inner_frame = TransactionFrame::with_network(inner_env, *network_id);
+                let inner_frame = TransactionFrame::from_owned_with_network(inner_env, *network_id);
                 inner_frame
                     .hash(network_id)
                     .map_err(|e| LedgerError::Internal(format!("inner tx hash error: {}", e)))

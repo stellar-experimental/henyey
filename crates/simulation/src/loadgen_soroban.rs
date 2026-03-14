@@ -580,7 +580,7 @@ pub fn sign_envelope(
     network_passphrase: &str,
 ) -> anyhow::Result<()> {
     let network_id = NetworkId::from_passphrase(network_passphrase);
-    let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), network_id);
+    let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), network_id);
     let hash = frame.hash(&network_id)?;
     let signature = sign_hash(secret, &hash);
     let public_key = secret.public_key();

@@ -368,7 +368,7 @@ impl SurgePricingPriorityQueue {
         network_id: &henyey_common::NetworkId,
         ledger_version: u32,
     ) {
-        let frame = TransactionFrame::with_network(tx.envelope.clone(), *network_id);
+        let frame = TransactionFrame::from_owned_with_network(tx.envelope.clone(), *network_id);
         let lane = self.lane_config.get_lane(&frame);
         let inserted = self
             .lanes
@@ -393,7 +393,7 @@ impl SurgePricingPriorityQueue {
         network_id: &henyey_common::NetworkId,
     ) {
         if self.lanes[lane].remove(entry) {
-            let frame = TransactionFrame::with_network(entry.tx.envelope.clone(), *network_id);
+            let frame = TransactionFrame::from_owned_with_network(entry.tx.envelope.clone(), *network_id);
             let resources = self.lane_config.tx_resources(&frame, ledger_version);
             self.lane_current_count[lane] -= resources;
         }
@@ -469,7 +469,7 @@ impl SurgePricingPriorityQueue {
                 break;
             };
 
-            let frame = TransactionFrame::with_network(entry.tx.envelope.clone(), *network_id);
+            let frame = TransactionFrame::from_owned_with_network(entry.tx.envelope.clone(), *network_id);
             let resources = self.lane_config.tx_resources(&frame, ledger_version);
             let exceeds_lane = any_greater(&resources, &lane_left_until_limit[lane]);
             let exceeds_generic = any_greater(&resources, &lane_left_until_limit[GENERIC_LANE]);
@@ -512,7 +512,7 @@ impl SurgePricingPriorityQueue {
         network_id: &henyey_common::NetworkId,
         ledger_version: u32,
     ) -> Option<Vec<(QueuedTransaction, bool)>> {
-        let frame = TransactionFrame::with_network(tx.envelope.clone(), *network_id);
+        let frame = TransactionFrame::from_owned_with_network(tx.envelope.clone(), *network_id);
         let lane = self.lane_config.get_lane(&frame);
         let mut tx_resources = self.lane_config.tx_resources(&frame, ledger_version);
         if let Some(discount) = tx_discount {
@@ -626,7 +626,7 @@ impl SurgePricingPriorityQueue {
             }
 
             let evict_frame =
-                TransactionFrame::with_network(entry.tx.envelope.clone(), *network_id);
+                TransactionFrame::from_owned_with_network(entry.tx.envelope.clone(), *network_id);
             let evict_resources = self.lane_config.tx_resources(&evict_frame, ledger_version);
             evictions.push((entry.tx.clone(), evicted_due_to_lane_limit));
 

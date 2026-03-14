@@ -594,7 +594,7 @@ fn test_fee_bump_result_encoding() {
     };
 
     let pair = build_tx_result_pair(
-        &henyey_tx::TransactionFrame::with_network(envelope, NetworkId::testnet()),
+        &henyey_tx::TransactionFrame::from_owned_with_network(envelope, NetworkId::testnet()),
         &NetworkId::testnet(),
         &exec,
         100, // base_fee

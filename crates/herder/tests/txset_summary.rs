@@ -207,7 +207,7 @@ fn summary_for_set(
     let mut classic_non_dex_base_fee: Option<i64> = None;
     let mut classic_dex_base_fee: Option<i64> = None;
     for tx in txs {
-        let frame = TransactionFrame::with_network(tx.clone(), network_id);
+        let frame = TransactionFrame::from_owned_with_network(tx.clone(), network_id);
         let hash = tx_hash(tx);
         let base_fee = base_fee_map.get(&hash).copied().flatten();
 

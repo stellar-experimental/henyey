@@ -16,7 +16,7 @@
 //! use henyey_tx::TransactionFrame;
 //! use henyey_common::NetworkId;
 //!
-//! let frame = TransactionFrame::new(envelope);
+//! let frame = TransactionFrame::from_owned(envelope);
 //!
 //! // Access transaction properties
 //! println!("Fee: {}", frame.fee());
@@ -26,6 +26,8 @@
 //! // Compute transaction hash
 //! let hash = frame.hash(&NetworkId::testnet())?;
 //! ```
+
+use std::sync::Arc;
 
 use henyey_common::protocol::{
     protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
@@ -70,8 +72,8 @@ use crate::{Result, TxError};
 /// ```
 #[derive(Debug, Clone)]
 pub struct TransactionFrame {
-    /// The underlying XDR transaction envelope.
-    envelope: TransactionEnvelope,
+    /// The underlying XDR transaction envelope (shared via Arc for cheap cloning).
+    envelope: Arc<TransactionEnvelope>,
     /// Cached transaction hash (lazily computed).
     hash: Option<Hash256>,
     /// Network ID used when computing the cached hash.
@@ -79,8 +81,8 @@ pub struct TransactionFrame {
 }
 
 impl TransactionFrame {
-    /// Create a new TransactionFrame from an envelope.
-    pub fn new(envelope: TransactionEnvelope) -> Self {
+    /// Create a new TransactionFrame from a shared envelope.
+    pub fn new(envelope: Arc<TransactionEnvelope>) -> Self {
         Self {
             envelope,
             hash: None,
@@ -89,7 +91,7 @@ impl TransactionFrame {
     }
 
     /// Create a new TransactionFrame with a known network ID.
-    pub fn with_network(envelope: TransactionEnvelope, network_id: NetworkId) -> Self {
+    pub fn with_network(envelope: Arc<TransactionEnvelope>, network_id: NetworkId) -> Self {
         Self {
             envelope,
             hash: None,
@@ -97,15 +99,29 @@ impl TransactionFrame {
         }
     }
 
+    /// Create a new TransactionFrame from an owned envelope (wraps in Arc).
+    pub fn from_owned(envelope: TransactionEnvelope) -> Self {
+        Self::new(Arc::new(envelope))
+    }
+
+    /// Create a new TransactionFrame from an owned envelope with a known network ID.
+    pub fn from_owned_with_network(envelope: TransactionEnvelope, network_id: NetworkId) -> Self {
+        Self::with_network(Arc::new(envelope), network_id)
+    }
 
     /// Get the underlying envelope.
     pub fn envelope(&self) -> &TransactionEnvelope {
         &self.envelope
     }
 
+    /// Get the shared Arc reference to the envelope.
+    pub fn envelope_arc(&self) -> &Arc<TransactionEnvelope> {
+        &self.envelope
+    }
+
     /// Consume the frame and return the envelope.
     pub fn into_envelope(self) -> TransactionEnvelope {
-        self.envelope
+        Arc::try_unwrap(self.envelope).unwrap_or_else(|arc| (*arc).clone())
     }
 
     /// Get the inner `Transaction` for V1 and FeeBump envelopes.
@@ -114,7 +130,7 @@ impl TransactionFrame {
     /// inside the `FeeBumpTransactionInnerTx`. Returns `None` for V0 envelopes
     /// (which use `TransactionV0`, a different type).
     fn inner_tx(&self) -> Option<&Transaction> {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(_) => None,
             TransactionEnvelope::Tx(env) => Some(&env.tx),
             TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
@@ -128,7 +144,7 @@ impl TransactionFrame {
     /// For V1, returns the envelope itself. For FeeBump, returns the inner
     /// envelope from `FeeBumpTransactionInnerTx`. Returns `None` for V0.
     fn inner_envelope(&self) -> Option<&stellar_xdr::curr::TransactionV1Envelope> {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(_) => None,
             TransactionEnvelope::Tx(env) => Some(env),
             TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
@@ -165,7 +181,7 @@ impl TransactionFrame {
 
     /// Create the signature payload for signing/verification.
     fn signature_payload(&self, network_id: &NetworkId) -> Result<TransactionSignaturePayload> {
-        let tagged_tx = match &self.envelope {
+        let tagged_tx = match &*self.envelope {
             TransactionEnvelope::TxV0(env) => {
                 // Convert V0 to V1 for signature payload
                 let tx = self.v0_to_v1_transaction(&env.tx)?;
@@ -203,7 +219,7 @@ impl TransactionFrame {
 
     /// Get the source account.
     pub fn source_account(&self) -> MuxedAccount {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => {
                 MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
             }
@@ -219,7 +235,7 @@ impl TransactionFrame {
 
     /// Get the fee-paying account (for fee bump, this is the outer source).
     pub fn fee_source_account(&self) -> MuxedAccount {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => {
                 MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
             }
@@ -230,7 +246,7 @@ impl TransactionFrame {
 
     /// Get the inner transaction source (for fee bump, this is the inner tx source).
     pub fn inner_source_account(&self) -> MuxedAccount {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => {
                 MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone())
             }
@@ -254,7 +270,7 @@ impl TransactionFrame {
 
     /// Get the sequence number.
     pub fn sequence_number(&self) -> i64 {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
             _ => self.inner_tx().unwrap().seq_num.0,
         }
@@ -262,7 +278,7 @@ impl TransactionFrame {
 
     /// Get the fee.
     pub fn fee(&self) -> u32 {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => env.tx.fee,
             TransactionEnvelope::Tx(env) => env.tx.fee,
             TransactionEnvelope::TxFeeBump(env) => {
@@ -275,7 +291,7 @@ impl TransactionFrame {
 
     /// Get the total fee (for fee bump, this is the outer fee).
     pub fn total_fee(&self) -> i64 {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => env.tx.fee as i64,
             TransactionEnvelope::Tx(env) => env.tx.fee as i64,
             TransactionEnvelope::TxFeeBump(env) => env.tx.fee,
@@ -332,7 +348,7 @@ impl TransactionFrame {
 
     /// Get the inner transaction's original fee (for fee bump).
     pub fn inner_fee(&self) -> u32 {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => env.tx.fee,
             _ => self.inner_tx().unwrap().fee,
         }
@@ -340,7 +356,7 @@ impl TransactionFrame {
 
     /// Get the operations.
     pub fn operations(&self) -> &[Operation] {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => env.tx.operations.as_slice(),
             _ => self.inner_tx().unwrap().operations.as_slice(),
         }
@@ -395,7 +411,7 @@ impl TransactionFrame {
 
     /// Get the memo.
     pub fn memo(&self) -> &Memo {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => &env.tx.memo,
             _ => &self.inner_tx().unwrap().memo,
         }
@@ -403,7 +419,7 @@ impl TransactionFrame {
 
     /// Get the preconditions (time bounds, ledger bounds, etc.).
     pub fn preconditions(&self) -> Preconditions {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => {
                 // V0 only has time bounds
                 if let Some(tb) = &env.tx.time_bounds {
@@ -418,7 +434,7 @@ impl TransactionFrame {
 
     /// Get the signatures.
     pub fn signatures(&self) -> &[DecoratedSignature] {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => env.signatures.as_slice(),
             TransactionEnvelope::Tx(env) => env.signatures.as_slice(),
             TransactionEnvelope::TxFeeBump(env) => env.signatures.as_slice(),
@@ -427,7 +443,7 @@ impl TransactionFrame {
 
     /// Get the inner transaction signatures (for fee bump).
     pub fn inner_signatures(&self) -> &[DecoratedSignature] {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(env) => env.signatures.as_slice(),
             _ => self.inner_envelope().unwrap().signatures.as_slice(),
         }
@@ -435,7 +451,7 @@ impl TransactionFrame {
 
     /// Check if this is a fee bump transaction.
     pub fn is_fee_bump(&self) -> bool {
-        matches!(&self.envelope, TransactionEnvelope::TxFeeBump(_))
+        matches!(&*self.envelope, TransactionEnvelope::TxFeeBump(_))
     }
 
     /// Check if this is a Soroban transaction.
@@ -534,7 +550,7 @@ impl TransactionFrame {
     /// This is used for Soroban resource fee computation, matching stellar-core behavior where
     /// FeeBumpTransactionFrame::getResources() delegates to mInnerTx->getResources().
     pub fn inner_tx_size_bytes(&self) -> u32 {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxFeeBump(_) => {
                 let inner = self.inner_envelope().unwrap();
                 TransactionEnvelope::Tx(inner.clone())
@@ -588,7 +604,7 @@ impl TransactionFrame {
 
     /// Get the envelope type.
     pub fn envelope_type(&self) -> EnvelopeType {
-        match &self.envelope {
+        match &*self.envelope {
             TransactionEnvelope::TxV0(_) => EnvelopeType::TxV0,
             TransactionEnvelope::Tx(_) => EnvelopeType::Tx,
             TransactionEnvelope::TxFeeBump(_) => EnvelopeType::TxFeeBump,
@@ -866,7 +882,7 @@ mod tests {
     #[test]
     fn test_frame_creation() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope.clone());
+        let frame = TransactionFrame::from_owned(envelope.clone());
 
         assert_eq!(frame.operation_count(), 1);
         assert_eq!(frame.fee(), 100);
@@ -878,7 +894,7 @@ mod tests {
     #[test]
     fn test_hash_computation() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
 
         let network_id = NetworkId::testnet();
         let hash = frame.hash(&network_id).unwrap();
@@ -896,7 +912,7 @@ mod tests {
     #[test]
     fn test_resources_classic_ops() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let resources = frame.resources(false, 25);
 
         assert_eq!(resources.size(), 1);
@@ -906,7 +922,7 @@ mod tests {
     #[test]
     fn test_resources_soroban_disk_reads() {
         let envelope = create_soroban_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let resources = frame.resources(false, 25);
 
         assert_eq!(resources.size(), 7);
@@ -921,14 +937,14 @@ mod tests {
     #[test]
     fn test_structure_validation() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.is_valid_structure());
     }
 
     #[test]
     fn test_inclusion_fee_classic() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert_eq!(frame.declared_soroban_resource_fee(), 0);
         assert_eq!(frame.inclusion_fee(), frame.total_fee());
     }
@@ -936,7 +952,7 @@ mod tests {
     #[test]
     fn test_inclusion_fee_soroban() {
         let envelope = create_soroban_transaction_with_fees(200, 1000);
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert_eq!(frame.declared_soroban_resource_fee(), 200);
         assert_eq!(frame.inclusion_fee(), 800);
     }
@@ -944,7 +960,7 @@ mod tests {
     #[test]
     fn test_inclusion_fee_fee_bump_soroban() {
         let envelope = create_fee_bump_soroban(600, 150, 900);
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert_eq!(frame.declared_soroban_resource_fee(), 150);
         assert_eq!(frame.inclusion_fee(), 750);
     }
@@ -954,7 +970,7 @@ mod tests {
     fn test_frame_with_network() {
         let envelope = create_test_transaction();
         let network = NetworkId::testnet();
-        let frame = TransactionFrame::with_network(envelope, network.clone());
+        let frame = TransactionFrame::from_owned_with_network(envelope, network.clone());
 
         // Hash should be computed with the network ID
         let hash_result = frame.hash(&network);
@@ -965,7 +981,7 @@ mod tests {
     #[test]
     fn test_operation_count() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert_eq!(frame.operation_count(), 1);
     }
 
@@ -973,7 +989,7 @@ mod tests {
     #[test]
     fn test_fee_extraction() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert_eq!(frame.fee(), 100);
     }
 
@@ -981,7 +997,7 @@ mod tests {
     #[test]
     fn test_source_account() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let source = frame.source_account();
         // Should be MuxedAccount::Ed25519 with all zeros
         match source {
@@ -996,7 +1012,7 @@ mod tests {
     #[test]
     fn test_memo() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(matches!(frame.memo(), Memo::None));
     }
 
@@ -1005,7 +1021,7 @@ mod tests {
     #[test]
     fn test_into_envelope() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope.clone());
+        let frame = TransactionFrame::from_owned(envelope.clone());
         let recovered = frame.into_envelope();
         // Verify the envelope was recovered
         match recovered {
@@ -1017,14 +1033,14 @@ mod tests {
     #[test]
     fn test_cached_hash_none_initially() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.cached_hash().is_none());
     }
 
     #[test]
     fn test_compute_hash_caches() {
         let envelope = create_test_transaction();
-        let mut frame = TransactionFrame::new(envelope);
+        let mut frame = TransactionFrame::from_owned(envelope);
         let network = NetworkId::testnet();
 
         assert!(frame.cached_hash().is_none());
@@ -1038,7 +1054,7 @@ mod tests {
     #[test]
     fn test_source_account_id() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let account_id = frame.source_account_id();
 
         // Should be AccountId with all zeros
@@ -1052,7 +1068,7 @@ mod tests {
     #[test]
     fn test_fee_source_account_id() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
 
         // For non-fee-bump, fee source is same as inner source
         assert_eq!(
@@ -1064,7 +1080,7 @@ mod tests {
     #[test]
     fn test_inner_source_account_id() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let inner_source = frame.inner_source_account_id();
 
         match inner_source.0 {
@@ -1077,42 +1093,42 @@ mod tests {
     #[test]
     fn test_total_fee() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert_eq!(frame.total_fee(), 100);
     }
 
     #[test]
     fn test_is_fee_bump_false() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(!frame.is_fee_bump());
     }
 
     #[test]
     fn test_is_soroban_false_for_classic() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(!frame.is_soroban());
     }
 
     #[test]
     fn test_is_soroban_true_for_soroban() {
         let envelope = create_soroban_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.is_soroban());
     }
 
     #[test]
     fn test_refundable_fee_classic() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.refundable_fee().is_none());
     }
 
     #[test]
     fn test_refundable_fee_soroban() {
         let envelope = create_soroban_transaction_with_fees(200, 1000);
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let refundable = frame.refundable_fee();
         assert!(refundable.is_some());
         assert_eq!(refundable.unwrap(), 200);
@@ -1121,14 +1137,14 @@ mod tests {
     #[test]
     fn test_soroban_data_none_for_classic() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.soroban_data().is_none());
     }
 
     #[test]
     fn test_soroban_data_some_for_soroban() {
         let envelope = create_soroban_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let data = frame.soroban_data();
         assert!(data.is_some());
     }
@@ -1136,7 +1152,7 @@ mod tests {
     #[test]
     fn test_operations() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let ops = frame.operations();
         assert_eq!(ops.len(), 1);
     }
@@ -1144,28 +1160,28 @@ mod tests {
     #[test]
     fn test_is_valid_structure_true() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.is_valid_structure());
     }
 
     #[test]
     fn test_declared_soroban_resource_fee_zero_for_classic() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert_eq!(frame.declared_soroban_resource_fee(), 0);
     }
 
     #[test]
     fn test_declared_soroban_resource_fee_for_soroban() {
         let envelope = create_soroban_transaction_with_fees(300, 500);
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert_eq!(frame.declared_soroban_resource_fee(), 300);
     }
 
     #[test]
     fn test_signatures() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let sigs = frame.signatures();
         assert!(sigs.is_empty());
     }
@@ -1173,7 +1189,7 @@ mod tests {
     #[test]
     fn test_preconditions() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let precond = frame.preconditions();
         assert!(matches!(precond, Preconditions::None));
     }
@@ -1221,7 +1237,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(
             frame.tx_size_bytes() > 100 * 1024,
             "test envelope should exceed 100KB, actual: {} bytes",
@@ -1236,7 +1252,7 @@ mod tests {
     #[test]
     fn test_is_valid_structure_accepts_normal_sized_envelope() {
         let envelope = create_test_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.tx_size_bytes() < 100 * 1024);
         assert!(frame.is_valid_structure());
     }
@@ -1272,7 +1288,7 @@ mod tests {
             tx,
             signatures: vec![].try_into().unwrap(),
         });
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(!frame.is_soroban());
         assert!(frame.validate_soroban_memo());
     }
@@ -1280,7 +1296,7 @@ mod tests {
     #[test]
     fn test_validate_soroban_memo_none_passes() {
         let envelope = create_soroban_transaction();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.is_soroban());
         assert!(frame.validate_soroban_memo());
     }
@@ -1292,7 +1308,7 @@ mod tests {
         if let TransactionEnvelope::Tx(ref mut env) = envelope {
             env.tx.memo = Memo::Text(StringM::try_from("bad").unwrap());
         }
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.is_soroban());
         assert!(!frame.validate_soroban_memo());
     }
@@ -1307,7 +1323,7 @@ mod tests {
                 ed25519: Uint256([2u8; 32]),
             });
         }
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(!frame.validate_soroban_memo());
     }
 
@@ -1323,7 +1339,7 @@ mod tests {
             }));
             env.tx.operations = ops.try_into().unwrap();
         }
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(!frame.validate_soroban_memo());
     }
 
@@ -1375,7 +1391,7 @@ mod tests {
             tx,
             signatures: vec![].try_into().unwrap(),
         });
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.is_soroban(), "ExtendFootprintTtl is a Soroban op");
         assert!(
             frame.validate_soroban_memo(),
@@ -1427,7 +1443,7 @@ mod tests {
             tx,
             signatures: vec![].try_into().unwrap(),
         });
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(frame.is_soroban(), "RestoreFootprint is a Soroban op");
         assert!(
             frame.validate_soroban_memo(),

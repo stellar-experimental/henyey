@@ -679,7 +679,7 @@ impl TransactionQueue {
             TransactionFrame, TxResultCode,
         };
 
-        let frame = TransactionFrame::with_network(envelope.clone(), self.config.network_id);
+        let frame = TransactionFrame::from_owned_with_network(envelope.clone(), self.config.network_id);
         let ctx = self.validation_context.read();
         let base_fee = ctx.base_fee.max(self.config.min_fee_per_op);
 
@@ -1003,7 +1003,7 @@ impl TransactionQueue {
             });
             let lane_config = DexLimitingLaneConfig::new(generic_limit.clone(), dex_limit.clone());
             let filter = |tx: &QueuedTransaction| {
-                let frame = henyey_tx::TransactionFrame::with_network(
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
                     tx.envelope.clone(),
                     self.config.network_id,
                 );
@@ -1026,7 +1026,7 @@ impl TransactionQueue {
                     continue;
                 }
                 pending_eviction_list.push(evicted.clone());
-                let frame = henyey_tx::TransactionFrame::with_network(
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
                     evicted.envelope.clone(),
                     self.config.network_id,
                 );
@@ -1047,7 +1047,7 @@ impl TransactionQueue {
             if let Some(limit) = &self.config.max_queue_soroban_resources {
                 let lane_config = SorobanGenericLaneConfig::new(limit.clone());
                 let filter = |tx: &QueuedTransaction| {
-                    let frame = henyey_tx::TransactionFrame::with_network(
+                    let frame = henyey_tx::TransactionFrame::from_owned_with_network(
                         tx.envelope.clone(),
                         self.config.network_id,
                     );
@@ -1070,7 +1070,7 @@ impl TransactionQueue {
                         continue;
                     }
                     pending_eviction_list.push(evicted.clone());
-                    let frame = henyey_tx::TransactionFrame::with_network(
+                    let frame = henyey_tx::TransactionFrame::from_owned_with_network(
                         evicted.envelope.clone(),
                         self.config.network_id,
                     );
@@ -1154,7 +1154,7 @@ impl TransactionQueue {
 
         let mut by_hash = self.by_hash.write();
         let ledger_version = self.validation_context.read().protocol_version;
-        let queued_frame = henyey_tx::TransactionFrame::with_network(
+        let queued_frame = henyey_tx::TransactionFrame::from_owned_with_network(
             queued.envelope.clone(),
             self.config.network_id,
         );
@@ -1515,7 +1515,7 @@ impl TransactionQueue {
 
         for (envelope, applied_seq) in applied_txs {
             let frame =
-                henyey_tx::TransactionFrame::with_network(envelope.clone(), self.config.network_id);
+                henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), self.config.network_id);
 
             // Get sequence-number-source (inner source for fee-bump)
             let seq_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
@@ -1536,7 +1536,7 @@ impl TransactionQueue {
                         // Collect fee release info
                         let tx_fee = queued_tx.total_fee as i64;
                         let tx_fee_source_id = henyey_tx::muxed_to_account_id(
-                            &henyey_tx::TransactionFrame::with_network(
+                            &henyey_tx::TransactionFrame::from_owned_with_network(
                                 queued_tx.envelope.clone(),
                                 self.config.network_id,
                             )
@@ -1834,12 +1834,12 @@ fn precondition_hash_and_signatures<'a>(
 ) -> std::result::Result<(Hash256, &'a [DecoratedSignature]), &'static str> {
     match envelope {
         TransactionEnvelope::TxV0(env) => {
-            let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
+            let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), *network_id);
             let hash = frame.hash(network_id).map_err(|_| "tx hash error")?;
             Ok((hash, env.signatures.as_slice()))
         }
         TransactionEnvelope::Tx(env) => {
-            let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
+            let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), *network_id);
             let hash = frame.hash(network_id).map_err(|_| "tx hash error")?;
             Ok((hash, env.signatures.as_slice()))
         }
@@ -1847,7 +1847,7 @@ fn precondition_hash_and_signatures<'a>(
             let inner_env = match &env.tx.inner_tx {
                 FeeBumpTransactionInnerTx::Tx(inner) => inner.clone(),
             };
-            let inner_frame = henyey_tx::TransactionFrame::with_network(
+            let inner_frame = henyey_tx::TransactionFrame::from_owned_with_network(
                 TransactionEnvelope::Tx(inner_env),
                 *network_id,
             );
@@ -2073,7 +2073,7 @@ mod tests {
         secret: &SecretKey,
         network_id: &NetworkId,
     ) -> DecoratedSignature {
-        let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
+        let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), *network_id);
         let hash = frame.hash(network_id).expect("tx hash");
         let signature = sign_hash(secret, &hash);
 
@@ -2289,10 +2289,10 @@ mod tests {
         let mut tx_b = make_test_envelope(200, 1);
         set_source(&mut tx_a, 4);
         set_source(&mut tx_b, 5);
-        let hash_a = henyey_tx::TransactionFrame::with_network(tx_a.clone(), network_id)
+        let hash_a = henyey_tx::TransactionFrame::from_owned_with_network(tx_a.clone(), network_id)
             .hash(&network_id)
             .expect("hash tx_a");
-        let hash_b = henyey_tx::TransactionFrame::with_network(tx_b.clone(), network_id)
+        let hash_b = henyey_tx::TransactionFrame::from_owned_with_network(tx_b.clone(), network_id)
             .hash(&network_id)
             .expect("hash tx_b");
 
@@ -2311,7 +2311,7 @@ mod tests {
             .transactions
             .iter()
             .map(|tx| {
-                henyey_tx::TransactionFrame::with_network(tx.clone(), network_id)
+                henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), network_id)
                     .hash(&network_id)
                     .expect("hash tx")
             })
@@ -2527,7 +2527,7 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(txs.len(), 1);
-                assert!(!henyey_tx::TransactionFrame::with_network(
+                assert!(!henyey_tx::TransactionFrame::from_owned_with_network(
                     txs[0].clone(),
                     NetworkId::testnet()
                 )
@@ -2545,7 +2545,7 @@ mod tests {
                     }
                 }
                 assert_eq!(txs.len(), 1);
-                assert!(henyey_tx::TransactionFrame::with_network(
+                assert!(henyey_tx::TransactionFrame::from_owned_with_network(
                     txs[0].clone(),
                     NetworkId::testnet()
                 )
@@ -2819,7 +2819,7 @@ mod tests {
 
         let mut dex_count = 0;
         for tx in &set.transactions {
-            let frame = henyey_tx::TransactionFrame::with_network(tx.clone(), NetworkId::testnet());
+            let frame = henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), NetworkId::testnet());
             if frame.has_dex_operations() {
                 dex_count += 1;
             }
@@ -4449,7 +4449,7 @@ mod tests {
             .unwrap(),
         });
 
-        henyey_tx::TransactionFrame::with_network(envelope, NetworkId::testnet())
+        henyey_tx::TransactionFrame::from_owned_with_network(envelope, NetworkId::testnet())
     }
 
     fn make_queue_with_soroban_limits(limits: SorobanTxLimits) -> TransactionQueue {

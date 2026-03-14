@@ -874,7 +874,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        TransactionFrame::new(envelope)
+        TransactionFrame::from_owned(envelope)
     }
 
     // DiagnosticEventManager tests
@@ -1224,7 +1224,7 @@ mod tests {
             tx,
             signatures: vec![].try_into().unwrap(),
         });
-        let soroban_frame = TransactionFrame::new(envelope);
+        let soroban_frame = TransactionFrame::from_owned(envelope);
 
         let mut builder = TransactionMetaBuilder::new(
             true,
@@ -1273,7 +1273,7 @@ mod tests {
             tx,
             signatures: vec![].try_into().unwrap(),
         });
-        let soroban_frame = TransactionFrame::new(envelope);
+        let soroban_frame = TransactionFrame::from_owned(envelope);
 
         let mut builder = TransactionMetaBuilder::new(
             true,

@@ -59,7 +59,7 @@ impl TransactionQueue {
         let mut soroban_txs = Vec::new();
         for tx in &transactions {
             let frame =
-                henyey_tx::TransactionFrame::with_network(tx.clone(), self.config.network_id);
+                henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), self.config.network_id);
             if frame.is_soroban() {
                 soroban_txs.push(tx.clone());
             } else {
@@ -78,7 +78,7 @@ impl TransactionQueue {
 
             for tx in &classic_txs {
                 let frame =
-                    henyey_tx::TransactionFrame::with_network(tx.clone(), self.config.network_id);
+                    henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), self.config.network_id);
                 let lane = if has_dex_lane && frame.has_dex_operations() {
                     crate::surge_pricing::DEX_LANE
                 } else {
@@ -284,7 +284,7 @@ impl TransactionQueue {
             if let Some(txs) = layered.get(&account) {
                 let mut seen_soroban = false;
                 for tx in txs {
-                    let frame = henyey_tx::TransactionFrame::with_network(
+                    let frame = henyey_tx::TransactionFrame::from_owned_with_network(
                         tx.envelope.clone(),
                         self.config.network_id,
                     );
@@ -351,7 +351,7 @@ impl TransactionQueue {
             .collect();
         classic_had_not_fitting.resize(lane_count, false);
         while let Some((lane, entry)) = classic_queue.peek_top() {
-            let frame = henyey_tx::TransactionFrame::with_network(
+            let frame = henyey_tx::TransactionFrame::from_owned_with_network(
                 entry.tx.envelope.clone(),
                 self.config.network_id,
             );
@@ -431,7 +431,7 @@ impl TransactionQueue {
             let mut selected = Vec::new();
             let mut lane_left = [queue.lane_limits(GENERIC_LANE)];
             while let Some((lane, entry)) = queue.peek_top() {
-                let frame = henyey_tx::TransactionFrame::with_network(
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
                     entry.tx.envelope.clone(),
                     self.config.network_id,
                 );

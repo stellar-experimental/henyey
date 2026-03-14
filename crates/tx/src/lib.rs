@@ -72,7 +72,7 @@
 //! let meta: TransactionMeta = /* from archive */;
 //!
 //! // Create frame wrapper
-//! let frame = TransactionFrame::new(envelope);
+//! let frame = TransactionFrame::from_owned(envelope);
 //!
 //! // Apply historical transaction to accumulate state changes
 //! let mut delta = LedgerDelta::new(ledger_seq);
@@ -311,7 +311,7 @@ impl TransactionValidator {
 
     /// Validate a transaction envelope (basic checks only).
     pub fn validate(&self, tx: &stellar_xdr::curr::TransactionEnvelope) -> ValidationResult {
-        let frame = TransactionFrame::new(tx.clone());
+        let frame = TransactionFrame::from_owned(tx.clone());
 
         match validate_basic(&frame, &self.context) {
             Ok(()) => ValidationResult::Valid,
@@ -332,7 +332,7 @@ impl TransactionValidator {
         tx: &stellar_xdr::curr::TransactionEnvelope,
         source_account: &stellar_xdr::curr::AccountEntry,
     ) -> ValidationResult {
-        let frame = TransactionFrame::new(tx.clone());
+        let frame = TransactionFrame::from_owned(tx.clone());
 
         match validate_full(&frame, &self.context, source_account) {
             Ok(()) => ValidationResult::Valid,
@@ -348,7 +348,7 @@ impl TransactionValidator {
 
     /// Check if all required signatures are present.
     pub fn check_signatures(&self, tx: &stellar_xdr::curr::TransactionEnvelope) -> bool {
-        let frame = TransactionFrame::new(tx.clone());
+        let frame = TransactionFrame::from_owned(tx.clone());
         validate_signatures(&frame, &self.context).is_ok()
     }
 }
@@ -474,7 +474,7 @@ mod tests {
     #[test]
     fn test_frame_creation_and_properties() {
         let envelope = create_test_envelope();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
 
         assert_eq!(frame.operation_count(), 1);
         assert_eq!(frame.fee(), 100);
@@ -613,7 +613,7 @@ mod tests {
     fn test_frame_fee_bump_detection() {
         // Regular transaction is not fee bump
         let envelope = create_test_envelope();
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         assert!(!frame.is_fee_bump());
     }
 

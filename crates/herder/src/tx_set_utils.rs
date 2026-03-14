@@ -166,7 +166,7 @@ pub fn get_invalid_tx_list(
     let need_lower_check = lower_close_time != upper_close_time;
 
     for tx in txs {
-        let frame = TransactionFrame::with_network(tx.clone(), ctx.network_id);
+        let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);
 
         // Validate with upper bound close time (catches max_time violations).
         let upper_result = validate_basic(&frame, &upper_ledger_ctx);

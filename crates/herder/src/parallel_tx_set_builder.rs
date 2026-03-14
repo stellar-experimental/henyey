@@ -400,7 +400,7 @@ fn detect_conflicts(txs: &[TransactionEnvelope], network_id: NetworkId) -> Vec<B
         std::collections::HashMap::new();
 
     for (tx_id, tx) in txs.iter().enumerate() {
-        let frame = TransactionFrame::with_network(tx.clone(), network_id);
+        let frame = TransactionFrame::from_owned_with_network(tx.clone(), network_id);
         if let Some(data) = frame.soroban_data() {
             for key in data.resources.footprint.read_only.iter() {
                 let kb = ledger_key_bytes(key);
@@ -477,7 +477,7 @@ fn build_with_stage_count(
     // Build BuilderTx representations.
     let builder_txs: Vec<BuilderTx> = (0..n)
         .map(|id| {
-            let frame = TransactionFrame::with_network(txs[id].clone(), network_id);
+            let frame = TransactionFrame::from_owned_with_network(txs[id].clone(), network_id);
             let instructions = frame
                 .soroban_data()
                 .map(|d| d.resources.instructions)

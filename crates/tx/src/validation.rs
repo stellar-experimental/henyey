@@ -26,7 +26,7 @@
 //! use henyey_tx::validation::{validate_basic, LedgerContext};
 //!
 //! let context = LedgerContext::testnet(1000, current_time);
-//! let frame = TransactionFrame::new(envelope);
+//! let frame = TransactionFrame::from_owned(envelope);
 //!
 //! match validate_basic(&frame, &context) {
 //!     Ok(()) => println!("Transaction is valid"),
@@ -700,7 +700,7 @@ fn fee_bump_inner_hash(
         TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
             stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
                 let inner_env = TransactionEnvelope::Tx(inner.clone());
-                let inner_frame = TransactionFrame::with_network(inner_env, *network_id);
+                let inner_frame = TransactionFrame::from_owned_with_network(inner_env, *network_id);
                 inner_frame
                     .hash(network_id)
                     .map_err(|e| format!("inner tx hash error: {}", e))
@@ -900,7 +900,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        TransactionFrame::new(envelope)
+        TransactionFrame::from_owned(envelope)
     }
 
     fn create_account_entry(account_id: AccountId, seq_num: i64) -> AccountEntry {
@@ -982,7 +982,7 @@ mod tests {
         secret: &SecretKey,
         network_id: &NetworkId,
     ) -> DecoratedSignature {
-        let frame = TransactionFrame::with_network(envelope.clone(), *network_id);
+        let frame = TransactionFrame::from_owned_with_network(envelope.clone(), *network_id);
         let hash = frame.hash(network_id).expect("tx hash");
         let signature = sign_hash(secret, &hash);
 
@@ -1041,7 +1041,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000);
 
         assert!(matches!(
@@ -1070,7 +1070,7 @@ mod tests {
     #[test]
     fn test_validate_soroban_missing_data() {
         let envelope = create_soroban_envelope(Vec::new(), None, false);
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000);
 
         assert!(matches!(
@@ -1085,7 +1085,7 @@ mod tests {
             hash: Hash([3u8; 32]),
         });
         let envelope = create_soroban_envelope(vec![key], Some(vec![1]), true);
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000);
 
         assert!(matches!(
@@ -1102,7 +1102,7 @@ mod tests {
             durability: ContractDataDurability::Temporary,
         });
         let envelope = create_soroban_envelope(vec![key], Some(vec![0]), true);
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000);
 
         assert!(matches!(
@@ -1151,7 +1151,7 @@ mod tests {
 
         let context = LedgerContext::testnet(1, 1000);
         let account = create_account_entry(account_id, 1);
-        let result = validate_full(&TransactionFrame::new(envelope), &context, &account);
+        let result = validate_full(&TransactionFrame::from_owned(envelope), &context, &account);
         assert!(matches!(
             result,
             Err(errors) if matches!(errors.first(), Some(ValidationError::BadMinAccountSequence))
@@ -1200,7 +1200,7 @@ mod tests {
 
         let context = LedgerContext::testnet(1, 1000);
         let account = create_account_entry(account_id, 1);
-        let result = validate_full(&TransactionFrame::new(envelope), &context, &account);
+        let result = validate_full(&TransactionFrame::from_owned(envelope), &context, &account);
         assert!(matches!(
             result,
             Err(errors) if matches!(errors.first(), Some(ValidationError::ExtraSignersNotMet))
@@ -1258,7 +1258,7 @@ mod tests {
 
         let context = LedgerContext::testnet(1, 1000);
         let account = create_account_entry(account_id, 1);
-        assert!(validate_full(&TransactionFrame::new(envelope), &context, &account).is_ok());
+        assert!(validate_full(&TransactionFrame::from_owned(envelope), &context, &account).is_ok());
     }
 
     /// Test validate_time_bounds with min_time in the future.
@@ -1298,7 +1298,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000); // close_time = 1000
 
         assert!(matches!(
@@ -1344,7 +1344,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000); // close_time = 1000
 
         assert!(matches!(
@@ -1399,7 +1399,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(50, 1000); // ledger = 50
 
         assert!(matches!(
@@ -1454,7 +1454,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(100, 1000); // ledger = 100
 
         assert!(matches!(
@@ -1571,7 +1571,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(100, 1000); // ledger = 100
 
         assert!(validate_ledger_bounds(&frame, &context).is_ok());
@@ -1614,7 +1614,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000); // close_time = 1000
 
         assert!(validate_time_bounds(&frame, &context).is_ok());
@@ -1656,7 +1656,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 999999); // Any large close_time
 
         assert!(validate_time_bounds(&frame, &context).is_ok());
@@ -1707,7 +1707,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(999999, 1000); // Any large ledger
 
         assert!(validate_ledger_bounds(&frame, &context).is_ok());
@@ -1752,7 +1752,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000);
 
         assert!(validate_basic(&frame, &context).is_ok());
@@ -1797,7 +1797,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(1, 1000);
 
         assert!(matches!(
@@ -1873,7 +1873,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
 
         // current == max_ledger: should fail
         let context = LedgerContext::testnet(100, 1000);
@@ -1941,7 +1941,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        let frame = TransactionFrame::new(envelope);
+        let frame = TransactionFrame::from_owned(envelope);
         let context = LedgerContext::testnet(100, 1000);
 
         let result = validate_basic(&frame, &context);

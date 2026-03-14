@@ -510,7 +510,7 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
     }
 
     let mut delta = LedgerDelta::new(1);
-    let transactions = vec![(envelope, None)];
+    let transactions = vec![(Arc::new(envelope), None)];
 
     // Create an empty hot archive bucket list wrapped in the expected type
     let hot_archive = HotArchiveBucketList::new();
@@ -943,8 +943,8 @@ async fn test_parallel_soroban_multi_cluster_execution() {
     let phase = SorobanPhaseStructure {
         base_fee: None,
         stages: vec![vec![
-            vec![(tx1.clone(), None)], // cluster 0
-            vec![(tx2.clone(), None)], // cluster 1
+            vec![(std::sync::Arc::new(tx1.clone()), None)], // cluster 0
+            vec![(std::sync::Arc::new(tx2.clone()), None)], // cluster 1
         ]],
     };
 
@@ -1034,8 +1034,8 @@ async fn test_parallel_soroban_matches_sequential() {
     let parallel_phase = SorobanPhaseStructure {
         base_fee: None,
         stages: vec![vec![
-            vec![(tx1.clone(), None)],
-            vec![(tx2.clone(), None)],
+            vec![(std::sync::Arc::new(tx1.clone()), None)],
+            vec![(std::sync::Arc::new(tx2.clone()), None)],
         ]],
     };
     let mut parallel_delta = LedgerDelta::new(1);
@@ -1065,8 +1065,8 @@ async fn test_parallel_soroban_matches_sequential() {
     let sequential_phase = SorobanPhaseStructure {
         base_fee: None,
         stages: vec![
-            vec![vec![(tx1.clone(), None)]],
-            vec![vec![(tx2.clone(), None)]],
+            vec![vec![(std::sync::Arc::new(tx1.clone()), None)]],
+            vec![vec![(std::sync::Arc::new(tx2.clone()), None)]],
         ],
     };
     let mut sequential_delta = LedgerDelta::new(1);
@@ -1143,8 +1143,8 @@ async fn test_parallel_soroban_deterministic() {
     let phase = SorobanPhaseStructure {
         base_fee: None,
         stages: vec![vec![
-            vec![(tx1.clone(), None)],
-            vec![(tx2.clone(), None)],
+            vec![(std::sync::Arc::new(tx1.clone()), None)],
+            vec![(std::sync::Arc::new(tx2.clone()), None)],
         ]],
     };
 
@@ -1226,8 +1226,8 @@ async fn test_parallel_soroban_from_spawn_blocking() {
     let phase = SorobanPhaseStructure {
         base_fee: None,
         stages: vec![vec![
-            vec![(tx1.clone(), None)],
-            vec![(tx2.clone(), None)],
+            vec![(std::sync::Arc::new(tx1.clone()), None)],
+            vec![(std::sync::Arc::new(tx2.clone()), None)],
         ]],
     };
 
@@ -1304,8 +1304,8 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     let phase = SorobanPhaseStructure {
         base_fee: None,
         stages: vec![vec![
-            vec![(tx1.clone(), None)],
-            vec![(tx2.clone(), None)],
+            vec![(std::sync::Arc::new(tx1.clone()), None)],
+            vec![(std::sync::Arc::new(tx2.clone()), None)],
         ]],
     };
 
@@ -2373,7 +2373,7 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
 
     // Create 3 payment TXs from the same source, each paying 200 native.
     let network_id = NetworkId::testnet();
-    let mut tx_set: Vec<(TransactionEnvelope, Option<u32>)> = Vec::new();
+    let mut tx_set: Vec<(std::sync::Arc<TransactionEnvelope>, Option<u32>)> = Vec::new();
     for i in 0..3u32 {
         let operation = Operation {
             source_account: None,
@@ -2404,7 +2404,7 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
             env.signatures = vec![decorated].try_into().unwrap();
         }
 
-        tx_set.push((envelope, None));
+        tx_set.push((std::sync::Arc::new(envelope), None));
     }
 
     let context = henyey_tx::LedgerContext::new(
@@ -3196,7 +3196,7 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
 
     // Compute TX 2's hash — this becomes the PreAuthTx signer key.
     let tx2_frame =
-        henyey_tx::TransactionFrame::with_network(tx2_envelope.clone(), network_id);
+        henyey_tx::TransactionFrame::from_owned_with_network(tx2_envelope.clone(), network_id);
     let tx2_hash = tx2_frame.hash(&network_id).expect("tx2 hash");
 
     // Build TX 1: SetOptions × 3.
@@ -3275,8 +3275,8 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
     }
 
     // Execute both TXs in a single ledger.
-    let tx_set: Vec<(TransactionEnvelope, Option<u32>)> =
-        vec![(tx1_envelope, None), (tx2_envelope, None)];
+    let tx_set: Vec<(std::sync::Arc<TransactionEnvelope>, Option<u32>)> =
+        vec![(std::sync::Arc::new(tx1_envelope), None), (std::sync::Arc::new(tx2_envelope), None)];
 
     let context = henyey_tx::LedgerContext::new(
         2,     // ledger_seq
@@ -3781,7 +3781,7 @@ fn test_pre_charged_fee_override_on_validation_failure() {
         fee_changes: LedgerEntryChanges(vec![].try_into().unwrap()),
     }];
 
-    let transactions = vec![(envelope, None)];
+    let transactions = vec![(std::sync::Arc::new(envelope), None)];
     let mut delta = LedgerDelta::new(2);
 
     let result = run_transactions_on_executor(

@@ -18,10 +18,12 @@
 //! The generalized format supports parallel execution stages for Soroban
 //! transactions and per-component fee overrides.
 
-use henyey_common::Hash256;
-use henyey_crypto::Sha256Hasher;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use henyey_common::Hash256;
+use henyey_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
     AccountId, ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader,
     LedgerHeaderExt, LedgerHeaderExtensionV1, LedgerHeaderExtensionV1Ext, LedgerUpgrade, Limits,
@@ -316,12 +318,12 @@ impl TransactionSetVariant {
     }
 
     /// Get owned transactions with optional per-component base fee overrides.
-    pub fn transactions_with_base_fee(&self) -> Vec<(TransactionEnvelope, Option<u32>)> {
+    pub fn transactions_with_base_fee(&self) -> Vec<(Arc<TransactionEnvelope>, Option<u32>)> {
         let set_hash = self.hash();
         match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<(TransactionEnvelope, Option<u32>)> =
-                    set.txs.iter().cloned().map(|tx| (tx, None)).collect();
+                let txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)> =
+                    set.txs.iter().cloned().map(|tx| (Arc::new(tx), None)).collect();
                 sorted_for_apply_sequential(txs, set_hash)
             }
             TransactionSetVariant::Generalized(set) => {
@@ -335,7 +337,7 @@ impl TransactionSetVariant {
                                 match comp {
                                     stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
                                         let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
-                                        phase_txs.extend(c.txs.iter().cloned().map(|tx| (tx, base_fee)));
+                                        phase_txs.extend(c.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)));
                                     }
                                 }
                             }
@@ -361,12 +363,12 @@ impl TransactionSetVariant {
     ///
     /// Returns only the V0 (classic) phase transactions, sorted for apply.
     /// Returns an empty vec for Classic transaction sets.
-    pub fn classic_phase_transactions(&self) -> Vec<(TransactionEnvelope, Option<u32>)> {
+    pub fn classic_phase_transactions(&self) -> Vec<(Arc<TransactionEnvelope>, Option<u32>)> {
         let set_hash = self.hash();
         match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<(TransactionEnvelope, Option<u32>)> =
-                    set.txs.iter().cloned().map(|tx| (tx, None)).collect();
+                let txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)> =
+                    set.txs.iter().cloned().map(|tx| (Arc::new(tx), None)).collect();
                 sorted_for_apply_sequential(txs, set_hash)
             }
             TransactionSetVariant::Generalized(set) => {
@@ -379,7 +381,7 @@ impl TransactionSetVariant {
                             match comp {
                                 stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
                                     let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
-                                    phase_txs.extend(c.txs.iter().cloned().map(|tx| (tx, base_fee)));
+                                    phase_txs.extend(c.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)));
                                 }
                             }
                         }
@@ -477,14 +479,14 @@ fn tx_sequence_number(tx: &TransactionEnvelope) -> i64 {
 }
 
 fn sorted_for_apply_sequential(
-    txs: Vec<(TransactionEnvelope, Option<u32>)>,
+    txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)>,
     set_hash: Hash256,
-) -> Vec<(TransactionEnvelope, Option<u32>)> {
+) -> Vec<(Arc<TransactionEnvelope>, Option<u32>)> {
     if txs.len() <= 1 {
         return txs;
     }
 
-    let mut by_account: HashMap<AccountId, Vec<(TransactionEnvelope, Option<u32>)>> =
+    let mut by_account: HashMap<AccountId, Vec<(Arc<TransactionEnvelope>, Option<u32>)>> =
         HashMap::new();
     for (tx, base_fee) in txs {
         let account_id = tx_source_id(&tx);
@@ -495,7 +497,7 @@ fn sorted_for_apply_sequential(
     }
 
     // Pre-compute TX hashes and attach to each item to avoid redundant XDR+SHA256 during sort.
-    let mut queues: Vec<std::collections::VecDeque<(TransactionEnvelope, Option<u32>, Hash256)>> =
+    let mut queues: Vec<std::collections::VecDeque<(Arc<TransactionEnvelope>, Option<u32>, Hash256)>> =
         by_account
             .into_values()
             .map(|mut txs| {
@@ -532,9 +534,9 @@ fn sorted_for_apply_sequential(
 fn sort_parallel_stages(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
     set_hash: &Hash256,
-) -> Vec<Vec<Vec<TransactionEnvelope>>> {
+) -> Vec<Vec<Vec<Arc<TransactionEnvelope>>>> {
     // Pre-compute TX hashes alongside each TX to avoid redundant XDR+SHA256 during sort.
-    let mut stage_vec: Vec<Vec<Vec<(TransactionEnvelope, Hash256)>>> = stages
+    let mut stage_vec: Vec<Vec<Vec<(Arc<TransactionEnvelope>, Hash256)>>> = stages
         .iter()
         .map(|stage| {
             stage
@@ -546,7 +548,7 @@ fn sort_parallel_stages(
                         .iter()
                         .map(|tx| {
                             let h = tx_hash(tx);
-                            (tx.clone(), h)
+                            (Arc::new(tx.clone()), h)
                         })
                         .collect()
                 })
@@ -606,7 +608,7 @@ fn sorted_for_apply_parallel(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
     set_hash: Hash256,
     base_fee: Option<u32>,
-) -> Vec<(TransactionEnvelope, Option<u32>)> {
+) -> Vec<(Arc<TransactionEnvelope>, Option<u32>)> {
     sort_parallel_stages(stages, &set_hash)
         .into_iter()
         .flat_map(|stage| stage.into_iter().flatten())
@@ -615,7 +617,7 @@ fn sorted_for_apply_parallel(
 }
 
 /// A transaction paired with an optional per-component base fee override.
-pub type TxWithFee = (TransactionEnvelope, Option<u32>);
+pub type TxWithFee = (Arc<TransactionEnvelope>, Option<u32>);
 
 /// Structured Soroban parallel phase preserving stage/cluster nesting.
 ///
@@ -681,7 +683,7 @@ impl TransactionSetVariant {
     pub fn prepare_with_hash(&self, hash: Hash256) -> PreparedTxSet {
         let (classic_txs, soroban_phase, all_txs) = match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<TxWithFee> = set.txs.iter().cloned().map(|tx| (tx, None)).collect();
+                let txs: Vec<TxWithFee> = set.txs.iter().cloned().map(|tx| (Arc::new(tx), None)).collect();
                 let sorted = sorted_for_apply_sequential(txs, hash);
                 (sorted.clone(), None, sorted)
             }
@@ -701,7 +703,7 @@ impl TransactionSetVariant {
                                         let base_fee =
                                             c.base_fee.and_then(|fee| u32::try_from(fee).ok());
                                         phase_txs.extend(
-                                            c.txs.iter().cloned().map(|tx| (tx, base_fee)),
+                                            c.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)),
                                         );
                                     }
                                 }

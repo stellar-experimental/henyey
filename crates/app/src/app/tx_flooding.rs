@@ -597,7 +597,7 @@ impl App {
         let mut classic_count = 0usize;
         let mut soroban_count = 0usize;
         for env in &transactions {
-            let frame = henyey_tx::TransactionFrame::with_network(env.clone(), network_id);
+            let frame = henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
             if frame.is_soroban() {
                 soroban_count += 1;
             } else {

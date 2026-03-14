@@ -778,7 +778,7 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
 
-        TransactionFrame::new(envelope)
+        TransactionFrame::from_owned(envelope)
     }
 
     fn make_test_context(protocol_version: u32) -> LiveExecutionContext {

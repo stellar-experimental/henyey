@@ -31,7 +31,7 @@ pub async fn handle(
     // Compute the transaction hash
     let network_id =
         henyey_common::NetworkId::from_passphrase(&ctx.app.info().network_passphrase);
-    let mut frame = henyey_tx::TransactionFrame::with_network(tx_env.clone(), network_id);
+    let mut frame = henyey_tx::TransactionFrame::from_owned_with_network(tx_env.clone(), network_id);
     let hash = frame
         .compute_hash(&network_id)
         .map(|h| h.to_hex())

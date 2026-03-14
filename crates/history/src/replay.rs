@@ -1108,7 +1108,7 @@ fn log_tx_result_mismatch(
     header: &LedgerHeader,
     expected: &[TransactionResultPair],
     actual: &[TransactionResultPair],
-    transactions: &[(TransactionEnvelope, Option<u32>)],
+    transactions: &[(std::sync::Arc<TransactionEnvelope>, Option<u32>)],
 ) {
     use tracing::warn;
 

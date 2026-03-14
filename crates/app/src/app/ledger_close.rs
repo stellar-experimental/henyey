@@ -47,7 +47,7 @@ impl App {
     ) -> anyhow::Result<()> {
         let header_xdr = header.to_xdr(stellar_xdr::curr::Limits::none())?;
         let network_id = NetworkId::from_passphrase(&self.config.network.passphrase);
-        let ordered_txs: Vec<TransactionEnvelope> = tx_set_variant
+        let ordered_txs: Vec<std::sync::Arc<TransactionEnvelope>> = tx_set_variant
             .transactions_with_base_fee()
             .into_iter()
             .map(|(tx, _)| tx)
@@ -222,7 +222,7 @@ impl App {
     /// Extract contract events from transaction metadata for indexing.
     fn extract_contract_events(
         ledger_seq: u32,
-        ordered_txs: &[stellar_xdr::curr::TransactionEnvelope],
+        ordered_txs: &[std::sync::Arc<stellar_xdr::curr::TransactionEnvelope>],
         tx_results: &[TransactionResultPair],
         tx_metas: &[TransactionMeta],
         network_id: NetworkId,

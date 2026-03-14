@@ -273,7 +273,7 @@ fn sign_envelope(
     secret: &SecretKey,
     network_id: &NetworkId,
 ) -> DecoratedSignature {
-    let frame = henyey_tx::TransactionFrame::with_network(envelope.clone(), *network_id);
+    let frame = henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), *network_id);
     let hash = frame.hash(network_id).expect("tx hash");
     let signature = sign_hash(secret, &hash);
 

@@ -35,6 +35,7 @@
 //! [`LedgerStateManager`]: henyey_tx::LedgerStateManager
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use soroban_env_host_p25::fees::{
     compute_rent_write_fee_per_1kb, compute_transaction_resource_fee, FeeConfiguration,
@@ -1604,7 +1605,7 @@ impl TransactionExecutor {
         tx_envelope: &TransactionEnvelope,
         base_fee: u32,
     ) -> Result<(LedgerEntryChanges, i64)> {
-        let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
+        let frame = TransactionFrame::from_owned_with_network(tx_envelope.clone(), self.network_id);
         let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
 
@@ -1750,7 +1751,7 @@ impl TransactionExecutor {
         base_fee: u32,
     ) -> Result<std::result::Result<ValidatedTransaction, ValidationFailure>> {
         let val_start = std::time::Instant::now();
-        let frame = TransactionFrame::with_network(tx_envelope.clone(), self.network_id);
+        let frame = TransactionFrame::from_owned_with_network(tx_envelope.clone(), self.network_id);
         let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
 
@@ -1814,7 +1815,7 @@ impl TransactionExecutor {
                     stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
                         let inner_env = TransactionEnvelope::Tx(inner.clone());
                         let inner_frame =
-                            TransactionFrame::with_network(inner_env, self.network_id);
+                            TransactionFrame::from_owned_with_network(inner_env, self.network_id);
                         (inner_frame.inclusion_fee(), inner_frame.is_soroban())
                     }
                 },
@@ -2067,7 +2068,7 @@ impl TransactionExecutor {
         // finalizeFeeRefund(). We need to replicate this by setting fee_refund
         // on the failure result when validate_preconditions fails.
         let soroban_max_refundable = {
-            let pre_frame = TransactionFrame::new(tx_envelope.clone());
+            let pre_frame = TransactionFrame::from_owned(tx_envelope.clone());
             if pre_frame.is_soroban() {
                 let (non_refundable_fee, _) = compute_soroban_resource_fee(
                     &pre_frame,
@@ -2101,7 +2102,7 @@ impl TransactionExecutor {
                 // though the TX failed. This matches stellar-core's
                 // commonPreApply which calls processSeqNum before returning.
                 if validation_failure.past_seq_check {
-                    let frame = TransactionFrame::with_network(
+                    let frame = TransactionFrame::from_owned_with_network(
                         tx_envelope.clone(),
                         self.network_id,
                     );
@@ -4103,7 +4104,7 @@ impl<'a> SignatureTracker<'a> {
 // ---------------------------------------------------------------------------
 
 /// Transaction envelope paired with an optional per-TX base fee override.
-type TxWithFee = (TransactionEnvelope, Option<u32>);
+type TxWithFee = (Arc<TransactionEnvelope>, Option<u32>);
 
 /// Result of executing a transaction set (or a single cluster within one).
 pub struct TxSetResult {

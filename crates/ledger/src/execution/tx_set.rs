@@ -5,6 +5,8 @@
 //! fee pre-deduction for Soroban transactions, and sequential classic phase
 //! processing.
 
+use std::sync::Arc;
+
 use super::*;
 
 /// Execute a full transaction set.
@@ -14,7 +16,7 @@ use super::*;
 /// * `soroban` - Soroban execution context (config, PRNG seed, module cache, etc.)
 pub fn execute_transaction_set(
     snapshot: &SnapshotHandle,
-    transactions: &[(TransactionEnvelope, Option<u32>)],
+    transactions: &[(Arc<TransactionEnvelope>, Option<u32>)],
     context: &LedgerContext,
     delta: &mut LedgerDelta,
     soroban: SorobanContext<'_>,
@@ -37,7 +39,7 @@ pub fn execute_transaction_set(
 /// * `deduct_fee` - Whether to deduct fees from source accounts.
 pub fn execute_transaction_set_with_fee_mode(
     snapshot: &SnapshotHandle,
-    transactions: &[(TransactionEnvelope, Option<u32>)],
+    transactions: &[(Arc<TransactionEnvelope>, Option<u32>)],
     context: &LedgerContext,
     delta: &mut LedgerDelta,
     soroban: SorobanContext<'_>,
@@ -95,7 +97,7 @@ pub fn execute_transaction_set_with_fee_mode(
 pub fn run_transactions_on_executor(
     executor: &mut TransactionExecutor,
     snapshot: &SnapshotHandle,
-    transactions: &[(TransactionEnvelope, Option<u32>)],
+    transactions: &[(Arc<TransactionEnvelope>, Option<u32>)],
     base_fee: u32,
     soroban_base_prng_seed: [u8; 32],
     deduct_fee: bool,
@@ -112,7 +114,7 @@ pub fn run_transactions_on_executor(
         let prefetch_start = std::time::Instant::now();
         let mut all_keys = std::collections::HashSet::new();
         for (tx, _) in transactions {
-            let frame = TransactionFrame::new(tx.clone());
+            let frame = TransactionFrame::new(Arc::clone(tx));
             for key in frame.keys_for_fee_processing() {
                 all_keys.insert(key);
             }
@@ -160,7 +162,7 @@ pub fn run_transactions_on_executor(
         let mut merge_seen = false;
         let mut acc_to_max_seq: HashMap<AccountId, i64> = HashMap::new();
         for (tx, _) in transactions.iter() {
-            let frame = TransactionFrame::new(tx.clone());
+            let frame = TransactionFrame::new(Arc::clone(tx));
             let source_id = frame.source_account_id();
             let seq = frame.sequence_number();
             acc_to_max_seq
@@ -222,7 +224,7 @@ pub fn run_transactions_on_executor(
             result.fee_charged = pre_fee_results[tx_index].charged_fee;
         }
 
-        let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
+        let frame = TransactionFrame::with_network(Arc::clone(tx), executor.network_id);
 
         let tx_result = build_tx_result_pair(
             &frame,
@@ -280,7 +282,7 @@ pub fn run_transactions_on_executor(
         for (idx, (tx, _)) in transactions.iter().enumerate() {
             let refund = results[idx].fee_refund;
             if refund > 0 {
-                let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
+                let frame = TransactionFrame::with_network(Arc::clone(tx), executor.network_id);
                 let fee_source_id =
                     henyey_tx::muxed_to_account_id(&frame.fee_source_account());
 
@@ -399,7 +401,7 @@ pub fn execute_soroban_parallel_phase(
         for stage in &phase.stages {
             for cluster in stage {
                 for (tx, _) in cluster {
-                    let frame = TransactionFrame::new(tx.clone());
+                    let frame = TransactionFrame::new(Arc::clone(tx));
                     for key in frame.keys_for_fee_processing() {
                         all_keys.insert(key);
                     }
@@ -511,7 +513,7 @@ pub fn execute_soroban_parallel_phase(
         .iter()
         .flat_map(|s| s.iter())
         .flat_map(|c| c.iter())
-        .map(|(tx, _)| tx)
+        .map(|(tx, _)| tx.as_ref())
         .collect();
 
     // Apply Soroban fee refunds: stellar-core processPostTxSetApply() calls
@@ -560,7 +562,7 @@ pub fn execute_soroban_parallel_phase(
 ///
 /// Returns `(classic_pre_charged, soroban_pre_charged, total_fee_pool)`.
 pub fn pre_deduct_all_fees_on_delta(
-    classic_txs: &[(TransactionEnvelope, Option<u32>)],
+    classic_txs: &[(Arc<TransactionEnvelope>, Option<u32>)],
     soroban_phase: &crate::close::SorobanPhaseStructure,
     base_fee: u32,
     network_id: NetworkId,
@@ -604,7 +606,7 @@ pub fn pre_deduct_all_fees_on_delta(
     let mut classic_pre_charged = Vec::with_capacity(classic_txs.len());
     for (tx, tx_base_fee) in classic_txs {
         let tx_fee = tx_base_fee.unwrap_or(base_fee);
-        let frame = TransactionFrame::with_network(tx.clone(), network_id);
+        let frame = TransactionFrame::with_network(Arc::clone(tx), network_id);
         let fee_source = fee_source_account_id(tx);
 
         let num_ops = std::cmp::max(1, frame.operation_count() as i64);
@@ -636,7 +638,7 @@ pub fn pre_deduct_all_fees_on_delta(
         for cluster in stage {
             for (tx, tx_base_fee) in cluster {
                 let tx_fee = tx_base_fee.unwrap_or(base_fee);
-                let frame = TransactionFrame::with_network(tx.clone(), network_id);
+                let frame = TransactionFrame::with_network(Arc::clone(tx), network_id);
                 let fee_source = fee_source_account_id(tx);
 
                 let num_ops = std::cmp::max(1, frame.operation_count() as i64);
@@ -690,7 +692,7 @@ fn soroban_write_footprint(tx: &TransactionEnvelope) -> Option<Vec<LedgerKey>> {
 /// Returns `(TxSetResult, per_cluster_delta, total_fees)`.
 pub(super) fn execute_single_cluster(
     snapshot: &SnapshotHandle,
-    cluster: &[(TransactionEnvelope, Option<u32>)],
+    cluster: &[(Arc<TransactionEnvelope>, Option<u32>)],
     cluster_offset: usize,
     context: &LedgerContext,
     soroban: &SorobanContext<'_>,
@@ -801,7 +803,7 @@ pub(super) fn execute_single_cluster(
         result.fee_charged = pre.charged_fee.saturating_sub(result.fee_refund);
         result.fee_changes = Some(pre.fee_changes.clone());
 
-        let frame = TransactionFrame::with_network(tx.clone(), executor.network_id);
+        let frame = TransactionFrame::with_network(Arc::clone(tx), executor.network_id);
         let tx_result = build_tx_result_pair(
             &frame,
             &executor.network_id,
@@ -903,7 +905,7 @@ pub(super) fn execute_single_cluster(
 /// merged into `delta` in deterministic cluster order.
 pub(super) fn execute_stage_clusters(
     snapshot: &SnapshotHandle,
-    clusters: &[Vec<(TransactionEnvelope, Option<u32>)>],
+    clusters: &[Vec<(Arc<TransactionEnvelope>, Option<u32>)>],
     global_tx_offset: usize,
     context: &LedgerContext,
     soroban: &SorobanContext<'_>,
@@ -1223,11 +1225,11 @@ pub fn compute_state_size_window_entry(
 /// to determine which order books will be accessed during execution.
 #[cfg(test)]
 fn collect_dex_asset_pairs(
-    transactions: &[(TransactionEnvelope, Option<u32>)],
+    transactions: &[(Arc<TransactionEnvelope>, Option<u32>)],
 ) -> HashSet<(Asset, Asset)> {
     let mut pairs = HashSet::new();
     for (tx, _) in transactions {
-        let frame = TransactionFrame::new(tx.clone());
+        let frame = TransactionFrame::new(Arc::clone(tx));
         for op in frame.operations() {
             match &op.body {
                 OperationBody::ManageSellOffer(o) => {
@@ -1285,7 +1287,7 @@ mod tests {
         })
     }
 
-    fn make_tx_with_ops(ops: Vec<Operation>) -> (TransactionEnvelope, Option<u32>) {
+    fn make_tx_with_ops(ops: Vec<Operation>) -> (Arc<TransactionEnvelope>, Option<u32>) {
         let ops_vec: VecM<Operation, 100> = ops.try_into().unwrap();
         let tx = Transaction {
             source_account: MuxedAccount::Ed25519(Uint256([1u8; 32])),
@@ -1296,10 +1298,10 @@ mod tests {
             operations: ops_vec,
             ext: TransactionExt::V0,
         };
-        (TransactionEnvelope::Tx(TransactionV1Envelope {
+        (Arc::new(TransactionEnvelope::Tx(TransactionV1Envelope {
             tx,
             signatures: VecM::default(),
-        }), None)
+        })), None)
     }
 
     fn op(body: OperationBody) -> Operation {

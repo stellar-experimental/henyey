@@ -277,7 +277,7 @@ impl TransactionSet {
     ) -> std::result::Result<Self, String> {
         for env in transactions {
             validate_tx_fee(env)?;
-            let frame = henyey_tx::TransactionFrame::with_network(env.clone(), network_id);
+            let frame = henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
             if frame.is_soroban() {
                 return Err("Legacy transaction set contains Soroban transaction".to_string());
             }
@@ -543,7 +543,7 @@ fn validate_wire_txs(
     for env in txs {
         validate_tx_fee(env)?;
 
-        let frame = henyey_tx::TransactionFrame::with_network(env.clone(), network_id);
+        let frame = henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
         if frame.is_soroban() != expect_soroban {
             if expect_soroban {
                 return Err("Classic transaction found in Soroban phase".to_string());
