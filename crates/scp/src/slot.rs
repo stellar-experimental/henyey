@@ -293,10 +293,12 @@ impl Slot {
         driver: &Arc<D>,
     ) -> bool {
         if !self.is_validator {
+            tracing::debug!(slot = self.slot_index, "nominate: not a validator");
             return false;
         }
 
         if self.is_externalized() {
+            tracing::debug!(slot = self.slot_index, "nominate: already externalized");
             return false;
         }
 

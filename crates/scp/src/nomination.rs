@@ -293,7 +293,8 @@ impl NominationProtocol {
         self.update_round_leaders(ctx, prev_value);
 
         let mut updated = self.adopt_leader_values(ctx);
-        updated = self.vote_as_leader(ctx, &value) || updated;
+        let voted = self.vote_as_leader(ctx, &value);
+        updated = voted || updated;
 
         // Emit nomination envelope
         if updated {

@@ -1470,28 +1470,42 @@ impl Herder {
         }
 
         // Combine static (config) and runtime (HTTP /upgrades?mode=set) upgrades.
-        // Runtime upgrades take precedence and are time-gated.
-        let mut upgrade_list: Vec<LedgerUpgrade> = self.config.proposed_upgrades.clone();
+        // Parity: stellar-core uses only `Upgrades::createUpgradesFor` which checks
+        // against current ledger state. We must similarly filter static proposed
+        // upgrades to avoid proposing already-applied upgrades (e.g., a protocol
+        // version upgrade that has already taken effect).
+        let header = self.ledger_manager.read().as_ref()
+            .map(|lm| lm.current_header())
+            .unwrap_or_default();
+        let state = CurrentLedgerState {
+            close_time,
+            protocol_version: header.ledger_version,
+            base_fee: header.base_fee,
+            max_tx_set_size: header.max_tx_set_size,
+            base_reserve: header.base_reserve,
+            flags: match &header.ext {
+                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+            },
+            max_soroban_tx_set_size: None, // TODO: read from config settings
+        };
+
+        // Filter static upgrades against current state to avoid proposing
+        // upgrades that have already been applied.
+        let mut upgrade_list: Vec<LedgerUpgrade> = self.config.proposed_upgrades.iter()
+            .filter(|upgrade| match upgrade {
+                LedgerUpgrade::Version(v) => *v != state.protocol_version,
+                LedgerUpgrade::BaseFee(f) => *f != state.base_fee,
+                LedgerUpgrade::MaxTxSetSize(s) => *s != state.max_tx_set_size,
+                LedgerUpgrade::BaseReserve(r) => *r != state.base_reserve,
+                LedgerUpgrade::Flags(f) => *f != state.flags,
+                _ => true, // Config/Soroban upgrades always pass through
+            })
+            .cloned()
+            .collect();
 
         // Add runtime upgrades from the Upgrades scheduling system
-        let runtime_upgrades = {
-            let header = self.ledger_manager.read().as_ref()
-                .map(|lm| lm.current_header())
-                .unwrap_or_default();
-            let state = CurrentLedgerState {
-                close_time,
-                protocol_version: header.ledger_version,
-                base_fee: header.base_fee,
-                max_tx_set_size: header.max_tx_set_size,
-                base_reserve: header.base_reserve,
-                flags: match &header.ext {
-                    stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-                    stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
-                },
-                max_soroban_tx_set_size: None, // TODO: read from config settings
-            };
-            self.runtime_upgrades.read().create_upgrades_for(&state)
-        };
+        let runtime_upgrades = self.runtime_upgrades.read().create_upgrades_for(&state);
         for upgrade in runtime_upgrades {
             // Don't duplicate upgrades of the same type
             let dominated = upgrade_list.iter().any(|existing| {

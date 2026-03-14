@@ -348,6 +348,12 @@ enum Commands {
         #[arg(long)]
         force_catchup: bool,
 
+        /// Run a single-node standalone network from genesis with zero config.
+        /// Creates database, initializes genesis ledger, and starts validating
+        /// with 1-second ledger closes. Data stored in ./local-data/.
+        #[arg(long)]
+        local: bool,
+
         /// Wait to hear from the network before voting (validators only).
         /// Accepted for stellar-core compatibility.
         #[arg(long, hide = true)]
@@ -676,8 +682,24 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging
     init_logging(&cli)?;
 
+    // Check if local mode is requested (needed before config loading).
+    let local = matches!(cli.command, Commands::Run { local: true, .. });
+
+    // Validate --local flag combinations early.
+    if local {
+        if cli.mainnet {
+            anyhow::bail!("--local is incompatible with --mainnet");
+        }
+        if cli.testnet {
+            anyhow::bail!("--local is incompatible with --testnet");
+        }
+        if matches!(cli.command, Commands::Run { watcher: true, .. }) {
+            anyhow::bail!("--local is incompatible with --watcher");
+        }
+    }
+
     // Load or create configuration
-    let mut config = load_config(&cli)?;
+    let mut config = load_config(&cli, local)?;
 
     // Inject build metadata from compile-time environment variables
     config.build = henyey_app::BuildMetadata {
@@ -698,12 +720,13 @@ async fn main() -> anyhow::Result<()> {
             validator,
             watcher,
             force_catchup,
+            local,
             wait_for_consensus: _,
             in_memory: _,
             start_at_ledger: _,
             start_at_hash: _,
             disable_bucket_gc: _,
-        } => cmd_run(config, validator, watcher, force_catchup).await,
+        } => cmd_run(config, validator, watcher, force_catchup, local).await,
 
         Commands::Catchup {
             target,
@@ -873,27 +896,162 @@ fn all_archives(config: &AppConfig) -> anyhow::Result<Vec<henyey_history::Histor
     Ok(archives)
 }
 
+/// Build a standalone local-mode configuration.
+///
+/// Creates an `AppConfig` suitable for running a single-node standalone
+/// network from genesis:
+/// - Network passphrase: "Standalone Network ; February 2017"
+/// - Deterministic node seed (derived from SHA-256 of "local-standalone-seed")
+/// - Self-only quorum set (threshold 100%)
+/// - 1-second ledger closes (`accelerate_time = true`)
+/// - Load generation enabled, compat HTTP enabled
+/// - Data stored in `./local-data/`
+/// - Immediate protocol upgrade to latest version (v25)
+fn local_config() -> AppConfig {
+    use henyey_app::config::{
+        CompatHttpConfig, DatabaseConfig, BucketConfig, HistoryArchiveEntry, HistoryConfig,
+        HttpConfig, NetworkConfig, NodeConfig, OverlayConfig, QuorumSetConfig, TestingConfig,
+        UpgradeConfig,
+    };
+
+    // Derive a deterministic keypair so the node identity is stable across restarts.
+    let seed_hash = henyey_crypto::sha256(b"local-standalone-seed");
+    let secret_key = henyey_crypto::SecretKey::from_seed(&seed_hash.0);
+    let public_key = secret_key.public_key();
+    let node_seed_strkey = secret_key.to_strkey();
+    let node_pubkey_strkey = public_key.to_strkey();
+
+    let data_dir = PathBuf::from("./local-data");
+
+    AppConfig {
+        node: NodeConfig {
+            name: "local".to_string(),
+            node_seed: Some(node_seed_strkey),
+            is_validator: true,
+            home_domain: None,
+            quorum_set: QuorumSetConfig {
+                threshold_percent: 100,
+                validators: vec![node_pubkey_strkey],
+                inner_sets: vec![],
+            },
+            manual_close: false,
+        },
+        network: NetworkConfig {
+            passphrase: "Standalone Network ; February 2017".to_string(),
+            base_fee: 100,
+            base_reserve: 100_000_000, // 10 XLM
+            max_protocol_version: 25,
+        },
+        upgrades: UpgradeConfig {
+            protocol_version: Some(25),
+            base_fee: None,
+            base_reserve: None,
+            max_tx_set_size: None,
+        },
+        database: DatabaseConfig {
+            path: data_dir.join("stellar.db"),
+            pool_size: 10,
+        },
+        buckets: BucketConfig {
+            directory: data_dir.join("buckets"),
+            ..Default::default()
+        },
+        history: HistoryConfig {
+            archives: vec![HistoryArchiveEntry {
+                name: "local".to_string(),
+                url: format!("file://{}", data_dir.join("history").display()),
+                get_enabled: true,
+                put_enabled: true,
+                put: Some(format!(
+                    "mkdir -p {dir}/{{1}} && cp {{0}} {dir}/{{1}}",
+                    dir = data_dir.join("history").display()
+                )),
+                mkdir: Some(format!(
+                    "mkdir -p {dir}/{{0}}",
+                    dir = data_dir.join("history").display()
+                )),
+            }],
+        },
+        overlay: OverlayConfig {
+            known_peers: vec![],
+            preferred_peers: vec![],
+            ..Default::default()
+        },
+        testing: TestingConfig {
+            accelerate_time: true,
+            ledger_close_time: None,
+            generate_load_for_testing: true,
+        },
+        compat_http: CompatHttpConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        http: HttpConfig {
+            port: 11627, // Native HTTP on 11627 to avoid conflict with compat HTTP on 11626
+            ..Default::default()
+        },
+        // Prevent the overlay from injecting default seed peers — this is a
+        // standalone network with no external connectivity.
+        is_compat_config: true,
+        ..Default::default()
+    }
+}
+
 /// Load configuration from file or use defaults.
 ///
 /// Auto-detects stellar-core format configs (flat `SCREAMING_CASE` TOML)
 /// and translates them to henyey's nested format using the compat layer.
-fn load_config(cli: &Cli) -> anyhow::Result<AppConfig> {
-    let mut config = match (&cli.config, cli.mainnet) {
-        (Some(config_path), _) => {
-            tracing::info!(path = ?config_path, "Loading configuration from file");
-            load_config_file(config_path)?
+fn load_config(cli: &Cli, local: bool) -> anyhow::Result<AppConfig> {
+    let mut config = if local {
+        // Start from local standalone defaults. If --config is also provided,
+        // we load it and merge user-specified fields on top.
+        let mut base = local_config();
+        if let Some(config_path) = &cli.config {
+            tracing::info!(
+                path = ?config_path,
+                "Local mode: overlaying config file on local defaults"
+            );
+            let overlay = load_config_file(config_path)?;
+            // Merge overlay: only override fields the user explicitly set.
+            // For simplicity, we merge all non-default-ish config sections.
+            // The key local-mode fields (node, network, database, buckets, testing)
+            // stay from `base` unless the overlay file specifies them.
+            //
+            // Since TOML deserialization fills defaults for unset fields, we
+            // can't distinguish "explicitly set" from "default". Instead we
+            // selectively merge sections that are commonly customized via overlay:
+            // RPC, HTTP, metadata, logging, events, diagnostics, and maintenance.
+            base.rpc = overlay.rpc;
+            base.http = overlay.http;
+            base.metadata = overlay.metadata;
+            base.logging = overlay.logging;
+            base.events = overlay.events;
+            base.diagnostics = overlay.diagnostics;
+            base.maintenance = overlay.maintenance;
+            base.query = overlay.query;
+            base.surge_pricing = overlay.surge_pricing;
+            base.catchup = overlay.catchup;
         }
-        (None, true) => {
-            tracing::info!("Using mainnet configuration");
-            let mut c = AppConfig::mainnet();
-            c.apply_env_overrides();
-            c
-        }
-        (None, false) => {
-            tracing::info!("Using testnet configuration (default)");
-            let mut c = AppConfig::testnet();
-            c.apply_env_overrides();
-            c
+        base.apply_env_overrides();
+        base
+    } else {
+        match (&cli.config, cli.mainnet) {
+            (Some(config_path), _) => {
+                tracing::info!(path = ?config_path, "Loading configuration from file");
+                load_config_file(config_path)?
+            }
+            (None, true) => {
+                tracing::info!("Using mainnet configuration");
+                let mut c = AppConfig::mainnet();
+                c.apply_env_overrides();
+                c
+            }
+            (None, false) => {
+                tracing::info!("Using testnet configuration (default)");
+                let mut c = AppConfig::testnet();
+                c.apply_env_overrides();
+                c
+            }
         }
     };
 
@@ -930,17 +1088,74 @@ async fn cmd_run(
     validator: bool,
     watcher: bool,
     force_catchup: bool,
+    local: bool,
 ) -> anyhow::Result<()> {
     if validator && watcher {
         anyhow::bail!("Cannot run as both validator and watcher");
     }
 
-    let mode = if validator {
+    // In local mode, always run as validator (it's a single-node standalone network).
+    let mode = if local || validator {
         RunMode::Validator
     } else if watcher {
         RunMode::Watcher
     } else {
         RunMode::Full
+    };
+
+    // Local mode: auto-initialize database and history if needed.
+    let config = if local {
+        let config = config;
+        let db_path = &config.database.path;
+
+        // Ensure data directory exists.
+        if let Some(parent) = db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
+        let needs_init = !db_path.exists();
+
+        if needs_init {
+            tracing::info!(path = ?db_path, "Local mode: creating database and genesis ledger");
+
+            // Create database and initialize genesis ledger.
+            let db = henyey_db::Database::open(db_path)?;
+            initialize_genesis_ledger(&db, &config.network.passphrase)?;
+            tracing::info!("Local mode: genesis ledger initialized");
+
+            // Initialize local history archive.
+            let history_dir = config.database.path.parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("history");
+            std::fs::create_dir_all(&history_dir)?;
+            cmd_new_hist(&config, "local").await?;
+            tracing::info!("Local mode: history archive initialized");
+        }
+
+        // Always set force-scp so the node bootstraps from the LCL.
+        {
+            let db = henyey_db::Database::open(db_path)?;
+            db.with_connection(|conn| {
+                use henyey_db::queries::StateQueries;
+                use henyey_db::schema::state_keys;
+                conn.set_state(state_keys::FORCE_SCP, "true")
+            })?;
+            tracing::info!("Local mode: force-scp flag set");
+        }
+
+        // Ensure protocol upgrade is scheduled for immediate application.
+        if config.upgrades.protocol_version.is_some() {
+            tracing::info!(
+                version = config.upgrades.protocol_version,
+                "Local mode: protocol upgrade will be proposed immediately"
+            );
+        }
+
+        config
+    } else {
+        config
     };
 
     let rpc_enabled = config.rpc.enabled;
