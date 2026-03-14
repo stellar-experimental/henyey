@@ -97,6 +97,7 @@ impl TransactionFrame {
         }
     }
 
+
     /// Get the underlying envelope.
     pub fn envelope(&self) -> &TransactionEnvelope {
         &self.envelope

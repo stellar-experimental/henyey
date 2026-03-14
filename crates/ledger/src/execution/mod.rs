@@ -1356,12 +1356,12 @@ impl TransactionExecutor {
             // prior stage TX only modified the entry data (not the TTL). We always check
             // whether the TTL needs loading, even when the entry is already in state.
             if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
-                // Compute TTL key hash once (O3: reused for both IMS and bucket-list paths).
+                // Compute TTL key hash (O3: reused for both IMS and bucket-list paths).
+                // The cache is shared across TXs in this cluster for entries that recur.
                 let key_bytes = key
                     .to_xdr(Limits::none())
                     .map_err(|e| LedgerError::Serialization(e.to_string()))?;
                 let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
-                // Cache the computed hash for reuse in validation/execution.
                 ttl_key_cache.insert(key.clone(), key_hash.clone());
                 let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                     key_hash,
