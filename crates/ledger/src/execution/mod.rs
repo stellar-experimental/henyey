@@ -1991,8 +1991,13 @@ impl TransactionExecutor {
         // not here. The check_operation_signatures call in execute_transaction_with_fee_mode
         // handles inner sig validation after the fee has been deducted.
 
+        // For non-fee-bump TXs, the fee source IS the inner source. When they're
+        // the same account, the second weight check is identical to the first (same
+        // account, same threshold_low, same signatures, same hash). Skip it to avoid
+        // a redundant sig cache lookup (~5µs/TX × 12,500 TXs = ~62ms/cluster).
         let required_weight = threshold_low(&source_account);
         if !frame.is_fee_bump()
+            && fee_source_id != inner_source_id
             && !has_sufficient_signer_weight(
                 &outer_hash,
                 frame.signatures(),

@@ -12,7 +12,7 @@
 //! keys before performing the expensive signature verification.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use once_cell::sync::Lazy;
 
@@ -29,8 +29,11 @@ const SIG_CACHE_CAPACITY: usize = 250_000;
 /// Keyed by SHA-256(pubkey || signature || message_hash). Matches stellar-core's
 /// global `gVerifySigCache` which persists across the validator lifetime so that
 /// signatures verified during flood/nomination get cache hits during apply.
-static SIG_VERIFY_CACHE: Lazy<Mutex<SigVerifyCache>> =
-    Lazy::new(|| Mutex::new(SigVerifyCache::new(SIG_CACHE_CAPACITY)));
+///
+/// Uses RwLock to allow parallel cache lookups from concurrent cluster threads.
+/// Only cache inserts require exclusive access.
+static SIG_VERIFY_CACHE: Lazy<RwLock<SigVerifyCache>> =
+    Lazy::new(|| RwLock::new(SigVerifyCache::new(SIG_CACHE_CAPACITY)));
 
 struct SigVerifyCache {
     map: HashMap<[u8; 32], bool>,
@@ -199,9 +202,9 @@ pub fn verify_hash(
 ) -> Result<(), CryptoError> {
     let cache_key = compute_cache_key(public_key.as_bytes(), signature.as_bytes(), hash.as_bytes());
 
-    // Check cache (lock held only for HashMap lookup, not during crypto)
+    // Check cache (read lock allows parallel lookups from cluster threads)
     {
-        let cache = SIG_VERIFY_CACHE.lock().unwrap();
+        let cache = SIG_VERIFY_CACHE.read().unwrap();
         if let Some(result) = cache.get(&cache_key) {
             return if result {
                 Ok(())
@@ -214,9 +217,9 @@ pub fn verify_hash(
     // Cache miss — perform actual ed25519 verification
     let result = public_key.verify(hash.as_bytes(), signature);
 
-    // Store result in cache
+    // Store result in cache (write lock only for inserts)
     {
-        let mut cache = SIG_VERIFY_CACHE.lock().unwrap();
+        let mut cache = SIG_VERIFY_CACHE.write().unwrap();
         cache.insert(cache_key, result.is_ok());
     }
 
@@ -242,9 +245,9 @@ pub fn verify_hash_from_raw_key(
 ) -> Result<(), CryptoError> {
     let cache_key = compute_cache_key(pubkey_bytes, signature.as_bytes(), hash.as_bytes());
 
-    // Check cache — no decompression needed
+    // Check cache — no decompression needed (read lock for parallel access)
     {
-        let cache = SIG_VERIFY_CACHE.lock().unwrap();
+        let cache = SIG_VERIFY_CACHE.read().unwrap();
         if let Some(result) = cache.get(&cache_key) {
             return if result {
                 Ok(())
@@ -258,9 +261,9 @@ pub fn verify_hash_from_raw_key(
     let public_key = PublicKey::from_bytes(pubkey_bytes)?;
     let result = public_key.verify(hash.as_bytes(), signature);
 
-    // Store result in cache
+    // Store result in cache (write lock only for inserts)
     {
-        let mut cache = SIG_VERIFY_CACHE.lock().unwrap();
+        let mut cache = SIG_VERIFY_CACHE.write().unwrap();
         cache.insert(cache_key, result.is_ok());
     }
 
