@@ -99,9 +99,14 @@ pub fn build_tx_result_pair(
     base_fee: i64,
     protocol_version: u32,
 ) -> Result<TransactionResultPair> {
-    let tx_hash = frame
-        .hash(network_id)
-        .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
+    // Reuse cached hash from execution when available, avoiding redundant XDR+SHA-256
+    let tx_hash = if let Some(h) = exec.tx_hash {
+        h
+    } else {
+        frame
+            .hash(network_id)
+            .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?
+    };
     let op_results: Vec<OperationResult> = exec.operation_results.clone();
 
     let result = if frame.is_fee_bump() {

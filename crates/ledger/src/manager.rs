@@ -60,9 +60,9 @@ use stellar_xdr::curr::{
     LedgerCloseMeta, LedgerCloseMetaExt, LedgerCloseMetaExtV1, LedgerCloseMetaV2, LedgerEntry,
     LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderHistoryEntry,
     LedgerHeaderHistoryEntryExt, LedgerKey, LedgerKeyConfigSetting, PoolId,
-    StateArchivalSettings, TransactionEventStage, TransactionMeta, TransactionPhase,
-    TransactionResultMetaV1, TransactionSetV1, TxSetComponent,
-    TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM,
+    ScpHistoryEntry, StateArchivalSettings, TransactionEventStage, TransactionMeta,
+    TransactionPhase, TransactionResultMetaV1, TransactionSet, TransactionSetV1,
+    TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, UpgradeEntryMeta, VecM,
 };
 use tracing::{debug, info};
 
@@ -4028,11 +4028,40 @@ impl<'a> LedgerCloseContext<'a> {
 
         let commit_start = std::time::Instant::now();
 
-        // Compute transaction result hash
-        let result_set = stellar_xdr::curr::TransactionResultSet {
-            results: self.tx_results.clone().try_into().unwrap_or_default(),
+        // Compute transaction result hash by streaming XDR directly to the
+        // hasher, avoiding a clone of all 50K results just to build a
+        // TransactionResultSet wrapper.
+        let tx_result_hash = {
+            use sha2::{Digest, Sha256};
+            use stellar_xdr::curr::{Limited, Limits, WriteXdr};
+
+            struct Sha256Writer(Sha256);
+            impl std::io::Write for Sha256Writer {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.update(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+
+            let mut writer = Sha256Writer(Sha256::new());
+            let mut limited = Limited::new(&mut writer, Limits::none());
+            // XDR variable-length array: 4-byte length prefix + elements
+            let len = self.tx_results.len() as u32;
+            let ok = len.write_xdr(&mut limited).is_ok()
+                && self
+                    .tx_results
+                    .iter()
+                    .all(|r| r.write_xdr(&mut limited).is_ok());
+            if ok {
+                let hash: [u8; 32] = writer.0.finalize().into();
+                Hash256::from(hash)
+            } else {
+                Hash256::ZERO
+            }
         };
-        let tx_result_hash = Hash256::hash_xdr(&result_set).unwrap_or(Hash256::ZERO);
 
         // Log transaction results for debugging - helps identify tx execution differences
         tracing::debug!(
@@ -4798,11 +4827,19 @@ impl<'a> LedgerCloseContext<'a> {
         };
 
         let meta_start = std::time::Instant::now();
+        // Move tx_set and scp_history out of close_data to avoid cloning 50K envelopes
+        let empty_tx_set = TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash([0; 32]),
+            txs: Default::default(),
+        });
+        let tx_set = std::mem::replace(&mut self.close_data.tx_set, empty_tx_set);
+        let scp_history = std::mem::take(&mut self.close_data.scp_history);
         let meta = build_ledger_close_meta(
-            &self.close_data,
+            tx_set,
+            scp_history,
             &new_header,
             header_hash,
-            &self.tx_result_metas,
+            std::mem::take(&mut self.tx_result_metas),
             evicted_meta_keys,
             avg_soroban_state_size,
             upgrades_meta,
@@ -4879,19 +4916,19 @@ impl<'a> LedgerCloseContext<'a> {
     }
 }
 
-fn build_generalized_tx_set(tx_set: &TransactionSetVariant) -> GeneralizedTransactionSet {
+fn build_generalized_tx_set_owned(tx_set: TransactionSetVariant) -> GeneralizedTransactionSet {
     match tx_set {
-        TransactionSetVariant::Generalized(set) => set.clone(),
+        TransactionSetVariant::Generalized(set) => set,
         TransactionSetVariant::Classic(set) => {
             let component = TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
                 TxSetComponentTxsMaybeDiscountedFee {
                     base_fee: None,
-                    txs: set.txs.clone(),
+                    txs: set.txs,
                 },
             );
             let phase = TransactionPhase::V0(vec![component].try_into().unwrap_or_default());
             GeneralizedTransactionSet::V1(TransactionSetV1 {
-                previous_ledger_hash: set.previous_ledger_hash.clone(),
+                previous_ledger_hash: set.previous_ledger_hash,
                 phases: vec![phase].try_into().unwrap_or_default(),
             })
         }
@@ -4900,10 +4937,11 @@ fn build_generalized_tx_set(tx_set: &TransactionSetVariant) -> GeneralizedTransa
 
 #[allow(clippy::too_many_arguments)]
 fn build_ledger_close_meta(
-    close_data: &LedgerCloseData,
+    tx_set_variant: TransactionSetVariant,
+    scp_history: Vec<ScpHistoryEntry>,
     header: &LedgerHeader,
     header_hash: Hash256,
-    tx_result_metas: &[TransactionResultMetaV1],
+    tx_result_metas: Vec<TransactionResultMetaV1>,
     evicted_keys: Vec<LedgerKey>,
     total_byte_size_of_live_soroban_state: u64,
     upgrades_processing: Vec<UpgradeEntryMeta>,
@@ -4916,7 +4954,7 @@ fn build_ledger_close_meta(
         ext: LedgerHeaderHistoryEntryExt::V0,
     };
 
-    let tx_set = build_generalized_tx_set(&close_data.tx_set);
+    let tx_set = build_generalized_tx_set_owned(tx_set_variant);
 
     // Build the meta extension. When EMIT_LEDGER_CLOSE_META_EXT_V1 is enabled,
     // include sorobanFeeWrite1KB (the flat-rate write fee per 1KB, i.e.
@@ -4938,13 +4976,9 @@ fn build_ledger_close_meta(
         ext,
         ledger_header,
         tx_set,
-        tx_processing: tx_result_metas.to_vec().try_into().unwrap_or_default(),
+        tx_processing: tx_result_metas.try_into().unwrap_or_default(),
         upgrades_processing: upgrades_processing.try_into().unwrap_or_default(),
-        scp_info: close_data
-            .scp_history
-            .clone()
-            .try_into()
-            .unwrap_or_default(),
+        scp_info: scp_history.try_into().unwrap_or_default(),
         total_byte_size_of_live_soroban_state,
         evicted_keys: evicted_keys.try_into().unwrap_or_default(),
     })
@@ -5760,7 +5794,7 @@ mod tests {
         .with_scp_history(vec![scp_entry.clone()]);
 
         let header = create_genesis_header();
-        let meta = build_ledger_close_meta(&close_data, &header, Hash256::ZERO, &[], Vec::new(), 0, Vec::new(), false, 0);
+        let meta = build_ledger_close_meta(close_data.tx_set, close_data.scp_history, &header, Hash256::ZERO, Vec::new(), Vec::new(), 0, Vec::new(), false, 0);
         let scp_info_len = match meta {
             LedgerCloseMeta::V0(_) => 0,
             LedgerCloseMeta::V1(v1) => v1.scp_info.len(),

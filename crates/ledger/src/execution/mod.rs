@@ -346,6 +346,8 @@ pub struct TransactionExecutionResult {
     pub meta_commit_us: u64,
     pub meta_fee_refund_us: u64,
     pub meta_build_phase_us: u64,
+    /// Cached transaction hash (computed during validation, reused in result building).
+    pub tx_hash: Option<Hash256>,
 }
 
 /// Type alias: `ExecutionFailure` is now `TransactionResultCode` from the XDR crate.
@@ -386,6 +388,7 @@ fn failed_result(failure: TransactionResultCode, error: &str) -> TransactionExec
         op_sig_check_us: 0,
         signer_removal_us: 0,
         seq_bump_us: 0,
+        tx_hash: None,
     }
 }
 
@@ -463,6 +466,8 @@ struct PreApplyResult {
     op_sig_check_us: u64,
     signer_removal_us: u64,
     seq_bump_us: u64,
+    // Cached transaction hash from validation phase
+    tx_hash: Option<Hash256>,
 }
 
 /// Snapshot of created/updated/deleted entries for a delta phase (fee, seq, signer).
@@ -2464,6 +2469,7 @@ impl TransactionExecutor {
             op_sig_check_us,
             signer_removal_us,
             seq_bump_us,
+            tx_hash: Some(outer_hash),
         }))
     }
 
@@ -2527,6 +2533,7 @@ impl TransactionExecutor {
             op_sig_check_us: pre.op_sig_check_us,
             signer_removal_us: pre.signer_removal_us,
             seq_bump_us: pre.seq_bump_us,
+            tx_hash: pre.tx_hash,
         }
     }
 
@@ -2643,6 +2650,7 @@ impl TransactionExecutor {
             op_sig_check_us,
             signer_removal_us,
             seq_bump_us,
+            tx_hash,
         } = pre;
 
         // Create ledger context for operation execution
@@ -3353,6 +3361,7 @@ impl TransactionExecutor {
             op_sig_check_us,
             signer_removal_us,
             seq_bump_us,
+            tx_hash,
         })
     }
 
