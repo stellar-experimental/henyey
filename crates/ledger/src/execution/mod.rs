@@ -342,6 +342,10 @@ pub struct TransactionExecutionResult {
     pub signer_removal_us: u64,
     pub seq_bump_us: u64,
     pub meta_build_us: u64,
+    // Meta sub-component timings (microseconds)
+    pub meta_commit_us: u64,
+    pub meta_fee_refund_us: u64,
+    pub meta_build_phase_us: u64,
 }
 
 /// Type alias: `ExecutionFailure` is now `TransactionResultCode` from the XDR crate.
@@ -371,6 +375,9 @@ fn failed_result(failure: TransactionResultCode, error: &str) -> TransactionExec
         footprint_us: 0,
         ops_us: 0,
         meta_build_us: 0,
+        meta_commit_us: 0,
+        meta_fee_refund_us: 0,
+        meta_build_phase_us: 0,
         val_account_load_us: 0,
         val_tx_hash_us: 0,
         val_ed25519_us: 0,
@@ -2504,6 +2511,9 @@ impl TransactionExecutor {
             footprint_us: 0,
             ops_us: 0,
             meta_build_us: 0,
+            meta_commit_us: 0,
+            meta_fee_refund_us: 0,
+            meta_build_phase_us: 0,
             val_account_load_us: pre.val_account_load_us,
             val_tx_hash_us: pre.val_tx_hash_us,
             val_ed25519_us: pre.val_ed25519_us,
@@ -2736,6 +2746,8 @@ impl TransactionExecutor {
         let mut soroban_return_value = None;
         let mut all_success = true;
         let mut failure = None;
+        // Track pre-TX delta position so we only scan NEW created entries for contract cache.
+        let pre_tx_created_count = self.state.delta().created_entries().len();
         // For multi-operation transactions, stellar-core records STATE/UPDATED
         // for every accessed entry per operation, even if values are identical.
         // For single-operation transactions, it only records if values changed.
@@ -3147,6 +3159,8 @@ impl TransactionExecutor {
             - fee_seq_us
             - footprint_us;
 
+        let meta_phase_start = std::time::Instant::now();
+
         if all_success && self.state.has_pending_sponsorship() {
             all_success = false;
             failure = Some(TransactionResultCode::TxBadSponsorship);
@@ -3215,12 +3229,17 @@ impl TransactionExecutor {
             // This ensures subsequent transactions can use VmCachedInstantiation
             // (cheap) instead of VmInstantiation (expensive) for contracts
             // deployed in this transaction.
-            for entry in self.state.delta().created_entries() {
+            // Only scan entries created by THIS TX (not all prior TXs in the cluster)
+            // to avoid O(n²) iteration over the growing delta.
+            let created = self.state.delta().created_entries();
+            for entry in &created[pre_tx_created_count..] {
                 if let stellar_xdr::curr::LedgerEntryData::ContractCode(cc) = &entry.data {
                     self.add_contract_to_cache(cc.code.as_slice());
                 }
             }
         }
+
+        let commit_phase_us = meta_phase_start.elapsed().as_micros() as u64;
 
         let post_fee_changes = empty_entry_changes();
         let mut fee_refund = 0i64;
@@ -3238,6 +3257,8 @@ impl TransactionExecutor {
             fee_refund = refund;
         }
 
+        let fee_refund_phase_us = meta_phase_start.elapsed().as_micros() as u64 - commit_phase_us;
+
         let tx_events = tx_event_manager.finalize();
         let tx_meta = build_transaction_meta(
             tx_changes_before,
@@ -3250,6 +3271,8 @@ impl TransactionExecutor {
             self.emit_soroban_tx_meta_ext_v1,
             self.enable_soroban_diagnostic_events,
         );
+
+        let meta_build_phase_us = meta_phase_start.elapsed().as_micros() as u64 - commit_phase_us - fee_refund_phase_us;
 
         let total_us = tx_timing_start.elapsed().as_micros() as u64;
         let meta_us = total_us - validation_us - fee_seq_us - footprint_us - ops_us;
@@ -3314,6 +3337,9 @@ impl TransactionExecutor {
             footprint_us,
             ops_us,
             meta_build_us: meta_us,
+            meta_commit_us: commit_phase_us,
+            meta_fee_refund_us: fee_refund_phase_us,
+            meta_build_phase_us,
             val_account_load_us,
             val_tx_hash_us,
             val_ed25519_us,

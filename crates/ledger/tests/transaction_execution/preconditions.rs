@@ -591,6 +591,9 @@ fn test_fee_bump_result_encoding() {
         op_sig_check_us: 0,
         signer_removal_us: 0,
         seq_bump_us: 0,
+        meta_commit_us: 0,
+        meta_fee_refund_us: 0,
+        meta_build_phase_us: 0,
     };
 
     let pair = build_tx_result_pair(

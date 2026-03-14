@@ -754,6 +754,18 @@ pub(super) fn execute_single_cluster(
     let mut agg_snapshot_delta_us: u64 = 0;
     let mut agg_execute_us: u64 = 0;
     let mut agg_result_build_us: u64 = 0;
+    let mut agg_validation_us: u64 = 0;
+    let mut agg_fee_seq_us: u64 = 0;
+    let mut agg_footprint_us: u64 = 0;
+    let mut agg_ops_us: u64 = 0;
+    let mut agg_meta_us: u64 = 0;
+    let mut agg_val_account_load_us: u64 = 0;
+    let mut agg_val_tx_hash_us: u64 = 0;
+    let mut agg_val_ed25519_us: u64 = 0;
+    let mut agg_val_other_us: u64 = 0;
+    let mut agg_meta_commit_us: u64 = 0;
+    let mut agg_meta_fee_refund_us: u64 = 0;
+    let mut agg_meta_build_phase_us: u64 = 0;
 
     for (local_idx, (tx, tx_base_fee)) in cluster.iter().enumerate() {
         // Flush pending RO TTL bumps for keys in this TX's write footprint.
@@ -798,6 +810,18 @@ pub(super) fn execute_single_cluster(
             pre.should_apply,
         )?;
         agg_execute_us += exec_start.elapsed().as_micros() as u64;
+        agg_validation_us += result.validation_us;
+        agg_fee_seq_us += result.fee_seq_us;
+        agg_footprint_us += result.footprint_us;
+        agg_ops_us += result.ops_us;
+        agg_meta_us += result.meta_build_us;
+        agg_val_account_load_us += result.val_account_load_us;
+        agg_val_tx_hash_us += result.val_tx_hash_us;
+        agg_val_ed25519_us += result.val_ed25519_us;
+        agg_val_other_us += result.val_other_us;
+        agg_meta_commit_us += result.meta_commit_us;
+        agg_meta_fee_refund_us += result.meta_fee_refund_us;
+        agg_meta_build_phase_us += result.meta_build_phase_us;
 
         // Override fee_charged and fee_changes from pre-deduction.
         // The executor computed fee_refund correctly (based on resource consumption),
@@ -878,6 +902,18 @@ pub(super) fn execute_single_cluster(
         flush_ttl_us = agg_flush_ttl_us,
         snapshot_delta_us = agg_snapshot_delta_us,
         execute_us = agg_execute_us,
+        validation_us = agg_validation_us,
+        fee_seq_us = agg_fee_seq_us,
+        footprint_us = agg_footprint_us,
+        ops_us = agg_ops_us,
+        meta_us = agg_meta_us,
+        val_acct_load_us = agg_val_account_load_us,
+        val_hash_us = agg_val_tx_hash_us,
+        val_ed25519_us = agg_val_ed25519_us,
+        val_other_us = agg_val_other_us,
+        meta_commit_us = agg_meta_commit_us,
+        meta_fee_refund_us = agg_meta_fee_refund_us,
+        meta_build_phase_us = agg_meta_build_phase_us,
         result_build_us = agg_result_build_us,
         flush_final_us,
         apply_delta_us,
