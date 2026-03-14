@@ -641,11 +641,11 @@ pub fn merge_in_memory(
     // Uses reusable buffers to minimize allocations
     let add_entry = |entry: BucketEntry,
                      hasher: &mut Sha256,
-                     key_index: &mut HashMap<Vec<u8>, usize>,
+                     key_index: &mut HashMap<LedgerKey, usize>,
                      all_entries: &mut Vec<BucketEntry>,
                      entry_idx: &mut usize,
                      entry_buf: &mut Vec<u8>,
-                     key_buf: &mut Vec<u8>|
+                     _key_buf: &mut Vec<u8>|
      -> Result<()> {
         use stellar_xdr::curr::Limited;
 
@@ -667,15 +667,7 @@ pub fn merge_in_memory(
         // Build key index for non-metadata entries
         if !entry.is_metadata() {
             if let Some(key) = entry.key() {
-                // Serialize key using reusable buffer, then copy to owned vec for index
-                key_buf.clear();
-                {
-                    let mut limited = Limited::new(key_buf as &mut Vec<u8>, Limits::none());
-                    key.write_xdr(&mut limited).map_err(|e| {
-                        BucketError::Serialization(format!("Failed to serialize key: {}", e))
-                    })?;
-                }
-                key_index.insert(key_buf.clone(), *entry_idx);
+                key_index.insert(key, *entry_idx);
             }
         }
 

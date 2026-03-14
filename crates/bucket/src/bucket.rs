@@ -57,8 +57,8 @@ enum BucketStorage {
     InMemory {
         /// The sorted list of bucket entries.
         entries: Arc<Vec<BucketEntry>>,
-        /// Map from serialized key bytes to entry index for fast lookups.
-        key_index: Arc<HashMap<Vec<u8>, usize>>,
+        /// Map from ledger key to entry index for O(1) lookups.
+        key_index: Arc<HashMap<LedgerKey, usize>>,
     },
     /// Entries stored on disk with a compact index for on-demand loading.
     DiskBacked {
@@ -230,12 +230,9 @@ impl Bucket {
             hasher.update(record_mark.to_be_bytes());
             hasher.update(&entry_bytes);
 
-            // Build key index (only need to serialize key if entry has one)
+            // Build key index
             if let Some(key) = entry.key() {
-                let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
-                    BucketError::Serialization(format!("Failed to serialize key: {}", e))
-                })?;
-                key_index.insert(key_bytes, idx);
+                key_index.insert(key, idx);
             }
         }
 
@@ -267,7 +264,7 @@ impl Bucket {
     pub fn from_parts(
         hash: Hash256,
         entries: Arc<Vec<BucketEntry>>,
-        key_index: Arc<HashMap<Vec<u8>, usize>>,
+        key_index: Arc<HashMap<LedgerKey, usize>>,
         metadata_count: usize,
     ) -> Self {
         Self {
@@ -434,10 +431,7 @@ impl Bucket {
             let mut index = HashMap::new();
             for (idx, entry) in entries.iter().enumerate() {
                 if let Some(key) = entry.key() {
-                    let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
-                        BucketError::Serialization(format!("Failed to serialize key: {}", e))
-                    })?;
-                    index.insert(key_bytes, idx);
+                    index.insert(key, idx);
                 }
             }
             index
@@ -761,11 +755,11 @@ impl Bucket {
             BucketStorage::InMemory { entries, key_index } => {
                 // entries Vec: BucketEntry structs on heap
                 let entries_cap = entries.capacity() * std::mem::size_of::<BucketEntry>();
-                // key_index: HashMap<Vec<u8>, usize> - keys are serialized ledger keys
-                let key_data_bytes: usize = key_index.keys().map(|k| k.len()).sum();
-                // Vec overhead per key (24 bytes) + value usize + hashmap bucket overhead
-                let map_overhead = key_index.len() * (24 + std::mem::size_of::<usize>() + 48);
-                entries_cap + key_data_bytes + map_overhead
+                // key_index: HashMap<LedgerKey, usize>
+                // LedgerKey size + value usize + hashmap bucket overhead per entry
+                let map_overhead = key_index.len()
+                    * (std::mem::size_of::<LedgerKey>() + std::mem::size_of::<usize>() + 48);
+                entries_cap + map_overhead
             }
             BucketStorage::DiskBacked { disk_bucket } => {
                 let index_bytes = disk_bucket.index_heap_bytes();
@@ -873,11 +867,7 @@ impl Bucket {
     pub fn get(&self, key: &LedgerKey) -> Result<Option<BucketEntry>> {
         match &self.storage {
             BucketStorage::InMemory { entries, key_index } => {
-                let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
-                    BucketError::Serialization(format!("Failed to serialize key: {}", e))
-                })?;
-
-                if let Some(&idx) = key_index.get(&key_bytes) {
+                if let Some(&idx) = key_index.get(key) {
                     Ok(entries.get(idx).cloned())
                 } else {
                     Ok(None)
@@ -898,7 +888,7 @@ impl Bucket {
     ) -> Result<Option<BucketEntry>> {
         match &self.storage {
             BucketStorage::InMemory { entries, key_index } => {
-                if let Some(&idx) = key_index.get(key_bytes) {
+                if let Some(&idx) = key_index.get(key) {
                     Ok(entries.get(idx).cloned())
                 } else {
                     Ok(None)
@@ -1043,10 +1033,7 @@ impl Bucket {
 
             // Build key index for entries with keys
             if let Some(key) = entry.key() {
-                let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {
-                    BucketError::Serialization(format!("Failed to serialize key: {}", e))
-                })?;
-                key_index.insert(key_bytes, idx);
+                key_index.insert(key, idx);
             }
         }
 

@@ -60,8 +60,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use stellar_xdr::curr::{
     AccountId, Asset, HotArchiveBucketEntry, LedgerEntry, LedgerEntryData, LedgerEntryType,
-    LedgerHeader, LedgerKey, LedgerKeyTrustLine, Limits, PoolId, StateArchivalSettings,
-    TrustLineAsset, WriteXdr,
+    LedgerHeader, LedgerKey, LedgerKeyTrustLine, PoolId, StateArchivalSettings, TrustLineAsset,
 };
 
 /// A read-only snapshot of a single bucket.
@@ -514,7 +513,7 @@ impl BucketListSnapshot {
         let mut bytes_remaining = settings.eviction_scan_size as u64;
 
         // Track keys we've seen to avoid duplicates (from shadowed entries)
-        let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
 
         loop {
             let level = iter.bucket_list_level as usize;
@@ -582,7 +581,7 @@ impl BucketListSnapshot {
         max_bytes: u64,
         current_ledger: u32,
         candidates: &mut Vec<EvictionCandidate>,
-        seen_keys: &mut HashSet<Vec<u8>>,
+        seen_keys: &mut HashSet<LedgerKey>,
     ) -> crate::Result<(usize, u64, bool)> {
         let mut entries_scanned = 0;
         let mut bytes_used = 0u64;
@@ -602,9 +601,7 @@ impl BucketListSnapshot {
             let live_entry = match &entry {
                 BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
                 BucketEntry::Deadentry(key) => {
-                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                        seen_keys.insert(key_bytes);
-                    }
+                    seen_keys.insert(key.clone());
                     if bytes_used >= max_bytes {
                         iter.bucket_file_offset = start_offset + bytes_used;
                         return Ok((entries_scanned, bytes_used, false));
@@ -630,18 +627,7 @@ impl BucketListSnapshot {
 
             let key = henyey_common::entry_to_key(live_entry);
 
-            let key_bytes = match key.to_xdr(Limits::none()) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    if bytes_used >= max_bytes {
-                        iter.bucket_file_offset = start_offset + bytes_used;
-                        return Ok((entries_scanned, bytes_used, false));
-                    }
-                    continue;
-                }
-            };
-
-            if !seen_keys.insert(key_bytes) {
+            if !seen_keys.insert(key.clone()) {
                 if bytes_used >= max_bytes {
                     iter.bucket_file_offset = start_offset + bytes_used;
                     return Ok((entries_scanned, bytes_used, false));
