@@ -766,27 +766,13 @@ pub(crate) fn build_storage_map_from_typed_ledger_entries(
 /// This function serializes the value to XDR (non-metered) solely to determine
 /// its byte length, then charges the equivalent `ValDeser` cost.
 fn charge_val_deser_for_typed<T: WriteXdr>(budget: &Budget, val: &T) -> Result<(), HostError> {
-    // Count serialized bytes without allocating a buffer.
-    struct ByteCounter(usize);
-    impl std::io::Write for ByteCounter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = ByteCounter(0);
-    let mut limited =
-        soroban_env_common::xdr::Limited::new(&mut counter, DEFAULT_XDR_RW_LIMITS);
-    val.write_xdr(&mut limited).map_err(|_| {
+    let bytes = val.to_xdr(DEFAULT_XDR_RW_LIMITS).map_err(|_| {
         HostError::from(Error::from_type_and_code(
             ScErrorType::Value,
             ScErrorCode::InternalError,
         ))
     })?;
-    budget.charge(ContractCostType::ValDeser, Some(counter.0 as u64))?;
+    budget.charge(ContractCostType::ValDeser, Some(bytes.len() as u64))?;
     Ok(())
 }
 
