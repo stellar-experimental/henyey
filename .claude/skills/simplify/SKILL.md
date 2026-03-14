@@ -49,6 +49,10 @@ For each finding, classify it into exactly one category:
  8. **SCATTERED CONCERN** — a single logical operation (e.g., resetting tracking
     state) performed in multiple call sites instead of one function.
  9. **UNNECESSARY CLONING** — values cloned where a borrow or move would suffice.
+ 9b. **TRIVIAL WRAPPER** — one-liner functions that only delegate to another
+    function with no added logic (e.g., `fn foo(x: T) { bar(x) }`). Inline the
+    call at the call site and remove the wrapper, unless it provides meaningful
+    abstraction (e.g., a public API shielding an internal signature).
 
 ### Naming & Constants
 10. **MISLEADING NAMES** — identifiers whose name does not match their actual

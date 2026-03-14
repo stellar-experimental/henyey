@@ -29,11 +29,6 @@ impl OfferDescriptor {
         }
     }
 
-    /// Create an offer descriptor from an offer entry (alias for `from_offer`).
-    pub fn from_offer_entry(offer: &OfferEntry) -> Self {
-        Self::from_offer(offer)
-    }
-
     /// Create an offer descriptor from a ledger entry containing an offer.
     ///
     /// # Panics
