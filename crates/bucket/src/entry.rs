@@ -226,12 +226,29 @@ pub(crate) fn compare_sc_address(
     a: &stellar_xdr::curr::ScAddress,
     b: &stellar_xdr::curr::ScAddress,
 ) -> Ordering {
-    // Compare by type discriminant first, then by content
-    // Use XDR byte comparison for correctness matching stellar-core xdrpp
-    use stellar_xdr::curr::Limits;
-    let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
-    let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
-    a_bytes.cmp(&b_bytes)
+    // Compare by type discriminant first (XDR enum discriminant order),
+    // then by variant content. Matches stellar-core xdrpp byte ordering
+    // without actually serializing to XDR.
+    use stellar_xdr::curr::ScAddress::*;
+    let disc_a = i32::from(a.discriminant());
+    let disc_b = i32::from(b.discriminant());
+    if disc_a != disc_b {
+        return disc_a.cmp(&disc_b);
+    }
+    match (a, b) {
+        (Account(a), Account(b)) => a.0.cmp(&b.0),
+        (Contract(a), Contract(b)) => a.0.cmp(&b.0),
+        (MuxedAccount(a), MuxedAccount(b)) => a.id.cmp(&b.id).then_with(|| a.ed25519.cmp(&b.ed25519)),
+        (ClaimableBalance(a), ClaimableBalance(b)) => {
+            // ClaimableBalanceId has a discriminant + inner type
+            use stellar_xdr::curr::Limits;
+            let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+            let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+            a_bytes.cmp(&b_bytes)
+        }
+        (LiquidityPool(a), LiquidityPool(b)) => a.0.cmp(&b.0),
+        _ => Ordering::Equal,
+    }
 }
 
 /// Compare two ScVal values using the same order as stellar-core.
