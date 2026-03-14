@@ -1160,6 +1160,7 @@ impl ApplyLoad {
         let mut agg_hot_archive_us: u64 = 0;
         let mut agg_header_us: u64 = 0;
         let mut agg_meta_us: u64 = 0;
+        let mut agg_commit_close_us: u64 = 0;
         let mut agg_total_us: u64 = 0;
 
         for iter in 0..num_ledgers {
@@ -1197,6 +1198,7 @@ impl ApplyLoad {
                 agg_hot_archive_us += p.hot_archive_us;
                 agg_header_us += p.header_us;
                 agg_meta_us += p.meta_us;
+                agg_commit_close_us += p.commit_close_us;
                 agg_total_us += p.total_us;
 
                 warn!(
@@ -1296,8 +1298,20 @@ impl ApplyLoad {
             agg_meta_us as f64 / 1000.0 / n
         );
         warn!(
-            "    total (perf):   {:.2}ms",
-            agg_total_us as f64 / 1000.0 / n
+            "    commit_close:   {:.2}ms",
+            agg_commit_close_us as f64 / 1000.0 / n
+        );
+        let sum_us = agg_begin_close_us + agg_prepare_us + agg_config_load_us
+            + agg_executor_setup_us + agg_fee_pre_deduct_us + agg_post_exec_us
+            + agg_classic_exec_us + agg_soroban_exec_us
+            + agg_commit_setup_us + agg_bucket_lock_wait_us + agg_eviction_us
+            + agg_soroban_state_us + agg_add_batch_us + agg_hot_archive_us
+            + agg_header_us + agg_meta_us + agg_commit_close_us;
+        warn!(
+            "    total (perf):   {:.2}ms (sum={:.2}ms, gap={:.2}ms)",
+            agg_total_us as f64 / 1000.0 / n,
+            sum_us as f64 / 1000.0 / n,
+            (agg_total_us - sum_us) as f64 / 1000.0 / n,
         );
 
         Ok(avg_time)

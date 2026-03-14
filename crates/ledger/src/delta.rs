@@ -48,6 +48,19 @@ use stellar_xdr::curr::{
 /// - `Updated` entries go to the "live" batch
 /// - `Deleted` entries go to the "dead" batch
 #[derive(Debug, Clone)]
+/// Result of categorizing delta entries for bucket list update in a single pass.
+pub struct DeltaCategorization {
+    pub init_entries: Vec<LedgerEntry>,
+    pub live_entries: Vec<LedgerEntry>,
+    pub dead_keys: Vec<LedgerKey>,
+    pub created_count: usize,
+    pub updated_count: usize,
+    pub deleted_count: usize,
+    pub has_offers: bool,
+    pub has_pool_share_trustlines: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum EntryChange {
     /// A new entry was created (did not exist in previous ledger state).
     Created(LedgerEntry),
@@ -553,6 +566,56 @@ impl LedgerDelta {
             .filter(|change| change.is_deleted())
             .map(|change| change.key())
             .collect()
+    }
+
+    /// Result of categorizing delta entries for bucket list update.
+    pub fn categorize_for_bucket_update(&self) -> DeltaCategorization {
+        let mut init = Vec::new();
+        let mut live = Vec::new();
+        let mut dead = Vec::new();
+        let mut created = 0usize;
+        let mut updated = 0usize;
+        let mut deleted = 0usize;
+        let mut has_offers = false;
+        let mut has_pool_share_trustlines = false;
+        for change in self.changes() {
+            // Check entry data type for fast-path in commit_close
+            let entry_ref = match change {
+                EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
+                EntryChange::Updated { current, .. } => current,
+            };
+            match &entry_ref.data {
+                stellar_xdr::curr::LedgerEntryData::Offer(_) => has_offers = true,
+                stellar_xdr::curr::LedgerEntryData::Trustline(tl) if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) => {
+                    has_pool_share_trustlines = true;
+                }
+                _ => {}
+            }
+            match change {
+                EntryChange::Created(entry) => {
+                    created += 1;
+                    init.push(entry.clone());
+                }
+                EntryChange::Updated { current, .. } => {
+                    updated += 1;
+                    live.push((**current).clone());
+                }
+                EntryChange::Deleted { previous } => {
+                    deleted += 1;
+                    dead.push(henyey_common::entry_to_key(previous));
+                }
+            }
+        }
+        DeltaCategorization {
+            init_entries: init,
+            live_entries: live,
+            dead_keys: dead,
+            created_count: created,
+            updated_count: updated,
+            deleted_count: deleted,
+            has_offers,
+            has_pool_share_trustlines,
+        }
     }
 
     /// Get a specific change by key.

@@ -1806,6 +1806,8 @@ impl LedgerManager {
         delta: LedgerDelta,
         new_header: LedgerHeader,
         new_header_hash: Hash256,
+        has_offers: bool,
+        has_pool_share_trustlines: bool,
     ) -> Result<()> {
         // Note: Bucket list was already updated in LedgerCloseContext::commit()
         // Just validate the hash if configured
@@ -1849,73 +1851,62 @@ impl LedgerManager {
             }
         }
 
-        // Update unified offer store with offer changes from this ledger.
-        // OfferStore handles all indexes (order book, account-asset, by-id) internally.
-        if *self.offers_initialized.read() {
-            let mut store = self.offer_store.lock();
-            for change in delta.changes() {
-                let key = change.key();
-                if !matches!(key, LedgerKey::Offer(_)) {
-                    continue;
-                }
-                match change {
-                    EntryChange::Created(entry) => {
-                        store.insert_from_ledger_entry(&entry);
-                    }
-                    EntryChange::Updated { current, .. } => {
-                        store.insert_from_ledger_entry(&current);
-                    }
-                    EntryChange::Deleted { .. } => {
-                        if let LedgerKey::Offer(offer_key) = &key {
-                            store.remove_by_seller(&offer_key.seller_id, offer_key.offer_id);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Update pool share trustline secondary index with changes from this ledger.
+        // Update offer store and pool share index — skip iteration entirely if no relevant changes.
+        if has_offers || has_pool_share_trustlines {
+        let offers_initialized = has_offers && *self.offers_initialized.read();
         for change in delta.changes() {
-            let key = change.key();
-            let tl_key = match &key {
-                LedgerKey::Trustline(tl_key)
-                    if matches!(
-                        tl_key.asset,
-                        stellar_xdr::curr::TrustLineAsset::PoolShare(_)
-                    ) =>
-                {
-                    tl_key
-                }
-                _ => continue,
+            // Quick discriminant check on the entry data to avoid expensive key construction
+            let entry_ref = match change {
+                EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
+                EntryChange::Updated { current, .. } => current,
             };
-            let account_id = tl_key.account_id.clone();
-            match change {
-                EntryChange::Created(entry) => {
-                    if let LedgerEntryData::Trustline(ref tl) = entry.data {
-                        if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset
-                        {
-                            self.pool_share_tl_account_index
-                                .write()
-                                .entry(account_id)
-                                .or_default()
-                                .insert(pool_id.clone());
+            match &entry_ref.data {
+                LedgerEntryData::Offer(_) if offers_initialized => {
+                    let mut store = self.offer_store.lock();
+                    match change {
+                        EntryChange::Created(entry) => {
+                            store.insert_from_ledger_entry(&entry);
                         }
-                    }
-                }
-                EntryChange::Deleted { previous } => {
-                    if let LedgerEntryData::Trustline(ref tl) = previous.data {
-                        if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset
-                        {
-                            let mut idx = self.pool_share_tl_account_index.write();
-                            if let Some(pools) = idx.get_mut(&account_id) {
-                                pools.remove(pool_id);
+                        EntryChange::Updated { current, .. } => {
+                            store.insert_from_ledger_entry(&current);
+                        }
+                        EntryChange::Deleted { previous } => {
+                            if let LedgerEntryData::Offer(ref o) = previous.data {
+                                store.remove_by_seller(&o.seller_id, o.offer_id);
                             }
                         }
                     }
                 }
-                _ => {} // Updated pool share trustlines: no index change needed
+                LedgerEntryData::Trustline(tl) if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) => {
+                    match change {
+                        EntryChange::Created(entry) => {
+                            if let LedgerEntryData::Trustline(ref tl) = entry.data {
+                                if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
+                                    self.pool_share_tl_account_index
+                                        .write()
+                                        .entry(tl.account_id.clone())
+                                        .or_default()
+                                        .insert(pool_id.clone());
+                                }
+                            }
+                        }
+                        EntryChange::Deleted { previous } => {
+                            if let LedgerEntryData::Trustline(ref tl) = previous.data {
+                                if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) = tl.asset {
+                                    let mut idx = self.pool_share_tl_account_index.write();
+                                    if let Some(pools) = idx.get_mut(&tl.account_id) {
+                                        pools.remove(pool_id);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {} // Updated pool share trustlines: no index change needed
+                    }
+                }
+                _ => {} // Skip non-offer, non-pool-share entries
             }
         }
+        } // end if has_offers || has_pool_share_trustlines
 
         // Update state
         {
@@ -4068,10 +4059,7 @@ impl<'a> LedgerCloseContext<'a> {
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             delta_count_final = self.delta.num_changes(),
-            init_count = self.delta.init_entries().len(),
-            live_count = self.delta.live_entries().len(),
-            dead_count = self.delta.dead_entries().len(),
-            "Delta entry counts before bucket list update"
+            "Delta entry count before bucket list update"
         );
 
         // Load state archival settings BEFORE acquiring bucket list lock to avoid deadlock.
@@ -4096,6 +4084,17 @@ impl<'a> LedgerCloseContext<'a> {
             None
         };
 
+        // Categorize delta entries for bucket list update (single pass) before acquiring write lock
+        let cat = self.delta.categorize_for_bucket_update();
+        let init_entries = cat.init_entries;
+        let mut live_entries = cat.live_entries;
+        let mut dead_entries = cat.dead_keys;
+        let bucket_created_count = cat.created_count;
+        let bucket_updated_count = cat.updated_count;
+        let bucket_deleted_count = cat.deleted_count;
+        let delta_has_offers = cat.has_offers;
+        let delta_has_pool_share_trustlines = cat.has_pool_share_trustlines;
+
         let commit_setup_us = commit_start.elapsed().as_micros() as u64;
 
         // Apply delta to bucket list FIRST, then compute its hash
@@ -4112,9 +4111,6 @@ impl<'a> LedgerCloseContext<'a> {
                 ledger_seq = self.close_data.ledger_seq,
                 "Acquired bucket list write lock"
             );
-            let init_entries = self.delta.init_entries();
-            let mut live_entries = self.delta.live_entries();
-            let mut dead_entries = self.delta.dead_entries();
 
             // Filter out entries restored from hot archive that were then deleted.
             // These entries came from hot archive (not live bucket list), so deleting them
@@ -4692,17 +4688,14 @@ impl<'a> LedgerCloseContext<'a> {
         )?;
         let header_us = header_start.elapsed().as_micros() as u64;
 
-        // Record stats
-        let entries_created = self.delta.changes().filter(|c| c.is_created()).count();
-        let entries_updated = self.delta.changes().filter(|c| c.is_updated()).count();
-        let entries_deleted = self.delta.changes().filter(|c| c.is_deleted()).count();
+        // Record stats (counts were already computed during categorize_for_bucket_update)
         self.stats
-            .record_entry_changes(entries_created, entries_updated, entries_deleted);
+            .record_entry_changes(bucket_created_count, bucket_updated_count, bucket_deleted_count);
 
         // Commit to manager
         let commit_close_start = std::time::Instant::now();
         self.manager
-            .commit_close(self.delta, new_header.clone(), header_hash)?;
+            .commit_close(self.delta, new_header.clone(), header_hash, delta_has_offers, delta_has_pool_share_trustlines)?;
         let commit_close_us = commit_close_start.elapsed().as_micros() as u64;
 
         // If protocol upgraded to a new major version, rebuild the module cache.
