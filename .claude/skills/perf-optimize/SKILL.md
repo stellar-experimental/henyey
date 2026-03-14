@@ -17,6 +17,12 @@ Iteratively optimize henyey's apply-load single-shot benchmark to reach
 results, ledger hashes, meta) must stay identical. Only internal implementation
 performance is in scope.
 
+**Major refactorings are allowed and encouraged** when they unlock performance
+gains. Don't shy away from changing data structures (e.g. `Vec` → `Arc`),
+reworking function signatures, or restructuring hot paths across crate
+boundaries. Correctness is verified by the test suite, not by minimizing diff
+size.
+
 ## Phase 1: Baseline Measurement
 
 1. Generate a session ID (8-char random hex). All session data goes under
