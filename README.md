@@ -137,6 +137,24 @@ A validator participates in consensus. Requires a secret key and quorum configur
 ./target/release/henyey --config configs/mainnet.toml run
 ```
 
+### Local Standalone Network
+
+Start a single-node standalone network from genesis with zero configuration:
+
+```bash
+./target/release/henyey run --local
+```
+
+This single command replaces the manual `new-db` → `new-hist` → `force-scp` → `run --validator` workflow. It creates a fresh genesis ledger, initializes a local history archive, auto-upgrades to the latest protocol (v25), and closes ledgers at 1-second intervals. Data is stored in `./local-data/` relative to the current directory.
+
+You can overlay a config file on top of local defaults, for example to enable the RPC server:
+
+```bash
+./target/release/henyey --config my-rpc.toml run --local
+```
+
+The local network passphrase is `Standalone Network ; February 2017`.
+
 ## Henyey RPC Server
 
 Henyey includes a built-in Stellar JSON-RPC 2.0 server that can replace the standalone `stellar-rpc` service entirely. Enable it by adding a `[rpc]` section to your config:

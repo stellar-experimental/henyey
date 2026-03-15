@@ -59,6 +59,12 @@ henyey --testnet run --validator
 
 # Run as watcher (observe only)
 henyey --testnet run --watcher
+
+# Run a local standalone network from genesis (zero configuration)
+henyey run --local
+
+# Local mode with config overlay (e.g., enable RPC)
+henyey --config my-rpc.toml run --local
 ```
 
 ### Catching up from history archives
