@@ -983,7 +983,6 @@ impl Clone for BucketLevel {
 ///
 /// BucketList is `Clone` but not `Send` or `Sync` by default. For concurrent
 /// access, wrap in appropriate synchronization primitives.
-#[derive(Clone)]
 pub struct BucketList {
     /// The 11 levels of the bucket list (indices 0-10).
     levels: Vec<BucketLevel>,
@@ -1005,6 +1004,9 @@ pub struct BucketList {
     merge_map: Option<std::sync::Arc<std::sync::RwLock<BucketMergeMap>>>,
     /// Counters for merge operations (shared across all merge calls).
     merge_counters: Arc<MergeCounters>,
+    /// Background thread handle for async bucket persistence.
+    /// Bounded to one concurrent write; the next add_batch waits for completion.
+    pending_persist: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Deduplicate ledger entries by key, keeping only the last occurrence.
@@ -1163,6 +1165,7 @@ impl BucketList {
             completed_merges: Vec::new(),
             merge_map: None,
             merge_counters: Arc::new(MergeCounters::new()),
+            pending_persist: None,
         }
     }
 
@@ -1904,25 +1907,42 @@ impl BucketList {
         // restart recovery can locate them by hash.  Level 0 uses an in-memory
         // merge whose result has no backing file; writing it here means the
         // persisted HAS always references files that exist.
+        //
+        // Optimization: persist in a background thread so the critical path
+        // doesn't block on disk I/O. The next add_batch_internal call will
+        // wait for this thread to complete (via join) before starting new
+        // persistence work, bounding concurrency to one background write.
         if let Some(ref dir) = self.bucket_dir {
+            // Wait for any previous background persist to complete
+            if let Some(handle) = self.pending_persist.take() {
+                handle.join().ok();
+            }
+
+            let mut buckets_to_persist: Vec<(Arc<Bucket>, std::path::PathBuf)> = Vec::new();
             for level in &self.levels {
-                for bucket in [&level.curr, &level.snap] {
-                    if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
-                        let permanent = dir.join(canonical_bucket_filename(&bucket.hash()));
+                for bucket_ref in [&level.curr, &level.snap] {
+                    if bucket_ref.backing_file_path().is_none() && !bucket_ref.hash().is_zero() {
+                        let permanent = dir.join(canonical_bucket_filename(&bucket_ref.hash()));
                         if !permanent.exists() {
-                            if let Err(e) = bucket.save_to_xdr_file(&permanent) {
-                                tracing::warn!(
-                                    error = %e,
-                                    hash = %bucket.hash().to_hex(),
-                                    "Failed to persist in-memory bucket to disk"
-                                );
-                            }
+                            buckets_to_persist.push((Arc::clone(bucket_ref), permanent));
                         }
                     }
                 }
             }
+            if !buckets_to_persist.is_empty() {
+                self.pending_persist = Some(std::thread::spawn(move || {
+                    for (bucket, path) in buckets_to_persist {
+                        if let Err(e) = bucket.save_to_xdr_file(&path) {
+                            tracing::warn!(
+                                error = %e,
+                                hash = %bucket.hash().to_hex(),
+                                "Failed to persist in-memory bucket to disk"
+                            );
+                        }
+                    }
+                }));
+            }
         }
-
         Ok(())
     }
 
@@ -2272,6 +2292,7 @@ impl BucketList {
             completed_merges: Vec::new(),
             merge_map: None,
             merge_counters: Arc::new(MergeCounters::new()),
+            pending_persist: None,
         })
     }
 
@@ -2370,6 +2391,7 @@ impl BucketList {
             completed_merges: Vec::new(),
             merge_map: None,
             merge_counters: Arc::new(MergeCounters::new()),
+            pending_persist: None,
         })
     }
 
@@ -3065,6 +3087,30 @@ impl BucketList {
 impl Default for BucketList {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for BucketList {
+    fn drop(&mut self) {
+        // Wait for any pending background persist to complete
+        if let Some(handle) = self.pending_persist.take() {
+            handle.join().ok();
+        }
+    }
+}
+
+impl Clone for BucketList {
+    fn clone(&self) -> Self {
+        Self {
+            levels: self.levels.clone(),
+            ledger_seq: self.ledger_seq,
+            bucket_dir: self.bucket_dir.clone(),
+            bucket_list_db_config: self.bucket_list_db_config.clone(),
+            completed_merges: self.completed_merges.clone(),
+            merge_map: self.merge_map.clone(),
+            merge_counters: self.merge_counters.clone(),
+            pending_persist: None, // Background persist is not cloned
+        }
     }
 }
 

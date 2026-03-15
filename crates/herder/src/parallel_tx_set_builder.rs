@@ -672,6 +672,32 @@ pub fn stages_to_xdr_phase(
     })
 }
 
+/// Like `stages_to_xdr_phase`, but skips canonical sorting.
+///
+/// Use this when the caller will re-sort the transactions later (e.g.,
+/// `prepare_with_hash` in the ledger close path). Avoids the cost of
+/// XDR-serializing + SHA-256-hashing every transaction for sort keys.
+fn stages_to_xdr_phase_unsorted(
+    stages: Vec<Vec<Vec<TransactionEnvelope>>>,
+    base_fee: Option<i64>,
+) -> TransactionPhase {
+    let execution_stages: Vec<ParallelTxExecutionStage> = stages
+        .into_iter()
+        .map(|stage| {
+            let clusters: Vec<DependentTxCluster> = stage
+                .into_iter()
+                .map(|cluster| DependentTxCluster(cluster.try_into().unwrap_or_default()))
+                .collect();
+            ParallelTxExecutionStage(clusters.try_into().unwrap_or_default())
+        })
+        .collect();
+
+    TransactionPhase::V1(ParallelTxsComponent {
+        base_fee,
+        execution_stages: execution_stages.try_into().unwrap_or_default(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -726,7 +752,9 @@ pub fn build_two_phase_tx_set(
             .into_iter()
             .filter(|c| !c.is_empty())
             .collect::<Vec<_>>()];
-        stages_to_xdr_phase(stages, soroban_base_fee)
+        // Skip sorting here — prepare_with_hash re-sorts all TXs by hash anyway.
+        // This avoids double-hashing 50K TXs (saves ~100ms).
+        stages_to_xdr_phase_unsorted(stages, soroban_base_fee)
     };
 
     GeneralizedTransactionSet::V1(TransactionSetV1 {

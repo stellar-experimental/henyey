@@ -1803,7 +1803,7 @@ impl LedgerManager {
     /// This is called by LedgerCloseContext::commit().
     fn commit_close(
         &self,
-        delta: LedgerDelta,
+        offer_pool_changes: Vec<crate::delta::EntryChange>,
         new_header: LedgerHeader,
         new_header_hash: Hash256,
         has_offers: bool,
@@ -1854,7 +1854,7 @@ impl LedgerManager {
         // Update offer store and pool share index — skip iteration entirely if no relevant changes.
         if has_offers || has_pool_share_trustlines {
         let offers_initialized = has_offers && *self.offers_initialized.read();
-        for change in delta.changes() {
+        for change in &offer_pool_changes {
             // Quick discriminant check on the entry data to avoid expensive key construction
             let entry_ref = match change {
                 EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
@@ -1915,9 +1915,10 @@ impl LedgerManager {
             state.header_hash = new_header_hash;
         }
 
-        // Drop the delta (150K+ entries) on a background thread to avoid blocking
-        // the critical path with deallocation. The delta is no longer needed.
-        std::thread::spawn(move || drop(delta));
+        // Drop offer/pool changes on a background thread if non-trivial.
+        if !offer_pool_changes.is_empty() {
+            std::thread::spawn(move || drop(offer_pool_changes));
+        }
 
         Ok(())
     }
@@ -2235,7 +2236,7 @@ impl<'a> LedgerCloseContext<'a> {
     /// Load an entry from the snapshot.
     fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         // First check if we have a pending change
-        if let Some(change) = self.delta.get_change(key)? {
+        if let Some(change) = self.delta.get_change(key) {
             return Ok(change.current_entry().cloned());
         }
 
@@ -3196,7 +3197,21 @@ impl<'a> LedgerCloseContext<'a> {
 
         let prepare_start = std::time::Instant::now();
         let tx_set_hash = self.close_data.tx_set_hash();
-        let prepared = self.close_data.tx_set.prepare_with_hash(tx_set_hash);
+        let prepared = if self.close_data.presorted {
+            // Take ownership of tx_set to avoid cloning 50K envelopes.
+            // Replace with empty classic set; the original is only needed for meta later
+            // (which is skipped in simulation mode).
+            let tx_set = std::mem::replace(
+                &mut self.close_data.tx_set,
+                TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                    previous_ledger_hash: Hash([0; 32]),
+                    txs: Default::default(),
+                }),
+            );
+            tx_set.prepare_presorted(tx_set_hash)
+        } else {
+            self.close_data.tx_set.prepare_with_hash(tx_set_hash)
+        };
         let prepare_us = prepare_start.elapsed().as_micros() as u64;
 
         if prepared.all_txs.is_empty() {
@@ -3834,7 +3849,7 @@ impl<'a> LedgerCloseContext<'a> {
                 // by the config upgrade), falling back to the snapshot.
                 // Parity: stellar-core reads from LedgerTxn which includes prior modifications.
                 let (window_vec_base, previous_entry) = {
-                    let delta_change = self.delta.get_change(&window_key)?;
+                    let delta_change = self.delta.get_change(&window_key);
                     if let Some(change) = delta_change {
                         if let Some(current) = change.current_entry() {
                             if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
@@ -4117,8 +4132,10 @@ impl<'a> LedgerCloseContext<'a> {
             None
         };
 
-        // Categorize delta entries for bucket list update (single pass) before acquiring write lock
-        let cat = self.delta.categorize_for_bucket_update();
+        // Categorize delta entries for bucket list update (single pass) before acquiring write lock.
+        // Drains entries from the delta (moving instead of cloning), saving ~50K clone operations.
+        // Metadata (fee_pool_delta, total_coins_delta) is preserved for build_and_hash_header.
+        let cat = self.delta.drain_categorization_for_bucket_update();
         let init_entries = cat.init_entries;
         let mut live_entries = cat.live_entries;
         let mut dead_entries = cat.dead_keys;
@@ -4127,6 +4144,7 @@ impl<'a> LedgerCloseContext<'a> {
         let bucket_deleted_count = cat.deleted_count;
         let delta_has_offers = cat.has_offers;
         let delta_has_pool_share_trustlines = cat.has_pool_share_trustlines;
+        let offer_pool_changes = cat.offer_pool_changes;
 
         let commit_setup_us = commit_start.elapsed().as_micros() as u64;
 
@@ -4728,7 +4746,7 @@ impl<'a> LedgerCloseContext<'a> {
         // Commit to manager
         let commit_close_start = std::time::Instant::now();
         self.manager
-            .commit_close(self.delta, new_header.clone(), header_hash, delta_has_offers, delta_has_pool_share_trustlines)?;
+            .commit_close(offer_pool_changes, new_header.clone(), header_hash, delta_has_offers, delta_has_pool_share_trustlines)?;
         let commit_close_us = commit_close_start.elapsed().as_micros() as u64;
 
         // If protocol upgraded to a new major version, rebuild the module cache.
@@ -5986,7 +6004,7 @@ mod tests {
         let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: id,
         });
-        delta.get_change(&key).ok().flatten().and_then(|change| {
+        delta.get_change(&key).and_then(|change| {
             change.current_entry().and_then(|entry| {
                 if let LedgerEntryData::ConfigSetting(ref cs) = entry.data {
                     Some(cs.clone())

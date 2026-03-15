@@ -108,6 +108,10 @@ pub struct LedgerCloseData {
 
     /// Cached transaction set hash (computed once, reused).
     cached_tx_set_hash: std::cell::OnceCell<Hash256>,
+
+    /// When true, skip per-TX hashing and sorting in prepare_with_hash.
+    /// Only safe when the TX set stages are already in final execution order.
+    pub presorted: bool,
 }
 
 impl LedgerCloseData {
@@ -127,6 +131,7 @@ impl LedgerCloseData {
             prev_ledger_hash,
             stellar_value_ext: StellarValueExt::Basic,
             cached_tx_set_hash: std::cell::OnceCell::new(),
+            presorted: false,
         }
     }
 
@@ -154,6 +159,13 @@ impl LedgerCloseData {
     /// correct ledger header hash.
     pub fn with_stellar_value_ext(mut self, ext: StellarValueExt) -> Self {
         self.stellar_value_ext = ext;
+        self
+    }
+
+    /// Mark the TX set as already sorted in final execution order.
+    /// Skips per-TX hashing and sorting in prepare (~140ms for 50K TXs).
+    pub fn with_presorted(mut self) -> Self {
+        self.presorted = true;
         self
     }
 
@@ -715,7 +727,92 @@ impl TransactionSetVariant {
         self.prepare_with_hash(self.hash())
     }
 
-    /// Prepare with a pre-computed hash (avoids recomputing when cached).
+    /// Consuming variant that moves TX envelopes instead of cloning.
+    /// Skips per-TX hashing and sorting — stages must already be in final order.
+    pub fn prepare_presorted(self, hash: Hash256) -> PreparedTxSet {
+        let (classic_txs, soroban_phase, all_txs) = match self {
+            TransactionSetVariant::Classic(set) => {
+                let txs: Vec<TxWithFee> = Vec::from(set.txs).into_iter().map(|tx| (Arc::new(tx), None)).collect();
+                let sorted = sorted_for_apply_sequential(txs, hash);
+                (sorted.clone(), None, sorted)
+            }
+            TransactionSetVariant::Generalized(set) => {
+                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
+                let mut classic_txs = Vec::new();
+                let mut soroban_phase = None;
+                let mut all_txs = Vec::new();
+
+                for phase in Vec::from(set_v1.phases) {
+                    match phase {
+                        stellar_xdr::curr::TransactionPhase::V0(components) => {
+                            let mut phase_txs = Vec::new();
+                            for comp in Vec::from(components) {
+                                match comp {
+                                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
+                                        let base_fee =
+                                            c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                        phase_txs.extend(
+                                            Vec::from(c.txs).into_iter().map(|tx| (Arc::new(tx), base_fee)),
+                                        );
+                                    }
+                                }
+                            }
+                            let sorted = sorted_for_apply_sequential(phase_txs, hash);
+                            classic_txs = sorted.clone();
+                            all_txs.extend(sorted);
+                        }
+                        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                            let base_fee =
+                                parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                            let stages: Vec<Vec<Vec<TxWithFee>>> = Vec::from(parallel.execution_stages)
+                                .into_iter()
+                                .map(|stage| {
+                                    Vec::from(stage.0)
+                                        .into_iter()
+                                        .map(|cluster| {
+                                            Vec::from(cluster.0)
+                                                .into_iter()
+                                                .map(|tx| (Arc::new(tx), base_fee))
+                                                .collect()
+                                        })
+                                        .collect()
+                                })
+                                .collect();
+
+                            for stage in &stages {
+                                for cluster in stage {
+                                    all_txs.extend(cluster.iter().cloned());
+                                }
+                            }
+
+                            if !stages.is_empty() {
+                                soroban_phase = Some(SorobanPhaseStructure { base_fee, stages });
+                            }
+                        }
+                    }
+                }
+
+                (classic_txs, soroban_phase, all_txs)
+            }
+        };
+
+        let tx_meta = all_txs
+            .iter()
+            .map(|(env, _)| TxMeta {
+                fee_source: crate::execution::fee_source_account_id(env),
+                is_soroban: envelope_is_soroban(env),
+            })
+            .collect();
+
+        PreparedTxSet {
+            hash,
+            classic_txs,
+            soroban_phase,
+            all_txs,
+            tx_meta,
+        }
+    }
+
     pub fn prepare_with_hash(&self, hash: Hash256) -> PreparedTxSet {
         let (classic_txs, soroban_phase, all_txs) = match self {
             TransactionSetVariant::Classic(set) => {
@@ -1206,7 +1303,7 @@ impl UpgradeContext {
 
         // Load existing entry from delta (if previously modified) or snapshot
         let existing = delta
-            .get_change(&key)?
+            .get_change(&key)
             .and_then(|c| c.current_entry().cloned())
             .or_else(|| snapshot.get_entry(&key).ok().flatten());
 

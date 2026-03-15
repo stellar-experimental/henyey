@@ -41,7 +41,6 @@ fn test_execute_transaction_time_bounds_too_early() {
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -100,7 +99,6 @@ fn test_execute_transaction_min_seq_num_precondition() {
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -171,7 +169,6 @@ fn test_execute_transaction_min_seq_num_relaxed_sequence() {
     let (key, entry) = create_account_entry(account_id.clone(), 100, 10_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -248,7 +245,6 @@ fn test_execute_transaction_strict_sequence_without_min_seq_num() {
     let (key, entry) = create_account_entry(account_id.clone(), 100, 10_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -324,7 +320,6 @@ fn test_execute_transaction_min_seq_age_precondition() {
         create_account_entry_with_seq_info(account_id.clone(), 1, 10_000_000, seq_ledger, seq_time);
     let snapshot = SnapshotBuilder::new(10)
         .add_entry(key, entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -398,7 +393,6 @@ fn test_execute_transaction_min_seq_ledger_gap_precondition() {
         create_account_entry_with_seq_info(account_id.clone(), 1, 10_000_000, seq_ledger, seq_time);
     let snapshot = SnapshotBuilder::new(10)
         .add_entry(key, entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -465,7 +459,6 @@ fn test_execute_transaction_extra_signers_missing() {
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -620,7 +613,6 @@ fn test_operation_failure_rolls_back_changes() {
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -726,9 +718,7 @@ fn test_fee_bump_inner_signature_uses_low_threshold() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(inner_key, inner_entry)
-        .expect("add inner")
         .add_entry(fee_key, fee_entry)
-        .expect("add fee")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 

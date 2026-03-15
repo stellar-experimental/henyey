@@ -45,11 +45,8 @@ fn test_soroban_refund_event_after_all_txs() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(contract_key.clone(), contract_entry)
-        .expect("add contract")
         .add_entry(ttl_key, ttl_entry)
-        .expect("add ttl")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -345,9 +342,7 @@ fn test_set_options_loads_signer_sponsor_accounts() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(sponsor_key, sponsor_entry)
-        .expect("add sponsor")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -475,7 +470,6 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(key, entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -649,19 +643,12 @@ fn test_deleted_offer_not_reloaded_from_snapshot() {
     // Build snapshot with all entries
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .add_entry(offer_owner_key, offer_owner_entry)
-        .expect("add offer_owner")
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(source_tl_key, source_tl_entry)
-        .expect("add source trustline")
         .add_entry(offer_owner_tl_key, offer_owner_tl_entry)
-        .expect("add offer_owner trustline")
         .add_entry(offer_key.clone(), offer_entry)
-        .expect("add offer")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -935,7 +922,7 @@ async fn test_parallel_soroban_multi_cluster_execution() {
     // Build snapshot with all entries
     let mut builder = SnapshotBuilder::new(1);
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
-        builder = builder.add_entry(key, entry).expect("add entry");
+        builder = builder.add_entry(key, entry);
     }
     let snapshot = SnapshotHandle::new(builder.build_with_default_header());
 
@@ -1017,7 +1004,7 @@ async fn test_parallel_soroban_matches_sequential() {
     // Build snapshot with all entries.
     let mut builder = SnapshotBuilder::new(1);
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
-        builder = builder.add_entry(key, entry).expect("add entry");
+        builder = builder.add_entry(key, entry);
     }
     let snapshot = SnapshotHandle::new(builder.build_with_default_header());
 
@@ -1136,7 +1123,7 @@ async fn test_parallel_soroban_deterministic() {
 
     let mut builder = SnapshotBuilder::new(1);
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
-        builder = builder.add_entry(key, entry).expect("add entry");
+        builder = builder.add_entry(key, entry);
     }
     let snapshot = SnapshotHandle::new(builder.build_with_default_header());
 
@@ -1218,7 +1205,7 @@ async fn test_parallel_soroban_from_spawn_blocking() {
 
     let mut builder = SnapshotBuilder::new(1);
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
-        builder = builder.add_entry(key, entry).expect("add entry");
+        builder = builder.add_entry(key, entry);
     }
     let snapshot = SnapshotHandle::new(builder.build_with_default_header());
 
@@ -1297,7 +1284,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
 
     let mut builder = SnapshotBuilder::new(1);
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
-        builder = builder.add_entry(key, entry).expect("add entry");
+        builder = builder.add_entry(key, entry);
     }
     let snapshot = SnapshotHandle::new(builder.build_with_default_header());
 
@@ -1348,7 +1335,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
         let (_, e1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
         let (_, e2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
         for (key, entry) in e1.into_iter().chain(e2.into_iter()) {
-            b = b.add_entry(key, entry).expect("add entry");
+            b = b.add_entry(key, entry);
         }
         b.build_with_default_header()
     });
@@ -1460,11 +1447,8 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(tl_key, tl_entry)
-        .expect("add trustline")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -1728,25 +1712,15 @@ fn test_advance_to_ledger_preserving_offers() {
     // Build snapshot
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(owner_a_key, owner_a_entry)
-        .expect("add owner_a")
         .add_entry(owner_b_key, owner_b_entry)
-        .expect("add owner_b")
         .add_entry(source_tl_key, source_tl_entry)
-        .expect("add source_tl")
         .add_entry(owner_a_tl_key, owner_a_tl_entry)
-        .expect("add owner_a_tl")
         .add_entry(owner_b_tl_key, owner_b_tl_entry)
-        .expect("add owner_b_tl")
         .add_entry(offer_a_key.clone(), offer_a_entry)
-        .expect("add offer_a")
         .add_entry(offer_b_key.clone(), offer_b_entry)
-        .expect("add offer_b")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -1990,19 +1964,12 @@ fn test_internal_error_maps_to_tx_internal_error() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .add_entry(seller_key, seller_entry)
-        .expect("add seller")
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(source_tl_key, source_tl_entry)
-        .expect("add source trustline")
         .add_entry(seller_tl_key, seller_tl_entry)
-        .expect("add seller trustline")
         .add_entry(offer_key, offer_entry)
-        .expect("add offer")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -2098,9 +2065,7 @@ fn test_create_account_sponsor_low_reserve_before_underfunded() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(sponsor_key, sponsor_entry)
-        .expect("add sponsor")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -2258,9 +2223,7 @@ fn test_clawback_claimable_balance_not_issuer_error_code() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(cb_key, cb_entry)
-        .expect("add cb")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -2365,9 +2328,7 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 10_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -2638,17 +2599,11 @@ fn test_set_trust_line_flags_redeems_pool_shares_loaded_from_snapshot() {
     // Build snapshot WITHOUT the pool share trustline — it's "on disk" only.
     let snapshot = SnapshotBuilder::new(10)
         .add_entry(issuer_key, issuer_entry)
-        .unwrap()
         .add_entry(trustor_key, trustor_entry)
-        .unwrap()
         .add_entry(other_issuer_key, other_issuer_entry)
-        .unwrap()
         .add_entry(pool_key, pool_entry)
-        .unwrap()
         .add_entry(asset_a_tl_key, asset_a_tl_entry)
-        .unwrap()
         .add_entry(asset_b_tl_key, asset_b_tl_entry)
-        .unwrap()
         .build_with_default_header();
 
     // Encode the pool share TL key for lookup.
@@ -2841,9 +2796,7 @@ fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(inner_key, inner_entry)
-        .expect("add inner")
         .add_entry(fee_key, fee_entry)
-        .expect("add fee")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -3001,11 +2954,8 @@ fn test_op_source_merged_in_prior_tx_returns_bad_auth() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(op_source_key, op_source_entry)
-        .expect("add op_source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -3161,9 +3111,7 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -3381,9 +3329,7 @@ fn test_fee_bump_soroban_checks_inner_signatures() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(inner_key, inner_entry)
-        .expect("add inner")
         .add_entry(fee_key, fee_entry)
-        .expect("add fee")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -3570,11 +3516,8 @@ fn test_should_apply_false_skips_operation_body() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(contract_key.clone(), contract_entry)
-        .expect("add contract")
         .add_entry(ttl_key, ttl_entry)
-        .expect("add ttl")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -3730,7 +3673,6 @@ fn test_pre_charged_fee_override_on_validation_failure() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -3835,7 +3777,6 @@ fn test_single_op_tx_failure_rolls_back_without_per_op_savepoint() {
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, initial_balance);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 

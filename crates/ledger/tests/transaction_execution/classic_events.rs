@@ -10,9 +10,7 @@ fn test_classic_events_emitted_for_payment() {
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 1_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -113,9 +111,7 @@ fn test_classic_events_payment_with_muxed_destination() {
     let (dest_key, dest_entry) = create_account_entry(dest_account_id.clone(), 1, 1_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -211,9 +207,7 @@ fn test_classic_events_payment_with_memo_data() {
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 1_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -307,9 +301,7 @@ fn test_classic_events_payment_memo_precedence() {
     let (dest_key, dest_entry) = create_account_entry(dest_account_id.clone(), 1, 1_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -402,9 +394,7 @@ fn test_classic_events_emitted_for_account_merge() {
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 1_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add dest")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -495,7 +485,6 @@ fn test_classic_events_emitted_for_create_account() {
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 200_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -586,7 +575,6 @@ fn test_classic_events_emitted_for_create_claimable_balance() {
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 200_000_000);
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -710,9 +698,7 @@ fn test_classic_events_emitted_for_claim_claimable_balance() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(claimable_key, claimable_entry)
-        .expect("add claimable balance")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -817,11 +803,8 @@ fn test_classic_events_emitted_for_allow_trust() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(trustor_key, trustor_entry)
-        .expect("add trustor")
         .add_entry(trustline_key, trustline_entry)
-        .expect("add trustline")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -920,11 +903,8 @@ fn test_classic_events_emitted_for_set_trustline_flags() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(trustor_key, trustor_entry)
-        .expect("add trustor")
         .add_entry(trustline_key, trustline_entry)
-        .expect("add trustline")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -1031,11 +1011,8 @@ fn test_classic_events_emitted_for_clawback() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(trustor_key, trustor_entry)
-        .expect("add trustor")
         .add_entry(trustline_key, trustline_entry)
-        .expect("add trustline")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -1149,9 +1126,7 @@ fn test_classic_events_emitted_for_clawback_claimable_balance() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(claimable_key, claimable_entry)
-        .expect("add claimable balance")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -1266,15 +1241,10 @@ fn test_classic_events_emitted_for_liquidity_pool_deposit() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(pool_key, pool_entry)
-        .expect("add pool")
         .add_entry(asset_b_key, asset_b_entry)
-        .expect("add trustline")
         .add_entry(pool_share_key, pool_share_entry)
-        .expect("add pool share")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -1410,15 +1380,10 @@ fn test_classic_events_emitted_for_liquidity_pool_withdraw() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(pool_key, pool_entry)
-        .expect("add pool")
         .add_entry(asset_b_key, asset_b_entry)
-        .expect("add trustline")
         .add_entry(pool_share_key, pool_share_entry)
-        .expect("add pool share")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -1603,17 +1568,11 @@ fn test_classic_events_emitted_for_manage_sell_offer() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(offer_key.clone(), offer_entry)
-        .expect("add offer owner")
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(source_tl_key, source_tl_entry)
-        .expect("add source trustline")
         .add_entry(offer_tl_key.clone(), offer_tl_entry)
-        .expect("add offer trustline")
         .add_entry(offer_entry_key.clone(), offer_entry_value)
-        .expect("add offer entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 
@@ -1750,19 +1709,12 @@ fn test_classic_events_emitted_for_path_payment_strict_send() {
 
     let snapshot = SnapshotBuilder::new(1)
         .add_entry(source_key, source_entry)
-        .expect("add source")
         .add_entry(dest_key, dest_entry)
-        .expect("add destination")
         .add_entry(offer_key.clone(), offer_entry)
-        .expect("add offer owner")
         .add_entry(issuer_key, issuer_entry)
-        .expect("add issuer")
         .add_entry(source_tl_key, source_tl_entry)
-        .expect("add source trustline")
         .add_entry(offer_tl_key.clone(), offer_tl_entry)
-        .expect("add offer trustline")
         .add_entry(offer_entry_key.clone(), offer_entry_value)
-        .expect("add offer entry")
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
 

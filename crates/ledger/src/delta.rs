@@ -31,7 +31,7 @@ use crate::{LedgerError, Result};
 use std::collections::HashMap;
 use stellar_xdr::curr::{
     AccountId, LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerKey,
-    LedgerKeyAccount, Limits, VecM, WriteXdr,
+    LedgerKeyAccount, VecM,
 };
 
 /// Represents a single change to a ledger entry.
@@ -58,6 +58,9 @@ pub struct DeltaCategorization {
     pub deleted_count: usize,
     pub has_offers: bool,
     pub has_pool_share_trustlines: bool,
+    /// Offer and pool share trustline changes, extracted for commit_close processing.
+    /// Only populated when has_offers or has_pool_share_trustlines is true.
+    pub offer_pool_changes: Vec<EntryChange>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,14 +125,6 @@ impl EntryChange {
     }
 }
 
-/// Serialize a ledger key to bytes for use as a hash map key.
-///
-/// Uses XDR encoding to produce a canonical byte representation of the key.
-/// This ensures consistent hashing regardless of how the key was constructed.
-pub fn key_to_bytes(key: &LedgerKey) -> Result<Vec<u8>> {
-    key.to_xdr(Limits::none())
-        .map_err(|e| LedgerError::Serialization(e.to_string()))
-}
 
 /// Accumulator for all ledger entry changes during a single ledger close.
 ///
@@ -163,11 +158,15 @@ pub struct LedgerDelta {
     /// The ledger sequence this delta applies to.
     ledger_seq: u32,
 
-    /// All entry changes, keyed by XDR-encoded LedgerKey.
-    changes: HashMap<Vec<u8>, EntryChange>,
+    /// All entry changes, keyed by LedgerKey directly.
+    ///
+    /// Using LedgerKey as the HashMap key eliminates XDR serialization overhead
+    /// on every lookup (~1µs per call), which saves ~50ms per 50K-TX ledger in
+    /// the fee pre-deduction path alone.
+    changes: HashMap<LedgerKey, EntryChange>,
 
     /// Keys in the order changes were first recorded (for deterministic iteration).
-    change_order: Vec<Vec<u8>>,
+    change_order: Vec<LedgerKey>,
 
     /// Net change to the fee pool (positive = fees collected).
     fee_pool_delta: i64,
@@ -203,18 +202,17 @@ impl LedgerDelta {
     /// - If it was deleted, return error (can't create a deleted entry)
     pub fn record_create(&mut self, entry: LedgerEntry) -> Result<()> {
         let key = henyey_common::entry_to_key(&entry);
-        let key_bytes = key_to_bytes(&key)?;
 
-        if let Some(existing) = self.changes.get(&key_bytes) {
+        if let Some(existing) = self.changes.get(&key) {
             match existing {
                 EntryChange::Created(_) => {
                     // Entry was already created, update with new value
-                    self.changes.insert(key_bytes, EntryChange::Created(entry));
+                    self.changes.insert(key, EntryChange::Created(entry));
                 }
                 EntryChange::Updated { previous, .. } => {
                     // Entry was updated, keep original previous and update current
                     self.changes.insert(
-                        key_bytes,
+                        key,
                         EntryChange::Updated {
                             previous: previous.clone(),
                             current: Box::new(entry),
@@ -225,7 +223,7 @@ impl LedgerDelta {
                     // Deleted then created = update (entry existed before the ledger,
                     // was deleted, then recreated - net effect is an update).
                     self.changes.insert(
-                        key_bytes,
+                        key,
                         EntryChange::Updated {
                             previous: previous.clone(),
                             current: Box::new(entry),
@@ -234,8 +232,8 @@ impl LedgerDelta {
                 }
             }
         } else {
-            self.change_order.push(key_bytes.clone());
-            self.changes.insert(key_bytes, EntryChange::Created(entry));
+            self.change_order.push(key.clone());
+            self.changes.insert(key, EntryChange::Created(entry));
         }
         Ok(())
     }
@@ -243,20 +241,19 @@ impl LedgerDelta {
     /// Record an update to an existing entry.
     pub fn record_update(&mut self, previous: LedgerEntry, current: LedgerEntry) -> Result<()> {
         let key = henyey_common::entry_to_key(&current);
-        let key_bytes = key_to_bytes(&key)?;
 
         // Check if we already have a change for this entry
-        if let Some(existing) = self.changes.get(&key_bytes) {
+        if let Some(existing) = self.changes.get(&key) {
             match existing {
                 EntryChange::Created(_) => {
                     // If we created and then updated, just record as created with new value
                     self.changes
-                        .insert(key_bytes, EntryChange::Created(current));
+                        .insert(key, EntryChange::Created(current));
                 }
                 EntryChange::Updated { previous: orig, .. } => {
                     // Update the current value, keep original previous
                     self.changes.insert(
-                        key_bytes,
+                        key,
                         EntryChange::Updated {
                             previous: orig.clone(),
                             current: Box::new(current),
@@ -267,7 +264,7 @@ impl LedgerDelta {
                     // Deleted then updated = entry was deleted then came back
                     // (e.g., via fee refund restore). Keep original previous.
                     self.changes.insert(
-                        key_bytes,
+                        key,
                         EntryChange::Updated {
                             previous: orig.clone(),
                             current: Box::new(current),
@@ -276,9 +273,9 @@ impl LedgerDelta {
                 }
             }
         } else {
-            self.change_order.push(key_bytes.clone());
+            self.change_order.push(key.clone());
             self.changes.insert(
-                key_bytes,
+                key,
                 EntryChange::Updated {
                     previous,
                     current: Box::new(current),
@@ -313,20 +310,19 @@ impl LedgerDelta {
         }
 
         let key = henyey_common::entry_to_key(&entry);
-        let key_bytes = key_to_bytes(&key)?;
 
         // Check if we already have a change for this entry
-        if let Some(existing) = self.changes.get(&key_bytes) {
+        if let Some(existing) = self.changes.get(&key) {
             match existing {
                 EntryChange::Created(_) => {
                     // If we created and then deleted, remove from delta entirely
-                    self.changes.remove(&key_bytes);
-                    self.change_order.retain(|k| k != &key_bytes);
+                    self.changes.remove(&key);
+                    self.change_order.retain(|k| k != &key);
                 }
                 EntryChange::Updated { previous, .. } => {
                     // If we updated and then deleted, record as deleted with original previous
                     self.changes.insert(
-                        key_bytes,
+                        key,
                         EntryChange::Deleted {
                             previous: previous.clone(),
                         },
@@ -338,9 +334,9 @@ impl LedgerDelta {
                 }
             }
         } else {
-            self.change_order.push(key_bytes.clone());
+            self.change_order.push(key.clone());
             self.changes
-                .insert(key_bytes, EntryChange::Deleted { previous: entry });
+                .insert(key, EntryChange::Deleted { previous: entry });
         }
 
         Ok(())
@@ -375,10 +371,9 @@ impl LedgerDelta {
         let key = LedgerKey::Account(LedgerKeyAccount {
             account_id: account_id.clone(),
         });
-        let key_bytes = key_to_bytes(&key)?;
 
         // Get the current entry from the delta, or load from snapshot.
-        let (mut entry, is_new) = if let Some(change) = self.changes.get(&key_bytes) {
+        let (mut entry, is_new) = if let Some(change) = self.changes.get(&key) {
             if let Some(current) = change.current_entry() {
                 (current.clone(), false)
             } else {
@@ -429,9 +424,9 @@ impl LedgerDelta {
         // Update the delta with the post-fee-deduction entry.
         if is_new {
             // First time this account appears in the delta — record as Update.
-            self.change_order.push(key_bytes.clone());
+            self.change_order.push(key.clone());
             self.changes.insert(
-                key_bytes,
+                key,
                 EntryChange::Updated {
                     previous: state_entry,
                     current: Box::new(entry),
@@ -439,7 +434,7 @@ impl LedgerDelta {
             );
         } else {
             // Already in delta — update the current value in place.
-            if let Some(change) = self.changes.get_mut(&key_bytes) {
+            if let Some(change) = self.changes.get_mut(&key) {
                 match change {
                     EntryChange::Created(ref mut e) => {
                         if let LedgerEntryData::Account(ref mut acc) = e.data {
@@ -469,12 +464,11 @@ impl LedgerDelta {
     ///
     /// Returns `Some(entry)` if the key has a Created or Updated change.
     /// Returns `None` if the key is Deleted or not present in the delta.
-    pub fn get_current_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-        let key_bytes = key_to_bytes(key)?;
-        if let Some(change) = self.changes.get(&key_bytes) {
-            Ok(change.current_entry().cloned())
+    pub fn get_current_entry(&self, key: &LedgerKey) -> Option<LedgerEntry> {
+        if let Some(change) = self.changes.get(key) {
+            change.current_entry().cloned()
         } else {
-            Ok(None)
+            None
         }
     }
 
@@ -487,9 +481,8 @@ impl LedgerDelta {
         let key = LedgerKey::Account(LedgerKeyAccount {
             account_id: account_id.clone(),
         });
-        let key_bytes = key_to_bytes(&key)?;
 
-        if let Some(change) = self.changes.get_mut(&key_bytes) {
+        if let Some(change) = self.changes.get_mut(&key) {
             match change {
                 EntryChange::Created(ref mut entry) => {
                     if let LedgerEntryData::Account(ref mut acc) = entry.data {
@@ -615,32 +608,94 @@ impl LedgerDelta {
             deleted_count: deleted,
             has_offers,
             has_pool_share_trustlines,
+            offer_pool_changes: Vec::new(),
+        }
+    }
+
+    /// Drains entries from the delta, categorizing them for bucket list update.
+    /// Moves entries instead of cloning, saving ~50K clone operations.
+    /// Metadata (fee_pool_delta, total_coins_delta) is preserved.
+    /// Offer and pool share trustline changes are collected separately for commit_close.
+    pub fn drain_categorization_for_bucket_update(&mut self) -> DeltaCategorization {
+        let mut init = Vec::new();
+        let mut live = Vec::new();
+        let mut dead = Vec::new();
+        let mut created = 0usize;
+        let mut updated = 0usize;
+        let mut deleted = 0usize;
+        let mut has_offers = false;
+        let mut has_pool_share_trustlines = false;
+        let mut offer_pool_changes = Vec::new();
+        for (_key, change) in self.changes.drain() {
+            let entry_ref = match &change {
+                EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
+                EntryChange::Updated { current, .. } => current,
+            };
+            let is_offer_or_pool = match &entry_ref.data {
+                stellar_xdr::curr::LedgerEntryData::Offer(_) => {
+                    has_offers = true;
+                    true
+                }
+                stellar_xdr::curr::LedgerEntryData::Trustline(tl) if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)) => {
+                    has_pool_share_trustlines = true;
+                    true
+                }
+                _ => false,
+            };
+            if is_offer_or_pool {
+                offer_pool_changes.push(change.clone());
+            }
+            match change {
+                EntryChange::Created(entry) => {
+                    created += 1;
+                    init.push(entry);
+                }
+                EntryChange::Updated { current, .. } => {
+                    updated += 1;
+                    live.push(*current);
+                }
+                EntryChange::Deleted { previous } => {
+                    deleted += 1;
+                    dead.push(henyey_common::entry_to_key(&previous));
+                }
+            }
+        }
+        DeltaCategorization {
+            init_entries: init,
+            live_entries: live,
+            dead_keys: dead,
+            created_count: created,
+            updated_count: updated,
+            deleted_count: deleted,
+            has_offers,
+            has_pool_share_trustlines,
+            offer_pool_changes,
         }
     }
 
     /// Get a specific change by key.
-    pub fn get_change(&self, key: &LedgerKey) -> Result<Option<&EntryChange>> {
-        let key_bytes = key_to_bytes(key)?;
-        Ok(self.changes.get(&key_bytes))
+    pub fn get_change(&self, key: &LedgerKey) -> Option<&EntryChange> {
+        self.changes.get(key)
     }
 
     /// Merge another delta into this one.
     ///
     /// This is useful when combining changes from multiple operations.
     pub fn merge(&mut self, other: LedgerDelta) -> Result<()> {
-        // Build a map from change_order for O(1) lookup, consuming `other` by value
-        // to avoid cloning entries.
+        // Consume `other` by value, iterating in insertion order to preserve
+        // deterministic ordering. Using LedgerKey directly avoids XDR
+        // serialization during the merge (~1µs per key eliminated).
         let mut other_changes = other.changes;
-        for key_bytes in other.change_order {
-            if let Some(change) = other_changes.remove(&key_bytes) {
+        for key in other.change_order {
+            if let Some(change) = other_changes.remove(&key) {
                 match change {
                     EntryChange::Created(entry) => {
-                        if let Some(existing) = self.changes.get(&key_bytes) {
+                        if let Some(existing) = self.changes.get(&key) {
                             match existing {
                                 EntryChange::Deleted { previous } => {
                                     // Deleted then created = update
                                     self.changes.insert(
-                                        key_bytes,
+                                        key,
                                         EntryChange::Updated {
                                             previous: previous.clone(),
                                             current: Box::new(entry),
@@ -652,7 +707,7 @@ impl LedgerDelta {
                                     // same entry that an earlier stage already restored
                                     // from the hot archive.  Keep the later value.
                                     self.changes
-                                        .insert(key_bytes, EntryChange::Created(entry));
+                                        .insert(key, EntryChange::Created(entry));
                                 }
                                 EntryChange::Updated { .. } => {
                                     return Err(LedgerError::Internal(
@@ -661,23 +716,23 @@ impl LedgerDelta {
                                 }
                             }
                         } else {
-                            self.change_order.push(key_bytes.clone());
+                            self.change_order.push(key.clone());
                             self.changes
-                                .insert(key_bytes, EntryChange::Created(entry));
+                                .insert(key, EntryChange::Created(entry));
                         }
                     }
                     EntryChange::Updated { previous, current } => {
-                        if let Some(existing) = self.changes.get(&key_bytes) {
+                        if let Some(existing) = self.changes.get(&key) {
                             match existing {
                                 EntryChange::Created(_) => {
                                     self.changes.insert(
-                                        key_bytes,
+                                        key,
                                         EntryChange::Created(*current),
                                     );
                                 }
                                 EntryChange::Updated { previous: orig, .. } => {
                                     self.changes.insert(
-                                        key_bytes,
+                                        key,
                                         EntryChange::Updated {
                                             previous: orig.clone(),
                                             current,
@@ -695,9 +750,9 @@ impl LedgerDelta {
                             // This occurs when merging independent deltas (e.g. parallel
                             // cluster execution) where each delta carries its own
                             // previous/current state.
-                            self.change_order.push(key_bytes.clone());
+                            self.change_order.push(key.clone());
                             self.changes.insert(
-                                key_bytes,
+                                key,
                                 EntryChange::Updated {
                                     previous,
                                     current,
@@ -706,16 +761,16 @@ impl LedgerDelta {
                         }
                     }
                     EntryChange::Deleted { previous } => {
-                        if let Some(existing) = self.changes.get(&key_bytes) {
+                        if let Some(existing) = self.changes.get(&key) {
                             match existing {
                                 EntryChange::Created(_) => {
                                     // Created then deleted = no change
-                                    self.changes.remove(&key_bytes);
-                                    self.change_order.retain(|k| k != &key_bytes);
+                                    self.changes.remove(&key);
+                                    self.change_order.retain(|k| k != &key);
                                 }
                                 EntryChange::Updated { previous: orig, .. } => {
                                     self.changes.insert(
-                                        key_bytes,
+                                        key,
                                         EntryChange::Deleted {
                                             previous: orig.clone(),
                                         },
@@ -739,9 +794,9 @@ impl LedgerDelta {
                                 }
                             }
                         } else {
-                            self.change_order.push(key_bytes.clone());
+                            self.change_order.push(key.clone());
                             self.changes.insert(
-                                key_bytes,
+                                key,
                                 EntryChange::Deleted {
                                     previous,
                                 },
@@ -1462,7 +1517,7 @@ mod tests {
         delta.record_delete(entry.clone()).unwrap();
 
         // get_change should return Deleted
-        let change = delta.get_change(&key).unwrap();
+        let change = delta.get_change(&key);
         assert!(change.is_some(), "deleted entry should be findable");
         assert!(change.unwrap().is_deleted());
 
@@ -1487,7 +1542,7 @@ mod tests {
         assert_eq!(delta.num_changes(), 0, "create+delete should cancel out");
 
         // Entry should not be findable
-        let change = delta.get_change(&key).unwrap();
+        let change = delta.get_change(&key);
         assert!(
             change.is_none(),
             "entry should have been removed from delta"
@@ -1515,7 +1570,7 @@ mod tests {
 
         delta.record_delete(custom.clone()).unwrap();
 
-        let change = delta.get_change(&key).unwrap().unwrap();
+        let change = delta.get_change(&key).unwrap();
         assert!(change.is_deleted());
 
         // Previous entry should be the exact entry we deleted

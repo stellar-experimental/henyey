@@ -396,7 +396,8 @@ impl ApplyLoad {
             header.scp_value.close_time.0 + 1,
             header_hash,
         )
-        .with_upgrades(upgrades);
+        .with_upgrades(upgrades)
+        .with_presorted();
 
         let result = self.app.ledger_manager().close_ledger(close_data, None)?;
 

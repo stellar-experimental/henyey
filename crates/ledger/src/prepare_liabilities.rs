@@ -370,7 +370,7 @@ fn update_sponsor_num_sponsoring(
     });
 
     // Load the current version of the sponsor account: first from delta, then snapshot.
-    let (mut entry, previous) = if let Some(current) = delta.get_current_entry(&key)? {
+    let (mut entry, previous) = if let Some(current) = delta.get_current_entry(&key) {
         // Already in the delta — use it as both current and we'll update in place.
         (current.clone(), None) // None means it's already tracked in delta
     } else if let Some(entry) = snapshot.get_entry(&key)? {
@@ -550,7 +550,7 @@ pub fn prepare_liabilities(
         }
     }
 
-    let mut changed_accounts: HashSet<Vec<u8>> = HashSet::new();
+    let mut changed_accounts: HashSet<LedgerKey> = HashSet::new();
     let mut n_changed_trustlines: u64 = 0;
     let mut n_updated_offers: HashMap<UpdateOfferResult, u64> = HashMap::new();
 
@@ -594,7 +594,7 @@ pub fn prepare_liabilities(
             account_id: account_id.clone(),
         });
         let (account_entry, _account_already_in_delta) =
-            if let Some(current) = delta.get_current_entry(&account_key)? {
+            if let Some(current) = delta.get_current_entry(&account_key) {
                 (current, true)
             } else {
                 let entry = snapshot
@@ -680,8 +680,7 @@ pub fn prepare_liabilities(
                 let sponsor_key = LedgerKey::Account(LedgerKeyAccount {
                     account_id: sponsor_id.clone(),
                 });
-                let sponsor_key_bytes = crate::delta::key_to_bytes(&sponsor_key)?;
-                changed_accounts.insert(sponsor_key_bytes);
+                changed_accounts.insert(sponsor_key);
             }
 
             // Record the offer deletion in the delta.
@@ -792,8 +791,7 @@ pub fn prepare_liabilities(
         // previous iteration), coalescing keeps the original previous and
         // replaces the current with our updated entry.
         if account_mut != &account_before {
-            let account_key_bytes = crate::delta::key_to_bytes(&account_key)?;
-            changed_accounts.insert(account_key_bytes);
+            changed_accounts.insert(account_key.clone());
             account_entry_current.last_modified_ledger_seq = ledger_seq;
             delta.record_update(account_entry.clone(), account_entry_current)?;
         }

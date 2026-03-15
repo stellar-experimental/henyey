@@ -21,7 +21,6 @@
 //! not in the cache. This allows efficient snapshots that don't need to copy
 //! the entire ledger state upfront.
 
-use crate::delta::key_to_bytes;
 use crate::{LedgerError, Result};
 use henyey_common::Hash256;
 use std::collections::HashMap;
@@ -66,11 +65,11 @@ pub struct LedgerSnapshot {
     /// SHA-256 hash of the XDR-encoded header.
     header_hash: Hash256,
 
-    /// Cached entries keyed by XDR-encoded LedgerKey.
+    /// Cached entries keyed by LedgerKey directly.
     ///
     /// This may be a subset of the full ledger state. Entries not in
     /// this cache can be loaded via the lookup function in SnapshotHandle.
-    entries: HashMap<Vec<u8>, LedgerEntry>,
+    entries: HashMap<LedgerKey, LedgerEntry>,
 }
 
 impl LedgerSnapshot {
@@ -78,7 +77,7 @@ impl LedgerSnapshot {
     pub fn new(
         header: LedgerHeader,
         header_hash: Hash256,
-        entries: HashMap<Vec<u8>, LedgerEntry>,
+        entries: HashMap<LedgerKey, LedgerEntry>,
     ) -> Self {
         Self {
             ledger_seq: header.ledger_seq,
@@ -155,29 +154,27 @@ impl LedgerSnapshot {
     }
 
     /// Look up an entry by key.
-    pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<&LedgerEntry>> {
-        let key_bytes = key_to_bytes(key)?;
-        Ok(self.entries.get(&key_bytes))
+    pub fn get_entry(&self, key: &LedgerKey) -> Option<&LedgerEntry> {
+        self.entries.get(key)
     }
 
     /// Look up an account by ID.
-    pub fn get_account(&self, account_id: &AccountId) -> Result<Option<&AccountEntry>> {
+    pub fn get_account(&self, account_id: &AccountId) -> Option<&AccountEntry> {
         let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
             account_id: account_id.clone(),
         });
 
-        if let Some(entry) = self.get_entry(&key)? {
+        if let Some(entry) = self.get_entry(&key) {
             if let LedgerEntryData::Account(ref account) = entry.data {
-                return Ok(Some(account));
+                return Some(account);
             }
         }
-        Ok(None)
+        None
     }
 
     /// Check if an entry exists.
-    pub fn contains(&self, key: &LedgerKey) -> Result<bool> {
-        let key_bytes = key_to_bytes(key)?;
-        Ok(self.entries.contains_key(&key_bytes))
+    pub fn contains(&self, key: &LedgerKey) -> bool {
+        self.entries.contains_key(key)
     }
 
     /// Set the ID pool value in the header.
@@ -269,7 +266,7 @@ pub struct SnapshotHandle {
     pool_share_tls_by_account_fn: Option<PoolShareTrustlinesByAccountFn>,
     /// Cache populated by prefetch, checked before falling through to lookup_fn.
     /// Uses Arc<RwLock> so clones of SnapshotHandle share the same cache.
-    prefetch_cache: Arc<parking_lot::RwLock<HashMap<Vec<u8>, LedgerEntry>>>,
+    prefetch_cache: Arc<parking_lot::RwLock<HashMap<LedgerKey, LedgerEntry>>>,
 }
 
 impl SnapshotHandle {
@@ -389,15 +386,12 @@ impl SnapshotHandle {
         let mut remaining = Vec::new();
         let prefetch = self.prefetch_cache.read();
         for key in keys {
-            if let Some(entry) = self.inner.get_entry(key)? {
+            if let Some(entry) = self.inner.get_entry(key) {
+                result.push(entry.clone());
+            } else if let Some(entry) = prefetch.get(key) {
                 result.push(entry.clone());
             } else {
-                let key_bytes = key_to_bytes(key)?;
-                if let Some(entry) = prefetch.get(&key_bytes) {
-                    result.push(entry.clone());
-                } else {
-                    remaining.push(key.clone());
-                }
+                remaining.push(key.clone());
             }
         }
         drop(prefetch);
@@ -425,9 +419,7 @@ impl SnapshotHandle {
             let mut cache = self.prefetch_cache.write();
             for entry in &loaded {
                 let key = henyey_common::entry_to_key(entry);
-                if let Ok(key_bytes) = key_to_bytes(&key) {
-                    cache.insert(key_bytes, entry.clone());
-                }
+                cache.insert(key, entry.clone());
             }
         }
         result.extend(loaded);
@@ -465,14 +457,13 @@ impl SnapshotHandle {
     /// list lookups).
     pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         // 1. Check snapshot's built-in cache
-        if let Some(entry) = self.inner.get_entry(key)? {
+        if let Some(entry) = self.inner.get_entry(key) {
             return Ok(Some(entry.clone()));
         }
 
         // 2. Check prefetch cache
         {
-            let key_bytes = key_to_bytes(key)?;
-            if let Some(entry) = self.prefetch_cache.read().get(&key_bytes) {
+            if let Some(entry) = self.prefetch_cache.read().get(key) {
                 return Ok(Some(entry.clone()));
             }
         }
@@ -481,8 +472,7 @@ impl SnapshotHandle {
         if let Some(ref lookup_fn) = self.lookup_fn {
             let result = lookup_fn(key)?;
             if let Some(ref entry) = result {
-                let key_bytes = key_to_bytes(key)?;
-                self.prefetch_cache.write().insert(key_bytes, entry.clone());
+                self.prefetch_cache.write().insert(key.clone(), entry.clone());
             }
             return Ok(result);
         }
@@ -513,8 +503,7 @@ impl SnapshotHandle {
         let cache = self.prefetch_cache.read();
 
         for key in keys {
-            let key_bytes = key_to_bytes(key)?;
-            if self.inner.get_entry(key)?.is_some() || cache.contains_key(&key_bytes) {
+            if self.inner.get_entry(key).is_some() || cache.contains_key(key) {
                 continue;
             }
             needed.push(key.clone());
@@ -547,9 +536,7 @@ impl SnapshotHandle {
         let mut cache = self.prefetch_cache.write();
         for entry in entries {
             let key = henyey_common::entry_to_key(&entry);
-            if let Ok(key_bytes) = key_to_bytes(&key) {
-                cache.insert(key_bytes, entry);
-            }
+            cache.insert(key, entry);
         }
 
         Ok(PrefetchStats {
@@ -580,7 +567,7 @@ pub struct SnapshotBuilder {
     /// Hash of the header.
     header_hash: Hash256,
     /// Preloaded entries.
-    entries: HashMap<Vec<u8>, LedgerEntry>,
+    entries: HashMap<LedgerKey, LedgerEntry>,
 }
 
 impl SnapshotBuilder {
@@ -602,22 +589,20 @@ impl SnapshotBuilder {
     }
 
     /// Add an entry to the snapshot.
-    pub fn add_entry(mut self, key: LedgerKey, entry: LedgerEntry) -> Result<Self> {
-        let key_bytes = key_to_bytes(&key)?;
-        self.entries.insert(key_bytes, entry);
-        Ok(self)
+    pub fn add_entry(mut self, key: LedgerKey, entry: LedgerEntry) -> Self {
+        self.entries.insert(key, entry);
+        self
     }
 
     /// Add multiple entries.
     pub fn add_entries(
         mut self,
         entries: impl IntoIterator<Item = (LedgerKey, LedgerEntry)>,
-    ) -> Result<Self> {
+    ) -> Self {
         for (key, entry) in entries {
-            let key_bytes = key_to_bytes(&key)?;
-            self.entries.insert(key_bytes, entry);
+            self.entries.insert(key, entry);
         }
-        Ok(self)
+        self
     }
 
     /// Build the snapshot.
@@ -712,11 +697,10 @@ mod tests {
 
         let snapshot = SnapshotBuilder::new(10)
             .add_entry(key.clone(), entry.clone())
-            .unwrap()
             .build_with_default_header();
 
         assert_eq!(snapshot.ledger_seq(), 10);
-        assert!(snapshot.get_entry(&key).unwrap().is_some());
+        assert!(snapshot.get_entry(&key).is_some());
     }
 
     #[test]
@@ -731,10 +715,9 @@ mod tests {
 
         let snapshot = SnapshotBuilder::new(1)
             .add_entry(key, entry)
-            .unwrap()
             .build_with_default_header();
 
-        let account = snapshot.get_account(&account_id).unwrap();
+        let account = snapshot.get_account(&account_id);
         assert!(account.is_some());
         assert_eq!(account.unwrap().balance, 1000000000);
     }
@@ -749,27 +732,22 @@ mod tests {
 
         let snapshot = SnapshotBuilder::new(5)
             .add_entry(key1.clone(), entry1.clone())
-            .unwrap()
             .add_entry(key2.clone(), entry2.clone())
-            .unwrap()
             .build_with_default_header();
 
         // Read entries multiple times
         for _ in 0..3 {
-            let e1 = snapshot.get_entry(&key1).unwrap();
-            assert!(e1.is_some());
-            let e2 = snapshot.get_entry(&key2).unwrap();
-            assert!(e2.is_some());
+            assert!(snapshot.get_entry(&key1).is_some());
+            assert!(snapshot.get_entry(&key2).is_some());
         }
 
         // Reading a non-existent entry is fine
         let (missing_key, _) = create_test_account(99);
-        let missing = snapshot.get_entry(&missing_key).unwrap();
-        assert!(missing.is_none());
+        assert!(snapshot.get_entry(&missing_key).is_none());
 
         // Snapshot state hasn't changed: sequence, header, entries all same
         assert_eq!(snapshot.ledger_seq(), 5);
-        let e1_again = snapshot.get_entry(&key1).unwrap().unwrap();
+        let e1_again = snapshot.get_entry(&key1).unwrap();
         assert_eq!(e1_again.data, entry1.data);
     }
 
@@ -782,18 +760,17 @@ mod tests {
 
         let snapshot = SnapshotBuilder::new(5)
             .add_entry(key1.clone(), entry1)
-            .unwrap()
             .build_with_default_header();
 
         // Existing entry: found
-        assert!(snapshot.get_entry(&key1).unwrap().is_some());
+        assert!(snapshot.get_entry(&key1).is_some());
 
         // Missing entry: returns None (not error)
-        assert!(snapshot.get_entry(&missing_key).unwrap().is_none());
+        assert!(snapshot.get_entry(&missing_key).is_none());
 
         // Missing account: returns None
         if let LedgerKey::Account(ref ak) = missing_key {
-            assert!(snapshot.get_account(&ak.account_id).unwrap().is_none());
+            assert!(snapshot.get_account(&ak.account_id).is_none());
         }
     }
 
@@ -809,17 +786,15 @@ mod tests {
         // Build snapshot with only key1 and key2 (key3 was "erased")
         let snapshot = SnapshotBuilder::new(5)
             .add_entry(key1.clone(), entry1)
-            .unwrap()
             .add_entry(key2.clone(), entry2)
-            .unwrap()
             .build_with_default_header();
 
         // key1 and key2 are found
-        assert!(snapshot.get_entry(&key1).unwrap().is_some());
-        assert!(snapshot.get_entry(&key2).unwrap().is_some());
+        assert!(snapshot.get_entry(&key1).is_some());
+        assert!(snapshot.get_entry(&key2).is_some());
 
         // key3 was never added (simulating deletion) - not found
-        assert!(snapshot.get_entry(&key3).unwrap().is_none());
+        assert!(snapshot.get_entry(&key3).is_none());
     }
 
     /// Snapshot provides an immutable header view.
