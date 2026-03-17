@@ -304,7 +304,7 @@ impl Work for GetHistoryArchiveStateWork {
         "get-history-archive-state"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(&self.state, HistoryWorkStage::FetchHas, "fetching HAS").await;
         match self.archive.get_checkpoint_has(self.checkpoint).await {
             Ok(has) => {
@@ -382,7 +382,7 @@ impl Work for DownloadBucketsWork {
         "download-buckets"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(
             &self.state,
             HistoryWorkStage::DownloadBuckets,
@@ -516,7 +516,7 @@ impl Work for DownloadLedgerHeadersWork {
         "download-ledger-headers"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(
             &self.state,
             HistoryWorkStage::DownloadHeaders,
@@ -588,7 +588,7 @@ impl Work for DownloadTransactionsWork {
         "download-transactions"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(
             &self.state,
             HistoryWorkStage::DownloadTransactions,
@@ -685,7 +685,7 @@ impl Work for DownloadTxResultsWork {
         "download-tx-results"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         let headers = {
             let guard = self.state.lock().await;
             guard.headers.clone()
@@ -783,7 +783,7 @@ impl Work for DownloadScpHistoryWork {
         "download-scp-history"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(
             &self.state,
             HistoryWorkStage::DownloadScp,
@@ -966,7 +966,7 @@ impl Work for PublishHistoryArchiveStateWork {
         "publish-has"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(&self.state, HistoryWorkStage::PublishHas, "publishing HAS").await;
         let has = {
             let guard = self.state.lock().await;
@@ -1137,7 +1137,7 @@ impl Work for PublishXdrWork {
         self.file_type.publish_work_name()
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(
             &self.state,
             self.file_type.publish_stage(),
@@ -1193,7 +1193,7 @@ impl Work for PublishBucketsWork {
         "publish-buckets"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         set_progress(
             &self.state,
             HistoryWorkStage::PublishBuckets,
@@ -1308,7 +1308,7 @@ impl Work for CheckSingleLedgerHeaderWork {
         "check-single-ledger-header"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         let ledger_seq = self.expected.header.ledger_seq;
 
         // Genesis ledger (ledger 1) has no header in the archive
@@ -1872,7 +1872,7 @@ impl Work for BatchDownloadWork {
         "batch-download"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         let checkpoints: Vec<u32> = self.range.iter().collect();
         let total = checkpoints.len();
 

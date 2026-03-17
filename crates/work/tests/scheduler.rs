@@ -32,7 +32,7 @@ impl Work for LogWork {
         &self.name
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         self.log.lock().unwrap().push(self.name.clone());
         WorkOutcome::Success
     }
@@ -50,7 +50,7 @@ impl Work for RetryWork {
         &self.name
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         let mut attempts = self.attempts.lock().unwrap();
         *attempts += 1;
         if *attempts == 1 {
@@ -74,7 +74,7 @@ impl Work for CancellableWork {
         &self.name
     }
 
-    async fn run(&mut self, ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, ctx: &WorkContext) -> WorkOutcome {
         for _ in 0..5u32 {
             if ctx.is_cancelled() {
                 return WorkOutcome::Cancelled;
@@ -200,9 +200,9 @@ async fn test_work_callback() {
     let callback_count = Arc::new(AtomicU32::new(0));
     let log = Arc::new(Mutex::new(Vec::new()));
 
-    let callback: Arc<dyn Fn(WorkOutcome, WorkContext) + Send + Sync> = {
+    let callback: Arc<dyn Fn(&WorkOutcome, &WorkContext) + Send + Sync> = {
         let callback_count = Arc::clone(&callback_count);
-        Arc::new(move |_outcome: WorkOutcome, _ctx: WorkContext| {
+        Arc::new(move |_outcome: &WorkOutcome, _ctx: &WorkContext| {
             callback_count.fetch_add(1, Ordering::SeqCst);
         })
     };

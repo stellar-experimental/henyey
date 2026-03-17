@@ -34,7 +34,7 @@
 //! #[async_trait::async_trait]
 //! impl Work for MyWork {
 //!     fn name(&self) -> &str { &self.name }
-//!     async fn run(&mut self, ctx: WorkContext) -> WorkOutcome {
+//!     async fn run(&mut self, ctx: &WorkContext) -> WorkOutcome {
 //!         // Perform work, checking for cancellation as needed
 //!         if ctx.is_cancelled() {
 //!             return WorkOutcome::Cancelled;
@@ -108,6 +108,9 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
+/// Callback function type for [`WorkWithCallback`].
+type WorkCallback = dyn Fn(&WorkOutcome, &WorkContext) + Send + Sync;
+
 /// Capacity of the internal channel used for work completion notifications.
 const COMPLETION_CHANNEL_CAPACITY: usize = 128;
 
@@ -129,7 +132,7 @@ pub type WorkId = u64;
 /// When returning [`WorkOutcome::Retry`], the scheduler will wait for the
 /// specified delay before re-attempting the work, provided retries remain.
 /// If no retries remain, the work transitions to [`WorkState::Failed`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum WorkOutcome {
     /// Work completed successfully.
     ///
@@ -206,27 +209,14 @@ impl WorkState {
         )
     }
 
-    /// Returns `true` if this is a successful terminal state.
-    #[must_use]
-    pub fn is_success(self) -> bool {
-        matches!(self, Self::Success)
-    }
 
-    /// Returns `true` if this is a failure state.
-    ///
-    /// This includes [`Failed`](Self::Failed), [`Blocked`](Self::Blocked),
-    /// and [`Cancelled`](Self::Cancelled).
-    #[must_use]
-    pub fn is_failure(self) -> bool {
-        matches!(self, Self::Failed | Self::Blocked | Self::Cancelled)
-    }
 }
 
 /// Execution context provided to a work item during execution.
 ///
 /// The context provides the work item with its identity, the current attempt
 /// number, and a mechanism to check for cancellation requests.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WorkContext {
     /// The unique identifier of this work item.
     pub id: WorkId,
@@ -301,7 +291,7 @@ pub trait Work: Send {
     /// This method is called each time the work item is executed, including
     /// retries. The provided context contains the attempt number and a
     /// cancellation token.
-    async fn run(&mut self, ctx: WorkContext) -> WorkOutcome;
+    async fn run(&mut self, ctx: &WorkContext) -> WorkOutcome;
 }
 
 // ============================================================================
@@ -371,7 +361,7 @@ struct WorkEntry {
 /// use henyey_work::{Work, WorkWithCallback, WorkOutcome, WorkContext};
 /// use std::sync::Arc;
 ///
-/// let callback = Arc::new(|outcome: WorkOutcome, ctx: WorkContext| {
+/// let callback = Arc::new(|outcome: &WorkOutcome, ctx: &WorkContext| {
 ///     println!("Work {} finished with {:?}", ctx.id, outcome);
 /// });
 ///
@@ -383,7 +373,7 @@ pub struct WorkWithCallback {
     work: Box<dyn Work + Send>,
 
     /// Callback invoked after each execution attempt with the outcome and context.
-    callback: Arc<dyn Fn(WorkOutcome, WorkContext) + Send + Sync>,
+    callback: Arc<WorkCallback>,
 }
 
 impl WorkWithCallback {
@@ -396,7 +386,7 @@ impl WorkWithCallback {
     ///   the outcome and execution context.
     pub fn new(
         work: Box<dyn Work + Send>,
-        callback: Arc<dyn Fn(WorkOutcome, WorkContext) + Send + Sync>,
+        callback: Arc<WorkCallback>,
     ) -> Self {
         Self { work, callback }
     }
@@ -408,9 +398,9 @@ impl Work for WorkWithCallback {
         self.work.name()
     }
 
-    async fn run(&mut self, ctx: WorkContext) -> WorkOutcome {
-        let outcome = self.work.run(ctx.clone()).await;
-        (self.callback)(outcome.clone(), ctx);
+    async fn run(&mut self, ctx: &WorkContext) -> WorkOutcome {
+        let outcome = self.work.run(ctx).await;
+        (self.callback)(&outcome, ctx);
         outcome
     }
 }
@@ -915,7 +905,7 @@ impl WorkScheduler {
                         attempt,
                         cancel_token,
                     };
-                    let outcome = work.run(ctx.clone()).await;
+                    let outcome = work.run(&ctx).await;
                     let _ = completion_tx
                         .send(WorkCompletion {
                             id,
@@ -1217,7 +1207,7 @@ impl Work for EmptyWork {
         "empty"
     }
 
-    async fn run(&mut self, _ctx: WorkContext) -> WorkOutcome {
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
         WorkOutcome::Success
     }
 }
