@@ -1,13 +1,10 @@
 //! Clock abstractions for monotonic timing, async sleep, and periodic intervals.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::time::{Duration, Instant, SystemTime};
 
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::stream::unfold;
-
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
