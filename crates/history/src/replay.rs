@@ -619,6 +619,20 @@ pub struct ReplayConfig {
     pub wait_for_publish: bool,
 }
 
+/// Inputs and mutable state needed for execution-based ledger replay.
+pub struct ReplayExecutionContext<'a> {
+    pub bucket_list: &'a mut henyey_bucket::BucketList,
+    pub hot_archive_bucket_list: &'a mut henyey_bucket::HotArchiveBucketList,
+    pub network_id: &'a NetworkId,
+    pub config: &'a ReplayConfig,
+    pub expected_tx_results: Option<&'a [TransactionResultPair]>,
+    pub eviction_iterator: Option<EvictionIterator>,
+    pub module_cache: Option<&'a PersistentModuleCache>,
+    pub soroban_state_size: Option<u64>,
+    pub prev_id_pool: u64,
+    pub offer_entries: Option<Vec<LedgerEntry>>,
+}
+
 impl Default for ReplayConfig {
     fn default() -> Self {
         Self {
@@ -754,29 +768,24 @@ pub fn replay_ledger(
 ///
 /// * `header` - The ledger header being replayed
 /// * `tx_set` - The transaction set to execute
-/// * `bucket_list` - The live bucket list (will be modified)
-/// * `hot_archive_bucket_list` - Optional hot archive bucket list for Protocol 23+
-/// * `network_id` - The network identifier
-/// * `config` - Replay configuration options
-/// * `expected_tx_results` - Optional expected results for comparison
-/// * `eviction_iterator` - Current eviction scan position (Protocol 23+)
-/// * `module_cache` - Optional persistent module cache for Soroban WASM reuse
-/// * `prev_id_pool` - The ID pool value from the previous ledger (for correct offer ID assignment)
-#[allow(clippy::too_many_arguments)]
 pub fn replay_ledger_with_execution(
     header: &LedgerHeader,
     tx_set: &TransactionSetVariant,
-    bucket_list: &mut henyey_bucket::BucketList,
-    hot_archive_bucket_list: &mut henyey_bucket::HotArchiveBucketList,
-    network_id: &NetworkId,
-    config: &ReplayConfig,
-    expected_tx_results: Option<&[TransactionResultPair]>,
-    eviction_iterator: Option<EvictionIterator>,
-    module_cache: Option<&PersistentModuleCache>,
-    soroban_state_size: Option<u64>,
-    prev_id_pool: u64,
-    offer_entries: Option<Vec<LedgerEntry>>,
+    context: ReplayExecutionContext<'_>,
 ) -> Result<LedgerReplayResult> {
+    let ReplayExecutionContext {
+        bucket_list,
+        hot_archive_bucket_list,
+        network_id,
+        config,
+        expected_tx_results,
+        eviction_iterator,
+        module_cache,
+        soroban_state_size,
+        prev_id_pool,
+        offer_entries,
+    } = context;
+
     if config.verify_results {
         verify::verify_tx_set(header, tx_set)?;
     }
@@ -1653,16 +1662,18 @@ mod tests {
         let result = replay_ledger_with_execution(
             &header,
             &tx_set,
-            &mut bucket_list,
-            &mut hot_archive,
-            &NetworkId::testnet(),
-            &config,
-            None,
-            eviction_iterator,
-            None, // module_cache
-            None, // soroban_state_size
-            0,    // prev_id_pool
-            None, // offer_entries
+            ReplayExecutionContext {
+                bucket_list: &mut bucket_list,
+                hot_archive_bucket_list: &mut hot_archive,
+                network_id: &NetworkId::testnet(),
+                config: &config,
+                expected_tx_results: None,
+                eviction_iterator,
+                module_cache: None,
+                soroban_state_size: None,
+                prev_id_pool: 0,
+                offer_entries: None,
+            },
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
@@ -1689,16 +1700,18 @@ mod tests {
         let result = replay_ledger_with_execution(
             &header,
             &tx_set,
-            &mut bucket_list,
-            &mut hot_archive,
-            &NetworkId::testnet(),
-            &config,
-            None,
-            None,
-            None, // module_cache
-            None, // soroban_state_size
-            0,    // prev_id_pool
-            None, // offer_entries
+            ReplayExecutionContext {
+                bucket_list: &mut bucket_list,
+                hot_archive_bucket_list: &mut hot_archive,
+                network_id: &NetworkId::testnet(),
+                config: &config,
+                expected_tx_results: None,
+                eviction_iterator: None,
+                module_cache: None,
+                soroban_state_size: None,
+                prev_id_pool: 0,
+                offer_entries: None,
+            },
         );
 
         assert!(matches!(result, Err(HistoryError::InvalidTxSetHash { .. })));
@@ -1728,16 +1741,18 @@ mod tests {
         let result = replay_ledger_with_execution(
             &header,
             &tx_set,
-            &mut bucket_list,
-            &mut hot_archive,
-            &NetworkId::testnet(),
-            &config,
-            None,
-            None,
-            None, // module_cache
-            None, // soroban_state_size
-            0,    // prev_id_pool
-            None, // offer_entries
+            ReplayExecutionContext {
+                bucket_list: &mut bucket_list,
+                hot_archive_bucket_list: &mut hot_archive,
+                network_id: &NetworkId::testnet(),
+                config: &config,
+                expected_tx_results: None,
+                eviction_iterator: None,
+                module_cache: None,
+                soroban_state_size: None,
+                prev_id_pool: 0,
+                offer_entries: None,
+            },
         );
 
         assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));

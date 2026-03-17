@@ -4,23 +4,7 @@
 //! - `/getledgerentryraw` — Returns raw ledger entries from the bucket list
 //! - `/getledgerentry` — Returns entries with TTL state classification
 
-use serde::{Deserialize, Serialize};
-
-/// Request body for `/getledgerentryraw`.
-///
-/// Documents the expected schema. The actual request is parsed from
-/// `application/x-www-form-urlencoded` format with repeated `key=` params
-/// to match stellar-core's QueryServer.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct GetLedgerEntryRawRequest {
-    /// Base64-encoded XDR `LedgerKey` values to look up.
-    pub key: Vec<String>,
-    /// Optional ledger sequence for historical queries. If omitted, uses the
-    /// current snapshot.
-    #[serde(default, rename = "ledgerSeq")]
-    pub ledger_seq: Option<u32>,
-}
+use serde::Serialize;
 
 /// Response body for `/getledgerentryraw`.
 #[derive(Debug, Serialize)]
@@ -37,22 +21,6 @@ pub struct GetLedgerEntryRawResponse {
 pub struct RawEntryResult {
     /// Base64-encoded XDR `LedgerEntry`.
     pub entry: String,
-}
-
-/// Request body for `/getledgerentry`.
-///
-/// Documents the expected schema. The actual request is parsed from
-/// `application/x-www-form-urlencoded` format with repeated `key=` params
-/// to match stellar-core's QueryServer.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct GetLedgerEntryRequest {
-    /// Base64-encoded XDR `LedgerKey` values to look up.
-    pub key: Vec<String>,
-    /// Optional ledger sequence for historical queries. If omitted, uses the
-    /// current snapshot.
-    #[serde(default, rename = "ledgerSeq")]
-    pub ledger_seq: Option<u32>,
 }
 
 /// Response body for `/getledgerentry`.

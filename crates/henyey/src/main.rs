@@ -118,13 +118,20 @@ mod loadgen_runner {
         }
 
         fn parse_mode(mode: &str) -> Option<LoadGenMode> {
-            match mode.to_lowercase().as_str() {
-                "pay" | "create" => Some(LoadGenMode::Pay),
-                "sorobanupload" => Some(LoadGenMode::SorobanUpload),
-                "sorobaninvokesetup" => Some(LoadGenMode::SorobanInvokeSetup),
-                "sorobaninvoke" => Some(LoadGenMode::SorobanInvoke),
-                "mixed" | "mixedclassicsoroban" => Some(LoadGenMode::MixedClassicSoroban),
-                _ => None,
+            if mode.eq_ignore_ascii_case("pay") || mode.eq_ignore_ascii_case("create") {
+                Some(LoadGenMode::Pay)
+            } else if mode.eq_ignore_ascii_case("sorobanupload") {
+                Some(LoadGenMode::SorobanUpload)
+            } else if mode.eq_ignore_ascii_case("sorobaninvokesetup") {
+                Some(LoadGenMode::SorobanInvokeSetup)
+            } else if mode.eq_ignore_ascii_case("sorobaninvoke") {
+                Some(LoadGenMode::SorobanInvoke)
+            } else if mode.eq_ignore_ascii_case("mixed")
+                || mode.eq_ignore_ascii_case("mixedclassicsoroban")
+            {
+                Some(LoadGenMode::MixedClassicSoroban)
+            } else {
+                None
             }
         }
     }
@@ -1105,7 +1112,6 @@ async fn cmd_run(
 
     // Local mode: auto-initialize database and history if needed.
     let config = if local {
-        let config = config;
         let db_path = &config.database.path;
 
         // Ensure data directory exists.
@@ -1629,14 +1635,7 @@ async fn cmd_new_hist(config: &AppConfig, name: &str) -> anyhow::Result<()> {
     // Build remote archive config
     let remote_config = RemoteArchiveConfig {
         name: name.to_string(),
-        get_cmd: if archive_config.get_enabled {
-            // The get command is not stored directly in HistoryArchiveEntry,
-            // but for local archives it's typically a cp command.
-            // For new-hist, we only need the put/mkdir commands.
-            None
-        } else {
-            None
-        },
+        get_cmd: None,
         put_cmd: archive_config.put.clone(),
         mkdir_cmd: archive_config.mkdir.clone(),
     };

@@ -55,10 +55,6 @@ impl VirtualClock {
     pub fn new() -> Self {
         Self::default()
     }
-
-    pub fn set_base_instant(&mut self, instant: Instant) {
-        self.base_instant = instant;
-    }
 }
 
 impl Clock for VirtualClock {
@@ -86,9 +82,8 @@ mod tests {
 
     #[test]
     fn virtual_clock_base_instant_controls_now() {
-        let mut clock = VirtualClock::new();
         let base = Instant::now() - Duration::from_secs(2);
-        clock.set_base_instant(base);
+        let clock = VirtualClock { base_instant: base };
         let now = clock.now();
         assert!(now >= base + Duration::from_secs(2));
     }

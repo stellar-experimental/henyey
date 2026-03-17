@@ -462,6 +462,16 @@ pub(super) struct SelectedTxs {
     pub(super) classic_limited: bool,
 }
 
+struct EvictionScan<'a, F> {
+    by_hash: &'a HashMap<Hash256, QueuedTransaction>,
+    queued: &'a QueuedTransaction,
+    lane_config: Box<dyn SurgePricingLaneConfig>,
+    ledger_version: u32,
+    exclude: &'a HashSet<Hash256>,
+    filter: F,
+    seed: u64,
+}
+
 /// Get the source account (inner for fee-bump) as a MuxedAccount.
 fn source_account_from_envelope(envelope: &TransactionEnvelope) -> stellar_xdr::curr::MuxedAccount {
     match envelope {
@@ -816,20 +826,23 @@ impl TransactionQueue {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn collect_evictions_for_lane_config<F>(
         &self,
-        by_hash: &HashMap<Hash256, QueuedTransaction>,
-        queued: &QueuedTransaction,
-        lane_config: Box<dyn crate::surge_pricing::SurgePricingLaneConfig>,
-        ledger_version: u32,
-        exclude: &HashSet<Hash256>,
-        filter: F,
-        seed: u64,
+        scan: EvictionScan<'_, F>,
     ) -> Option<Vec<(QueuedTransaction, bool)>>
     where
         F: Fn(&QueuedTransaction) -> bool,
     {
+        let EvictionScan {
+            by_hash,
+            queued,
+            lane_config,
+            ledger_version,
+            exclude,
+            filter,
+            seed,
+        } = scan;
+
         let mut queue = SurgePricingPriorityQueue::new(lane_config, seed);
         for tx in by_hash.values() {
             if exclude.contains(&tx.hash) {
@@ -1028,15 +1041,15 @@ impl TransactionQueue {
                     );
                     !frame.is_soroban()
                 };
-                let Some(evictions) = self.collect_evictions_for_lane_config(
+                let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
                     by_hash,
                     queued,
-                    Box::new(lane_config),
+                    lane_config: Box::new(lane_config),
                     ledger_version,
-                    &pending_evictions,
+                    exclude: &pending_evictions,
                     filter,
                     seed,
-                ) else {
+                }) else {
                     return Err(TxQueueResult::QueueFull);
                 };
                 let lane_config = self.build_classic_lane_config().unwrap();
@@ -1060,15 +1073,15 @@ impl TransactionQueue {
                     );
                     frame.is_soroban()
                 };
-                let Some(evictions) = self.collect_evictions_for_lane_config(
+                let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
                     by_hash,
                     queued,
-                    Box::new(lane_config),
+                    lane_config: Box::new(lane_config),
                     ledger_version,
-                    &pending_evictions,
+                    exclude: &pending_evictions,
                     filter,
                     seed,
-                ) else {
+                }) else {
                     return Err(TxQueueResult::QueueFull);
                 };
                 let lane_config = SorobanGenericLaneConfig::new(limit.clone());
@@ -1085,15 +1098,15 @@ impl TransactionQueue {
         if let Some(limit) = self.config.max_queue_ops {
             let lane_config = OpsOnlyLaneConfig::new(Resource::new(vec![limit as i64]));
             let filter = |_tx: &QueuedTransaction| true;
-            let Some(evictions) = self.collect_evictions_for_lane_config(
+            let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
                 by_hash,
                 queued,
-                Box::new(lane_config),
+                lane_config: Box::new(lane_config),
                 ledger_version,
-                &pending_evictions,
+                exclude: &pending_evictions,
                 filter,
                 seed,
-            ) else {
+            }) else {
                 return Err(TxQueueResult::QueueFull);
             };
             for (evicted, _evicted_due_to_lane_limit) in evictions {

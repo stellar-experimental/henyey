@@ -168,13 +168,6 @@ pub fn protocol_version_starts_from(version: u32, from: ProtocolVersion) -> bool
     version >= from.as_u32()
 }
 
-/// Returns `true` if `version` equals the target version exactly.
-#[allow(dead_code)] // Parity with stellar-core; not yet called in production
-#[inline]
-pub(crate) fn protocol_version_equals(version: u32, equals: ProtocolVersion) -> bool {
-    version == equals.as_u32()
-}
-
 /// Returns `true` if an upgrade to the target version occurred between `prev_version` and `new_version`.
 ///
 /// This is useful for detecting when a protocol upgrade has just happened and

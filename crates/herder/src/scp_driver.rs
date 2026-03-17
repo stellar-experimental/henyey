@@ -73,6 +73,19 @@ pub enum ValueValidation {
     Invalid,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TrackingState {
+    index: u64,
+    close_time: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValueValidationContext {
+    lcl_seq: u64,
+    lcl_close_time: u64,
+    tracking: Option<TrackingState>,
+}
+
 /// Configuration for the SCP driver.
 #[derive(Debug, Clone)]
 pub struct ScpDriverConfig {
@@ -605,17 +618,18 @@ impl ScpDriver {
     /// * `is_tracking` - Whether we are in tracking state
     /// * `tracking_index` - Next consensus ledger index (tracking_slot)
     /// * `tracking_close_time` - Tracking consensus close time
-    #[allow(clippy::too_many_arguments)]
     fn validate_past_or_future_value(
         &self,
         slot_index: SlotIndex,
         close_time: u64,
-        lcl_seq: u64,
-        lcl_close_time: u64,
-        is_tracking: bool,
-        tracking_index: u64,
-        tracking_close_time: u64,
+        context: ValueValidationContext,
     ) -> ValueValidation {
+        let ValueValidationContext {
+            lcl_seq,
+            lcl_close_time,
+            tracking,
+        } = context;
+
         // slot_index must NOT be lcl_seq + 1 (that's the current ledger path)
         if slot_index == lcl_seq + 1 {
             debug!(
@@ -654,11 +668,16 @@ impl ScpDriver {
             }
         }
 
-        if !is_tracking {
+        let Some(tracking) = tracking else {
             // Can't validate further without tracking state
             trace!("MaybeValidValue (not tracking) for slot {}", slot_index);
             return ValueValidation::MaybeValid;
-        }
+        };
+
+        let TrackingState {
+            index: tracking_index,
+            close_time: tracking_close_time,
+        } = tracking;
 
         // Check slotIndex against tracking state
         if tracking_index > slot_index {
@@ -835,18 +854,23 @@ impl ScpDriver {
             ValueValidation::Valid
         } else {
             // Past or future slot — partial validation
-            let is_tracking = *self.is_tracking.read();
-            let tracking_index = *self.tracking_consensus_index.read();
-            let tracking_close_time = *self.tracking_consensus_close_time.read();
+            let tracking = if *self.is_tracking.read() {
+                Some(TrackingState {
+                    index: *self.tracking_consensus_index.read(),
+                    close_time: *self.tracking_consensus_close_time.read(),
+                })
+            } else {
+                None
+            };
 
             self.validate_past_or_future_value(
                 slot_index,
                 close_time,
-                lcl_seq,
-                lcl_close_time,
-                is_tracking,
-                tracking_index,
-                tracking_close_time,
+                ValueValidationContext {
+                    lcl_seq,
+                    lcl_close_time,
+                    tracking,
+                },
             )
         }
     }
@@ -2872,12 +2896,28 @@ mod tests {
 
         // slot_index == lcl_seq: close time must match LCL exactly
         assert_eq!(
-            driver.validate_past_or_future_value(100, 500, 100, 500, false, 0, 0),
+            driver.validate_past_or_future_value(
+                100,
+                500,
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: 500,
+                    tracking: None,
+                }
+            ),
             ValueValidation::MaybeValid
         );
         // Close time doesn't match -> Invalid
         assert_eq!(
-            driver.validate_past_or_future_value(100, 501, 100, 500, false, 0, 0),
+            driver.validate_past_or_future_value(
+                100,
+                501,
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: 500,
+                    tracking: None,
+                }
+            ),
             ValueValidation::Invalid
         );
     }
@@ -2888,16 +2928,40 @@ mod tests {
 
         // slot_index < lcl_seq: close time must be strictly less than LCL
         assert_eq!(
-            driver.validate_past_or_future_value(99, 499, 100, 500, false, 0, 0),
+            driver.validate_past_or_future_value(
+                99,
+                499,
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: 500,
+                    tracking: None,
+                }
+            ),
             ValueValidation::MaybeValid
         );
         // Close time >= LCL -> Invalid
         assert_eq!(
-            driver.validate_past_or_future_value(99, 500, 100, 500, false, 0, 0),
+            driver.validate_past_or_future_value(
+                99,
+                500,
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: 500,
+                    tracking: None,
+                }
+            ),
             ValueValidation::Invalid
         );
         assert_eq!(
-            driver.validate_past_or_future_value(99, 501, 100, 500, false, 0, 0),
+            driver.validate_past_or_future_value(
+                99,
+                501,
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: 500,
+                    tracking: None,
+                }
+            ),
             ValueValidation::Invalid
         );
     }
@@ -2914,12 +2978,12 @@ mod tests {
         assert_eq!(
             driver.validate_past_or_future_value(
                 200,
-                now,      // close_time
-                100,      // lcl_seq
-                now - 10, // lcl_close_time
-                false,    // not tracking
-                0,
-                0
+                now, // close_time
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: now - 10,
+                    tracking: None,
+                }
             ),
             ValueValidation::MaybeValid
         );
@@ -2938,11 +3002,14 @@ mod tests {
             driver.validate_past_or_future_value(
                 150,
                 now,
-                100,
-                now - 50,
-                true, // tracking
-                200,  // tracking_index > slot_index
-                now - 5
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: now - 50,
+                    tracking: Some(TrackingState {
+                        index: 200,
+                        close_time: now - 5,
+                    }),
+                }
             ),
             ValueValidation::MaybeValid
         );
@@ -2961,11 +3028,14 @@ mod tests {
             driver.validate_past_or_future_value(
                 200,
                 now,
-                100,
-                now - 50,
-                true, // tracking
-                150,  // tracking_index < slot_index
-                now - 5
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: now - 50,
+                    tracking: Some(TrackingState {
+                        index: 150,
+                        close_time: now - 5,
+                    }),
+                }
             ),
             ValueValidation::Invalid
         );
@@ -2984,11 +3054,14 @@ mod tests {
             driver.validate_past_or_future_value(
                 150,
                 now, // close_time > tracking_close_time, within drift
-                100,
-                now - 50,
-                true,
-                150,     // same as slot_index
-                now - 5  // tracking_close_time
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: now - 50,
+                    tracking: Some(TrackingState {
+                        index: 150,
+                        close_time: now - 5,
+                    }),
+                }
             ),
             ValueValidation::MaybeValid
         );
@@ -2997,11 +3070,14 @@ mod tests {
             driver.validate_past_or_future_value(
                 150,
                 now - 10, // close_time <= tracking_close_time
-                100,
-                now - 50,
-                true,
-                150,
-                now - 5 // tracking_close_time > close_time
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: now - 50,
+                    tracking: Some(TrackingState {
+                        index: 150,
+                        close_time: now - 5,
+                    }),
+                }
             ),
             ValueValidation::Invalid
         );
@@ -3014,7 +3090,15 @@ mod tests {
         // slot_index == lcl_seq + 1 is the current ledger path -- should be Invalid
         // (validate_past_or_future_value is not for the current ledger)
         assert_eq!(
-            driver.validate_past_or_future_value(101, 500, 100, 490, false, 0, 0),
+            driver.validate_past_or_future_value(
+                101,
+                500,
+                ValueValidationContext {
+                    lcl_seq: 100,
+                    lcl_close_time: 490,
+                    tracking: None,
+                }
+            ),
             ValueValidation::Invalid
         );
     }

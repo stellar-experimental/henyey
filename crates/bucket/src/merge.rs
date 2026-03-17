@@ -54,6 +54,15 @@ use crate::entry::{compare_keys, BucketEntry, BucketEntryExt};
 use crate::metrics::{EntryCountType, MergeCounters};
 use crate::{protocol_version_starts_from, BucketError, ProtocolVersion, Result};
 
+struct MergeOptions<'a> {
+    keep_dead_entries: bool,
+    max_protocol_version: u32,
+    normalize_init_entries: bool,
+    shadow_buckets: &'a [Bucket],
+    keep_shadowed_lifecycle_entries: bool,
+    counters: Option<&'a MergeCounters>,
+}
+
 /// Record an entry type in the merge counters.
 fn record_entry_type(counters: Option<&MergeCounters>, entry: &BucketEntry) {
     if let Some(c) = counters {
@@ -125,12 +134,14 @@ pub fn merge_buckets_with_options(
     merge_with_shadows_impl(
         old_bucket,
         new_bucket,
-        keep_dead_entries,
-        max_protocol_version,
-        normalize_init_entries,
-        &[],
-        false,
-        None,
+        MergeOptions {
+            keep_dead_entries,
+            max_protocol_version,
+            normalize_init_entries,
+            shadow_buckets: &[],
+            keep_shadowed_lifecycle_entries: false,
+            counters: None,
+        },
     )
 }
 
@@ -141,17 +152,19 @@ pub fn merge_buckets_with_options(
 /// stellar-core's `BucketOutputIterator::maybePut()` pattern where shadow
 /// checking is integrated into the output path rather than as a post-processing
 /// filter.
-#[allow(clippy::too_many_arguments)]
 fn merge_with_shadows_impl(
     old_bucket: &Bucket,
     new_bucket: &Bucket,
-    keep_dead_entries: bool,
-    max_protocol_version: u32,
-    normalize_init_entries: bool,
-    shadow_buckets: &[Bucket],
-    keep_shadowed_lifecycle_entries: bool,
-    counters: Option<&MergeCounters>,
+    options: MergeOptions<'_>,
 ) -> Result<Bucket> {
+    let MergeOptions {
+        keep_dead_entries,
+        max_protocol_version,
+        normalize_init_entries,
+        shadow_buckets,
+        keep_shadowed_lifecycle_entries,
+        counters,
+    } = options;
     // Note: We intentionally do NOT use fast paths for empty buckets here.
     // stellar-core always goes through the full merge process even when
     // one input is empty. This is important because:
@@ -883,12 +896,14 @@ pub fn merge_buckets_with_options_and_shadows_and_counters(
         return merge_with_shadows_impl(
             old_bucket,
             new_bucket,
-            keep_dead_entries,
-            max_protocol_version,
-            normalize_init_entries,
-            &[],
-            false,
-            counters,
+            MergeOptions {
+                keep_dead_entries,
+                max_protocol_version,
+                normalize_init_entries,
+                shadow_buckets: &[],
+                keep_shadowed_lifecycle_entries: false,
+                counters,
+            },
         );
     }
 
@@ -897,12 +912,14 @@ pub fn merge_buckets_with_options_and_shadows_and_counters(
     merge_with_shadows_impl(
         old_bucket,
         new_bucket,
-        keep_dead_entries,
-        max_protocol_version,
-        normalize_init_entries,
-        shadow_buckets,
-        keep_shadowed_lifecycle_entries,
-        counters,
+        MergeOptions {
+            keep_dead_entries,
+            max_protocol_version,
+            normalize_init_entries,
+            shadow_buckets,
+            keep_shadowed_lifecycle_entries,
+            counters,
+        },
     )
 }
 

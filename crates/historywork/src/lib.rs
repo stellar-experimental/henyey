@@ -607,14 +607,9 @@ impl Work for DownloadTransactionsWork {
             guard.headers.clone()
         };
         for entry in &entries {
-            let Some(header) = headers
-                .iter()
-                .find(|h| h.header.ledger_seq == entry.ledger_seq)
-            else {
-                return WorkOutcome::Failed(format!(
-                    "no header found for transaction set at ledger {}",
-                    entry.ledger_seq
-                ));
+            let header = match find_header(&headers, entry.ledger_seq, "transaction set") {
+                Ok(header) => header,
+                Err(err) => return WorkOutcome::Failed(err),
             };
             let tx_set = match &entry.ext {
                 TransactionHistoryEntryExt::V0 => {
@@ -705,14 +700,9 @@ impl Work for DownloadTxResultsWork {
         };
 
         for entry in &results {
-            let Some(header) = headers
-                .iter()
-                .find(|h| h.header.ledger_seq == entry.ledger_seq)
-            else {
-                return WorkOutcome::Failed(format!(
-                    "no header found for tx result set at ledger {}",
-                    entry.ledger_seq
-                ));
+            let header = match find_header(&headers, entry.ledger_seq, "tx result set") {
+                Ok(header) => header,
+                Err(err) => return WorkOutcome::Failed(err),
             };
             let xdr = match entry
                 .tx_result_set
@@ -918,6 +908,21 @@ fn content_bucket_hashes(has: &HistoryArchiveState) -> Vec<Hash256> {
         .collect()
 }
 
+fn find_header<'a>(
+    headers: &'a [LedgerHeaderHistoryEntry],
+    ledger_seq: u32,
+    missing_label: &str,
+) -> Result<&'a LedgerHeaderHistoryEntry, String> {
+    headers
+        .iter()
+        .find(|header| header.header.ledger_seq == ledger_seq)
+        .ok_or_else(|| format!("no header found for {missing_label} at ledger {ledger_seq}"))
+}
+
+fn checkpoint_frequency() -> u32 {
+    henyey_history::checkpoint_frequency()
+}
+
 /// The well-known path for stellar history (``.well-known/stellar-history.json``).
 ///
 /// This is the RFC 5785 compliant location for the current history archive state.
@@ -1094,40 +1099,19 @@ pub(crate) struct PublishXdrWork {
 }
 
 impl PublishXdrWork {
-    /// Creates a new publish work item for ledger headers.
-    pub(crate) fn headers(
+    /// Creates a new publish work item for the given history file type.
+    pub(crate) fn new(
         writer: Arc<dyn ArchiveWriter>,
         checkpoint: u32,
         state: SharedHistoryState,
+        file_type: HistoryFileType,
     ) -> Self {
-        Self { writer, checkpoint, state, file_type: HistoryFileType::Ledger }
-    }
-
-    /// Creates a new publish work item for transactions.
-    pub(crate) fn transactions(
-        writer: Arc<dyn ArchiveWriter>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-    ) -> Self {
-        Self { writer, checkpoint, state, file_type: HistoryFileType::Transactions }
-    }
-
-    /// Creates a new publish work item for transaction results.
-    pub(crate) fn results(
-        writer: Arc<dyn ArchiveWriter>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-    ) -> Self {
-        Self { writer, checkpoint, state, file_type: HistoryFileType::Results }
-    }
-
-    /// Creates a new publish work item for SCP history.
-    pub(crate) fn scp(
-        writer: Arc<dyn ArchiveWriter>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-    ) -> Self {
-        Self { writer, checkpoint, state, file_type: HistoryFileType::Scp }
+        Self {
+            writer,
+            checkpoint,
+            state,
+            file_type,
+        }
     }
 }
 
@@ -1587,40 +1571,44 @@ impl HistoryWorkBuilder {
         );
 
         let headers_id = scheduler.add_work(
-            Box::new(PublishXdrWork::headers(
+            Box::new(PublishXdrWork::new(
                 Arc::clone(&writer),
                 self.checkpoint,
                 Arc::clone(&self.state),
+                HistoryFileType::Ledger,
             )),
             vec![deps.headers],
             2,
         );
 
         let transactions_id = scheduler.add_work(
-            Box::new(PublishXdrWork::transactions(
+            Box::new(PublishXdrWork::new(
                 Arc::clone(&writer),
                 self.checkpoint,
                 Arc::clone(&self.state),
+                HistoryFileType::Transactions,
             )),
             vec![deps.transactions],
             2,
         );
 
         let results_id = scheduler.add_work(
-            Box::new(PublishXdrWork::results(
+            Box::new(PublishXdrWork::new(
                 Arc::clone(&writer),
                 self.checkpoint,
                 Arc::clone(&self.state),
+                HistoryFileType::Results,
             )),
             vec![deps.tx_results],
             2,
         );
 
         let scp_id = scheduler.add_work(
-            Box::new(PublishXdrWork::scp(
+            Box::new(PublishXdrWork::new(
                 Arc::clone(&writer),
                 self.checkpoint,
                 Arc::clone(&self.state),
+                HistoryFileType::Scp,
             )),
             vec![deps.scp_history],
             2,
@@ -1718,7 +1706,7 @@ impl CheckpointRange {
 
     /// Returns the number of checkpoints in this range.
     pub fn count(&self) -> usize {
-        let freq = henyey_history::checkpoint_frequency();
+        let freq = checkpoint_frequency();
         let first_idx = self.first / freq;
         let last_idx = self.last / freq;
         (last_idx - first_idx + 1) as usize
@@ -1726,7 +1714,7 @@ impl CheckpointRange {
 
     /// Returns an iterator over all checkpoint ledger sequences in this range.
     pub fn iter(&self) -> impl Iterator<Item = u32> {
-        let freq = henyey_history::checkpoint_frequency();
+        let freq = checkpoint_frequency();
         (self.first..=self.last).step_by(freq as usize)
     }
 
@@ -1735,7 +1723,7 @@ impl CheckpointRange {
     /// The first ledger is the start of the first checkpoint
     /// and the last ledger is `last` (the end of the last checkpoint).
     pub fn ledger_range(&self) -> (u32, u32) {
-        let freq = henyey_history::checkpoint_frequency();
+        let freq = checkpoint_frequency();
         let first_ledger = if self.first <= freq {
             1
         } else {

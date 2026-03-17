@@ -91,7 +91,11 @@ mod tx_set;
 pub use config::load_soroban_config;
 pub(crate) use config::{load_soroban_network_info, compute_soroban_resource_fee};
 pub use result_mapping::build_tx_result_pair;
-pub use tx_set::{execute_transaction_set, execute_transaction_set_with_fee_mode, run_transactions_on_executor, execute_soroban_parallel_phase, compute_state_size_window_entry};
+pub use tx_set::{
+    compute_state_size_window_entry, execute_soroban_parallel_phase,
+    execute_transaction_set, execute_transaction_set_with_fee_mode,
+    run_transactions_on_executor, RunTransactionsParams,
+};
 pub(crate) use tx_set::pre_deduct_all_fees_on_delta;
 
 use meta::*;
@@ -104,6 +108,25 @@ use signatures::*;
 /// requiring the tx layer to depend on the bucket crate.
 pub struct HotArchiveLookupImpl {
     hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
+}
+
+pub struct TransactionExecutionRequest {
+    pub tx_envelope: Arc<TransactionEnvelope>,
+    pub base_fee: u32,
+    pub soroban_prng_seed: Option<[u8; 32]>,
+    pub deduct_fee: bool,
+    pub fee_source_pre_state: Option<LedgerEntry>,
+    pub should_apply: bool,
+}
+
+struct OperationExecutionRequest<'a> {
+    op: &'a stellar_xdr::curr::Operation,
+    source: &'a AccountId,
+    tx_source: &'a AccountId,
+    tx_seq: i64,
+    op_index: u32,
+    context: &'a LedgerContext,
+    soroban_data: Option<&'a stellar_xdr::curr::SorobanTransactionData>,
 }
 
 impl HotArchiveLookupImpl {
@@ -2494,17 +2517,17 @@ impl TransactionExecutor {
             .map(|t| t.refund_amount())
             .unwrap_or(0);
 
-        let tx_meta = build_transaction_meta(
-            pre.tx_changes_before,
-            vec![],  // no operation changes
-            vec![],  // no operation events
-            vec![],  // no tx events
-            None,    // no soroban return value
-            vec![],  // no diagnostic events
+        let tx_meta = build_transaction_meta(TransactionMetaParts {
+            tx_changes_before: pre.tx_changes_before,
+            op_changes: vec![],
+            op_events: vec![],
+            tx_events: vec![],
+            soroban_return_value: None,
+            diagnostic_events: vec![],
             soroban_fee_info,
             emit_soroban_tx_meta_ext_v1,
             enable_soroban_diagnostic_events,
-        );
+        });
 
         let total_us = pre.tx_timing_start.elapsed().as_micros() as u64;
         TransactionExecutionResult {
@@ -2569,25 +2592,42 @@ impl TransactionExecutor {
         fee_source_pre_state: Option<LedgerEntry>,
         should_apply: bool,
     ) -> Result<TransactionExecutionResult> {
-        let tx_arc = Arc::new(tx_envelope.clone());
-        self.execute_transaction_with_arc(
-            snapshot, tx_arc, base_fee, soroban_prng_seed,
-            deduct_fee, fee_source_pre_state, should_apply,
+        self.execute_transaction_with_request(
+            snapshot,
+            TransactionExecutionRequest {
+                tx_envelope: Arc::new(tx_envelope.clone()),
+                base_fee,
+                soroban_prng_seed,
+                deduct_fee,
+                fee_source_pre_state,
+                should_apply,
+            },
         )
     }
 
     /// Execute a transaction from a shared Arc envelope (avoids cloning the envelope).
-    #[allow(clippy::too_many_arguments)]
     pub fn execute_transaction_with_arc(
         &mut self,
         snapshot: &SnapshotHandle,
-        tx_envelope: Arc<TransactionEnvelope>,
-        base_fee: u32,
-        soroban_prng_seed: Option<[u8; 32]>,
-        deduct_fee: bool,
-        fee_source_pre_state: Option<LedgerEntry>,
-        should_apply: bool,
+        request: TransactionExecutionRequest,
     ) -> Result<TransactionExecutionResult> {
+        self.execute_transaction_with_request(snapshot, request)
+    }
+
+    fn execute_transaction_with_request(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        request: TransactionExecutionRequest,
+    ) -> Result<TransactionExecutionResult> {
+        let TransactionExecutionRequest {
+            tx_envelope,
+            base_fee,
+            soroban_prng_seed,
+            deduct_fee,
+            fee_source_pre_state,
+            should_apply,
+        } = request;
+
         // Phase 1: Pre-apply (validate, charge fees, remove signers, bump seq)
         let pre = match self.pre_apply_arc(
             snapshot, &tx_envelope, base_fee,
@@ -2850,15 +2890,15 @@ impl TransactionExecutor {
                 } else {
                     Some(self.state.create_savepoint())
                 };
-                let result = self.execute_single_operation(
+                let result = self.execute_single_operation(OperationExecutionRequest {
                     op,
-                    &op_source,
-                    &inner_source_id,
+                    source: &op_source,
+                    tx_source: &inner_source_id,
                     tx_seq,
                     op_index,
-                    &ledger_context,
+                    context: &ledger_context,
                     soroban_data,
-                );
+                });
 
                 match result {
                     Ok(mut op_exec) => {
@@ -3276,17 +3316,17 @@ impl TransactionExecutor {
         let fee_refund_phase_us = meta_phase_start.elapsed().as_micros() as u64 - commit_phase_us;
 
         let tx_events = tx_event_manager.finalize();
-        let tx_meta = build_transaction_meta(
+        let tx_meta = build_transaction_meta(TransactionMetaParts {
             tx_changes_before,
-            op_changes,
-            op_events,
-            tx_events,
-            soroban_return_value,
-            diagnostic_events,
-            soroban_fee_info,
-            self.emit_soroban_tx_meta_ext_v1,
-            self.enable_soroban_diagnostic_events,
-        );
+            op_changes: op_changes,
+            op_events: op_events,
+            tx_events: tx_events,
+            soroban_return_value: soroban_return_value,
+            diagnostic_events: diagnostic_events,
+            soroban_fee_info: soroban_fee_info,
+            emit_soroban_tx_meta_ext_v1: self.emit_soroban_tx_meta_ext_v1,
+            enable_soroban_diagnostic_events: self.enable_soroban_diagnostic_events,
+        });
 
         let meta_build_phase_us = meta_phase_start.elapsed().as_micros() as u64 - commit_phase_us - fee_refund_phase_us;
 
@@ -3769,18 +3809,20 @@ impl TransactionExecutor {
     }
 
     /// Execute a single operation using the central dispatcher.
-    #[allow(clippy::too_many_arguments)]
     fn execute_single_operation(
         &mut self,
-        op: &stellar_xdr::curr::Operation,
-        source: &AccountId,
-        tx_source: &AccountId,
-        tx_seq: i64,
-        op_index: u32,
-        context: &LedgerContext,
-        soroban_data: Option<&stellar_xdr::curr::SorobanTransactionData>,
-    ) -> std::result::Result<henyey_tx::operations::execute::OperationExecutionResult, TxError>
-    {
+        request: OperationExecutionRequest<'_>,
+    ) -> std::result::Result<henyey_tx::operations::execute::OperationExecutionResult, TxError> {
+        let OperationExecutionRequest {
+            op,
+            source,
+            tx_source,
+            tx_seq,
+            op_index,
+            context,
+            soroban_data,
+        } = request;
+
         // Create a hot archive lookup wrapper if hot archive is available
         let hot_archive_lookup;
         let hot_archive_ref: Option<&dyn henyey_tx::soroban::HotArchiveLookup> =

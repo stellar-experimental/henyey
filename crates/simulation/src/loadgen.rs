@@ -29,7 +29,8 @@ use tracing::{debug, info, warn};
 
 use crate::loadgen_soroban::{
     compute_contract_id, contract_code_key, contract_instance_key, make_account_address,
-    make_contract_address, make_u32, make_u64, SorobanTxBuilder,
+    make_contract_address, make_u32, make_u64, BatchTransfer, ContractInvocation,
+    SacTransfer, SorobanTxBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -652,15 +653,17 @@ impl TxGenerator {
         let envelope = builder.invoke_contract_tx(
             &sk,
             seq,
-            &instance.contract_id,
-            "do_work",
-            args,
-            instance.read_only_keys.clone(),
-            rw_keys,
-            target_instructions,
-            5000 + instance.contract_entries_size,
-            (n_entries as u32) * (kb_per_entry as u32) * 1024,
-            fee,
+            ContractInvocation {
+                contract_id: instance.contract_id,
+                function_name: "do_work".to_string(),
+                args,
+                read_only_keys: instance.read_only_keys.clone(),
+                read_write_keys: rw_keys,
+                instructions: target_instructions,
+                read_bytes: 5000 + instance.contract_entries_size,
+                write_bytes: (n_entries as u32) * (kb_per_entry as u32) * 1024,
+                inclusion_fee: fee,
+            },
         )?;
         Ok((account_id, envelope))
     }
@@ -706,12 +709,14 @@ impl TxGenerator {
         let envelope = builder.invoke_sac_transfer_tx(
             &sk,
             seq,
-            &instance.contract_id,
-            from_address,
-            to_address,
-            amount as i128,
-            instance.read_only_keys.clone(),
-            fee,
+            SacTransfer {
+                contract_id: instance.contract_id,
+                from_address,
+                to_address,
+                amount: amount as i128,
+                instance_keys: instance.read_only_keys.clone(),
+                inclusion_fee: fee,
+            },
         )?;
         Ok((from_account_id, envelope))
     }
@@ -741,11 +746,13 @@ impl TxGenerator {
         let envelope = builder.invoke_batch_transfer_tx(
             &sk,
             seq,
-            &batch_instance.contract_id,
-            ScVal::Address(sac_address),
-            dest_vals,
-            batch_instance.read_only_keys.clone(),
-            fee,
+            BatchTransfer {
+                contract_id: batch_instance.contract_id,
+                sac_address: ScVal::Address(sac_address),
+                destinations: dest_vals,
+                instance_keys: batch_instance.read_only_keys.clone(),
+                inclusion_fee: fee,
+            },
         )?;
         Ok((source_account_id, envelope))
     }

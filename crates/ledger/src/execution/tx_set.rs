@@ -12,6 +12,17 @@ use super::*;
 /// Result of a parallel cluster execution: (result, elapsed_us, cluster_index).
 type ClusterThreadResult = (Result<(TxSetResult, LedgerDelta, i64)>, u64, usize);
 
+pub struct RunTransactionsParams<'a> {
+    pub executor: &'a mut TransactionExecutor,
+    pub snapshot: &'a SnapshotHandle,
+    pub transactions: &'a [TxWithFee],
+    pub base_fee: u32,
+    pub soroban_base_prng_seed: [u8; 32],
+    pub deduct_fee: bool,
+    pub delta: &'a mut LedgerDelta,
+    pub external_pre_charged: Option<&'a [PreChargedFee]>,
+}
+
 /// Execute a full transaction set.
 ///
 /// # Arguments
@@ -73,16 +84,16 @@ pub fn execute_transaction_set_with_fee_mode(
         executor.set_offer_store(offer_store.clone());
     }
 
-    run_transactions_on_executor(
-        &mut executor,
+    run_transactions_on_executor(RunTransactionsParams {
+        executor: &mut executor,
         snapshot,
         transactions,
-        context.base_fee,
-        soroban.base_prng_seed,
+        base_fee: context.base_fee,
+        soroban_base_prng_seed: soroban.base_prng_seed,
         deduct_fee,
         delta,
-        None,
-    )
+        external_pre_charged: None,
+    })
 }
 
 /// Execute transactions on a pre-configured executor, apply results to delta.
@@ -96,17 +107,17 @@ pub fn execute_transaction_set_with_fee_mode(
 /// When `external_pre_charged` is `Some`, fees have already been pre-deducted
 /// on the delta by `pre_deduct_all_fees_on_delta`. The internal fee loop is
 /// skipped and the provided fee changes are used for transaction meta.
-#[allow(clippy::too_many_arguments)]
-pub fn run_transactions_on_executor(
-    executor: &mut TransactionExecutor,
-    snapshot: &SnapshotHandle,
-    transactions: &[TxWithFee],
-    base_fee: u32,
-    soroban_base_prng_seed: [u8; 32],
-    deduct_fee: bool,
-    delta: &mut LedgerDelta,
-    external_pre_charged: Option<&[PreChargedFee]>,
-) -> Result<TxSetResult> {
+pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result<TxSetResult> {
+    let RunTransactionsParams {
+        executor,
+        snapshot,
+        transactions,
+        base_fee,
+        soroban_base_prng_seed,
+        deduct_fee,
+        delta,
+        external_pre_charged,
+    } = params;
     let ledger_seq = executor.ledger_seq;
     let protocol_version = executor.protocol_version;
 
@@ -213,12 +224,14 @@ pub fn run_transactions_on_executor(
         // (when deduct_fee=true) or not needed (when deduct_fee=false from caller).
         let mut result = executor.execute_transaction_with_arc(
             snapshot,
-            Arc::clone(tx),
-            tx_fee,
-            Some(tx_prng_seed),
-            false,
-            None,
-            true, // should_apply: always execute body in sequential path
+            TransactionExecutionRequest {
+                tx_envelope: Arc::clone(tx),
+                base_fee: tx_fee,
+                soroban_prng_seed: Some(tx_prng_seed),
+                deduct_fee: false,
+                fee_source_pre_state: None,
+                should_apply: true,
+            },
         )?;
 
         // When fees were pre-charged (parallel path), the executor runs with
@@ -804,12 +817,14 @@ pub(super) fn execute_single_cluster(
         let exec_start = std::time::Instant::now();
         let mut result = executor.execute_transaction_with_arc(
             snapshot,
-            Arc::clone(tx),
-            tx_fee,
-            Some(tx_prng_seed),
-            false,
-            None,
-            pre.should_apply,
+            TransactionExecutionRequest {
+                tx_envelope: Arc::clone(tx),
+                base_fee: tx_fee,
+                soroban_prng_seed: Some(tx_prng_seed),
+                deduct_fee: false,
+                fee_source_pre_state: None,
+                should_apply: pre.should_apply,
+            },
         )?;
         agg_execute_us += exec_start.elapsed().as_micros() as u64;
         agg_validation_us += result.validation_us;

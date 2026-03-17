@@ -20,6 +20,9 @@ use std::path::Path;
 
 use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
 
+const FRAME_CONTINUATION_BIT: u8 = 0x80;
+const MAX_FRAME_SIZE: u32 = 0x8000_0000;
+
 /// Compute the XDR-encoded byte length of a value without heap allocation.
 ///
 /// Uses a counting writer that discards output bytes, avoiding the `Vec<u8>`
@@ -39,6 +42,24 @@ pub fn xdr_encoded_len(val: &impl WriteXdr) -> usize {
     }
     let mut w = stellar_xdr::curr::Limited::new(CountingWriter(0), Limits::none());
     val.write_xdr(&mut w).map(|_| w.inner.0).unwrap_or(0)
+}
+
+#[inline]
+fn encode_frame_header(size: u32) -> [u8; 4] {
+    [
+        ((size >> 24) & 0xFF) as u8 | FRAME_CONTINUATION_BIT,
+        ((size >> 16) & 0xFF) as u8,
+        ((size >> 8) & 0xFF) as u8,
+        (size & 0xFF) as u8,
+    ]
+}
+
+#[inline]
+fn decode_frame_size(header: [u8; 4]) -> u32 {
+    (((header[0] & !FRAME_CONTINUATION_BIT) as u32) << 24)
+        | ((header[1] as u32) << 16)
+        | ((header[2] as u32) << 8)
+        | (header[3] as u32)
 }
 
 /// Serialize a value to XDR and write it as a size-prefixed frame.
@@ -66,18 +87,13 @@ fn write_frame<W: Write>(writer: &mut W, value: &impl WriteXdr) -> io::Result<us
 
     let sz = payload.len() as u32;
     assert!(
-        sz < 0x8000_0000,
+        sz < MAX_FRAME_SIZE,
         "XDR payload size {} exceeds maximum (0x80000000)",
         sz
     );
 
     // Write 4-byte size header with continuation bit (bit 31) set
-    let header: [u8; 4] = [
-        ((sz >> 24) & 0xFF) as u8 | 0x80,
-        ((sz >> 16) & 0xFF) as u8,
-        ((sz >> 8) & 0xFF) as u8,
-        (sz & 0xFF) as u8,
-    ];
+    let header = encode_frame_header(sz);
 
     writer.write_all(&header)?;
     writer.write_all(&payload)?;
@@ -246,10 +262,7 @@ impl XdrInputStream {
         }
 
         // Extract size (strip continuation bit from high byte)
-        let sz = (((header[0] & 0x7F) as u32) << 24)
-            | ((header[1] as u32) << 16)
-            | ((header[2] as u32) << 8)
-            | (header[3] as u32);
+        let sz = decode_frame_size(header);
 
         // Read payload
         let mut payload = vec![0u8; sz as usize];
@@ -303,10 +316,12 @@ mod tests {
 
     /// Helper to extract size from a 4-byte header with continuation bit.
     fn read_frame_size(data: &[u8], offset: usize) -> u32 {
-        (((data[offset] & 0x7F) as u32) << 24)
-            | ((data[offset + 1] as u32) << 16)
-            | ((data[offset + 2] as u32) << 8)
-            | (data[offset + 3] as u32)
+        decode_frame_size([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ])
     }
 
     #[test]
@@ -321,7 +336,10 @@ mod tests {
         let data = buf.data();
 
         // Verify the header has the continuation bit set
-        assert!(data[0] & 0x80 != 0, "continuation bit must be set");
+        assert!(
+            data[0] & FRAME_CONTINUATION_BIT != 0,
+            "continuation bit must be set"
+        );
 
         // Extract the size from the header
         let sz = read_frame_size(&data, 0);
@@ -507,7 +525,7 @@ mod tests {
 
         // Read back and verify
         let data = std::fs::read(&path).unwrap();
-        assert!(data[0] & 0x80 != 0);
+        assert!(data[0] & FRAME_CONTINUATION_BIT != 0);
         let sz = read_frame_size(&data, 0);
         let _decoded =
             LedgerCloseMeta::from_xdr(&data[4..4 + sz as usize], stellar_xdr::curr::Limits::none())

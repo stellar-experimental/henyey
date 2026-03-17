@@ -1003,10 +1003,12 @@ pub fn execute_operation_with_soroban(
                 &op_source,
                 state,
                 context,
-                soroban.soroban_data,
-                config.min_persistent_entry_ttl,
-                &ha_restore_entries,
-                soroban.ttl_key_cache,
+                restore_footprint::RestoreFootprintResources {
+                    soroban_data: soroban.soroban_data,
+                    min_persistent_entry_ttl: config.min_persistent_entry_ttl,
+                    hot_archive_restores: &ha_restore_entries,
+                    ttl_key_cache: soroban.ttl_key_cache,
+                },
             )?;
             let mut exec = OperationExecutionResult::new(result);
             if matches!(

@@ -128,12 +128,17 @@ const MAX_TOPICS_PER_FILTER: usize = 5;
 /// Maximum number of alternatives per topic segment.
 const MAX_TOPIC_SEGMENTS: usize = 4;
 
+type EventTypeFilter = Option<&'static str>;
+type ContractIdFilters = Vec<String>;
+type TopicFilters = Vec<Vec<String>>;
+type EventFilters = (EventTypeFilter, ContractIdFilters, TopicFilters);
+
 /// Parse event filter parameters from the JSON-RPC request.
 ///
 /// Returns `(event_type, contract_ids, topic_filters)`.
 fn parse_event_filters(
     filters: Option<&Vec<serde_json::Value>>,
-) -> Result<(Option<&'static str>, Vec<String>, Vec<Vec<String>>), JsonRpcError> {
+) -> Result<EventFilters, JsonRpcError> {
     let mut event_type: Option<&'static str> = None;
     let mut contract_ids = Vec::new();
     let mut topic_filters = Vec::new();

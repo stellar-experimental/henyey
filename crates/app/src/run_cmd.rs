@@ -36,6 +36,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::future::Future;
 
 use serde::Serialize;
 use tokio::signal;
@@ -219,11 +220,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         if let Some(ref factory) = options.loadgen_runner_factory {
             status_server.set_loadgen_runner(factory(app.clone()));
         }
-        Some(tokio::spawn(async move {
-            if let Err(e) = status_server.start().await {
-                tracing::error!(error = %e, "HTTP status server error");
-            }
-        }))
+        Some(spawn_server("HTTP status server", status_server.start()))
     } else {
         None
     };
@@ -231,11 +228,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     // Start the HTTP query server if configured
     let query_handle = if let Some(port) = query_port {
         let query_server = QueryServer::new(port, app.clone());
-        Some(tokio::spawn(async move {
-            if let Err(e) = query_server.start().await {
-                tracing::error!(error = %e, "HTTP query server error");
-            }
-        }))
+        Some(spawn_server("HTTP query server", query_server.start()))
     } else {
         None
     };
@@ -248,11 +241,10 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         if let Some(ref factory) = options.loadgen_runner_factory {
             compat_server.set_loadgen_runner(factory(app.clone()));
         }
-        Some(tokio::spawn(async move {
-            if let Err(e) = compat_server.start().await {
-                tracing::error!(error = %e, "stellar-core compat HTTP server error");
-            }
-        }))
+        Some(spawn_server(
+            "stellar-core compat HTTP server",
+            compat_server.start(),
+        ))
     } else {
         None
     };
@@ -296,6 +288,17 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
             Err(e)
         }
     }
+}
+
+fn spawn_server<F>(name: &'static str, future: F) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        if let Err(e) = future.await {
+            tracing::error!(error = %e, "{name} error");
+        }
+    })
 }
 
 /// Validate that the options are compatible with the configuration.

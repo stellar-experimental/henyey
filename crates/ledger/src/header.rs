@@ -39,6 +39,18 @@ pub const SKIP_2: u32 = 5000;
 pub const SKIP_3: u32 = 50000;
 pub const SKIP_4: u32 = 500000;
 
+/// Variable fields needed to construct the next ledger header.
+pub struct NextHeaderFields {
+    pub close_time: u64,
+    pub tx_set_hash: Hash256,
+    pub bucket_list_hash: Hash256,
+    pub tx_set_result_hash: Hash256,
+    pub total_coins: i64,
+    pub fee_pool: i64,
+    pub inflation_seq: u32,
+    pub stellar_value_ext: stellar_xdr::curr::StellarValueExt,
+}
+
 /// Compute the canonical hash of a ledger header.
 ///
 /// The header hash is the SHA-256 digest of the XDR-encoded header.
@@ -131,17 +143,29 @@ pub fn skip_list_target_seq(current_seq: u32, skip_index: usize) -> Option<u32> 
         1 => {
             // Points back by at most 4
             let rem = current_seq % 4;
-            if rem == 0 { 4 } else { rem }
+            if rem == 0 {
+                4
+            } else {
+                rem
+            }
         }
         2 => {
             // Points back by at most 16
             let rem = current_seq % 16;
-            if rem == 0 { 16 } else { rem }
+            if rem == 0 {
+                16
+            } else {
+                rem
+            }
         }
         3 => {
             // Points back by at most 64
             let rem = current_seq % 64;
-            if rem == 0 { 64 } else { rem }
+            if rem == 0 {
+                64
+            } else {
+                rem
+            }
         }
         _ => return None,
     };
@@ -261,18 +285,10 @@ pub fn verify_skip_list(
 ///
 /// The skip_list is copied from the previous header and then updated via
 /// `calculate_skip_values` based on the new bucket_list_hash.
-#[allow(clippy::too_many_arguments)]
 pub fn create_next_header(
     prev_header: &LedgerHeader,
     prev_header_hash: Hash256,
-    close_time: u64,
-    tx_set_hash: Hash256,
-    bucket_list_hash: Hash256,
-    tx_set_result_hash: Hash256,
-    total_coins: i64,
-    fee_pool: i64,
-    inflation_seq: u32,
-    stellar_value_ext: stellar_xdr::curr::StellarValueExt,
+    fields: NextHeaderFields,
 ) -> LedgerHeader {
     let new_seq = prev_header.ledger_seq + 1;
 
@@ -280,17 +296,17 @@ pub fn create_next_header(
         ledger_version: prev_header.ledger_version,
         previous_ledger_hash: prev_header_hash.into(),
         scp_value: stellar_xdr::curr::StellarValue {
-            tx_set_hash: tx_set_hash.into(),
-            close_time: stellar_xdr::curr::TimePoint(close_time),
+            tx_set_hash: fields.tx_set_hash.into(),
+            close_time: stellar_xdr::curr::TimePoint(fields.close_time),
             upgrades: stellar_xdr::curr::VecM::default(),
-            ext: stellar_value_ext,
+            ext: fields.stellar_value_ext,
         },
-        tx_set_result_hash: tx_set_result_hash.into(),
-        bucket_list_hash: bucket_list_hash.into(),
+        tx_set_result_hash: fields.tx_set_result_hash.into(),
+        bucket_list_hash: fields.bucket_list_hash.into(),
         ledger_seq: new_seq,
-        total_coins,
-        fee_pool,
-        inflation_seq,
+        total_coins: fields.total_coins,
+        fee_pool: fields.fee_pool,
+        inflation_seq: fields.inflation_seq,
         id_pool: prev_header.id_pool,
         base_fee: prev_header.base_fee,
         base_reserve: prev_header.base_reserve,

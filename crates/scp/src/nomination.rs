@@ -157,7 +157,7 @@ impl NominationProtocol {
     }
 
     /// Update fully-validated state for local emission gating.
-    pub fn set_fully_validated(&mut self, fully_validated: bool) {
+    pub(crate) fn set_fully_validated(&mut self, fully_validated: bool) {
         self.fully_validated = fully_validated;
     }
 
@@ -978,7 +978,7 @@ impl NominationProtocol {
     }
 
     /// Get the candidates (confirmed values ready for ballot protocol).
-    pub fn candidates(&self) -> &[Value] {
+    pub(crate) fn candidates(&self) -> &[Value] {
         &self.candidates
     }
 }

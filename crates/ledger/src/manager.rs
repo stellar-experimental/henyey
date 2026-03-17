@@ -36,7 +36,7 @@ use crate::{
         SorobanContext, SorobanNetworkInfo, TransactionExecutionResult,
         TransactionExecutor, TxSetResult,
     },
-    header::{compute_header_hash, create_next_header},
+    header::{compute_header_hash, create_next_header, NextHeaderFields},
     snapshot::{LedgerSnapshot, SnapshotHandle},
     LedgerError, Result,
 };
@@ -3364,16 +3364,16 @@ impl<'a> LedgerCloseContext<'a> {
                         hot_archive_restored_keys: Vec::new(),
                     }
                 } else {
-                    run_transactions_on_executor(
-                        executor_ref,
-                        &self.snapshot,
-                        classic_txs,
-                        self.prev_header.base_fee,
-                        soroban_base_prng_seed.0,
-                        false,
-                        &mut self.delta,
-                        Some(&classic_pre_charged),
-                    )?
+                    run_transactions_on_executor(crate::execution::RunTransactionsParams {
+                        executor: executor_ref,
+                        snapshot: &self.snapshot,
+                        transactions: classic_txs,
+                        base_fee: self.prev_header.base_fee,
+                        soroban_base_prng_seed: soroban_base_prng_seed.0,
+                        deduct_fee: false,
+                        delta: &mut self.delta,
+                        external_pre_charged: Some(&classic_pre_charged),
+                    })?
                 };
                 self.timing_classic_exec_us = classic_start.elapsed().as_micros() as u64;
 
@@ -3427,16 +3427,16 @@ impl<'a> LedgerCloseContext<'a> {
                 classic_result
             } else {
                 // Sequential path: run all transactions on the persistent executor.
-                run_transactions_on_executor(
-                    executor_ref,
-                    &self.snapshot,
-                    &prepared.all_txs,
-                    self.prev_header.base_fee,
-                    soroban_base_prng_seed.0,
-                    true,
-                    &mut self.delta,
-                    None,
-                )?
+                run_transactions_on_executor(crate::execution::RunTransactionsParams {
+                    executor: executor_ref,
+                    snapshot: &self.snapshot,
+                    transactions: &prepared.all_txs,
+                    base_fee: self.prev_header.base_fee,
+                    soroban_base_prng_seed: soroban_base_prng_seed.0,
+                    deduct_fee: true,
+                    delta: &mut self.delta,
+                    external_pre_charged: None,
+                })?
             };
 
         // Store the executor back for reuse on the next ledger close
@@ -3958,14 +3958,16 @@ impl<'a> LedgerCloseContext<'a> {
         let mut new_header = create_next_header(
             &self.prev_header,
             self.prev_header_hash,
-            self.close_data.close_time,
-            self.close_data.tx_set_hash(),
-            bucket_list_hash,
-            tx_result_hash,
-            total_coins,
-            fee_pool,
-            self.prev_header.inflation_seq,
-            self.close_data.stellar_value_ext.clone(),
+            NextHeaderFields {
+                close_time: self.close_data.close_time,
+                tx_set_hash: self.close_data.tx_set_hash(),
+                bucket_list_hash,
+                tx_set_result_hash: tx_result_hash,
+                total_coins,
+                fee_pool,
+                inflation_seq: self.prev_header.inflation_seq,
+                stellar_value_ext: self.close_data.stellar_value_ext.clone(),
+            },
         );
 
         // Apply upgrades to header fields (e.g., ledger_version, base_fee)
@@ -4856,18 +4858,18 @@ impl<'a> LedgerCloseContext<'a> {
         });
         let tx_set = std::mem::replace(&mut self.close_data.tx_set, empty_tx_set);
         let scp_history = std::mem::take(&mut self.close_data.scp_history);
-        let meta = build_ledger_close_meta(
-            tx_set,
+        let meta = build_ledger_close_meta(LedgerCloseMetaInputs {
+            tx_set_variant: tx_set,
             scp_history,
-            &new_header,
+            header: new_header.clone(),
             header_hash,
-            std::mem::take(&mut self.tx_result_metas),
-            evicted_meta_keys,
-            avg_soroban_state_size,
-            upgrades_meta,
-            self.manager.config.emit_ledger_close_meta_ext_v1,
-            self.soroban_fee_write_1kb,
-        );
+            tx_result_metas: std::mem::take(&mut self.tx_result_metas),
+            evicted_keys: evicted_meta_keys,
+            total_byte_size_of_live_soroban_state: avg_soroban_state_size,
+            upgrades_processing: upgrades_meta,
+            emit_ext_v1: self.manager.config.emit_ledger_close_meta_ext_v1,
+            soroban_fee_write_1kb: self.soroban_fee_write_1kb,
+        });
         let meta_us = meta_start.elapsed().as_micros() as u64;
 
         // Emit single summary timing line for performance analysis
@@ -4957,11 +4959,10 @@ fn build_generalized_tx_set_owned(tx_set: TransactionSetVariant) -> GeneralizedT
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_ledger_close_meta(
+struct LedgerCloseMetaInputs {
     tx_set_variant: TransactionSetVariant,
     scp_history: Vec<ScpHistoryEntry>,
-    header: &LedgerHeader,
+    header: LedgerHeader,
     header_hash: Hash256,
     tx_result_metas: Vec<TransactionResultMetaV1>,
     evicted_keys: Vec<LedgerKey>,
@@ -4969,10 +4970,26 @@ fn build_ledger_close_meta(
     upgrades_processing: Vec<UpgradeEntryMeta>,
     emit_ext_v1: bool,
     soroban_fee_write_1kb: i64,
+}
+
+fn build_ledger_close_meta(
+    inputs: LedgerCloseMetaInputs,
 ) -> LedgerCloseMeta {
+    let LedgerCloseMetaInputs {
+        tx_set_variant,
+        scp_history,
+        header,
+        header_hash,
+        tx_result_metas,
+        evicted_keys,
+        total_byte_size_of_live_soroban_state,
+        upgrades_processing,
+        emit_ext_v1,
+        soroban_fee_write_1kb,
+    } = inputs;
     let ledger_header = LedgerHeaderHistoryEntry {
         hash: Hash::from(header_hash),
-        header: header.clone(),
+        header,
         ext: LedgerHeaderHistoryEntryExt::V0,
     };
 
@@ -5816,7 +5833,18 @@ mod tests {
         .with_scp_history(vec![scp_entry.clone()]);
 
         let header = create_genesis_header();
-        let meta = build_ledger_close_meta(close_data.tx_set, close_data.scp_history, &header, Hash256::ZERO, Vec::new(), Vec::new(), 0, Vec::new(), false, 0);
+        let meta = build_ledger_close_meta(LedgerCloseMetaInputs {
+            tx_set_variant: close_data.tx_set,
+            scp_history: close_data.scp_history,
+            header,
+            header_hash: Hash256::ZERO,
+            tx_result_metas: Vec::new(),
+            evicted_keys: Vec::new(),
+            total_byte_size_of_live_soroban_state: 0,
+            upgrades_processing: Vec::new(),
+            emit_ext_v1: false,
+            soroban_fee_write_1kb: 0,
+        });
         let scp_info_len = match meta {
             LedgerCloseMeta::V0(_) => 0,
             LedgerCloseMeta::V1(v1) => v1.scp_info.len(),

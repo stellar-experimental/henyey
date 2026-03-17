@@ -126,18 +126,18 @@ pub fn execute_liquidity_pool_deposit(
             }
         }
     } else {
-        match deposit_into_non_empty_pool(
-            op.max_amount_a,
-            op.max_amount_b,
+        match deposit_into_non_empty_pool(NonEmptyPoolDepositRequest {
+            max_amount_a: op.max_amount_a,
+            max_amount_b: op.max_amount_b,
             available_a,
             available_b,
             available_pool_share_limit,
             reserve_a,
             reserve_b,
             total_shares,
-            &op.min_price,
-            &op.max_price,
-        )? {
+            min_price: &op.min_price,
+            max_price: &op.max_price,
+        })? {
             DepositOutcome::Success { a, b, shares } => (a, b, shares),
             DepositOutcome::Underfunded => {
                 return Ok(make_deposit_result(
@@ -447,6 +447,19 @@ enum DepositOutcome {
     LineFull,
 }
 
+struct NonEmptyPoolDepositRequest<'a> {
+    max_amount_a: i64,
+    max_amount_b: i64,
+    available_a: i64,
+    available_b: i64,
+    available_pool_share_limit: i64,
+    reserve_a: i64,
+    reserve_b: i64,
+    total_shares: i64,
+    min_price: &'a Price,
+    max_price: &'a Price,
+}
+
 fn deposit_into_empty_pool(
     max_amount_a: i64,
     max_amount_b: i64,
@@ -476,19 +489,19 @@ fn deposit_into_empty_pool(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn deposit_into_non_empty_pool(
-    max_amount_a: i64,
-    max_amount_b: i64,
-    available_a: i64,
-    available_b: i64,
-    available_pool_share_limit: i64,
-    reserve_a: i64,
-    reserve_b: i64,
-    total_shares: i64,
-    min_price: &Price,
-    max_price: &Price,
-) -> Result<DepositOutcome> {
+fn deposit_into_non_empty_pool(request: NonEmptyPoolDepositRequest<'_>) -> Result<DepositOutcome> {
+    let NonEmptyPoolDepositRequest {
+        max_amount_a,
+        max_amount_b,
+        available_a,
+        available_b,
+        available_pool_share_limit,
+        reserve_a,
+        reserve_b,
+        total_shares,
+        min_price,
+        max_price,
+    } = request;
     let shares_a = big_divide_checked(total_shares, max_amount_a, reserve_a, Round::Down);
     let shares_b = big_divide_checked(total_shares, max_amount_b, reserve_b, Round::Down);
 
@@ -2011,18 +2024,18 @@ mod tests {
         let min_price = Price { n: 1, d: i32::MAX };
         let max_price = Price { n: i32::MAX, d: 1 };
 
-        let result = deposit_into_non_empty_pool(
+        let result = deposit_into_non_empty_pool(NonEmptyPoolDepositRequest {
             max_amount_a,
             max_amount_b,
-            i64::MAX, // available_a
-            i64::MAX, // available_b
-            i64::MAX, // available_pool_share_limit
+            available_a: i64::MAX,
+            available_b: i64::MAX,
+            available_pool_share_limit: i64::MAX,
             reserve_a,
             reserve_b,
             total_shares,
-            &min_price,
-            &max_price,
-        );
+            min_price: &min_price,
+            max_price: &max_price,
+        });
 
         // The key assertion: with minAmongValid, when shares_a overflows,
         // pool_shares should be shares_b (100), not min(0, 100) = 0.

@@ -48,6 +48,26 @@ enum SorobanOp {
     },
 }
 
+struct InvokeRequest {
+    host_fn: HostFunction,
+    source_account: stellar_xdr::curr::AccountId,
+    ledger_info: soroban_host::LedgerInfo,
+    snapshot_source: BucketListSnapshotSource,
+    soroban_info: henyey_ledger::SorobanNetworkInfo,
+    latest_ledger: u32,
+    format: XdrFormat,
+    auth_mode: soroban_host::e2e_invoke::RecordingInvocationAuthMode,
+    instruction_leeway: u32,
+}
+
+struct InvokeResponseContext<'a> {
+    soroban_info: &'a henyey_ledger::SorobanNetworkInfo,
+    latest_ledger: u32,
+    host_fn: &'a HostFunction,
+    format: XdrFormat,
+    instruction_leeway: u32,
+}
+
 /// Extract the Soroban operation, source account, and optional footprint from the envelope.
 fn extract_soroban_op(
     tx_env: &TransactionEnvelope,
@@ -257,17 +277,17 @@ pub async fn handle(
             // Determine the effective auth mode
             let resolved_auth_mode = resolve_auth_mode(auth_mode_str, &auth)?;
 
-            handle_invoke(
+            handle_invoke(InvokeRequest {
                 host_fn,
                 source_account,
                 ledger_info,
                 snapshot_source,
-                &soroban_info,
-                ledger.num,
+                soroban_info: soroban_info.clone(),
+                latest_ledger: ledger.num,
                 format,
-                resolved_auth_mode,
+                auth_mode: resolved_auth_mode,
                 instruction_leeway,
-            )
+            })
             .await
         }
         SorobanOp::ExtendFootprintTtl { keys, extend_to } => {
@@ -355,20 +375,12 @@ fn resolve_auth_mode(
 // InvokeHostFunction path (existing logic, refactored)
 // ---------------------------------------------------------------------------
 
-async fn handle_invoke(
-    host_fn: HostFunction,
-    source_account: stellar_xdr::curr::AccountId,
-    ledger_info: soroban_host::LedgerInfo,
-    snapshot_source: BucketListSnapshotSource,
-    soroban_info: &henyey_ledger::SorobanNetworkInfo,
-    latest_ledger: u32,
-    format: XdrFormat,
-    auth_mode: soroban_host::e2e_invoke::RecordingInvocationAuthMode,
-    instruction_leeway: u32,
-) -> Result<serde_json::Value, JsonRpcError> {
-    let host_fn_clone = host_fn.clone();
-    let source_account_clone = source_account.clone();
-    let ledger_info_clone = ledger_info.clone();
+async fn handle_invoke(request: InvokeRequest) -> Result<serde_json::Value, JsonRpcError> {
+    let host_fn_clone = request.host_fn.clone();
+    let source_account_clone = request.source_account.clone();
+    let ledger_info_clone = request.ledger_info.clone();
+    let snapshot_source = request.snapshot_source;
+    let auth_mode = request.auth_mode;
 
     let result = tokio::task::spawn_blocking(move || {
         run_invoke_simulation(
@@ -387,14 +399,15 @@ async fn handle_invoke(
             sim_output.recording_result,
             sim_output.diagnostic_events,
             sim_output.state_changes,
-            soroban_info,
-            latest_ledger,
-            &host_fn,
-            &source_account,
-            format,
-            instruction_leeway,
+            InvokeResponseContext {
+                soroban_info: &request.soroban_info,
+                latest_ledger: request.latest_ledger,
+                host_fn: &request.host_fn,
+                format: request.format,
+                instruction_leeway: request.instruction_leeway,
+            },
         ),
-        Err(e) => build_error_response(e, latest_ledger),
+        Err(e) => build_error_response(e, request.latest_ledger),
     }
 }
 
@@ -444,7 +457,7 @@ fn run_invoke_simulation(
             Ok(_) => {
                 // Extract state changes (before/after diffs) for read-write entries
                 let state_changes = extract_modified_entries(
-                    &*snapshot_rc,
+                    &snapshot_rc,
                     &recording_result.ledger_changes,
                     &ledger_info,
                 );
@@ -746,12 +759,7 @@ fn build_invoke_response(
     sim_result: soroban_host::e2e_invoke::InvokeHostFunctionRecordingModeResult,
     diagnostic_events: Vec<stellar_xdr::curr::DiagnosticEvent>,
     state_changes: Vec<LedgerEntryDiff>,
-    soroban_info: &henyey_ledger::SorobanNetworkInfo,
-    latest_ledger: u32,
-    host_fn: &HostFunction,
-    _source_account: &stellar_xdr::curr::AccountId,
-    format: XdrFormat,
-    instruction_leeway: u32,
+    ctx: InvokeResponseContext<'_>,
 ) -> Result<serde_json::Value, JsonRpcError> {
     // Use the host's resource estimates directly. The host computes:
     //   - instructions: CPU insns consumed during simulation
@@ -763,14 +771,14 @@ fn build_invoke_response(
 
     // Apply resource adjustments (mirrors soroban-simulation default_adjustment)
     let mut adjusted_resources = resources.clone();
-    adjust_resources(&mut adjusted_resources, instruction_leeway);
+    adjust_resources(&mut adjusted_resources, ctx.instruction_leeway);
 
     // Compute rent changes for fee estimation
     let rent_changes = soroban_host::e2e_invoke::extract_rent_changes(&sim_result.ledger_changes);
 
     // Estimate the transaction size for fee computation
     let op = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-        host_function: host_fn.clone(),
+        host_function: ctx.host_fn.clone(),
         auth: sim_result
             .auth
             .clone()
@@ -800,8 +808,8 @@ fn build_invoke_response(
         resource_fee: compute_invoke_resource_fee(
             &resources,
             &rent_changes,
-            soroban_info,
-            latest_ledger,
+            ctx.soroban_info,
+            ctx.latest_ledger,
             sim_result.contract_events_and_return_value_size,
             tx_size,
             sim_result.restored_rw_entry_indices.len() as u32,
@@ -813,7 +821,7 @@ fn build_invoke_response(
     let mut obj = serde_json::Map::new();
 
     // transactionData — upstream uses unsuffixed "transactionData" for base64
-    insert_sim_xdr_field(&mut obj, "transactionData", &soroban_data, format)?;
+    insert_sim_xdr_field(&mut obj, "transactionData", &soroban_data, ctx.format)?;
 
     obj.insert("minResourceFee".into(), json!(min_resource_fee.to_string()));
     obj.insert(
@@ -823,11 +831,11 @@ fn build_invoke_response(
             "memBytes": "0"
         }),
     );
-    obj.insert("latestLedger".into(), json!(latest_ledger));
+    obj.insert("latestLedger".into(), json!(ctx.latest_ledger));
 
     // Diagnostic events — upstream uses unsuffixed "events" for base64
     if !diagnostic_events.is_empty() {
-        insert_sim_xdr_array_field(&mut obj, "events", &diagnostic_events, format)?;
+        insert_sim_xdr_array_field(&mut obj, "events", &diagnostic_events, ctx.format)?;
     }
 
     // Encode auth entries and return value
@@ -841,7 +849,7 @@ fn build_invoke_response(
         let mut result_obj = serde_json::Map::new();
 
         // auth array
-        match format {
+        match ctx.format {
             XdrFormat::Base64 => {
                 let auth_b64: Vec<serde_json::Value> = auth
                     .iter()
@@ -864,9 +872,9 @@ fn build_invoke_response(
 
         // return value
         if let Some(rv) = &return_value {
-            util::insert_xdr_field(&mut result_obj, "xdr_val", rv, format)?;
+            util::insert_xdr_field(&mut result_obj, "xdr_val", rv, ctx.format)?;
             // Upstream uses "xdr" for base64, "xdrJson" for JSON
-            match format {
+            match ctx.format {
                 XdrFormat::Base64 => {
                     if let Some(val) = result_obj.remove("xdr_valXdr") {
                         result_obj.insert("xdr".into(), val);
@@ -888,7 +896,7 @@ fn build_invoke_response(
 
     // State changes (ledger entry diffs)
     if !state_changes.is_empty() {
-        let changes_json = serialize_state_changes(&state_changes, format)?;
+        let changes_json = serialize_state_changes(&state_changes, ctx.format)?;
         obj.insert("stateChanges".into(), changes_json);
     }
 
@@ -1660,7 +1668,7 @@ mod tests {
                 sub_invocations: Default::default(),
             },
         };
-        let result = resolve_auth_mode("", &[auth_entry.clone()]).unwrap();
+        let result = resolve_auth_mode("", std::slice::from_ref(&auth_entry)).unwrap();
         match result {
             soroban_host::e2e_invoke::RecordingInvocationAuthMode::Enforcing(entries) => {
                 assert_eq!(entries.len(), 1);

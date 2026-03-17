@@ -714,16 +714,16 @@ fn compute_pool_exchange(
 
     let mut to_pool = 0i64;
     let mut from_pool = 0i64;
-    let ok = exchange_with_pool(
-        reserves_to,
-        max_send,
-        &mut to_pool,
-        reserves_from,
-        max_recv,
-        &mut from_pool,
+    let ok = exchange_with_pool(PoolExchangeRequest {
+        reserves_to_pool: reserves_to,
+        max_send_to_pool: max_send,
+        to_pool: &mut to_pool,
+        reserves_from_pool: reserves_from,
+        max_receive_from_pool: max_recv,
+        from_pool: &mut from_pool,
         fee_bps,
         round,
-    )?;
+    })?;
     if !ok {
         return Ok(None);
     }
@@ -787,17 +787,28 @@ fn pool_id_for_assets(send_asset: &Asset, recv_asset: &Asset) -> Result<PoolId> 
     Ok(PoolId(Hash(hasher.finalize().into())))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn exchange_with_pool(
+struct PoolExchangeRequest<'a> {
     reserves_to_pool: i64,
     max_send_to_pool: i64,
-    to_pool: &mut i64,
+    to_pool: &'a mut i64,
     reserves_from_pool: i64,
     max_receive_from_pool: i64,
-    from_pool: &mut i64,
+    from_pool: &'a mut i64,
     fee_bps: i64,
     round: RoundingType,
-) -> Result<bool> {
+}
+
+fn exchange_with_pool(request: PoolExchangeRequest<'_>) -> Result<bool> {
+    let PoolExchangeRequest {
+        reserves_to_pool,
+        max_send_to_pool,
+        to_pool,
+        reserves_from_pool,
+        max_receive_from_pool,
+        from_pool,
+        fee_bps,
+        round,
+    } = request;
     const MAX_BPS: i64 = 10_000;
     if !(0..MAX_BPS).contains(&fee_bps) {
         return Err(TxError::Internal("pool fee out of range".into()));
@@ -1849,16 +1860,16 @@ mod tests {
         // The hugeDivide decomposition should still produce a correct result
         let mut to_pool = 0i64;
         let mut from_pool = 0i64;
-        let ok = exchange_with_pool(
+        let ok = exchange_with_pool(PoolExchangeRequest {
             reserves_to_pool,
-            send_amount,
-            &mut to_pool,
-            reserves_from_large,
-            i64::MAX,
-            &mut from_pool,
-            30, // 30 bps fee
-            RoundingType::PathPaymentStrictSend,
-        )
+            max_send_to_pool: send_amount,
+            to_pool: &mut to_pool,
+            reserves_from_pool: reserves_from_large,
+            max_receive_from_pool: i64::MAX,
+            from_pool: &mut from_pool,
+            fee_bps: 30,
+            round: RoundingType::PathPaymentStrictSend,
+        })
         .unwrap();
 
         assert!(ok, "Exchange should succeed");
@@ -1888,16 +1899,16 @@ mod tests {
         let mut to_pool: i64 = 0;
         let mut from_pool: i64 = 0;
 
-        let result = exchange_with_pool(
+        let result = exchange_with_pool(PoolExchangeRequest {
             reserves_to_pool,
-            i64::MAX, // max_send_to_pool = INT64_MAX for strict receive
-            &mut to_pool,
+            max_send_to_pool: i64::MAX,
+            to_pool: &mut to_pool,
             reserves_from_pool,
             max_receive_from_pool,
-            &mut from_pool,
+            from_pool: &mut from_pool,
             fee_bps,
-            RoundingType::PathPaymentStrictReceive,
-        );
+            round: RoundingType::PathPaymentStrictReceive,
+        });
 
         // Must return Ok(false) — exchange not possible — NOT Err
         assert!(
@@ -1918,16 +1929,16 @@ mod tests {
         let mut to_pool: i64 = 0;
         let mut from_pool: i64 = 0;
 
-        let result = exchange_with_pool(
+        let result = exchange_with_pool(PoolExchangeRequest {
             reserves_to_pool,
             max_send_to_pool,
-            &mut to_pool,
+            to_pool: &mut to_pool,
             reserves_from_pool,
-            i64::MAX, // max_receive_from_pool = INT64_MAX for strict send
-            &mut from_pool,
+            max_receive_from_pool: i64::MAX,
+            from_pool: &mut from_pool,
             fee_bps,
-            RoundingType::PathPaymentStrictSend,
-        );
+            round: RoundingType::PathPaymentStrictSend,
+        });
 
         // Must return Ok — exchange result (true or false) — NOT Err
         assert!(

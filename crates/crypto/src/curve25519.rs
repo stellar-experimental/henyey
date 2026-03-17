@@ -37,8 +37,7 @@
 //! assert_eq!(alice_shared, bob_shared);
 //! ```
 
-use crate::hkdf_extract;
-use rand::RngCore;
+use crate::{hkdf_extract, random_bytes};
 use std::hash::{Hash, Hasher};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::ZeroizeOnDrop;
@@ -65,10 +64,8 @@ impl Curve25519Secret {
     ///
     /// Uses the system's cryptographically secure random number generator.
     pub fn random() -> Self {
-        let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
         Self {
-            inner: StaticSecret::from(bytes),
+            inner: StaticSecret::from(random_bytes()),
         }
     }
 

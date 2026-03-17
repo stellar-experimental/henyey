@@ -45,6 +45,19 @@ use rand::rngs::OsRng;
 
 use crate::{CryptoError, PublicKey, SecretKey};
 
+fn seal(curve_pk: CurvePublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let mut rng = OsRng;
+    curve_pk
+        .seal(&mut rng, plaintext)
+        .map_err(|_| CryptoError::EncryptionFailed)
+}
+
+fn open(curve_sk: CurveSecretKey, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    curve_sk
+        .unseal(ciphertext)
+        .map_err(|_| CryptoError::DecryptionFailed)
+}
+
 /// Encrypts a payload to a recipient's Ed25519 public key.
 ///
 /// The Ed25519 public key is converted to Curve25519 internally. The returned
@@ -55,11 +68,10 @@ use crate::{CryptoError, PublicKey, SecretKey};
 /// Returns [`CryptoError::EncryptionFailed`] if encryption fails (rare, typically
 /// only on RNG failure).
 pub fn seal_to_public_key(recipient: &PublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let curve_pk = CurvePublicKey::from(recipient.to_curve25519_bytes());
-    let mut rng = OsRng;
-    curve_pk
-        .seal(&mut rng, plaintext)
-        .map_err(|_| CryptoError::EncryptionFailed)
+    seal(
+        CurvePublicKey::from(recipient.to_curve25519_bytes()),
+        plaintext,
+    )
 }
 
 /// Encrypts a payload to a Curve25519 public key.
@@ -73,11 +85,7 @@ pub fn seal_to_curve25519_public_key(
     recipient: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let curve_pk = CurvePublicKey::from(*recipient);
-    let mut rng = OsRng;
-    curve_pk
-        .seal(&mut rng, plaintext)
-        .map_err(|_| CryptoError::EncryptionFailed)
+    seal(CurvePublicKey::from(*recipient), plaintext)
 }
 
 /// Decrypts a sealed payload using the recipient's Ed25519 secret key.
@@ -94,10 +102,10 @@ pub fn open_from_secret_key(
     recipient: &SecretKey,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let curve_sk = CurveSecretKey::from(recipient.to_curve25519_bytes());
-    curve_sk
-        .unseal(ciphertext)
-        .map_err(|_| CryptoError::DecryptionFailed)
+    open(
+        CurveSecretKey::from(recipient.to_curve25519_bytes()),
+        ciphertext,
+    )
 }
 
 /// Decrypts a sealed payload using a Curve25519 secret key.
@@ -111,10 +119,7 @@ pub fn open_from_curve25519_secret_key(
     recipient: &[u8; 32],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let curve_sk = CurveSecretKey::from(*recipient);
-    curve_sk
-        .unseal(ciphertext)
-        .map_err(|_| CryptoError::DecryptionFailed)
+    open(CurveSecretKey::from(*recipient), ciphertext)
 }
 
 #[cfg(test)]

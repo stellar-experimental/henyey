@@ -39,6 +39,35 @@ pub struct SorobanTxBuilder {
     network_passphrase: String,
 }
 
+pub struct ContractInvocation {
+    pub contract_id: Hash256,
+    pub function_name: String,
+    pub args: Vec<ScVal>,
+    pub read_only_keys: Vec<LedgerKey>,
+    pub read_write_keys: Vec<LedgerKey>,
+    pub instructions: u32,
+    pub read_bytes: u32,
+    pub write_bytes: u32,
+    pub inclusion_fee: u32,
+}
+
+pub struct SacTransfer {
+    pub contract_id: Hash256,
+    pub from_address: ScAddress,
+    pub to_address: ScAddress,
+    pub amount: i128,
+    pub instance_keys: Vec<LedgerKey>,
+    pub inclusion_fee: u32,
+}
+
+pub struct BatchTransfer {
+    pub contract_id: Hash256,
+    pub sac_address: ScVal,
+    pub destinations: Vec<ScVal>,
+    pub instance_keys: Vec<LedgerKey>,
+    pub inclusion_fee: u32,
+}
+
 impl SorobanTxBuilder {
     pub fn new(network_passphrase: String) -> Self {
         Self { network_passphrase }
@@ -166,31 +195,23 @@ impl SorobanTxBuilder {
     /// Build a contract invocation transaction.
     ///
     /// Matches stellar-core `TxGenerator::invokeSorobanLoadTransaction()`.
-    #[allow(clippy::too_many_arguments)]
     pub fn invoke_contract_tx(
         &self,
         source: &SecretKey,
         sequence: i64,
-        contract_id: &Hash256,
-        function_name: &str,
-        args: Vec<ScVal>,
-        read_only_keys: Vec<LedgerKey>,
-        read_write_keys: Vec<LedgerKey>,
-        instructions: u32,
-        read_bytes: u32,
-        write_bytes: u32,
-        inclusion_fee: u32,
+        invocation: ContractInvocation,
     ) -> anyhow::Result<TransactionEnvelope> {
-        let contract_address = ScAddress::Contract(ContractId(Hash(contract_id.0)));
+        let contract_address = ScAddress::Contract(ContractId(Hash(invocation.contract_id.0)));
 
         let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address,
             function_name: ScSymbol(
-                function_name
+                invocation
+                    .function_name
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("function name too long"))?,
             ),
-            args: args.try_into().unwrap_or_default(),
+            args: invocation.args.try_into().unwrap_or_default(),
         });
 
         let op = Operation {
@@ -203,16 +224,23 @@ impl SorobanTxBuilder {
 
         let resources = SorobanResources {
             footprint: LedgerFootprint {
-                read_only: read_only_keys.try_into().unwrap_or_default(),
-                read_write: read_write_keys.try_into().unwrap_or_default(),
+                read_only: invocation.read_only_keys.try_into().unwrap_or_default(),
+                read_write: invocation.read_write_keys.try_into().unwrap_or_default(),
             },
-            instructions,
-            disk_read_bytes: read_bytes,
-            write_bytes,
+            instructions: invocation.instructions,
+            disk_read_bytes: invocation.read_bytes,
+            write_bytes: invocation.write_bytes,
         };
 
         let resource_fee = 50_000_000i64;
-        self.build_soroban_envelope(source, sequence, op, resources, resource_fee, inclusion_fee)
+        self.build_soroban_envelope(
+            source,
+            sequence,
+            op,
+            resources,
+            resource_fee,
+            invocation.inclusion_fee,
+        )
     }
 
     /// Build a SAC (Stellar Asset Contract) creation transaction.
@@ -267,29 +295,23 @@ impl SorobanTxBuilder {
     /// Build a SAC `transfer` invocation transaction.
     ///
     /// Matches stellar-core `TxGenerator::invokeSACPayment()`.
-    #[allow(clippy::too_many_arguments)]
     pub fn invoke_sac_transfer_tx(
         &self,
         source: &SecretKey,
         sequence: i64,
-        sac_contract_id: &Hash256,
-        from_address: ScAddress,
-        to_address: ScAddress,
-        amount: i128,
-        instance_keys: Vec<LedgerKey>,
-        inclusion_fee: u32,
+        transfer: SacTransfer,
     ) -> anyhow::Result<TransactionEnvelope> {
         let args = vec![
-            ScVal::Address(from_address.clone()),
-            ScVal::Address(to_address.clone()),
-            make_i128(amount),
+            ScVal::Address(transfer.from_address.clone()),
+            ScVal::Address(transfer.to_address.clone()),
+            make_i128(transfer.amount),
         ];
 
         let auth = SorobanAuthorizationEntry {
             credentials: SorobanCredentials::SourceAccount,
             root_invocation: SorobanAuthorizedInvocation {
                 function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
-                    contract_address: ScAddress::Contract(ContractId(Hash(sac_contract_id.0))),
+                    contract_address: ScAddress::Contract(ContractId(Hash(transfer.contract_id.0))),
                     function_name: ScSymbol("transfer".try_into().unwrap()),
                     args: args.clone().try_into().unwrap_or_default(),
                 }),
@@ -297,7 +319,7 @@ impl SorobanTxBuilder {
             },
         };
 
-        let contract_address = ScAddress::Contract(ContractId(Hash(sac_contract_id.0)));
+        let contract_address = ScAddress::Contract(ContractId(Hash(transfer.contract_id.0)));
 
         let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address,
@@ -319,24 +341,22 @@ impl SorobanTxBuilder {
         let mut read_write_keys = Vec::new();
 
         // Source account key
-        if let ScAddress::Account(ref aid) = from_address {
-            read_write_keys.push(LedgerKey::Account(
-                stellar_xdr::curr::LedgerKeyAccount {
-                    account_id: aid.clone(),
-                },
-            ));
+        if let ScAddress::Account(ref aid) = transfer.from_address {
+            read_write_keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: aid.clone(),
+            }));
         }
 
         // Destination balance key (CONTRACT_DATA with Balance + to_address)
-        match &to_address {
+        match &transfer.to_address {
             ScAddress::Contract(_) => {
                 read_write_keys.push(LedgerKey::ContractData(
                     stellar_xdr::curr::LedgerKeyContractData {
-                        contract: ScAddress::Contract(ContractId(Hash(sac_contract_id.0))),
+                        contract: ScAddress::Contract(ContractId(Hash(transfer.contract_id.0))),
                         key: ScVal::Vec(Some(stellar_xdr::curr::ScVec(
                             vec![
                                 ScVal::Symbol(ScSymbol("Balance".try_into().unwrap())),
-                                ScVal::Address(to_address),
+                                ScVal::Address(transfer.to_address),
                             ]
                             .try_into()
                             .unwrap_or_default(),
@@ -346,18 +366,16 @@ impl SorobanTxBuilder {
                 ));
             }
             ScAddress::Account(ref aid) => {
-                read_write_keys.push(LedgerKey::Account(
-                    stellar_xdr::curr::LedgerKeyAccount {
-                        account_id: aid.clone(),
-                    },
-                ));
+                read_write_keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                    account_id: aid.clone(),
+                }));
             }
             _ => {} // MuxedAccount, ClaimableBalance, LiquidityPool not used in load test
         }
 
         let resources = SorobanResources {
             footprint: LedgerFootprint {
-                read_only: instance_keys.try_into().unwrap_or_default(),
+                read_only: transfer.instance_keys.try_into().unwrap_or_default(),
                 read_write: read_write_keys.try_into().unwrap_or_default(),
             },
             // stellar-core uses 250K instructions but our non-typed host API (P25)
@@ -369,28 +387,32 @@ impl SorobanTxBuilder {
         };
 
         let resource_fee = 10_000_000i64;
-        self.build_soroban_envelope(source, sequence, op, resources, resource_fee, inclusion_fee)
+        self.build_soroban_envelope(
+            source,
+            sequence,
+            op,
+            resources,
+            resource_fee,
+            transfer.inclusion_fee,
+        )
     }
 
     /// Build a batch transfer invocation transaction.
     ///
     /// Matches stellar-core `TxGenerator::invokeBatchTransfer()`.
-    #[allow(clippy::too_many_arguments)]
     pub fn invoke_batch_transfer_tx(
         &self,
         source: &SecretKey,
         sequence: i64,
-        batch_contract_id: &Hash256,
-        sac_address: ScVal,
-        destinations: Vec<ScVal>,
-        instance_keys: Vec<LedgerKey>,
-        inclusion_fee: u32,
+        transfer: BatchTransfer,
     ) -> anyhow::Result<TransactionEnvelope> {
-        let batch_size = destinations.len() as u32;
-        let dest_vec = ScVal::Vec(Some(ScVec(destinations.try_into().unwrap_or_default())));
-        let args = vec![sac_address, dest_vec];
+        let batch_size = transfer.destinations.len() as u32;
+        let dest_vec = ScVal::Vec(Some(ScVec(
+            transfer.destinations.try_into().unwrap_or_default(),
+        )));
+        let args = vec![transfer.sac_address, dest_vec];
 
-        let contract_address = ScAddress::Contract(ContractId(Hash(batch_contract_id.0)));
+        let contract_address = ScAddress::Contract(ContractId(Hash(transfer.contract_id.0)));
 
         let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address,
@@ -408,7 +430,7 @@ impl SorobanTxBuilder {
 
         let resources = SorobanResources {
             footprint: LedgerFootprint {
-                read_only: instance_keys.try_into().unwrap_or_default(),
+                read_only: transfer.instance_keys.try_into().unwrap_or_default(),
                 read_write: VecM::default(),
             },
             instructions: 500_000 * batch_size,
@@ -417,7 +439,14 @@ impl SorobanTxBuilder {
         };
 
         let resource_fee = 50_000_000i64;
-        self.build_soroban_envelope(source, sequence, op, resources, resource_fee, inclusion_fee)
+        self.build_soroban_envelope(
+            source,
+            sequence,
+            op,
+            resources,
+            resource_fee,
+            transfer.inclusion_fee,
+        )
     }
 
     /// Get the embedded loadgen test contract WASM bytes.

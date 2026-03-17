@@ -900,21 +900,23 @@ pub(super) fn empty_entry_changes() -> LedgerEntryChanges {
     LedgerEntryChanges(VecM::default())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn build_transaction_meta(
-    tx_changes_before: LedgerEntryChanges,
-    op_changes: Vec<LedgerEntryChanges>,
-    op_events: Vec<Vec<ContractEvent>>,
-    tx_events: Vec<TransactionEvent>,
-    soroban_return_value: Option<stellar_xdr::curr::ScVal>,
-    diagnostic_events: Vec<DiagnosticEvent>,
-    soroban_fee_info: Option<(i64, i64, i64)>, // (non_refundable, refundable_consumed, rent_consumed)
-    emit_soroban_tx_meta_ext_v1: bool,
-    enable_soroban_diagnostic_events: bool,
-) -> TransactionMeta {
-    let operations: Vec<OperationMetaV2> = op_changes
+pub(super) struct TransactionMetaParts {
+    pub tx_changes_before: LedgerEntryChanges,
+    pub op_changes: Vec<LedgerEntryChanges>,
+    pub op_events: Vec<Vec<ContractEvent>>,
+    pub tx_events: Vec<TransactionEvent>,
+    pub soroban_return_value: Option<stellar_xdr::curr::ScVal>,
+    pub diagnostic_events: Vec<DiagnosticEvent>,
+    pub soroban_fee_info: Option<(i64, i64, i64)>,
+    pub emit_soroban_tx_meta_ext_v1: bool,
+    pub enable_soroban_diagnostic_events: bool,
+}
+
+pub(super) fn build_transaction_meta(parts: TransactionMetaParts) -> TransactionMeta {
+    let operations: Vec<OperationMetaV2> = parts
+        .op_changes
         .into_iter()
-        .zip(op_events)
+        .zip(parts.op_events)
         .map(|(changes, events)| OperationMetaV2 {
             ext: ExtensionPoint::V0,
             changes,
@@ -925,20 +927,22 @@ pub(super) fn build_transaction_meta(
     // Filter diagnostic events based on config flag.
     // The Soroban host always captures diagnostic events (enable_diagnostics: true),
     // but we only include them in the meta stream when the config flag is set.
-    let filtered_diagnostics = if enable_soroban_diagnostic_events {
-        diagnostic_events
+    let filtered_diagnostics = if parts.enable_soroban_diagnostic_events {
+        parts.diagnostic_events
     } else {
         Vec::new()
     };
 
-    let has_soroban = soroban_return_value.is_some()
+    let has_soroban = parts.soroban_return_value.is_some()
         || !filtered_diagnostics.is_empty()
-        || soroban_fee_info.is_some();
+        || parts.soroban_fee_info.is_some();
     let soroban_meta = if has_soroban {
         // Only emit SorobanTransactionMetaExtV1 (fee breakdown) when the flag is set.
         // This matches stellar-core's EMIT_SOROBAN_TRANSACTION_META_EXT_V1 behavior.
-        let ext = if emit_soroban_tx_meta_ext_v1 {
-            if let Some((non_refundable, refundable_consumed, rent_consumed)) = soroban_fee_info {
+        let ext = if parts.emit_soroban_tx_meta_ext_v1 {
+            if let Some((non_refundable, refundable_consumed, rent_consumed)) =
+                parts.soroban_fee_info
+            {
                 SorobanTransactionMetaExt::V1(SorobanTransactionMetaExtV1 {
                     ext: ExtensionPoint::V0,
                     total_non_refundable_resource_fee_charged: non_refundable,
@@ -953,7 +957,7 @@ pub(super) fn build_transaction_meta(
         };
         Some(SorobanTransactionMetaV2 {
             ext,
-            return_value: soroban_return_value,
+            return_value: parts.soroban_return_value,
         })
     } else {
         None
@@ -961,25 +965,25 @@ pub(super) fn build_transaction_meta(
 
     TransactionMeta::V4(TransactionMetaV4 {
         ext: ExtensionPoint::V0,
-        tx_changes_before,
+        tx_changes_before: parts.tx_changes_before,
         operations: operations.try_into().unwrap_or_default(),
         tx_changes_after: empty_entry_changes(),
         soroban_meta,
-        events: tx_events.try_into().unwrap_or_default(),
+        events: parts.tx_events.try_into().unwrap_or_default(),
         diagnostic_events: filtered_diagnostics.try_into().unwrap_or_default(),
     })
 }
 
 pub(super) fn empty_transaction_meta() -> TransactionMeta {
-    build_transaction_meta(
-        empty_entry_changes(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
-        Vec::new(),
-        None,
-        false,
-        false,
-    )
+    build_transaction_meta(TransactionMetaParts {
+        tx_changes_before: empty_entry_changes(),
+        op_changes: Vec::new(),
+        op_events: Vec::new(),
+        tx_events: Vec::new(),
+        soroban_return_value: None,
+        diagnostic_events: Vec::new(),
+        soroban_fee_info: None,
+        emit_soroban_tx_meta_ext_v1: false,
+        enable_soroban_diagnostic_events: false,
+    })
 }

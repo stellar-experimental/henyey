@@ -121,10 +121,7 @@ fn validate_ledger_pagination(
         ));
     }
 
-    let limit = limit
-        .unwrap_or(DEFAULT_LEDGER_LIMIT)
-        .min(MAX_LEDGER_LIMIT)
-        .max(1);
+    let limit = limit.unwrap_or(DEFAULT_LEDGER_LIMIT).clamp(1, MAX_LEDGER_LIMIT);
 
     if let Some(c) = cursor {
         if c.is_empty() {
@@ -158,4 +155,3 @@ fn extract_header_entry(lcm: &LedgerCloseMeta) -> &LedgerHeaderHistoryEntry {
         LedgerCloseMeta::V2(v2) => &v2.ledger_header,
     }
 }
-

@@ -387,7 +387,6 @@ impl PeerAddress {
     ///
     /// These addresses should not be shared with other peers as they
     /// are not routable on the public internet.
-    #[allow(clippy::incompatible_msrv)]
     pub fn is_private(&self) -> bool {
         use std::net::IpAddr;
 
@@ -402,11 +401,12 @@ impl PeerAddress {
                         || v4.is_unspecified()
                 }
                 IpAddr::V6(v6) => {
+                    let first_segment = v6.segments()[0];
                     v6.is_loopback()
                         || v6.is_multicast()
                         || v6.is_unspecified()
-                        || v6.is_unicast_link_local()
-                        || v6.is_unique_local()
+                        || ((first_segment & 0xffc0) == 0xfe80)
+                        || ((first_segment & 0xfe00) == 0xfc00)
                 }
             }
         } else {
@@ -576,49 +576,43 @@ const OVERLAY_MIN_VERSION: u32 = 35;
 const DEFAULT_LISTENING_PORT: u16 = 11625;
 
 impl LocalNode {
-    /// Creates a new local node configured for the Stellar testnet.
-    ///
-    /// Uses the testnet network passphrase and current protocol versions.
-    pub fn new_testnet(secret_key: henyey_crypto::SecretKey) -> Self {
+    fn with_network(
+        secret_key: henyey_crypto::SecretKey,
+        network_id: henyey_common::NetworkId,
+    ) -> Self {
         Self {
             secret_key,
-            network_id: henyey_common::NetworkId::testnet(),
+            network_id,
             version_string: VERSION_STRING.to_string(),
             ledger_version: LEDGER_VERSION,
             overlay_version: OVERLAY_VERSION,
             overlay_min_version: OVERLAY_MIN_VERSION,
             listening_port: DEFAULT_LISTENING_PORT,
         }
+    }
+
+    /// Creates a new local node configured for the Stellar testnet.
+    ///
+    /// Uses the testnet network passphrase and current protocol versions.
+    pub fn new_testnet(secret_key: henyey_crypto::SecretKey) -> Self {
+        Self::with_network(secret_key, henyey_common::NetworkId::testnet())
     }
 
     /// Creates a new local node configured for the Stellar mainnet.
     ///
     /// Uses the mainnet network passphrase and current protocol versions.
     pub fn new_mainnet(secret_key: henyey_crypto::SecretKey) -> Self {
-        Self {
-            secret_key,
-            network_id: henyey_common::NetworkId::mainnet(),
-            version_string: VERSION_STRING.to_string(),
-            ledger_version: LEDGER_VERSION,
-            overlay_version: OVERLAY_VERSION,
-            overlay_min_version: OVERLAY_MIN_VERSION,
-            listening_port: DEFAULT_LISTENING_PORT,
-        }
+        Self::with_network(secret_key, henyey_common::NetworkId::mainnet())
     }
 
     /// Creates a new local node with a custom network passphrase.
     ///
     /// Use this for standalone networks or other non-standard deployments.
     pub fn new(secret_key: henyey_crypto::SecretKey, network_passphrase: &str) -> Self {
-        Self {
+        Self::with_network(
             secret_key,
-            network_id: henyey_common::NetworkId::from_passphrase(network_passphrase),
-            version_string: VERSION_STRING.to_string(),
-            ledger_version: LEDGER_VERSION,
-            overlay_version: OVERLAY_VERSION,
-            overlay_min_version: OVERLAY_MIN_VERSION,
-            listening_port: DEFAULT_LISTENING_PORT,
-        }
+            henyey_common::NetworkId::from_passphrase(network_passphrase),
+        )
     }
 
     /// Returns this node's public key.

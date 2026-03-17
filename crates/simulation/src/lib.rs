@@ -32,7 +32,7 @@ pub use loadgen::{
     GeneratedLoadConfig, GeneratedTransaction, LoadGenMode, LoadGenerator, LoadReport, LoadResult,
     LoadStep, TestAccount, TxGenerator,
 };
-pub use loadgen_soroban::SorobanTxBuilder;
+pub use loadgen_soroban::{BatchTransfer, ContractInvocation, SacTransfer, SorobanTxBuilder};
 pub use applyload::{ApplyLoad, ApplyLoadConfig, ApplyLoadMode, Histogram};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,7 +252,7 @@ impl Simulation {
             .collect();
 
         let overlay_connection_factory: Arc<dyn ConnectionFactory> = match self.mode {
-            SimulationMode::OverLoopback => Arc::new(LoopbackConnectionFactory::new()),
+            SimulationMode::OverLoopback => Arc::new(LoopbackConnectionFactory::default()),
             SimulationMode::OverTcp => Arc::new(TcpConnectionFactory),
         };
         self.overlay_connection_factory = Some(Arc::clone(&overlay_connection_factory));

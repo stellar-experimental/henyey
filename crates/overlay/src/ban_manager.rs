@@ -19,7 +19,7 @@
 //! ```
 
 use crate::{OverlayError, PeerId, Result};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::Path;
@@ -42,7 +42,7 @@ pub struct BanManager {
     /// `None` expiry means permanent ban (manual).
     cache: RwLock<HashMap<PeerId, Option<Instant>>>,
     /// Database connection (optional - if None, bans are in-memory only).
-    db: Option<Arc<RwLock<Connection>>>,
+    db: Option<Arc<Mutex<Connection>>>,
 }
 
 impl BanManager {
@@ -97,8 +97,7 @@ impl BanManager {
             }
         }
 
-        #[allow(clippy::arc_with_non_send_sync)]
-        let db = Arc::new(RwLock::new(conn));
+        let db = Arc::new(Mutex::new(conn));
 
         Ok(Self {
             cache: RwLock::new(cache),
@@ -129,7 +128,7 @@ impl BanManager {
 
         // Insert into database if available
         if let Some(ref db) = self.db {
-            let conn = db.write();
+            let conn = db.lock();
             conn.execute(
                 "INSERT OR IGNORE INTO ban (nodeid) VALUES (?1)",
                 [&node_id_str],
@@ -206,7 +205,7 @@ impl BanManager {
 
         // Delete from database if available
         if let Some(ref db) = self.db {
-            let conn = db.write();
+            let conn = db.lock();
             conn.execute("DELETE FROM ban WHERE nodeid = ?1", [&node_id_str])
                 .map_err(|e| OverlayError::DatabaseError(format!("Failed to delete ban: {}", e)))?;
         }
@@ -277,7 +276,7 @@ impl BanManager {
 
         // Delete from database if available
         if let Some(ref db) = self.db {
-            let conn = db.write();
+            let conn = db.lock();
             conn.execute("DELETE FROM ban", [])
                 .map_err(|e| OverlayError::DatabaseError(format!("Failed to clear bans: {}", e)))?;
         }
@@ -296,7 +295,7 @@ impl BanManager {
     /// This is useful for database migrations or resetting state.
     pub fn drop_and_create(&self) -> Result<()> {
         if let Some(ref db) = self.db {
-            let conn = db.write();
+            let conn = db.lock();
             conn.execute("DROP TABLE IF EXISTS ban", []).map_err(|e| {
                 OverlayError::DatabaseError(format!("Failed to drop ban table: {}", e))
             })?;

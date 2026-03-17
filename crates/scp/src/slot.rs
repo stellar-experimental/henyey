@@ -177,6 +177,24 @@ impl Slot {
         self.ballot.set_fully_validated(validated);
     }
 
+    /// Check whether we have any latest message recorded from `node_id`.
+    fn has_latest_message_from(&self, node_id: &NodeId) -> bool {
+        self.ballot.latest_envelopes().contains_key(node_id)
+            || self.nomination.get_latest_nomination(node_id).is_some()
+    }
+
+    /// Mirror ballot externalization into slot-level state.
+    fn sync_externalized_value_from_ballot(&mut self) {
+        if !self.ballot.is_externalized() {
+            return;
+        }
+
+        if let Some(value) = self.ballot.get_externalized_value() {
+            self.externalized_value = Some(value.clone());
+            self.set_fully_validated(true);
+        }
+    }
+
     /// Check if we've heard from quorum for the current ballot.
     pub fn heard_from_quorum(&self) -> bool {
         self.ballot.heard_from_quorum()
@@ -199,10 +217,8 @@ impl Slot {
         if !self.ballot.is_externalized() || self.externalized_value.is_some() {
             return;
         }
-        if let Some(value) = self.ballot.get_externalized_value() {
-            self.externalized_value = Some(value.clone());
-            self.set_fully_validated(true);
-
+        if self.ballot.get_externalized_value().is_some() {
+            self.sync_externalized_value_from_ballot();
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Ballot);
         }
@@ -226,9 +242,7 @@ impl Slot {
         let all_nodes = crate::quorum::get_all_nodes(&self.local_quorum_set);
         for node_id in &all_nodes {
             // Check ballot protocol first, then nomination (matching stellar-core getLatestMessage)
-            if self.ballot.latest_envelopes().contains_key(node_id)
-                || self.nomination.get_latest_nomination(node_id).is_some()
-            {
+            if self.has_latest_message_from(node_id) {
                 heard_nodes.insert(node_id.clone());
             }
         }
@@ -249,8 +263,7 @@ impl Slot {
 
         // Check if this is the first message from this node
         // stellar-core checks getLatestMessage(nodeID) which checks ballot then nomination
-        let prev = self.ballot.latest_envelopes().contains_key(&node_id)
-            || self.nomination.get_latest_nomination(&node_id).is_some();
+        let prev = self.has_latest_message_from(&node_id);
 
         // Process based on statement type
         let result = match &envelope.statement.pledges {
@@ -628,14 +641,7 @@ impl Slot {
         }
 
         // Check if this is first message from this node
-        let prev = self
-            .ballot
-            .latest_envelopes()
-            .contains_key(&envelope.statement.node_id)
-            || self
-                .nomination
-                .get_latest_nomination(&envelope.statement.node_id)
-                .is_some();
+        let prev = self.has_latest_message_from(&envelope.statement.node_id);
 
         let result = match &envelope.statement.pledges {
             ScpStatementPledges::Nominate(_) => self.nomination.set_state_from_envelope(envelope),
@@ -643,11 +649,8 @@ impl Slot {
             | ScpStatementPledges::Confirm(_)
             | ScpStatementPledges::Externalize(_) => {
                 let result = self.ballot.set_state_from_envelope(envelope);
-                if result && self.ballot.is_externalized() {
-                    if let Some(value) = self.ballot.get_externalized_value() {
-                        self.externalized_value = Some(value.clone());
-                        self.fully_validated = true;
-                    }
+                if result {
+                    self.sync_externalized_value_from_ballot();
                 }
                 result
             }

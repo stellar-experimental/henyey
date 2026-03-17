@@ -266,7 +266,7 @@ impl BallotProtocol {
     }
 
     /// Update fully-validated state for local emission gating.
-    pub fn set_fully_validated(&mut self, fully_validated: bool) {
+    pub(crate) fn set_fully_validated(&mut self, fully_validated: bool) {
         self.fully_validated = fully_validated;
     }
 
@@ -427,7 +427,7 @@ impl BallotProtocol {
     /// Get the latest envelopes received from each node.
     ///
     /// Returns a map from node ID to the most recent envelope from that node.
-    pub fn latest_envelopes(&self) -> &HashMap<NodeId, ScpEnvelope> {
+    pub(crate) fn latest_envelopes(&self) -> &HashMap<NodeId, ScpEnvelope> {
         &self.latest_envelopes
     }
 
@@ -1009,24 +1009,27 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    struct PrepareEnvelopeCounters {
+        prepared: Option<ScpBallot>,
+        prepared_prime: Option<ScpBallot>,
+        n_c: u32,
+        n_h: u32,
+    }
+
     fn make_prepare_envelope_with_counters(
         node_id: NodeId,
         slot_index: u64,
         quorum_set: &ScpQuorumSet,
         ballot: ScpBallot,
-        prepared: Option<ScpBallot>,
-        prepared_prime: Option<ScpBallot>,
-        n_c: u32,
-        n_h: u32,
+        counters: PrepareEnvelopeCounters,
     ) -> ScpEnvelope {
         let prep = ScpStatementPrepare {
             quorum_set_hash: hash_quorum_set(quorum_set).into(),
             ballot,
-            prepared,
-            prepared_prime,
-            n_c,
-            n_h,
+            prepared: counters.prepared,
+            prepared_prime: counters.prepared_prime,
+            n_c: counters.n_c,
+            n_h: counters.n_h,
         };
         let statement = ScpStatement {
             node_id,
@@ -1290,20 +1293,24 @@ mod tests {
             5,
             &quorum_set,
             ballot_value.clone(),
-            prepared.clone(),
-            None,
-            0,
-            1,
+            PrepareEnvelopeCounters {
+                prepared: prepared.clone(),
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 1,
+            },
         );
         let newer = make_prepare_envelope_with_counters(
             make_node_id(2),
             5,
             &quorum_set,
             ballot_value.clone(),
-            prepared,
-            None,
-            0,
-            2,
+            PrepareEnvelopeCounters {
+                prepared,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 2,
+            },
         );
 
         let first = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 5));
@@ -1337,26 +1344,30 @@ mod tests {
             6,
             &quorum_set,
             ballot_value.clone(),
-            Some(ScpBallot {
-                counter: 1,
-                value: make_value(&[1]),
-            }),
-            None,
-            0,
-            1,
+            PrepareEnvelopeCounters {
+                prepared: Some(ScpBallot {
+                    counter: 1,
+                    value: make_value(&[1]),
+                }),
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 1,
+            },
         );
         let newer = make_prepare_envelope_with_counters(
             make_node_id(2),
             6,
             &quorum_set,
             ballot_value.clone(),
-            Some(ScpBallot {
-                counter: 2,
-                value: make_value(&[1]),
-            }),
-            None,
-            0,
-            1,
+            PrepareEnvelopeCounters {
+                prepared: Some(ScpBallot {
+                    counter: 2,
+                    value: make_value(&[1]),
+                }),
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 1,
+            },
         );
 
         let first = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 6));
@@ -1390,32 +1401,36 @@ mod tests {
             7,
             &quorum_set,
             ballot_value.clone(),
-            Some(ScpBallot {
-                counter: 2,
-                value: make_value(&[2]),
-            }),
-            Some(ScpBallot {
-                counter: 1,
-                value: make_value(&[9]),
-            }),
-            0,
-            1,
+            PrepareEnvelopeCounters {
+                prepared: Some(ScpBallot {
+                    counter: 2,
+                    value: make_value(&[2]),
+                }),
+                prepared_prime: Some(ScpBallot {
+                    counter: 1,
+                    value: make_value(&[9]),
+                }),
+                n_c: 0,
+                n_h: 1,
+            },
         );
         let newer = make_prepare_envelope_with_counters(
             make_node_id(2),
             7,
             &quorum_set,
             ballot_value.clone(),
-            Some(ScpBallot {
-                counter: 2,
-                value: make_value(&[2]),
-            }),
-            Some(ScpBallot {
-                counter: 2,
-                value: make_value(&[9]),
-            }),
-            0,
-            1,
+            PrepareEnvelopeCounters {
+                prepared: Some(ScpBallot {
+                    counter: 2,
+                    value: make_value(&[2]),
+                }),
+                prepared_prime: Some(ScpBallot {
+                    counter: 2,
+                    value: make_value(&[9]),
+                }),
+                n_c: 0,
+                n_h: 1,
+            },
         );
 
         let first = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 7));
@@ -1705,40 +1720,48 @@ mod tests {
             16,
             &quorum_set,
             current.clone(),
-            Some(current.clone()),
-            None,
-            current.counter,
-            current.counter,
+            PrepareEnvelopeCounters {
+                prepared: Some(current.clone()),
+                prepared_prime: None,
+                n_c: current.counter,
+                n_h: current.counter,
+            },
         );
         let prepared3 = make_prepare_envelope_with_counters(
             node3.clone(),
             16,
             &quorum_set,
             current.clone(),
-            Some(current.clone()),
-            None,
-            current.counter,
-            current.counter,
+            PrepareEnvelopeCounters {
+                prepared: Some(current.clone()),
+                prepared_prime: None,
+                n_c: current.counter,
+                n_h: current.counter,
+            },
         );
         let prepared4 = make_prepare_envelope_with_counters(
             node4.clone(),
             16,
             &quorum_set,
             current.clone(),
-            Some(current.clone()),
-            None,
-            current.counter,
-            current.counter,
+            PrepareEnvelopeCounters {
+                prepared: Some(current.clone()),
+                prepared_prime: None,
+                n_c: current.counter,
+                n_h: current.counter,
+            },
         );
         let prepared5 = make_prepare_envelope_with_counters(
             node5.clone(),
             16,
             &quorum_set,
             current.clone(),
-            Some(current.clone()),
-            None,
-            current.counter,
-            current.counter,
+            PrepareEnvelopeCounters {
+                prepared: Some(current.clone()),
+                prepared_prime: None,
+                n_c: current.counter,
+                n_h: current.counter,
+            },
         );
 
         ballot.process_envelope(&prepared2, &ctx!(&node, &quorum_set, &driver, 16));
@@ -3151,13 +3174,15 @@ mod tests {
                 counter: 5,
                 value: value.clone(),
             },
-            Some(ScpBallot {
-                counter: 3,
-                value: value.clone(),
-            }),
-            None,
-            2,
-            3,
+            PrepareEnvelopeCounters {
+                prepared: Some(ScpBallot {
+                    counter: 3,
+                    value: value.clone(),
+                }),
+                prepared_prime: None,
+                n_c: 2,
+                n_h: 3,
+            },
         );
 
         assert!(bp.set_state_from_envelope(&envelope));

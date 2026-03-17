@@ -100,6 +100,48 @@ fn parse_level_hashes(level: &HASBucketLevel) -> (Option<Hash256>, Option<Hash25
     )
 }
 
+fn validate_known_hash(
+    known_hashes: &HashSet<Hash256>,
+    level: usize,
+    label: &str,
+    hash: &str,
+) -> Result<(), HistoryError> {
+    if let Some(parsed) = parse_nonzero_hash(hash) {
+        if !known_hashes.contains(&parsed) {
+            return Err(HistoryError::VerificationFailed(format!(
+                "unknown {label} bucket hash at level {level}: {hash}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_future_bucket_hashes(
+    known_hashes: &HashSet<Hash256>,
+    level: usize,
+    next: &HASBucketNext,
+) -> Result<(), HistoryError> {
+    match next.state {
+        1 => {
+            if let Some(output) = next.output.as_deref() {
+                validate_known_hash(known_hashes, level, "output", output)?;
+            }
+        }
+        2 => {
+            if let Some(curr) = next.curr.as_deref() {
+                validate_known_hash(known_hashes, level, "input curr", curr)?;
+            }
+            if let Some(snap) = next.snap.as_deref() {
+                validate_known_hash(known_hashes, level, "input snap", snap)?;
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
 /// Compute the differential bucket set for a single bucket type (live or hot archive).
 ///
 /// This mirrors the `processBuckets` lambda inside stellar-core's `differingBuckets()`.
@@ -428,66 +470,9 @@ impl HistoryArchiveState {
         }
 
         for (i, level) in self.current_buckets.iter().enumerate() {
-            // Check curr hash
-            if let Some(h) = parse_nonzero_hash(&level.curr) {
-                if !known_hashes.contains(&h) {
-                    return Err(HistoryError::VerificationFailed(format!(
-                        "unknown curr bucket hash at level {}: {}",
-                        i, level.curr
-                    )));
-                }
-            }
-
-            // Check snap hash
-            if let Some(h) = parse_nonzero_hash(&level.snap) {
-                if !known_hashes.contains(&h) {
-                    return Err(HistoryError::VerificationFailed(format!(
-                        "unknown snap bucket hash at level {}: {}",
-                        i, level.snap
-                    )));
-                }
-            }
-
-            // Check future bucket references
-            match level.next.state {
-                1 => {
-                    // Output hash must be known
-                    if let Some(ref output) = level.next.output {
-                        if let Some(h) = parse_nonzero_hash(output) {
-                            if !known_hashes.contains(&h) {
-                                return Err(HistoryError::VerificationFailed(format!(
-                                    "unknown output bucket hash at level {}: {}",
-                                    i, output
-                                )));
-                            }
-                        }
-                    }
-                }
-                2 => {
-                    // Input curr/snap must be known
-                    if let Some(ref curr) = level.next.curr {
-                        if let Some(h) = parse_nonzero_hash(curr) {
-                            if !known_hashes.contains(&h) {
-                                return Err(HistoryError::VerificationFailed(format!(
-                                    "unknown input curr bucket hash at level {}: {}",
-                                    i, curr
-                                )));
-                            }
-                        }
-                    }
-                    if let Some(ref snap) = level.next.snap {
-                        if let Some(h) = parse_nonzero_hash(snap) {
-                            if !known_hashes.contains(&h) {
-                                return Err(HistoryError::VerificationFailed(format!(
-                                    "unknown input snap bucket hash at level {}: {}",
-                                    i, snap
-                                )));
-                            }
-                        }
-                    }
-                }
-                _ => {} // state 0 (clear) — nothing to check
-            }
+            validate_known_hash(known_hashes, i, "curr", &level.curr)?;
+            validate_known_hash(known_hashes, i, "snap", &level.snap)?;
+            validate_future_bucket_hashes(known_hashes, i, &level.next)?;
         }
 
         Ok(())

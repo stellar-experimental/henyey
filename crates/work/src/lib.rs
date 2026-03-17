@@ -208,8 +208,6 @@ impl WorkState {
             Self::Success | Self::Failed | Self::Blocked | Self::Cancelled
         )
     }
-
-
 }
 
 /// Execution context provided to a work item during execution.
@@ -783,7 +781,7 @@ impl WorkScheduler {
             .map(|(id, entry)| WorkSnapshot {
                 id: *id,
                 name: entry.name.clone(),
-                state: self.states.get(id).copied().unwrap_or(WorkState::Pending),
+                state: self.state_or_pending(*id),
                 deps: entry.deps.clone(),
                 dependents: self.dependents.get(id).cloned().unwrap_or_default(),
                 attempts: entry.attempts,
@@ -807,7 +805,7 @@ impl WorkScheduler {
             ..Default::default()
         };
         for (id, entry) in &self.entries {
-            match self.states.get(id).copied().unwrap_or(WorkState::Pending) {
+            match self.state_or_pending(*id) {
                 WorkState::Pending => metrics.pending += 1,
                 WorkState::Running => metrics.running += 1,
                 WorkState::Success => metrics.success += 1,
@@ -874,49 +872,9 @@ impl WorkScheduler {
                 if running.contains(&id) {
                     continue;
                 }
-
-                if !self.can_run(id) {
-                    continue;
+                if self.start_work(id, &tx) {
+                    running.insert(id);
                 }
-
-                let Some(entry) = self.entries.get_mut(&id) else {
-                    continue;
-                };
-                if entry.cancel_token.is_cancelled() {
-                    let attempts = entry.attempts;
-                    self.fail_or_cancel(id, WorkState::Cancelled, attempts);
-                    continue;
-                }
-                entry.attempts += 1;
-                let attempt = entry.attempts;
-                let mut work = std::mem::replace(&mut entry.work, Box::new(EmptyWork));
-                let name = entry.name.clone();
-                let completion_tx = tx.clone();
-                let cancel_token = entry.cancel_token.clone();
-                entry.started_at = Some(Instant::now());
-
-                self.states.insert(id, WorkState::Running);
-                self.emit_event(id, WorkState::Running, attempt);
-                running.insert(id);
-
-                tokio::spawn(async move {
-                    let ctx = WorkContext {
-                        id,
-                        attempt,
-                        cancel_token,
-                    };
-                    let outcome = work.run(&ctx).await;
-                    let _ = completion_tx
-                        .send(WorkCompletion {
-                            id,
-                            outcome,
-                            work: Some(work),
-                            attempt,
-                            cancelled: ctx.is_cancelled(),
-                        })
-                        .await;
-                    debug!(work_id = id, name = %name, "work completed");
-                });
             }
 
             if running.is_empty() && queue.is_empty() {
@@ -968,9 +926,62 @@ impl WorkScheduler {
     fn ready_queue(&self) -> VecDeque<WorkId> {
         self.entries
             .keys()
-            .filter(|id| matches!(self.states.get(id), Some(WorkState::Pending)))
+            .filter(|id| self.state_or_pending(**id) == WorkState::Pending)
             .copied()
             .collect()
+    }
+
+    /// Returns the tracked state for a work item, defaulting to pending.
+    fn state_or_pending(&self, id: WorkId) -> WorkState {
+        self.states.get(&id).copied().unwrap_or(WorkState::Pending)
+    }
+
+    /// Starts a ready work item and spawns its execution task.
+    fn start_work(&mut self, id: WorkId, tx: &mpsc::Sender<WorkCompletion>) -> bool {
+        if !self.can_run(id) {
+            return false;
+        }
+
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        if entry.cancel_token.is_cancelled() {
+            let attempts = entry.attempts;
+            self.fail_or_cancel(id, WorkState::Cancelled, attempts);
+            return false;
+        }
+
+        entry.attempts += 1;
+        let attempt = entry.attempts;
+        let mut work = std::mem::replace(&mut entry.work, Box::new(EmptyWork));
+        let name = entry.name.clone();
+        let completion_tx = tx.clone();
+        let cancel_token = entry.cancel_token.clone();
+        entry.started_at = Some(Instant::now());
+
+        self.states.insert(id, WorkState::Running);
+        self.emit_event(id, WorkState::Running, attempt);
+
+        tokio::spawn(async move {
+            let ctx = WorkContext {
+                id,
+                attempt,
+                cancel_token,
+            };
+            let outcome = work.run(&ctx).await;
+            let _ = completion_tx
+                .send(WorkCompletion {
+                    id,
+                    outcome,
+                    work,
+                    attempt,
+                    cancelled: ctx.is_cancelled(),
+                })
+                .await;
+            debug!(work_id = id, name = %name, "work completed");
+        });
+
+        true
     }
 
     /// Enqueues dependents of a completed work item that are now ready to run.
@@ -992,7 +1003,7 @@ impl WorkScheduler {
             if running.contains(&child) {
                 continue;
             }
-            if !matches!(self.states.get(&child), Some(WorkState::Pending)) {
+            if self.state_or_pending(child) != WorkState::Pending {
                 continue;
             }
             if self.can_run(child) && queued.insert(child) {
@@ -1027,7 +1038,7 @@ impl WorkScheduler {
         let pending: Vec<WorkId> = children
             .iter()
             .copied()
-            .filter(|child| matches!(self.states.get(child), Some(WorkState::Pending)))
+            .filter(|child| self.state_or_pending(*child) == WorkState::Pending)
             .collect();
         for child in pending {
             self.states.insert(child, WorkState::Blocked);
@@ -1048,11 +1059,9 @@ impl WorkScheduler {
     /// Called after a spawned work task completes, regardless of outcome.
     /// Moves the work implementation back into the entry (replacing the
     /// placeholder) and records the elapsed execution time.
-    fn finalize_entry(&mut self, id: WorkId, work: Option<Box<dyn Work + Send>>) {
+    fn finalize_entry(&mut self, id: WorkId, work: Box<dyn Work + Send>) {
         if let Some(entry) = self.entries.get_mut(&id) {
-            if let Some(work) = work {
-                entry.work = work;
-            }
+            entry.work = work;
             if let Some(started_at) = entry.started_at.take() {
                 let elapsed = started_at.elapsed();
                 entry.last_duration = Some(elapsed);
@@ -1155,8 +1164,8 @@ impl WorkScheduler {
 /// Action returned by [`WorkScheduler::handle_completion`] to direct the
 /// main execution loop.
 enum CompletionAction {
-    /// A work item completed (successfully or via cancellation). The main
-    /// loop should check dependents of `completed_id` for readiness.
+    /// A work item completed successfully. The main loop should check
+    /// dependents of `completed_id` for readiness.
     Done { completed_id: WorkId },
     /// A work item should be retried after `delay`.
     Retry { id: WorkId, delay: Duration },
@@ -1178,7 +1187,7 @@ struct WorkCompletion {
     /// The work item itself, returned for potential reuse on retry.
     ///
     /// This allows stateful work items to maintain state across retries.
-    work: Option<Box<dyn Work + Send>>,
+    work: Box<dyn Work + Send>,
 
     /// The attempt number for this execution.
     attempt: u32,

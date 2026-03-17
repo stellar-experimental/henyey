@@ -20,10 +20,6 @@ pub struct LoopbackConnectionFactory {
 }
 
 impl LoopbackConnectionFactory {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     fn socket_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
     }

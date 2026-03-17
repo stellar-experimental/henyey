@@ -6,6 +6,46 @@
 
 use super::*;
 
+type AccountTransactions = HashMap<Vec<u8>, Vec<QueuedTransaction>>;
+
+fn seed_account_queue(
+    queue: &mut SurgePricingPriorityQueue,
+    accounts: &AccountTransactions,
+    positions: &mut HashMap<Vec<u8>, usize>,
+    network_id: &NetworkId,
+    ledger_version: u32,
+) {
+    for (account, txs) in accounts {
+        if let Some(first) = txs.first() {
+            queue.add(first.clone(), network_id, ledger_version);
+            positions.insert(account.clone(), 0);
+        }
+    }
+}
+
+fn push_next_account_tx(
+    queue: &mut SurgePricingPriorityQueue,
+    accounts: &AccountTransactions,
+    positions: &mut HashMap<Vec<u8>, usize>,
+    account: &[u8],
+    network_id: &NetworkId,
+    ledger_version: u32,
+) {
+    let Some(txs) = accounts.get(account) else {
+        return;
+    };
+
+    let next_index = positions
+        .get(account)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1);
+    if next_index < txs.len() {
+        positions.insert(account.to_vec(), next_index);
+        queue.add(txs[next_index].clone(), network_id, ledger_version);
+    }
+}
+
 impl TransactionQueue {
     /// Get a transaction set for the next ledger.
     ///
@@ -286,44 +326,7 @@ impl TransactionQueue {
             self.config.max_classic_bytes.is_some() || self.config.max_dex_bytes.is_some();
         let ledger_version = self.validation_context.read().protocol_version;
 
-        let mut classic_accounts: HashMap<Vec<u8>, Vec<QueuedTransaction>> = HashMap::new();
-        let mut soroban_accounts: HashMap<Vec<u8>, Vec<QueuedTransaction>> = HashMap::new();
-        let mut accounts: Vec<_> = layered.keys().cloned().collect();
-        accounts.sort();
-        for account in accounts {
-            if let Some(txs) = layered.get(&account) {
-                let mut seen_soroban = false;
-                for tx in txs {
-                    let frame = henyey_tx::TransactionFrame::from_owned_with_network(
-                        tx.envelope.clone(),
-                        self.config.network_id,
-                    );
-                    let is_soroban = frame.is_soroban();
-                    if !seen_soroban {
-                        if is_soroban {
-                            seen_soroban = true;
-                            soroban_accounts
-                                .entry(account.clone())
-                                .or_default()
-                                .push(tx.clone());
-                        } else {
-                            classic_accounts
-                                .entry(account.clone())
-                                .or_default()
-                                .push(tx.clone());
-                        }
-                    } else {
-                        if !is_soroban {
-                            break;
-                        }
-                        soroban_accounts
-                            .entry(account.clone())
-                            .or_default()
-                            .push(tx.clone());
-                    }
-                }
-            }
-        }
+        let (classic_accounts, soroban_accounts) = self.split_layered_accounts_by_phase(&layered);
 
         let classic_bytes = self
             .config
@@ -347,12 +350,13 @@ impl TransactionQueue {
         let mut classic_had_not_fitting = Vec::new();
         let mut classic_queue = SurgePricingPriorityQueue::new(Box::new(classic_lane_config), seed);
         let mut classic_positions: HashMap<Vec<u8>, usize> = HashMap::new();
-        for (account, txs) in classic_accounts.iter() {
-            if let Some(first) = txs.first() {
-                classic_queue.add(first.clone(), &self.config.network_id, ledger_version);
-                classic_positions.insert(account.clone(), 0);
-            }
-        }
+        seed_account_queue(
+            &mut classic_queue,
+            &classic_accounts,
+            &mut classic_positions,
+            &self.config.network_id,
+            ledger_version,
+        );
 
         let mut classic_selected = Vec::new();
         let lane_count = classic_queue.get_num_lanes();
@@ -386,21 +390,14 @@ impl TransactionQueue {
 
             classic_queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
             let account = account_key(&entry.tx.envelope);
-            if let Some(txs) = classic_accounts.get(&account) {
-                let next_index = classic_positions
-                    .get(&account)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                if next_index < txs.len() {
-                    classic_positions.insert(account.clone(), next_index);
-                    classic_queue.add(
-                        txs[next_index].clone(),
-                        &self.config.network_id,
-                        ledger_version,
-                    );
-                }
-            }
+            push_next_account_tx(
+                &mut classic_queue,
+                &classic_accounts,
+                &mut classic_positions,
+                &account,
+                &self.config.network_id,
+                ledger_version,
+            );
         }
         let classic_limited = classic_had_not_fitting
             .get(GENERIC_LANE)
@@ -431,12 +428,13 @@ impl TransactionQueue {
             let lane_config = SorobanGenericLaneConfig::new(limit);
             let mut queue = SurgePricingPriorityQueue::new(Box::new(lane_config), seed);
             let mut positions: HashMap<Vec<u8>, usize> = HashMap::new();
-            for (account, txs) in soroban_accounts.iter() {
-                if let Some(first) = txs.first() {
-                    queue.add(first.clone(), &self.config.network_id, ledger_version);
-                    positions.insert(account.clone(), 0);
-                }
-            }
+            seed_account_queue(
+                &mut queue,
+                &soroban_accounts,
+                &mut positions,
+                &self.config.network_id,
+                ledger_version,
+            );
 
             let mut selected = Vec::new();
             let mut lane_left = [queue.lane_limits(GENERIC_LANE)];
@@ -456,21 +454,14 @@ impl TransactionQueue {
                 lane_left[GENERIC_LANE] -= resources;
                 queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
                 let account = account_key(&entry.tx.envelope);
-                if let Some(txs) = soroban_accounts.get(&account) {
-                    let next_index = positions
-                        .get(&account)
-                        .copied()
-                        .unwrap_or(0)
-                        .saturating_add(1);
-                    if next_index < txs.len() {
-                        positions.insert(account.clone(), next_index);
-                        queue.add(
-                            txs[next_index].clone(),
-                            &self.config.network_id,
-                            ledger_version,
-                        );
-                    }
-                }
+                push_next_account_tx(
+                    &mut queue,
+                    &soroban_accounts,
+                    &mut positions,
+                    &account,
+                    &self.config.network_id,
+                    ledger_version,
+                );
             }
             let limited = had_not_fitting.get(GENERIC_LANE).copied().unwrap_or(false);
             (selected, limited)
@@ -496,5 +487,44 @@ impl TransactionQueue {
             dex_limited,
             classic_limited,
         }
+    }
+
+    fn split_layered_accounts_by_phase(
+        &self,
+        layered: &AccountTransactions,
+    ) -> (AccountTransactions, AccountTransactions) {
+        let mut classic_accounts: AccountTransactions = HashMap::new();
+        let mut soroban_accounts: AccountTransactions = HashMap::new();
+        let mut accounts: Vec<_> = layered.keys().cloned().collect();
+        accounts.sort();
+
+        for account in accounts {
+            let Some(txs) = layered.get(&account) else {
+                continue;
+            };
+
+            let mut seen_soroban = false;
+            for tx in txs {
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                    tx.envelope.clone(),
+                    self.config.network_id,
+                );
+                let is_soroban = frame.is_soroban();
+                if seen_soroban && !is_soroban {
+                    break;
+                }
+
+                let target = if seen_soroban || is_soroban {
+                    seen_soroban = true;
+                    &mut soroban_accounts
+                } else {
+                    &mut classic_accounts
+                };
+
+                target.entry(account.clone()).or_default().push(tx.clone());
+            }
+        }
+
+        (classic_accounts, soroban_accounts)
     }
 }

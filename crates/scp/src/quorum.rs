@@ -79,45 +79,44 @@ pub const MAXIMUM_QUORUM_NODES: usize = 1000;
 ///
 /// # Returns
 /// True if the nodes satisfy this quorum slice.
-// `get_quorum_set` is threaded through recursion to maintain a uniform interface
-// with `is_quorum`, which calls this function. Clippy's lint is a false positive.
-#[allow(clippy::only_used_in_recursion)]
 pub fn is_quorum_slice<F>(
     quorum_set: &ScpQuorumSet,
     nodes: &HashSet<NodeId>,
-    get_quorum_set: &F,
+    _get_quorum_set: &F,
 ) -> bool
 where
     F: Fn(&NodeId) -> Option<ScpQuorumSet>,
 {
-    let threshold = quorum_set.threshold as usize;
-    if threshold == 0 {
-        return true;
-    }
+    fn is_quorum_slice_inner(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
+        let threshold = quorum_set.threshold as usize;
+        if threshold == 0 {
+            return true;
+        }
 
-    let mut count = 0;
+        let mut count = 0;
 
-    // Count validators
-    for validator in quorum_set.validators.iter() {
-        if nodes.contains(validator) {
-            count += 1;
-            if count >= threshold {
-                return true;
+        for validator in quorum_set.validators.iter() {
+            if nodes.contains(validator) {
+                count += 1;
+                if count >= threshold {
+                    return true;
+                }
             }
         }
-    }
 
-    // Count inner sets
-    for inner_set in quorum_set.inner_sets.iter() {
-        if is_quorum_slice(inner_set, nodes, get_quorum_set) {
-            count += 1;
-            if count >= threshold {
-                return true;
+        for inner_set in quorum_set.inner_sets.iter() {
+            if is_quorum_slice_inner(inner_set, nodes) {
+                count += 1;
+                if count >= threshold {
+                    return true;
+                }
             }
         }
+
+        count >= threshold
     }
 
-    count >= threshold
+    is_quorum_slice_inner(quorum_set, nodes)
 }
 
 /// Check if a set of nodes forms a quorum.

@@ -14,6 +14,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::compat_http::CompatServerState;
+use crate::http::types::{ConnectParams, DropPeerParams, UnbanParams};
 
 // ── Admin endpoints (plain text) ─────────────────────────────────────────
 
@@ -105,16 +106,6 @@ pub(crate) async fn compat_ll_handler(
 
 // ── Peer management (plain text) ─────────────────────────────────────────
 
-/// GET /connect?peer=...&port=...
-#[derive(Deserialize, Default)]
-#[allow(dead_code)]
-pub(crate) struct ConnectParams {
-    #[serde(default)]
-    peer: Option<String>,
-    #[serde(default)]
-    port: Option<u16>,
-}
-
 pub(crate) async fn compat_connect_handler(
     State(_state): State<Arc<CompatServerState>>,
     Query(params): Query<ConnectParams>,
@@ -125,16 +116,6 @@ pub(crate) async fn compat_connect_handler(
     }
 }
 
-/// GET /droppeer?node=...&ban=...
-#[derive(Deserialize, Default)]
-#[allow(dead_code)]
-pub(crate) struct DropPeerParams {
-    #[serde(default)]
-    node: Option<String>,
-    #[serde(default)]
-    ban: Option<u32>,
-}
-
 pub(crate) async fn compat_droppeer_handler(
     State(_state): State<Arc<CompatServerState>>,
     Query(params): Query<DropPeerParams>,
@@ -143,14 +124,6 @@ pub(crate) async fn compat_droppeer_handler(
         Some(_) => "done\n".to_string(),
         None => "Must specify a peer: droppeer?node=<node_id>\n".to_string(),
     }
-}
-
-/// GET /unban?node=...
-#[derive(Deserialize, Default)]
-#[allow(dead_code)]
-pub(crate) struct UnbanParams {
-    #[serde(default)]
-    node: Option<String>,
 }
 
 pub(crate) async fn compat_unban_handler(

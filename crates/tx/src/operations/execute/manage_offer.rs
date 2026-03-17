@@ -38,30 +38,44 @@ pub fn execute_manage_sell_offer(
     context: &LedgerContext,
 ) -> Result<OperationResult> {
     execute_manage_offer(
-        source,
-        &op.selling,
-        &op.buying,
-        op.offer_id,
-        &op.price,
-        OfferKind::Sell { amount: op.amount },
-        false,
+        ManageOfferRequest {
+            source,
+            selling: &op.selling,
+            buying: &op.buying,
+            offer_id: op.offer_id,
+            price: &op.price,
+            offer_kind: OfferKind::Sell { amount: op.amount },
+            passive: false,
+        },
         state,
         context,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_manage_offer(
-    source: &AccountId,
-    selling: &Asset,
-    buying: &Asset,
+struct ManageOfferRequest<'a> {
+    source: &'a AccountId,
+    selling: &'a Asset,
+    buying: &'a Asset,
     offer_id: i64,
-    price: &Price,
+    price: &'a Price,
     offer_kind: OfferKind,
     passive: bool,
+}
+
+fn execute_manage_offer(
+    request: ManageOfferRequest<'_>,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationResult> {
+    let ManageOfferRequest {
+        source,
+        selling,
+        buying,
+        offer_id,
+        price,
+        offer_kind,
+        passive,
+    } = request;
     let offer_amount = offer_kind.amount();
 
     // Validate the offer parameters
@@ -480,15 +494,17 @@ pub fn execute_manage_buy_offer(
     let effective_price = invert_price(&op.price);
 
     let result = execute_manage_offer(
-        source,
-        &op.selling,
-        &op.buying,
-        op.offer_id,
-        &effective_price,
-        OfferKind::Buy {
-            buy_amount: op.buy_amount,
+        ManageOfferRequest {
+            source,
+            selling: &op.selling,
+            buying: &op.buying,
+            offer_id: op.offer_id,
+            price: &effective_price,
+            offer_kind: OfferKind::Buy {
+                buy_amount: op.buy_amount,
+            },
+            passive: false,
         },
-        false,
         state,
         context,
     )?;
@@ -513,13 +529,15 @@ pub fn execute_create_passive_sell_offer(
     context: &LedgerContext,
 ) -> Result<OperationResult> {
     execute_manage_offer(
-        source,
-        &op.selling,
-        &op.buying,
-        0,
-        &op.price,
-        OfferKind::Sell { amount: op.amount },
-        true,
+        ManageOfferRequest {
+            source,
+            selling: &op.selling,
+            buying: &op.buying,
+            offer_id: 0,
+            price: &op.price,
+            offer_kind: OfferKind::Sell { amount: op.amount },
+            passive: true,
+        },
         state,
         context,
     )

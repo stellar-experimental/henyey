@@ -274,6 +274,27 @@ pub(crate) struct MergeContext<'a> {
     pub merge_counters: Option<Arc<MergeCounters>>,
 }
 
+struct AsyncMergeRequest {
+    curr: Arc<Bucket>,
+    snap: Arc<Bucket>,
+    keep_dead_entries: bool,
+    protocol_version: u32,
+    normalize_init: bool,
+    shadow_buckets: Vec<Bucket>,
+    level: usize,
+    bucket_dir: Option<std::path::PathBuf>,
+    counters: Option<Arc<MergeCounters>>,
+}
+
+struct AddBatchArgs {
+    ledger_seq: u32,
+    protocol_version: u32,
+    bucket_list_type: BucketListType,
+    init_entries: Vec<LedgerEntry>,
+    live_entries: Vec<LedgerEntry>,
+    dead_entries: Vec<LedgerKey>,
+}
+
 /// Handle to an asynchronous bucket merge running in a background thread.
 ///
 /// The merge is started immediately when this handle is created, and runs
@@ -309,18 +330,18 @@ impl AsyncMergeHandle {
     /// # Panics
     ///
     /// Panics if called outside of a tokio runtime context. Tests should use `#[tokio::test(flavor = "multi_thread")]`.
-    #[allow(clippy::too_many_arguments)]
-    fn start_merge(
-        curr: Arc<Bucket>,
-        snap: Arc<Bucket>,
-        keep_dead_entries: bool,
-        protocol_version: u32,
-        normalize_init: bool,
-        shadow_buckets: Vec<Bucket>,
-        level: usize,
-        bucket_dir: Option<std::path::PathBuf>,
-        counters: Option<Arc<MergeCounters>>,
-    ) -> Self {
+    fn start_merge(request: AsyncMergeRequest) -> Self {
+        let AsyncMergeRequest {
+            curr,
+            snap,
+            keep_dead_entries,
+            protocol_version,
+            normalize_init,
+            shadow_buckets,
+            level,
+            bucket_dir,
+            counters,
+        } = request;
         let (sender, receiver) = oneshot::channel();
 
         // Capture input hashes BEFORE the merge starts. These are needed for
@@ -802,17 +823,17 @@ impl BucketLevel {
         //
         // Level 0 uses synchronous in-memory merging (handled in prepare_first_level).
         if self.level >= 1 {
-            let handle = AsyncMergeHandle::start_merge(
-                curr_for_merge,
-                incoming,
-                ctx.keep_dead_entries,
+            let handle = AsyncMergeHandle::start_merge(AsyncMergeRequest {
+                curr: curr_for_merge,
+                snap: incoming,
+                keep_dead_entries: ctx.keep_dead_entries,
                 protocol_version,
-                ctx.normalize_init,
-                shadow_buckets.to_vec(),
-                self.level,
-                ctx.bucket_dir.map(|p| p.to_path_buf()),
-                ctx.merge_counters,
-            );
+                normalize_init: ctx.normalize_init,
+                shadow_buckets: shadow_buckets.to_vec(),
+                level: self.level,
+                bucket_dir: ctx.bucket_dir.map(|p| p.to_path_buf()),
+                counters: ctx.merge_counters,
+            });
             self.next = Some(PendingMerge::Async(handle));
         } else {
             // Level 0 should use prepare_first_level, but if called here, do sync merge
@@ -1615,7 +1636,17 @@ impl BucketList {
         live_entries: Vec<LedgerEntry>,
         dead_entries: Vec<LedgerKey>,
     ) -> Result<()> {
-        self.add_batch_impl(ledger_seq, protocol_version, bucket_list_type, init_entries, live_entries, dead_entries, false)
+        self.add_batch_impl(
+            AddBatchArgs {
+                ledger_seq,
+                protocol_version,
+                bucket_list_type,
+                init_entries,
+                live_entries,
+                dead_entries,
+            },
+            false,
+        )
     }
 
     /// Like `add_batch`, but skips deduplication when entries are known to be
@@ -1629,20 +1660,28 @@ impl BucketList {
         live_entries: Vec<LedgerEntry>,
         dead_entries: Vec<LedgerKey>,
     ) -> Result<()> {
-        self.add_batch_impl(ledger_seq, protocol_version, bucket_list_type, init_entries, live_entries, dead_entries, true)
+        self.add_batch_impl(
+            AddBatchArgs {
+                ledger_seq,
+                protocol_version,
+                bucket_list_type,
+                init_entries,
+                live_entries,
+                dead_entries,
+            },
+            true,
+        )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn add_batch_impl(
-        &mut self,
-        ledger_seq: u32,
-        protocol_version: u32,
-        bucket_list_type: BucketListType,
-        init_entries: Vec<LedgerEntry>,
-        live_entries: Vec<LedgerEntry>,
-        dead_entries: Vec<LedgerKey>,
-        skip_dedup: bool,
-    ) -> Result<()> {
+    fn add_batch_impl(&mut self, args: AddBatchArgs, skip_dedup: bool) -> Result<()> {
+        let AddBatchArgs {
+            ledger_seq,
+            protocol_version,
+            bucket_list_type,
+            init_entries,
+            live_entries,
+            dead_entries,
+        } = args;
         let add_batch_start = std::time::Instant::now();
         let use_init = protocol_version_starts_from(protocol_version, ProtocolVersion::V11);
 
@@ -3623,17 +3662,17 @@ mod tests {
         assert!(bucket2.is_disk_backed(), "bucket2 should be disk-backed");
 
         // Create an async merge handle
-        let handle = AsyncMergeHandle::start_merge(
-            bucket1.clone(),
-            bucket2.clone(),
-            false,
-            TEST_PROTOCOL,
-            true,
-            vec![],
-            1,
-            Some(temp_dir.path().to_path_buf()),
-            None,
-        );
+        let handle = AsyncMergeHandle::start_merge(AsyncMergeRequest {
+            curr: bucket1.clone(),
+            snap: bucket2.clone(),
+            keep_dead_entries: false,
+            protocol_version: TEST_PROTOCOL,
+            normalize_init: true,
+            shadow_buckets: vec![],
+            level: 1,
+            bucket_dir: Some(temp_dir.path().to_path_buf()),
+            counters: None,
+        });
 
         // Set up bucket list with the pending merge
         let mut bl = BucketList::new();

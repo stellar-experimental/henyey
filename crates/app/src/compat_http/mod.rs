@@ -17,7 +17,6 @@ pub mod handlers;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -31,9 +30,6 @@ use crate::app::App;
 /// Shared state for the compatibility HTTP server.
 pub(crate) struct CompatServerState {
     pub app: Arc<App>,
-    /// Used for uptime calculation (e.g. in `/info` handler).
-    #[allow(dead_code)]
-    pub start_time: Instant,
     /// ISO 8601 UTC timestamp of when the server started.
     pub started_on: String,
     /// Load generation state (only present when `loadgen` feature is enabled).
@@ -178,7 +174,6 @@ impl CompatServer {
         let started_on = crate::http::format_utc_now();
         let state = Arc::new(CompatServerState {
             app: self.app.clone(),
-            start_time: Instant::now(),
             started_on,
             #[cfg(feature = "loadgen")]
             loadgen_state: self.loadgen_state,

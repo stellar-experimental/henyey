@@ -3726,16 +3726,16 @@ fn test_pre_charged_fee_override_on_validation_failure() {
     let transactions = vec![(std::sync::Arc::new(envelope), None)];
     let mut delta = LedgerDelta::new(2);
 
-    let result = run_transactions_on_executor(
-        &mut executor,
-        &snapshot,
-        &transactions,
+    let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
+        executor: &mut executor,
+        snapshot: &snapshot,
+        transactions: &transactions,
         base_fee,
-        [0u8; 32],
-        false,
-        &mut delta,
-        Some(&pre_charged),
-    )
+        soroban_base_prng_seed: [0u8; 32],
+        deduct_fee: false,
+        delta: &mut delta,
+        external_pre_charged: Some(&pre_charged),
+    })
     .expect("run_transactions_on_executor");
 
     // TX must fail with NoAccount.

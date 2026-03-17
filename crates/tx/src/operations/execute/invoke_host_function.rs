@@ -270,32 +270,47 @@ pub fn execute_invoke_host_function(
     // All host functions go through soroban-env-host, matching stellar-core behavior.
     // This ensures rent calculation and other host-computed values are consistent.
     execute_contract_invocation(
-        op,
-        source,
+        ContractInvocationRequest {
+            op,
+            source,
+            soroban_data,
+            soroban_config,
+            module_cache: soroban.module_cache,
+            hot_archive: soroban.hot_archive,
+            ttl_key_cache: soroban.ttl_key_cache,
+        },
         state,
         context,
-        soroban_data,
-        soroban_config,
-        soroban.module_cache,
-        soroban.hot_archive,
-        soroban.ttl_key_cache,
     )
 }
 
 /// Execute a contract invocation using soroban-env-host.
-#[allow(clippy::too_many_arguments)]
+struct ContractInvocationRequest<'a> {
+    op: &'a InvokeHostFunctionOp,
+    source: &'a AccountId,
+    soroban_data: &'a SorobanTransactionData,
+    soroban_config: &'a SorobanConfig,
+    module_cache: Option<&'a PersistentModuleCache>,
+    hot_archive: Option<&'a dyn crate::soroban::HotArchiveLookup>,
+    ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
+}
+
 fn execute_contract_invocation(
-    op: &InvokeHostFunctionOp,
-    source: &AccountId,
+    request: ContractInvocationRequest<'_>,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
-    soroban_data: &SorobanTransactionData,
-    soroban_config: &SorobanConfig,
-    module_cache: Option<&PersistentModuleCache>,
-    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
-    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Result<OperationExecutionResult> {
     use crate::soroban::execute_host_function_with_cache;
+
+    let ContractInvocationRequest {
+        op,
+        source,
+        soroban_data,
+        soroban_config,
+        module_cache,
+        hot_archive,
+        ttl_key_cache,
+    } = request;
 
     // Convert auth entries to a slice
     let auth_entries: Vec<_> = op.auth.iter().cloned().collect();

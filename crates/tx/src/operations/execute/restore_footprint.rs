@@ -21,6 +21,18 @@ pub struct HotArchiveRestoreEntry {
     pub entry: LedgerEntry,
 }
 
+/// Soroban inputs needed to restore archived entries.
+pub struct RestoreFootprintResources<'a> {
+    /// Soroban transaction data containing the restore footprint.
+    pub soroban_data: Option<&'a SorobanTransactionData>,
+    /// Minimum persistent entry TTL from Soroban config.
+    pub min_persistent_entry_ttl: u32,
+    /// Entries loaded from the hot archive for this operation.
+    pub hot_archive_restores: &'a [HotArchiveRestoreEntry],
+    /// Optional TTL key cache for hashing restored entries.
+    pub ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
+}
+
 /// Execute a RestoreFootprint operation.
 ///
 /// This operation restores archived entries that have expired TTLs,
@@ -39,19 +51,15 @@ pub struct HotArchiveRestoreEntry {
 /// # Returns
 ///
 /// Returns the operation result indicating success or a specific failure reason.
-#[allow(clippy::too_many_arguments)]
 pub fn execute_restore_footprint(
     _op: &RestoreFootprintOp,
     _source: &AccountId,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
-    soroban_data: Option<&SorobanTransactionData>,
-    min_persistent_entry_ttl: u32,
-    hot_archive_restores: &[HotArchiveRestoreEntry],
-    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+    resources: RestoreFootprintResources<'_>,
 ) -> Result<OperationResult> {
     // Get the footprint from Soroban transaction data
-    let footprint = match soroban_data {
+    let footprint = match resources.soroban_data {
         Some(data) => &data.resources.footprint,
         None => {
             return Ok(make_result(RestoreFootprintResultCode::Malformed));
@@ -73,12 +81,12 @@ pub fn execute_restore_footprint(
     //   restoredLiveUntilLedger = ledgerSeq + archivalSettings.minPersistentTTL - 1
     let current_ledger = context.sequence;
     let new_ttl = current_ledger
-        .saturating_add(min_persistent_entry_ttl)
+        .saturating_add(resources.min_persistent_entry_ttl)
         .saturating_sub(1);
 
     // First, restore hot archive entries to state.
     // These entries don't exist in the live bucket list, so we need to add them.
-    for restore in hot_archive_restores {
+    for restore in resources.hot_archive_restores {
         tracing::debug!(
             ?restore.key,
             new_ttl,
@@ -102,7 +110,8 @@ pub fn execute_restore_footprint(
         }
 
         // Create the TTL entry for the restored entry
-        let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &restore.key);
+        let key_hash =
+            crate::soroban::get_or_compute_key_hash(resources.ttl_key_cache, &restore.key);
         let ttl_entry = TtlEntry {
             key_hash,
             live_until_ledger_seq: new_ttl,
@@ -114,11 +123,11 @@ pub fn execute_restore_footprint(
     // (these have expired TTLs but the entry still exists)
     for key in footprint.read_write.iter() {
         // Skip entries that were restored from hot archive - they're already handled
-        if hot_archive_restores.iter().any(|r| &r.key == key) {
+        if resources.hot_archive_restores.iter().any(|r| &r.key == key) {
             continue;
         }
 
-        if restore_entry(key, new_ttl, state, current_ledger, ttl_key_cache).is_err() {
+        if restore_entry(key, new_ttl, state, current_ledger, resources.ttl_key_cache).is_err() {
             return Ok(make_result(
                 RestoreFootprintResultCode::ResourceLimitExceeded,
             ));
@@ -233,10 +242,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            None,
-            TEST_MIN_PERSISTENT_TTL,
-            &[], // No hot archive restores
-            None,
+            RestoreFootprintResources {
+                soroban_data: None,
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[], // No hot archive restores
+                ttl_key_cache: None,
+            },
         );
         assert!(result.is_ok());
 
@@ -277,10 +288,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            TEST_MIN_PERSISTENT_TTL,
-            &[], // No hot archive restores
-            None,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[], // No hot archive restores
+                ttl_key_cache: None,
+            },
         );
         assert!(result.is_ok());
 
@@ -325,10 +338,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            TEST_MIN_PERSISTENT_TTL,
-            &[], // No hot archive restores
-            None,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[], // No hot archive restores
+                ttl_key_cache: None,
+            },
         );
         assert!(result.is_ok());
 
@@ -375,10 +390,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            TEST_MIN_PERSISTENT_TTL,
-            &[], // No hot archive restores
-            None,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[], // No hot archive restores
+                ttl_key_cache: None,
+            },
         );
         assert!(result.is_ok());
 
@@ -426,10 +443,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            TEST_MIN_PERSISTENT_TTL,
-            &[],
-            None,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+            },
         );
         assert!(result.is_ok());
 
@@ -484,10 +503,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            TEST_MIN_PERSISTENT_TTL,
-            &[],
-            None,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+            },
         );
         assert!(result.is_ok());
 
@@ -542,10 +563,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            TEST_MIN_PERSISTENT_TTL,
-            &[],
-            None,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+            },
         );
         assert!(result.is_ok());
 
@@ -601,10 +624,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            TEST_MIN_PERSISTENT_TTL,
-            &[],
-            None,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+            },
         );
         assert!(result.is_ok());
 

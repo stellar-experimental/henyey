@@ -95,7 +95,7 @@ pub(crate) fn compute_fee_distribution(fees: &mut Vec<u64>, ledger_count: u32) -
     let count = fees.len() as u64;
     let percentile = |p: u64| -> u64 {
         // ceiling(p * count / 100)
-        let kth = (p * count + 99) / 100;
+        let kth = (p * count).div_ceil(100);
         fees[(kth - 1) as usize]
     };
 
