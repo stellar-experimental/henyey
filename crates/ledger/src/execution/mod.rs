@@ -1756,13 +1756,14 @@ impl TransactionExecutor {
     /// Validate a transaction's structure, accounts, fees, preconditions, sequence,
     /// and signatures before any state changes. Returns the validated data needed
     /// for execution, or a `ValidationFailure` on validation failure.
-    fn validate_preconditions_with_frame(
+    fn validate_preconditions(
         &mut self,
         snapshot: &SnapshotHandle,
-        frame: TransactionFrame,
+        tx_envelope: &Arc<TransactionEnvelope>,
         base_fee: u32,
     ) -> Result<std::result::Result<ValidatedTransaction, ValidationFailure>> {
         let val_start = std::time::Instant::now();
+        let frame = TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
         let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
         let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
 
@@ -2077,19 +2078,18 @@ impl TransactionExecutor {
     ) -> Result<std::result::Result<PreApplyResult, TransactionExecutionResult>> {
         let tx_timing_start = std::time::Instant::now();
 
-        // Create the frame once from Arc (cheap clone) and reuse for both soroban fee check and validation.
-        let frame = TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
-
         let soroban_max_refundable = {
-            if frame.is_soroban() {
+            let pre_frame =
+                TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
+            if pre_frame.is_soroban() {
                 let (non_refundable_fee, _) = compute_soroban_resource_fee(
-                    &frame,
+                    &pre_frame,
                     self.protocol_version,
                     &self.soroban_config,
                     0,
                 )
                 .unwrap_or((0, 0));
-                frame
+                pre_frame
                     .declared_soroban_resource_fee()
                     .saturating_sub(non_refundable_fee)
             } else {
@@ -2098,7 +2098,7 @@ impl TransactionExecutor {
         };
 
         // Phase 1-6: Validate structure, accounts, fees, preconditions, sequence, signatures
-        let validated = match self.validate_preconditions_with_frame(snapshot, frame, base_fee)? {
+        let validated = match self.validate_preconditions(snapshot, tx_envelope, base_fee)? {
             Ok(v) => v,
             Err(validation_failure) => {
                 let mut failure_result = validation_failure.result;

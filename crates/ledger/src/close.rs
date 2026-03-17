@@ -547,62 +547,26 @@ fn sort_parallel_stages(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
     set_hash: &Hash256,
 ) -> Vec<Vec<Vec<Arc<TransactionEnvelope>>>> {
-    // Flatten all TXs to compute hashes in parallel, then reassemble the nested structure.
-    // Each TX hash requires XDR serialization + SHA-256, ~5µs/TX × 50K TXs = ~250ms serial.
-    // Parallel computation across available cores reduces this proportionally.
-    let mut flat_txs: Vec<&TransactionEnvelope> = Vec::new();
-    let mut structure: Vec<Vec<usize>> = Vec::new(); // stage > cluster > count
-    for stage in stages {
-        let mut stage_counts = Vec::new();
-        for cluster in stage.0.iter() {
-            stage_counts.push(cluster.0.len());
-            for tx in cluster.0.iter() {
-                flat_txs.push(tx);
-            }
-        }
-        structure.push(stage_counts);
-    }
-
-    // Compute hashes in parallel using thread::scope.
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4);
-    let chunk_size = (flat_txs.len() + num_threads - 1) / num_threads;
-    let mut flat_hashes: Vec<Hash256> = vec![Hash256::ZERO; flat_txs.len()];
-
-    if chunk_size > 0 {
-        std::thread::scope(|s| {
-            let hash_chunks: Vec<_> = flat_hashes.chunks_mut(chunk_size).collect();
-            let tx_chunks: Vec<_> = flat_txs.chunks(chunk_size).collect();
-            let mut handles = Vec::new();
-            for (hash_chunk, tx_chunk) in hash_chunks.into_iter().zip(tx_chunks.into_iter()) {
-                handles.push(s.spawn(move || {
-                    for (h, tx) in hash_chunk.iter_mut().zip(tx_chunk.iter()) {
-                        *h = tx_hash(tx);
-                    }
-                }));
-            }
-            for handle in handles {
-                handle.join().expect("hash thread panicked");
-            }
-        });
-    }
-
-    // Reassemble the nested structure with (Arc<TX>, Hash) pairs.
-    let mut idx = 0;
-    let mut stage_vec: Vec<Vec<Vec<(Arc<TransactionEnvelope>, Hash256)>>> = Vec::new();
-    for (stage, stage_counts) in stages.iter().zip(structure.iter()) {
-        let mut stage_clusters = Vec::new();
-        for (cluster, &count) in stage.0.iter().zip(stage_counts.iter()) {
-            let mut cluster_txs = Vec::with_capacity(count);
-            for tx in cluster.0.iter() {
-                cluster_txs.push((Arc::new(TransactionEnvelope::clone(tx)), flat_hashes[idx]));
-                idx += 1;
-            }
-            stage_clusters.push(cluster_txs);
-        }
-        stage_vec.push(stage_clusters);
-    }
+    // Pre-compute TX hashes alongside each TX to avoid redundant XDR+SHA256 during sort.
+    let mut stage_vec: Vec<Vec<Vec<(Arc<TransactionEnvelope>, Hash256)>>> = stages
+        .iter()
+        .map(|stage| {
+            stage
+                .0
+                .iter()
+                .map(|cluster| {
+                    cluster
+                        .0
+                        .iter()
+                        .map(|tx| {
+                            let h = tx_hash(tx);
+                            (Arc::new(tx.clone()), h)
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
 
     for stage in stage_vec.iter_mut() {
         for cluster in stage.iter_mut() {

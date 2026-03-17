@@ -1017,59 +1017,6 @@ pub struct BucketList {
 /// duplicates after sorting (`LiveBucket.cpp:414`). We keep the dedup behavior
 /// for resilience but warn when duplicates are actually found, since their
 /// presence indicates a bug in the entry-generation path.
-/// Deduplicate entries using structural key comparison via sort + adjacent dedup.
-///
-/// Much cheaper than `deduplicate_entries` which serializes every key to XDR bytes
-/// for a HashMap. Here we leverage the bucket entry comparison function that uses
-/// structural comparisons (no XDR serialization for common key types).
-///
-/// Keeps the LAST occurrence of each key (matching stellar-core semantics).
-fn deduplicate_entries_by_sort(mut entries: Vec<LedgerEntry>) -> Vec<LedgerEntry> {
-    if entries.len() <= 1 {
-        return entries;
-    }
-    let original_count = entries.len();
-
-    // Sort by key using structural comparison (no XDR serialization).
-    // Stable sort preserves relative order of equal elements.
-    entries.sort_by(|a, b| {
-        let key_a = henyey_common::entry_to_key(a);
-        let key_b = henyey_common::entry_to_key(b);
-        crate::entry::compare_keys(&key_a, &key_b)
-    });
-
-    // Dedup keeping the LAST occurrence of each key (reverse, dedup, reverse).
-    entries.reverse();
-    entries.dedup_by(|a, b| {
-        let key_a = henyey_common::entry_to_key(a);
-        let key_b = henyey_common::entry_to_key(b);
-        crate::entry::compare_keys(&key_a, &key_b) == std::cmp::Ordering::Equal
-    });
-    entries.reverse();
-
-    let removed = original_count - entries.len();
-    if removed > 0 {
-        tracing::warn!(
-            removed,
-            original_count,
-            "deduplicate_entries removed duplicate bucket entries; \
-             this indicates a bug in the entry-generation path"
-        );
-    }
-    entries
-}
-
-/// Deduplicate keys using structural comparison via sort + adjacent dedup.
-fn deduplicate_keys_by_sort(mut keys: Vec<LedgerKey>) -> Vec<LedgerKey> {
-    if keys.len() <= 1 {
-        return keys;
-    }
-    keys.sort_by(|a, b| crate::entry::compare_keys(a, b));
-    keys.dedup_by(|a, b| crate::entry::compare_keys(a, b) == std::cmp::Ordering::Equal);
-    keys
-}
-
-#[allow(dead_code)]
 fn deduplicate_entries(entries: Vec<LedgerEntry>) -> Vec<LedgerEntry> {
     let original_count = entries.len();
 
@@ -1716,16 +1663,32 @@ impl BucketList {
             entries.extend(live_entries.into_iter().map(BucketEntry::Liveentry));
             entries.extend(dead_entries.into_iter().map(BucketEntry::Deadentry));
         } else {
-            // Deduplicate init_entries - keep only the last occurrence of each key.
-            let dedup_init = deduplicate_entries_by_sort(init_entries);
+            // Deduplicate init_entries - keep only the last occurrence of each key
+            // This handles the case where the same entry is created and updated in the same ledger
+            let dedup_init = deduplicate_entries(init_entries);
             if use_init {
                 entries.extend(dedup_init.into_iter().map(BucketEntry::Initentry));
             } else {
                 entries.extend(dedup_init.into_iter().map(BucketEntry::Liveentry));
             }
-            let dedup_live = deduplicate_entries_by_sort(live_entries);
+
+            // Deduplicate live_entries - keep only the last occurrence of each key
+            // This handles the case where the same entry is updated multiple times in the same ledger
+            let dedup_live = deduplicate_entries(live_entries);
             entries.extend(dedup_live.into_iter().map(BucketEntry::Liveentry));
-            let dedup_dead = deduplicate_keys_by_sort(dead_entries);
+
+            // Deduplicate dead_entries - keep only unique keys
+            let mut seen_dead: HashSet<Vec<u8>> = HashSet::new();
+            let dedup_dead: Vec<LedgerKey> = dead_entries
+                .into_iter()
+                .filter(|key| {
+                    if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
+                        seen_dead.insert(key_bytes)
+                    } else {
+                        true
+                    }
+                })
+                .collect();
             entries.extend(dedup_dead.into_iter().map(BucketEntry::Deadentry));
         }
         let dedup_us = dedup_start.elapsed().as_micros() as u64;

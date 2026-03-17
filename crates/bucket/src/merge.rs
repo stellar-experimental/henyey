@@ -54,70 +54,6 @@ use crate::entry::{compare_keys, BucketEntry, BucketEntryExt};
 use crate::metrics::{EntryCountType, MergeCounters};
 use crate::{protocol_version_starts_from, BucketError, ProtocolVersion, Result};
 
-/// Incremental merge output that computes hash and key index while collecting entries.
-///
-/// Avoids the separate `from_sorted_entries` pass by serializing each entry to XDR
-/// and feeding it to the hasher as it is added. At the end, call `into_bucket()` to
-/// produce the final `Bucket` without any additional serialization.
-struct IncrementalMergeOutput {
-    entries: Vec<BucketEntry>,
-    key_index: HashMap<LedgerKey, usize>,
-    hasher: Sha256,
-    /// Reusable buffer for XDR serialization to avoid per-entry allocation.
-    xdr_buf: Vec<u8>,
-}
-
-impl IncrementalMergeOutput {
-    fn with_capacity(entry_count_hint: usize) -> Self {
-        Self {
-            entries: Vec::with_capacity(entry_count_hint),
-            key_index: HashMap::with_capacity(entry_count_hint),
-            hasher: Sha256::new(),
-            xdr_buf: Vec::with_capacity(4096),
-        }
-    }
-
-    /// Add an entry, serializing it to XDR for hashing and key index building.
-    fn push(&mut self, entry: BucketEntry) {
-        // Serialize entry to XDR
-        self.xdr_buf.clear();
-        let mut limited = stellar_xdr::curr::Limited::new(&mut self.xdr_buf, Limits::none());
-        // write_xdr should not fail with Limits::none() on valid entries
-        entry.write_xdr(&mut limited).expect("XDR serialization of BucketEntry failed");
-
-        // Feed to hasher (XDR Record Marking format)
-        let size = self.xdr_buf.len() as u32;
-        let record_mark = size | 0x80000000;
-        self.hasher.update(record_mark.to_be_bytes());
-        self.hasher.update(&self.xdr_buf);
-
-        // Build key index
-        let idx = self.entries.len();
-        if let Some(key) = entry.key() {
-            self.key_index.insert(key, idx);
-        }
-
-        self.entries.push(entry);
-    }
-
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Finalize into a Bucket with pre-computed hash and key index.
-    fn into_bucket(self) -> Bucket {
-        let hash_bytes: [u8; 32] = self.hasher.finalize().into();
-        let hash = Hash256::from_bytes(hash_bytes);
-        let metadata_count = self.entries.iter().take_while(|e| e.is_metadata()).count();
-        Bucket::from_parts(
-            hash,
-            Arc::new(self.entries),
-            Arc::new(self.key_index),
-            metadata_count,
-        )
-    }
-}
-
 /// Record an entry type in the merge counters.
 fn record_entry_type(counters: Option<&MergeCounters>, entry: &BucketEntry) {
     if let Some(c) = counters {
@@ -251,7 +187,7 @@ fn merge_with_shadows_impl(
     let (_, output_meta) =
         build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
 
-    let mut merged = IncrementalMergeOutput::with_capacity(old_bucket.len() + new_bucket.len());
+    let mut merged: Vec<BucketEntry> = Vec::with_capacity(old_bucket.len() + new_bucket.len());
 
     // Create shadow cursors for inline shadow checking.
     // For protocol >= 12 (V12, shadows removed), shadow_buckets is always
@@ -386,8 +322,7 @@ fn merge_with_shadows_impl(
         return Ok(Bucket::empty());
     }
 
-    // Hash and key index were computed incrementally during the merge loop.
-    let result = merged.into_bucket();
+    let result = Bucket::from_sorted_entries(merged)?;
 
     tracing::trace!(
         result_hash = %result.hash(),
@@ -1034,7 +969,7 @@ fn maybe_put(
     entry: BucketEntry,
     shadow_cursors: &mut [ShadowCursor<'_>],
     keep_shadowed_lifecycle_entries: bool,
-    output: &mut IncrementalMergeOutput,
+    output: &mut Vec<BucketEntry>,
     counters: Option<&MergeCounters>,
 ) {
     if !shadow_cursors.is_empty() {

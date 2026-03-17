@@ -480,17 +480,16 @@ pub fn execute_soroban_parallel_phase(
         total_stage_clusters_us += stage_clusters_start.elapsed().as_micros() as u64;
 
         // Merge cluster results. Use max id_pool across clusters.
-        // Move by value (into_iter) to avoid cloning large XDR structs.
         let result_merge_start = std::time::Instant::now();
-        for cr in cluster_results {
+        for cr in &cluster_results {
             if cr.id_pool > id_pool {
                 id_pool = cr.id_pool;
             }
-            all_results.extend(cr.results);
-            all_tx_results.extend(cr.tx_results);
-            all_tx_result_metas.extend(cr.tx_result_metas);
+            all_results.extend(cr.results.iter().cloned());
+            all_tx_results.extend(cr.tx_results.iter().cloned());
+            all_tx_result_metas.extend(cr.tx_result_metas.iter().cloned());
             all_hot_archive_restored_keys
-                .extend(cr.hot_archive_restored_keys);
+                .extend(cr.hot_archive_restored_keys.iter().cloned());
         }
         total_result_merge_us += result_merge_start.elapsed().as_micros() as u64;
 
