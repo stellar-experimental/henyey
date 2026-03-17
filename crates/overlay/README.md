@@ -59,6 +59,13 @@ graph TD
 | `TxAdverts` | Manages outgoing/incoming transaction flood adverts with batching |
 | `TxDemandsManager` | Tracks transaction demand lifecycle with retries and latency metrics |
 | `SurveyManager` | Time-sliced network topology survey collection and reporting |
+| `ConnectionFactory` | Trait abstracting TCP transport for connect and bind operations |
+| `TcpConnectionFactory` | Default `ConnectionFactory` implementation using real TCP sockets |
+| `LoopbackConnectionFactory` | In-process `ConnectionFactory` using `tokio::io::duplex` for testing |
+| `OverlayError` | Error enum covering connection, auth, codec, and protocol failures |
+| `PeerEvent` | Enum (`Connected` / `Failed`) for peer connection lifecycle notifications |
+| `PeerType` | Enum distinguishing `Inbound` vs `Outbound` peer connections |
+| `MessageHandler` | Trait for processing incoming Stellar messages from peers |
 | `OverlayMetrics` | Thread-safe atomic counters and timers for overlay statistics |
 
 ## Usage
@@ -128,6 +135,8 @@ config.listen_enabled = false; // Don't accept inbound connections
 | `tx_demands.rs` | `TxDemandsManager` -- demand status tracking, linear backoff retries, latency |
 | `survey.rs` | `SurveyManager` -- time-sliced network survey lifecycle and data collection |
 | `metrics.rs` | `OverlayMetrics` -- atomic counters/timers for messages, bytes, errors, latency |
+| `connection_factory.rs` | `ConnectionFactory` trait, `TcpConnectionFactory` -- transport abstraction |
+| `loopback.rs` | `LoopbackConnectionFactory` -- in-process transport for testing |
 | `error.rs` | `OverlayError` enum with thiserror |
 
 ## Design Notes
@@ -168,6 +177,8 @@ config.listen_enabled = false; // Don't accept inbound connections
 | `tx_demands.rs` | `src/overlay/TxDemandsManager.h` |
 | `survey.rs` | `src/overlay/SurveyManager.h`, `SurveyDataManager.h` |
 | `metrics.rs` | `src/overlay/OverlayMetrics.h` |
+| `connection_factory.rs` | No direct equivalent (stellar-core uses `TCPPeer` directly) |
+| `loopback.rs` | `src/overlay/LoopbackPeer.h` (test-only in stellar-core) |
 
 ## Parity Status
 

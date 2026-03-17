@@ -170,6 +170,58 @@ fn is_ping_response(
     }
 }
 
+/// Tracks outstanding ping state and measures round-trip time.
+///
+/// Encapsulates the ping hash, send time, and last RTT so that the
+/// duplicated ping-response matching in `run_peer_loop` can be a
+/// single `check_response` call.
+struct PingTracker {
+    sent_time: Option<Instant>,
+    hash: Option<stellar_xdr::curr::Uint256>,
+    last_rtt: Option<Duration>,
+}
+
+impl PingTracker {
+    fn new() -> Self {
+        Self {
+            sent_time: None,
+            hash: None,
+            last_rtt: None,
+        }
+    }
+
+    /// Record that a ping was sent with the given hash.
+    fn record_sent(&mut self, hash: stellar_xdr::curr::Uint256) {
+        self.sent_time = Some(Instant::now());
+        self.hash = Some(hash);
+    }
+
+    /// Check whether `response_hash` matches the outstanding ping.
+    /// If so, record the RTT and clear the outstanding ping. Returns
+    /// the RTT if this was a match.
+    fn check_response(
+        &mut self,
+        response_hash: &stellar_xdr::curr::Uint256,
+        peer_id: &PeerId,
+    ) -> Option<Duration> {
+        let sent = self.sent_time?;
+        if !is_ping_response(self.hash.as_ref(), response_hash) {
+            return None;
+        }
+        let rtt = sent.elapsed();
+        debug!("Latency {}: {} ms", peer_id, rtt.as_millis());
+        self.last_rtt = Some(rtt);
+        self.sent_time = None;
+        self.hash = None;
+        Some(rtt)
+    }
+
+    /// True if no ping is currently outstanding.
+    fn is_idle(&self) -> bool {
+        self.sent_time.is_none()
+    }
+}
+
 /// Compute the next DNS resolution delay based on the backoff state.
 ///
 /// Implements the linear backoff state machine from stellar-core:
@@ -255,6 +307,58 @@ fn send_error_and_drop(
         code,
         truncate_error_msg(message),
     );
+}
+
+/// Log received fetch messages and check for ping responses.
+///
+/// Handles debug-level logging of fetch response details (hashes, types)
+/// and checks `ScpQuorumset`/`DontHave` messages for ping RTT measurement.
+fn log_fetch_message(message: &StellarMessage, peer_id: &PeerId, ping: &mut PingTracker) {
+    match message {
+        StellarMessage::TxSet(ts) => {
+            debug!(
+                "OVERLAY: Received TxSet from {} hash={} prev_ledger={}",
+                peer_id,
+                hex::encode(sha2::Sha256::digest(
+                    stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none())
+                        .unwrap_or_default()
+                )),
+                hex::encode(ts.previous_ledger_hash.0)
+            );
+        }
+        StellarMessage::GeneralizedTxSet(ts) => {
+            let hash = henyey_common::Hash256::hash_xdr(ts)
+                .unwrap_or(henyey_common::Hash256::ZERO);
+            debug!(
+                "OVERLAY: Received GeneralizedTxSet from {} hash={}",
+                peer_id, hash
+            );
+        }
+        StellarMessage::ScpQuorumset(qs) => {
+            let hash =
+                henyey_common::Hash256::hash_xdr(qs).unwrap_or(henyey_common::Hash256::ZERO);
+            ping.check_response(&Uint256(hash.0), peer_id);
+            debug!(
+                "OVERLAY: Received ScpQuorumset from {} hash={}",
+                peer_id, hash
+            );
+        }
+        StellarMessage::DontHave(dh) => {
+            ping.check_response(&dh.req_hash, peer_id);
+            debug!(
+                "OVERLAY: Received DontHave from {} type={:?} hash={}",
+                peer_id, dh.type_, hex::encode(dh.req_hash.0)
+            );
+        }
+        StellarMessage::GetTxSet(hash) => {
+            debug!(
+                "OVERLAY: Received GetTxSet from {} hash={}",
+                peer_id,
+                hex::encode(hash.0)
+            );
+        }
+        _ => {}
+    }
 }
 
 fn is_fetch_message(message: &StellarMessage) -> bool {
@@ -401,6 +505,59 @@ impl SharedPeerState {
         self.peer_info_cache.remove(peer_id);
         self.dropped_authenticated_peers
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Forward an overlay message to the appropriate subscriber channels.
+    ///
+    /// Returns `true` if the message was an SCP message (for counter tracking).
+    /// Routes to dedicated channels (SCP, fetch response, extra subscribers)
+    /// first, then falls through to the generic broadcast channel for
+    /// non-dedicated messages.
+    fn route_to_subscribers(&self, msg: OverlayMessage) -> bool {
+        let is_scp = matches!(msg.message, StellarMessage::ScpMessage(_));
+        let is_fetch_response = matches!(
+            msg.message,
+            StellarMessage::GeneralizedTxSet(_)
+                | StellarMessage::TxSet(_)
+                | StellarMessage::DontHave(_)
+                | StellarMessage::ScpQuorumset(_)
+        );
+        let is_dedicated = is_scp || is_fetch_response;
+
+        if is_scp {
+            if let Err(e) = self.scp_message_tx.send(msg.clone()) {
+                error!("SCP channel send FAILED for peer {}: {}", msg.from_peer, e);
+            }
+        }
+
+        if is_fetch_response {
+            if let Err(e) = self.fetch_response_tx.try_send(msg.clone()) {
+                error!(
+                    "Fetch response channel send FAILED for peer {}: {}",
+                    msg.from_peer, e
+                );
+            }
+        }
+
+        // Send catchup-critical messages to extra subscribers
+        if matches!(
+            msg.message,
+            StellarMessage::ScpMessage(_)
+                | StellarMessage::GeneralizedTxSet(_)
+                | StellarMessage::TxSet(_)
+                | StellarMessage::ScpQuorumset(_)
+        ) {
+            let subs = self.extra_subscribers.read();
+            for sub in subs.iter() {
+                let _ = sub.send(msg.clone());
+            }
+        }
+
+        if !is_dedicated {
+            let _ = self.message_tx.send(msg);
+        }
+
+        is_scp
     }
 }
 /// Central manager for all peer connections in the overlay network.
@@ -1117,17 +1274,10 @@ impl OverlayManager {
         flow_control: Arc<FlowControl>,
         state: SharedPeerState,
     ) {
-        let SharedPeerState {
-            message_tx,
-            scp_message_tx,
-            fetch_response_tx,
-            flood_gate,
-            running,
-            last_closed_ledger,
-            is_validator,
-            extra_subscribers,
-            ..
-        } = state;
+        let flood_gate = &state.flood_gate;
+        let running = &state.running;
+        let last_closed_ledger = &state.last_closed_ledger;
+        let is_validator = state.is_validator;
 
         // Send initial SendMoreExtended to grant the peer our full reading capacity.
         // Matches stellar-core's Peer::recvAuth() → sendSendMore().
@@ -1171,9 +1321,7 @@ impl OverlayManager {
         // Ping/RTT tracking (G4/G17): store the hash and send time of the
         // outstanding ping so we can compute round-trip time when the peer
         // responds with DontHave (or a matching ScpQuorumset).
-        let mut ping_sent_time: Option<Instant> = None;
-        let mut ping_hash: Option<stellar_xdr::curr::Uint256> = None;
-        let mut last_ping_rtt: Option<Duration> = None;
+        let mut ping = PingTracker::new();
 
         loop {
             if !running.load(Ordering::Relaxed) {
@@ -1389,55 +1537,7 @@ impl OverlayManager {
                                     }
                                 } else if is_fetch_message(&message) {
                                     peer.record_fetch_stats(true, message_size);
-                                    match &message {
-                                        StellarMessage::TxSet(ts) => {
-                                            debug!(
-                                                "OVERLAY: Received TxSet from {} hash={} prev_ledger={}",
-                                                peer_id,
-                                                hex::encode(sha2::Sha256::digest(
-                                                    stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()).unwrap_or_default()
-                                                )),
-                                                hex::encode(ts.previous_ledger_hash.0)
-                                            );
-                                        }
-                                        StellarMessage::GeneralizedTxSet(ts) => {
-                                            let hash = henyey_common::Hash256::hash_xdr(ts)
-                                                .unwrap_or(henyey_common::Hash256::ZERO);
-                                            debug!("OVERLAY: Received GeneralizedTxSet from {} hash={}", peer_id, hash);
-                                        }
-                                        StellarMessage::ScpQuorumset(qs) => {
-                                            let hash = henyey_common::Hash256::hash_xdr(qs)
-                                                .unwrap_or(henyey_common::Hash256::ZERO);
-                                            // G4: check if this is a ping response
-                                            if let Some(sent) = ping_sent_time {
-                                                if is_ping_response(ping_hash.as_ref(), &Uint256(hash.0)) {
-                                                    let rtt = sent.elapsed();
-                                                    debug!("Latency {}: {} ms", peer_id, rtt.as_millis());
-                                                    last_ping_rtt = Some(rtt);
-                                                    ping_sent_time = None;
-                                                    ping_hash = None;
-                                                }
-                                            }
-                                            debug!("OVERLAY: Received ScpQuorumset from {} hash={}", peer_id, hash);
-                                        }
-                                        StellarMessage::DontHave(dh) => {
-                                            // G4: check if this DontHave is a ping response
-                                            if let Some(sent) = ping_sent_time {
-                                                if is_ping_response(ping_hash.as_ref(), &dh.req_hash) {
-                                                    let rtt = sent.elapsed();
-                                                    debug!("Latency {}: {} ms", peer_id, rtt.as_millis());
-                                                    last_ping_rtt = Some(rtt);
-                                                    ping_sent_time = None;
-                                                    ping_hash = None;
-                                                }
-                                            }
-                                            debug!("OVERLAY: Received DontHave from {} type={:?} hash={}", peer_id, dh.type_, hex::encode(dh.req_hash.0));
-                                        }
-                                        StellarMessage::GetTxSet(hash) => {
-                                            debug!("OVERLAY: Received GetTxSet from {} hash={}", peer_id, hex::encode(hash.0));
-                                        }
-                                        _ => {}
-                                    }
+                                    log_fetch_message(&message, &peer_id, &mut ping);
                                 }
 
                                 // Forward to subscribers
@@ -1447,53 +1547,8 @@ impl OverlayManager {
                                     received_at: Instant::now(),
                                 };
 
-                                // Route to dedicated channels
-                                let is_dedicated = matches!(
-                                    overlay_msg.message,
-                                    StellarMessage::ScpMessage(_)
-                                        | StellarMessage::GeneralizedTxSet(_)
-                                        | StellarMessage::TxSet(_)
-                                        | StellarMessage::DontHave(_)
-                                        | StellarMessage::ScpQuorumset(_)
-                                );
-
-                                if matches!(overlay_msg.message, StellarMessage::ScpMessage(_)) {
+                                if state.route_to_subscribers(overlay_msg) {
                                     scp_messages += 1;
-                                    if let Err(e) = scp_message_tx.send(overlay_msg.clone()) {
-                                        error!("SCP channel send FAILED for peer {}: {}", peer_id, e);
-                                    }
-                                }
-
-                                if matches!(
-                                    overlay_msg.message,
-                                    StellarMessage::GeneralizedTxSet(_)
-                                        | StellarMessage::TxSet(_)
-                                        | StellarMessage::DontHave(_)
-                                        | StellarMessage::ScpQuorumset(_)
-                                ) {
-                                    if let Err(e) = fetch_response_tx.try_send(overlay_msg.clone()) {
-                                        error!("Fetch response channel send FAILED for peer {}: {}", peer_id, e);
-                                    }
-                                }
-
-                                // Send catchup-critical messages to extra subscribers
-                                if matches!(
-                                    overlay_msg.message,
-                                    StellarMessage::ScpMessage(_)
-                                        | StellarMessage::GeneralizedTxSet(_)
-                                        | StellarMessage::TxSet(_)
-                                        | StellarMessage::ScpQuorumset(_)
-                                ) {
-                                    let subs = extra_subscribers.read();
-                                    if !subs.is_empty() {
-                                        for sub in subs.iter() {
-                                            let _ = sub.send(overlay_msg.clone());
-                                        }
-                                    }
-                                }
-
-                                if !is_dedicated {
-                                    let _ = message_tx.send(overlay_msg);
                                 }
                             }
 
@@ -1553,7 +1608,7 @@ impl OverlayManager {
                     ticks_since_ping += 1;
                     if ticks_since_ping >= 5 {
                         ticks_since_ping = 0;
-                        if peer.is_connected() && ping_sent_time.is_none() {
+                        if peer.is_connected() && ping.is_idle() {
                             let now_nanos = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -1563,15 +1618,14 @@ impl OverlayManager {
                             if let Err(e) = peer.send(ping_msg).await {
                                 debug!("Failed to send ping to {}: {}", peer_id, e);
                             } else {
-                                ping_sent_time = Some(Instant::now());
-                                ping_hash = Some(hash);
+                                ping.record_sent(hash);
                                 last_write = Instant::now();
                             }
                         }
 
                         // Periodic stats (every 60s, checked on ping interval)
                         if last_stats_log.elapsed() >= Duration::from_secs(60) {
-                            let rtt_str = last_ping_rtt
+                            let rtt_str = ping.last_rtt
                                 .map(|d| format!("{}ms", d.as_millis()))
                                 .unwrap_or_else(|| "n/a".to_string());
                             debug!("Peer {} stats: total_msgs={}, scp_msgs={}, rtt={}", peer_id, total_messages, scp_messages, rtt_str);
@@ -2135,30 +2189,8 @@ impl OverlayManager {
         })
     }
 
-    #[allow(clippy::incompatible_msrv)]
     fn is_public_peer(addr: &PeerAddress) -> bool {
-        if addr.port == 0 {
-            return false;
-        }
-        let Ok(ip) = addr.host.parse::<IpAddr>() else {
-            return true;
-        };
-        match ip {
-            IpAddr::V4(v4) => {
-                !(v4.is_private()
-                    || v4.is_loopback()
-                    || v4.is_link_local()
-                    || v4.is_multicast()
-                    || v4.is_unspecified())
-            }
-            IpAddr::V6(v6) => {
-                !(v6.is_loopback()
-                    || v6.is_multicast()
-                    || v6.is_unspecified()
-                    || v6.is_unicast_link_local()
-                    || v6.is_unique_local())
-            }
-        }
+        addr.port != 0 && !addr.is_private()
     }
 
     /// Get info for all connected peers.

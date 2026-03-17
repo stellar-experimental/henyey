@@ -380,39 +380,33 @@ impl PeerAddress {
     /// - 172.16.0.0/12 (172.16-31.x.x)
     /// - 192.168.0.0/16 (192.168.x.x)
     /// - 127.0.0.0/8 (localhost)
-    /// - ::1 (IPv6 localhost)
+    /// - 169.254.0.0/16 (link-local)
+    /// - 224.0.0.0/4 (multicast)
+    /// - 0.0.0.0 (unspecified)
+    /// - ::1, fe80::/10, fc00::/7, multicast, unspecified (IPv6)
     ///
     /// These addresses should not be shared with other peers as they
     /// are not routable on the public internet.
+    #[allow(clippy::incompatible_msrv)]
     pub fn is_private(&self) -> bool {
         use std::net::IpAddr;
 
         // Try to parse as IP address
         if let Ok(ip) = self.host.parse::<IpAddr>() {
             match ip {
-                IpAddr::V4(ipv4) => {
-                    let octets = ipv4.octets();
-                    // 10.0.0.0/8
-                    if octets[0] == 10 {
-                        return true;
-                    }
-                    // 172.16.0.0/12
-                    if octets[0] == 172 && (16..=31).contains(&octets[1]) {
-                        return true;
-                    }
-                    // 192.168.0.0/16
-                    if octets[0] == 192 && octets[1] == 168 {
-                        return true;
-                    }
-                    // 127.0.0.0/8 (loopback)
-                    if octets[0] == 127 {
-                        return true;
-                    }
-                    false
+                IpAddr::V4(v4) => {
+                    v4.is_private()
+                        || v4.is_loopback()
+                        || v4.is_link_local()
+                        || v4.is_multicast()
+                        || v4.is_unspecified()
                 }
-                IpAddr::V6(ipv6) => {
-                    // ::1 (loopback)
-                    ipv6.is_loopback()
+                IpAddr::V6(v6) => {
+                    v6.is_loopback()
+                        || v6.is_multicast()
+                        || v6.is_unspecified()
+                        || v6.is_unicast_link_local()
+                        || v6.is_unique_local()
                 }
             }
         } else {
