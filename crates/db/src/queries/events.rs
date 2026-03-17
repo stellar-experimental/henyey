@@ -38,6 +38,7 @@ pub trait EventQueries {
     fn store_events(&self, events: &[EventRecord]) -> Result<(), DbError>;
 
     /// Queries events with filters.
+    #[allow(clippy::too_many_arguments)]
     fn query_events(
         &self,
         start_ledger: u32,

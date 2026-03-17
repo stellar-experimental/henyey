@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-app`
 **Upstream**: `stellar-core/src/main/`
-**Overall Parity**: 65%
-**Last Updated**: 2026-03-05
+**Overall Parity**: 73%
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -181,6 +181,7 @@ Corresponds to: `CommandHandler.h`
 | `startSurveyCollecting()` | `start_survey_collecting_handler` | Full |
 | `stopSurveyCollecting()` | `stop_survey_collecting_handler` | Full |
 | `surveyTopologyTimeSliced()` | `survey_topology_handler` | Full |
+| `generateload()` | `generateload_handler` | Full |
 | `checkBooted()` | `survey_booted()` | Full |
 
 ### Maintainer (`maintainer.rs`)
@@ -330,9 +331,8 @@ Features excluded by design. These are NOT counted against parity %.
 | `TmpDirManager` | Uses standard `tempfile` crate |
 | `ProcessManager` | External process spawning handled by `tokio::process` where needed |
 | `ARTIFICIALLY_*_FOR_TESTING` configs | Testing-only knobs; Rust tests use different patterns |
-| `LOADGEN_*` / `APPLY_LOAD_*` configs | Load generation not implemented (different testing approach) |
+| `LOADGEN_*` / `APPLY_LOAD_*` config fields | Load generation uses HTTP query params, not config fields |
 | `BUILD_TESTS`-only endpoints | Rust test framework provides equivalent capabilities |
-| `LoadGenerator` | Not needed; test workloads use different approach |
 | Legacy (non-time-sliced) survey | Deprecated in stellar-core v25 |
 | `Protocol23CorruptionDataVerifier` | Protocol 23 bug workaround; not needed for p24+ only |
 | `Protocol23CorruptionEventReconciler` | Protocol 23 bug workaround; not needed for p24+ only |
@@ -340,6 +340,9 @@ Features excluded by design. These are NOT counted against parity %.
 | `MODE_USES_IN_MEMORY_LEDGER` | Test-only mode; Rust uses different testing approach |
 | `EXPERIMENTAL_PARALLEL_LEDGER_APPLY` | Future feature; not in stable upstream |
 | `EXPERIMENTAL_BACKGROUND_TX_SIG_VERIFICATION` | Experimental; not in stable upstream |
+| `setNoListen()` / `setNoPublish()` | Test convenience setters; config handled differently in Rust |
+| `allBucketsInMemory()` / `modeDoesCatchupWithBucketList()` | In-memory test mode helpers; not applicable |
+| `getLedgerTxnRoot()` | Different architecture; Rust does not expose raw LedgerTxn root |
 
 ## Gaps
 
@@ -369,6 +372,14 @@ Features not yet implemented. These ARE counted against parity %.
 | `syncOwnMetrics()` / `syncAllMetrics()` | Low | Medida metrics sync (Prometheus model differs) |
 | `getStellarCoreMajorReleaseVersion()` | Low | Version string parsing utility |
 | `writeCatchupInfo()` | Low | Write catchup JSON info to file |
+| `Config::load(istream)` | Low | Loading config from stream (only file loading supported) |
+| `Config::toString(qset)` | Low | Quorum set display helper |
+| `dumpWasmBlob()` | Low | Wasm blob dump utility |
+| `loadXdr()` | Low | Generic XDR loading utility |
+| `rebuildLedgerFromBuckets()` | Low | Rebuild ledger state from bucket snapshots |
+| `setAuthenticatedLedgerHashPair()` | Low | Set authenticated ledger hash for catchup verification |
+| PersistentState: `getTxSetHashesForAllSlots()` | Low | Retrieve tx set hashes for SCP state |
+| PersistentState: `hasTxSet()` / `deleteTxSets()` | Low | Tx set existence check and deletion |
 
 ## Architectural Differences
 
@@ -411,20 +422,22 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Config | 8 TEST_CASE / 18 SECTION | 23 `#[test]` | Good coverage of config loading, validation, and BucketListDB wiring |
+| Config | 8 TEST_CASE / 18 SECTION | 32 `#[test]` | Good coverage of config loading, validation, and BucketListDB wiring |
 | CommandHandler | 3 TEST_CASE / 25 SECTION | 6 `#[test]` | Rust tests cover run_cmd options; less endpoint testing |
 | ApplicationUtils | 4 TEST_CASE / 5 SECTION | 13 `#[test]` (catchup_cmd) | Catchup target parsing well tested |
 | SelfCheck | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No dedicated self-check tests |
-| QueryServer | 1 TEST_CASE / 9 SECTION | 0 `#[test]` | Implemented but no dedicated tests |
-| App core | — | 47 `#[test]` | Extensive app-level tests |
-| Maintainer | — | 13 `#[test]` | Good coverage (threshold correctness, RPC retention, config) |
+| QueryServer | 1 TEST_CASE / 9 SECTION | 7 `#[test]` | Basic query endpoint coverage |
+| App core | — | 26 `#[test]` | App-level tests |
+| Compat config | — | 21 `#[test]` | stellar-core config format translation |
+| Maintainer | — | 12 `#[test]` | Good coverage (threshold correctness, RPC retention, config) |
+| GenerateLoad | — | 8 `#[test]` | Handler and type tests |
 | Logging | — | 5 `#[test]` | Basic coverage |
 | Meta stream | — | 5 `#[test]` | Covers emit, rotation, error handling |
 
 ### Test Gaps
 
 - **HTTP endpoint integration tests**: stellar-core has 25 SECTION entries testing various command handler scenarios (manual close with different parameters, overlay-only mode toggle, transaction envelope bridge). The Rust crate lacks HTTP endpoint integration tests.
-- **QueryServer tests**: 1 TEST_CASE with 9 SECTION entries in stellar-core for getLedgerEntry; Rust has the implementation but no dedicated unit tests.
+- **QueryServer tests**: 1 TEST_CASE with 9 SECTION entries in stellar-core for getLedgerEntry; Rust has 7 tests but doesn't cover all edge cases.
 - **Self-check scheduling tests**: stellar-core tests online self-check scheduling; Rust only has the self-check function, not its scheduling.
 - **Config edge cases**: stellar-core has extensive tests for validator config validation (bad validators, nesting levels, operation filters, domain quality). Rust tests are simpler.
 
@@ -439,7 +452,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 86 |
-| Gaps (None + Partial) | 47 |
-| Intentional Omissions | 17 |
-| **Parity** | **86 / (86 + 47) = 65%** |
+| Implemented (Full) | 116 |
+| Gaps (None + Partial) | 44 |
+| Intentional Omissions | 27 |
+| **Parity** | **116 / (116 + 44) = 73%** |

@@ -54,6 +54,7 @@ pub trait HistoryQueries {
     ///
     /// If a transaction with the same ID already exists, it is replaced.
     /// `status` should be [`TX_STATUS_SUCCESS`] or [`TX_STATUS_FAILED`].
+    #[allow(clippy::too_many_arguments)]
     fn store_transaction(
         &self,
         ledger_seq: u32,
@@ -345,14 +346,14 @@ impl HistoryQueries for Connection {
                 let mut stmt = self.prepare(&sql)?;
                 let rows = if let Some(status) = status_filter {
                     // With status filter, shift the LIMIT param index
-                    let sql_with_status = format!(
+                    let sql_with_status =
                         "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status \
                          FROM txhistory \
                          WHERE (ledgerseq > ?1 OR (ledgerseq = ?1 AND txindex > ?2)) \
                            AND ledgerseq < ?3 AND status = ?4 \
                          ORDER BY ledgerseq ASC, txindex ASC \
-                         LIMIT ?5",
-                    );
+                         LIMIT ?5"
+                            .to_string();
                     stmt = self.prepare(&sql_with_status)?;
                     stmt.query_map(
                         params![start_ledger, tx_index, end_ledger, status, limit],

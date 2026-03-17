@@ -334,8 +334,12 @@ impl TransactionSetVariant {
         let set_hash = self.hash();
         match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)> =
-                    set.txs.iter().cloned().map(|tx| (Arc::new(tx), None)).collect();
+                let txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)> = set
+                    .txs
+                    .iter()
+                    .cloned()
+                    .map(|tx| (Arc::new(tx), None))
+                    .collect();
                 sorted_for_apply_sequential(txs, set_hash)
             }
             TransactionSetVariant::Generalized(set) => {
@@ -379,8 +383,12 @@ impl TransactionSetVariant {
         let set_hash = self.hash();
         match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)> =
-                    set.txs.iter().cloned().map(|tx| (Arc::new(tx), None)).collect();
+                let txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)> = set
+                    .txs
+                    .iter()
+                    .cloned()
+                    .map(|tx| (Arc::new(tx), None))
+                    .collect();
                 sorted_for_apply_sequential(txs, set_hash)
             }
             TransactionSetVariant::Generalized(set) => {
@@ -490,6 +498,7 @@ fn tx_sequence_number(tx: &TransactionEnvelope) -> i64 {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn sorted_for_apply_sequential(
     txs: Vec<(Arc<TransactionEnvelope>, Option<u32>)>,
     set_hash: Hash256,
@@ -509,19 +518,20 @@ fn sorted_for_apply_sequential(
     }
 
     // Pre-compute TX hashes and attach to each item to avoid redundant XDR+SHA256 during sort.
-    let mut queues: Vec<std::collections::VecDeque<(Arc<TransactionEnvelope>, Option<u32>, Hash256)>> =
-        by_account
-            .into_values()
-            .map(|mut txs| {
-                txs.sort_by(|a, b| tx_sequence_number(&a.0).cmp(&tx_sequence_number(&b.0)));
-                txs.into_iter()
-                    .map(|(tx, fee)| {
-                        let h = tx_hash(&tx);
-                        (tx, fee, h)
-                    })
-                    .collect()
-            })
-            .collect();
+    let mut queues: Vec<
+        std::collections::VecDeque<(Arc<TransactionEnvelope>, Option<u32>, Hash256)>,
+    > = by_account
+        .into_values()
+        .map(|mut txs| {
+            txs.sort_by(|a, b| tx_sequence_number(&a.0).cmp(&tx_sequence_number(&b.0)));
+            txs.into_iter()
+                .map(|(tx, fee)| {
+                    let h = tx_hash(&tx);
+                    (tx, fee, h)
+                })
+                .collect()
+        })
+        .collect();
 
     let mut result = Vec::new();
     while queues.iter().any(|q| !q.is_empty()) {
@@ -543,6 +553,7 @@ fn sorted_for_apply_sequential(
 /// and stages are sorted by their first cluster's first transaction.
 /// Clusters within a stage are NOT sorted -- they are independent, so stellar-core
 /// preserves XDR order to keep deterministic result ordering.
+#[allow(clippy::type_complexity)]
 fn sort_parallel_stages(
     stages: &[stellar_xdr::curr::ParallelTxExecutionStage],
     set_hash: &Hash256,
@@ -696,7 +707,10 @@ impl TransactionSetVariant {
     pub fn prepare_presorted(self, hash: Hash256) -> PreparedTxSet {
         let (classic_txs, soroban_phase, all_txs) = match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<TxWithFee> = Vec::from(set.txs).into_iter().map(|tx| (Arc::new(tx), None)).collect();
+                let txs: Vec<TxWithFee> = Vec::from(set.txs)
+                    .into_iter()
+                    .map(|tx| (Arc::new(tx), None))
+                    .collect();
                 let sorted = sorted_for_apply_sequential(txs, hash);
                 (sorted.clone(), None, sorted)
             }
@@ -728,20 +742,21 @@ impl TransactionSetVariant {
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
                             let base_fee =
                                 parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
-                            let stages: Vec<Vec<Vec<TxWithFee>>> = Vec::from(parallel.execution_stages)
-                                .into_iter()
-                                .map(|stage| {
-                                    Vec::from(stage.0)
-                                        .into_iter()
-                                        .map(|cluster| {
-                                            Vec::from(cluster.0)
-                                                .into_iter()
-                                                .map(|tx| (Arc::new(tx), base_fee))
-                                                .collect()
-                                        })
-                                        .collect()
-                                })
-                                .collect();
+                            let stages: Vec<Vec<Vec<TxWithFee>>> =
+                                Vec::from(parallel.execution_stages)
+                                    .into_iter()
+                                    .map(|stage| {
+                                        Vec::from(stage.0)
+                                            .into_iter()
+                                            .map(|cluster| {
+                                                Vec::from(cluster.0)
+                                                    .into_iter()
+                                                    .map(|tx| (Arc::new(tx), base_fee))
+                                                    .collect()
+                                            })
+                                            .collect()
+                                    })
+                                    .collect();
 
                             for stage in &stages {
                                 for cluster in stage {
@@ -780,7 +795,12 @@ impl TransactionSetVariant {
     pub fn prepare_with_hash(&self, hash: Hash256) -> PreparedTxSet {
         let (classic_txs, soroban_phase, all_txs) = match self {
             TransactionSetVariant::Classic(set) => {
-                let txs: Vec<TxWithFee> = set.txs.iter().cloned().map(|tx| (Arc::new(tx), None)).collect();
+                let txs: Vec<TxWithFee> = set
+                    .txs
+                    .iter()
+                    .cloned()
+                    .map(|tx| (Arc::new(tx), None))
+                    .collect();
                 let sorted = sorted_for_apply_sequential(txs, hash);
                 (sorted.clone(), None, sorted)
             }

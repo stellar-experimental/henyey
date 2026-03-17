@@ -941,6 +941,7 @@ pub(super) fn execute_single_cluster(
 /// When a stage has multiple clusters, they are executed in parallel using
 /// `tokio::task::spawn_blocking` (one blocking task per cluster). Results are
 /// merged into `delta` in deterministic cluster order.
+#[allow(clippy::type_complexity)]
 pub(super) fn execute_stage_clusters(
     snapshot: &SnapshotHandle,
     clusters: &[Vec<(Arc<TransactionEnvelope>, Option<u32>)>],

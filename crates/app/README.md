@@ -37,6 +37,8 @@ graph TD
 | `CatchupOptions` | Options for the catchup command (target ledger, mode, parallelism) |
 | `CatchupTarget` | Catchup destination: Current, specific Ledger, or Checkpoint |
 | `CatchupResult` | Result of a catchup operation (final ledger, buckets applied) |
+| `LedgerSummary` | Compact snapshot of a closed ledger (sequence, hash, tx count, close time) |
+| `SimulationDebugStats` | Diagnostic counters collected during transaction simulation |
 | `SurveyReport` | Collected network topology survey data |
 | `NodeStatsSnapshot` | Baseline node statistics captured at survey collection start |
 | `Maintainer` | Background scheduler for database cleanup |
@@ -106,7 +108,8 @@ let config = ConfigBuilder::new()
 | `app/survey_impl.rs` | Survey message handling: processing survey requests/responses, building topology data, peer data collection |
 | `app/publish.rs` | History archive publishing: checkpoint queuing, file upload via command templates, local archive support |
 | `config.rs` | Configuration types (`AppConfig`, `NodeConfig`, `NetworkConfig`, etc.), TOML loading, environment variable overrides, and `ConfigBuilder` |
-| `run_cmd.rs` | `run_node` entry point, `NodeRunner` lifecycle, `StatusServer` HTTP API with axum handlers for all REST endpoints |
+| `run_cmd.rs` | `run_node` entry point, `NodeRunner` lifecycle, server spawning coordination |
+| `http/` | HTTP status & query servers (`StatusServer`, `QueryServer`), axum route definitions, endpoint handlers (`handlers/`) and request/response types (`types/`) for info, admin, metrics, peers, SCP, soroban, survey, and tx endpoints |
 | `catchup_cmd.rs` | `run_catchup` entry point, `CatchupOptions` parsing, progress callbacks |
 | `logging.rs` | Logging initialization, `ProgressTracker` for catchup/apply progress, dynamic `LogLevelHandle` |
 | `maintainer.rs` | `Maintainer` background scheduler for database cleanup (SCP history, ledger headers, events, ledger close meta, tx history) |

@@ -1626,6 +1626,7 @@ impl BucketList {
         self.add_batch_impl(ledger_seq, protocol_version, bucket_list_type, init_entries, live_entries, dead_entries, true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_batch_impl(
         &mut self,
         ledger_seq: u32,
