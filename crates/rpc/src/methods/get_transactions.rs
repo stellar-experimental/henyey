@@ -6,9 +6,7 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use stellar_xdr::curr::{
-    Limits, ReadXdr, TransactionEnvelope, TransactionMeta, TransactionResult,
-};
+use stellar_xdr::curr::{TransactionEnvelope, TransactionMeta, TransactionResult};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -29,7 +27,7 @@ pub async fn handle(
     let oldest = util::oldest_ledger(&ctx.app);
 
     // Look up oldest ledger close time
-    let oldest_close_time = get_ledger_close_time(ctx, oldest);
+    let oldest_close_time = util::ledger_close_time(&ctx.app, oldest).to_string();
 
     // Parse optional status filter
     let status_filter = match params.get("status").and_then(|v| v.as_str()) {
@@ -107,13 +105,13 @@ pub async fn handle(
         let status = util::determine_tx_status(&record.result);
 
         // Detect fee bump from the envelope
-        let fee_bump = is_fee_bump_envelope(&record.body);
+        let fee_bump = util::is_fee_bump_envelope(&record.body);
 
         // Application order is 1-based (txindex is 0-based in DB)
         let application_order = record.tx_index + 1;
 
         // Ledger close time — returned as a number (not string) per upstream getTransactions
-        let created_at = get_ledger_close_time_num(ctx, record.ledger_seq);
+        let created_at = util::ledger_close_time(&ctx.app, record.ledger_seq);
 
         // Build TOID cursor for this transaction
         let toid = util::toid_encode(record.ledger_seq, application_order, 0);
@@ -164,28 +162,3 @@ pub async fn handle(
     }))
 }
 
-/// Check if a transaction envelope is a fee bump.
-fn is_fee_bump_envelope(envelope_bytes: &[u8]) -> bool {
-    TransactionEnvelope::from_xdr(envelope_bytes, Limits::none())
-        .map(|env| matches!(env, TransactionEnvelope::TxFeeBump(_)))
-        .unwrap_or(false)
-}
-
-/// Get ledger close time as a number (for getTransactions — upstream returns number).
-fn get_ledger_close_time_num(ctx: &RpcContext, ledger_seq: u32) -> u64 {
-    ctx.app
-        .database()
-        .with_connection(|conn| {
-            use henyey_db::LedgerQueries;
-            conn.load_ledger_header(ledger_seq)
-        })
-        .ok()
-        .flatten()
-        .map(|h| h.scp_value.close_time.0)
-        .unwrap_or(0)
-}
-
-/// Get ledger close time as a string (for response envelope fields).
-fn get_ledger_close_time(ctx: &RpcContext, ledger_seq: u32) -> String {
-    get_ledger_close_time_num(ctx, ledger_seq).to_string()
-}

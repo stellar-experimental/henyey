@@ -24,7 +24,7 @@ pub async fn dispatch(
         "getLedgers" => methods::get_ledgers::handle(ctx, params).await,
         "getEvents" => methods::get_events::handle(ctx, params).await,
         "sendTransaction" => methods::send_transaction::handle(ctx, params).await,
-        "simulateTransaction" => methods::simulate_transaction::handle(ctx, params).await,
+        "simulateTransaction" => crate::simulate::handle(ctx, params).await,
         _ => Err(JsonRpcError::method_not_found(method)),
     };
 

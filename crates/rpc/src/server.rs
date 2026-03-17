@@ -14,6 +14,9 @@ use crate::error::JsonRpcError;
 use crate::fee_window::FeeWindows;
 use crate::types::{JsonRpcRequest, JsonRpcResponse};
 
+/// Maximum allowed JSON-RPC request body size (512 KiB).
+const MAX_REQUEST_BODY_BYTES: usize = 512 * 1024;
+
 /// Stellar JSON-RPC 2.0 server.
 pub struct RpcServer {
     port: u16,
@@ -48,7 +51,7 @@ impl RpcServer {
 
         let router = Router::new()
             .route("/", post(rpc_handler))
-            .layer(axum::extract::DefaultBodyLimit::max(512 * 1024))
+            .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
             .with_state(ctx);
 
         let addr = SocketAddr::from(([0, 0, 0, 0], self.port));
@@ -125,27 +128,41 @@ async fn fee_window_poller(
         };
 
         let mut gap_found = false;
-        for (i, (_seq, meta_bytes)) in metas.iter().enumerate() {
-            if let Err(e) = windows.ingest_ledger_close_meta(meta_bytes) {
-                tracing::warn!(error = %e, "Gap in LCM data, resetting fee window to post-gap range");
-                // Gap detected — reset and re-ingest from this point forward
-                windows.reset();
-                gap_found = true;
-                for (_seq2, meta_bytes2) in &metas[i..] {
-                    if let Err(e2) = windows.ingest_ledger_close_meta(meta_bytes2) {
-                        tracing::warn!(error = %e2, "Multiple gaps in LCM data");
-                        windows.reset();
-                        break;
-                    }
-                }
-                break;
-            }
+        if let Err(e) = ingest_metas_with_gap_recovery(&windows, &metas) {
+            tracing::warn!(error = %e, "Multiple gaps in LCM data");
+            windows.reset();
+            gap_found = true;
         }
         if gap_found {
             // Already handled the gap above, continue to next poll cycle
             continue;
         }
     }
+}
+
+/// Ingest a sequence of LCMs into the fee windows, recovering from a single gap.
+///
+/// If a gap is detected (ingestion fails), the windows are reset and
+/// re-ingestion starts from the gap position. Returns `Err` if a second gap is
+/// found in the post-gap suffix.
+fn ingest_metas_with_gap_recovery(
+    windows: &FeeWindows,
+    metas: &[(u32, Vec<u8>)],
+) -> Result<(), String> {
+    for (i, (_seq, meta_bytes)) in metas.iter().enumerate() {
+        if let Err(e) = windows.ingest_ledger_close_meta(meta_bytes) {
+            // Gap detected — reset and re-ingest from this point forward
+            tracing::warn!(error = %e, "Gap in LCM data, resetting fee window to post-gap range");
+            windows.reset();
+            for (_seq2, meta_bytes2) in &metas[i..] {
+                if let Err(e2) = windows.ingest_ledger_close_meta(meta_bytes2) {
+                    return Err(format!("multiple gaps in fee window data: {e2}"));
+                }
+            }
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Bulk-load the last N ledgers' fees from the database.
@@ -173,22 +190,7 @@ fn bulk_load_fees(app: &App, windows: &FeeWindows, retention: u32) -> Result<(),
 
     // Ingest metas, skipping over any gaps (e.g., from catchup).
     // Only keep the contiguous suffix so the window starts clean.
-    for (i, (_seq, meta_bytes)) in metas.iter().enumerate() {
-        if let Err(_e) = windows.ingest_ledger_close_meta(meta_bytes) {
-            // Gap detected — reset and re-ingest from this point forward.
-            // This discards pre-gap data and starts the window at the post-gap
-            // contiguous range.
-            windows.reset();
-            // Re-ingest remaining entries from current position
-            for (_seq2, meta_bytes2) in &metas[i..] {
-                if let Err(e2) = windows.ingest_ledger_close_meta(meta_bytes2) {
-                    // Another gap in the suffix — give up on bulk load
-                    return Err(format!("multiple gaps in fee window data: {e2}"));
-                }
-            }
-            return Ok(());
-        }
-    }
+    ingest_metas_with_gap_recovery(windows, &metas)?;
 
     Ok(())
 }

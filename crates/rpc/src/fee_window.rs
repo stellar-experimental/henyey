@@ -27,7 +27,7 @@ use std::sync::RwLock;
 
 use stellar_xdr::curr::{
     InnerTransactionResultResult, LedgerCloseMeta, Limits, ReadXdr, SorobanTransactionMetaExt,
-    TransactionMeta, TransactionResultResult,
+    TransactionMeta, TransactionResultPair, TransactionResultResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -269,7 +269,7 @@ pub(crate) struct FeeWindows {
 
 impl FeeWindows {
     /// Create new fee windows with the given retention (number of ledgers).
-    pub fn new(retention: u32) -> Self {
+    pub(crate) fn new(retention: u32) -> Self {
         Self {
             classic: FeeWindow::new(retention),
             soroban: FeeWindow::new(retention),
@@ -277,24 +277,24 @@ impl FeeWindows {
     }
 
     /// Get the classic fee distribution.
-    pub fn get_classic_distribution(&self) -> FeeDistribution {
+    pub(crate) fn get_classic_distribution(&self) -> FeeDistribution {
         self.classic.distribution()
     }
 
     /// Get the Soroban inclusion fee distribution.
-    pub fn get_soroban_distribution(&self) -> FeeDistribution {
+    pub(crate) fn get_soroban_distribution(&self) -> FeeDistribution {
         self.soroban.distribution()
     }
 
     /// Get the latest ledger sequence processed by either window.
-    pub fn latest_ledger(&self) -> u32 {
+    pub(crate) fn latest_ledger(&self) -> u32 {
         self.classic
             .latest_ledger()
             .max(self.soroban.latest_ledger())
     }
 
     /// Reset both windows (e.g., on discontinuity).
-    pub fn reset(&self) {
+    pub(crate) fn reset(&self) {
         self.classic.reset();
         self.soroban.reset();
     }
@@ -303,7 +303,7 @@ impl FeeWindows {
     ///
     /// Extracts classic and Soroban fees from each transaction in the meta
     /// and appends them to the appropriate window.
-    pub fn ingest_ledger_close_meta(&self, meta_bytes: &[u8]) -> Result<(), String> {
+    pub(crate) fn ingest_ledger_close_meta(&self, meta_bytes: &[u8]) -> Result<(), String> {
         let lcm = LedgerCloseMeta::from_xdr(meta_bytes, Limits::none())
             .map_err(|e| format!("failed to parse LedgerCloseMeta: {e}"))?;
 
@@ -343,33 +343,31 @@ fn extract_fees_from_lcm(lcm: &LedgerCloseMeta) -> (Vec<u64>, Vec<u64>) {
         meta: &'a TransactionMeta,
     }
 
+    // Helper: all LCM variants have tx_processing entries with
+    // `result.result.fee_charged`, `result.result.result`, and `tx_apply_processing`.
+    fn to_tx_info<'a>(result: &TransactionResultPair, meta: &'a TransactionMeta) -> TxInfo<'a> {
+        TxInfo {
+            fee_charged: result.result.fee_charged,
+            num_ops: count_ops_from_result(&result.result.result),
+            meta,
+        }
+    }
+
     let infos: Vec<TxInfo> = match lcm {
         LedgerCloseMeta::V0(v0) => v0
             .tx_processing
             .iter()
-            .map(|tp| TxInfo {
-                fee_charged: tp.result.result.fee_charged,
-                num_ops: count_ops_from_result(&tp.result.result.result),
-                meta: &tp.tx_apply_processing,
-            })
+            .map(|tp| to_tx_info(&tp.result, &tp.tx_apply_processing))
             .collect(),
         LedgerCloseMeta::V1(v1) => v1
             .tx_processing
             .iter()
-            .map(|tp| TxInfo {
-                fee_charged: tp.result.result.fee_charged,
-                num_ops: count_ops_from_result(&tp.result.result.result),
-                meta: &tp.tx_apply_processing,
-            })
+            .map(|tp| to_tx_info(&tp.result, &tp.tx_apply_processing))
             .collect(),
         LedgerCloseMeta::V2(v2) => v2
             .tx_processing
             .iter()
-            .map(|tp| TxInfo {
-                fee_charged: tp.result.result.fee_charged,
-                num_ops: count_ops_from_result(&tp.result.result.result),
-                meta: &tp.tx_apply_processing,
-            })
+            .map(|tp| to_tx_info(&tp.result, &tp.tx_apply_processing))
             .collect(),
     };
 

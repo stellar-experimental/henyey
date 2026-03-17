@@ -70,7 +70,7 @@ pub async fn handle(
     // Look up ledger close times for the events
     let mut event_json: Vec<serde_json::Value> = Vec::with_capacity(events.len());
     for event in &events {
-        let close_time = get_ledger_close_time(ctx, event.ledger_seq);
+        let close_time = format_unix_timestamp_utc(util::ledger_close_time(&ctx.app, event.ledger_seq));
 
         let event_type_str = match event.event_type {
             0 => "contract",
@@ -107,7 +107,7 @@ pub async fn handle(
     let last_cursor = events.last().map(|e| e.id.as_str()).unwrap_or("");
 
     let oldest = util::oldest_ledger(&ctx.app);
-    let oldest_close_time = get_ledger_close_time(ctx, oldest);
+    let oldest_close_time = format_unix_timestamp_utc(util::ledger_close_time(&ctx.app, oldest));
 
     Ok(json!({
         "events": event_json,
@@ -203,22 +203,6 @@ fn parse_event_filters(
     }
 
     Ok((event_type, contract_ids, topic_filters))
-}
-
-fn get_ledger_close_time(ctx: &RpcContext, ledger_seq: u32) -> String {
-    ctx.app
-        .database()
-        .with_connection(|conn| {
-            use henyey_db::LedgerQueries;
-            conn.load_ledger_header(ledger_seq)
-        })
-        .ok()
-        .flatten()
-        .map(|h| {
-            let ts = h.scp_value.close_time.0;
-            format_unix_timestamp_utc(ts)
-        })
-        .unwrap_or_default()
 }
 
 /// Insert event value and topic fields into the JSON object, format-aware.

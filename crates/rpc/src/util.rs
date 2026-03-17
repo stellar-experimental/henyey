@@ -262,6 +262,27 @@ pub(crate) fn oldest_ledger(app: &henyey_app::App) -> u32 {
         .unwrap_or(1)
 }
 
+/// Get the close time (unix seconds) for a given ledger, returning 0 on error.
+pub(crate) fn ledger_close_time(app: &henyey_app::App, ledger_seq: u32) -> u64 {
+    app.database()
+        .with_connection(|conn| {
+            use henyey_db::LedgerQueries;
+            conn.load_ledger_header(ledger_seq)
+        })
+        .ok()
+        .flatten()
+        .map(|h| h.scp_value.close_time.0)
+        .unwrap_or(0)
+}
+
+/// Check if XDR-encoded transaction envelope bytes represent a fee bump transaction.
+pub(crate) fn is_fee_bump_envelope(envelope_bytes: &[u8]) -> bool {
+    use stellar_xdr::curr::TransactionEnvelope;
+    TransactionEnvelope::from_xdr(envelope_bytes, Limits::none())
+        .map(|env| matches!(env, TransactionEnvelope::TxFeeBump(_)))
+        .unwrap_or(false)
+}
+
 /// Extract diagnostic events from `TransactionMeta` bytes.
 ///
 /// Returns `None` if no diagnostic events are present or the meta cannot be parsed.

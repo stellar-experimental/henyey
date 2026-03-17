@@ -3,7 +3,7 @@
 **Crate**: `henyey-rpc`
 **Upstream**: `stellar/stellar-rpc` (Go, GitHub)
 **Overall Parity**: 100%
-**Last Updated**: 2026-03-13
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -309,7 +309,7 @@ Corresponds to: `cmd/soroban-rpc/internal/methods/simulate_transaction.go`, `cmd
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 105 |
+| Implemented (Full) | 107 |
 | Gaps (None + Partial) | 0 |
 | Intentional Omissions | 5 |
-| **Parity** | **105 / 105 = 100%** |
+| **Parity** | **107 / 107 = 100%** |

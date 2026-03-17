@@ -27,7 +27,7 @@ pub async fn handle(
     let oldest = util::oldest_ledger(&ctx.app);
 
     // Look up oldest ledger close time
-    let oldest_close_time = get_ledger_close_time_str(ctx, oldest);
+    let oldest_close_time = util::ledger_close_time(&ctx.app, oldest).to_string();
 
     // Parse parameters
     let start_ledger = params
@@ -159,16 +159,3 @@ fn extract_header_entry(lcm: &LedgerCloseMeta) -> &LedgerHeaderHistoryEntry {
     }
 }
 
-/// Get ledger close time as a string.
-fn get_ledger_close_time_str(ctx: &RpcContext, ledger_seq: u32) -> String {
-    ctx.app
-        .database()
-        .with_connection(|conn| {
-            use henyey_db::LedgerQueries;
-            conn.load_ledger_header(ledger_seq)
-        })
-        .ok()
-        .flatten()
-        .map(|h| h.scp_value.close_time.0.to_string())
-        .unwrap_or_else(|| "0".to_string())
-}

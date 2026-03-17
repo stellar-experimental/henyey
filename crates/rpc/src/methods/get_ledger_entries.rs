@@ -10,6 +10,9 @@ use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 use crate::util::{self, XdrFormat, ttl_key_for_ledger_key};
 
+/// Maximum number of ledger entry keys allowed per request.
+const MAX_KEYS: usize = 200;
+
 pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
@@ -25,9 +28,9 @@ pub async fn handle(
         return Err(JsonRpcError::invalid_params("'keys' must not be empty"));
     }
 
-    if keys_array.len() > 200 {
+    if keys_array.len() > MAX_KEYS {
         return Err(JsonRpcError::invalid_params(
-            "too many keys: max 200 allowed",
+            format!("too many keys: max {} allowed", MAX_KEYS),
         ));
     }
 
