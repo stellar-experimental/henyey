@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-history`
 **Upstream**: `stellar-core/src/history/`
-**Overall Parity**: 82%
-**Last Updated**: 2026-03-05
+**Overall Parity**: 83%
+**Last Updated**: 2026-03-17
 
 ## Summary
 
@@ -260,17 +260,17 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Checkpoint arithmetic | 2 TEST_CASE / 3 SECTION | 21 `#[test]` | More thorough in Rust |
-| HAS serialization | 1 TEST_CASE / 1 SECTION | 8 `#[test]` | Rust includes roundtrip, hot archive |
-| Bucket verification | 5 TEST_CASE / 8 SECTION | 7 `#[test]` | Rust missing failure mode tests |
-| Ledger chain verification | 3 TEST_CASE / 5 SECTION | 6 `#[test]` | Rust missing overshot/undershot/version |
-| Publish workflow | 6 TEST_CASE / 12 SECTION | 11 `#[test]` | Rust missing multi-archive, restart |
-| Catchup modes | 8 TEST_CASE / 15 SECTION | 13 `#[test]` | Rust missing online catchup, gap handling |
-| Checkpoint builder | 2 TEST_CASE / 5 SECTION | 5 `#[test]` | Rust missing crash simulation |
-| Remote archive | -- | 12 `#[test]` | Rust-only (shell command testing) |
-| CDP / download | -- | 7 `#[test]` | Rust-only extensions |
+| Checkpoint arithmetic | 2 TEST_CASE / 3 SECTION | 22 `#[test]` | More thorough in Rust |
+| HAS serialization | 1 TEST_CASE / 1 SECTION | 29 `#[test]` | Extensive roundtrip, hot archive, differing buckets |
+| Bucket/chain verification | 5 TEST_CASE / 8 SECTION | 35 `#[test]` | Strong coverage including chain trust anchors |
+| Publish workflow | 6 TEST_CASE / 12 SECTION | 14 `#[test]` | Rust missing multi-archive, restart |
+| Catchup/replay | 8 TEST_CASE / 15 SECTION | 33 `#[test]` | Rust missing online catchup, gap handling |
+| Checkpoint builder | 2 TEST_CASE / 5 SECTION | 14 `#[test]` | Rust missing crash simulation |
+| Remote archive | -- | 6 `#[test]` | Rust-only (shell command testing) |
+| Archive/HTTP client | -- | 7 `#[test]` | Rust-only (reqwest-based access) |
+| CDP / download | -- | 11 `#[test]` | Rust-only extensions |
 | Archive manager | -- | 10 `#[test]` | Rust-only unit tests |
-| **Total** | **34 TEST_CASE / 60 SECTION** | **122 `#[test]`** | |
+| **Total** | **34 TEST_CASE / 60 SECTION** | **181 `#[test]`** | |
 
 ### Test Gaps
 
@@ -285,7 +285,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 74 |
+| Implemented (Full) | 78 |
 | Gaps (None + Partial) | 16 |
 | Intentional Omissions | 7 |
-| **Parity** | **74 / (74 + 16) = 82%** |
+| **Parity** | **78 / (78 + 16) = 83%** |

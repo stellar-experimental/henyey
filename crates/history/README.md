@@ -68,18 +68,29 @@ flowchart TD
 | `HistoryManager` | Manages multiple archives with automatic failover |
 | `HistoryArchiveManager` | Full archive manager with read/write capability tracking |
 | `ArchiveEntry` | Single archive entry combining HTTP read and shell-command write |
+| `ArchiveConfig` | Configuration for a single archive (URL, get/put enabled) |
 | `HistoryArchiveState` | Parsed History Archive State (HAS) JSON file |
 | `CatchupManager` | Orchestrates the complete catchup process |
+| `CatchupManagerBuilder` | Builder for creating a `CatchupManager` with custom options |
 | `CatchupMode` | Catchup strategy: `Minimal`, `Complete`, or `Recent(N)` |
 | `CatchupRange` | Calculated range of ledgers to download and replay |
-| `CatchupOutput` | Full catchup result including bucket list state and ledger header |
+| `CatchupOptions` | Verification flags for catchup (bucket hashes, header chain) |
+| `CatchupOutput` | Complete catchup result wrapping `CatchupResult` |
+| `CatchupResult` | Summary statistics: ledger seq, hash, buckets downloaded, ledgers applied |
+| `CatchupStatus` | Phase enum: `Pending`, `DownloadingBuckets`, `Replaying`, `Completed`, etc. |
+| `CatchupProgress` | Detailed progress info for UI (step count, bucket count, current ledger) |
+| `CheckpointData` | Pre-downloaded checkpoint data for catchup without re-fetching |
+| `LedgerData` | Single ledger's header, tx set, and results for replay |
 | `ReplayConfig` | Configuration for ledger replay verification flags |
+| `ReplayedLedgerState` | Post-replay state: sequence, hashes, protocol version, fees |
+| `ChainTrustAnchors` | Optional external trust anchors for ledger chain verification |
 | `CheckpointBuilder` | Crash-safe checkpoint file builder using dirty-then-rename |
 | `PublishManager` | Publishes checkpoint data to local and remote archives |
 | `PublishQueue` | SQLite-backed persistent queue for pending publications |
 | `RemoteArchive` | Shell-command-based archive upload client (put, mkdir) |
 | `CdpDataLake` | Fetches `LedgerCloseMeta` from CDP (SEP-0054) |
 | `CachedCdpDataLake` | Disk-caching wrapper around `CdpDataLake` with prefetch |
+| `DownloadConfig` | HTTP download settings: retries, timeouts, buffer sizes |
 
 ## Usage
 
@@ -180,6 +191,14 @@ async fn cdp_example() -> Result<(), henyey_history::HistoryError> {
 - **Catchup range cases**: `CatchupRange::calculate` implements five distinct cases
   matching stellar-core's `CatchupConfiguration` logic, depending on whether the LCL
   is at genesis, the target is a checkpoint boundary, and how many ledgers to replay.
+
+- **Chain trust anchors**: `ChainTrustAnchors` allows verification to be anchored to
+  externally trusted hashes (e.g., the LCL hash or a known checkpoint hash), closing
+  the trust gap between internal chain consistency and externally known-good state.
+
+- **Publish queue backpressure**: `PublishQueue` enforces `PUBLISH_QUEUE_MAX_SIZE` and
+  `PUBLISH_QUEUE_UNBLOCK_APPLICATION` thresholds matching stellar-core's publish
+  queue semantics, ensuring the node does not fall too far behind on publishing.
 
 ## stellar-core Mapping
 

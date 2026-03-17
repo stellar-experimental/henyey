@@ -94,6 +94,80 @@ fn rss_mb() -> Option<u64> {
     None
 }
 
+/// Run a future to completion from a synchronous context.
+///
+/// Handles three cases:
+/// 1. Inside a multi-threaded tokio runtime → `block_in_place` + `block_on`
+/// 2. Inside a single-threaded tokio runtime → spawn a helper thread
+/// 3. No runtime → create a temporary single-threaded runtime
+fn block_on_async<F, T>(future: F) -> std::result::Result<T, henyey_bucket::BucketError>
+where
+    F: std::future::Future<Output = std::result::Result<T, henyey_bucket::BucketError>> + Send + 'static,
+    T: Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        if matches!(
+            handle.runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            tokio::task::block_in_place(|| handle.block_on(future))
+        } else {
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        henyey_bucket::BucketError::NotFound(format!(
+                            "failed to build runtime: {}",
+                            e
+                        ))
+                    })?;
+                rt.block_on(future)
+            })
+            .join()
+            .map_err(|_| {
+                henyey_bucket::BucketError::NotFound(
+                    "bucket download thread panicked".to_string(),
+                )
+            })?
+        }
+    } else {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                henyey_bucket::BucketError::NotFound(format!(
+                    "failed to build runtime: {}",
+                    e
+                ))
+            })?;
+        rt.block_on(future)
+    }
+}
+
+/// Download a bucket from archives, trying each archive in order.
+async fn download_bucket_from_archives(
+    archives: Vec<Arc<HistoryArchive>>,
+    hash: Hash256,
+) -> std::result::Result<Vec<u8>, henyey_bucket::BucketError> {
+    for archive in &archives {
+        match archive.get_bucket(&hash).await {
+            Ok(data) => return Ok(data),
+            Err(e) => {
+                warn!(
+                    "Failed to download bucket {} from archive: {}",
+                    hash, e
+                );
+                continue;
+            }
+        }
+    }
+    Err(henyey_bucket::BucketError::NotFound(format!(
+        "Bucket {} not found in any archive",
+        hash
+    )))
+}
+
 /// Current status of a catchup operation.
 ///
 /// This enum represents the discrete phases of the catchup process,
@@ -1258,63 +1332,7 @@ impl CatchupManager {
                 data
             } else {
                 // Download the bucket (blocking - we're in a sync context)
-                let hash = *hash;
-                let archives = archives.clone();
-
-                let download = async move {
-                    for archive in &archives {
-                        match archive.get_bucket(&hash).await {
-                            Ok(data) => return Ok(data),
-                            Err(e) => {
-                                warn!("Failed to download bucket {} from archive: {}", hash, e);
-                                continue;
-                            }
-                        }
-                    }
-                    Err(henyey_bucket::BucketError::NotFound(format!(
-                        "Bucket {} not found in any archive",
-                        hash
-                    )))
-                };
-
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    if matches!(
-                        handle.runtime_flavor(),
-                        tokio::runtime::RuntimeFlavor::MultiThread
-                    ) {
-                        tokio::task::block_in_place(|| handle.block_on(download))?
-                    } else {
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map_err(|e| {
-                                    henyey_bucket::BucketError::NotFound(format!(
-                                        "failed to build runtime: {}",
-                                        e
-                                    ))
-                                })?;
-                            rt.block_on(download)
-                        })
-                        .join()
-                        .map_err(|_| {
-                            henyey_bucket::BucketError::NotFound(
-                                "bucket download thread panicked".to_string(),
-                            )
-                        })??
-                    }
-                } else {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            henyey_bucket::BucketError::NotFound(format!(
-                                "failed to build runtime: {}",
-                                e
-                            ))
-                        })?;
-                    rt.block_on(download)?
-                }
+                block_on_async(download_bucket_from_archives(archives.clone(), *hash))?
             };
 
             info!(
@@ -1368,12 +1386,7 @@ impl CatchupManager {
         let live_next_states: Vec<HasNextState> = has
             .live_next_states()
             .into_iter()
-            .map(|s| HasNextState {
-                state: s.state,
-                output: s.output,
-                input_curr: s.input_curr,
-                input_snap: s.input_snap,
-            })
+            .map(HasNextState::from)
             .collect();
 
         for (level_idx, (curr, snap)) in live_hash_pairs.iter().enumerate() {
@@ -1406,12 +1419,7 @@ impl CatchupManager {
             .hot_archive_next_states()
             .unwrap_or_default()
             .into_iter()
-            .map(|s| HasNextState {
-                state: s.state,
-                output: s.output,
-                input_curr: s.input_curr,
-                input_snap: s.input_snap,
-            })
+            .map(HasNextState::from)
             .collect();
 
         // Build hot archive bucket list if present (protocol 23+)
@@ -1480,65 +1488,10 @@ impl CatchupManager {
                             "Hot archive bucket {} not found in cache, downloading",
                             hash
                         );
-                        let hash = *hash;
-                        let archives = archives_clone.clone();
-                        let download = async move {
-                            for archive in &archives {
-                                match archive.get_bucket(&hash).await {
-                                    Ok(data) => return Ok(data),
-                                    Err(e) => {
-                                        warn!("Failed to download hot archive bucket {} from archive: {}", hash, e);
-                                        continue;
-                                    }
-                                }
-                            }
-                            Err(henyey_bucket::BucketError::NotFound(format!(
-                                "hot archive bucket {} not available from any archive",
-                                hash
-                            )))
-                        };
-
-                        // Handle async download from sync context properly
-                        // (matching the pattern used for live buckets)
-                        let downloaded = if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                            if matches!(
-                                handle.runtime_flavor(),
-                                tokio::runtime::RuntimeFlavor::MultiThread
-                            ) {
-                                tokio::task::block_in_place(|| handle.block_on(download))?
-                            } else {
-                                std::thread::spawn(move || {
-                                    let rt = tokio::runtime::Builder::new_current_thread()
-                                        .enable_all()
-                                        .build()
-                                        .map_err(|e| {
-                                            henyey_bucket::BucketError::NotFound(format!(
-                                                "failed to build runtime: {}",
-                                                e
-                                            ))
-                                        })?;
-                                    rt.block_on(download)
-                                })
-                                .join()
-                                .map_err(|_| {
-                                    henyey_bucket::BucketError::NotFound(
-                                        "bucket download thread panicked".to_string(),
-                                    )
-                                })??
-                            }
-                        } else {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map_err(|e| {
-                                    henyey_bucket::BucketError::NotFound(format!(
-                                        "failed to build runtime: {}",
-                                        e
-                                    ))
-                                })?;
-                            rt.block_on(download)?
-                        };
-                        Some(downloaded)
+                        Some(block_on_async(download_bucket_from_archives(
+                            archives_clone.clone(),
+                            *hash,
+                        ))?)
                     };
 
                     // If we downloaded data, save it to disk first

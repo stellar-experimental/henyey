@@ -226,49 +226,62 @@ impl HistoryManager {
         self.archives.len()
     }
 
+    /// Try an operation against each archive until one succeeds.
+    ///
+    /// On failure, logs a warning with the archive URL and the error,
+    /// then moves on to the next archive. Returns `fallback_err` if all
+    /// archives fail.
+    async fn try_archives<'a, F, T>(
+        &'a self,
+        op: F,
+        context: &str,
+        fallback_err: HistoryError,
+    ) -> Result<T>
+    where
+        F: Fn(&'a HistoryArchive) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>,
+    {
+        for archive in &self.archives {
+            match op(archive).await {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    tracing::warn!(
+                        url = %archive.base_url(),
+                        error = %e,
+                        "Failed to {} from archive", context,
+                    );
+                }
+            }
+        }
+        Err(fallback_err)
+    }
+
     /// Get the root HAS from any available archive.
     ///
     /// Tries each archive in sequence until one succeeds.
     pub async fn get_root_has(&self) -> Result<HistoryArchiveState> {
-        for archive in &self.archives {
-            match archive.get_root_has().await {
-                Ok(has) => return Ok(has),
-                Err(e) => {
-                    tracing::warn!(
-                        url = %archive.base_url(),
-                        error = %e,
-                        "Failed to get HAS from archive"
-                    );
-                    continue;
-                }
-            }
-        }
-        Err(HistoryError::NoArchiveAvailable)
+        self.try_archives(
+            |a| Box::pin(a.get_root_has()),
+            "get HAS",
+            HistoryError::NoArchiveAvailable,
+        )
+        .await
     }
 
     /// Get the checkpoint HAS from any available archive.
     pub async fn get_checkpoint_has(&self, ledger: u32) -> Result<HistoryArchiveState> {
-        for archive in &self.archives {
-            match archive.get_checkpoint_has(ledger).await {
-                Ok(has) => return Ok(has),
-                Err(e) => {
-                    tracing::warn!(
-                        url = %archive.base_url(),
-                        ledger = ledger,
-                        error = %e,
-                        "Failed to get checkpoint HAS from archive"
-                    );
-                    continue;
-                }
-            }
-        }
-        Err(HistoryError::CheckpointNotFound(ledger))
+        self.try_archives(
+            |a| Box::pin(a.get_checkpoint_has(ledger)),
+            "get checkpoint HAS",
+            HistoryError::CheckpointNotFound(ledger),
+        )
+        .await
     }
 
     /// Download a bucket from any available archive.
     pub async fn get_bucket(&self, hash: &henyey_common::Hash256) -> Result<Vec<u8>> {
+        let hash = *hash;
         for archive in &self.archives {
-            match archive.get_bucket(hash).await {
+            match archive.get_bucket(&hash).await {
                 Ok(data) => return Ok(data),
                 Err(e) => {
                     tracing::warn!(
@@ -277,11 +290,10 @@ impl HistoryManager {
                         error = %e,
                         "Failed to get bucket from archive"
                     );
-                    continue;
                 }
             }
         }
-        Err(HistoryError::BucketNotFound(*hash))
+        Err(HistoryError::BucketNotFound(hash))
     }
 
     /// Get ledger headers for a checkpoint from any available archive.
@@ -289,21 +301,12 @@ impl HistoryManager {
         &self,
         checkpoint: u32,
     ) -> Result<Vec<stellar_xdr::curr::LedgerHeaderHistoryEntry>> {
-        for archive in &self.archives {
-            match archive.get_ledger_headers(checkpoint).await {
-                Ok(headers) => return Ok(headers),
-                Err(e) => {
-                    tracing::warn!(
-                        url = %archive.base_url(),
-                        checkpoint = checkpoint,
-                        error = %e,
-                        "Failed to get ledger headers from archive"
-                    );
-                    continue;
-                }
-            }
-        }
-        Err(HistoryError::CheckpointNotFound(checkpoint))
+        self.try_archives(
+            |a| Box::pin(a.get_ledger_headers(checkpoint)),
+            "get ledger headers",
+            HistoryError::CheckpointNotFound(checkpoint),
+        )
+        .await
     }
 
     /// Get transactions for a checkpoint from any available archive.
@@ -311,21 +314,12 @@ impl HistoryManager {
         &self,
         checkpoint: u32,
     ) -> Result<Vec<stellar_xdr::curr::TransactionHistoryEntry>> {
-        for archive in &self.archives {
-            match archive.get_transactions(checkpoint).await {
-                Ok(txs) => return Ok(txs),
-                Err(e) => {
-                    tracing::warn!(
-                        url = %archive.base_url(),
-                        checkpoint = checkpoint,
-                        error = %e,
-                        "Failed to get transactions from archive"
-                    );
-                    continue;
-                }
-            }
-        }
-        Err(HistoryError::CheckpointNotFound(checkpoint))
+        self.try_archives(
+            |a| Box::pin(a.get_transactions(checkpoint)),
+            "get transactions",
+            HistoryError::CheckpointNotFound(checkpoint),
+        )
+        .await
     }
 
     /// Get transaction results for a checkpoint from any available archive.
@@ -333,21 +327,12 @@ impl HistoryManager {
         &self,
         checkpoint: u32,
     ) -> Result<Vec<stellar_xdr::curr::TransactionHistoryResultEntry>> {
-        for archive in &self.archives {
-            match archive.get_results(checkpoint).await {
-                Ok(results) => return Ok(results),
-                Err(e) => {
-                    tracing::warn!(
-                        url = %archive.base_url(),
-                        checkpoint = checkpoint,
-                        error = %e,
-                        "Failed to get transaction results from archive"
-                    );
-                    continue;
-                }
-            }
-        }
-        Err(HistoryError::CheckpointNotFound(checkpoint))
+        self.try_archives(
+            |a| Box::pin(a.get_results(checkpoint)),
+            "get transaction results",
+            HistoryError::CheckpointNotFound(checkpoint),
+        )
+        .await
     }
 }
 

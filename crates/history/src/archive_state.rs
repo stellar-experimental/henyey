@@ -596,6 +596,17 @@ pub struct LiveBucketNextState {
     pub input_snap: Option<Hash256>,
 }
 
+impl From<LiveBucketNextState> for henyey_bucket::HasNextState {
+    fn from(s: LiveBucketNextState) -> Self {
+        Self {
+            state: s.state,
+            output: s.output,
+            input_curr: s.input_curr,
+            input_snap: s.input_snap,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
