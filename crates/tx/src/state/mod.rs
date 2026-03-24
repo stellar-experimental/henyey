@@ -2630,6 +2630,60 @@ mod tests {
         assert!(has_offer_update, "The updated entry should be the Offer");
     }
 
+    /// Test that Data-entry sponsorship-only changes are recorded in delta and
+    /// stamped with the current ledger sequence.
+    #[test]
+    fn test_data_sponsorship_only_change_recorded_in_delta() {
+        let mut manager = new_manager_with_offers(5_000_000, 100);
+
+        let owner_id = create_test_account_id(1);
+        manager.create_account(create_test_account_entry(1));
+
+        let data_name = String64::try_from(b"test".to_vec()).unwrap();
+        let data_entry = DataEntry {
+            account_id: owner_id.clone(),
+            data_name: data_name.clone(),
+            data_value: vec![1, 2, 3].try_into().unwrap(),
+            ext: DataEntryExt::V0,
+        };
+
+        manager.create_data(data_entry);
+        let ledger_key = LedgerKey::Data(LedgerKeyData {
+            account_id: owner_id.clone(),
+            data_name: data_name.clone(),
+        });
+        let initial_sponsor = create_test_account_id(2);
+        manager.set_entry_sponsor(ledger_key.clone(), initial_sponsor);
+        manager.commit();
+
+        let new_ledger = 200;
+        manager.set_ledger_seq(new_ledger);
+        manager.delta = LedgerDelta::new(new_ledger);
+
+        manager.begin_op_snapshot();
+
+        let _ = manager.get_data_mut(&owner_id, "test");
+
+        let new_sponsor = create_test_account_id(3);
+        manager.set_entry_sponsor(ledger_key.clone(), new_sponsor.clone());
+
+        manager.flush_modified_entries();
+        let _ = manager.end_op_snapshot();
+
+        let delta = manager.take_delta();
+        let updated = delta
+            .updated_entries()
+            .iter()
+            .find(|entry| matches!(&entry.data, LedgerEntryData::Data(data) if data.account_id == owner_id))
+            .expect("data entry should be recorded as updated");
+
+        assert_eq!(updated.last_modified_ledger_seq, new_ledger);
+        assert!(matches!(
+            &updated.ext,
+            LedgerEntryExt::V1(v1) if v1.sponsoring_id.0 == Some(new_sponsor)
+        ));
+    }
+
     // ==================== OfferIndex Tests ====================
 
     fn create_test_offer(seller_seed: u8, offer_id: i64, price_n: i32, price_d: i32) -> OfferEntry {

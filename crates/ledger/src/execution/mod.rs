@@ -3735,6 +3735,7 @@ impl TransactionExecutor {
                     RevokeSponsorshipOp::LedgerEntry(ledger_key) => {
                         // Load the entry directly by its key
                         self.load_entry(snapshot, ledger_key)?;
+                        self.state.record_entry_access(ledger_key);
                         // Also load owner/sponsor accounts that may be modified
                         match ledger_key {
                             LedgerKey::Account(k) => {
@@ -5079,6 +5080,69 @@ mod tests {
             executor.state.get_account(&account_id).is_none(),
             "Account must remain absent after load_entry returns false"
         );
+    }
+
+    #[test]
+    fn test_record_entry_access_stamps_loaded_data_entry() {
+        use crate::snapshot::{LedgerSnapshot, SnapshotHandle};
+        use std::sync::Arc;
+        use stellar_xdr::curr::*;
+
+        let owner = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0x11; 32])));
+        let sponsor = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0x22; 32])));
+        let data_name = String64::try_from(b"Test".to_vec()).unwrap();
+
+        let data_key = LedgerKey::Data(LedgerKeyData {
+            account_id: owner.clone(),
+            data_name: data_name.clone(),
+        });
+        let data_entry = LedgerEntry {
+            last_modified_ledger_seq: 123,
+            data: LedgerEntryData::Data(DataEntry {
+                account_id: owner.clone(),
+                data_name: data_name.clone(),
+                data_value: vec![1, 2, 3].try_into().unwrap(),
+                ext: DataEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V1(LedgerEntryExtensionV1 {
+                sponsoring_id: SponsorshipDescriptor(Some(sponsor)),
+                ext: LedgerEntryExtensionV1Ext::V0,
+            }),
+        };
+
+        let data_entry_for_lookup = data_entry.clone();
+        let data_key_for_lookup = data_key.clone();
+        let lookup_fn: crate::snapshot::EntryLookupFn = Arc::new(move |key: &LedgerKey| {
+            if *key == data_key_for_lookup {
+                Ok(Some(data_entry_for_lookup.clone()))
+            } else {
+                Ok(None)
+            }
+        });
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(123), lookup_fn);
+
+        let context = LedgerContext::new(200, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+
+        executor.state.begin_op_snapshot();
+        executor.load_entry(&snapshot, &data_key).unwrap();
+        executor.state.record_entry_access(&data_key);
+        executor.state.flush_modified_entries();
+        let _ = executor.state.end_op_snapshot();
+
+        let updated = executor
+            .state
+            .delta()
+            .updated_entries()
+            .iter()
+            .find(|entry| matches!(&entry.data, LedgerEntryData::Data(data) if data.account_id == owner))
+            .expect("data entry should be recorded as updated");
+        assert_eq!(updated.last_modified_ledger_seq, 200);
     }
 
     /// O1 optimization: load_soroban_footprint uses InMemorySorobanState when set.

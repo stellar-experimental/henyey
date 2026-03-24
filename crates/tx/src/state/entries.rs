@@ -316,6 +316,35 @@ impl LedgerStateManager {
         }
     }
 
+    /// Record that an entry was accessed during operation execution.
+    ///
+    /// This matches stellar-core's load-with-record behavior for operations that
+    /// only read an entry but still commit an updated last-modified ledger.
+    pub fn record_entry_access(&mut self, key: &LedgerKey) {
+        match key {
+            LedgerKey::Account(k) => {
+                let _ = self.get_account_mut(&k.account_id);
+            }
+            LedgerKey::Trustline(k) => {
+                let _ = self.get_trustline_by_trustline_asset_mut(&k.account_id, &k.asset);
+            }
+            LedgerKey::Offer(k) => {
+                let _ = self.get_offer_mut(&k.seller_id, k.offer_id);
+            }
+            LedgerKey::Data(k) => {
+                let name = data_name_to_string(&k.data_name);
+                let _ = self.get_data_mut(&k.account_id, &name);
+            }
+            LedgerKey::ClaimableBalance(k) => {
+                let _ = self.get_claimable_balance_mut(&k.balance_id);
+            }
+            LedgerKey::LiquidityPool(k) => {
+                let _ = self.get_liquidity_pool_mut(&k.liquidity_pool_id);
+            }
+            _ => {}
+        }
+    }
+
     /// Create a new account entry.
     pub fn create_account(&mut self, entry: AccountEntry) {
         let account_id = entry.account_id.clone();
