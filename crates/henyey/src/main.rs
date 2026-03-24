@@ -1042,6 +1042,7 @@ fn local_config() -> AppConfig {
             accelerate_time: true,
             ledger_close_time: None,
             generate_load_for_testing: true,
+            genesis_test_account_count: 0,
         },
         compat_http: CompatHttpConfig {
             enabled: true,
@@ -1182,7 +1183,7 @@ async fn cmd_run(
 
             // Create database and initialize genesis ledger.
             let db = henyey_db::Database::open(db_path)?;
-            initialize_genesis_ledger(&db, &config.network.passphrase)?;
+            initialize_genesis_ledger(&db, &config.network.passphrase, config.testing.genesis_test_account_count)?;
             tracing::info!("Local mode: genesis ledger initialized");
 
             // Initialize local history archive.
@@ -1306,10 +1307,20 @@ async fn cmd_new_db(
 
     // Initialize genesis ledger (ledger 1) with root account, matching stellar-core
     let passphrase = &config.network.passphrase;
-    initialize_genesis_ledger(&db, passphrase)?;
+    initialize_genesis_ledger(&db, passphrase, config.testing.genesis_test_account_count)?;
 
     println!("Database created successfully at: {}", db_path.display());
     Ok(())
+}
+
+/// Deterministic seed derivation matching stellar-core `txtest::getAccount()`.
+///
+/// The name is right-padded with `.` to 32 bytes, then used as an ed25519 seed.
+fn deterministic_seed(name: &str) -> [u8; 32] {
+    let mut seed = [b'.'; 32];
+    let len = name.len().min(32);
+    seed[..len].copy_from_slice(&name.as_bytes()[..len]);
+    seed
 }
 
 /// Initialize the genesis ledger (ledger 1) in the database.
@@ -1318,11 +1329,18 @@ async fn cmd_new_db(
 /// protocol version 0, a root account holding 100 billion XLM, an empty bucket
 /// list with the root account entry, and persists everything to the database.
 ///
+/// When `genesis_test_account_count > 0`, creates that many additional accounts
+/// named `"TestAccount-0"` through `"TestAccount-{N-1}"` with deterministic
+/// keys (name padded with `'.'` to 32 bytes, used as Ed25519 seed). The total
+/// coins are split evenly among root + test accounts, with root receiving the
+/// remainder from integer division.
+///
 /// The root account's public key is derived from SHA-256(network_passphrase),
 /// matching stellar-core's `SecretKey::fromSeed(networkID).getPublicKey()`.
 fn initialize_genesis_ledger(
     db: &henyey_db::Database,
     network_passphrase: &str,
+    genesis_test_account_count: u32,
 ) -> anyhow::Result<()> {
     use henyey_bucket::BucketList;
     use henyey_common::NetworkId;
@@ -1349,11 +1367,23 @@ fn initialize_genesis_ledger(
 
     // 2. Create root account entry (balance = 100 billion XLM)
     let total_coins: i64 = 1_000_000_000_000_000_000; // 100B XLM in stroops
+
+    // Compute per-account balance when test accounts are requested.
+    // Matches stellar-core: split evenly, root gets the remainder.
+    let (root_balance, test_balance) = if genesis_test_account_count > 0 {
+        let total_accounts = genesis_test_account_count as i64 + 1; // +1 for root
+        let base = total_coins / total_accounts;
+        let remainder = total_coins % total_accounts;
+        (base + remainder, base)
+    } else {
+        (total_coins, 0i64)
+    };
+
     let root_entry = LedgerEntry {
         last_modified_ledger_seq: 1,
         data: LedgerEntryData::Account(AccountEntry {
             account_id: root_account_id,
-            balance: total_coins,
+            balance: root_balance,
             seq_num: SequenceNumber(0),
             num_sub_entries: 0,
             inflation_dest: None,
@@ -1366,18 +1396,57 @@ fn initialize_genesis_ledger(
         ext: LedgerEntryExt::V0,
     };
 
-    // 3. Create bucket list and add root account
+    // Build list of genesis entries: root + test accounts
+    let mut genesis_entries = vec![root_entry];
+
+    for i in 0..genesis_test_account_count {
+        let name = format!("TestAccount-{}", i);
+        let seed = deterministic_seed(&name);
+        let secret = henyey_crypto::SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            *public.as_bytes(),
+        )));
+
+        genesis_entries.push(LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id,
+                balance: test_balance,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: stellar_xdr::curr::String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: VecM::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        });
+    }
+
+    if genesis_test_account_count > 0 {
+        tracing::info!(
+            count = genesis_test_account_count,
+            balance_per_account = test_balance,
+            root_balance = root_balance,
+            "Creating genesis test accounts"
+        );
+    }
+
+    // 3. Create bucket list and add all genesis entries
     let mut bucket_list = BucketList::new();
     bucket_list
         .add_batch(
             1, // ledger_seq
             0, // protocol_version (genesis is v0)
             BucketListType::Live,
-            vec![root_entry], // init_entries
-            vec![],           // live_entries
-            vec![],           // dead_entries
+            genesis_entries, // init_entries
+            vec![],          // live_entries
+            vec![],          // dead_entries
         )
-        .map_err(|e| anyhow::anyhow!("Failed to add genesis entry to bucket list: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to add genesis entries to bucket list: {}", e))?;
 
     // 4. Compute bucket list hash (protocol 0 = just the live hash, no hot archive)
     let bucket_list_hash = bucket_list.hash();
@@ -5025,7 +5094,7 @@ mod tests {
         let db = henyey_db::Database::open_in_memory().unwrap();
         let passphrase = "Standalone Network ; February 2017";
 
-        initialize_genesis_ledger(&db, passphrase).unwrap();
+        initialize_genesis_ledger(&db, passphrase, 0).unwrap();
 
         // Verify LCL is set to 1
         db.with_connection(|conn| {
@@ -5081,6 +5150,95 @@ mod tests {
             root_secret.to_strkey(),
             "SC5O7VZUXDJ6JBDSZ74DSERXL7W3Y5LTOAMRF7RQRL3TAGAPS7LUVG3L"
         );
+    }
+
+    #[test]
+    fn test_genesis_test_accounts_created() {
+        // When genesis_test_account_count > 0, initialize_genesis_ledger should
+        // create test accounts alongside root, splitting total_coins evenly.
+        use henyey_db::queries::{LedgerQueries, StateQueries};
+
+        let db = henyey_db::Database::open_in_memory().unwrap();
+        let passphrase = "Standalone Network ; February 2017";
+        let count = 10;
+
+        initialize_genesis_ledger(&db, passphrase, count).unwrap();
+
+        // Verify LCL is set and header is stored
+        db.with_connection(|conn| {
+            let lcl = conn.get_last_closed_ledger().unwrap();
+            assert_eq!(lcl, Some(1));
+
+            // Verify header still has full total_coins
+            let header = conn.load_ledger_header(1).unwrap().unwrap();
+            assert_eq!(header.total_coins, 1_000_000_000_000_000_000);
+
+            // Verify bucket_list_hash differs from the 0-account case
+            // (it should include 11 accounts instead of 1)
+            let db2 = henyey_db::Database::open_in_memory().unwrap();
+            initialize_genesis_ledger(&db2, passphrase, 0).unwrap();
+            let header0 = db2.with_connection(|c| {
+                c.load_ledger_header(1)
+            }).unwrap().unwrap();
+            assert_ne!(header.bucket_list_hash, header0.bucket_list_hash);
+
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_genesis_test_account_balance_split() {
+        // Verify that total_coins are split evenly with root getting the remainder.
+        // total = 1_000_000_000_000_000_000, count = 3 => 4 accounts
+        // base = 250_000_000_000_000_000, remainder = 0
+        // root_balance = 250_000_000_000_000_000
+        // test_balance = 250_000_000_000_000_000
+        let total_coins: i64 = 1_000_000_000_000_000_000;
+        let count: u32 = 3;
+        let total_accounts = count as i64 + 1;
+        let base = total_coins / total_accounts;
+        let remainder = total_coins % total_accounts;
+        assert_eq!(base, 250_000_000_000_000_000);
+        assert_eq!(remainder, 0);
+
+        // With count = 7 => 8 accounts
+        let count2: u32 = 7;
+        let total_accounts2 = count2 as i64 + 1;
+        let base2 = total_coins / total_accounts2;
+        let remainder2 = total_coins % total_accounts2;
+        assert_eq!(base2, 125_000_000_000_000_000);
+        assert_eq!(remainder2, 0);
+
+        // With count = 6 => 7 accounts (has a remainder)
+        let count3: u32 = 6;
+        let total_accounts3 = count3 as i64 + 1;
+        let base3 = total_coins / total_accounts3;
+        let remainder3 = total_coins % total_accounts3;
+        assert_eq!(base3, 142_857_142_857_142_857);
+        assert_eq!(remainder3, 1);
+        // Root gets base3 + remainder3 = 142_857_142_857_142_858
+        // Verify no coins are lost
+        assert_eq!(base3 * total_accounts3 + remainder3, total_coins);
+    }
+
+    #[test]
+    fn test_genesis_test_account_key_derivation() {
+        // Verify that test account keys match stellar-core's getAccount() derivation.
+        // "TestAccount-0" padded with '.' to 32 bytes => ed25519 seed.
+        let seed = deterministic_seed("TestAccount-0");
+        assert_eq!(seed.len(), 32);
+        assert_eq!(&seed[..14], b"TestAccount-0.");
+        assert!(seed[14..].iter().all(|&b| b == b'.'));
+
+        let secret = henyey_crypto::SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        // The public key should be deterministic and non-zero
+        assert_ne!(public.as_bytes(), &[0u8; 32]);
+
+        // Verify different names produce different keys
+        let seed1 = deterministic_seed("TestAccount-1");
+        assert_ne!(seed, seed1);
     }
 
     #[test]

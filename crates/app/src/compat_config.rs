@@ -365,6 +365,9 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
             config.testing.generate_load_for_testing = s.eq_ignore_ascii_case("true");
         }
     }
+    if let Some(v) = get_u32(table, "GENESIS_TEST_ACCOUNT_COUNT") {
+        config.testing.genesis_test_account_count = v;
+    }
 
     // --- Ignored keys (accepted silently for compatibility) ---
     // UNSAFE_QUORUM, RUN_STANDALONE, FORCE_SCP, DISABLE_XDR_FSYNC, etc.
@@ -799,6 +802,31 @@ mod tests {
         .unwrap();
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert!(!config.testing.generate_load_for_testing);
+    }
+
+    #[test]
+    fn test_genesis_test_account_count() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            GENESIS_TEST_ACCOUNT_COUNT = 100
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(config.testing.genesis_test_account_count, 100);
+    }
+
+    #[test]
+    fn test_genesis_test_account_count_default() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(config.testing.genesis_test_account_count, 0);
     }
 
     #[test]

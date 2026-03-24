@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 
 mod loopback;
 mod loadgen;
+use loadgen::deterministic_seed;
 use loopback::LoopbackNetwork;
 mod loadgen_soroban;
 mod applyload;
@@ -1357,6 +1358,8 @@ pub fn initialize_genesis_ledger(config: &AppConfig, network_passphrase: &str) -
         WriteXdr,
     };
 
+    let genesis_test_account_count = config.testing.genesis_test_account_count;
+
     let db = henyey_db::Database::open(&config.database.path)?;
     let network_id = NetworkId::from_passphrase(network_passphrase);
     let root_secret = SecretKey::from_seed(network_id.as_bytes());
@@ -1364,11 +1367,23 @@ pub fn initialize_genesis_ledger(config: &AppConfig, network_passphrase: &str) -
     let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*root_public.as_bytes())));
 
     let total_coins: i64 = 1_000_000_000_000_000_000;
+
+    // Compute per-account balance when test accounts are requested.
+    // Matches stellar-core: split evenly, root gets the remainder.
+    let (root_balance, test_balance) = if genesis_test_account_count > 0 {
+        let total_accounts = genesis_test_account_count as i64 + 1;
+        let base = total_coins / total_accounts;
+        let remainder = total_coins % total_accounts;
+        (base + remainder, base)
+    } else {
+        (total_coins, 0i64)
+    };
+
     let root_entry = LedgerEntry {
         last_modified_ledger_seq: 1,
         data: LedgerEntryData::Account(AccountEntry {
             account_id: root_account_id,
-            balance: total_coins,
+            balance: root_balance,
             seq_num: SequenceNumber(0),
             num_sub_entries: 0,
             inflation_dest: None,
@@ -1381,10 +1396,49 @@ pub fn initialize_genesis_ledger(config: &AppConfig, network_passphrase: &str) -
         ext: LedgerEntryExt::V0,
     };
 
+    // Build list of genesis entries: root + test accounts
+    let mut genesis_entries = vec![root_entry];
+
+    for i in 0..genesis_test_account_count {
+        let name = format!("TestAccount-{}", i);
+        let seed = deterministic_seed(&name);
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            *public.as_bytes(),
+        )));
+
+        genesis_entries.push(LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id,
+                balance: test_balance,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: stellar_xdr::curr::String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: VecM::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        });
+    }
+
+    if genesis_test_account_count > 0 {
+        tracing::info!(
+            count = genesis_test_account_count,
+            balance_per_account = test_balance,
+            root_balance = root_balance,
+            "Creating genesis test accounts"
+        );
+    }
+
     let mut bucket_list = BucketList::new();
     bucket_list
-        .add_batch(1, 0, BucketListType::Live, vec![root_entry], vec![], vec![])
-        .map_err(|e| anyhow::anyhow!("Failed to add genesis entry to bucket list: {}", e))?;
+        .add_batch(1, 0, BucketListType::Live, genesis_entries, vec![], vec![])
+        .map_err(|e| anyhow::anyhow!("Failed to add genesis entries to bucket list: {}", e))?;
 
     let bucket_list_hash = bucket_list.hash();
     let mut header = LedgerHeader {

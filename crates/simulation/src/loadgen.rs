@@ -298,7 +298,7 @@ impl TestAccount {
 /// Deterministic seed derivation matching stellar-core `txtest::getAccount()`.
 ///
 /// The name is right-padded with `.` to 32 bytes, then used as an ed25519 seed.
-fn deterministic_seed(name: &str) -> [u8; 32] {
+pub(crate) fn deterministic_seed(name: &str) -> [u8; 32] {
     let mut seed = [b'.'; 32];
     let len = name.len().min(32);
     seed[..len].copy_from_slice(&name.as_bytes()[..len]);

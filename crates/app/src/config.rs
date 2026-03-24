@@ -509,6 +509,18 @@ pub struct TestingConfig {
     /// generation. Maps to `ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING`.
     #[serde(default)]
     pub generate_load_for_testing: bool,
+
+    /// Number of test accounts to create in the genesis ledger.
+    ///
+    /// When non-zero, `initialize_genesis_ledger()` creates this many accounts
+    /// named `"TestAccount-0"` through `"TestAccount-{N-1}"` alongside the root
+    /// account, splitting `total_coins` evenly (root gets the remainder).
+    /// Keys are derived deterministically: the name is right-padded with `'.'`
+    /// to 32 bytes and used as an Ed25519 seed.
+    ///
+    /// Maps to stellar-core's `GENESIS_TEST_ACCOUNT_COUNT`.
+    #[serde(default)]
+    pub genesis_test_account_count: u32,
 }
 
 /// Catchup behavior configuration.

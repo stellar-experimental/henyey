@@ -925,7 +925,8 @@ impl App {
     ///
     /// Used by the force-scp flow for standalone single-node networks.
     /// Reads the genesis ledger header from the DB, recreates the bucket list
-    /// with the root account entry, and initializes the LedgerManager.
+    /// with the root account entry (and test accounts if configured), and
+    /// initializes the LedgerManager.
     pub async fn bootstrap_from_db(&self) -> anyhow::Result<()> {
         use henyey_bucket::BucketList;
         use henyey_bucket::HotArchiveBucketList;
@@ -949,8 +950,10 @@ impl App {
         let header_hash = compute_header_hash(&header)
             .map_err(|e| anyhow::anyhow!("Failed to compute header hash: {}", e))?;
 
-        // Recreate the bucket list with the root account entry.
-        // For genesis (protocol 0), this is a single entry in level 0.
+        // Recreate the bucket list with the root account entry (and test accounts
+        // if GENESIS_TEST_ACCOUNT_COUNT > 0).
+        // For genesis (protocol 0), these are entries in level 0.
+        let genesis_test_account_count = self.config.testing.genesis_test_account_count;
         let network_id = NetworkId::from_passphrase(&self.config.network.passphrase);
         let root_secret = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
         let root_public = root_secret.public_key();
@@ -958,11 +961,21 @@ impl App {
             *root_public.as_bytes(),
         )));
 
+        // Compute per-account balance (same logic as initialize_genesis_ledger).
+        let (root_balance, test_balance) = if genesis_test_account_count > 0 {
+            let total_accounts = genesis_test_account_count as i64 + 1;
+            let base = header.total_coins / total_accounts;
+            let remainder = header.total_coins % total_accounts;
+            (base + remainder, base)
+        } else {
+            (header.total_coins, 0i64)
+        };
+
         let root_entry = LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Account(AccountEntry {
                 account_id: root_account_id,
-                balance: header.total_coins,
+                balance: root_balance,
                 seq_num: SequenceNumber(0),
                 num_sub_entries: 0,
                 inflation_dest: None,
@@ -975,6 +988,34 @@ impl App {
             ext: LedgerEntryExt::V0,
         };
 
+        let mut genesis_entries = vec![root_entry];
+
+        for i in 0..genesis_test_account_count {
+            let name = format!("TestAccount-{}", i);
+            let seed = deterministic_seed_for_test_account(&name);
+            let secret = henyey_crypto::SecretKey::from_seed(&seed);
+            let public = secret.public_key();
+            let acct_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                *public.as_bytes(),
+            )));
+            genesis_entries.push(LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id: acct_id,
+                    balance: test_balance,
+                    seq_num: SequenceNumber(0),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: stellar_xdr::curr::String32::default(),
+                    thresholds: Thresholds([1, 0, 0, 0]),
+                    signers: VecM::default(),
+                    ext: AccountEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            });
+        }
+
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
         std::fs::create_dir_all(&bucket_dir)?;
 
@@ -982,7 +1023,7 @@ impl App {
         bucket_list.set_bucket_dir(bucket_dir.clone());
         bucket_list.add_batch(
             1, 0, BucketListType::Live,
-            vec![root_entry], vec![], vec![],
+            genesis_entries, vec![], vec![],
         ).map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
 
         // Persist all non-empty buckets to disk so they're available for
@@ -1999,6 +2040,16 @@ impl App {
 
         tracing::info!("Event loop watchdog started");
     }
+}
+
+/// Deterministic seed derivation matching stellar-core `txtest::getAccount()`.
+///
+/// The name is right-padded with `.` to 32 bytes, then used as an Ed25519 seed.
+fn deterministic_seed_for_test_account(name: &str) -> [u8; 32] {
+    let mut seed = [b'.'; 32];
+    let len = name.len().min(32);
+    seed[..len].copy_from_slice(&name.as_bytes()[..len]);
+    seed
 }
 
 #[cfg(test)]
