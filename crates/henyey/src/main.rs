@@ -1264,6 +1264,7 @@ async fn cmd_run(
             let db = henyey_db::Database::open(db_path)?;
             initialize_genesis_ledger(
                 &db,
+                Some(&db_path.parent().unwrap_or(db_path).join("buckets")),
                 &config.network.passphrase,
                 config.testing.genesis_test_account_count,
             )?;
@@ -1395,7 +1396,16 @@ async fn cmd_new_db(
 
     // Initialize genesis ledger (ledger 1) with root account, matching stellar-core
     let passphrase = &config.network.passphrase;
-    initialize_genesis_ledger(&db, passphrase, config.testing.genesis_test_account_count)?;
+    // Compute bucket directory (same as App::new uses: <db_parent>/buckets/)
+    let bucket_dir = db_path.parent().unwrap_or(db_path).join("buckets");
+    std::fs::create_dir_all(&bucket_dir)?;
+
+    initialize_genesis_ledger(
+        &db,
+        Some(&bucket_dir),
+        passphrase,
+        config.testing.genesis_test_account_count,
+    )?;
 
     println!("Database created successfully at: {}", db_path.display());
     Ok(())
@@ -1417,6 +1427,7 @@ async fn cmd_new_db(
 /// matching stellar-core's `SecretKey::fromSeed(networkID).getPublicKey()`.
 fn initialize_genesis_ledger(
     db: &henyey_db::Database,
+    bucket_dir: Option<&std::path::Path>,
     network_passphrase: &str,
     genesis_test_account_count: u32,
 ) -> anyhow::Result<()> {
@@ -1523,6 +1534,30 @@ fn initialize_genesis_ledger(
             vec![],          // dead_entries
         )
         .map_err(|e| anyhow::anyhow!("Failed to add genesis entries to bucket list: {}", e))?;
+
+    // 3b. Persist non-empty bucket files to disk so that `load_last_known_ledger`
+    //     can restore state on the next `run` startup (matches stellar-core's
+    //     startNewLedger which writes bucket files via the full ledger-close path).
+    if let Some(bucket_dir) = bucket_dir {
+        std::fs::create_dir_all(bucket_dir)?;
+        for level in bucket_list.levels() {
+            for bucket in [&level.curr, &level.snap] {
+                if !bucket.hash().is_zero() {
+                    let path =
+                        bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
+                    if !path.exists() {
+                        bucket.save_to_xdr_file(&path).map_err(|e| {
+                            anyhow::anyhow!("Failed to persist genesis bucket: {}", e)
+                        })?;
+                        tracing::debug!(
+                            hash = %bucket.hash().to_hex(),
+                            "Persisted genesis bucket file"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     // 4. Compute bucket list hash (protocol 0 = just the live hash, no hot archive)
     let bucket_list_hash = bucket_list.hash();
@@ -5420,7 +5455,7 @@ mod tests {
         let db = henyey_db::Database::open_in_memory().unwrap();
         let passphrase = "Standalone Network ; February 2017";
 
-        initialize_genesis_ledger(&db, passphrase, 0).unwrap();
+        initialize_genesis_ledger(&db, None, passphrase, 0).unwrap();
 
         // Verify LCL is set to 1
         db.with_connection(|conn| {
@@ -5490,7 +5525,7 @@ mod tests {
         let passphrase = "Standalone Network ; February 2017";
         let count = 10;
 
-        initialize_genesis_ledger(&db, passphrase, count).unwrap();
+        initialize_genesis_ledger(&db, None, passphrase, count).unwrap();
 
         // Verify LCL is set and header is stored
         db.with_connection(|conn| {
@@ -5504,7 +5539,7 @@ mod tests {
             // Verify bucket_list_hash differs from the 0-account case
             // (it should include 11 accounts instead of 1)
             let db2 = henyey_db::Database::open_in_memory().unwrap();
-            initialize_genesis_ledger(&db2, passphrase, 0).unwrap();
+            initialize_genesis_ledger(&db2, None, passphrase, 0).unwrap();
             let header0 = db2
                 .with_connection(|c| c.load_ledger_header(1))
                 .unwrap()

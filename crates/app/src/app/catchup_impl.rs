@@ -102,7 +102,7 @@ impl App {
             });
         }
 
-        // For replay-only catchup (Case 1: LCL > genesis), we need the bucket
+        // For replay-only catchup (Case 1: LCL >= genesis), we need the bucket
         // lists at the current LCL to replay ledgers from LCL+1 to target.
         //
         // Fast path: if the ledger manager is already initialized, clone the
@@ -114,7 +114,7 @@ impl App {
         //
         // Slow path: if the ledger manager is NOT initialized (e.g., first
         // startup with existing DB), fall back to rebuilding from persisted HAS.
-        let (existing_state, override_lcl) = if current > GENESIS_LEDGER_SEQ {
+        let (existing_state, override_lcl) = if current >= GENESIS_LEDGER_SEQ {
             if self.ledger_manager.is_initialized() {
                 // Fast path: clone from live ledger manager.
                 // Must resolve async merges first — structure-based restart_merges
