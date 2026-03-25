@@ -2758,7 +2758,7 @@ mod tests {
         index.add_offer(&offer2);
 
         // Remove best offer
-        index.remove_offer(&offer2.seller_id, offer2.offer_id);
+        index.remove_with_data(&offer2);
 
         assert_eq!(index.len(), 1);
 
@@ -2779,7 +2779,7 @@ mod tests {
         // Update to better price
         let mut updated_offer = offer1.clone();
         updated_offer.price = Price { n: 1, d: 2 }; // price = 0.5
-        index.update_offer(&updated_offer);
+        index.update_offer(&offer1, &updated_offer);
 
         assert_eq!(index.len(), 1);
 
@@ -2834,6 +2834,80 @@ mod tests {
         assert!(index.is_empty());
         assert!(!index.has_offers(&buying, &selling));
         assert!(index.best_offer_key(&buying, &selling).is_none());
+    }
+
+    #[test]
+    fn test_offer_index_update_across_asset_pairs() {
+        let mut index = OfferIndex::new();
+
+        let offer = create_test_offer(1, 100, 1, 1);
+        index.add_offer(&offer);
+        assert_eq!(index.num_asset_pairs(), 1);
+        assert_eq!(index.len(), 1);
+
+        // Update to a different asset pair
+        let mut updated = offer.clone();
+        updated.buying = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'E', b'U', b'R', 0]),
+            issuer: create_test_account_id(98),
+        });
+        index.update_offer(&offer, &updated);
+
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.num_asset_pairs(), 1);
+
+        // Old pair should have no offers
+        assert!(!index.has_offers(&offer.buying, &offer.selling));
+        // New pair should have the offer
+        assert!(index.has_offers(&updated.buying, &updated.selling));
+    }
+
+    #[test]
+    fn test_offer_index_remove_last_cleans_order_book() {
+        let mut index = OfferIndex::new();
+
+        let offer = create_test_offer(1, 100, 1, 1);
+        index.add_offer(&offer);
+        assert_eq!(index.num_asset_pairs(), 1);
+
+        index.remove_with_data(&offer);
+        assert_eq!(index.len(), 0);
+        assert_eq!(index.num_asset_pairs(), 0);
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_offer_index_len_correct_across_operations() {
+        let mut index = OfferIndex::new();
+        assert_eq!(index.len(), 0);
+
+        // Insert 3 offers
+        let o1 = create_test_offer(1, 100, 1, 1);
+        let o2 = create_test_offer(2, 200, 2, 1);
+        let o3 = create_test_offer(3, 300, 3, 1);
+        index.add_offer(&o1);
+        index.add_offer(&o2);
+        index.add_offer(&o3);
+        assert_eq!(index.len(), 3);
+
+        // Update one (count stays the same)
+        let mut o2_updated = o2.clone();
+        o2_updated.price = Price { n: 1, d: 2 };
+        index.update_offer(&o2, &o2_updated);
+        assert_eq!(index.len(), 3);
+
+        // Remove one
+        index.remove_with_data(&o1);
+        assert_eq!(index.len(), 2);
+
+        // Remove another
+        index.remove_with_data(&o3);
+        assert_eq!(index.len(), 1);
+
+        // Remove last
+        index.remove_with_data(&o2_updated);
+        assert_eq!(index.len(), 0);
+        assert!(index.is_empty());
     }
 
     #[test]

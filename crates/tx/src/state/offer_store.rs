@@ -218,7 +218,7 @@ impl OfferStore {
         // Remove old index entries if updating
         if let Some(old) = self.offers.get(&key) {
             aa_index_remove(&mut self.account_asset_index, &old.entry);
-            self.order_book.remove_by_key(&key);
+            self.order_book.remove_with_data(&old.entry);
         }
 
         // Add to indexes
@@ -250,11 +250,12 @@ impl OfferStore {
     /// is NOT changed — the caller should update those separately if needed.
     pub fn update_offer_entry(&mut self, entry: OfferEntry) {
         let key = OfferKey::from_offer(&entry);
+        let old_entry = self.offers.get(&key).map(|r| r.entry.clone());
 
-        if let Some(old) = self.offers.get(&key) {
-            aa_index_remove(&mut self.account_asset_index, &old.entry);
+        if let Some(ref old) = old_entry {
+            aa_index_remove(&mut self.account_asset_index, old);
+            self.order_book.update_offer(old, &entry);
         }
-        self.order_book.update_offer(&entry);
         aa_index_insert(&mut self.account_asset_index, &entry);
 
         if let Some(record) = self.offers.get_mut(&key) {
@@ -267,7 +268,7 @@ impl OfferStore {
     /// Returns the removed record if it existed.
     pub fn remove(&mut self, key: &OfferKey) -> Option<OfferRecord> {
         if let Some(record) = self.offers.remove(key) {
-            self.order_book.remove_by_key(key);
+            self.order_book.remove_with_data(&record.entry);
             aa_index_remove(&mut self.account_asset_index, &record.entry);
             self.by_id.remove(&record.entry.offer_id);
             Some(record)
@@ -401,11 +402,6 @@ impl OfferStore {
         // Order book index
         let order_books =
             hashmap_heap_bytes(self.order_book.order_book_capacity(), asset_pair_size, 200);
-        let locations = hashmap_heap_bytes(
-            self.order_book.location_capacity(),
-            offer_key_size,
-            asset_pair_size + 24,
-        );
 
         // Account-asset secondary index
         let aa_index =
@@ -418,7 +414,7 @@ impl OfferStore {
             offer_key_size,
         );
 
-        offers + order_books + locations + aa_index + by_id
+        offers + order_books + aa_index + by_id
     }
 
     /// Number of unique asset pairs with offers.

@@ -152,8 +152,8 @@ type OrderBook = BTreeMap<OfferDescriptor, OfferKey>;
 pub struct OfferIndex {
     /// Order books keyed by (buying, selling) asset pair.
     order_books: HashMap<AssetPair, OrderBook>,
-    /// Reverse index: offer key -> (asset pair, descriptor) for efficient removal.
-    offer_locations: HashMap<OfferKey, (AssetPair, OfferDescriptor)>,
+    /// Total number of offers across all order books.
+    count: usize,
 }
 
 impl OfferIndex {
@@ -161,7 +161,7 @@ impl OfferIndex {
     pub fn new() -> Self {
         Self {
             order_books: HashMap::new(),
-            offer_locations: HashMap::new(),
+            count: 0,
         }
     }
 
@@ -171,28 +171,21 @@ impl OfferIndex {
         let descriptor = OfferDescriptor::from_offer(offer);
         let asset_pair = AssetPair::new(&offer.buying, &offer.selling);
 
-        // Add to order book
-        let order_book = self.order_books.entry(asset_pair.clone()).or_default();
-        order_book.insert(descriptor.clone(), key.clone());
-
-        // Add to reverse index
-        self.offer_locations.insert(key, (asset_pair, descriptor));
+        let order_book = self.order_books.entry(asset_pair).or_default();
+        order_book.insert(descriptor, key);
+        self.count += 1;
     }
 
-    /// Remove an offer from the index.
-    pub fn remove_offer(&mut self, seller: &AccountId, offer_id: i64) {
-        let key = OfferKey::new(seller.clone(), offer_id);
-        self.remove_by_key(&key);
-    }
-
-    /// Remove an offer from the index by its key.
-    pub fn remove_by_key(&mut self, key: &OfferKey) {
-        // Look up location in reverse index
-        if let Some((asset_pair, descriptor)) = self.offer_locations.remove(key) {
-            // Remove from order book
-            if let Some(order_book) = self.order_books.get_mut(&asset_pair) {
-                order_book.remove(&descriptor);
-                // Clean up empty order books
+    /// Remove an offer from the index using the offer's data to locate it.
+    ///
+    /// The caller must provide the offer entry so we can derive the asset pair
+    /// and descriptor to find the correct order book entry.
+    pub fn remove_with_data(&mut self, offer: &OfferEntry) {
+        let descriptor = OfferDescriptor::from_offer(offer);
+        let asset_pair = AssetPair::new(&offer.buying, &offer.selling);
+        if let Some(order_book) = self.order_books.get_mut(&asset_pair) {
+            if order_book.remove(&descriptor).is_some() {
+                self.count -= 1;
                 if order_book.is_empty() {
                     self.order_books.remove(&asset_pair);
                 }
@@ -202,12 +195,11 @@ impl OfferIndex {
 
     /// Update an offer in the index.
     ///
-    /// This handles the case where an offer's price or assets might change.
-    pub fn update_offer(&mut self, offer: &OfferEntry) {
-        // Remove old entry if exists
-        self.remove_offer(&offer.seller_id, offer.offer_id);
-        // Add with new values
-        self.add_offer(offer);
+    /// Takes both old and new entries so that price or asset-pair changes
+    /// remove from the correct order book.
+    pub fn update_offer(&mut self, old: &OfferEntry, new: &OfferEntry) {
+        self.remove_with_data(old);
+        self.add_offer(new);
     }
 
     /// Get the best (lowest price) offer for an asset pair.
@@ -275,18 +267,18 @@ impl OfferIndex {
 
     /// Get the total number of offers in the index.
     pub fn len(&self) -> usize {
-        self.offer_locations.len()
+        self.count
     }
 
     /// Check if the index is empty.
     pub fn is_empty(&self) -> bool {
-        self.offer_locations.is_empty()
+        self.count == 0
     }
 
     /// Clear all offers from the index.
     pub fn clear(&mut self) {
         self.order_books.clear();
-        self.offer_locations.clear();
+        self.count = 0;
     }
 
     /// Get the number of asset pairs with offers.
@@ -299,10 +291,6 @@ impl OfferIndex {
         self.order_books.capacity()
     }
 
-    /// Capacity of the offer locations map (for memory estimation).
-    pub fn location_capacity(&self) -> usize {
-        self.offer_locations.capacity()
-    }
 }
 
 #[cfg(test)]
