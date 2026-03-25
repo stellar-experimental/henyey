@@ -1,0 +1,21 @@
+#!/bin/sh
+# Pre-commit hook: check formatting and clippy warnings.
+# Install: cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+set -e
+
+echo "pre-commit: checking formatting..."
+cargo fmt --all -- --check
+if [ $? -ne 0 ]; then
+    echo "pre-commit: formatting check failed. Run 'cargo fmt --all' to fix."
+    exit 1
+fi
+
+echo "pre-commit: running clippy..."
+cargo clippy --all -- -D warnings
+if [ $? -ne 0 ]; then
+    echo "pre-commit: clippy found warnings. Fix them before committing."
+    exit 1
+fi
+
+echo "pre-commit: all checks passed."
