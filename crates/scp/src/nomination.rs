@@ -412,6 +412,7 @@ impl NominationProtocol {
 
             let (mut modified, new_candidates) = self.attempt_promote(
                 &votes_to_check,
+                ctx.local_node_id,
                 ctx.local_quorum_set,
                 ctx.driver,
                 ctx.slot_index,
@@ -511,6 +512,7 @@ impl NominationProtocol {
     fn attempt_promote<D: SCPDriver>(
         &mut self,
         votes_to_check: &[Value],
+        local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
         slot_index: u64,
@@ -524,7 +526,8 @@ impl NominationProtocol {
                 continue;
             }
 
-            if !self.should_accept_value(value, local_quorum_set, driver, slot_index) {
+            if !self.should_accept_value(value, local_node_id, local_quorum_set, driver, slot_index)
+            {
                 continue;
             }
             match driver.validate_value(slot_index, value, true) {
@@ -551,7 +554,7 @@ impl NominationProtocol {
                 continue;
             }
 
-            if self.should_ratify_value(&value, local_quorum_set, driver)
+            if self.should_ratify_value(&value, local_node_id, local_quorum_set, driver)
                 && Self::insert_unique(&mut self.candidates, value.clone())
             {
                 new_candidates = true;
@@ -608,8 +611,13 @@ impl NominationProtocol {
         // Step 2: Run self-processing (stellar-core processEnvelope body).
         // This may recursively call emit_nomination, updating last_envelope.
         if self.started {
-            let (modified, new_candidates) =
-                self.attempt_promote(&votes, ctx.local_quorum_set, ctx.driver, ctx.slot_index);
+            let (modified, new_candidates) = self.attempt_promote(
+                &votes,
+                ctx.local_node_id,
+                ctx.local_quorum_set,
+                ctx.driver,
+                ctx.slot_index,
+            );
 
             if modified {
                 // Cascade: stellar-core emitNomination -> processEnvelope -> emitNomination
@@ -744,9 +752,40 @@ impl NominationProtocol {
         true
     }
 
+    /// Build a map of node_id → quorum_set from stored nomination envelopes.
+    ///
+    /// This mirrors stellar-core's `getQuorumSetFromStatement` approach: quorum
+    /// sets are resolved from the quorum_set_hash embedded in each nomination
+    /// statement. Ensures the local node's quorum set is always present in the
+    /// map (matching the ballot protocol's `statement_quorum_set_map` fallback).
+    fn nomination_quorum_set_map<D: SCPDriver>(
+        &self,
+        local_node_id: &NodeId,
+        local_quorum_set: &ScpQuorumSet,
+        driver: &Arc<D>,
+    ) -> HashMap<NodeId, ScpQuorumSet> {
+        let mut map = HashMap::new();
+        for (node_id, envelope) in &self.latest_nominations {
+            if let ScpStatementPledges::Nominate(nom) = &envelope.statement.pledges {
+                let qset_hash = henyey_common::Hash256::from(nom.quorum_set_hash.clone());
+                if let Some(qs) = driver.get_quorum_set_by_hash(&qset_hash) {
+                    map.insert(node_id.clone(), qs);
+                } else if let Some(qs) = driver.get_quorum_set(node_id) {
+                    map.insert(node_id.clone(), qs);
+                }
+            }
+        }
+        // Ensure local node is always present (matches ballot protocol fallback).
+        if !map.contains_key(local_node_id) {
+            map.insert(local_node_id.clone(), local_quorum_set.clone());
+        }
+        map
+    }
+
     fn should_accept_value<D: SCPDriver>(
         &self,
         value: &Value,
+        local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
         _slot_index: u64,
@@ -754,7 +793,8 @@ impl NominationProtocol {
         let voters = self.get_nodes_with_value(value, |nom| &nom.votes);
         let acceptors = self.get_nodes_with_value(value, |nom| &nom.accepted);
         let supporters: HashSet<_> = voters.union(&acceptors).cloned().collect();
-        let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { driver.get_quorum_set(node_id) };
+        let qsets = self.nomination_quorum_set_map(local_node_id, local_quorum_set, driver);
+        let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
 
         is_blocking_set(local_quorum_set, &acceptors)
             || is_quorum(local_quorum_set, &supporters, get_qs)
@@ -763,11 +803,13 @@ impl NominationProtocol {
     fn should_ratify_value<D: SCPDriver>(
         &self,
         value: &Value,
+        local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
     ) -> bool {
         let acceptors = self.get_nodes_with_value(value, |nom| &nom.accepted);
-        let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { driver.get_quorum_set(node_id) };
+        let qsets = self.nomination_quorum_set_map(local_node_id, local_quorum_set, driver);
+        let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
         is_quorum(local_quorum_set, &acceptors, get_qs)
     }
 

@@ -796,6 +796,13 @@ impl ScpDriver {
                 } else {
                     (0, 0)
                 }
+            } else if *self.is_tracking.read() {
+                // When tracking but no ledger manager or externalized data (e.g., after
+                // bootstrap), derive the LCL from the tracking consensus index.
+                // tracking_consensus_index is the next slot to close, so LCL = index - 1.
+                let tracking_index = *self.tracking_consensus_index.read();
+                let tracking_close_time = *self.tracking_consensus_close_time.read();
+                (tracking_index.saturating_sub(1), tracking_close_time)
             } else {
                 (0, 0)
             }

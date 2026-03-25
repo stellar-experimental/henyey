@@ -2276,10 +2276,10 @@ mod tests {
     use henyey_crypto::SecretKey;
     use henyey_scp::hash_quorum_set;
     use stellar_xdr::curr::{
-        EnvelopeType, LedgerCloseValueSignature, Limits, NodeId as XdrNodeId, ScpBallot,
-        ScpNomination, ScpStatement, ScpStatementExternalize, ScpStatementPledges,
-        ScpStatementPrepare, Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint,
-        Value, WriteXdr,
+        EnvelopeType, LedgerCloseValueSignature, LedgerUpgrade, Limits, NodeId as XdrNodeId,
+        ReadXdr, ScpBallot, ScpNomination, ScpStatement, ScpStatementExternalize,
+        ScpStatementPledges, ScpStatementPrepare, Signature as XdrSignature, StellarValue,
+        StellarValueExt, TimePoint, Value, WriteXdr,
     };
 
     fn make_test_herder() -> Herder {
@@ -2975,6 +2975,79 @@ mod tests {
         let result = herder.receive_scp_envelope(env);
         // Should be Invalid due to close-time, NOT InvalidSignature
         assert_eq!(result, EnvelopeState::Invalid);
+    }
+
+    /// Regression test for root cause #5: solo validator should include upgrades
+    /// in externalized value when runtime upgrades are armed.
+    #[tokio::test]
+    async fn test_trigger_next_ledger_includes_runtime_upgrades() {
+        let (herder, _secret) = make_validator_herder();
+
+        // Set runtime upgrades: protocol version 25, base reserve 5000000
+        let upgrade_params = crate::upgrades::UpgradeParameters {
+            upgrade_time: 0, // immediate
+            protocol_version: Some(25),
+            base_reserve: Some(5_000_000),
+            ..Default::default()
+        };
+        herder
+            .set_upgrade_parameters(upgrade_params)
+            .expect("set_upgrade_parameters should succeed");
+
+        // Bootstrap herder to Tracking state (required for trigger_next_ledger)
+        herder.bootstrap(1);
+        assert_eq!(herder.state(), HerderState::Tracking);
+
+        // Trigger consensus for ledger 2 (no LedgerManager, so header defaults
+        // to version=0, base_reserve=0 — upgrades should fire)
+        let result = herder.trigger_next_ledger(2).await;
+        assert!(
+            result.is_ok(),
+            "trigger_next_ledger should succeed: {:?}",
+            result.err()
+        );
+
+        // For a solo validator (1-of-1 quorum), nomination→ballot→externalization
+        // happens synchronously. The externalized value should contain the upgrades.
+        let externalized = herder.scp_driver.get_externalized(2);
+        assert!(
+            externalized.is_some(),
+            "Slot 2 should be externalized for solo validator"
+        );
+
+        let ext = externalized.unwrap();
+        let stellar_value =
+            StellarValue::from_xdr(&ext.value, Limits::none()).expect("should parse StellarValue");
+
+        // Verify upgrades are present
+        assert!(
+            !stellar_value.upgrades.is_empty(),
+            "Externalized StellarValue should contain upgrades, but upgrades vec is empty"
+        );
+
+        // Decode and verify the specific upgrades
+        let mut found_version = false;
+        let mut found_reserve = false;
+        for upgrade_bytes in stellar_value.upgrades.iter() {
+            if let Ok(upgrade) = LedgerUpgrade::from_xdr(&upgrade_bytes.0, Limits::none()) {
+                match upgrade {
+                    LedgerUpgrade::Version(v) => {
+                        assert_eq!(v, 25, "Expected protocol version 25");
+                        found_version = true;
+                    }
+                    LedgerUpgrade::BaseReserve(r) => {
+                        assert_eq!(r, 5_000_000, "Expected base reserve 5000000");
+                        found_reserve = true;
+                    }
+                    other => panic!("Unexpected upgrade: {:?}", other),
+                }
+            }
+        }
+        assert!(found_version, "Should have found Version(25) upgrade");
+        assert!(
+            found_reserve,
+            "Should have found BaseReserve(5000000) upgrade"
+        );
     }
 }
 
