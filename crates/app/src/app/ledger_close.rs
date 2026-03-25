@@ -1544,8 +1544,12 @@ impl App {
             self.ledger_tx_count.fetch_add(1, Ordering::Relaxed);
         }
 
+        // Pass both applied and failed hashes so account_states are cleared
+        // for all transactions, allowing the account to submit new ones.
+        let mut all_hashes = applied_hashes.clone();
+        all_hashes.extend_from_slice(&failed_hashes);
         self.herder
-            .ledger_closed(pending.ledger_seq as u64, &applied_hashes);
+            .ledger_closed(pending.ledger_seq as u64, &all_hashes);
 
         // Clear per-ledger overlay state (flood gate, etc.) for old ledgers.
         // Mirrors upstream HerderImpl::eraseBelow() -> clearLedgersBelow().

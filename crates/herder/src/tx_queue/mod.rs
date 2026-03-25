@@ -1362,14 +1362,33 @@ impl TransactionQueue {
         TxQueueResult::Added
     }
 
-    /// Remove transactions that were applied in a ledger (simple version).
+    /// Remove transactions that were applied in a ledger.
     ///
-    /// This is a simplified version that only removes by hash.
-    /// For full per-account tracking, use `remove_applied_with_seq()`.
+    /// Removes each transaction from `by_hash` and clears the corresponding
+    /// `account_states` entry so that subsequent transactions from the same
+    /// source account are not rejected with `TryAgainLater`.
     pub fn remove_applied_by_hash(&self, tx_hashes: &[Hash256]) {
         let mut by_hash = self.by_hash.write();
+        let mut account_states = self.account_states.write();
         for hash in tx_hashes {
-            by_hash.remove(hash);
+            if let Some(removed) = by_hash.remove(hash) {
+                // Clear account state so the next tx from this account is accepted.
+                let seq_source_id = henyey_tx::muxed_to_account_id(
+                    &henyey_tx::TransactionFrame::from_owned_with_network(
+                        removed.envelope.clone(),
+                        self.config.network_id,
+                    )
+                    .inner_source_account(),
+                );
+                let seq_source_key = account_key_from_account_id(&seq_source_id);
+                if let Some(state) = account_states.get_mut(&seq_source_key) {
+                    // Only clear if the pending tx matches the one we removed.
+                    if state.transaction.as_ref().map(|t| &t.hash) == Some(hash) {
+                        state.transaction = None;
+                        state.age = 0;
+                    }
+                }
+            }
         }
         // Keep in seen to prevent re-adding
     }
