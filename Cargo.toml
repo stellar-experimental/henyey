@@ -19,11 +19,8 @@ members = [
     "crates/historywork",
     "crates/rpc",
 ]
-# Vendored soroban-env crates are NOT workspace members (name collision between P24/P25).
-# They are referenced as path dependencies from workspace.dependencies below.
-exclude = [
-    "vendor",
-]
+# Soroban-env crates from crates.io are NOT workspace members.
+# They are referenced as workspace dependencies with version pins below.
 
 [workspace.package]
 version = "0.1.0"
@@ -41,14 +38,10 @@ stellar-xdr = { version = "=25.0.0", default-features = false, features = ["std"
 stellar-strkey = "0.0.11"
 
 # Soroban host for Protocol 24 (supports protocols 20-24)
-# Vendored from stellar/rs-soroban-env rev a37eeda8, with typed invoke API backported
-soroban-env-host-p24 = { package = "soroban-env-host", path = "vendor/soroban-env-p24/soroban-env-host" }
-soroban-env-common-p24 = { package = "soroban-env-common", path = "vendor/soroban-env-p24/soroban-env-common" }
+soroban-env-host-p24 = { package = "soroban-env-host", version = "=24.0.0" }
 
 # Soroban host for Protocol 25 (supports protocol 25+)
-# Vendored from stellar/rs-soroban-env v25.0.0 (rev d2ff024b), with typed invoke API added
-soroban-env-host-p25 = { package = "soroban-env-host", path = "vendor/soroban-env-p25/soroban-env-host" }
-soroban-env-common-p25 = { package = "soroban-env-common", path = "vendor/soroban-env-p25/soroban-env-common" }
+soroban-env-host-p25 = { package = "soroban-env-host", version = "=25.0.0" }
 
 # Workspace crates
 henyey-common = { path = "crates/common" }
