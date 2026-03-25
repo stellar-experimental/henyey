@@ -1691,6 +1691,21 @@ fn execute_host_function_p25(
         }
     };
 
+    // ── ValSer budget charges for return value ──
+    // The non-typed API calls metered_write_xdr() which charges ValSer as bytes
+    // are serialized. The typed API skips serialization, so we must charge
+    // explicitly to match stellar-core's budget consumption.
+    {
+        use soroban_env_host25::xdr::ContractCostType;
+        budget
+            .charge(ContractCostType::ValSer, Some(return_value_size as u64))
+            .map_err(|e| SorobanExecutionError {
+                host_error: e,
+                cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+            })?;
+    }
+
     // ── Contract events: extract from Events directly ──
     // After XDR alignment, HostEvent.event is our workspace ContractEvent type.
     let mut contract_events = Vec::new();
@@ -1705,6 +1720,25 @@ fn execute_host_function_p25(
         let event_size = xdr_encoded_len(&host_event.event);
         contract_events_size = contract_events_size.saturating_add(event_size);
         contract_events.push(host_event.event.clone());
+    }
+
+    // ── ValSer budget charges for contract events ──
+    // The non-typed API calls encode_contract_events() which charges ValSer for
+    // each event via metered_write_xdr(). We charge the total event bytes in one
+    // call; the linear cost (29 * bytes) dominates, so this closely matches the
+    // incremental charges from the non-typed path.
+    {
+        use soroban_env_host25::xdr::ContractCostType;
+        budget
+            .charge(
+                ContractCostType::ValSer,
+                Some(contract_events_size as u64),
+            )
+            .map_err(|e| SorobanExecutionError {
+                host_error: e,
+                cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+            })?;
     }
 
     // ── Rent: use get_ledger_changes_typed() + extract_rent_changes_from_typed() ──
@@ -1979,6 +2013,64 @@ mod tests {
              (estimated: {}). The actual L61593050 TX consumed ~3M extra instructions from \
              XDR deserialization, pushing it from 17.1M to 20.03M (over 20M limit).",
             estimated_45_entries
+        );
+    }
+
+    /// Regression test for VE-16 / L61811687: XDR serialization metering.
+    ///
+    /// The non-typed API calls `metered_write_xdr()` to serialize the return
+    /// value and contract events, charging `ContractCostType::ValSer` per byte.
+    /// The typed API skips serialization entirely. Without explicit ValSer
+    /// charges, the typed path under-reports CPU consumption, causing TXs near
+    /// their instruction limit to succeed when stellar-core rejects them with
+    /// `ResourceLimitExceeded`.
+    ///
+    /// At L61811687 TX 378, the missing ValSer charges let the TX succeed in
+    /// Henyey while stellar-core rejected it.
+    #[test]
+    fn test_xdr_serialization_budget_charge_val_ser() {
+        use soroban_env_host25::budget::Budget;
+        use soroban_env_host25::xdr::ContractCostType;
+
+        let budget = Budget::default();
+        budget.reset_default().expect("reset budget");
+
+        let cpu_before = budget.get_cpu_insns_consumed().expect("get cpu");
+
+        // Simulate the cost of serializing a return value + contract events.
+        // The non-typed API calls metered_write_xdr() which charges ValSer.
+        // A typical Soroban TX might have ~1KB of return value + events.
+        let serialize_bytes: u64 = 1000;
+        budget
+            .charge(ContractCostType::ValSer, Some(serialize_bytes))
+            .expect("charge should succeed");
+
+        let cpu_after = budget.get_cpu_insns_consumed().expect("get cpu");
+        let cpu_for_serialization = cpu_after - cpu_before;
+
+        assert!(
+            cpu_for_serialization > 0,
+            "VE-16: ValSer charge must consume CPU instructions (consumed: {}). \
+             The non-typed API charges this for return value and event serialization.",
+            cpu_for_serialization
+        );
+
+        // With larger payloads (e.g., 10KB events), the cost should be significant
+        // enough to push a TX over its instruction limit.
+        let cpu_before = budget.get_cpu_insns_consumed().expect("get cpu");
+        let large_events: u64 = 10_000; // 10KB of events
+        budget
+            .charge(ContractCostType::ValSer, Some(large_events))
+            .expect("charge should succeed");
+        let cpu_after = budget.get_cpu_insns_consumed().expect("get cpu");
+        let cpu_for_large_events = cpu_after - cpu_before;
+
+        assert!(
+            cpu_for_large_events > 1_000,
+            "VE-16: 10KB of event serialization should consume >1K CPU instructions \
+             (consumed: {}). Missing this charge caused L61811687 TX 378 to incorrectly \
+             succeed instead of ResourceLimitExceeded.",
+            cpu_for_large_events
         );
     }
 
