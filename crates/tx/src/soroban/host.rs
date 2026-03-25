@@ -1668,10 +1668,20 @@ fn execute_host_function_p25(
 
     // ── Process typed result ──
     // Return value: already a typed Result<ScVal, HostError>.
+    // The non-typed API serializes the return value via metered_write_xdr() which
+    // charges ValSer per write() call. We must do the same serialization to match
+    // stellar-core's budget consumption exactly (VE-16).
     let (return_value, return_value_size) = match result.invoke_result {
         Ok(ref val) => {
-            // Compute byte size without heap allocation (counting writer).
-            let size = xdr_encoded_len(val);
+            let mut buf = vec![];
+            soroban_env_host25::metered_write_xdr(&budget, val, &mut buf).map_err(|e| {
+                SorobanExecutionError {
+                    host_error: e,
+                    cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+                    mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+                }
+            })?;
+            let size = buf.len() as u32;
             (val.clone(), size)
         }
         Err(ref e) => {
@@ -1691,23 +1701,9 @@ fn execute_host_function_p25(
         }
     };
 
-    // ── ValSer budget charges for return value ──
-    // The non-typed API calls metered_write_xdr() which charges ValSer as bytes
-    // are serialized. The typed API skips serialization, so we must charge
-    // explicitly to match stellar-core's budget consumption.
-    {
-        use soroban_env_host25::xdr::ContractCostType;
-        budget
-            .charge(ContractCostType::ValSer, Some(return_value_size as u64))
-            .map_err(|e| SorobanExecutionError {
-                host_error: e,
-                cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
-                mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
-            })?;
-    }
-
-    // ── Contract events: extract from Events directly ──
-    // After XDR alignment, HostEvent.event is our workspace ContractEvent type.
+    // ── Contract events: serialize via metered_write_xdr for exact ValSer parity ──
+    // The non-typed API calls encode_contract_events() which uses metered_write_xdr()
+    // per event, charging ValSer per write() call. We replicate that exact metering.
     let mut contract_events = Vec::new();
     let mut contract_events_size = 0u32;
     for host_event in result.events.0.iter() {
@@ -1716,29 +1712,16 @@ fn execute_host_function_p25(
         {
             continue;
         }
-        // Compute byte size without heap allocation (counting writer).
-        let event_size = xdr_encoded_len(&host_event.event);
-        contract_events_size = contract_events_size.saturating_add(event_size);
-        contract_events.push(host_event.event.clone());
-    }
-
-    // ── ValSer budget charges for contract events ──
-    // The non-typed API calls encode_contract_events() which charges ValSer for
-    // each event via metered_write_xdr(). We charge the total event bytes in one
-    // call; the linear cost (29 * bytes) dominates, so this closely matches the
-    // incremental charges from the non-typed path.
-    {
-        use soroban_env_host25::xdr::ContractCostType;
-        budget
-            .charge(
-                ContractCostType::ValSer,
-                Some(contract_events_size as u64),
-            )
-            .map_err(|e| SorobanExecutionError {
+        let mut buf = vec![];
+        soroban_env_host25::metered_write_xdr(&budget, &host_event.event, &mut buf).map_err(
+            |e| SorobanExecutionError {
                 host_error: e,
                 cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
                 mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
-            })?;
+            },
+        )?;
+        contract_events_size = contract_events_size.saturating_add(buf.len() as u32);
+        contract_events.push(host_event.event.clone());
     }
 
     // ── Rent: use get_ledger_changes_typed() + extract_rent_changes_from_typed() ──
@@ -2016,62 +1999,48 @@ mod tests {
         );
     }
 
-    /// Regression test for VE-16 / L61811687: XDR serialization metering.
+    /// Regression test for VE-16 / L61811687: metered XDR serialization.
     ///
     /// The non-typed API calls `metered_write_xdr()` to serialize the return
-    /// value and contract events, charging `ContractCostType::ValSer` per byte.
-    /// The typed API skips serialization entirely. Without explicit ValSer
-    /// charges, the typed path under-reports CPU consumption, causing TXs near
-    /// their instruction limit to succeed when stellar-core rejects them with
-    /// `ResourceLimitExceeded`.
+    /// value and contract events, charging `ContractCostType::ValSer` per
+    /// `write()` call (const_term per call + lin_term per byte). The typed API
+    /// skips serialization entirely. Without matching serialization charges,
+    /// the typed path under-reports CPU consumption.
     ///
-    /// At L61811687 TX 378, the missing ValSer charges let the TX succeed in
-    /// Henyey while stellar-core rejected it.
+    /// At L61811687 TX 378, the missing metered serialization let the TX succeed
+    /// in Henyey while stellar-core rejected it with `ResourceLimitExceeded`.
     #[test]
-    fn test_xdr_serialization_budget_charge_val_ser() {
+    fn test_metered_write_xdr_val_ser_charges() {
         use soroban_env_host25::budget::Budget;
-        use soroban_env_host25::xdr::ContractCostType;
 
         let budget = Budget::default();
         budget.reset_default().expect("reset budget");
 
+        // Create a non-trivial ScVal to serialize (Bytes with 1KB payload).
+        let val = stellar_xdr::curr::ScVal::Bytes(
+            stellar_xdr::curr::ScBytes::try_from(vec![0u8; 1000]).unwrap(),
+        );
+
         let cpu_before = budget.get_cpu_insns_consumed().expect("get cpu");
-
-        // Simulate the cost of serializing a return value + contract events.
-        // The non-typed API calls metered_write_xdr() which charges ValSer.
-        // A typical Soroban TX might have ~1KB of return value + events.
-        let serialize_bytes: u64 = 1000;
-        budget
-            .charge(ContractCostType::ValSer, Some(serialize_bytes))
-            .expect("charge should succeed");
-
+        let mut buf = vec![];
+        soroban_env_host25::metered_write_xdr(&budget, &val, &mut buf)
+            .expect("metered_write_xdr should succeed");
         let cpu_after = budget.get_cpu_insns_consumed().expect("get cpu");
         let cpu_for_serialization = cpu_after - cpu_before;
 
+        // metered_write_xdr charges ValSer per write() call. For a Bytes(1KB):
+        // ~3 write calls (discriminant, length, payload) each with const_term.
+        // This must consume meaningful CPU instructions.
         assert!(
-            cpu_for_serialization > 0,
-            "VE-16: ValSer charge must consume CPU instructions (consumed: {}). \
-             The non-typed API charges this for return value and event serialization.",
+            cpu_for_serialization > 500,
+            "VE-16: metered_write_xdr of 1KB ScVal::Bytes should consume >500 CPU \
+             instructions (consumed: {}). The per-write ValSer charges are critical \
+             for budget parity with stellar-core.",
             cpu_for_serialization
         );
 
-        // With larger payloads (e.g., 10KB events), the cost should be significant
-        // enough to push a TX over its instruction limit.
-        let cpu_before = budget.get_cpu_insns_consumed().expect("get cpu");
-        let large_events: u64 = 10_000; // 10KB of events
-        budget
-            .charge(ContractCostType::ValSer, Some(large_events))
-            .expect("charge should succeed");
-        let cpu_after = budget.get_cpu_insns_consumed().expect("get cpu");
-        let cpu_for_large_events = cpu_after - cpu_before;
-
-        assert!(
-            cpu_for_large_events > 1_000,
-            "VE-16: 10KB of event serialization should consume >1K CPU instructions \
-             (consumed: {}). Missing this charge caused L61811687 TX 378 to incorrectly \
-             succeed instead of ResourceLimitExceeded.",
-            cpu_for_large_events
-        );
+        // Verify the serialized bytes match XDR expectations.
+        assert_eq!(buf.len(), 1008); // 4 (discriminant) + 4 (length) + 1000 (data)
     }
 
     /// Test StorageChange struct representing a delete (new_entry = None).

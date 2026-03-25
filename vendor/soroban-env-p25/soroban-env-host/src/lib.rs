@@ -37,8 +37,8 @@ pub use vm::{CompilationContext, ModuleCache, Vm};
 pub mod storage;
 pub use budget::{DEFAULT_HOST_DEPTH_LIMIT, DEFAULT_XDR_RW_LIMITS};
 pub use host::{
-    metered_map::MeteredOrdMap, metered_vector::MeteredVector, ErrorHandler, Host, HostError, Seed,
-    SEED_BYTES,
+    metered_map::MeteredOrdMap, metered_vector::MeteredVector, metered_xdr::metered_write_xdr,
+    ErrorHandler, Host, HostError, Seed, SEED_BYTES,
 };
 pub use soroban_env_common::*;
 
