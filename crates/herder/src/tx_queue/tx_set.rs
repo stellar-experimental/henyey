@@ -369,6 +369,12 @@ fn validate_sequential_phase_xdr_structure(
                 if comp.txs.is_empty() {
                     return Err("Empty component in sequential phase".to_string());
                 }
+                // Reject negative base fees (parity: TxSetFrame.cpp:1442)
+                if let Some(fee) = comp.base_fee {
+                    if fee < 0 {
+                        return Err("Component has negative base fee".to_string());
+                    }
+                }
             }
         }
     }
@@ -380,6 +386,12 @@ fn validate_sequential_phase_xdr_structure(
 fn validate_parallel_component(
     parallel: &stellar_xdr::curr::ParallelTxsComponent,
 ) -> std::result::Result<(), String> {
+    // Reject negative base fees (parity: TxSetFrame.cpp:1480)
+    if let Some(fee) = parallel.base_fee {
+        if fee < 0 {
+            return Err("Parallel component has negative base fee".to_string());
+        }
+    }
     for stage in parallel.execution_stages.iter() {
         if stage.is_empty() {
             return Err("Empty stage in parallel phase".to_string());
@@ -1166,5 +1178,73 @@ mod tests {
             vec![make_tx_envelope(1, 100), make_tx_envelope(2, 200)],
         );
         assert_eq!(tx_set.recompute_hash(), Some(tx_set.hash));
+    }
+
+    // --- Negative base fee rejection tests (parity: TxSetFrame.cpp:1442, 1480) ---
+
+    #[test]
+    fn test_validate_sequential_phase_rejects_negative_base_fee() {
+        let components = vec![make_classic_component(
+            vec![make_tx_envelope(1, 100)],
+            Some(-1),
+        )];
+        let result = validate_sequential_phase_xdr_structure(&components);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("negative base fee"),
+            "should reject negative base fee"
+        );
+    }
+
+    #[test]
+    fn test_validate_sequential_phase_accepts_zero_base_fee() {
+        let components = vec![make_classic_component(
+            vec![make_tx_envelope(1, 100)],
+            Some(0),
+        )];
+        let result = validate_sequential_phase_xdr_structure(&components);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_parallel_component_rejects_negative_base_fee() {
+        let mut sorted_tx = vec![make_tx_envelope(1, 100)];
+        sort_txs_by_hash(&mut sorted_tx);
+        let parallel = make_parallel_component(vec![vec![sorted_tx]], Some(-5));
+        let result = validate_parallel_component(&parallel);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("negative base fee"),
+            "should reject negative base fee"
+        );
+    }
+
+    #[test]
+    fn test_validate_parallel_component_accepts_zero_base_fee() {
+        let mut sorted_tx = vec![make_tx_envelope(1, 100)];
+        sort_txs_by_hash(&mut sorted_tx);
+        let parallel = make_parallel_component(vec![vec![sorted_tx]], Some(0));
+        let result = validate_parallel_component(&parallel);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_generalized_tx_set_rejects_negative_base_fee_in_classic_phase() {
+        let mut sorted_tx = vec![make_tx_envelope(2, 200)];
+        sort_txs_by_hash(&mut sorted_tx);
+        let gen = make_gen_tx_set(vec![
+            TransactionPhase::V0(
+                vec![make_classic_component(
+                    vec![make_tx_envelope(1, 100)],
+                    Some(-10),
+                )]
+                .try_into()
+                .unwrap(),
+            ),
+            TransactionPhase::V1(make_parallel_component(vec![vec![sorted_tx]], Some(100))),
+        ]);
+        let result = validate_generalized_tx_set_xdr_structure(&gen);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("negative base fee"));
     }
 }

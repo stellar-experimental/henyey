@@ -175,7 +175,18 @@ impl HistoryArchive {
     ) -> Result<Vec<LedgerHeaderHistoryEntry>, HistoryError> {
         let path = checkpoint_path("ledger", checkpoint, "xdr.gz");
         let data = self.download_xdr_gz(&path).await?;
-        parse_record_marked_xdr_stream(&data)
+        parse_record_marked_xdr_stream(&data).map_err(|e| {
+            // Classify any XDR parsing / runtime error during header
+            // deserialization as CorruptHeader, matching stellar-core's
+            // VERIFY_STATUS_ERR_CORRUPT_HEADER.
+            match &e {
+                HistoryError::Xdr(_) | HistoryError::XdrParsing(_) => HistoryError::CorruptHeader {
+                    ledger: checkpoint,
+                    detail: e.to_string(),
+                },
+                _ => e,
+            }
+        })
     }
 
     /// Download transactions for a checkpoint.

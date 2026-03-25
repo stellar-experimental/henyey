@@ -711,6 +711,11 @@ impl TransactionQueue {
             return Err(TxResultCode::TxSorobanInvalid);
         }
 
+        // Validate Soroban create-contract host function pairing
+        if !frame.validate_host_fn() {
+            return Err(TxResultCode::TxSorobanInvalid);
+        }
+
         // Build ledger context once for time-bound and signature validation.
         let ledger_ctx = LedgerContext::new(
             ctx.ledger_seq,
@@ -1945,10 +1950,11 @@ mod tests {
     use henyey_common::{Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES};
     use henyey_crypto::{sign_hash, SecretKey};
     use stellar_xdr::curr::{
-        AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, DecoratedSignature, Duration,
-        HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, ManageSellOfferOp,
-        Memo, MuxedAccount, MuxedAccountMed25519, Operation, OperationBody, PaymentOp,
-        Preconditions, PreconditionsV2, Price, PublicKey, ScAddress, ScSymbol, ScVal,
+        AccountId, AlphaNum4, Asset, AssetCode4, ContractExecutable, ContractIdPreimage,
+        ContractIdPreimageFromAddress, CreateAccountOp, CreateContractArgs, DecoratedSignature,
+        Duration, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint,
+        ManageSellOfferOp, Memo, MuxedAccount, MuxedAccountMed25519, Operation, OperationBody,
+        PaymentOp, Preconditions, PreconditionsV2, Price, PublicKey, ScAddress, ScSymbol, ScVal,
         SequenceNumber, Signature as XdrSignature, SignatureHint, SignerKey, SorobanResources,
         SorobanTransactionData, SorobanTransactionDataExt, StringM, Transaction,
         TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
@@ -4395,6 +4401,103 @@ mod tests {
         // Normal soroban tx with MEMO_NONE should pass memo validation
         let mut envelope = make_soroban_envelope(500);
         set_source(&mut envelope, 111);
+
+        assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
+    }
+
+    // --- P3: Soroban create-contract host function pairing validation at queue time ---
+
+    /// Helper to create a Soroban envelope with a CreateContract host function.
+    fn make_create_contract_envelope(
+        preimage: ContractIdPreimage,
+        executable: ContractExecutable,
+    ) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([120u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::CreateContract(CreateContractArgs {
+                    contract_id_preimage: preimage,
+                    executable,
+                }),
+                auth: VecM::default(),
+            }),
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee: 500,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: VecM::default(),
+                        read_write: VecM::default(),
+                    },
+                    instructions: 100,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 50,
+            }),
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    #[test]
+    fn test_create_contract_from_asset_with_wasm_rejected() {
+        let queue = TransactionQueue::with_defaults();
+        let mut envelope = make_create_contract_envelope(
+            ContractIdPreimage::Asset(Asset::Native),
+            ContractExecutable::Wasm(Hash([12u8; 32])),
+        );
+        set_source(&mut envelope, 121);
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxSorobanInvalid)) => {}
+            other => panic!("expected Invalid(TxSorobanInvalid), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_contract_from_address_with_stellar_asset_rejected() {
+        let queue = TransactionQueue::with_defaults();
+        let mut envelope = make_create_contract_envelope(
+            ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [10u8; 32],
+                )))),
+                salt: Uint256([11u8; 32]),
+            }),
+            ContractExecutable::StellarAsset,
+        );
+        set_source(&mut envelope, 122);
+
+        match queue.try_add(envelope) {
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxSorobanInvalid)) => {}
+            other => panic!("expected Invalid(TxSorobanInvalid), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_contract_valid_pairing_accepted() {
+        let queue = TransactionQueue::with_defaults();
+        let mut envelope = make_create_contract_envelope(
+            ContractIdPreimage::Asset(Asset::Native),
+            ContractExecutable::StellarAsset,
+        );
+        set_source(&mut envelope, 123);
 
         assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
     }

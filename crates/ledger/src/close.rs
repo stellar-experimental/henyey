@@ -48,6 +48,25 @@ type TxWithHash = (Arc<TransactionEnvelope>, Option<u32>, Hash256);
 /// Arc'd transaction with precomputed hash, used during parallel stage sorting.
 type ArcTxWithHash = (Arc<TransactionEnvelope>, Hash256);
 
+/// Convert an optional i64 base fee to `Option<u32>`.
+///
+/// Negative base fees are rejected during tx-set validation
+/// (`validate_generalized_tx_set_xdr_structure`), so any negative value reaching
+/// this point indicates a programming error.
+///
+/// Parity: stellar-core rejects negative baseFee during tx-set parsing
+/// (TxSetFrame.cpp:1442, 1480).
+fn base_fee_to_u32(fee: Option<i64>) -> Option<u32> {
+    fee.map(|f| {
+        u32::try_from(f).unwrap_or_else(|_| {
+            panic!(
+                "negative base fee {} in tx-set should have been rejected during validation",
+                f
+            )
+        })
+    })
+}
+
 /// Result of applying config upgrades during ledger close.
 pub struct ConfigUpgradeResult {
     /// Whether state archival settings changed (requires eviction scan resize).
@@ -364,7 +383,7 @@ impl TransactionSetVariant {
                             for comp in components.iter() {
                                 match comp {
                                     stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
-                                        let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                        let base_fee = base_fee_to_u32(c.base_fee);
                                         phase_txs.extend(c.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)));
                                     }
                                 }
@@ -373,7 +392,7 @@ impl TransactionSetVariant {
                         }
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
                             let base_fee =
-                                parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                base_fee_to_u32(parallel.base_fee);
                             txs.extend(sorted_for_apply_parallel(
                                 parallel.execution_stages.as_slice(),
                                 set_hash,
@@ -412,7 +431,7 @@ impl TransactionSetVariant {
                         for comp in components.iter() {
                             match comp {
                                 stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
-                                    let base_fee = c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                    let base_fee = base_fee_to_u32(c.base_fee);
                                     phase_txs.extend(c.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)));
                                 }
                             }
@@ -439,7 +458,7 @@ impl TransactionSetVariant {
                 let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
                 for phase in set_v1.phases.iter() {
                     if let stellar_xdr::curr::TransactionPhase::V1(parallel) = phase {
-                        let base_fee = parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                        let base_fee = base_fee_to_u32(parallel.base_fee);
 
                         let stages = sorted_stages_for_parallel(
                             parallel.execution_stages.as_slice(),
@@ -729,7 +748,7 @@ impl TransactionSetVariant {
                                 match comp {
                                     stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
                                         let base_fee =
-                                            c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                            base_fee_to_u32(c.base_fee);
                                         phase_txs.extend(
                                             Vec::from(c.txs).into_iter().map(|tx| (Arc::new(tx), base_fee)),
                                         );
@@ -742,7 +761,7 @@ impl TransactionSetVariant {
                         }
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
                             let base_fee =
-                                parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                base_fee_to_u32(parallel.base_fee);
                             let stages: ParallelStages = Vec::from(parallel.execution_stages)
                                 .into_iter()
                                 .map(|stage| {
@@ -818,7 +837,7 @@ impl TransactionSetVariant {
                                 match comp {
                                     stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
                                         let base_fee =
-                                            c.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                            base_fee_to_u32(c.base_fee);
                                         phase_txs.extend(
                                             c.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)),
                                         );
@@ -831,7 +850,7 @@ impl TransactionSetVariant {
                         }
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
                             let base_fee =
-                                parallel.base_fee.and_then(|fee| u32::try_from(fee).ok());
+                                base_fee_to_u32(parallel.base_fee);
                             let stages = sorted_stages_for_parallel(
                                 parallel.execution_stages.as_slice(),
                                 hash,

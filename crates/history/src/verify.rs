@@ -226,7 +226,10 @@ pub fn verify_ledger_hash(header: &LedgerHeader, bucket_list_hash: &Hash256) -> 
 pub fn compute_header_hash(header: &LedgerHeader) -> Result<Hash256> {
     let xdr_bytes = header
         .to_xdr(stellar_xdr::curr::Limits::none())
-        .map_err(|e| HistoryError::VerificationFailed(format!("failed to encode header: {}", e)))?;
+        .map_err(|e| HistoryError::CorruptHeader {
+            ledger: header.ledger_seq,
+            detail: format!("failed to encode header: {}", e),
+        })?;
 
     Ok(Hash256::hash(&xdr_bytes))
 }

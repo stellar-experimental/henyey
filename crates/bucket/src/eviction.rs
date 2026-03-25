@@ -230,22 +230,50 @@ impl EvictionResult {
     ///
     /// This matches stellar-core's `resolveBackgroundEvictionScan`:
     /// 1. Filter out entries whose TTL was modified by transactions in this ledger
-    /// 2. Evict up to `max_entries_to_archive` entries from the filtered set
-    /// 3. Set the iterator position:
+    /// 2. For remaining entries, check if the live entry key was modified — if so,
+    ///    log an internal bug (this should not happen in a correct system)
+    /// 3. Evict up to `max_entries_to_archive` entries from the filtered set
+    /// 4. Set the iterator position:
     ///    - If the entry limit was hit: resume from the last evicted entry's position
     ///    - Otherwise (including max_entries=0): advance to end of scan region
     pub fn resolve(
         self,
         max_entries_to_archive: u32,
-        modified_ttl_keys: &std::collections::HashSet<LedgerKey>,
+        modified_keys: &std::collections::HashSet<LedgerKey>,
     ) -> ResolvedEviction {
         let scan_end_iterator = self.end_iterator;
 
-        // Phase 1: Filter out entries with modified TTLs
+        // Phase 1: Filter out entries with modified TTLs, and check for
+        // modified live entries (internal consistency check).
+        //
+        // Parity: stellar-core's `resolveBackgroundEvictionScan` uses a
+        // single `modifiedKeys` set containing ALL keys touched in the
+        // current ledger (data + TTL). For each candidate:
+        //   - If TTL key is in modifiedKeys → filter out (don't evict).
+        //   - Else if data key is in modifiedKeys → log internal bug
+        //     (a data-key write without a TTL update should not happen).
         let filtered: Vec<_> = self
             .candidates
             .into_iter()
-            .filter(|c| !modified_ttl_keys.contains(&c.ttl_key))
+            .filter(|c| {
+                if modified_keys.contains(&c.ttl_key) {
+                    // TTL was modified this ledger — skip eviction.
+                    return false;
+                }
+
+                // Parity: stellar-core checks if the live entry key was
+                // modified while the TTL was not. This should never happen
+                // in a correct system (a restore or write would also touch
+                // the TTL). Log it as an internal bug.
+                if modified_keys.contains(&c.data_key) {
+                    tracing::error!(
+                        key = ?c.data_key,
+                        "Eviction attempted on modified live entry — this is an internal bug"
+                    );
+                }
+
+                true
+            })
             .collect();
 
         // Phase 2: Apply max_entries limit and collect results
@@ -778,5 +806,201 @@ mod tests {
         assert_eq!(round_down(100, 32), 96);
         assert_eq!(round_down(127, 64), 64);
         assert_eq!(round_down(128, 64), 128);
+    }
+
+    // --- EvictionResult::resolve() tests ---
+
+    use stellar_xdr::curr::{
+        ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash,
+        LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyContractData,
+        LedgerKeyTtl, ScAddress, ScVal,
+    };
+
+    fn make_contract_data_candidate(
+        key_bytes: [u8; 32],
+        is_temporary: bool,
+    ) -> EvictionCandidate {
+        let data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash(key_bytes))),
+            key: ScVal::Void,
+            durability: if is_temporary {
+                ContractDataDurability::Temporary
+            } else {
+                ContractDataDurability::Persistent
+            },
+        });
+        let ttl_key = LedgerKey::Ttl(LedgerKeyTtl {
+            key_hash: Hash(key_bytes),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(key_bytes))),
+                key: ScVal::Void,
+                durability: if is_temporary {
+                    ContractDataDurability::Temporary
+                } else {
+                    ContractDataDurability::Persistent
+                },
+                val: ScVal::Void,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        EvictionCandidate {
+            entry,
+            data_key,
+            ttl_key,
+            is_temporary,
+            position: EvictionIterator::with_default_level(),
+        }
+    }
+
+    #[test]
+    fn test_resolve_filters_modified_ttl_keys() {
+        let candidate = make_contract_data_candidate([1u8; 32], true);
+        let ttl_key = candidate.ttl_key.clone();
+
+        let result = EvictionResult {
+            candidates: vec![candidate],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 1000,
+            scan_complete: true,
+        };
+
+        let mut modified = std::collections::HashSet::new();
+        modified.insert(ttl_key);
+
+        let resolved = result.resolve(10, &modified);
+        assert!(
+            resolved.evicted_keys.is_empty(),
+            "candidate with modified TTL should be filtered out"
+        );
+    }
+
+    #[test]
+    fn test_resolve_keeps_unmodified_candidates() {
+        let candidate = make_contract_data_candidate([1u8; 32], true);
+
+        let result = EvictionResult {
+            candidates: vec![candidate],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 1000,
+            scan_complete: true,
+        };
+
+        let modified = std::collections::HashSet::new(); // empty
+
+        let resolved = result.resolve(10, &modified);
+        assert_eq!(
+            resolved.evicted_keys.len(),
+            2,
+            "unmodified candidate should be evicted (data_key + ttl_key)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_logs_modified_live_entry_but_keeps_it() {
+        // When a candidate's data key is modified but its TTL key is NOT,
+        // the candidate should still be kept (not filtered), but an error
+        // should be logged. This test verifies the candidate is NOT removed.
+        let candidate = make_contract_data_candidate([1u8; 32], true);
+        let data_key = candidate.data_key.clone();
+
+        let result = EvictionResult {
+            candidates: vec![candidate],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 1000,
+            scan_complete: true,
+        };
+
+        let mut modified = std::collections::HashSet::new();
+        modified.insert(data_key); // data key modified, but TTL key is NOT
+
+        let resolved = result.resolve(10, &modified);
+        // Parity: stellar-core logs REPORT_INTERNAL_BUG but still proceeds
+        // with eviction (++iter, not erase). The candidate should still be
+        // evicted.
+        assert_eq!(
+            resolved.evicted_keys.len(),
+            2,
+            "candidate with modified data key but unmodified TTL should still be evicted"
+        );
+    }
+
+    #[test]
+    fn test_resolve_filters_ttl_not_data_when_both_modified() {
+        // When BOTH the TTL key and data key are in modified_keys,
+        // the TTL check fires first and filters out the candidate.
+        let candidate = make_contract_data_candidate([1u8; 32], true);
+        let data_key = candidate.data_key.clone();
+        let ttl_key = candidate.ttl_key.clone();
+
+        let result = EvictionResult {
+            candidates: vec![candidate],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 1000,
+            scan_complete: true,
+        };
+
+        let mut modified = std::collections::HashSet::new();
+        modified.insert(data_key);
+        modified.insert(ttl_key);
+
+        let resolved = result.resolve(10, &modified);
+        assert!(
+            resolved.evicted_keys.is_empty(),
+            "candidate should be filtered out because TTL was modified"
+        );
+    }
+
+    #[test]
+    fn test_resolve_max_entries_limit() {
+        let c1 = make_contract_data_candidate([1u8; 32], true);
+        let c2 = make_contract_data_candidate([2u8; 32], true);
+        let c3 = make_contract_data_candidate([3u8; 32], true);
+
+        let result = EvictionResult {
+            candidates: vec![c1, c2, c3],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 3000,
+            scan_complete: true,
+        };
+
+        let modified = std::collections::HashSet::new();
+
+        // Limit to 2 entries
+        let resolved = result.resolve(2, &modified);
+        assert_eq!(
+            resolved.evicted_keys.len(),
+            4,
+            "should evict 2 entries (4 keys: 2 data + 2 TTL)"
+        );
+    }
+
+    #[test]
+    fn test_resolve_persistent_entries_archived() {
+        let candidate = make_contract_data_candidate([1u8; 32], false); // persistent
+
+        let result = EvictionResult {
+            candidates: vec![candidate],
+            end_iterator: EvictionIterator::with_default_level(),
+            bytes_scanned: 1000,
+            scan_complete: true,
+        };
+
+        let modified = std::collections::HashSet::new();
+        let resolved = result.resolve(10, &modified);
+
+        assert_eq!(
+            resolved.archived_entries.len(),
+            1,
+            "persistent entry should be archived"
+        );
+        assert_eq!(
+            resolved.evicted_keys.len(),
+            2,
+            "persistent entry should also have evicted keys (data + TTL)"
+        );
     }
 }

@@ -371,11 +371,27 @@ impl AuthContext {
             return Err(OverlayError::NetworkMismatch);
         }
 
-        // Check overlay version
+        // Check overlay version range compatibility (matching stellar-core Peer::recvHello)
+        // Three conditions that cause version rejection:
+        // 1. Peer's range is malformed (min > max)
+        // 2. Peer's max version is below our minimum (peer too old)
+        // 3. Peer's min version is above our maximum (peer too new)
+        if hello.overlay_min_version > hello.overlay_version {
+            return Err(OverlayError::VersionMismatch(format!(
+                "peer overlay version range malformed: min {} > max {}",
+                hello.overlay_min_version, hello.overlay_version
+            )));
+        }
         if hello.overlay_version < self.local_node.overlay_min_version {
             return Err(OverlayError::VersionMismatch(format!(
                 "peer overlay version {} below minimum {}",
                 hello.overlay_version, self.local_node.overlay_min_version
+            )));
+        }
+        if hello.overlay_min_version > self.local_node.overlay_version {
+            return Err(OverlayError::VersionMismatch(format!(
+                "peer overlay min version {} above our maximum {}",
+                hello.overlay_min_version, self.local_node.overlay_version
             )));
         }
 
@@ -742,8 +758,8 @@ mod tests {
         let ctx = AuthContext::new(local_node, true);
 
         let hello = ctx.create_hello();
-        assert_eq!(hello.overlay_version, 38);
-        assert_eq!(hello.overlay_min_version, 35);
+        assert_eq!(hello.overlay_version, 39);
+        assert_eq!(hello.overlay_min_version, 38);
         assert_eq!(hello.ledger_version, 25);
     }
 
@@ -1076,5 +1092,113 @@ mod tests {
         assert!(restored
             .verify(&local_node.network_id, &local_node.public_key())
             .is_ok());
+    }
+
+    /// Helper: create a Hello message with custom overlay version fields.
+    fn make_hello_with_versions(
+        overlay_version: u32,
+        overlay_min_version: u32,
+        local_node: &LocalNode,
+    ) -> xdr::Hello {
+        let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let cert = AuthCert::new_cert(local_node, &ephemeral);
+        xdr::Hello {
+            ledger_version: 25,
+            overlay_version,
+            overlay_min_version,
+            network_id: xdr::Hash(*local_node.network_id.as_bytes()),
+            version_str: local_node.version_string.clone().try_into().unwrap(),
+            listening_port: local_node.listening_port as i32,
+            peer_id: xdr::NodeId(local_node.xdr_public_key()),
+            cert,
+            nonce: xdr::Uint256([42u8; 32]),
+        }
+    }
+
+    #[test]
+    fn test_process_hello_rejects_peer_too_old() {
+        // Peer advertises overlay_version below our minimum (38)
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let mut ctx = AuthContext::new(local_node.clone(), true);
+        ctx.hello_sent();
+
+        let hello = make_hello_with_versions(37, 35, &local_node);
+        let result = ctx.process_hello(&hello);
+        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(OverlayError::VersionMismatch(msg)) if msg.contains("below minimum")),
+            "expected VersionMismatch(below minimum), got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_process_hello_rejects_peer_too_new() {
+        // Peer's min version is above our max (39)
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let mut ctx = AuthContext::new(local_node.clone(), true);
+        ctx.hello_sent();
+
+        let hello = make_hello_with_versions(42, 40, &local_node);
+        let result = ctx.process_hello(&hello);
+        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(OverlayError::VersionMismatch(msg)) if msg.contains("above our maximum")),
+            "expected VersionMismatch(above our maximum), got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_process_hello_rejects_malformed_version_range() {
+        // Peer's min > max (malformed)
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let mut ctx = AuthContext::new(local_node.clone(), true);
+        ctx.hello_sent();
+
+        let hello = make_hello_with_versions(38, 40, &local_node);
+        let result = ctx.process_hello(&hello);
+        assert!(result.is_err());
+        assert!(
+            matches!(&result, Err(OverlayError::VersionMismatch(msg)) if msg.contains("malformed")),
+            "expected VersionMismatch(malformed), got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_process_hello_accepts_compatible_peer() {
+        // Peer with exact same range as ours (38-39)
+        let secret_a = SecretKey::generate();
+        let secret_b = SecretKey::generate();
+        let node_a = LocalNode::new_testnet(secret_a);
+        let node_b = LocalNode::new_testnet(secret_b);
+
+        let mut ctx_a = AuthContext::new(node_a, true);
+        ctx_a.hello_sent();
+
+        // Use node_b's identity to create a properly signed Hello
+        let ephemeral = EphemeralSecret::random_from_rng(rand::rngs::OsRng);
+        let cert = AuthCert::new_cert(&node_b, &ephemeral);
+        let hello = xdr::Hello {
+            ledger_version: 25,
+            overlay_version: 39,
+            overlay_min_version: 38,
+            network_id: xdr::Hash(*node_b.network_id.as_bytes()),
+            version_str: node_b.version_string.clone().try_into().unwrap(),
+            listening_port: node_b.listening_port as i32,
+            peer_id: xdr::NodeId(node_b.xdr_public_key()),
+            cert,
+            nonce: xdr::Uint256([42u8; 32]),
+        };
+        let result = ctx_a.process_hello(&hello);
+        assert!(
+            result.is_ok(),
+            "compatible peer should be accepted: {:?}",
+            result
+        );
     }
 }

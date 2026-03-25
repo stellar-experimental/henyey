@@ -79,6 +79,14 @@ const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 /// Current protocol version used for merge restarts.
 const CURRENT_PROTOCOL_VERSION: u32 = 25;
 
+/// Maximum number of retry attempts for the download-and-replay pipeline.
+///
+/// Matches stellar-core's `BasicWork::RETRY_A_FEW` used by
+/// `DownloadApplyTxsWork` (a `BatchWork` subclass). On each retry the
+/// replay start is recalculated from the current LCL, so partial
+/// progress is preserved (mirroring stellar-core's `resetIter()`).
+const REPLAY_RETRY_COUNT: u32 = 5;
+
 /// Read the current process RSS (Resident Set Size) in MB from `/proc/self/status`.
 /// Returns `None` on non-Linux platforms or if the file can't be read.
 fn rss_mb() -> Option<u64> {
@@ -527,50 +535,18 @@ impl CatchupManager {
                 HistoryError::CatchupFailed(format!("Failed to initialize ledger manager: {}", e))
             })?;
 
-        // Step 5: Download ledger data from checkpoint to target
-        self.update_progress(
-            CatchupStatus::DownloadingLedgers,
-            4,
-            "Downloading ledger data",
-        );
-        let ledger_data = self.download_ledger_data(checkpoint_seq, target).await?;
-
-        // Step 6: Verify the header chain
-        self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
-        // The checkpoint header hash serves as the bottom trust anchor:
-        // the first replayed header's previous_ledger_hash must match it.
-        let anchors = verify::ChainTrustAnchors {
-            previous_ledger_hash: Some(checkpoint_hash),
-            ..Default::default()
-        };
-        self.verify_downloaded_data(&ledger_data, &anchors)?;
-
-        let network_id = has
-            .network_passphrase
-            .as_ref()
-            .map(|p| NetworkId::from_passphrase(p))
-            .unwrap_or_else(NetworkId::testnet);
-
-        // Step 7: Replay ledgers from checkpoint to target using close_ledger
-        self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
-
-        let (final_header, final_hash, ledgers_applied) = if ledger_data.is_empty() {
+        // Steps 5-7: Download, verify, and replay ledgers with retry.
+        // Matches stellar-core's DownloadApplyTxsWork(RETRY_A_FEW).
+        let (final_header, final_hash, ledgers_applied) = if checkpoint_seq >= target {
+            // No replay needed — target is exactly at checkpoint.
+            self.persist_header_only(&checkpoint_header)?;
             (checkpoint_header, checkpoint_hash, 0)
         } else {
-            let ledgers_applied = target - checkpoint_seq;
-            self.replay_via_close_ledger(ledger_manager, &ledger_data)
+            let (header, hash, applied) = self
+                .download_verify_and_replay_with_retry(target, ledger_manager)
                 .await?;
-
-            // Get the final header from the ledger manager (already at target state)
-            let final_header = ledger_manager.current_header();
-            let final_hash = ledger_manager.current_header_hash();
-            (final_header, final_hash, ledgers_applied)
+            (header, hash, applied)
         };
-
-        self.persist_ledger_history(&ledger_data, &network_id)?;
-        if ledger_data.is_empty() {
-            self.persist_header_only(&final_header)?;
-        }
 
         // Complete!
         self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
@@ -746,8 +722,8 @@ impl CatchupManager {
             lcl
         };
 
-        // Download ledger data for replay range
-        let replay_first = range.replay_first();
+        // Download, verify, and replay ledgers with retry.
+        // Matches stellar-core's DownloadApplyTxsWork(RETRY_A_FEW).
         let replay_count = range.replay_count();
 
         let (final_header, final_hash, ledgers_applied) = if replay_count == 0 {
@@ -757,48 +733,14 @@ impl CatchupManager {
                 checkpoint_seq
             );
             let (header, hash) = self.download_checkpoint_header(checkpoint_seq).await?;
+            self.persist_header_only(&header)?;
             (header, hash, 0)
         } else {
-            // Download ledger data for replay
-            self.update_progress(
-                CatchupStatus::DownloadingLedgers,
-                4,
-                "Downloading ledger data",
-            );
-
-            let download_from_checkpoint = replay_first - 1;
-            let ledger_data = self
-                .download_ledger_data(download_from_checkpoint, target)
+            let (header, hash, applied) = self
+                .download_verify_and_replay_with_retry(target, ledger_manager)
                 .await?;
-
-            // Verify the header chain
-            self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
-            // Anchor the chain to the ledger manager's current state: the hash
-            // of the header at `download_from_checkpoint` (either the bucket
-            // apply checkpoint or the existing LCL).
-            let anchor_hash = ledger_manager.current_header_hash();
-            let anchors = verify::ChainTrustAnchors {
-                previous_ledger_hash: Some(anchor_hash),
-                ..Default::default()
-            };
-            self.verify_downloaded_data(&ledger_data, &anchors)?;
-
-            // Replay ledgers via close_ledger
-            self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
-            self.replay_via_close_ledger(ledger_manager, &ledger_data)
-                .await?;
-
-            let network_id = NetworkId(ledger_manager.network_id().0);
-            self.persist_ledger_history(&ledger_data, &network_id)?;
-
-            let final_header = ledger_manager.current_header();
-            let final_hash = ledger_manager.current_header_hash();
-            (final_header, final_hash, replay_count)
+            (header, hash, applied)
         };
-
-        if replay_count == 0 {
-            self.persist_header_only(&final_header)?;
-        }
 
         // Complete!
         self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
@@ -973,46 +915,17 @@ impl CatchupManager {
                 verify::verify_tx_result_set(header, &xdr)?;
             }
         }
-        let ledger_data = if target == checkpoint_seq {
-            Vec::new()
-        } else {
-            self.download_ledger_data(checkpoint_seq, target).await?
-        };
-
-        // Step 6: Verify the header chain
-        self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
-        let anchors = verify::ChainTrustAnchors {
-            previous_ledger_hash: Some(checkpoint_hash),
-            ..Default::default()
-        };
-        self.verify_downloaded_data(&ledger_data, &anchors)?;
-
-        let network_id = data
-            .has
-            .network_passphrase
-            .as_ref()
-            .map(|p| NetworkId::from_passphrase(p))
-            .unwrap_or_else(NetworkId::testnet);
-
-        // Step 7: Replay ledgers from checkpoint to target using close_ledger
-        self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
-
-        let (final_header, final_hash, ledgers_applied) = if ledger_data.is_empty() {
+        // Steps 6-7: Download, verify, and replay ledgers with retry.
+        // Matches stellar-core's DownloadApplyTxsWork(RETRY_A_FEW).
+        let (final_header, final_hash, ledgers_applied) = if target == checkpoint_seq {
+            self.persist_header_only(&checkpoint_header)?;
             (checkpoint_header, checkpoint_hash, 0)
         } else {
-            let ledgers_applied = target - checkpoint_seq;
-            self.replay_via_close_ledger(ledger_manager, &ledger_data)
+            let (header, hash, applied) = self
+                .download_verify_and_replay_with_retry(target, ledger_manager)
                 .await?;
-
-            let final_header = ledger_manager.current_header();
-            let final_hash = ledger_manager.current_header_hash();
-            (final_header, final_hash, ledgers_applied)
+            (header, hash, applied)
         };
-
-        self.persist_ledger_history(&ledger_data, &network_id)?;
-        if ledger_data.is_empty() {
-            self.persist_header_only(&final_header)?;
-        }
 
         self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
 
@@ -2078,6 +1991,119 @@ impl CatchupManager {
         )))
     }
 
+    /// Download, verify, and replay ledgers from `replay_start` to `target`
+    /// with bounded retry on transient failures.
+    ///
+    /// Matches stellar-core's `DownloadApplyTxsWork` which uses
+    /// `BatchWork(RETRY_A_FEW)`. On each retry, the replay start is
+    /// recalculated from the ledger manager's current LCL (mirroring
+    /// `DownloadApplyTxsWork::resetIter()` which resets
+    /// `mCheckpointToQueue` to `checkpointContainingLedger(LCL + 1)`).
+    ///
+    /// Fatal errors (verification/integrity failures) are NOT retried —
+    /// only transient errors (network, download, etc.) trigger a retry.
+    async fn download_verify_and_replay_with_retry(
+        &mut self,
+        target: u32,
+        ledger_manager: &LedgerManager,
+    ) -> Result<(LedgerHeader, Hash256, u32)> {
+        let mut last_error: Option<HistoryError> = None;
+
+        for attempt in 0..=REPLAY_RETRY_COUNT {
+            if attempt > 0 {
+                let delay_ms = 200 * (1 << (attempt - 1).min(4));
+                warn!(
+                    attempt,
+                    max_attempts = REPLAY_RETRY_COUNT + 1,
+                    delay_ms,
+                    error = %last_error.as_ref().unwrap(),
+                    "Retrying download-and-replay pipeline"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            // Recalculate replay start from current LCL (matching resetIter()).
+            let current_lcl = ledger_manager.current_header().ledger_seq;
+            let replay_first = current_lcl + 1;
+
+            if replay_first > target {
+                // Already past target — previous partial replay succeeded fully.
+                let final_header = ledger_manager.current_header();
+                let final_hash = ledger_manager.current_header_hash();
+                let ledgers_applied = target.saturating_sub(current_lcl);
+                return Ok((final_header, final_hash, ledgers_applied));
+            }
+
+            // Download from the checkpoint containing replay_first - 1 (the LCL).
+            let download_from = current_lcl;
+
+            match self
+                .download_verify_and_replay_once(download_from, target, ledger_manager)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    if e.is_fatal_catchup_failure() {
+                        warn!(
+                            attempt,
+                            error = %e,
+                            "Fatal error during replay — not retrying"
+                        );
+                        return Err(e);
+                    }
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            HistoryError::CatchupFailed(
+                "download-and-replay exhausted all retry attempts".to_string(),
+            )
+        }))
+    }
+
+    /// Single attempt at download + verify + replay from `download_from` to `target`.
+    async fn download_verify_and_replay_once(
+        &mut self,
+        download_from: u32,
+        target: u32,
+        ledger_manager: &LedgerManager,
+    ) -> Result<(LedgerHeader, Hash256, u32)> {
+        // Download ledger data for replay
+        self.update_progress(
+            CatchupStatus::DownloadingLedgers,
+            4,
+            "Downloading ledger data",
+        );
+        let ledger_data = self.download_ledger_data(download_from, target).await?;
+
+        // Verify the header chain
+        self.update_progress(CatchupStatus::Verifying, 5, "Verifying header chain");
+        let anchor_hash = ledger_manager.current_header_hash();
+        let anchors = verify::ChainTrustAnchors {
+            previous_ledger_hash: Some(anchor_hash),
+            ..Default::default()
+        };
+        self.verify_downloaded_data(&ledger_data, &anchors)?;
+
+        // Replay ledgers via close_ledger
+        self.update_progress(CatchupStatus::Replaying, 6, "Replaying ledgers");
+        self.replay_via_close_ledger(ledger_manager, &ledger_data)
+            .await?;
+
+        let network_id = NetworkId(ledger_manager.network_id().0);
+        self.persist_ledger_history(&ledger_data, &network_id)?;
+
+        let final_header = ledger_manager.current_header();
+        let final_hash = ledger_manager.current_header_hash();
+        let ledgers_applied = final_header
+            .ledger_seq
+            .saturating_sub(download_from);
+
+        Ok((final_header, final_hash, ledgers_applied))
+    }
+
     /// Replay ledgers by calling `LedgerManager::close_ledger()` for each one.
     ///
     /// This eliminates the duplicate replay implementation and uses the same
@@ -2474,5 +2500,68 @@ mod tests {
         assert_eq!(select(0), 0);
         assert_eq!(select(1), 0);
         assert_eq!(select(100), 0);
+    }
+
+    /// Verify REPLAY_RETRY_COUNT matches stellar-core's RETRY_A_FEW = 5.
+    #[test]
+    fn test_replay_retry_count_matches_stellar_core() {
+        assert_eq!(REPLAY_RETRY_COUNT, 5, "must match BasicWork::RETRY_A_FEW");
+    }
+
+    /// Fatal errors must not be retried — verify the classification.
+    #[test]
+    fn test_fatal_errors_not_retriable() {
+        let fatal_errors: Vec<HistoryError> = vec![
+            HistoryError::VerificationFailed("hash mismatch".to_string()),
+            HistoryError::InvalidPreviousHash { ledger: 100 },
+            HistoryError::InvalidTxSetHash { ledger: 100 },
+            HistoryError::InvalidSequence {
+                expected: 100,
+                got: 200,
+            },
+            HistoryError::CorruptHeader {
+                ledger: 100,
+                detail: "bad encoding".to_string(),
+            },
+        ];
+        for err in &fatal_errors {
+            assert!(
+                err.is_fatal_catchup_failure(),
+                "expected fatal: {}",
+                err
+            );
+        }
+    }
+
+    /// Transient errors should be retriable (i.e., NOT fatal).
+    #[test]
+    fn test_transient_errors_are_retriable() {
+        let transient_errors: Vec<HistoryError> = vec![
+            HistoryError::ArchiveUnreachable("timeout".to_string()),
+            HistoryError::DownloadFailed("connection reset".to_string()),
+            HistoryError::CatchupFailed("close_ledger failed at ledger 100".to_string()),
+            HistoryError::NotFound("missing file".to_string()),
+            HistoryError::HttpStatus {
+                url: "http://archive.example.com".to_string(),
+                status: 503,
+            },
+        ];
+        for err in &transient_errors {
+            assert!(
+                !err.is_fatal_catchup_failure(),
+                "expected transient (retriable): {}",
+                err
+            );
+        }
+    }
+
+    /// Verify the exponential backoff formula used in retry.
+    #[test]
+    fn test_retry_backoff_formula() {
+        // delay_ms = 200 * 2^(attempt-1), capped at 2^4 = 16
+        let delays: Vec<u64> = (1..=REPLAY_RETRY_COUNT)
+            .map(|attempt| 200 * (1u64 << (attempt - 1).min(4)))
+            .collect();
+        assert_eq!(delays, vec![200, 400, 800, 1600, 3200]);
     }
 }

@@ -10,11 +10,13 @@
 //! Mirrors `TxSetUtils::getInvalidTxList()` and `TxSetUtils::trimInvalid()`
 //! from stellar-core `src/herder/TxSetUtils.cpp`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use henyey_common::{Hash256, NetworkId};
 use henyey_tx::{validate_basic, LedgerContext, TransactionFrame};
-use stellar_xdr::curr::TransactionEnvelope;
+use stellar_xdr::curr::{AccountId, TransactionEnvelope};
+
+use crate::tx_queue::FeeBalanceProvider;
 
 /// Parameters for close-time bounds validation.
 ///
@@ -128,17 +130,25 @@ impl TxSetValidationContext {
 /// constructed for the next ledger (LCL + 1). Transactions that fail validation
 /// are collected and returned.
 ///
+/// When a `fee_balance_provider` is supplied, the function also performs a
+/// second pass that groups valid transactions by fee source, accumulates their
+/// total fees, and marks **all** transactions from a fee source as invalid if
+/// the account's available balance is insufficient to cover the total fees.
+///
 /// # Parity
 ///
 /// Mirrors `TxSetUtils::getInvalidTxList()` in stellar-core
 /// (`src/herder/TxSetUtils.cpp`). The upstream validates against a
-/// `LedgerSnapshot` with `ledgerSeq = lastClosedLedgerNum + 1`.
+/// `LedgerSnapshot` with `ledgerSeq = lastClosedLedgerNum + 1` and performs
+/// the fee-source affordability check in the same function.
 ///
 /// # Arguments
 ///
 /// * `txs` - List of candidate transaction envelopes.
 /// * `ctx` - Validation context (next ledger seq, close time, fees, network).
 /// * `close_time_bounds` - Offsets for close-time range during nomination.
+/// * `fee_balance_provider` - Optional provider for account balance lookups.
+///   When `None`, the fee-source affordability check is skipped.
 ///
 /// # Returns
 ///
@@ -147,8 +157,10 @@ pub fn get_invalid_tx_list(
     txs: &[TransactionEnvelope],
     ctx: &TxSetValidationContext,
     close_time_bounds: &CloseTimeBounds,
+    fee_balance_provider: Option<&dyn FeeBalanceProvider>,
 ) -> Vec<TransactionEnvelope> {
     let mut invalid_txs = Vec::new();
+    let mut seen_invalid: HashSet<Hash256> = HashSet::new();
 
     // For time bounds validation during nomination, upstream uses the
     // upper bound close time for max_time checks and lower bound for
@@ -169,6 +181,10 @@ pub fn get_invalid_tx_list(
     // Only build lower context if offsets differ (optimization for common case).
     let need_lower_check = lower_close_time != upper_close_time;
 
+    // --- Pass 1: per-transaction basic validation ---
+    // Also accumulate fees per fee source for valid transactions.
+    let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
+
     for tx in txs {
         let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);
 
@@ -176,6 +192,9 @@ pub fn get_invalid_tx_list(
         let upper_result = validate_basic(&frame, &upper_ledger_ctx);
 
         if upper_result.is_err() {
+            if let Ok(h) = Hash256::hash_xdr(tx) {
+                seen_invalid.insert(h);
+            }
             invalid_txs.push(tx.clone());
             continue;
         }
@@ -185,7 +204,51 @@ pub fn get_invalid_tx_list(
         if need_lower_check {
             let lower_ledger_ctx = ctx.to_ledger_context(lower_close_time);
             if validate_basic(&frame, &lower_ledger_ctx).is_err() {
+                if let Ok(h) = Hash256::hash_xdr(tx) {
+                    seen_invalid.insert(h);
+                }
                 invalid_txs.push(tx.clone());
+                continue;
+            }
+        }
+
+        // Transaction passed basic validation — accumulate fee for fee source.
+        if fee_balance_provider.is_some() {
+            let fee_source = frame.fee_source_account_id();
+            let full_fee = frame.total_fee();
+            let entry = account_fee_map.entry(fee_source).or_insert(0i64);
+            // Saturating add to avoid overflow (matches stellar-core).
+            *entry = entry.saturating_add(full_fee);
+        }
+    }
+
+    // --- Pass 2: fee-source affordability check ---
+    if let Some(provider) = fee_balance_provider {
+        for tx in txs {
+            // Skip transactions already marked invalid.
+            if let Ok(h) = Hash256::hash_xdr(tx) {
+                if seen_invalid.contains(&h) {
+                    continue;
+                }
+            }
+
+            let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);
+            let fee_source = frame.fee_source_account_id();
+
+            let available = provider.get_available_balance(&fee_source).unwrap_or(0);
+            let total_fee = account_fee_map.get(&fee_source).copied().unwrap_or(0);
+
+            if available < total_fee {
+                invalid_txs.push(tx.clone());
+                if let Ok(h) = Hash256::hash_xdr(tx) {
+                    seen_invalid.insert(h);
+                }
+                tracing::debug!(
+                    fee_source = ?fee_source,
+                    available_balance = available,
+                    total_fee = total_fee,
+                    "tx-set validation: account can't pay fee"
+                );
             }
         }
     }
@@ -208,6 +271,7 @@ pub fn get_invalid_tx_list(
 /// * `txs` - List of candidate transaction envelopes.
 /// * `ctx` - Validation context (next ledger seq, close time, fees, network).
 /// * `close_time_bounds` - Offsets for close-time range during nomination.
+/// * `fee_balance_provider` - Optional provider for fee-source affordability checks.
 ///
 /// # Returns
 ///
@@ -218,8 +282,9 @@ pub fn trim_invalid(
     txs: &[TransactionEnvelope],
     ctx: &TxSetValidationContext,
     close_time_bounds: &CloseTimeBounds,
+    fee_balance_provider: Option<&dyn FeeBalanceProvider>,
 ) -> (Vec<TransactionEnvelope>, Vec<TransactionEnvelope>) {
-    let invalid_txs = get_invalid_tx_list(txs, ctx, close_time_bounds);
+    let invalid_txs = get_invalid_tx_list(txs, ctx, close_time_bounds, fee_balance_provider);
 
     if invalid_txs.is_empty() {
         return (txs.to_vec(), Vec::new());
@@ -255,12 +320,37 @@ fn remove_txs(
 mod tests {
     use super::*;
     use henyey_common::NetworkId;
+    use crate::tx_queue::FeeBalanceProvider;
     use stellar_xdr::curr::{
-        Asset, DecoratedSignature, LedgerBounds, Memo, MuxedAccount, Operation, OperationBody,
-        PaymentOp, Preconditions, PreconditionsV2, SequenceNumber, Signature as XdrSignature,
-        SignatureHint, TimeBounds, TimePoint, Transaction, TransactionEnvelope, TransactionExt,
-        TransactionV1Envelope, Uint256, VecM,
+        AccountId, Asset, DecoratedSignature, LedgerBounds, Memo, MuxedAccount, Operation,
+        OperationBody, PaymentOp, Preconditions, PreconditionsV2, PublicKey, SequenceNumber,
+        Signature as XdrSignature, SignatureHint, TimeBounds, TimePoint, Transaction,
+        TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
     };
+
+    /// Mock fee balance provider for testing.
+    struct MockFeeBalanceProvider {
+        balances: HashMap<AccountId, i64>,
+    }
+
+    impl MockFeeBalanceProvider {
+        fn new() -> Self {
+            Self {
+                balances: HashMap::new(),
+            }
+        }
+
+        fn set_balance(&mut self, key_bytes: [u8; 32], balance: i64) {
+            let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key_bytes)));
+            self.balances.insert(account_id, balance);
+        }
+    }
+
+    impl FeeBalanceProvider for MockFeeBalanceProvider {
+        fn get_available_balance(&self, account_id: &AccountId) -> Option<i64> {
+            self.balances.get(account_id).copied()
+        }
+    }
 
     fn make_valid_envelope(fee: u32, seq: i64) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
@@ -443,7 +533,7 @@ mod tests {
             make_valid_envelope(300, 3),
         ];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds);
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
         assert!(
             invalid.is_empty(),
             "all valid transactions should produce no invalid list"
@@ -457,7 +547,7 @@ mod tests {
 
         let txs = vec![make_low_fee_envelope(1), make_low_fee_envelope(2)];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds);
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
         assert_eq!(
             invalid.len(),
             2,
@@ -476,7 +566,7 @@ mod tests {
 
         let txs = vec![valid, invalid_fee, expired];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds);
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
         assert_eq!(
             invalid.len(),
             2,
@@ -489,7 +579,7 @@ mod tests {
         let ctx = test_context();
         let bounds = CloseTimeBounds::exact();
 
-        let invalid = get_invalid_tx_list(&[], &ctx, &bounds);
+        let invalid = get_invalid_tx_list(&[], &ctx, &bounds, None);
         assert!(
             invalid.is_empty(),
             "empty input should produce empty invalid list"
@@ -505,7 +595,7 @@ mod tests {
         let bad_bounds = make_bad_ledger_bounds_envelope(1);
         let txs = vec![bad_bounds];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds);
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
         assert_eq!(
             invalid.len(),
             1,
@@ -526,7 +616,7 @@ mod tests {
             make_valid_envelope(300, 3),
         ];
 
-        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds);
+        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds, None);
         assert_eq!(valid.len(), 3, "all transactions should be valid");
         assert!(invalid.is_empty(), "no transactions should be invalid");
     }
@@ -538,7 +628,7 @@ mod tests {
 
         let txs = vec![make_low_fee_envelope(1), make_low_fee_envelope(2)];
 
-        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds);
+        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds, None);
         assert!(valid.is_empty(), "no transactions should be valid");
         assert_eq!(invalid.len(), 2, "all transactions should be invalid");
     }
@@ -560,7 +650,7 @@ mod tests {
             invalid2.clone(),
         ];
 
-        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds);
+        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds, None);
         assert_eq!(valid.len(), 2, "should have 2 valid transactions");
         assert_eq!(invalid.len(), 2, "should have 2 invalid transactions");
 
@@ -586,7 +676,7 @@ mod tests {
         let ctx = test_context();
         let bounds = CloseTimeBounds::exact();
 
-        let (valid, invalid) = trim_invalid(&[], &ctx, &bounds);
+        let (valid, invalid) = trim_invalid(&[], &ctx, &bounds, None);
         assert!(
             valid.is_empty(),
             "empty input should produce empty valid set"
@@ -609,7 +699,7 @@ mod tests {
 
         let txs = vec![tx1.clone(), tx2.clone(), tx3.clone()];
 
-        let (valid, _) = trim_invalid(&txs, &ctx, &bounds);
+        let (valid, _) = trim_invalid(&txs, &ctx, &bounds, None);
         assert_eq!(valid.len(), 3);
 
         // Verify order is preserved
@@ -738,7 +828,7 @@ mod tests {
 
         // With no offset, should be valid
         let bounds_exact = CloseTimeBounds::exact();
-        let invalid = get_invalid_tx_list(&[envelope.clone()], &ctx, &bounds_exact);
+        let invalid = get_invalid_tx_list(&[envelope.clone()], &ctx, &bounds_exact, None);
         assert!(
             invalid.is_empty(),
             "tx should be valid with exact close time"
@@ -746,11 +836,228 @@ mod tests {
 
         // With upper offset of 10 (close_time + 10 = 1010 > max_time 1005), should be invalid
         let bounds_offset = CloseTimeBounds::with_offsets(0, 10);
-        let invalid = get_invalid_tx_list(&[envelope.clone()], &ctx, &bounds_offset);
+        let invalid = get_invalid_tx_list(&[envelope.clone()], &ctx, &bounds_offset, None);
         assert_eq!(
             invalid.len(),
             1,
             "tx should be invalid with upper close time offset"
         );
+    }
+
+    // --- Fee-source affordability tests ---
+
+    /// Helper to make a valid envelope with a specific source key and fee.
+    fn make_envelope_with_source(source_key: [u8; 32], fee: u32, seq: i64) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256(source_key));
+        let dest = MuxedAccount::Ed25519(Uint256([0xFF; 32]));
+
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(seq),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    #[test]
+    fn test_fee_source_affordability_sufficient_balance() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // Source [10u8; 32] has fee=200, and balance is 500 -> sufficient
+        let tx = make_envelope_with_source([10u8; 32], 200, 1);
+
+        let mut provider = MockFeeBalanceProvider::new();
+        provider.set_balance([10u8; 32], 500);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
+        assert!(
+            invalid.is_empty(),
+            "tx should be valid when balance covers fee"
+        );
+    }
+
+    #[test]
+    fn test_fee_source_affordability_insufficient_balance() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // Source [10u8; 32] has fee=200, and balance is 100 -> insufficient
+        let tx = make_envelope_with_source([10u8; 32], 200, 1);
+
+        let mut provider = MockFeeBalanceProvider::new();
+        provider.set_balance([10u8; 32], 100);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "tx should be invalid when balance can't cover fee"
+        );
+    }
+
+    #[test]
+    fn test_fee_source_affordability_multiple_txs_same_source() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // Two txs from same source [10u8; 32], each fee=200, total=400
+        // Balance is 300 -> insufficient for total
+        let tx1 = make_envelope_with_source([10u8; 32], 200, 1);
+        let tx2 = make_envelope_with_source([10u8; 32], 200, 2);
+
+        let mut provider = MockFeeBalanceProvider::new();
+        provider.set_balance([10u8; 32], 300);
+
+        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
+        assert_eq!(
+            invalid.len(),
+            2,
+            "both txs should be invalid when cumulative fees exceed balance"
+        );
+    }
+
+    #[test]
+    fn test_fee_source_affordability_cumulative_exactly_at_balance() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // Two txs from same source, total fee = balance exactly
+        let tx1 = make_envelope_with_source([10u8; 32], 200, 1);
+        let tx2 = make_envelope_with_source([10u8; 32], 200, 2);
+
+        let mut provider = MockFeeBalanceProvider::new();
+        provider.set_balance([10u8; 32], 400); // exactly covers total
+
+        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
+        assert!(
+            invalid.is_empty(),
+            "txs should be valid when balance exactly covers cumulative fees"
+        );
+    }
+
+    #[test]
+    fn test_fee_source_affordability_multiple_sources_mixed() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // Source A ([10u8; 32]) has 2 txs, fee=200 each, total=400, balance=500 -> OK
+        // Source B ([20u8; 32]) has 1 tx, fee=300, balance=100 -> insufficient
+        let tx_a1 = make_envelope_with_source([10u8; 32], 200, 1);
+        let tx_a2 = make_envelope_with_source([10u8; 32], 200, 2);
+        let tx_b = make_envelope_with_source([20u8; 32], 300, 1);
+
+        let mut provider = MockFeeBalanceProvider::new();
+        provider.set_balance([10u8; 32], 500);
+        provider.set_balance([20u8; 32], 100);
+
+        let invalid =
+            get_invalid_tx_list(&[tx_a1, tx_a2, tx_b], &ctx, &bounds, Some(&provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "only source B's tx should be invalid"
+        );
+    }
+
+    #[test]
+    fn test_fee_source_affordability_unknown_account() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // Source [10u8; 32] not in provider (returns None -> treated as 0 balance)
+        let tx = make_envelope_with_source([10u8; 32], 200, 1);
+
+        let provider = MockFeeBalanceProvider::new(); // empty
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "tx from unknown account should be invalid (balance defaults to 0)"
+        );
+    }
+
+    #[test]
+    fn test_fee_source_affordability_skips_already_invalid_txs() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // tx1 is invalid (low fee), tx2 is valid
+        // Both from same source [2u8; 32] (make_low_fee_envelope uses [2u8; 32])
+        let tx1 = make_low_fee_envelope(1);
+        // Valid tx from same source
+        let tx2 = make_envelope_with_source([2u8; 32], 200, 2);
+
+        let mut provider = MockFeeBalanceProvider::new();
+        // Balance of 200 would cover tx2 alone, but not tx1+tx2 if tx1 wasn't filtered out
+        provider.set_balance([2u8; 32], 200);
+
+        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
+        // tx1 is invalid due to low fee; tx2 alone has fee=200, balance=200, so it passes
+        assert_eq!(
+            invalid.len(),
+            1,
+            "only the low-fee tx should be invalid; the valid tx's fee is affordable alone"
+        );
+    }
+
+    #[test]
+    fn test_fee_source_affordability_with_none_provider_skips_check() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        // Even with 0 balance, without a provider, fee check is skipped
+        let tx = make_envelope_with_source([10u8; 32], 200, 1);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None);
+        assert!(
+            invalid.is_empty(),
+            "without provider, fee affordability check should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_trim_invalid_with_fee_provider() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+
+        let tx_affordable = make_envelope_with_source([10u8; 32], 200, 1);
+        let tx_unaffordable = make_envelope_with_source([20u8; 32], 500, 1);
+
+        let mut provider = MockFeeBalanceProvider::new();
+        provider.set_balance([10u8; 32], 1000);
+        provider.set_balance([20u8; 32], 100);
+
+        let (valid, invalid) = trim_invalid(
+            &[tx_affordable.clone(), tx_unaffordable.clone()],
+            &ctx,
+            &bounds,
+            Some(&provider),
+        );
+        assert_eq!(valid.len(), 1, "one tx should be valid");
+        assert_eq!(invalid.len(), 1, "one tx should be invalid");
     }
 }

@@ -112,6 +112,7 @@ fn run_eviction_scan(
     eviction_settings: &StateArchivalSettings,
     init_entries: &[LedgerEntry],
     live_entries: &[LedgerEntry],
+    dead_entries: &[LedgerKey],
 ) -> Result<EvictionScanResult> {
     if !config.run_eviction
         || protocol_version_is_before(header.ledger_version, ProtocolVersion::V23)
@@ -139,27 +140,25 @@ fn run_eviction_scan(
         "Incremental eviction scan results"
     );
 
-    // Resolution phase: apply TTL filtering + max_entries limit.
+    // Resolution phase: apply TTL filtering + live-entry invalidation +
+    // max_entries limit.
     // This matches stellar-core resolveBackgroundEvictionScan which:
     // 1. Filters out entries whose TTL was modified by TXs in this ledger
-    // 2. Evicts up to maxEntriesToArchive entries
-    // 3. Sets iterator based on whether the limit was hit
-    let modified_ttl_keys: std::collections::HashSet<LedgerKey> = init_entries
+    // 2. Checks for (and logs) modified live entries without TTL changes
+    // 3. Evicts up to maxEntriesToArchive entries
+    // 4. Sets iterator based on whether the limit was hit
+    //
+    // Parity: stellar-core passes `ltx.getAllKeysWithoutSealing()` which
+    // contains ALL modified keys. We build the equivalent.
+    let modified_keys: std::collections::HashSet<LedgerKey> = init_entries
         .iter()
         .chain(live_entries.iter())
-        .filter_map(|entry| {
-            if let LedgerEntryData::Ttl(ttl) = &entry.data {
-                Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                    key_hash: ttl.key_hash.clone(),
-                }))
-            } else {
-                None
-            }
-        })
+        .map(|entry| henyey_common::entry_to_key(entry))
+        .chain(dead_entries.iter().cloned())
         .collect();
 
     let resolved =
-        eviction_result.resolve(eviction_settings.max_entries_to_archive, &modified_ttl_keys);
+        eviction_result.resolve(eviction_settings.max_entries_to_archive, &modified_keys);
 
     Ok(EvictionScanResult {
         evicted_keys: resolved.evicted_keys,
@@ -947,6 +946,7 @@ pub fn replay_ledger_with_execution(
         &eviction_settings,
         &init_entries,
         &live_entries,
+        &dead_entries,
     )?;
 
     // Combine transaction dead entries with evicted entries

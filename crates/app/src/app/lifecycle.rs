@@ -1065,8 +1065,31 @@ impl App {
             }
 
             StellarMessage::GetScpState(ledger_seq) => {
-                tracing::debug!(ledger_seq, peer = %msg.from_peer, "Peer requested SCP state");
-                self.send_scp_state(&msg.from_peer, ledger_seq).await;
+                // Rate-limit GET_SCP_STATE requests per peer (spec §OVERLAY).
+                // Window = expected_ledger_close_time * MAX_SLOTS_TO_REMEMBER ≈ 60s.
+                // Max = GET_SCP_STATE_MAX_RATE (10) per window.
+                let close_time_secs = self.herder.ledger_close_time() as u64;
+                // MAX_SLOTS_TO_REMEMBER = checkpoint_frequency * 2
+                // (matches herder_config.max_externalized_slots / freq computation).
+                // stellar-core uses config.MAX_SLOTS_TO_REMEMBER which defaults to 12.
+                let max_slots: u64 = 12;
+                let window = Duration::from_secs(close_time_secs * max_slots);
+                let allowed = {
+                    let mut map = self.scp_state_query_info.write().await;
+                    let info = map.entry(msg.from_peer.clone()).or_insert_with(QueryInfo::new);
+                    if info.allow(window, GET_SCP_STATE_MAX_RATE) {
+                        info.num_queries += 1;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if allowed {
+                    tracing::debug!(ledger_seq, peer = %msg.from_peer, "Peer requested SCP state");
+                    self.send_scp_state(&msg.from_peer, ledger_seq).await;
+                } else {
+                    tracing::debug!(peer = %msg.from_peer, "Dropping GET_SCP_STATE request (rate limited)");
+                }
             }
 
             StellarMessage::GetScpQuorumset(hash) => {

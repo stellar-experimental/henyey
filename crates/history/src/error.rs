@@ -75,6 +75,20 @@ pub enum HistoryError {
     #[error("XDR parsing error: {0}")]
     XdrParsing(String),
 
+    /// Corrupt ledger header material downloaded from archive.
+    ///
+    /// Matches stellar-core `VERIFY_STATUS_ERR_CORRUPT_HEADER`. This is
+    /// returned when ledger-header data fails to parse or produces runtime
+    /// errors during verification, indicating the archive material itself is
+    /// corrupted.
+    #[error("corrupt header at ledger {ledger}: {detail}")]
+    CorruptHeader {
+        /// The ledger sequence where corruption was detected (0 if unknown).
+        ledger: u32,
+        /// Description of the corruption.
+        detail: String,
+    },
+
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -175,6 +189,45 @@ impl HistoryError {
                 | HistoryError::InvalidPreviousHash { .. }
                 | HistoryError::InvalidTxSetHash { .. }
                 | HistoryError::InvalidSequence { .. }
+                | HistoryError::CorruptHeader { .. }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_corrupt_header_is_fatal() {
+        let err = HistoryError::CorruptHeader {
+            ledger: 100,
+            detail: "bad XDR".to_string(),
+        };
+        assert!(
+            err.is_fatal_catchup_failure(),
+            "CorruptHeader should be a fatal catchup failure"
+        );
+    }
+
+    #[test]
+    fn test_transient_errors_are_not_fatal() {
+        let transient = HistoryError::ArchiveUnreachable("timeout".into());
+        assert!(!transient.is_fatal_catchup_failure());
+
+        let download = HistoryError::DownloadFailed("404".into());
+        assert!(!download.is_fatal_catchup_failure());
+    }
+
+    #[test]
+    fn test_verification_errors_are_fatal() {
+        assert!(HistoryError::VerificationFailed("bad".into()).is_fatal_catchup_failure());
+        assert!(HistoryError::InvalidPreviousHash { ledger: 5 }.is_fatal_catchup_failure());
+        assert!(HistoryError::InvalidTxSetHash { ledger: 5 }.is_fatal_catchup_failure());
+        assert!(HistoryError::InvalidSequence {
+            expected: 5,
+            got: 6
+        }
+        .is_fatal_catchup_failure());
     }
 }

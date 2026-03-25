@@ -770,3 +770,96 @@ pub(super) fn current_epoch_seconds() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+// ── Per-peer query rate limiter ────────────────────────────────────────
+
+/// Maximum number of `GET_SCP_STATE` requests per peer per window.
+///
+/// Matches stellar-core's `GET_SCP_STATE_MAX_RATE` (Peer.cpp).
+pub(super) const GET_SCP_STATE_MAX_RATE: u32 = 10;
+
+/// Per-peer, per-message-type query rate limiter.
+///
+/// Tracks the number of queries received from a peer within a rolling window.
+/// When the window expires, the counter resets. Matches stellar-core's
+/// `Peer::QueryInfo` struct and `Peer::process()` method.
+pub(super) struct QueryInfo {
+    /// Start of the current rate-limiting window.
+    pub window_start: Instant,
+    /// Number of queries processed in the current window.
+    pub num_queries: u32,
+}
+
+impl QueryInfo {
+    pub fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            num_queries: 0,
+        }
+    }
+
+    /// Check whether another query is allowed within the given window and limit.
+    ///
+    /// If the window has elapsed, resets the counter and starts a new window.
+    /// Returns `true` if the query should be processed (under the limit),
+    /// `false` if it should be dropped.
+    ///
+    /// The caller is responsible for incrementing `num_queries` after a
+    /// successful check, matching stellar-core's `Peer::process()` contract.
+    pub fn allow(&mut self, window: Duration, max_queries: u32) -> bool {
+        if self.window_start.elapsed() >= window {
+            self.window_start = Instant::now();
+            self.num_queries = 0;
+        }
+        self.num_queries < max_queries
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_query_info_allows_within_limit() {
+        let mut info = QueryInfo::new();
+        let window = Duration::from_secs(60);
+        let max = 10;
+
+        // First 10 requests should be allowed
+        for i in 0..max {
+            assert!(info.allow(window, max), "request {} should be allowed", i);
+            info.num_queries += 1;
+        }
+
+        // 11th request should be rejected
+        assert!(!info.allow(window, max), "request 11 should be rejected");
+    }
+
+    #[test]
+    fn test_query_info_resets_after_window() {
+        let mut info = QueryInfo::new();
+        let window = Duration::from_millis(10);
+        let max = 2;
+
+        // Use up the limit
+        for _ in 0..max {
+            assert!(info.allow(window, max));
+            info.num_queries += 1;
+        }
+        assert!(!info.allow(window, max));
+
+        // Wait for window to expire
+        std::thread::sleep(Duration::from_millis(15));
+
+        // Should be allowed again after window reset
+        assert!(info.allow(window, max));
+        info.num_queries += 1;
+        assert_eq!(info.num_queries, 1);
+    }
+
+    #[test]
+    fn test_query_info_zero_limit_rejects_all() {
+        let mut info = QueryInfo::new();
+        assert!(!info.allow(Duration::from_secs(60), 0));
+    }
+}

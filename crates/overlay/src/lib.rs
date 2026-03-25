@@ -571,8 +571,8 @@ pub struct LocalNode {
 
 const VERSION_STRING: &str = "henyey 0.0.1";
 const LEDGER_VERSION: u32 = 25;
-const OVERLAY_VERSION: u32 = 38;
-const OVERLAY_MIN_VERSION: u32 = 35;
+const OVERLAY_VERSION: u32 = 39;
+const OVERLAY_MIN_VERSION: u32 = 38;
 const DEFAULT_LISTENING_PORT: u16 = 11625;
 
 impl LocalNode {

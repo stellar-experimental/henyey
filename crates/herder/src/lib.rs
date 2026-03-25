@@ -164,6 +164,9 @@ pub use tx_set_utils::{
     get_invalid_tx_list, trim_invalid, CloseTimeBounds, TxSetValidationContext,
 };
 
+// Fee balance provider trait (used by tx_set_utils for affordability checks)
+pub use tx_queue::FeeBalanceProvider;
+
 // Parallel tx set builder
 pub use parallel_tx_set_builder::build_two_phase_tx_set;
 

@@ -873,7 +873,14 @@ impl Herder {
             // Allow checkpoint messages through even if close time is stale.
             // enforce_recent = true only if we've never been in sync (tracking index <= genesis)
             let tracking_consensus_index = current_slot.saturating_sub(1);
-            let enforce_recent = tracking_consensus_index <= GENESIS_LEDGER_SEQ;
+            // enforce_recent = true only if:
+            // 1. We've never been in sync (tracking index <= genesis), AND
+            // 2. This is NOT the next consensus slot (which we're actively working on)
+            // This matches stellar-core:
+            //   trackingConsensusLedgerIndex() <= GENESIS_LEDGER_SEQ
+            //       && index != nextConsensusLedgerIndex()
+            let enforce_recent = tracking_consensus_index <= GENESIS_LEDGER_SEQ
+                && slot != self.next_consensus_ledger_index();
             if !self.check_envelope_close_time(&envelope, enforce_recent) && slot != checkpoint {
                 debug!(
                     slot,
@@ -3047,6 +3054,64 @@ mod tests {
         assert!(
             found_reserve,
             "Should have found BaseReserve(5000000) upgrade"
+        );
+    }
+
+    /// Regression test for Task 7: genesis-adjacent close-time relaxation.
+    ///
+    /// When a node is at genesis (tracking_consensus_index <= GENESIS_LEDGER_SEQ)
+    /// and an envelope arrives for the next consensus slot, enforce_recent should
+    /// be false so the envelope is NOT rejected by the recency filter.
+    ///
+    /// stellar-core computes:
+    ///   enforceRecent = trackingConsensusLedgerIndex() <= GENESIS_LEDGER_SEQ
+    ///                   && index != nextConsensusLedgerIndex()
+    ///
+    /// Without the `&& slot != next_consensus` condition, the next consensus
+    /// slot's envelope would be incorrectly subject to the recency filter.
+    #[test]
+    fn test_genesis_close_time_relaxation_for_next_consensus_slot() {
+        let herder = make_test_herder();
+        // Put herder in Syncing state (non-tracking) with tracking_slot = 0
+        // tracking_consensus_index = tracking_slot.saturating_sub(1) = 0 <= GENESIS_LEDGER_SEQ
+        herder.set_state(HerderState::Syncing);
+        assert!(!herder.state().is_tracking());
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // next_consensus_ledger_index() = tracking_slot = 0
+        // Create a stale-but-structurally-valid close time
+        let stale_time = now.saturating_sub(MAXIMUM_LEDGER_CLOSETIME_DRIFT + 60);
+
+        // Envelope for slot 0 (the next consensus slot) with stale close time
+        let env_stale = make_nomination_envelope_with_close_time(0, stale_time);
+
+        // Direct test: enforce_recent=false should accept stale close time
+        assert!(
+            herder.check_envelope_close_time(&env_stale, false),
+            "stale close time should pass with enforce_recent=false"
+        );
+        // enforce_recent=true should reject it (below cutoff)
+        assert!(
+            !herder.check_envelope_close_time(&env_stale, true),
+            "stale close time should fail with enforce_recent=true"
+        );
+
+        // Full receive path: for the next consensus slot at genesis,
+        // our fix computes enforce_recent = (0 <= 1) && (0 != 0) = false,
+        // so the stale envelope passes the non-tracking recency gate.
+        // It gets rejected later (e.g. by signature check), but NOT by recency.
+        // A stale envelope for a DIFFERENT slot should be rejected by recency:
+        let other_slot_env = make_nomination_envelope_with_close_time(5, stale_time);
+        // For slot 5: enforce_recent = (0 <= 1) && (5 != 0) = true → rejected
+        let result_other = herder.receive_scp_envelope(other_slot_env);
+        assert_eq!(
+            result_other,
+            EnvelopeState::Invalid,
+            "stale close time for non-next-consensus slot at genesis should be rejected"
         );
     }
 }

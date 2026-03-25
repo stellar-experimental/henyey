@@ -385,6 +385,13 @@ pub struct App {
     /// In-flight ping hash per peer.
     peer_ping_inflight: RwLock<HashMap<henyey_overlay::PeerId, Hash256>>,
 
+    /// Per-peer `GET_SCP_STATE` rate limiter.
+    ///
+    /// Tracks request counts in a rolling window to enforce the
+    /// `GET_SCP_STATE_MAX_RATE` (10 requests per ~60s window) cap.
+    /// Matches stellar-core's `Peer::mSCPStateQueryInfo`.
+    scp_state_query_info: RwLock<HashMap<henyey_overlay::PeerId, QueryInfo>>,
+
     /// Weak reference to self for spawning background tasks from &self methods.
     /// Set via `set_self_arc` after wrapping in Arc.
     self_arc: RwLock<std::sync::Weak<Self>>,
@@ -679,6 +686,7 @@ impl App {
             ping_counter: AtomicU64::new(0),
             ping_inflight: RwLock::new(HashMap::new()),
             peer_ping_inflight: RwLock::new(HashMap::new()),
+            scp_state_query_info: RwLock::new(HashMap::new()),
             self_arc: RwLock::new(std::sync::Weak::new()),
             last_event_loop_tick_ms: Arc::new(AtomicU64::new(0)),
             event_loop_phase: Arc::new(AtomicU64::new(0)),

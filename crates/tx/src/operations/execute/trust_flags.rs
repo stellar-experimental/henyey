@@ -695,6 +695,17 @@ fn find_pool_share_trustlines_for_asset(
         }
     }
 
+    // Sort by canonical LedgerKey order for deterministic revocation.
+    //
+    // The iteration order of trustlines_iter() is non-deterministic (HashMap).
+    // stellar-core sorts the collected pool-share LedgerKeys before processing
+    // to ensure deterministic claimable balance creation and sponsorship
+    // reserve interactions across all validators.
+    //
+    // Since all entries share the same account_id and are PoolShare type,
+    // the effective canonical sort order is by pool ID bytes.
+    result.sort_by(|a, b| a.0 .0 .0.cmp(&b.0 .0 .0));
+
     result
 }
 
@@ -2028,5 +2039,174 @@ mod tests {
             state.get_claimable_balance(&cb_id_b).is_none(),
             "No claimable balance should be created when trustor is the asset issuer"
         );
+    }
+
+    /// Verify that pool-share trustlines are processed in canonical sorted
+    /// order (by pool ID bytes) when multiple pools reference the same asset.
+    ///
+    /// Regression test for deterministic revocation ordering. Without sorting,
+    /// HashMap iteration order could cause different claimable balance creation
+    /// sequences across validators, breaking consensus.
+    #[test]
+    fn test_pool_share_revocation_canonical_order_with_multiple_pools() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(80);
+        let trustor_id = create_test_account_id(81);
+        let other_issuer_id = create_test_account_id(82);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: other_issuer_id.clone(),
+        });
+        let asset_c = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"GBP\0"),
+            issuer: other_issuer_id.clone(),
+        });
+
+        // Create three pools referencing asset_a, with pool IDs that are NOT
+        // in ascending order when inserted. This ensures the sort is tested.
+        let pool_id_high = PoolId(Hash([0xFFu8; 32])); // highest
+        let pool_id_mid = PoolId(Hash([0x80u8; 32])); // middle
+        let pool_id_low = PoolId(Hash([0x01u8; 32])); // lowest
+
+        for (pool_id, other_asset, reserve_a, reserve_b, total_shares) in [
+            (&pool_id_high, &asset_b, 900i64, 300i64, 300i64),
+            (&pool_id_mid, &asset_c, 600, 200, 200),
+            (&pool_id_low, &asset_b, 300, 100, 100),
+        ] {
+            state.create_liquidity_pool(create_pool_entry(
+                pool_id.clone(),
+                asset_a.clone(),
+                other_asset.clone(),
+                reserve_a,
+                reserve_b,
+                total_shares,
+                1,
+            ));
+
+            state.create_trustline(TrustLineEntry {
+                account_id: trustor_id.clone(),
+                asset: TrustLineAsset::PoolShare(pool_id.clone()),
+                balance: 50,
+                limit: i64::MAX,
+                flags: 0,
+                ext: TrustLineEntryExt::V0,
+            });
+        }
+
+        // Asset trustlines
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            3, // 3 pool share trustlines reference this asset
+        ));
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"EUR\0"),
+                issuer: other_issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            2,
+        ));
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"GBP\0"),
+                issuer: other_issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        // sub-entries: 3 asset TLs + 3 pool share TLs (2 each) = 3 + 6 = 9
+        if let Some(acct) = state.get_account_mut(&trustor_id) {
+            acct.num_sub_entries += 9;
+        }
+
+        let op = SetTrustLineFlagsOp {
+            trustor: trustor_id.clone(),
+            asset: asset_a.clone(),
+            clear_flags: AUTHORIZED_FLAG,
+            set_flags: 0,
+        };
+
+        let result =
+            execute_set_trust_line_flags(&op, &issuer_id, &issuer_id, 1, 0, &mut state, &context)
+                .unwrap();
+
+        match &result {
+            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(r)) => {
+                assert!(
+                    matches!(r, SetTrustLineFlagsResult::Success),
+                    "Expected Success, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        // All three pool share trustlines should be deleted
+        for pool_id in [&pool_id_low, &pool_id_mid, &pool_id_high] {
+            assert!(
+                state
+                    .get_trustline_by_trustline_asset(
+                        &trustor_id,
+                        &TrustLineAsset::PoolShare(pool_id.clone())
+                    )
+                    .is_none(),
+                "Pool share trustline for {:?} should be deleted",
+                pool_id
+            );
+        }
+
+        // Claimable balances should exist for each pool, verifying all three
+        // were processed. The canonical sorted order is: pool_id_low (0x01),
+        // pool_id_mid (0x80), pool_id_high (0xFF).
+        //
+        // pool_id_low: amount_a = floor(50 * 300 / 100) = 150
+        let cb_low_a = get_revoke_id(&issuer_id, 1, 0, &pool_id_low, &asset_a).unwrap();
+        let cb = state
+            .get_claimable_balance(&cb_low_a)
+            .expect("claimable balance for pool_id_low asset_a should exist");
+        assert_eq!(cb.amount, 150);
+
+        // pool_id_mid: amount_a = floor(50 * 600 / 200) = 150
+        let cb_mid_a = get_revoke_id(&issuer_id, 1, 0, &pool_id_mid, &asset_a).unwrap();
+        let cb = state
+            .get_claimable_balance(&cb_mid_a)
+            .expect("claimable balance for pool_id_mid asset_a should exist");
+        assert_eq!(cb.amount, 150);
+
+        // pool_id_high: amount_a = floor(50 * 900 / 300) = 150
+        let cb_high_a = get_revoke_id(&issuer_id, 1, 0, &pool_id_high, &asset_a).unwrap();
+        let cb = state
+            .get_claimable_balance(&cb_high_a)
+            .expect("claimable balance for pool_id_high asset_a should exist");
+        assert_eq!(cb.amount, 150);
     }
 }

@@ -713,6 +713,58 @@ impl TransactionFrame {
 
         true
     }
+
+    /// Validate Soroban create-contract host function pairing rules.
+    ///
+    /// For `CreateContract` and `CreateContractV2` host functions, the
+    /// `ContractIdPreimage` and `ContractExecutable` must be paired correctly:
+    /// - `FromAsset` preimage requires `StellarAsset` executable
+    /// - `FromAddress` preimage requires `Wasm` executable
+    ///
+    /// Returns `true` if the transaction is valid or not applicable (non-Soroban,
+    /// multi-op, or non-create-contract). Returns `false` if the pairing is invalid.
+    ///
+    /// Parity: TransactionFrame.cpp:358-410 (`validateHostFn`)
+    pub fn validate_host_fn(&self) -> bool {
+        use stellar_xdr::curr::{ContractExecutable, ContractIdPreimage, HostFunction};
+
+        if !self.is_soroban() {
+            return true;
+        }
+
+        let ops = self.operations();
+        if ops.len() != 1 {
+            return true;
+        }
+
+        let OperationBody::InvokeHostFunction(ref invoke_op) = ops[0].body else {
+            return true;
+        };
+
+        let validate_create = |preimage: &ContractIdPreimage, executable: &ContractExecutable| {
+            if matches!(preimage, ContractIdPreimage::Asset(_))
+                && !matches!(executable, ContractExecutable::StellarAsset)
+            {
+                return false;
+            }
+            if matches!(preimage, ContractIdPreimage::Address(_))
+                && !matches!(executable, ContractExecutable::Wasm(_))
+            {
+                return false;
+            }
+            true
+        };
+
+        match &invoke_op.host_function {
+            HostFunction::CreateContract(args) => {
+                validate_create(&args.contract_id_preimage, &args.executable)
+            }
+            HostFunction::CreateContractV2(args) => {
+                validate_create(&args.contract_id_preimage, &args.executable)
+            }
+            _ => true,
+        }
+    }
 }
 
 /// Convert a MuxedAccount to AccountId.
@@ -1478,5 +1530,206 @@ mod tests {
             frame.validate_soroban_memo(),
             "RestoreFootprint with memo should pass (C++ only rejects memo for InvokeHostFunction)"
         );
+    }
+
+    // --- P3: validate_host_fn() ---
+
+    /// Create a Soroban envelope with a create-contract host function.
+    fn create_contract_envelope(
+        preimage: ContractIdPreimage,
+        executable: ContractExecutable,
+    ) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::CreateContract(CreateContractArgs {
+                    contract_id_preimage: preimage,
+                    executable,
+                }),
+                auth: VecM::default(),
+            }),
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: VecM::default(),
+                        read_write: VecM::default(),
+                    },
+                    instructions: 100,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 50,
+            }),
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        })
+    }
+
+    /// Create a Soroban envelope with a create-contract-v2 host function.
+    fn create_contract_v2_envelope(
+        preimage: ContractIdPreimage,
+        executable: ContractExecutable,
+    ) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::CreateContractV2(CreateContractArgsV2 {
+                    contract_id_preimage: preimage,
+                    executable,
+                    constructor_args: VecM::default(),
+                }),
+                auth: VecM::default(),
+            }),
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: VecM::default(),
+                        read_write: VecM::default(),
+                    },
+                    instructions: 100,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 50,
+            }),
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        })
+    }
+
+    #[test]
+    fn test_validate_host_fn_classic_always_passes() {
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        assert!(frame.validate_host_fn());
+    }
+
+    #[test]
+    fn test_validate_host_fn_invoke_contract_passes() {
+        let frame = TransactionFrame::from_owned(create_soroban_transaction());
+        assert!(frame.validate_host_fn());
+    }
+
+    #[test]
+    fn test_validate_host_fn_from_asset_with_stellar_asset_passes() {
+        let env = create_contract_envelope(
+            ContractIdPreimage::Asset(Asset::Native),
+            ContractExecutable::StellarAsset,
+        );
+        let frame = TransactionFrame::from_owned(env);
+        assert!(frame.validate_host_fn());
+    }
+
+    #[test]
+    fn test_validate_host_fn_from_address_with_wasm_passes() {
+        let env = create_contract_envelope(
+            ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [10u8; 32],
+                )))),
+                salt: Uint256([11u8; 32]),
+            }),
+            ContractExecutable::Wasm(Hash([12u8; 32])),
+        );
+        let frame = TransactionFrame::from_owned(env);
+        assert!(frame.validate_host_fn());
+    }
+
+    #[test]
+    fn test_validate_host_fn_from_asset_with_wasm_rejected() {
+        let env = create_contract_envelope(
+            ContractIdPreimage::Asset(Asset::Native),
+            ContractExecutable::Wasm(Hash([12u8; 32])),
+        );
+        let frame = TransactionFrame::from_owned(env);
+        assert!(!frame.validate_host_fn());
+    }
+
+    #[test]
+    fn test_validate_host_fn_from_address_with_stellar_asset_rejected() {
+        let env = create_contract_envelope(
+            ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [10u8; 32],
+                )))),
+                salt: Uint256([11u8; 32]),
+            }),
+            ContractExecutable::StellarAsset,
+        );
+        let frame = TransactionFrame::from_owned(env);
+        assert!(!frame.validate_host_fn());
+    }
+
+    #[test]
+    fn test_validate_host_fn_v2_from_asset_with_stellar_asset_passes() {
+        let env = create_contract_v2_envelope(
+            ContractIdPreimage::Asset(Asset::Native),
+            ContractExecutable::StellarAsset,
+        );
+        let frame = TransactionFrame::from_owned(env);
+        assert!(frame.validate_host_fn());
+    }
+
+    #[test]
+    fn test_validate_host_fn_v2_from_address_with_wasm_passes() {
+        let env = create_contract_v2_envelope(
+            ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [10u8; 32],
+                )))),
+                salt: Uint256([11u8; 32]),
+            }),
+            ContractExecutable::Wasm(Hash([12u8; 32])),
+        );
+        let frame = TransactionFrame::from_owned(env);
+        assert!(frame.validate_host_fn());
+    }
+
+    #[test]
+    fn test_validate_host_fn_v2_from_asset_with_wasm_rejected() {
+        let env = create_contract_v2_envelope(
+            ContractIdPreimage::Asset(Asset::Native),
+            ContractExecutable::Wasm(Hash([12u8; 32])),
+        );
+        let frame = TransactionFrame::from_owned(env);
+        assert!(!frame.validate_host_fn());
+    }
+
+    #[test]
+    fn test_validate_host_fn_v2_from_address_with_stellar_asset_rejected() {
+        let env = create_contract_v2_envelope(
+            ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    [10u8; 32],
+                )))),
+                salt: Uint256([11u8; 32]),
+            }),
+            ContractExecutable::StellarAsset,
+        );
+        let frame = TransactionFrame::from_owned(env);
+        assert!(!frame.validate_host_fn());
     }
 }
