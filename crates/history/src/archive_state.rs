@@ -1108,4 +1108,202 @@ mod tests {
         let all = remote.all_differing_bucket_hashes(&local);
         assert_eq!(all.len(), 4); // A, B, C, D combined
     }
+
+    /// Compute the bucket list hash the same way the Go SDK does.
+    ///
+    /// Go SDK: for each of 11 levels, SHA256(hex_decode(curr) || hex_decode(snap)),
+    /// then SHA256(concatenation of all level hashes).
+    fn go_sdk_bucket_list_hash(levels: &[HASBucketLevel]) -> Hash256 {
+        use sha2::{Digest, Sha256};
+
+        let mut total = Vec::new();
+        for level in levels {
+            let curr = hex::decode(&level.curr).unwrap_or_default();
+            let snap = hex::decode(&level.snap).unwrap_or_default();
+            let mut hasher = Sha256::new();
+            hasher.update(&curr);
+            hasher.update(&snap);
+            let level_hash = hasher.finalize();
+            total.extend_from_slice(&level_hash);
+        }
+
+        let mut hasher = Sha256::new();
+        hasher.update(&total);
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        Hash256::from_bytes(bytes)
+    }
+
+    /// Compute the combined bucket list hash the way the Go SDK does for version >= 2.
+    fn go_sdk_combined_hash(has: &HistoryArchiveState) -> Hash256 {
+        use sha2::{Digest, Sha256};
+
+        let live_hash = go_sdk_bucket_list_hash(&has.current_buckets);
+        if has.version < 2 {
+            return live_hash;
+        }
+
+        let hot_archive_hash = match &has.hot_archive_buckets {
+            Some(levels) => go_sdk_bucket_list_hash(levels),
+            None => {
+                // Go SDK: zero-initialized BucketList [11]struct{Curr: "", Snap: ""}
+                // SHA256 of empty bytes for each level, then SHA256 of all level hashes
+                let zero_levels: Vec<HASBucketLevel> = (0..11)
+                    .map(|_| HASBucketLevel {
+                        curr: String::new(),
+                        snap: String::new(),
+                        next: HASBucketNext::default(),
+                    })
+                    .collect();
+                go_sdk_bucket_list_hash(&zero_levels)
+            }
+        };
+
+        let mut hasher = Sha256::new();
+        hasher.update(live_hash.as_bytes());
+        hasher.update(hot_archive_hash.as_bytes());
+        let result = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&result);
+        Hash256::from_bytes(bytes)
+    }
+
+    /// Verify that a fresh HAS with all-zero bucket hashes produces consistent
+    /// hashes between henyey's computation and the Go SDK's computation.
+    #[test]
+    fn test_has_bucket_list_hash_round_trip_empty() {
+        let zero = ZERO_HASH;
+        let levels: Vec<HASBucketLevel> = (0..11)
+            .map(|_| HASBucketLevel {
+                curr: zero.to_string(),
+                snap: zero.to_string(),
+                next: HASBucketNext::default(),
+            })
+            .collect();
+
+        let has = HistoryArchiveState {
+            version: 2,
+            server: Some("test".to_string()),
+            current_ledger: 7,
+            network_passphrase: None,
+            current_buckets: levels.clone(),
+            hot_archive_buckets: Some(levels),
+        };
+
+        // Serialize to JSON and re-parse (simulating the archive round-trip)
+        let json = has.to_json().unwrap();
+        let reparsed = HistoryArchiveState::from_json(&json).unwrap();
+
+        // Compute hash the Go SDK way
+        let go_hash = go_sdk_combined_hash(&reparsed);
+
+        // Compute hash the henyey way (using the bucket level hashes directly)
+        use sha2::{Digest, Sha256};
+        let zero_hash = Hash256::ZERO;
+        let mut level_hashes = Vec::new();
+        for _ in 0..11 {
+            let mut h = Sha256::new();
+            h.update(zero_hash.as_bytes());
+            h.update(zero_hash.as_bytes());
+            level_hashes.extend_from_slice(&h.finalize());
+        }
+        let live_hash = {
+            let mut h = Sha256::new();
+            h.update(&level_hashes);
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            Hash256::from_bytes(b)
+        };
+        let combined_henyey = {
+            let mut h = Sha256::new();
+            h.update(live_hash.as_bytes());
+            h.update(live_hash.as_bytes()); // hot archive is same (all zeros)
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            Hash256::from_bytes(b)
+        };
+
+        assert_eq!(
+            go_hash,
+            combined_henyey,
+            "Go SDK hash ({}) != henyey hash ({})",
+            go_hash.to_hex(),
+            combined_henyey.to_hex()
+        );
+    }
+
+    /// Verify round-trip hash with non-zero bucket hashes.
+    #[test]
+    fn test_has_bucket_list_hash_round_trip_nonzero() {
+        let zero = ZERO_HASH;
+        let mut levels: Vec<HASBucketLevel> = (0..11)
+            .map(|_| HASBucketLevel {
+                curr: zero.to_string(),
+                snap: zero.to_string(),
+                next: HASBucketNext::default(),
+            })
+            .collect();
+        // Set level 0 to have non-zero hashes
+        levels[0].curr = HASH_A.to_string();
+        levels[0].snap = HASH_B.to_string();
+
+        let has = HistoryArchiveState {
+            version: 2,
+            server: Some("test".to_string()),
+            current_ledger: 7,
+            network_passphrase: None,
+            current_buckets: levels.clone(),
+            hot_archive_buckets: Some(levels.clone()),
+        };
+
+        let json = has.to_json().unwrap();
+        eprintln!("HAS JSON:\n{}", json);
+
+        let reparsed = HistoryArchiveState::from_json(&json).unwrap();
+        let go_hash = go_sdk_combined_hash(&reparsed);
+
+        // Manually compute henyey-style hash
+        use sha2::{Digest, Sha256};
+        let a = Hash256::from_hex(HASH_A).unwrap();
+        let b = Hash256::from_hex(HASH_B).unwrap();
+        let zero_h = Hash256::ZERO;
+
+        let mut all_level_hashes = Vec::new();
+        for i in 0..11 {
+            let (curr, snap) = if i == 0 { (&a, &b) } else { (&zero_h, &zero_h) };
+            let mut h = Sha256::new();
+            h.update(curr.as_bytes());
+            h.update(snap.as_bytes());
+            all_level_hashes.extend_from_slice(&h.finalize());
+        }
+        let live_hash = {
+            let mut h = Sha256::new();
+            h.update(&all_level_hashes);
+            let r = h.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&r);
+            Hash256::from_bytes(bytes)
+        };
+
+        let combined_henyey = {
+            let mut h = Sha256::new();
+            h.update(live_hash.as_bytes());
+            h.update(live_hash.as_bytes()); // same for hot archive
+            let r = h.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&r);
+            Hash256::from_bytes(bytes)
+        };
+
+        assert_eq!(
+            go_hash,
+            combined_henyey,
+            "Go SDK hash ({}) != henyey hash ({})",
+            go_hash.to_hex(),
+            combined_henyey.to_hex()
+        );
+    }
 }

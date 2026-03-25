@@ -591,4 +591,213 @@ mod tests {
         let bucket_dir = temp.path().join("bucket/00");
         assert!(bucket_dir.exists());
     }
+
+    /// Verify that `build_history_archive_state` produces a HAS whose bucket
+    /// hashes round-trip correctly: the Go SDK hash computation on the HAS
+    /// must equal the direct `BucketList::hash()` value.
+    ///
+    /// This tests the full pipeline: BucketList → build_history_archive_state
+    /// → HAS JSON → Go SDK hash recomputation → compare with BucketList::hash().
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_has_hash_matches_bucket_list_hash() {
+        use henyey_bucket::BucketList;
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::*;
+
+        let mut bl = BucketList::new();
+
+        // Add entries to ledger 1 through 7 (first checkpoint in accelerated mode)
+        for seq in 1..=7u32 {
+            let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seq as u8; 32])));
+            let entry = LedgerEntry {
+                last_modified_ledger_seq: seq,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id: account_id.clone(),
+                    balance: 100_000_000 * (seq as i64),
+                    seq_num: SequenceNumber(0),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: String32(StringM::default()),
+                    thresholds: Thresholds([1, 0, 0, 0]),
+                    signers: VecM::default(),
+                    ext: AccountEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            };
+            bl.add_batch(
+                seq,
+                25, // protocol 25
+                BucketListType::Live,
+                vec![entry],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        // Build HAS
+        let has = build_history_archive_state(7, &bl, None, None).unwrap();
+
+        // Verify HAS has 11 levels
+        assert_eq!(has.current_buckets.len(), 11, "HAS must have 11 levels");
+        assert_eq!(has.version, 2);
+
+        // Compute hash from HAS the Go SDK way
+        let go_live_hash = {
+            let mut total = Vec::new();
+            for level in &has.current_buckets {
+                let curr_bytes = hex::decode(&level.curr).unwrap();
+                let snap_bytes = hex::decode(&level.snap).unwrap();
+                let mut h = Sha256::new();
+                h.update(&curr_bytes);
+                h.update(&snap_bytes);
+                total.extend_from_slice(&h.finalize());
+            }
+            let mut h = Sha256::new();
+            h.update(&total);
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            henyey_common::Hash256::from_bytes(b)
+        };
+
+        // Compute hash directly from BucketList
+        let direct_live_hash = bl.hash();
+
+        assert_eq!(
+            go_live_hash,
+            direct_live_hash,
+            "Go SDK hash from HAS ({}) != BucketList::hash() ({})",
+            go_live_hash.to_hex(),
+            direct_live_hash.to_hex()
+        );
+
+        // Also verify JSON round-trip
+        let json = has.to_json().unwrap();
+        let reparsed: HistoryArchiveState = serde_json::from_str(&json).unwrap();
+        let go_live_hash_rt = {
+            let mut total = Vec::new();
+            for level in &reparsed.current_buckets {
+                let curr_bytes = hex::decode(&level.curr).unwrap();
+                let snap_bytes = hex::decode(&level.snap).unwrap();
+                let mut h = Sha256::new();
+                h.update(&curr_bytes);
+                h.update(&snap_bytes);
+                total.extend_from_slice(&h.finalize());
+            }
+            let mut h = Sha256::new();
+            h.update(&total);
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            henyey_common::Hash256::from_bytes(b)
+        };
+
+        assert_eq!(
+            go_live_hash_rt,
+            direct_live_hash,
+            "Go SDK hash after JSON round-trip ({}) != BucketList::hash() ({})",
+            go_live_hash_rt.to_hex(),
+            direct_live_hash.to_hex()
+        );
+    }
+
+    /// Same as above but with hot archive bucket list too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_build_has_hash_matches_with_hot_archive() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::*;
+
+        let mut bl = BucketList::new();
+        let mut habl = HotArchiveBucketList::new();
+
+        for seq in 1..=7u32 {
+            let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([seq as u8; 32])));
+            let entry = LedgerEntry {
+                last_modified_ledger_seq: seq,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id: account_id.clone(),
+                    balance: 100_000_000 * (seq as i64),
+                    seq_num: SequenceNumber(0),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: String32(StringM::default()),
+                    thresholds: Thresholds([1, 0, 0, 0]),
+                    signers: VecM::default(),
+                    ext: AccountEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            };
+            bl.add_batch(seq, 25, BucketListType::Live, vec![entry], vec![], vec![])
+                .unwrap();
+            // Add empty batch to hot archive to advance it
+            habl.add_batch(seq, 25, vec![], vec![]).unwrap();
+        }
+
+        let has = build_history_archive_state(7, &bl, Some(&habl), None).unwrap();
+
+        assert_eq!(has.current_buckets.len(), 11);
+        assert!(has.hot_archive_buckets.is_some());
+        assert_eq!(has.hot_archive_buckets.as_ref().unwrap().len(), 11);
+
+        // Compute combined hash from HAS the Go SDK way
+        let compute_hash_from_levels = |levels: &[HASBucketLevel]| -> henyey_common::Hash256 {
+            let mut total = Vec::new();
+            for level in levels {
+                let curr_bytes = hex::decode(&level.curr).unwrap();
+                let snap_bytes = hex::decode(&level.snap).unwrap();
+                let mut h = Sha256::new();
+                h.update(&curr_bytes);
+                h.update(&snap_bytes);
+                total.extend_from_slice(&h.finalize());
+            }
+            let mut h = Sha256::new();
+            h.update(&total);
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            henyey_common::Hash256::from_bytes(b)
+        };
+
+        let go_live = compute_hash_from_levels(&has.current_buckets);
+        let go_hot = compute_hash_from_levels(has.hot_archive_buckets.as_ref().unwrap());
+
+        let go_combined = {
+            let mut h = Sha256::new();
+            h.update(go_live.as_bytes());
+            h.update(go_hot.as_bytes());
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            henyey_common::Hash256::from_bytes(b)
+        };
+
+        // Compute combined hash directly
+        let direct_live = bl.hash();
+        let direct_hot = habl.hash();
+        let direct_combined = {
+            let mut h = Sha256::new();
+            h.update(direct_live.as_bytes());
+            h.update(direct_hot.as_bytes());
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            henyey_common::Hash256::from_bytes(b)
+        };
+
+        assert_eq!(
+            go_combined,
+            direct_combined,
+            "Combined: Go SDK ({}) != direct ({})\nLive: go={} direct={}\nHot: go={} direct={}",
+            go_combined.to_hex(),
+            direct_combined.to_hex(),
+            go_live.to_hex(),
+            direct_live.to_hex(),
+            go_hot.to_hex(),
+            direct_hot.to_hex(),
+        );
+    }
 }

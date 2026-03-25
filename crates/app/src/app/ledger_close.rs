@@ -119,6 +119,41 @@ impl App {
             let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
             let hot_archive_ref = hot_archive_guard.as_ref();
 
+            // Verify that the bucket list hash matches the header at checkpoint boundaries.
+            // This detects any state drift between close_ledger (which computes the hash)
+            // and persist_ledger_close (which builds the HAS).
+            if is_checkpoint_ledger(header.ledger_seq) {
+                use sha2::{Digest, Sha256};
+                let live_hash = bucket_list.hash();
+                let hot_archive_hash_val = hot_archive_ref.map(|h| h.hash());
+                let combined_hash = if let Some(hot_hash) = hot_archive_hash_val {
+                    let mut hasher = Sha256::new();
+                    hasher.update(live_hash.as_bytes());
+                    hasher.update(hot_hash.as_bytes());
+                    let result = hasher.finalize();
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&result);
+                    henyey_common::Hash256::from_bytes(bytes)
+                } else {
+                    live_hash
+                };
+                let header_bl_hash = henyey_common::Hash256::from_bytes(header.bucket_list_hash.0);
+                let direct_match = combined_hash == header_bl_hash;
+                tracing::info!(
+                    ledger_seq = header.ledger_seq,
+                    direct_computed_hash = %combined_hash.to_hex(),
+                    header_bucket_list_hash = %header_bl_hash.to_hex(),
+                    live_hash = %live_hash.to_hex(),
+                    hot_archive_hash = %hot_archive_hash_val.map(|h| h.to_hex()).unwrap_or_default(),
+                    hot_archive_present = hot_archive_ref.is_some(),
+                    direct_match = direct_match,
+                    "Checkpoint bucket list hash verification (direct computation)"
+                );
+                if !direct_match {
+                    tracing::error!("BUCKET LIST HASH MISMATCH between persist and close!");
+                }
+            }
+
             // Ensure hot archive buckets are persisted to disk for restart recovery.
             // Hot archive merges are all in-memory, so after each close the curr/snap
             // buckets may have no backing file.
@@ -133,6 +168,111 @@ impl App {
                 Some(self.config.network.passphrase.clone()),
             )
             .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
+
+            // At checkpoint boundaries, verify the HAS round-trips correctly
+            // by computing the hash the same way the Go SDK does.
+            if is_checkpoint_ledger(header.ledger_seq) {
+                use sha2::{Digest, Sha256};
+
+                // Compute hash from HAS the Go SDK way
+                let go_live_hash = {
+                    let mut total = Vec::new();
+                    for level in &has.current_buckets {
+                        let curr_bytes = hex::decode(&level.curr).unwrap_or_default();
+                        let snap_bytes = hex::decode(&level.snap).unwrap_or_default();
+                        let mut h = Sha256::new();
+                        h.update(&curr_bytes);
+                        h.update(&snap_bytes);
+                        total.extend_from_slice(&h.finalize());
+                    }
+                    let mut h = Sha256::new();
+                    h.update(&total);
+                    let r = h.finalize();
+                    let mut b = [0u8; 32];
+                    b.copy_from_slice(&r);
+                    henyey_common::Hash256::from_bytes(b)
+                };
+
+                let go_combined = if has.version >= 2 {
+                    let hot_hash = if let Some(ref hot_buckets) = has.hot_archive_buckets {
+                        let mut total = Vec::new();
+                        for level in hot_buckets {
+                            let curr_bytes = hex::decode(&level.curr).unwrap_or_default();
+                            let snap_bytes = hex::decode(&level.snap).unwrap_or_default();
+                            let mut h = Sha256::new();
+                            h.update(&curr_bytes);
+                            h.update(&snap_bytes);
+                            total.extend_from_slice(&h.finalize());
+                        }
+                        let mut h = Sha256::new();
+                        h.update(&total);
+                        let r = h.finalize();
+                        let mut b = [0u8; 32];
+                        b.copy_from_slice(&r);
+                        henyey_common::Hash256::from_bytes(b)
+                    } else {
+                        // Go SDK: zero-initialized BucketList with empty strings
+                        let mut total = Vec::new();
+                        for _ in 0..11 {
+                            let h = Sha256::new();
+                            // empty curr + empty snap
+                            total.extend_from_slice(&h.finalize());
+                        }
+                        let mut h = Sha256::new();
+                        h.update(&total);
+                        let r = h.finalize();
+                        let mut b = [0u8; 32];
+                        b.copy_from_slice(&r);
+                        henyey_common::Hash256::from_bytes(b)
+                    };
+                    let mut h = Sha256::new();
+                    h.update(go_live_hash.as_bytes());
+                    h.update(hot_hash.as_bytes());
+                    let r = h.finalize();
+                    let mut b = [0u8; 32];
+                    b.copy_from_slice(&r);
+                    henyey_common::Hash256::from_bytes(b)
+                } else {
+                    go_live_hash
+                };
+
+                let header_bl_hash = henyey_common::Hash256::from_bytes(header.bucket_list_hash.0);
+
+                tracing::info!(
+                    ledger_seq = header.ledger_seq,
+                    has_version = has.version,
+                    has_num_current_buckets = has.current_buckets.len(),
+                    has_num_hot_archive_buckets = has.hot_archive_buckets.as_ref().map(|v| v.len()).unwrap_or(0),
+                    has_hot_archive_present = has.hot_archive_buckets.is_some(),
+                    go_sdk_hash = %go_combined.to_hex(),
+                    header_bucket_list_hash = %header_bl_hash.to_hex(),
+                    match_result = (go_combined == header_bl_hash),
+                    "Checkpoint HAS hash verification (Go SDK algorithm)"
+                );
+
+                if go_combined != header_bl_hash {
+                    // Dump individual level hashes for debugging
+                    for (i, level) in has.current_buckets.iter().enumerate() {
+                        tracing::error!(
+                            level = i,
+                            curr = %level.curr,
+                            snap = %level.snap,
+                            "HAS live bucket level"
+                        );
+                    }
+                    if let Some(ref hot_buckets) = has.hot_archive_buckets {
+                        for (i, level) in hot_buckets.iter().enumerate() {
+                            tracing::error!(
+                                level = i,
+                                curr = %level.curr,
+                                snap = %level.snap,
+                                "HAS hot archive bucket level"
+                            );
+                        }
+                    }
+                }
+            }
+
             has.to_json()
                 .map_err(|e| anyhow::anyhow!("Failed to serialize HAS: {}", e))?
         };

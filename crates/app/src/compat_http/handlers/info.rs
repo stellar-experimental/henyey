@@ -36,7 +36,7 @@ pub(crate) async fn compat_info_handler(
 
     let info = CompatInfoResponse {
         build: format!("henyey-v{}", env!("CARGO_PKG_VERSION")),
-        protocol_version: ledger.version,
+        protocol_version: app.config().network.max_protocol_version,
         state: state_str.to_string(),
         started_on: state.started_on.clone(),
         ledger: CompatLedgerInfo {

@@ -750,15 +750,18 @@ fn execute_host_function_p24(
 
     // Read-only footprint entries
     for key in soroban_data.resources.footprint.read_only.iter() {
-        if let Some((entry, live_until)) = snapshot.get_local(key).map_err(|e| {
-            SorobanExecutionError {
+        if let Some((entry, live_until)) =
+            snapshot.get_local(key).map_err(|e| SorobanExecutionError {
                 host_error: e,
                 cpu_insns_consumed: 0,
                 mem_bytes_consumed: 0,
-            }
-        })? {
-            encoded_ledger_entries
-                .push(entry.to_xdr(Limits::none()).map_err(|_| make_xdr_setup_error())?);
+            })?
+        {
+            encoded_ledger_entries.push(
+                entry
+                    .to_xdr(Limits::none())
+                    .map_err(|_| make_xdr_setup_error())?,
+            );
             encoded_ttl_entries.push(encode_ttl(key, live_until));
         }
     }
@@ -830,15 +833,18 @@ fn execute_host_function_p24(
                     encoded_ttl_entries.push(encode_ttl(key, live_until));
                 }
             }
-        } else if let Some((entry, live_until)) = snapshot.get_local(key).map_err(|e| {
-            SorobanExecutionError {
+        } else if let Some((entry, live_until)) =
+            snapshot.get_local(key).map_err(|e| SorobanExecutionError {
                 host_error: e,
                 cpu_insns_consumed: 0,
                 mem_bytes_consumed: 0,
-            }
-        })? {
-            encoded_ledger_entries
-                .push(entry.to_xdr(Limits::none()).map_err(|_| make_xdr_setup_error())?);
+            })?
+        {
+            encoded_ledger_entries.push(
+                entry
+                    .to_xdr(Limits::none())
+                    .map_err(|_| make_xdr_setup_error())?,
+            );
             encoded_ttl_entries.push(encode_ttl(key, live_until));
         }
     }
@@ -1134,8 +1140,11 @@ fn execute_host_function_p25(
     // Read-only footprint entries
     for key in soroban_data.resources.footprint.read_only.iter() {
         if let Some((entry, live_until)) = snapshot.get_local(key).map_err(make_setup_error)? {
-            encoded_ledger_entries
-                .push(entry.to_xdr(Limits::none()).map_err(|_| make_xdr_setup_error())?);
+            encoded_ledger_entries.push(
+                entry
+                    .to_xdr(Limits::none())
+                    .map_err(|_| make_xdr_setup_error())?,
+            );
             encoded_ttl_entries.push(encode_ttl(key, live_until));
         }
     }
@@ -1206,8 +1215,11 @@ fn execute_host_function_p25(
         } else if let Some((entry, live_until)) =
             snapshot.get_local(key).map_err(make_setup_error)?
         {
-            encoded_ledger_entries
-                .push(entry.to_xdr(Limits::none()).map_err(|_| make_xdr_setup_error())?);
+            encoded_ledger_entries.push(
+                entry
+                    .to_xdr(Limits::none())
+                    .map_err(|_| make_xdr_setup_error())?,
+            );
             encoded_ttl_entries.push(encode_ttl(key, live_until));
         }
     }
