@@ -1725,6 +1725,7 @@ impl HerderCallback for App {
             tx_set,
             tx_set_variant,
             close_time,
+            upgrades: Vec::new(),
         };
 
         let join_result = (&mut pending.handle).await;
@@ -2657,6 +2658,7 @@ mod tests {
                 txs: stellar_xdr::curr::VecM::default(),
             }),
             close_time: 1,
+            upgrades: Vec::new(),
         };
 
         let mut pending = pending;
@@ -2698,6 +2700,7 @@ mod tests {
                 txs: stellar_xdr::curr::VecM::default(),
             }),
             close_time: 1,
+            upgrades: Vec::new(),
         };
 
         let mut pending = pending;
@@ -2755,6 +2758,7 @@ mod tests {
                 txs: stellar_xdr::curr::VecM::default(),
             }),
             close_time: 1,
+            upgrades: Vec::new(),
         };
 
         let mut pending = pending;

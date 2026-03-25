@@ -1630,11 +1630,32 @@ impl Herder {
     /// Mark a ledger as closed and clean up.
     ///
     /// Called after the application has applied the ledger.
-    pub fn ledger_closed(&self, slot: SlotIndex, applied_tx_hashes: &[Hash256]) {
+    pub fn ledger_closed(
+        &self,
+        slot: SlotIndex,
+        applied_tx_hashes: &[Hash256],
+        applied_upgrades: &[UpgradeType],
+        close_time: u64,
+    ) {
         debug!(slot, txs = applied_tx_hashes.len(), "Ledger closed");
 
         // Remove applied transactions from queue
         self.tx_queue.remove_applied_by_hash(applied_tx_hashes);
+
+        // Clear consumed upgrade parameters so they are not proposed again.
+        // Mirrors stellar-core HerderImpl::processExternalized() -> removeUpgrades().
+        {
+            let (new_params, updated) = self
+                .runtime_upgrades
+                .read()
+                .remove_upgrades(applied_upgrades, close_time);
+            if updated {
+                let max_protocol = self.config.max_protocol_version;
+                let mut upgrades = self.runtime_upgrades.write();
+                // Ignore the result — the params were already validated when set.
+                let _ = upgrades.set_parameters(new_params, max_protocol);
+            }
+        }
 
         // Drop pending tx set requests for slots older than the next slot.
         let _ = self

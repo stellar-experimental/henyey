@@ -320,6 +320,9 @@ pub(super) struct PendingLedgerClose {
     pub tx_set_variant: TransactionSetVariant,
     /// Close time for the ledger.
     pub close_time: u64,
+    /// Upgrades included in the externalized StellarValue (used for clearing
+    /// runtime upgrade parameters after application).
+    pub upgrades: Vec<UpgradeType>,
 }
 
 #[derive(Debug)]

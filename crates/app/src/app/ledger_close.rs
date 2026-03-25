@@ -1401,6 +1401,7 @@ impl App {
             tx_set,
             tx_set_variant,
             close_time,
+            upgrades: close_info.upgrades.clone(),
         })
     }
 
@@ -1548,8 +1549,12 @@ impl App {
         // for all transactions, allowing the account to submit new ones.
         let mut all_hashes = applied_hashes.clone();
         all_hashes.extend_from_slice(&failed_hashes);
-        self.herder
-            .ledger_closed(pending.ledger_seq as u64, &all_hashes);
+        self.herder.ledger_closed(
+            pending.ledger_seq as u64,
+            &all_hashes,
+            &pending.upgrades,
+            pending.close_time,
+        );
 
         // Clear per-ledger overlay state (flood gate, etc.) for old ledgers.
         // Mirrors upstream HerderImpl::eraseBelow() -> clearLedgersBelow().
