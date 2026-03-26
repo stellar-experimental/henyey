@@ -207,10 +207,17 @@ impl App {
             // don't exist on disk.
             self.persist_hot_archive_buckets(hot_archive_ref);
 
+            // Only include hot archive in HAS when protocol >= 23
+            let hot_archive_for_has = if final_header.ledger_version >= 23 {
+                Some(hot_archive_ref)
+            } else {
+                None
+            };
+
             let has = build_history_archive_state(
                 final_header.ledger_seq,
                 &bucket_list,
-                Some(hot_archive_ref),
+                hot_archive_for_has,
                 Some(self.config.network.passphrase.clone()),
             )
             .map_err(|e| anyhow::anyhow!("Failed to build HAS after catchup: {}", e))?;

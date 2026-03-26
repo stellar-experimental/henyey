@@ -890,4 +890,192 @@ mod tests {
             "Combined hash must differ from live-only hash"
         );
     }
+
+    /// Reproduce the quickstart local mode bug: Horizon reads the HAS published
+    /// by henyey and computes a bucket_list_hash that doesn't match the header.
+    ///
+    /// This simulates the exact flow:
+    /// 1. Genesis at protocol 0 (no hot archive in header hash)
+    /// 2. Upgrade to protocol 25 (header now uses SHA256(live || hot))
+    /// 3. Close ledgers through a checkpoint boundary
+    /// 4. Build HAS with hot archive
+    /// 5. Verify Go SDK hash from HAS matches header's bucket_list_hash
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_quickstart_local_mode_has_hash_matches_header() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, AccountId, BucketListType, LedgerEntry, LedgerEntryData,
+            LedgerEntryExt, PublicKey, SequenceNumber, String32, StringM, Thresholds, Uint256,
+            VecM,
+        };
+
+        // --- Helper: compute Go SDK hash from HAS (same as Horizon) ---
+        let go_sdk_hash_from_levels = |levels: &[HASBucketLevel]| -> henyey_common::Hash256 {
+            let mut total = Vec::new();
+            for level in levels {
+                let curr = hex::decode(&level.curr).unwrap_or_default();
+                let snap = hex::decode(&level.snap).unwrap_or_default();
+                let mut h = Sha256::new();
+                h.update(&curr);
+                h.update(&snap);
+                total.extend_from_slice(&h.finalize());
+            }
+            let mut h = Sha256::new();
+            h.update(&total);
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            henyey_common::Hash256::from_bytes(b)
+        };
+
+        let go_sdk_combined_hash = |has: &HistoryArchiveState| -> henyey_common::Hash256 {
+            let live_hash = go_sdk_hash_from_levels(&has.current_buckets);
+            if has.version < 2 {
+                return live_hash;
+            }
+            let hot_hash = match &has.hot_archive_buckets {
+                Some(levels) => go_sdk_hash_from_levels(levels),
+                None => {
+                    let zero_levels: Vec<HASBucketLevel> = (0..11)
+                        .map(|_| HASBucketLevel {
+                            curr: String::new(),
+                            snap: String::new(),
+                            next: HASBucketNext::default(),
+                        })
+                        .collect();
+                    go_sdk_hash_from_levels(&zero_levels)
+                }
+            };
+            let mut h = Sha256::new();
+            h.update(live_hash.as_bytes());
+            h.update(hot_hash.as_bytes());
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            henyey_common::Hash256::from_bytes(b)
+        };
+
+        // --- Simulate quickstart local mode ---
+        let mut bl = BucketList::new();
+        let mut habl = HotArchiveBucketList::new();
+
+        // Genesis: add root account at ledger 1, protocol 0
+        let root_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+                balance: 1_000_000_000_000_000_000,
+                seq_num: SequenceNumber(0),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: String32(StringM::default()),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: VecM::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        bl.add_batch(1, 0, BucketListType::Live, vec![root_entry], vec![], vec![])
+            .unwrap();
+
+        // Genesis header: protocol 0, bucket_list_hash = live_hash only
+        let genesis_live_hash = bl.hash();
+
+        // Verify genesis HAS (version 1, no hot archive)
+        let genesis_has = build_history_archive_state(1, &bl, None, None).unwrap();
+        assert_eq!(genesis_has.version, 1);
+        let genesis_go_hash = go_sdk_combined_hash(&genesis_has);
+        assert_eq!(
+            genesis_go_hash,
+            genesis_live_hash,
+            "Genesis: Go SDK hash from HAS ({}) != header bucket_list_hash ({})",
+            genesis_go_hash.to_hex(),
+            genesis_live_hash.to_hex()
+        );
+
+        // Ledger 2: protocol upgrade 0 → 25
+        // stellar-core gates addHotArchiveBatch behind prev_version (0 < 23),
+        // so hot archive is NOT updated. But the hash combination uses the
+        // upgraded version (25 >= 23), so header hash = SHA256(live || hot).
+        bl.add_batch(2, 25, BucketListType::Live, vec![], vec![], vec![])
+            .unwrap();
+        // Don't call habl.add_batch — matching stellar-core's behavior on upgrade ledger.
+        // Just advance the ledger_seq so subsequent ledgers don't try to backfill.
+        habl.set_ledger_seq(2);
+
+        let live_hash = bl.hash();
+        let hot_hash = habl.hash();
+        let header_hash = {
+            let mut h = Sha256::new();
+            h.update(live_hash.as_bytes());
+            h.update(hot_hash.as_bytes());
+            let r = h.finalize();
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&r);
+            henyey_common::Hash256::from_bytes(b)
+        };
+
+        // Build HAS with hot archive (this is what henyey now does after the fix)
+        let has = build_history_archive_state(2, &bl, Some(&habl), None).unwrap();
+        assert_eq!(has.version, 2);
+        let go_hash = go_sdk_combined_hash(&has);
+
+        assert_eq!(
+            go_hash,
+            header_hash,
+            "Ledger 2 (upgrade): Go SDK hash from HAS ({}) != header bucket_list_hash ({})\n\
+             live_hash={}, hot_hash={}",
+            go_hash.to_hex(),
+            header_hash.to_hex(),
+            live_hash.to_hex(),
+            hot_hash.to_hex(),
+        );
+
+        // Close ledgers 3..=7 (first checkpoint at accelerated frequency)
+        for seq in 3..=7u32 {
+            bl.add_batch(seq, 25, BucketListType::Live, vec![], vec![], vec![])
+                .unwrap();
+            habl.add_batch(seq, 25, vec![], vec![]).unwrap();
+
+            let live_hash = bl.hash();
+            let hot_hash = habl.hash();
+            let header_hash = {
+                let mut h = Sha256::new();
+                h.update(live_hash.as_bytes());
+                h.update(hot_hash.as_bytes());
+                let r = h.finalize();
+                let mut b = [0u8; 32];
+                b.copy_from_slice(&r);
+                henyey_common::Hash256::from_bytes(b)
+            };
+
+            let has = build_history_archive_state(seq, &bl, Some(&habl), None).unwrap();
+            assert_eq!(has.version, 2, "Ledger {}: should be version 2", seq);
+
+            let go_hash = go_sdk_combined_hash(&has);
+            assert_eq!(
+                go_hash,
+                header_hash,
+                "Ledger {}: Go SDK hash from HAS ({}) != header bucket_list_hash ({})",
+                seq,
+                go_hash.to_hex(),
+                header_hash.to_hex(),
+            );
+
+            // Also verify JSON round-trip preserves hashes
+            let json = has.to_json().unwrap();
+            let reparsed: HistoryArchiveState = serde_json::from_str(&json).unwrap();
+            let go_hash_rt = go_sdk_combined_hash(&reparsed);
+            assert_eq!(
+                go_hash_rt,
+                header_hash,
+                "Ledger {} (after JSON round-trip): Go SDK hash ({}) != header ({})",
+                seq,
+                go_hash_rt.to_hex(),
+                header_hash.to_hex(),
+            );
+        }
+    }
 }

@@ -368,6 +368,70 @@ impl HistoryArchiveState {
         self.network_passphrase.as_deref()
     }
 
+    /// Compute the bucket list hash from this HAS using the same algorithm
+    /// as the Go SDK (Horizon).
+    ///
+    /// This is SHA256(concat of per-level SHA256(hex_decode(curr) || hex_decode(snap)))
+    /// for the live bucket list, and for version >= 2, SHA256(live_hash || hot_hash).
+    ///
+    /// This function is used for diagnostic verification - the result should
+    /// match the ledger header's `bucket_list_hash` for the same checkpoint.
+    pub fn compute_bucket_list_hash(&self) -> Result<Hash256, HistoryError> {
+        use sha2::{Digest, Sha256};
+
+        let hash_levels = |levels: &[HASBucketLevel]| -> Result<Hash256, HistoryError> {
+            let mut total = Vec::with_capacity(levels.len() * 32);
+            for level in levels {
+                let curr_bytes = hex::decode(&level.curr).map_err(|e| {
+                    HistoryError::VerificationFailed(format!("invalid hex in curr: {}", e))
+                })?;
+                let snap_bytes = hex::decode(&level.snap).map_err(|e| {
+                    HistoryError::VerificationFailed(format!("invalid hex in snap: {}", e))
+                })?;
+                let mut h = Sha256::new();
+                h.update(&curr_bytes);
+                h.update(&snap_bytes);
+                total.extend_from_slice(&h.finalize());
+            }
+            let mut h = Sha256::new();
+            h.update(&total);
+            let r = h.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&r);
+            Ok(Hash256::from_bytes(bytes))
+        };
+
+        let live_hash = hash_levels(&self.current_buckets)?;
+
+        if self.version < 2 {
+            return Ok(live_hash);
+        }
+
+        let hot_hash = if let Some(ref hot_levels) = self.hot_archive_buckets {
+            hash_levels(hot_levels)?
+        } else {
+            // No hot archive levels: compute hash of 11 all-zero levels
+            let zero_levels: Vec<HASBucketLevel> = (0..11)
+                .map(|_| HASBucketLevel {
+                    curr: "0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                    snap: "0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                    next: HASBucketNext::default(),
+                })
+                .collect();
+            hash_levels(&zero_levels)?
+        };
+
+        let mut h = Sha256::new();
+        h.update(live_hash.as_bytes());
+        h.update(hot_hash.as_bytes());
+        let r = h.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&r);
+        Ok(Hash256::from_bytes(bytes))
+    }
+
     /// Get the server version string if available.
     pub fn server(&self) -> Option<&str> {
         self.server.as_deref()

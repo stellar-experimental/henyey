@@ -63,6 +63,7 @@ pub fn is_stellar_core_format(raw: &toml::Value) -> bool {
         "FORCE_SCP",
         "KNOWN_PEERS",
         "PREFERRED_PEERS",
+        "PREFERRED_UPGRADE_PROTOCOL_VERSION",
     ];
 
     table
@@ -193,6 +194,11 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
     if let Some(v) = get_bool(table, "ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION") {
         config.diagnostics.tx_submission_diagnostics = v;
+    }
+
+    // --- Upgrades ---
+    if let Some(v) = get_u32(table, "PREFERRED_UPGRADE_PROTOCOL_VERSION") {
+        config.upgrades.protocol_version = Some(v);
     }
 
     // --- Testing ---
@@ -728,6 +734,34 @@ mod tests {
         .public_key()
         .to_strkey();
         assert_eq!(config.node.quorum_set.validators[0], expected_pubkey);
+    }
+
+    #[test]
+    fn test_preferred_upgrade_protocol_version() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            PREFERRED_UPGRADE_PROTOCOL_VERSION = 25
+            "#,
+        )
+        .unwrap();
+
+        assert!(is_stellar_core_format(&core_toml));
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(config.upgrades.protocol_version, Some(25));
+    }
+
+    #[test]
+    fn test_preferred_upgrade_protocol_version_absent() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            "#,
+        )
+        .unwrap();
+
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(config.upgrades.protocol_version, None);
     }
 
     #[test]

@@ -126,13 +126,52 @@ impl App {
                 self.persist_hot_archive_buckets(habl);
             }
 
+            // Only include hot archive in HAS when protocol >= 23, matching
+            // stellar-core. At earlier protocols the header's bucket_list_hash
+            // is live-only, so including hot archive would cause Horizon to
+            // compute a combined hash that doesn't match the header.
+            let hot_archive_for_has = if header.ledger_version >= 23 {
+                hot_archive_ref
+            } else {
+                None
+            };
+
             let has = build_history_archive_state(
                 header.ledger_seq,
                 &bucket_list,
-                hot_archive_ref,
+                hot_archive_for_has,
                 Some(self.config.network.passphrase.clone()),
             )
             .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
+
+            // Diagnostic: verify that the Go SDK hash from this HAS matches
+            // the header's bucket_list_hash. If these differ, Horizon will
+            // reject the archive.
+            let expected_hash = henyey_common::Hash256::from_bytes(header.bucket_list_hash.0);
+            match has.compute_bucket_list_hash() {
+                Ok(go_sdk_hash) => {
+                    if go_sdk_hash != expected_hash {
+                        tracing::error!(
+                            ledger_seq = header.ledger_seq,
+                            has_version = has.version,
+                            go_sdk_hash = %go_sdk_hash.to_hex(),
+                            header_hash = %expected_hash.to_hex(),
+                            has_hot_archive = has.hot_archive_buckets.is_some(),
+                            hot_archive_levels = has.hot_archive_buckets.as_ref().map(|v| v.len()).unwrap_or(0),
+                            current_bucket_levels = has.current_buckets.len(),
+                            "DIAGNOSTIC: HAS bucket_list_hash does NOT match header! \
+                             Horizon will reject this archive."
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        ledger_seq = header.ledger_seq,
+                        error = %e,
+                        "Failed to compute diagnostic Go SDK hash from HAS"
+                    );
+                }
+            }
 
             has.to_json()
                 .map_err(|e| anyhow::anyhow!("Failed to serialize HAS: {}", e))?
