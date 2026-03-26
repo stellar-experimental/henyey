@@ -300,7 +300,7 @@ fn execute_contract_invocation(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationExecutionResult> {
-    use crate::soroban::execute_host_function_with_cache;
+    use crate::soroban::{execute_host_function_with_cache, HostFunctionInvocation};
 
     let ContractInvocationRequest {
         op,
@@ -359,9 +359,9 @@ fn execute_contract_invocation(
     }
 
     // Execute via soroban-env-host
-    match execute_host_function_with_cache(
-        &op.host_function,
-        &auth_entries,
+    match execute_host_function_with_cache(HostFunctionInvocation {
+        host_function: &op.host_function,
+        auth_entries: &auth_entries,
         source,
         state,
         context,
@@ -370,7 +370,7 @@ fn execute_contract_invocation(
         module_cache,
         hot_archive,
         ttl_key_cache,
-    ) {
+    }) {
         Ok(result) => {
             // stellar-core check: event size (collectEvents in doApply)
             if soroban_config.tx_max_contract_events_size_bytes > 0

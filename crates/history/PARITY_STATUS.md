@@ -3,117 +3,110 @@
 **Crate**: `henyey-history`
 **Upstream**: `stellar-core/src/history/`
 **Overall Parity**: 83%
-**Last Updated**: 2026-03-17
+**Last Updated**: 2026-03-26
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
-| Checkpoint arithmetic | Full | All static methods implemented |
-| History Archive State (HAS) | Full | FutureBucket resolution, differing buckets, validation |
-| HistoryArchive (shell commands) | Full | get/put/mkdir commands |
-| HistoryArchiveManager | Partial | Missing report/check work |
-| Publish queue | Full | SQLite-backed, crash-safe |
-| CheckpointBuilder | Full | ACID dirty-file pattern |
-| FileTransferInfo / paths | Full | All path generation covered |
-| StateSnapshot / publish | Partial | Missing SCP messages |
-| Publish metrics / callbacks | None | No Medida equivalent |
-| Verification | Full | Header chain, bucket, tx set |
-| Catchup orchestration | Full | 7-step process (Rust-native) |
-| Ledger replay | Full | Re-execution and meta-based |
+| Checkpoint math | Full | Matches 64-ledger checkpoint rules |
+| Archive path generation | Full | Standard shard and dirty paths covered |
+| HAS parsing and diffing | Partial | Missing direct bucket-list hash helper |
+| Archive HTTP and shell access | Full | Native HTTP reads plus shell-command writes |
+| Archive manager | Partial | No random selection or work wrappers |
+| Checkpoint builder | Full | Crash-safe dirty-file recovery implemented |
+| Publish queue persistence | Full | SQLite-backed queue replaces filesystem queue |
+| Publish orchestration | Partial | Missing some callbacks, metrics, cleanup helpers |
+| State snapshot publishing | Partial | No SCP snapshot file or differential HAS upload |
+| Verification | Full | Header, bucket, tx-set, tx-result checks implemented |
+| Catchup and replay | Full | Rust-native orchestration covers core flow |
+| Metrics and status plumbing | None | No Medida/StatusManager equivalent yet |
 
 ## File Mapping
 
 | stellar-core File | Rust Module | Notes |
 |--------------------|-------------|-------|
-| `HistoryManager.h` / `HistoryManagerImpl.h` | `lib.rs`, `checkpoint.rs`, `publish_queue.rs` | Split across multiple modules |
-| `HistoryArchive.h` (HistoryArchiveState) | `archive_state.rs` | JSON-based serde vs cereal |
-| `HistoryArchive.h` (HistoryArchive class) | `remote_archive.rs` | Shell command archive ops |
-| `HistoryArchiveManager.h` | `lib.rs` (HistoryArchiveManager) | Archive management |
-| `FileTransferInfo.h` | `paths.rs` | Path generation functions |
-| `CheckpointBuilder.h` | `checkpoint_builder.rs` | Crash-safe checkpoint building |
-| `StateSnapshot.h` | `publish.rs` | Publishing workflow |
-| `HistoryUtils.h` | Inline in `replay.rs` / `catchup.rs` | Entry iteration |
+| `HistoryManager.h` | `checkpoint.rs`, `publish_queue.rs`, `publish.rs`, `lib.rs` | Static checkpoint helpers and publish APIs are split across modules |
+| `HistoryManagerImpl.h` | `publish.rs`, `publish_queue.rs`, `checkpoint_builder.rs` | Rust keeps publish state in plain structs instead of one manager impl |
+| `HistoryArchive.h` | `archive_state.rs`, `archive.rs`, `remote_archive.rs` | HAS state and archive transport are split |
+| `HistoryArchiveManager.h` | `lib.rs` | Archive registry and initialization live at crate root |
+| `FileTransferInfo.h` | `paths.rs` | Path generation is function-based rather than object-based |
+| `CheckpointBuilder.h` | `checkpoint_builder.rs` | Crash-safe stream building maps closely |
+| `StateSnapshot.h` | `publish.rs` | PublishManager replaces `StateSnapshot` |
+| `HistoryUtils.h` | `replay.rs` | Gap-tolerant history iteration is inlined into replay logic |
+| `src/catchup/` and `src/historywork/` work classes | `catchup.rs`, `download.rs`, `verify.rs` | Rust crate also absorbs catchup/download orchestration beyond `src/history/` |
 
 ## Component Mapping
 
 ### checkpoint.rs / paths.rs (`checkpoint.rs`, `paths.rs`)
 
-Corresponds to: `HistoryManager.h` (static checkpoint methods), `FileTransferInfo.h`
+Corresponds to: `HistoryManager.h`, `FileTransferInfo.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `getCheckpointFrequency()` | `CHECKPOINT_FREQUENCY` | Full |
-| `checkpointContainingLedger()` | `checkpoint_ledger()` | Full |
+| `getCheckpointFrequency()` | `checkpoint_frequency()` / `CHECKPOINT_FREQUENCY` | Full |
+| `checkpointContainingLedger()` | `checkpoint_containing()` / `checkpoint_ledger()` | Full |
 | `publishCheckpointOnLedgerClose()` | `is_checkpoint_ledger()` | Full |
-| `isFirstLedgerInCheckpoint()` | Compare with `first_ledger_in_checkpoint_containing()` | Full |
+| `isFirstLedgerInCheckpoint()` | `first_ledger_in_checkpoint_containing()` | Full |
 | `isLastLedgerInCheckpoint()` | `is_checkpoint_ledger()` | Full |
 | `sizeOfCheckpointContaining()` | `size_of_checkpoint_containing()` | Full |
 | `firstLedgerInCheckpointContaining()` | `first_ledger_in_checkpoint_containing()` | Full |
 | `firstLedgerAfterCheckpointContaining()` | `next_checkpoint()` | Full |
 | `lastLedgerBeforeCheckpointContaining()` | `last_ledger_before_checkpoint_containing()` | Full |
 | `ledgerToTriggerCatchup()` | `ledger_to_trigger_catchup()` | Full |
-| `FileType` enum | Category strings in `paths.rs` | Full |
-| `typeString()` | Inline category strings | Full |
-| `createPath()` | `fs::create_dir_all` | Full |
-| `createPublishDir()` | `PublishManager` directory creation | Full |
-| `getPublishHistoryDir()` | `PublishManager` path handling | Full |
-| `FileTransferInfo` constructors | `checkpoint_path()`, `bucket_path()` | Full |
-| `localPath_nogz()` / `localPath_nogz_dirty()` | `checkpoint_path()` / `checkpoint_path_dirty()` | Full |
-| `localPath_gz()` / `localPath_gz_tmp()` | `checkpoint_path()` with `.gz` extension | Full |
-| `baseName_nogz()` / `baseName_gz()` | `checkpoint_path()` basename extraction | Full |
-| `remoteDir()` / `remoteName()` | `checkpoint_path()` URL generation | Full |
-| `checkpoint_path()` dirty helpers | `checkpoint_path_dirty()`, `is_dirty_path()`, `dirty_to_final_path()`, `final_to_dirty_path()` | Full |
+| `FileType` / `typeString()` | category strings in `paths.rs` | Full |
+| `createPath()` | `std::fs::create_dir_all()` call sites | Full |
+| `createPublishDir()` / `getPublishHistoryDir()` | `checkpoint_path*()` helpers plus publish dir management | Full |
+| `localPath_nogz*()` / `remoteDir()` / `remoteName()` | `checkpoint_path()`, `checkpoint_path_dirty()`, `bucket_path()`, `has_path()` | Full |
 
 ### archive_state.rs (`archive_state.rs`)
 
-Corresponds to: `HistoryArchive.h` (HistoryArchiveState)
+Corresponds to: `HistoryArchive.h` (`HistoryArchiveState`)
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `HistoryArchiveState()` (default) | `HistoryArchiveState` struct with serde defaults | Full |
-| `HistoryArchiveState(ledgerSeq, buckets, passphrase)` | `build_history_archive_state()` | Full |
+| `HistoryArchiveState()` | `HistoryArchiveState` serde struct | Full |
+| `HistoryArchiveState(ledgerSeq, ...)` | `build_history_archive_state()` | Full |
 | `baseName()` | `root_has_path()` | Full |
-| `wellKnownRemoteDir()` | `.well-known/` in paths | Full |
-| `wellKnownRemoteName()` | `root_has_path()` | Full |
-| `remoteDir()` | `checkpoint_path("history", ...)` | Full |
-| `remoteName()` | `has_path()` | Full |
-| `getBucketListHash()` | `get_bucket_list_hash()` | Full |
-| `differingBuckets()` | `differing_bucket_hashes()` | Full |
-| `allBuckets()` | `all_bucket_hashes()` | Full |
-| `serialize()` / `deserialize()` | `from_json()` / `to_json()` via serde | Full |
+| `wellKnownRemoteDir()` / `wellKnownRemoteName()` | `.well-known/stellar-history.json` helpers | Full |
+| `remoteDir()` / `remoteName()` | `has_path()` / `checkpoint_path("history", ...)` | Full |
+| `localName()` | -- | Omission |
+| `getBucketListHash()` | -- | None |
+| `differingBuckets()` | `differing_bucket_hashes()` / `all_differing_bucket_hashes()` | Full |
+| `allBuckets()` | `all_bucket_hashes()` / `unique_bucket_hashes()` | Full |
+| `serialize()` / `deserialize()` | `to_json()` / `from_json()` | Full |
 | `futuresAllClear()` | `futures_all_clear()` | Full |
 | `futuresAllResolved()` | `futures_all_resolved()` | Full |
 | `resolveAllFutures()` | `resolve_all_futures()` | Full |
 | `resolveAnyReadyFutures()` | -- | None |
-| `save()` / `load()` | `to_json()` / `from_json()` + file I/O | Full |
+| `save()` / `load()` | `to_json()` / `from_json()` plus file I/O call sites | Full |
 | `toString()` / `fromString()` | `to_json()` / `from_json()` | Full |
-| `prepareForPublish()` | `build_history_archive_state()` | Full |
+| `prepareForPublish()` | `build_history_archive_state()` | Partial |
 | `containsValidBuckets()` | `contains_valid_buckets()` | Full |
 | `hasHotArchiveBuckets()` | `has_hot_archive_buckets()` | Full |
 
-### remote_archive.rs (`remote_archive.rs`)
+### archive.rs / remote_archive.rs (`archive.rs`, `remote_archive.rs`)
 
-Corresponds to: `HistoryArchive.h` (HistoryArchive class)
+Corresponds to: `HistoryArchive.h` (`HistoryArchive`)
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `HistoryArchive(config)` | `RemoteArchive::new(config)` | Full |
+| `HistoryArchive(config)` | `HistoryArchive::new()` / `RemoteArchive::new()` | Full |
 | `hasGetCmd()` | `can_read()` | Full |
 | `hasPutCmd()` | `can_write()` | Full |
 | `hasMkdirCmd()` | `config.mkdir_cmd.is_some()` | Full |
-| `getName()` | `name()` | Full |
-| `getFileCmd()` | `get_file()` | Full |
-| `putFileCmd()` | `put_file()` | Full |
-| `mkdirCmd()` | `mkdir()` | Full |
+| `getName()` | `name()` / archive entry name | Full |
+| `getFileCmd()` | `get_file()` / HTTP `get_*()` methods | Full |
+| `putFileCmd()` | `put_file()` / `put_file_with_mkdir()` | Full |
+| `mkdirCmd()` | `mkdir()` / `ensure_dir()` | Full |
 
-### lib.rs - HistoryArchiveManager (`lib.rs`)
+### lib.rs (`lib.rs`)
 
 Corresponds to: `HistoryArchiveManager.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `HistoryArchiveManager(app)` | `HistoryArchiveManager::new(passphrase)` | Full |
+| `HistoryArchiveManager(app)` | `HistoryArchiveManager::new()` | Full |
 | `checkSensibleConfig()` | `check_sensible_config()` | Full |
 | `selectRandomReadableHistoryArchive()` | `get_readable_archives()` | Partial |
 | `getHistoryArchiveReportWork()` | -- | None |
@@ -129,63 +122,63 @@ Corresponds to: `CheckpointBuilder.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `CheckpointBuilder(app)` | `CheckpointBuilder::new(publish_dir)` | Full |
-| `appendTransactionSet()` (TxSetXDRFrame) | `append_transaction_set()` | Full |
-| `appendTransactionSet()` (TransactionHistoryEntry) | `append_transaction_set()` | Full |
+| `CheckpointBuilder(app)` | `CheckpointBuilder::new()` | Full |
+| `appendTransactionSet()` | `append_transaction_set()` | Full |
 | `appendLedgerHeader()` | `append_ledger_header()` | Full |
-| `cleanup(lcl)` | `cleanup(lcl)` | Full |
-| `checkpointComplete(checkpoint)` | `checkpoint_complete(checkpoint)` | Full |
-| `ensureOpen(ledgerSeq)` | `ensure_open(checkpoint)` | Full |
+| `cleanup(lcl)` | `cleanup()` | Full |
+| `checkpointComplete(checkpoint)` | `checkpoint_complete()` | Full |
+| `ensureOpen(ledgerSeq)` | `ensure_open()` | Full |
+| `skipIncompleteFirstCheckpointSinceRestart()` | -- | None |
 
-### publish_queue.rs / lib.rs - HistoryManager (`publish_queue.rs`, `lib.rs`)
+### publish_queue.rs / publish.rs (`publish_queue.rs`, `publish.rs`)
 
-Corresponds to: `HistoryManager.h` (publish queue methods), `HistoryManagerImpl.h`
+Corresponds to: `HistoryManager.h`, `HistoryManagerImpl.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `checkSensibleConfig()` | `HistoryArchiveManager::check_sensible_config()` | Full |
-| `create()` | `HistoryManager::new()` / `HistoryArchiveManager::new()` | Full |
-| `dropAll()` | PublishQueue DB schema in henyey-db | Full |
-| `publishQueuePath()` | DB-based (in-database) | Full |
+| `create()` | `PublishQueue::new()` / `PublishManager::new()` | Full |
+| `publishQueuePath()` | SQLite table in `henyey-db` | Full |
 | `publishQueueLength()` | `PublishQueue::len()` | Full |
 | `logAndUpdatePublishStatus()` | `PublishQueue::log_status()` | Partial |
-| `maybeQueueHistoryCheckpoint()` | Handled in app crate | Partial |
+| `maybeQueueHistoryCheckpoint()` | handled in `henyey-app` | Omission |
 | `queueCurrentHistory()` | `PublishQueue::enqueue()` | Full |
 | `getMinLedgerQueuedToPublish()` | `PublishQueue::min_ledger()` | Full |
 | `getMaxLedgerQueuedToPublish()` | `PublishQueue::max_ledger()` | Full |
 | `publishQueuedHistory()` | -- | Partial |
 | `maybeCheckpointComplete()` | `CheckpointBuilder::checkpoint_complete()` | Full |
 | `getMissingBucketsReferencedByPublishQueue()` | -- | None |
-| `getBucketsReferencedByPublishQueue()` | `PublishQueue::get_referenced_bucket_hashes()` | Full |
-| `getPublishQueueStates()` | `PublishQueue::get_all()` | Full |
+| `getBucketsReferencedByPublishQueue()` | `get_referenced_bucket_hashes()` | Full |
+| `getPublishQueueStates()` | `get_all()` / `get_state()` | Full |
 | `historyPublished()` | -- | None |
 | `appendTransactionSet()` | `CheckpointBuilder::append_transaction_set()` | Full |
 | `appendLedgerHeader()` | `CheckpointBuilder::append_ledger_header()` | Full |
-| `restoreCheckpoint()` | `CheckpointBuilder::cleanup()` | Full |
+| `restoreCheckpoint()` | `cleanup()` / `finalize_recovered_checkpoint()` | Full |
 | `deletePublishedFiles()` | -- | None |
-| `getPublishQueueCount()` | `PublishQueue::len()` | Full |
+| `getPublishQueueCount()` | `len()` / `stats()` | Full |
 | `getPublishSuccessCount()` | -- | None |
 | `getPublishFailureCount()` | -- | None |
 | `waitForCheckpointPublish()` | -- | None |
+| `getTmpDir()` | tempfile / path abstractions | Omission |
+| `localFilename()` | direct path construction | Omission |
 
 ### publish.rs (`publish.rs`)
 
-Corresponds to: `StateSnapshot.h`, `HistoryManagerImpl.h` (publish methods)
+Corresponds to: `StateSnapshot.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `StateSnapshot(app, state)` | `PublishManager` construction | Full |
+| `StateSnapshot(app, state)` | `PublishManager` plus `build_history_archive_state()` | Full |
 | `writeSCPMessages()` | -- | None |
 | `differingHASFiles()` | -- | None |
-| `takeSnapshotAndPublish()` | `PublishManager::publish_checkpoint()` | Full |
+| `takeSnapshotAndPublish()` | `publish_checkpoint()` | Full |
 
-### catchup.rs / replay.rs (`catchup.rs`, `replay.rs`)
+### replay.rs (`replay.rs`)
 
-Corresponds to: Catchup workflow (spans multiple upstream Work classes)
+Corresponds to: `HistoryUtils.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `getHistoryEntryForLedger()` | Inline iteration logic | Partial |
+| `getHistoryEntryForLedger()` | inlined sparse-entry iteration in replay/catchup code | Partial |
 
 ## Intentional Omissions
 
@@ -193,13 +186,13 @@ Features excluded by design. These are NOT counted against parity %.
 
 | stellar-core Component | Reason |
 |------------------------|--------|
-| `createPublishQueueDir()` | Publish queue is SQLite-backed, no filesystem directory needed |
-| `dropSQLBasedPublish()` | Never had SQL-based publish format to migrate from |
-| `getTmpDir()` | Handled by Rust temp directory abstractions (`tempfile` crate) |
-| `localFilename()` | Handled by Rust path manipulation directly |
-| `setPublicationEnabled()` | Test-only method (`#ifdef BUILD_TESTS`) |
-| `getConfig()` | Config passed at construction, no getter needed |
-| `localName()` (HAS) | Handled differently via temp file abstractions |
+| `localName()` | Rust keeps HAS temp files in generic temp-file helpers rather than a named method |
+| `maybeQueueHistoryCheckpoint()` | Checkpoint enqueue orchestration is owned by `henyey-app`, not this crate |
+| `getTmpDir()` | Temporary directory management is delegated to `tempfile` and call-site paths |
+| `localFilename()` | Rust uses direct `PathBuf` composition instead of a manager method |
+| `createPublishQueueDir()` | Publish queue is SQLite-backed, so no filesystem queue directory exists |
+| `dropSQLBasedPublish()` | Rust never had the legacy SQL publish migration path |
+| `setPublicationEnabled()` / `getConfig()` | Test-only toggle and config getter are not exposed in the Rust API shape |
 
 ## Gaps
 
@@ -207,79 +200,72 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `logAndUpdatePublishStatus()` | Low | Missing StatusManager integration (logs only) |
-| `maybeQueueHistoryCheckpoint()` | Low | Orchestration in app crate, not history crate |
-| `publishQueuedHistory()` | Medium | No work-based publish orchestration |
-| `getMissingBucketsReferencedByPublishQueue()` | Medium | Missing bucket availability check |
-| `historyPublished()` | Medium | No publish completion callback |
-| `deletePublishedFiles()` | Low | Published file cleanup |
-| `getPublishSuccessCount()` | Low | Metrics tracking |
-| `getPublishFailureCount()` | Low | Metrics tracking |
-| `waitForCheckpointPublish()` | Low | Blocking publish wait |
-| `resolveAnyReadyFutures()` | Low | Incremental FutureBucket resolution |
-| `writeSCPMessages()` | Low | SCP envelope publishing |
-| `differingHASFiles()` | Low | Differential file upload optimization |
-| `selectRandomReadableHistoryArchive()` | Low | Random selection (sequential used instead) |
-| `getHistoryArchiveReportWork()` | Low | Archive reporting diagnostics |
-| `getCheckLedgerHeaderWork()` | Low | Ledger header verification work |
-| `getHistoryEntryForLedger()` | Low | Handled inline, not as separate utility |
+| `getBucketListHash()` | Medium | No direct HAS helper returning the combined live/hot hash |
+| `resolveAnyReadyFutures()` | Low | Incremental FutureBucket resolution is still missing |
+| `prepareForPublish()` parity | Low | Publish preparation exists, but not as a full HAS instance method |
+| `selectRandomReadableHistoryArchive()` | Low | Readable archives are returned, not randomly selected |
+| `getHistoryArchiveReportWork()` | Low | No archive report diagnostic work wrapper |
+| `getCheckLedgerHeaderWork()` | Low | No dedicated per-archive ledger-header work wrapper |
+| `skipIncompleteFirstCheckpointSinceRestart()` | Low | Rust builder recovers files but has no exposed skip flag |
+| `logAndUpdatePublishStatus()` parity | Low | Logging exists, but no StatusManager state tracking |
+| `publishQueuedHistory()` | Medium | No full work-scheduler style publish loop |
+| `getMissingBucketsReferencedByPublishQueue()` | Medium | Queue cannot yet report unresolved bucket dependencies |
+| `historyPublished()` | Medium | No completion callback to dequeue/retry based on all-archive success |
+| `deletePublishedFiles()` | Low | Published file cleanup helper is absent |
+| `getPublishSuccessCount()` | Low | Success counters are not tracked |
+| `getPublishFailureCount()` | Low | Failure counters are not tracked |
+| `waitForCheckpointPublish()` | Low | No blocking wait helper for utility flows |
+| `writeSCPMessages()` | Low | Publish path still omits SCP history snapshot files |
+| `differingHASFiles()` | Low | No differential upload optimization for publish state |
+| `getHistoryEntryForLedger()` helper | Low | Logic exists inline, not as a reusable utility function |
 
 ## Architectural Differences
 
-1. **Async model**
-   - **stellar-core**: Work-based state machine (`WorkScheduler`, `BasicWork` subclasses). Catchup is orchestrated as a graph of dependent Work objects.
-   - **Rust**: `async/await` with Tokio. Catchup is a single `CatchupManager` with sequential async steps.
-   - **Rationale**: Rust's native async is more idiomatic and avoids the complexity of manual state machines.
+1. **Catchup orchestration**
+   - **stellar-core**: Uses `BasicWork` graphs spread across `src/history/`, `src/catchup/`, and `src/historywork/`.
+   - **Rust**: Uses `CatchupManager` plus async helper modules for download, verification, and replay.
+   - **Rationale**: The Rust crate folds historywork-style scheduling into one async pipeline.
 
-2. **Publish queue storage**
-   - **stellar-core**: Originally filesystem-based, migrated to SQL with `dropSQLBasedPublish()`. Uses file-based checkpoint builder plus DB queue.
-   - **Rust**: SQLite-backed from the start via `henyey-db`. No filesystem queue migration needed.
-   - **Rationale**: Database-backed queue is simpler and already crash-safe without extra filesystem coordination.
+2. **Archive transport split**
+   - **stellar-core**: Uses shell-command templates for both read and write archive access.
+   - **Rust**: Uses native HTTP (`reqwest`) for reads and shell commands for write-compatible remotes.
+   - **Rationale**: Native HTTP improves retries, error reporting, and connection reuse on the common read path.
 
-3. **FutureBucket handling**
-   - **stellar-core**: Full FutureBucket resolution with in-progress merge tracking. HAS contains merge state that can be resolved on load.
-   - **Rust**: Implements `futures_all_clear()`, `futures_all_resolved()`, `resolve_all_futures()`, `contains_valid_buckets()`, and `differing_bucket_hashes()`. Only `resolveAnyReadyFutures()` (incremental resolution of in-progress merges) remains unimplemented.
-   - **Rationale**: Incremental merge resolution is tightly coupled to BucketManager's merge engine. The Rust side handles all state queries and batch resolution.
+3. **Publish queue storage**
+   - **stellar-core**: Carries filesystem-era queue concepts plus SQL-backed persistence.
+   - **Rust**: Starts directly with a SQLite-backed queue in `henyey-db`.
+   - **Rationale**: The Rust implementation skips migration baggage and keeps queue state crash-safe in one place.
 
-4. **HTTP archive access**
-   - **stellar-core**: Shell command-based (`get` command templates) for all archive access. No built-in HTTP client.
-   - **Rust**: Native HTTP client (`reqwest`) for reading archives, plus shell commands (`RemoteArchive`) for writing. Both approaches coexist.
-   - **Rationale**: Native HTTP provides better error handling, retry logic, and connection pooling for the common read path.
+4. **FutureBucket handling**
+   - **stellar-core**: Exposes both blocking and incremental future-resolution helpers on HAS.
+   - **Rust**: Implements state inspection and full resolution, but not incremental ready-only resolution.
+   - **Rationale**: Rust currently only needs full replay/publish settlement paths.
 
-5. **CDP data lake integration**
-   - **stellar-core**: No CDP support; relies solely on traditional history archives.
-   - **Rust**: First-class `CdpDataLake` and `CachedCdpDataLake` for accessing LedgerCloseMeta from SEP-0054 cloud storage.
-   - **Rationale**: Enables direct access to transaction metadata for exact replay without full archive downloads.
-
-6. **Metrics**
-   - **stellar-core**: Medida-based metrics for publish success/failure counts, queue depth, publish latency.
-   - **Rust**: Structured logging via `tracing` only. No numeric metric counters.
-   - **Rationale**: Metrics infrastructure not yet built; `tracing` provides observability for now.
+5. **Publishing model**
+   - **stellar-core**: Uses `StateSnapshot`, publish callbacks, status updates, and Medida counters.
+   - **Rust**: Uses `PublishManager`, `PublishQueue`, and structured logs without a scheduler callback layer.
+   - **Rationale**: Core file generation is implemented first; operational polish is still pending.
 
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Checkpoint arithmetic | 2 TEST_CASE / 3 SECTION | 22 `#[test]` | More thorough in Rust |
-| HAS serialization | 1 TEST_CASE / 1 SECTION | 29 `#[test]` | Extensive roundtrip, hot archive, differing buckets |
-| Bucket/chain verification | 5 TEST_CASE / 8 SECTION | 35 `#[test]` | Strong coverage including chain trust anchors |
-| Publish workflow | 6 TEST_CASE / 12 SECTION | 14 `#[test]` | Rust missing multi-archive, restart |
-| Catchup/replay | 8 TEST_CASE / 15 SECTION | 33 `#[test]` | Rust missing online catchup, gap handling |
-| Checkpoint builder | 2 TEST_CASE / 5 SECTION | 14 `#[test]` | Rust missing crash simulation |
-| Remote archive | -- | 6 `#[test]` | Rust-only (shell command testing) |
-| Archive/HTTP client | -- | 7 `#[test]` | Rust-only (reqwest-based access) |
-| CDP / download | -- | 11 `#[test]` | Rust-only extensions |
-| Archive manager | -- | 10 `#[test]` | Rust-only unit tests |
-| **Total** | **34 TEST_CASE / 60 SECTION** | **181 `#[test]`** | |
+| Checkpoint math and paths | 1 `TEST_CASE` / 0 `SECTION` | 22 `#[test]` | Rust covers math and dirty-path helpers thoroughly |
+| HAS serialization and bucket state | 2 `TEST_CASE` / 2 `SECTION` | 31 `#[test]` | Strong Rust coverage for parsing, futures, and diffing |
+| Bucket and chain verification | 3 `TEST_CASE` / 31 `SECTION` | 35 `#[test]` | Rust has good unit coverage but fewer archive-failure integration cases |
+| Archive manager and transport | 4 `TEST_CASE` / 5 `SECTION` | 32 `#[test]` | Rust adds native HTTP and shell-command coverage |
+| Checkpoint builder and queue | 2 `TEST_CASE` / 6 `SECTION` | 25 `#[test]` | Rust covers recovery paths well |
+| Publish workflows | 6 `TEST_CASE` / 18 `SECTION` | 15 `#[test]` | Missing restart, multi-archive, and throttling scenarios |
+| Catchup and replay | 17 `TEST_CASE` / 9 `SECTION` | 44 `#[test]` | Rust has broad unit coverage but lighter end-to-end catchup scenarios |
+| **Total** | **35 `TEST_CASE` / 71 `SECTION`** | **204 `#[test]`** | Upstream still has more scenario-heavy acceptance coverage |
 
 ### Test Gaps
 
-- **Bucket verification failure modes**: stellar-core tests file-not-found, corrupted zip, and hash mismatch scenarios. Rust lacks these negative test cases.
-- **Ledger chain verification edge cases**: stellar-core tests `VERIFY_STATUS_ERR_BAD_LEDGER_VERSION`, `VERIFY_STATUS_ERR_OVERSHOT`, `VERIFY_STATUS_ERR_UNDERSHOT`, `VERIFY_STATUS_ERR_MISSING_ENTRIES`. Rust only tests basic chain validation and broken hashes.
-- **Online catchup with buffering**: stellar-core has extensive tests for online catchup with buffered ledgers, gaps, out-of-order delivery, trimming `mSyncingLedgers`, and recovery. Rust tests are primarily offline catchup.
-- **Publish integration**: stellar-core tests publish with restart, multiple archives, post-shadow-removal, and throttled catchup. Rust lacks these integration tests.
-- **Protocol upgrade during catchup**: stellar-core tests catching up across protocol boundaries. Rust lacks these.
-- **CheckpointBuilder crash simulation**: stellar-core uses `mThrowOnAppend` to simulate crashes during checkpoint building. Rust lacks equivalent crash injection tests.
+- Bucket download failure modes are thinner on the Rust side for truncated gzip, invalid enum, and other corrupt-archive scenarios exercised upstream.
+- Ledger-chain verification lacks stellar-core-style coverage for bad ledger version, overshot, undershot, and missing-entry status variants.
+- Publish flow coverage does not yet match upstream restart, multi-archive, post-shadow-removal, and throttled catchup scenarios.
+- Catchup coverage is still lighter for buffered-ledger recovery, gap handling, protocol-upgrade catchup, and fatal-failure recovery paths.
+- CheckpointBuilder has strong recovery tests, but not the exact upstream crash-injection hooks used by `mThrowOnAppend`.
 
 ## Parity Calculation
 

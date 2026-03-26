@@ -19,11 +19,12 @@ use stellar_xdr::curr::{
     ContractIdPreimage, ContractIdPreimageFromAddress, CreateContractArgs, DecoratedSignature,
     Hash, HashIdPreimage, HashIdPreimageContractId, HostFunction, InvokeContractArgs,
     LedgerFootprint, LedgerKey, LedgerKeyContractCode, LedgerKeyContractData, Memo, MuxedAccount,
-    Operation, OperationBody, Preconditions, ReadXdr, ScAddress, ScSymbol, ScVal, SignatureHint,
-    SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
-    SorobanCredentials, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
-    Transaction, TransactionEnvelope, TransactionExt, TransactionSignaturePayload,
-    TransactionSignaturePayloadTaggedTransaction, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    Operation, OperationBody, Preconditions, ReadXdr, ScAddress, ScSymbol, ScVal, SequenceNumber,
+    SignatureHint, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+    SorobanAuthorizedInvocation, SorobanCredentials, SorobanResources, SorobanTransactionData,
+    SorobanTransactionDataExt, Transaction, TransactionEnvelope, TransactionExt,
+    TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
+    TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 
 use henyey_crypto::{sha256, SecretKey};
@@ -31,6 +32,32 @@ use henyey_crypto::{sha256, SecretKey};
 /// The pre-compiled `write_upgrade_bytes` WASM contract.
 /// This is the same binary embedded in stellar-core via `soroban_test_wasms::WRITE_BYTES`.
 const WRITE_BYTES_WASM: &[u8] = include_bytes!("../wasm/soroban_write_upgrade_bytes_contract.wasm");
+
+fn build_soroban_envelope(
+    public_key: &Uint256,
+    seq_num: i64,
+    fee: i64,
+    resource_fee: i64,
+    operations: VecM<Operation, 100>,
+    resources: SorobanResources,
+) -> TransactionEnvelope {
+    TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: Transaction {
+            source_account: MuxedAccount::Ed25519(public_key.clone()),
+            fee: fee as u32,
+            seq_num: SequenceNumber(seq_num),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations,
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources,
+                resource_fee,
+            }),
+        },
+        signatures: VecM::default(),
+    })
+}
 
 /// Build the WASM restore transaction (tx 1 of 4).
 ///
@@ -59,13 +86,12 @@ fn get_wasm_restore_tx(
     let resource_fee = 55_000_000 + add_resource_fee;
     let fee = 100_000_000 + resource_fee;
 
-    let tx = Transaction {
-        source_account: MuxedAccount::Ed25519(public_key.clone()),
-        fee: fee as u32,
-        seq_num: stellar_xdr::curr::SequenceNumber(seq_num),
-        cond: Preconditions::None,
-        memo: Memo::None,
-        operations: vec![Operation {
+    let envelope = build_soroban_envelope(
+        public_key,
+        seq_num,
+        fee,
+        resource_fee,
+        vec![Operation {
             source_account: None,
             body: OperationBody::RestoreFootprint(stellar_xdr::curr::RestoreFootprintOp {
                 ext: stellar_xdr::curr::ExtensionPoint::V0,
@@ -73,17 +99,8 @@ fn get_wasm_restore_tx(
         }]
         .try_into()
         .unwrap(),
-        ext: TransactionExt::V1(SorobanTransactionData {
-            ext: SorobanTransactionDataExt::V0,
-            resources,
-            resource_fee,
-        }),
-    };
-
-    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
-        tx,
-        signatures: VecM::default(),
-    });
+        resources,
+    );
 
     (envelope, contract_code_key)
 }
@@ -115,13 +132,12 @@ fn get_upload_tx(
     let resource_fee: i64 = 55_000_000;
     let fee = 100_000_000 + resource_fee;
 
-    let tx = Transaction {
-        source_account: MuxedAccount::Ed25519(public_key.clone()),
-        fee: fee as u32,
-        seq_num: stellar_xdr::curr::SequenceNumber(seq_num),
-        cond: Preconditions::None,
-        memo: Memo::None,
-        operations: vec![Operation {
+    let envelope = build_soroban_envelope(
+        public_key,
+        seq_num,
+        fee,
+        resource_fee,
+        vec![Operation {
             source_account: None,
             body: OperationBody::InvokeHostFunction(stellar_xdr::curr::InvokeHostFunctionOp {
                 host_function: HostFunction::UploadContractWasm(wasm.try_into().unwrap()),
@@ -130,17 +146,8 @@ fn get_upload_tx(
         }]
         .try_into()
         .unwrap(),
-        ext: TransactionExt::V1(SorobanTransactionData {
-            ext: SorobanTransactionDataExt::V0,
-            resources,
-            resource_fee,
-        }),
-    };
-
-    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
-        tx,
-        signatures: VecM::default(),
-    });
+        resources,
+    );
 
     (envelope, contract_code_key)
 }
@@ -221,13 +228,12 @@ fn get_create_tx(
     let resource_fee = 15_000_000 + add_resource_fee;
     let fee = 25_000_000 + resource_fee;
 
-    let tx = Transaction {
-        source_account: MuxedAccount::Ed25519(public_key.clone()),
-        fee: fee as u32,
-        seq_num: stellar_xdr::curr::SequenceNumber(seq_num),
-        cond: Preconditions::None,
-        memo: Memo::None,
-        operations: vec![Operation {
+    let envelope = build_soroban_envelope(
+        public_key,
+        seq_num,
+        fee,
+        resource_fee,
+        vec![Operation {
             source_account: None,
             body: OperationBody::InvokeHostFunction(stellar_xdr::curr::InvokeHostFunctionOp {
                 host_function: HostFunction::CreateContract(create_args),
@@ -236,17 +242,8 @@ fn get_create_tx(
         }]
         .try_into()
         .unwrap(),
-        ext: TransactionExt::V1(SorobanTransactionData {
-            ext: SorobanTransactionDataExt::V0,
-            resources,
-            resource_fee,
-        }),
-    };
-
-    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
-        tx,
-        signatures: VecM::default(),
-    });
+        resources,
+    );
 
     (envelope, contract_source_ref_key, contract_id)
 }
@@ -311,13 +308,12 @@ fn get_invoke_tx(
     let resource_fee = 95_000_000 + add_resource_fee;
     let fee = 100_000_000 + resource_fee;
 
-    let tx = Transaction {
-        source_account: MuxedAccount::Ed25519(public_key.clone()),
-        fee: fee as u32,
-        seq_num: stellar_xdr::curr::SequenceNumber(seq_num),
-        cond: Preconditions::None,
-        memo: Memo::None,
-        operations: vec![Operation {
+    let envelope = build_soroban_envelope(
+        public_key,
+        seq_num,
+        fee,
+        resource_fee,
+        vec![Operation {
             source_account: None,
             body: OperationBody::InvokeHostFunction(stellar_xdr::curr::InvokeHostFunctionOp {
                 host_function: HostFunction::InvokeContract(invoke_args),
@@ -326,17 +322,8 @@ fn get_invoke_tx(
         }]
         .try_into()
         .unwrap(),
-        ext: TransactionExt::V1(SorobanTransactionData {
-            ext: SorobanTransactionDataExt::V0,
-            resources,
-            resource_fee,
-        }),
-    };
-
-    let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
-        tx,
-        signatures: VecM::default(),
-    });
+        resources,
+    );
 
     let key = ConfigUpgradeSetKey {
         contract_id: ContractId(contract_id.clone()),

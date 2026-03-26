@@ -4,7 +4,7 @@ use crate::error::JsonRpcError;
 
 /// JSON-RPC 2.0 request envelope.
 #[derive(Debug, Deserialize)]
-pub struct JsonRpcRequest {
+pub(crate) struct JsonRpcRequest {
     pub jsonrpc: String,
     pub id: serde_json::Value,
     pub method: String,
@@ -14,7 +14,7 @@ pub struct JsonRpcRequest {
 
 /// JSON-RPC 2.0 response envelope.
 #[derive(Debug, Serialize)]
-pub struct JsonRpcResponse {
+pub(crate) struct JsonRpcResponse {
     pub jsonrpc: &'static str,
     pub id: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -24,7 +24,7 @@ pub struct JsonRpcResponse {
 }
 
 impl JsonRpcResponse {
-    pub fn success(id: serde_json::Value, result: serde_json::Value) -> Self {
+    pub(crate) fn success(id: serde_json::Value, result: serde_json::Value) -> Self {
         Self {
             jsonrpc: "2.0",
             id,
@@ -33,7 +33,7 @@ impl JsonRpcResponse {
         }
     }
 
-    pub fn error(id: serde_json::Value, error: JsonRpcError) -> Self {
+    pub(crate) fn error(id: serde_json::Value, error: JsonRpcError) -> Self {
         Self {
             jsonrpc: "2.0",
             id,

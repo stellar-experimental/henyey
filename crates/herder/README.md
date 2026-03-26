@@ -1,219 +1,154 @@
 # henyey-herder
 
-SCP coordination and ledger-close orchestration for henyey.
+SCP coordination and ledger close orchestration for henyey.
 
 ## Overview
 
-The Herder is the central coordinator that bridges the overlay network and the ledger manager through SCP (Stellar Consensus Protocol). It orchestrates the entire flow from receiving transactions and SCP messages, through consensus, to triggering ledger close. This crate corresponds to stellar-core's `src/herder/` directory and implements `HerderImpl`, `HerderSCPDriver`, `TransactionQueue`, `PendingEnvelopes`, `Upgrades`, and related components.
-
-The Herder operates in two modes: **Observer** (tracks consensus without voting) and **Validator** (proposes values and votes via SCP). It progresses through three states: Booting, Syncing, and Tracking.
+`henyey-herder` is the consensus-facing crate that sits between `henyey-overlay`, `henyey-scp`, `henyey-ledger`, and `henyey-tx`. It receives transactions and SCP envelopes from the network, tracks or participates in SCP, manages pending and dependency-blocked envelopes, builds candidate transaction sets, records externalized values, and drives ledger close. It corresponds primarily to `stellar-core/src/herder/`.
 
 ## Architecture
 
 ```mermaid
 graph TD
-    subgraph "State Machine"
-        Boot[Booting] -->|start_syncing| Sync[Syncing]
-        Sync -->|bootstrap| Track[Tracking]
-        Track -->|out-of-sync| Sync
-    end
-
-    ON[Overlay Network] -->|Transactions| TQ[TransactionQueue]
-    ON -->|SCP Envelopes| H[Herder]
-    H --> FE[FetchingEnvelopes]
-    H --> PE[PendingEnvelopes]
-    H --> SD[ScpDriver]
-    SD --> SCP[SCP Consensus]
-    TQ --> SP[SurgePricing]
-    FE -->|ItemFetcher| ON
-    SCP -->|Externalize| LM[LedgerManager]
-
-    TM[TimerManager] -.-> SCP
-    SR[SyncRecovery] -.-> H
-    TB[TxBroadcast] -.-> ON
-    DT[DriftTracker] -.-> H
-    DN[DeadNodeTracker] -.-> H
+    Overlay[overlay peers] --> Herder[Herder]
+    Herder --> Pending[PendingEnvelopes]
+    Herder --> Fetching[FetchingEnvelopes]
+    Herder --> Queue[TransactionQueue]
+    Herder --> Driver[ScpDriver]
+    Herder --> Upgrades[Upgrades]
+    Herder --> Quorum[QuorumTracker]
+    Herder --> Persist[ScpPersistenceManager]
+    Queue --> Selection[tx_queue/selection]
+    Queue --> TxSet[tx_queue/tx_set]
+    Queue --> Parallel[parallel_tx_set_builder]
+    Driver --> SCP[SCP engine]
+    Herder --> Timers[TimerManager]
+    Herder --> Recovery[SyncRecoveryManager]
+    Herder --> Broadcast[TxBroadcastManager]
 ```
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `Herder` | Central coordinator: consensus, tx queue, envelope processing |
-| `HerderConfig` | Configuration: validator mode, queue limits, quorum set, timing |
-| `HerderState` | State machine enum: Booting, Syncing, Tracking |
-| `EnvelopeState` | Result of receiving an SCP envelope (Valid, Pending, Fetching, etc.) |
-| `ScpDriver` | SCP callback bridge: value validation, signing, tx set caching |
-| `HerderScpCallback` | Wrapper implementing `SCPDriver` trait for the SCP layer |
-| `TransactionQueue` | Pending tx mempool with surge pricing and lane-based limits |
-| `TransactionSet` | Built tx set ready for consensus (classic + Soroban phases) |
-| `QueuedTransaction` | A transaction in the queue with metadata (hash, fee, account) |
-| `TxQueueConfig` | Queue configuration: limits, fees, lane sizing, filtering |
-| `PendingEnvelopes` | Buffer for SCP envelopes arriving for future slots |
-| `FetchingEnvelopes` | Manages envelopes waiting for TxSet/QuorumSet fetches |
-| `QuorumTracker` | Transitive quorum membership graph for security checks |
-| `SlotQuorumTracker` | Per-slot quorum heard-from and v-blocking checks |
-| `Upgrades` | Ledger upgrade scheduling and validation |
-| `CurrentLedgerState` | Current ledger parameters for upgrade proposal decisions |
-| `LedgerCloseData` | Complete data package from consensus for ledger close |
-| `ScpPersistenceManager` | SCP state persistence for crash recovery |
-| `TimerManager` | Async SCP nomination/ballot timeout scheduling |
-| `SyncRecoveryManager` | Out-of-sync detection and recovery |
-| `TxBroadcastManager` | Periodic transaction flooding to peers |
-| `CloseTimeDriftTracker` | Close time drift monitoring |
-| `DeadNodeTracker` | Missing/dead validator detection |
-| `HerderCallback` | Trait for Herder event notifications |
-| `PendingTransaction` | Transaction envelope with hash, used in callbacks |
-| `ExternalizedValue` | Externalized slot data for callbacks |
+| `Herder` | Main coordinator for SCP message intake, tracking state, tx queueing, and ledger close orchestration. |
+| `HerderConfig` | Startup configuration for validator mode, quorum set, queue sizing, tx-set size, and upgrade limits. |
+| `HerderState` | High-level lifecycle state: `Booting`, `Syncing`, or `Tracking`. |
+| `EnvelopeState` | Outcome of `Herder::receive_scp_envelope`, including valid, pending, fetching, duplicate, and rejection states. |
+| `ScpDriver` | Bridge between the generic SCP engine and Herder-specific value validation, signing, quorum-set storage, and tx-set caching. |
+| `TransactionQueue` | Lane-aware pending transaction queue with per-account replacement, banning, and tx-set construction. |
+| `TransactionSet` | Legacy or generalized transaction set wrapper used for nomination, externalization, persistence, and ledger application. |
+| `FetchingEnvelopes` | Manages envelopes blocked on missing `TxSet` or `ScpQuorumSet` dependencies. |
+| `PendingEnvelopes` | Buffers future-slot envelopes until the node reaches the relevant slot. |
+| `QuorumTracker` | Tracks the transitive quorum graph used to validate trusted fast-forward and expose quorum diagnostics. |
+| `ScpPersistenceManager` | Persists recent SCP envelopes and referenced tx sets for crash recovery, backed by memory or SQLite. |
+| `Upgrades` / `UpgradeParameters` | Schedules and validates ledger upgrades proposed during nomination. |
+| `LedgerCloseData` | Serializable wrapper for an externalized tx set, `StellarValue`, and optional expected ledger hash. |
 
 ## Usage
 
-### Observer Setup
-
 ```rust
-use henyey_herder::{Herder, HerderConfig, HerderState, EnvelopeState};
+use henyey_herder::{Herder, HerderConfig, HerderState};
 
-let config = HerderConfig::default();
-let herder = Herder::new(config);
+let herder = Herder::new(HerderConfig::default());
 
-// Progress through state machine
 herder.start_syncing();
-herder.bootstrap(ledger_seq);
+assert_eq!(herder.state(), HerderState::Syncing);
 
-// Process incoming SCP envelopes
-match herder.receive_scp_envelope(envelope) {
-    EnvelopeState::Valid => { /* New valid envelope */ }
-    EnvelopeState::Pending => { /* Buffered for future slot */ }
-    EnvelopeState::Fetching => { /* Waiting for dependencies */ }
-    EnvelopeState::TooOld => { /* Slot already passed */ }
-    _ => {}
-}
-
-// Check for ledger close
-if let Some(close_data) = herder.check_ledger_close(slot) {
-    // Apply transaction set and close ledger
-    herder.ledger_closed(slot, &applied_tx_hashes);
-}
+herder.bootstrap(1024);
+assert_eq!(herder.state(), HerderState::Tracking);
+assert_eq!(herder.tracking_slot(), 1025);
 ```
 
-### Validator Setup
-
 ```rust
-use henyey_herder::{Herder, HerderConfig};
 use henyey_crypto::SecretKey;
+use henyey_herder::{Herder, HerderConfig, UpgradeParameters};
 
-let secret = SecretKey::from_seed(&seed);
 let config = HerderConfig {
     is_validator: true,
-    node_public_key: secret.public_key(),
-    local_quorum_set: Some(quorum_set),
-    ledger_close_time: 5,
-    ..Default::default()
+    ..HerderConfig::default()
 };
-let herder = Herder::with_secret_key(config, secret);
 
-// Set up envelope broadcasting
-herder.set_envelope_sender(|envelope| {
-    overlay.broadcast_scp(envelope);
-});
+let secret_key = SecretKey::from_binary([7; 32]);
+let herder = Herder::with_secret_key(config, secret_key);
 
-// Trigger consensus for the next ledger
-herder.trigger_next_ledger(ledger_seq).await;
+herder
+    .set_upgrade_parameters(UpgradeParameters {
+        protocol_version: Some(25),
+        ..UpgradeParameters::default()
+    })
+    .expect("supported upgrade");
 ```
 
-### Transaction Queue
-
 ```rust
-use henyey_herder::{TransactionQueue, TxQueueConfig, TxQueueResult};
+use henyey_common::Hash256;
+use henyey_herder::{Herder, HerderConfig};
 
-let queue = TransactionQueue::new(TxQueueConfig {
-    max_size: 5000,
-    min_fee_per_op: 100,
-    max_dex_ops: Some(500),
-    ..Default::default()
-});
+let herder = Herder::new(HerderConfig::default());
 
-match queue.try_add(tx_envelope) {
-    TxQueueResult::Added => { /* Queued successfully */ }
-    TxQueueResult::FeeTooLow => { /* Surge pricing rejected it */ }
-    TxQueueResult::Banned => { /* Previously failed tx */ }
-    _ => {}
+let needed: Hash256 = Hash256::ZERO;
+if herder.needs_tx_set(&needed) {
+    // fetch the tx set from peers, then deliver it with `receive_tx_set`
 }
-
-// Build transaction set for consensus
-let (tx_set, gen_tx_set) = queue.build_generalized_tx_set(
-    previous_ledger_hash, max_ops,
-);
 ```
 
 ## Module Layout
 
 | Module | Description |
 |--------|-------------|
-| `lib.rs` | Crate root: re-exports, `PendingTransaction`, `ExternalizedValue`, `HerderCallback` trait |
-| `herder.rs` | Main `Herder` struct, `HerderConfig`, envelope processing, state transitions |
-| `scp_driver.rs` | `ScpDriver` and `HerderScpCallback`: SCP value validation, signing, tx set caching |
-| `tx_queue/mod.rs` | `TransactionQueue`, `QueuedTransaction`, `TxQueueConfig`, queue management |
-| `tx_queue/selection.rs` | Transaction set selection with surge pricing and lane limits |
-| `tx_queue/tx_set.rs` | `TransactionSet`: wire-format parsing, validation, XDR conversion |
-| `tx_queue_limiter.rs` | `TxQueueLimiter`: resource-aware queue admission and eviction |
-| `surge_pricing.rs` | `SurgePricingLaneConfig`, `SurgePricingPriorityQueue`: lane-based fee thresholds |
-| `parallel_tx_set_builder.rs` | Parallel Soroban tx set building: conflict detection, staging, bin packing |
-| `pending.rs` | `PendingEnvelopes`: buffer for future-slot SCP envelopes |
-| `fetching_envelopes.rs` | `FetchingEnvelopes`: dependency fetching for TxSets and QuorumSets |
-| `quorum_tracker.rs` | `SlotQuorumTracker`, `QuorumTracker`: quorum membership and security checks |
-| `persistence.rs` | `ScpPersistenceManager`, `SqliteScpPersistence`: SCP state crash recovery |
-| `upgrades.rs` | `Upgrades`, `UpgradeParameters`, `CurrentLedgerState`: ledger upgrade scheduling |
-| `ledger_close_data.rs` | `LedgerCloseData`: complete consensus data for ledger close |
-| `tx_set_utils.rs` | Transaction set validation: invalid tx filtering, trimming |
-| `herder_utils.rs` | Utility functions: value extraction, node ID conversion, short strings |
-| `timer_manager.rs` | `TimerManager`: async SCP nomination/ballot timeout scheduling |
-| `sync_recovery.rs` | `SyncRecoveryManager`: out-of-sync detection and recovery |
-| `tx_broadcast.rs` | `TxBroadcastManager`: periodic transaction flooding to peers |
-| `drift_tracker.rs` | `CloseTimeDriftTracker`: close time drift monitoring |
-| `dead_node_tracker.rs` | `DeadNodeTracker`: offline validator detection |
-| `flow_control.rs` | Flow control constants: `FlowControlConfig`, tx size computation |
-| `json_api.rs` | JSON-serializable structs for admin/diagnostic HTTP endpoints |
-| `state.rs` | `HerderState` enum definition and helpers |
-| `error.rs` | `HerderError` enum with `thiserror` |
+| `lib.rs` | Crate exports, top-level traits, and public type aliases. |
+| `herder.rs` | Core Herder implementation, state transitions, envelope intake, tx intake, ledger close handling, and cache maintenance. |
+| `scp_driver.rs` | SCP callback bridge, value validation, signing, tx-set cache, externalized-slot tracking, and quorum-set lookup. |
+| `state.rs` | `HerderState` lifecycle enum and transition helpers. |
+| `error.rs` | `HerderError` definitions. |
+| `ledger_close_data.rs` | Serializable ledger-close wrapper and human-readable `StellarValue` formatting. |
+| `herder_utils.rs` | Helpers for extracting `StellarValue` and tx-set hashes from SCP statements. |
+| `json_api.rs` | JSON-serializable diagnostic structures for admin and monitoring endpoints. |
+| `fetching_envelopes.rs` | Dependency-aware envelope staging while waiting on tx sets or quorum sets. |
+| `pending.rs` | Future-slot envelope buffer with deduplication, eviction, and release-by-slot. |
+| `quorum_tracker.rs` | Per-slot quorum-heard tracking plus transitive quorum graph maintenance. |
+| `persistence.rs` | SCP state persistence traits, in-memory/SQLite backends, and restore helpers. |
+| `upgrades.rs` | Upgrade parameter parsing, scheduling, validation, and proposal generation. |
+| `parallel_tx_set_builder.rs` | Parallel Soroban phase construction via conflict clustering and stage packing. |
+| `surge_pricing.rs` | Lane configuration and fee-priority queue logic for classic, DEX, and Soroban selection. |
+| `tx_queue_limiter.rs` | Resource-aware queue admission and eviction built on top of surge-pricing primitives. |
+| `tx_queue/mod.rs` | Main transaction queue, validation, bans, replacement rules, and public queue stats/types. |
+| `tx_queue/selection.rs` | Candidate tx-set selection and generalized tx-set assembly. |
+| `tx_queue/tx_set.rs` | `TransactionSet` wire-format parsing, hash computation, and apply-time validation. |
+| `tx_set_utils.rs` | Helpers for trimming invalid transactions from candidate sets. |
+| `timer_manager.rs` | Async nomination and ballot timeout scheduling. |
+| `sync_recovery.rs` | Tracking heartbeat, stuck-consensus detection, and out-of-sync recovery loop. |
+| `tx_broadcast.rs` | Periodic transaction flooding and rebroadcast management. |
+| `flow_control.rs` | Transaction-size and flow-control constants derived from protocol/network limits. |
+| `drift_tracker.rs` | Close-time drift monitoring against network externalization. |
+| `dead_node_tracker.rs` | Detection of transitive quorum members that stop sending SCP traffic. |
 
 ## Design Notes
 
-- **Observer EXTERNALIZE fast-forward**: Observers advance their tracking slot based on EXTERNALIZE messages from trusted validators. To prevent attacks, the sender must be in the transitive quorum set (`QuorumTracker::is_node_definitely_in_quorum`). When tracking, incoming envelopes for slots beyond `LEDGER_VALIDITY_BRACKET` (100 ledgers) ahead of the current tracking slot are rejected.
-
-- **Dual-mode SCP**: Validators create a full `SCP` instance and actively vote. Observers track consensus without an SCP instance by processing only EXTERNALIZE envelopes. Both modes share `Herder::new()` / `Herder::with_secret_key()` constructors, with mode selected by the presence of a secret key and `is_validator` config.
-
-- **Surge pricing determinism**: Transaction set building must be deterministic across all validators. The `SurgePricingPriorityQueue` uses a seed derived from the previous ledger hash to break ties consistently. Lane limits ensure DEX operations cannot crowd out other transaction types.
-
-- **Parallel Soroban execution**: Soroban transactions are partitioned into stages and clusters for parallel execution. The `ParallelTxSetBuilder` detects RW-RW and RO-RW footprint conflicts, groups conflicting transactions into clusters, and uses first-fit-decreasing bin packing to assign clusters to execution slots.
-
-- **SCP state persistence**: The `ScpPersistenceManager` persists SCP state to SQLite on every externalization, enabling crash recovery. On restart, the node can restore its SCP state and resume consensus without re-syncing from scratch.
+- `PendingEnvelopes` and `FetchingEnvelopes` split two different concerns that are combined in stellar-core's `PendingEnvelopes`: future-slot buffering versus dependency fetching.
+- EXTERNALIZE-based fast-forward is intentionally conservative: the sender must be in the transitive quorum, the slot must remain within the validity bracket, and envelopes can stay blocked until referenced tx sets arrive.
+- Transaction selection is not a flat mempool pop. The queue keeps one pending transaction per sequence-number source, applies fee-bump replacement rules, separates classic and Soroban phases, and can build a parallel Soroban phase when network limits allow it.
+- Upgrade proposals come from both static config and runtime state. `Herder::set_upgrade_parameters` mutates a live `Upgrades` instance whose proposals are merged into nomination values.
 
 ## stellar-core Mapping
 
 | Rust | stellar-core |
 |------|--------------|
-| `herder.rs` | `src/herder/HerderImpl.cpp`, `src/herder/Herder.cpp` |
-| `scp_driver.rs` | `src/herder/HerderSCPDriver.cpp` |
-| `tx_queue/` | `src/herder/TransactionQueue.cpp`, `src/herder/TxSetFrame.cpp` |
-| `tx_queue_limiter.rs` | `src/herder/TxQueueLimiter.cpp` |
-| `surge_pricing.rs` | `src/herder/SurgePricingUtils.cpp` |
-| `parallel_tx_set_builder.rs` | `src/herder/ParallelTxSetBuilder.cpp` |
-| `pending.rs` | `src/herder/PendingEnvelopes.cpp` (buffering) |
-| `fetching_envelopes.rs` | `src/herder/PendingEnvelopes.cpp` (fetching) |
-| `quorum_tracker.rs` | `src/herder/QuorumTracker.cpp` |
-| `persistence.rs` | `src/herder/HerderPersistence.cpp` |
-| `upgrades.rs` | `src/herder/Upgrades.cpp` |
-| `ledger_close_data.rs` | `src/herder/LedgerCloseData.cpp` |
-| `tx_set_utils.rs` | `src/herder/TxSetUtils.cpp` |
-| `herder_utils.rs` | `src/herder/HerderUtils.cpp` |
-| `flow_control.rs` | `src/herder/Herder.h` (constants), `src/overlay/Peer.h` |
-| `timer_manager.rs` | SCP timeout logic within `HerderImpl.cpp` |
-| `sync_recovery.rs` | Out-of-sync logic within `HerderImpl.cpp` |
-| `tx_broadcast.rs` | Flood logic within `HerderImpl.cpp` |
-| `drift_tracker.rs` | No direct upstream equivalent (Rust-specific monitoring) |
-| `dead_node_tracker.rs` | No direct upstream equivalent (Rust-specific monitoring) |
-| `json_api.rs` | `src/herder/Herder.cpp` (JSON output methods) |
+| `herder.rs`, `state.rs` | `src/herder/Herder.h`, `src/herder/Herder.cpp`, `src/herder/HerderImpl.h`, `src/herder/HerderImpl.cpp` |
+| `scp_driver.rs` | `src/herder/HerderSCPDriver.h`, `src/herder/HerderSCPDriver.cpp` |
+| `pending.rs`, `fetching_envelopes.rs` | `src/herder/PendingEnvelopes.h`, `src/herder/PendingEnvelopes.cpp` |
+| `quorum_tracker.rs` | `src/herder/QuorumTracker.h`, `src/herder/QuorumTracker.cpp` |
+| `persistence.rs` | `src/herder/HerderPersistence.h`, `src/herder/HerderPersistenceImpl.h`, `src/herder/HerderPersistenceImpl.cpp` |
+| `tx_queue/mod.rs`, `tx_broadcast.rs` | `src/herder/TransactionQueue.h`, `src/herder/TransactionQueue.cpp` |
+| `tx_queue/tx_set.rs` | `src/herder/TxSetFrame.h`, `src/herder/TxSetFrame.cpp` |
+| `tx_set_utils.rs` | `src/herder/TxSetUtils.h`, `src/herder/TxSetUtils.cpp` |
+| `tx_queue_limiter.rs` | `src/herder/TxQueueLimiter.h`, `src/herder/TxQueueLimiter.cpp` |
+| `surge_pricing.rs` | `src/herder/SurgePricingUtils.h`, `src/herder/SurgePricingUtils.cpp` |
+| `upgrades.rs` | `src/herder/Upgrades.h`, `src/herder/Upgrades.cpp` |
+| `parallel_tx_set_builder.rs` | `src/herder/ParallelTxSetBuilder.h`, `src/herder/ParallelTxSetBuilder.cpp` |
+| `ledger_close_data.rs` | `src/herder/LedgerCloseData.h`, `src/herder/LedgerCloseData.cpp` |
+| `herder_utils.rs` | `src/herder/HerderUtils.h`, `src/herder/HerderUtils.cpp` |
+| `json_api.rs` | `HerderImpl::getJsonInfo`, `getJsonQuorumInfo`, and related JSON helpers in `src/herder/HerderImpl.cpp` |
 
 ## Parity Status
 

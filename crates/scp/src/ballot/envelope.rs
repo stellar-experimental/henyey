@@ -36,7 +36,7 @@ impl BallotProtocol {
     /// fields in the self-envelope contribute to `federated_accept`/`federated_ratify`).
     /// However, the envelope is NOT emitted to the network when `current_ballot`
     /// is `None` (matching stellar-core `canEmit = mCurrentBallot != nullptr`).
-    fn emit_prepare<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) -> Option<ScpStatement> {
+    fn emit_prepare<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) -> Option<ScpStatement> {
         // Use the current ballot if set, otherwise use a default zero ballot
         // (matching stellar-core which creates a PREPARE with default ballot {0, ""} when
         // mCurrentBallot is null).
@@ -101,7 +101,7 @@ impl BallotProtocol {
 
     /// Build and record a confirm statement envelope.
     /// Returns the statement if a new envelope was recorded (for self-processing).
-    fn emit_confirm<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) -> Option<ScpStatement> {
+    fn emit_confirm<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) -> Option<ScpStatement> {
         if let Some(ref ballot) = self.current_ballot {
             let conf = ScpStatementConfirm {
                 ballot: ballot.clone(),
@@ -125,10 +125,7 @@ impl BallotProtocol {
 
     /// Build and record an externalize statement envelope.
     /// Returns the statement if a new envelope was recorded (for self-processing).
-    fn emit_externalize<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-    ) -> Option<ScpStatement> {
+    fn emit_externalize<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) -> Option<ScpStatement> {
         if let Some(ref commit) = self.commit {
             let ext = ScpStatementExternalize {
                 commit: commit.clone(),
@@ -155,7 +152,7 @@ impl BallotProtocol {
     /// accept-commit) can happen within a single top-level `receiveEnvelope` call.
     /// The `current_message_level` guard in `send_latest_envelope` ensures only the
     /// final envelope is actually emitted to the network.
-    pub(super) fn emit_current_state<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) {
+    pub(super) fn emit_current_state<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) {
         let maybe_statement = match self.phase {
             BallotPhase::Prepare => self.emit_prepare(ctx),
             BallotPhase::Confirm => self.emit_confirm(ctx),

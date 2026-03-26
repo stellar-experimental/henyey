@@ -1,3 +1,3 @@
 mod jsonrpc;
 
-pub use jsonrpc::{JsonRpcRequest, JsonRpcResponse};
+pub(crate) use jsonrpc::{JsonRpcRequest, JsonRpcResponse};

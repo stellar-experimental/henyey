@@ -23,26 +23,13 @@ pub(crate) async fn start_survey_collecting_handler(
     Query(params): Query<StartSurveyParams>,
 ) -> impl IntoResponse {
     if !survey_booted(&state).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(SurveyCommandResponse {
-                success: false,
-                message: "Application is not fully booted, try again later.".to_string(),
-            }),
-        );
+        return survey_unavailable();
     }
     let ok = state.app.start_survey_collecting(params.nonce).await;
-    let message = if ok {
-        "Requested network to start survey collecting."
-    } else {
-        "Failed to start survey collecting."
-    };
-    (
-        StatusCode::OK,
-        Json(SurveyCommandResponse {
-            success: ok,
-            message: message.to_string(),
-        }),
+    survey_response(
+        ok,
+        "Requested network to start survey collecting.",
+        "Failed to start survey collecting.",
     )
 }
 
@@ -50,26 +37,13 @@ pub(crate) async fn stop_survey_collecting_handler(
     State(state): State<Arc<ServerState>>,
 ) -> impl IntoResponse {
     if !survey_booted(&state).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(SurveyCommandResponse {
-                success: false,
-                message: "Application is not fully booted, try again later.".to_string(),
-            }),
-        );
+        return survey_unavailable();
     }
     let ok = state.app.stop_survey_collecting().await;
-    let message = if ok {
-        "Requested network to stop survey collecting."
-    } else {
-        "Failed to stop survey collecting."
-    };
-    (
-        StatusCode::OK,
-        Json(SurveyCommandResponse {
-            success: ok,
-            message: message.to_string(),
-        }),
+    survey_response(
+        ok,
+        "Requested network to stop survey collecting.",
+        "Failed to stop survey collecting.",
     )
 }
 
@@ -78,13 +52,7 @@ pub(crate) async fn survey_topology_handler(
     Query(params): Query<SurveyTopologyParams>,
 ) -> impl IntoResponse {
     if !survey_booted(&state).await {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(SurveyCommandResponse {
-                success: false,
-                message: "Application is not fully booted, try again later.".to_string(),
-            }),
-        );
+        return survey_unavailable();
     }
     let pubkey = match henyey_crypto::PublicKey::from_strkey(&params.node) {
         Ok(key) => key,
@@ -113,18 +81,7 @@ pub(crate) async fn survey_topology_handler(
         .app
         .survey_topology_timesliced(peer_id, inbound, outbound)
         .await;
-    let message = if ok {
-        "Survey request queued."
-    } else {
-        "Survey request rejected."
-    };
-    (
-        StatusCode::OK,
-        Json(SurveyCommandResponse {
-            success: ok,
-            message: message.to_string(),
-        }),
-    )
+    survey_response(ok, "Survey request queued.", "Survey request rejected.")
 }
 
 pub(crate) async fn stop_survey_reporting_handler(
@@ -144,5 +101,34 @@ async fn survey_booted(state: &ServerState) -> bool {
     matches!(
         state.app.state().await,
         AppState::Synced | AppState::Validating
+    )
+}
+
+fn survey_unavailable() -> (StatusCode, Json<SurveyCommandResponse>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(SurveyCommandResponse {
+            success: false,
+            message: "Application is not fully booted, try again later.".to_string(),
+        }),
+    )
+}
+
+fn survey_response(
+    success: bool,
+    success_message: &'static str,
+    failure_message: &'static str,
+) -> (StatusCode, Json<SurveyCommandResponse>) {
+    let message = if success {
+        success_message
+    } else {
+        failure_message
+    };
+    (
+        StatusCode::OK,
+        Json(SurveyCommandResponse {
+            success,
+            message: message.to_string(),
+        }),
     )
 }

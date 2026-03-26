@@ -1150,6 +1150,17 @@ fn allocate_port_block(width: u16) -> u16 {
     NEXT_PORT.fetch_add(width.max(1), Ordering::Relaxed)
 }
 
+fn add_seeded_node(
+    sim: &mut Simulation,
+    node_id: impl Into<String>,
+    seed_material: impl AsRef<[u8]>,
+) {
+    let node_id = node_id.into();
+    let seed = Hash256::hash(seed_material.as_ref());
+    let secret_key = SecretKey::from_seed(&seed.0);
+    sim.add_node(node_id, secret_key);
+}
+
 pub struct Topologies;
 
 impl Topologies {
@@ -1162,9 +1173,7 @@ impl Topologies {
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
             let id = format!("node{}", i);
-            let seed = Hash256::hash(format!("SIM_NODE_SEED_{}", i).as_bytes());
-            let sk = SecretKey::from_seed(&seed.0);
-            sim.add_node(id.clone(), sk);
+            add_seeded_node(&mut sim, id.clone(), format!("SIM_NODE_SEED_{}", i));
             ids.push(id);
         }
 
@@ -1190,9 +1199,7 @@ impl Topologies {
         let mut ids = Vec::with_capacity(n);
         for i in 0..n {
             let id = format!("node{}", i);
-            let seed = Hash256::hash(format!("SIM_NODE_SEED_{}", i).as_bytes());
-            let sk = SecretKey::from_seed(&seed.0);
-            sim.add_node(id.clone(), sk);
+            add_seeded_node(&mut sim, id.clone(), format!("SIM_NODE_SEED_{}", i));
             ids.push(id);
         }
 
@@ -1224,9 +1231,7 @@ impl Topologies {
         let mut sim = Self::core(4, mode);
         for branch in 0..n_branches {
             let id = format!("branch{}", branch);
-            let seed = Hash256::hash(format!("SIM_BRANCH_SEED_{}", branch).as_bytes());
-            let sk = SecretKey::from_seed(&seed.0);
-            sim.add_node(id.clone(), sk);
+            add_seeded_node(&mut sim, id.clone(), format!("SIM_BRANCH_SEED_{}", branch));
             sim.add_pending_connection(id, format!("node{}", branch % 4));
             sim.add_pending_connection(
                 format!("branch{}", branch),
@@ -1244,9 +1249,7 @@ impl Topologies {
         let mut sim = Self::core(core_size, mode);
         for outer in 0..outer_nodes {
             let id = format!("outer{}", outer);
-            let seed = Hash256::hash(format!("SIM_OUTER_SEED_{}", outer).as_bytes());
-            let sk = SecretKey::from_seed(&seed.0);
-            sim.add_node(id.clone(), sk);
+            add_seeded_node(&mut sim, id.clone(), format!("SIM_OUTER_SEED_{}", outer));
             sim.add_pending_connection(id.clone(), format!("node{}", outer % core_size.max(1)));
             if core_size > 1 {
                 sim.add_pending_connection(id, format!("node{}", (outer + 1) % core_size));
@@ -1258,9 +1261,7 @@ impl Topologies {
     pub fn custom_a(mode: SimulationMode) -> Simulation {
         let mut sim = Simulation::new(mode);
         for id in ["A", "B", "C", "T", "I", "E", "S"] {
-            let seed = Hash256::hash(format!("SIM_CUSTOM_A_{}", id).as_bytes());
-            let sk = SecretKey::from_seed(&seed.0);
-            sim.add_node(id.to_string(), sk);
+            add_seeded_node(&mut sim, id, format!("SIM_CUSTOM_A_{}", id));
         }
         for (a, b) in [
             ("A", "B"),
@@ -1282,9 +1283,7 @@ impl Topologies {
         let mut sim = Self::core(4, mode);
         for extra in 0..3 {
             let id = format!("tier1_{}", extra);
-            let seed = Hash256::hash(format!("SIM_ASYM_SEED_{}", extra).as_bytes());
-            let sk = SecretKey::from_seed(&seed.0);
-            sim.add_node(id.clone(), sk);
+            add_seeded_node(&mut sim, id.clone(), format!("SIM_ASYM_SEED_{}", extra));
             sim.add_pending_connection(id, "node0");
         }
         sim
@@ -1294,9 +1293,7 @@ impl Topologies {
         let mut sim = Simulation::new(mode);
         for i in 0..4 {
             let id = format!("node{}", i);
-            let seed = Hash256::hash(format!("SIM_NODE_SEED_{}", i).as_bytes());
-            let sk = SecretKey::from_seed(&seed.0);
-            sim.add_node(id, sk);
+            add_seeded_node(&mut sim, id, format!("SIM_NODE_SEED_{}", i));
         }
 
         sim.add_pending_connection("node0", "node1");
@@ -1317,9 +1314,7 @@ impl Topologies {
         let half = n / 2;
         for i in 0..n {
             let id = format!("node{}", i);
-            let seed = Hash256::hash(format!("SIM_NODE_SEED_{}", i).as_bytes());
-            let sk = SecretKey::from_seed(&seed.0);
-            sim.add_node(id, sk);
+            add_seeded_node(&mut sim, id, format!("SIM_NODE_SEED_{}", i));
         }
 
         // Partition A: nodes 0..half, Partition B: nodes half..n
@@ -1337,9 +1332,7 @@ impl Topologies {
         // Add watcher nodes connected to partition A.
         for w in 0..watchers {
             let id = format!("watcher{}", w);
-            let seed = Hash256::hash(format!("SIM_WATCHER_SEED_{}", w).as_bytes());
-            let sk = SecretKey::from_seed(&seed.0);
-            sim.add_node(id.clone(), sk);
+            add_seeded_node(&mut sim, id.clone(), format!("SIM_WATCHER_SEED_{}", w));
             // Connect watcher to all nodes in partition A.
             for i in 0..half {
                 sim.add_pending_connection(id.clone(), format!("node{}", i));

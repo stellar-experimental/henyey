@@ -213,31 +213,30 @@ impl BucketManager {
     /// into memory without significant memory pressure.
     pub const DISK_BACKED_THRESHOLD: u64 = 10 * 1024 * 1024;
 
-    /// Create a new BucketManager with the given directory.
-    pub fn new(bucket_dir: PathBuf) -> Result<Self> {
-        // Create directory if it doesn't exist
-        std::fs::create_dir_all(&bucket_dir)?;
-
-        Ok(Self {
-            bucket_dir,
-            cache: RwLock::new(HashMap::new()),
-            max_cache_size: Self::DEFAULT_MAX_CACHE_SIZE,
-            persist_index: false,
-            finished_merges: RwLock::new(BucketMergeMap::new()),
-        })
-    }
-
-    /// Create a new BucketManager with a custom cache size.
-    pub fn with_cache_size(bucket_dir: PathBuf, max_cache_size: usize) -> Result<Self> {
+    fn build(bucket_dir: PathBuf, max_cache_size: usize, persist_index: bool) -> Result<Self> {
         std::fs::create_dir_all(&bucket_dir)?;
 
         Ok(Self {
             bucket_dir,
             cache: RwLock::new(HashMap::new()),
             max_cache_size,
-            persist_index: false,
+            persist_index,
             finished_merges: RwLock::new(BucketMergeMap::new()),
         })
+    }
+
+    fn cached_bucket(&self, hash: &Hash256) -> Option<Arc<Bucket>> {
+        self.cache.read().unwrap().get(hash).cloned()
+    }
+
+    /// Create a new BucketManager with the given directory.
+    pub fn new(bucket_dir: PathBuf) -> Result<Self> {
+        Self::build(bucket_dir, Self::DEFAULT_MAX_CACHE_SIZE, false)
+    }
+
+    /// Create a new BucketManager with a custom cache size.
+    pub fn with_cache_size(bucket_dir: PathBuf, max_cache_size: usize) -> Result<Self> {
+        Self::build(bucket_dir, max_cache_size, false)
     }
 
     /// Create a new BucketManager with index persistence enabled.
@@ -245,15 +244,7 @@ impl BucketManager {
     /// When `persist_index` is true, disk indexes are saved alongside bucket files
     /// and loaded on startup, avoiding expensive index rebuilds.
     pub fn with_persist_index(bucket_dir: PathBuf, persist_index: bool) -> Result<Self> {
-        std::fs::create_dir_all(&bucket_dir)?;
-
-        Ok(Self {
-            bucket_dir,
-            cache: RwLock::new(HashMap::new()),
-            max_cache_size: Self::DEFAULT_MAX_CACHE_SIZE,
-            persist_index,
-            finished_merges: RwLock::new(BucketMergeMap::new()),
-        })
+        Self::build(bucket_dir, Self::DEFAULT_MAX_CACHE_SIZE, persist_index)
     }
 
     /// Returns whether index persistence is enabled.
@@ -300,11 +291,8 @@ impl BucketManager {
         let hash = bucket.hash();
 
         // Check if already cached
-        {
-            let cache = self.cache.read().unwrap();
-            if let Some(cached) = cache.get(&hash) {
-                return Ok(Arc::clone(cached));
-            }
+        if let Some(cached) = self.cached_bucket(&hash) {
+            return Ok(cached);
         }
 
         // Save to disk as uncompressed XDR
@@ -349,11 +337,8 @@ impl BucketManager {
         }
 
         // Check cache first
-        {
-            let cache = self.cache.read().unwrap();
-            if let Some(bucket) = cache.get(hash) {
-                return Ok(Arc::clone(bucket));
-            }
+        if let Some(bucket) = self.cached_bucket(hash) {
+            return Ok(bucket);
         }
 
         // Load from canonical .bucket.xdr path
@@ -478,11 +463,8 @@ impl BucketManager {
         }
 
         // Check cache
-        {
-            let cache = self.cache.read().unwrap();
-            if cache.contains_key(hash) {
-                return true;
-            }
+        if self.cached_bucket(hash).is_some() {
+            return true;
         }
 
         // Check disk (canonical path only)
@@ -521,12 +503,9 @@ impl BucketManager {
         }
 
         // Check if already cached
-        {
-            let cache = self.cache.read().unwrap();
-            if let Some(cached) = cache.get(&hash) {
-                let _ = std::fs::remove_file(&temp_path);
-                return Ok(Arc::clone(cached));
-            }
+        if let Some(cached) = self.cached_bucket(&hash) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Ok(cached);
         }
 
         // Promote temp file to canonical path and load as disk-backed bucket
@@ -728,11 +707,8 @@ impl BucketManager {
         let hash = Hash256::hash(xdr_bytes);
 
         // Check cache
-        {
-            let cache = self.cache.read().unwrap();
-            if let Some(cached) = cache.get(&hash) {
-                return Ok(Arc::clone(cached));
-            }
+        if let Some(cached) = self.cached_bucket(&hash) {
+            return Ok(cached);
         }
 
         // Save raw XDR bytes to disk if not already there

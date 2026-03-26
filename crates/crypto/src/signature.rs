@@ -19,7 +19,7 @@ const SIG_CACHE_CAPACITY: usize = 250_000;
 
 /// Global ed25519 signature verification cache.
 ///
-/// Keyed by SHA-256(pubkey || signature || message_hash). Matches stellar-core's
+/// Keyed by BLAKE2b-256(pubkey || signature || message_hash). Matches stellar-core's
 /// global `gVerifySigCache` which persists across the validator lifetime so that
 /// signatures verified during flood/nomination get cache hits during apply.
 ///
@@ -71,6 +71,14 @@ fn compute_cache_key(pubkey: &[u8; 32], sig: &[u8; 64], hash: &[u8; 32]) -> [u8;
     hasher.finalize().into()
 }
 
+fn cached_verify_result(result: bool) -> Result<(), CryptoError> {
+    if result {
+        Ok(())
+    } else {
+        Err(CryptoError::InvalidSignature)
+    }
+}
+
 /// Signs a hash value.
 ///
 /// This signs the raw 32 bytes of the hash. Use this when signing transaction
@@ -100,13 +108,11 @@ pub fn verify_hash_from_raw_key(
 
     // Check cache — no decompression needed (read lock for parallel access)
     {
-        let cache = SIG_VERIFY_CACHE.read().unwrap();
+        let cache = SIG_VERIFY_CACHE
+            .read()
+            .expect("signature cache lock poisoned");
         if let Some(result) = cache.get(&cache_key) {
-            return if result {
-                Ok(())
-            } else {
-                Err(CryptoError::InvalidSignature)
-            };
+            return cached_verify_result(result);
         }
     }
 
@@ -116,7 +122,9 @@ pub fn verify_hash_from_raw_key(
 
     // Store result in cache (write lock only for inserts)
     {
-        let mut cache = SIG_VERIFY_CACHE.write().unwrap();
+        let mut cache = SIG_VERIFY_CACHE
+            .write()
+            .expect("signature cache lock poisoned");
         cache.insert(cache_key, result.is_ok());
     }
 

@@ -1,211 +1,133 @@
 # henyey
 
-Main binary crate -- a pure Rust implementation of Stellar Core's CLI and node entry point.
+Primary CLI and node entry point for the henyey Stellar Core implementation.
 
 ## Overview
 
-This crate is the primary executable for henyey, providing a command-line interface that wraps
-the `henyey-app` library crate. It handles argument parsing (via `clap`), configuration loading,
-logging initialization, and command dispatch. The actual node implementation, catchup logic,
-consensus, and subsystem coordination are handled by the underlying library crates (`henyey-app`,
-`henyey-ledger`, `henyey-overlay`, `henyey-herder`, etc.).
-
-The crate corresponds to stellar-core's `main.cpp` entry point and its collection of CLI
-subcommands defined in `CommandLine.cpp`.
+`henyey` is the workspace's main binary crate. It parses command-line arguments, loads and translates configuration, initializes logging, and dispatches operational commands into the underlying library crates such as `henyey-app`, `henyey-history`, `henyey-ledger`, `henyey-simulation`, and `henyey-rpc`. For stellar-core parity work it mostly corresponds to `src/main/main.cpp`, `src/main/CommandLine.cpp`, `src/main/ApplicationUtils.cpp`, and the settings-upgrade helpers in `src/main/SettingsUpgradeUtils.cpp`.
 
 ## Architecture
 
 ```mermaid
-graph TD
-    CLI["CLI (clap)"] --> Config["Config Loading"]
-    Config --> Dispatch["Command Dispatch"]
-    Dispatch --> Run["run: start node"]
-    Dispatch --> Catchup["catchup: sync from archives"]
-    Dispatch --> VerifyExec["verify-execution: CDP comparison"]
-    Dispatch --> ApplyLoad["apply-load: benchmark"]
-    Dispatch --> Admin["admin: new-db, new-keypair, info, sample-config"]
-    Dispatch --> History["verify-history, publish-history, verify-checkpoints"]
-    Dispatch --> Tools["dump-ledger, bucket-info, self-check, debug-bucket-entry"]
-    Dispatch --> Quorum["check-quorum-intersection"]
-    Dispatch --> HttpCmd["http-command"]
-    Run --> App["henyey-app"]
-    Run --> RPC["henyey-rpc (JSON-RPC server)"]
-    Run --> LoadGen["SimulationLoadGenRunner"]
-    Catchup --> App
-    VerifyExec --> Ledger["henyey-ledger"]
-    VerifyExec --> Bucket["henyey-bucket"]
-    VerifyExec --> HistoryLib["henyey-history (CDP)"]
-    ApplyLoad --> Sim["henyey-simulation"]
-    Tools --> Bucket
-    Quorum --> SCP["henyey-scp"]
+flowchart TD
+    CLI[clap CLI] --> Init[config + logging init]
+    Init --> Dispatch[command dispatch in main.rs]
+    Dispatch --> Run[run / catchup / info]
+    Dispatch --> History[verify-history / publish-history / verify-checkpoints / new-hist]
+    Dispatch --> Verify[verify-execution / debug-bucket-entry / dump-ledger / self-check]
+    Dispatch --> Admin[new-db / upgrade-db / new-keypair / sample-config]
+    Dispatch --> Compat[version / offline-info / convert-id / force-scp / http-command]
+    Dispatch --> Bench[apply-load / loadgen bridge]
+    Dispatch --> Tools[check-quorum-intersection / get-settings-upgrade-txs / header_compare]
+    Run --> App[henyey-app]
+    History --> HistLib[henyey-history]
+    Verify --> Ledger[henyey-ledger + henyey-bucket]
+    Bench --> Sim[henyey-simulation]
+    Tools --> SCP[henyey-scp]
 ```
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `Cli` | Top-level clap argument struct with global options (config, verbose, network, metadata-output-stream) |
-| `Commands` | Enum of all CLI subcommands (Run, Catchup, NewDb, VerifyExecution, ApplyLoad, DumpLedger, etc.) |
-| `CliLogFormat` | Log format selection enum (Text, Json) |
-| `VerifyExecutionOptions` | Options struct for the verify-execution command |
-| `CommandArchiveTarget` | Configuration for publishing to remote archives via shell commands |
-| `SimulationLoadGenRunner` | Concrete `LoadGenRunner` implementation backed by `LoadGenerator` from `henyey-simulation`; wired into the running node to drive synthetic load generation |
+| `Cli` | Top-level clap parser containing global flags such as `--config`, `--testnet`, `--mainnet`, and `--metadata-output-stream`. |
+| `Commands` | Enum of all supported subcommands, including node operation, history, diagnostics, compatibility utilities, and benchmarking. |
+| `CliLogFormat` | CLI-facing log format selector that maps to `henyey_app::LogFormat`. |
+| `SimulationLoadGenRunner` | `LoadGenRunner` implementation that wires the node's HTTP load-generation commands into `henyey-simulation`. |
+| `VerifyExecutionOptions` | Parameter bundle for the offline CDP-based execution verifier. |
+| `CommandArchiveTarget` | Shell-command-based publish target used for writable history archives configured with `put` and optional `mkdir` commands. |
+| `QsetEntry` | JSON quorum-set representation consumed by the quorum intersection checker. |
+| `Args` | Dedicated clap parser for the `header_compare` debugging binary. |
+| `ConfigUpgradeSetKey` | Final identifier emitted by `get-settings-upgrade-txs` for the uploaded Soroban config-upgrade payload. |
 
 ## Usage
 
-### Running a node
+```rust
+use std::process::Command;
 
-```bash
-# Run on testnet (default)
-henyey --testnet run
-
-# Run as validator
-henyey --testnet run --validator
-
-# Run as watcher (observe only)
-henyey --testnet run --watcher
-
-# Run a local standalone network from genesis (zero configuration)
-henyey run --local
-
-# Local mode with config overlay (e.g., enable RPC)
-henyey --config my-rpc.toml run --local
+# fn main() -> std::io::Result<()> {
+let status = Command::new("henyey")
+    .args(["--testnet", "run", "--watcher"])
+    .status()?;
+assert!(status.success());
+# Ok(())
+# }
 ```
 
-### Catching up from history archives
+```rust
+use std::process::Command;
 
-```bash
-# Catch up to current ledger (minimal mode)
-henyey --testnet catchup current
-
-# Catch up with complete history, 16 parallel downloads
-henyey --testnet catchup current --mode complete --parallelism 16
+# fn main() -> std::io::Result<()> {
+let status = Command::new("henyey")
+    .args([
+        "--testnet",
+        "catchup",
+        "current",
+        "--mode",
+        "complete",
+        "--parallelism",
+        "16",
+    ])
+    .status()?;
+assert!(status.success());
+# Ok(())
+# }
 ```
 
-### Offline verification against CDP
+```rust
+use std::process::{Command, Stdio};
 
-```bash
-# Compare transaction execution against CDP metadata
-henyey --testnet verify-execution --from 310000 --to 311000 --stop-on-error
+# fn main() -> std::io::Result<()> {
+let mut child = Command::new("henyey")
+    .args([
+        "get-settings-upgrade-txs",
+        "GBZXN7PIRZGNMHGA7MUUUF4GWPY5AYPV6LY4UV2GL6VJGIQRXFDNMADI",
+        "42",
+        "Test SDF Network ; September 2015",
+        "--xdr",
+        "AAAA...",
+        "--signtxs",
+    ])
+    .stdin(Stdio::piped())
+    .spawn()?;
 
-# This restores bucket list state from a checkpoint, then re-executes
-# transactions via close_ledger and compares results against CDP metadata.
-# Differences indicate execution divergence from stellar-core.
-```
-
-### Benchmarking with apply-load
-
-```bash
-# Run limit-based benchmark (default: 10 ledgers)
-henyey apply-load
-
-# Soroban SAC transfer throughput benchmark
-henyey apply-load --mode max-sac-tps --tx-count 50000
-
-# Single-shot mode with multiple iterations
-henyey apply-load --mode single-shot --iterations 5
-```
-
-### Other commands
-
-```bash
-# Generate a new node keypair
-henyey new-keypair
-
-# Create a fresh database
-henyey --testnet new-db --force
-
-# Verify history archive integrity
-henyey --testnet verify-history --from 1 --to 100000
-
-# Publish history to archives (validators only)
-henyey --config validator.toml publish-history
-
-# Initialize a named history archive
-henyey --config validator.toml new-hist my_archive
-
-# Check quorum intersection from JSON
-henyey check-quorum-intersection network.json
-
-# Send command to running node
-henyey http-command info
-
-# Convert identifier between formats (hex/strkey)
-henyey convert-id GDKXE2OZM...
-
-# Force SCP to start on next run (single-node networks)
-henyey --testnet force-scp
-
-# Print offline node state (used by stellar-rpc)
-henyey --testnet offline-info
-
-# Print version and protocol info
-henyey version
+// Write the secret seed to stdin when signing is requested.
+let status = child.wait()?;
+assert!(status.success());
+# Ok(())
+# }
 ```
 
 ## Module Layout
 
 | Module | Description |
 |--------|-------------|
-| `main.rs` | CLI entry point, argument parsing, configuration loading, and all command handlers |
-| `main.rs` (`loadgen_runner`) | Inner module containing `SimulationLoadGenRunner`, the concrete `LoadGenRunner` implementation that bridges `henyey-app` and `henyey-simulation` |
-| `quorum_intersection.rs` | Quorum intersection analysis -- loads a JSON network config and checks that all quorums overlap |
-| `bin/header_compare.rs` | Separate binary for comparing ledger headers between a local database and a history archive |
-| `build.rs` | Build script that captures the git commit hash and build timestamp into compile-time environment variables (`HENYEY_COMMIT_HASH`, `HENYEY_BUILD_TIMESTAMP`) |
+| `build.rs` | Injects the git commit hash and UTC build timestamp into compile-time environment variables. |
+| `src/main.rs` | Main CLI entry point plus command handlers for running the node, history tooling, diagnostics, compatibility commands, and benchmarks. |
+| `src/main.rs` (`loadgen_runner`) | Bridges `henyey-app` load-generation hooks to `henyey-simulation::LoadGenerator`. |
+| `src/quorum_intersection.rs` | Loads stellar-core-style JSON quorum descriptions and checks satisfiability plus quorum intersection. |
+| `src/settings_upgrade.rs` | Builds and optionally signs the four Soroban settings-upgrade transactions that mirror stellar-core's upgrade utility. |
+| `src/bin/header_compare.rs` | Separate debugging binary that compares local and archived ledger headers and optional transaction result sets. |
 
 ## Design Notes
 
-- **Single-file command handlers**: All command implementations live in `main.rs` rather than
-  being split across modules. This keeps the crate simple since it is a thin CLI wrapper, though
-  `cmd_verify_execution` and `cmd_publish_history` are notably large functions.
-
-- **Archive helper functions**: Common patterns for creating `HistoryArchive` clients from config
-  are factored into `first_archive()` and `all_archives()` helpers to reduce repetition across
-  the many commands that need archive access.
-
-- **Temporary directory lifetime management**: The `cmd_verify_execution` function uses
-  `Option<tempfile::TempDir>` holders to keep temporary directories alive for the duration of
-  execution when caching is disabled. The TempDir is dropped (and cleaned up) when the function
-  returns.
-
-- **Quorum intersection algorithm**: The `quorum_intersection` module uses a brute-force O(2^n)
-  algorithm that enumerates all node subsets. It is capped at 20 nodes to prevent runaway
-  computation. stellar-core also has a SAT-solver-based v2 algorithm which is not yet implemented.
-
-- **CDP integration**: The `verify-execution` and `debug-bucket-entry` commands use CDP
-  (Crypto Data Platform) as ground truth for comparing transaction execution results. This is
-  unique to the Rust implementation and is the primary tool for parity testing.
-
-- **RPC integration**: When RPC is enabled in config, `cmd_run` spawns a `henyey_rpc::RpcServer`
-  alongside the node, providing a JSON-RPC interface on the configured port.
-
-- **Load generation wiring**: `cmd_run` injects a `SimulationLoadGenRunner` factory into the
-  `RunOptions`, allowing the running node to generate synthetic load on demand via the
-  `LoadGenRunner` trait from `henyey-app`.
+- Most command handlers live in `src/main.rs`, keeping the crate thin but making it the central integration point for many workspace crates.
+- `run --local` bootstraps a complete single-node standalone network: it creates the database, initializes genesis state, enables accelerated time, initializes a local history archive, and forces SCP bootstrap on the next run.
+- History publishing supports both direct filesystem archives and shell-command archives, matching stellar-core's `put`/`mkdir` archive configuration style.
+- `verify-execution` restores bucket state from a history archive state snapshot, restarts pending merges in the same structure-based mode used by online stellar-core, and then replays ledgers against CDP metadata as the parity oracle.
 
 ## stellar-core Mapping
 
 | Rust | stellar-core |
 |------|--------------|
-| `main.rs` (CLI + dispatch) | `src/main/main.cpp`, `src/main/CommandLine.cpp` |
-| `main.rs` (`cmd_run`) | `src/main/ApplicationUtils.cpp` (`runWithConfig`) |
-| `main.rs` (`cmd_catchup`) | `src/main/ApplicationUtils.cpp` (`catchup`) |
-| `main.rs` (`cmd_apply_load`) | `src/main/CommandLine.cpp` (`runApplyLoad`) |
-| `main.rs` (`cmd_publish_history`) | `src/main/ApplicationUtils.cpp` (`publish`) |
-| `main.rs` (`cmd_verify_history`) | `src/main/ApplicationUtils.cpp` (`verifyHistory`) |
-| `main.rs` (`cmd_self_check`) | `src/main/ApplicationUtils.cpp` (`selfCheck`) |
-| `main.rs` (`cmd_dump_ledger`) | `src/main/ApplicationUtils.cpp` (`dumpLedger`) |
-| `main.rs` (`cmd_http_command`) | `src/main/CommandLine.cpp` (`httpCommand`) |
-| `main.rs` (`cmd_new_keypair`) | `src/main/CommandLine.cpp` (`genSeed`) |
-| `main.rs` (`cmd_verify_checkpoints`) | `src/main/CommandLine.cpp` (`writeVerifiedCheckpointHashes`) |
-| `main.rs` (`cmd_convert_id`) | `src/main/CommandLine.cpp` (`runConvertId`) |
-| `main.rs` (`cmd_force_scp`) | `src/main/CommandLine.cpp` (`runForceSCP`) |
-| `main.rs` (`cmd_offline_info`) | `src/main/CommandLine.cpp` (`runOfflineInfo`) |
-| `main.rs` (`cmd_version`) | `src/main/CommandLine.cpp` (`runVersion`) |
-| `main.rs` (`cmd_new_hist`) | `src/main/CommandLine.cpp` (`runNewHist`) |
-| `loadgen_runner` module | `src/simulation/LoadGenerator.cpp` (runner integration) |
-| `quorum_intersection.rs` | `src/herder/QuorumIntersectionChecker*` (v1 brute-force only) |
-| `bin/header_compare.rs` | No direct upstream equivalent (debugging tool) |
+| `src/main.rs` (`main`, `Cli`, `Commands`) | `src/main/main.cpp`, `src/main/CommandLine.cpp` |
+| `src/main.rs` (`cmd_run`, `cmd_catchup`, `cmd_publish_history`, `cmd_self_check`, `cmd_dump_ledger`) | `src/main/ApplicationUtils.cpp` |
+| `src/main.rs` (`cmd_version`, `cmd_convert_id`, `cmd_force_scp`, `cmd_new_hist`, `cmd_verify_checkpoints`, `cmd_http_command`) | `src/main/CommandLine.cpp` |
+| `src/main.rs` (`cmd_apply_load`, `loadgen_runner`) | `src/main/CommandLine.cpp`, `src/simulation/LoadGenerator.cpp` |
+| `src/main.rs` (`cmd_verify_execution`, `cmd_debug_bucket_entry`) | No direct upstream equivalent; parity/debug tooling specific to henyey |
+| `src/quorum_intersection.rs` | `src/herder/QuorumIntersectionCheckerImpl.cpp`, `src/herder/QuorumIntersectionCheckerImpl.h` |
+| `src/settings_upgrade.rs` | `src/main/SettingsUpgradeUtils.cpp`, parts of `src/main/CommandLine.cpp` and `src/main/dumpxdr.cpp` |
+| `src/bin/header_compare.rs` | No direct upstream equivalent |
 
 ## Parity Status
 

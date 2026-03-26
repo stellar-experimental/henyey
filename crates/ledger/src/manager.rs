@@ -1007,12 +1007,9 @@ pub struct LedgerManager {
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
-#[allow(dead_code)]
-const _: () = {
+const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
-    fn _check() {
-        assert_send_sync::<LedgerManager>();
-    }
+    let _ = assert_send_sync::<LedgerManager> as fn();
 };
 
 impl LedgerManager {
@@ -2233,7 +2230,7 @@ struct LedgerCloseContext<'a> {
     soroban_fee_write_1kb: i64,
 }
 
-impl<'a> LedgerCloseContext<'a> {
+impl LedgerCloseContext<'_> {
     /// Load an entry from the snapshot.
     fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         // First check if we have a pending change
@@ -4048,10 +4045,14 @@ impl<'a> LedgerCloseContext<'a> {
         // Compute header hash - add detailed XDR logging for debugging
         use stellar_xdr::curr::{Limits, WriteXdr};
         let header_xdr_bytes = new_header.to_xdr(Limits::none())?;
-        let header_xdr_hex: String = header_xdr_bytes
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect();
+        let header_xdr_hex = header_xdr_bytes.iter().fold(
+            String::with_capacity(header_xdr_bytes.len() * 2),
+            |mut hex, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(hex, "{:02x}", byte);
+                hex
+            },
+        );
         tracing::debug!(
             ledger_seq = new_header.ledger_seq,
             header_xdr_len = header_xdr_bytes.len(),

@@ -207,6 +207,18 @@ impl Drop for TimerGuard<'_> {
     }
 }
 
+fn reset_counters(counters: &[&Counter]) {
+    for counter in counters {
+        counter.reset();
+    }
+}
+
+fn reset_timers(timers: &[&Timer]) {
+    for timer in timers {
+        timer.reset();
+    }
+}
+
 /// Snapshot of timer statistics.
 #[derive(Debug, Clone)]
 pub struct TimerSnapshot {
@@ -473,97 +485,83 @@ impl OverlayMetrics {
 
     /// Reset all metrics to initial state.
     pub fn reset(&self) {
-        // Message metrics
-        self.messages_read.reset();
-        self.messages_written.reset();
-        self.messages_dropped.reset();
-        self.messages_broadcast.reset();
+        reset_counters(&[
+            &self.messages_read,
+            &self.messages_written,
+            &self.messages_dropped,
+            &self.messages_broadcast,
+            &self.bytes_read,
+            &self.bytes_written,
+            &self.errors_read,
+            &self.errors_write,
+            &self.timeouts_idle,
+            &self.timeouts_straggler,
+            &self.pending_peers,
+            &self.authenticated_peers,
+            &self.send_error,
+            &self.send_hello,
+            &self.send_auth,
+            &self.send_dont_have,
+            &self.send_peers,
+            &self.send_get_txset,
+            &self.send_transaction,
+            &self.send_txset,
+            &self.send_get_scp_qset,
+            &self.send_scp_qset,
+            &self.send_scp_message,
+            &self.send_get_scp_state,
+            &self.send_send_more,
+            &self.send_flood_advert,
+            &self.send_flood_demand,
+            &self.send_survey_request,
+            &self.send_survey_response,
+            &self.queue_drop_scp,
+            &self.queue_drop_tx,
+            &self.queue_drop_advert,
+            &self.queue_drop_demand,
+            &self.flood_demanded,
+            &self.flood_fulfilled,
+            &self.flood_unfulfilled_banned,
+            &self.flood_unfulfilled_unknown,
+            &self.flood_unique_bytes_recv,
+            &self.flood_duplicate_bytes_recv,
+            &self.fetch_unique_bytes_recv,
+            &self.fetch_duplicate_bytes_recv,
+            &self.item_fetcher_next_peer,
+            &self.demand_timeouts,
+            &self.pulled_relevant_txs,
+            &self.pulled_irrelevant_txs,
+            &self.abandoned_demands,
+        ]);
 
-        // Byte metrics
-        self.bytes_read.reset();
-        self.bytes_written.reset();
-
-        // Error metrics
-        self.errors_read.reset();
-        self.errors_write.reset();
-
-        // Timeout metrics
-        self.timeouts_idle.reset();
-        self.timeouts_straggler.reset();
-
-        // Connection metrics
-        self.connection_latency.reset();
-        self.pending_peers.reset();
-        self.authenticated_peers.reset();
-
-        // Receive timers
-        self.recv_error.reset();
-        self.recv_hello.reset();
-        self.recv_auth.reset();
-        self.recv_dont_have.reset();
-        self.recv_peers.reset();
-        self.recv_get_txset.reset();
-        self.recv_txset.reset();
-        self.recv_transaction.reset();
-        self.recv_get_scp_qset.reset();
-        self.recv_scp_qset.reset();
-        self.recv_scp_message.reset();
-        self.recv_get_scp_state.reset();
-        self.recv_send_more.reset();
-        self.recv_flood_advert.reset();
-        self.recv_flood_demand.reset();
-        self.recv_survey_request.reset();
-        self.recv_survey_response.reset();
-
-        // Send counters
-        self.send_error.reset();
-        self.send_hello.reset();
-        self.send_auth.reset();
-        self.send_dont_have.reset();
-        self.send_peers.reset();
-        self.send_get_txset.reset();
-        self.send_transaction.reset();
-        self.send_txset.reset();
-        self.send_get_scp_qset.reset();
-        self.send_scp_qset.reset();
-        self.send_scp_message.reset();
-        self.send_get_scp_state.reset();
-        self.send_send_more.reset();
-        self.send_flood_advert.reset();
-        self.send_flood_demand.reset();
-        self.send_survey_request.reset();
-        self.send_survey_response.reset();
-
-        // Queue metrics
-        self.queue_delay_scp.reset();
-        self.queue_delay_tx.reset();
-        self.queue_delay_advert.reset();
-        self.queue_delay_demand.reset();
-        self.queue_drop_scp.reset();
-        self.queue_drop_tx.reset();
-        self.queue_drop_advert.reset();
-        self.queue_drop_demand.reset();
-
-        // Flood metrics
-        self.flood_demanded.reset();
-        self.flood_fulfilled.reset();
-        self.flood_unfulfilled_banned.reset();
-        self.flood_unfulfilled_unknown.reset();
-        self.flood_unique_bytes_recv.reset();
-        self.flood_duplicate_bytes_recv.reset();
-
-        // Fetch metrics
-        self.fetch_unique_bytes_recv.reset();
-        self.fetch_duplicate_bytes_recv.reset();
-        self.item_fetcher_next_peer.reset();
-
-        // Pull metrics
-        self.tx_pull_latency.reset();
-        self.peer_tx_pull_latency.reset();
-        self.demand_timeouts.reset();
-        self.pulled_relevant_txs.reset();
-        self.pulled_irrelevant_txs.reset();
-        self.abandoned_demands.reset();
+        reset_timers(&[
+            &self.connection_latency,
+            &self.connection_read_throttle,
+            &self.connection_flood_throttle,
+            &self.recv_error,
+            &self.recv_hello,
+            &self.recv_auth,
+            &self.recv_dont_have,
+            &self.recv_peers,
+            &self.recv_get_txset,
+            &self.recv_txset,
+            &self.recv_transaction,
+            &self.recv_get_scp_qset,
+            &self.recv_scp_qset,
+            &self.recv_scp_message,
+            &self.recv_get_scp_state,
+            &self.recv_send_more,
+            &self.recv_flood_advert,
+            &self.recv_flood_demand,
+            &self.recv_survey_request,
+            &self.recv_survey_response,
+            &self.queue_delay_scp,
+            &self.queue_delay_tx,
+            &self.queue_delay_advert,
+            &self.queue_delay_demand,
+            &self.tx_pull_latency,
+            &self.peer_tx_pull_latency,
+        ]);
     }
 }
 

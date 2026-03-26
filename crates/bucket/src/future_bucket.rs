@@ -696,7 +696,7 @@ mod tests {
         let hash1 = Hash256::from_bytes([1u8; 32]);
         let hash2 = Hash256::from_bytes([2u8; 32]);
 
-        let key = MergeKey::new(true, hash1.clone(), hash2.clone());
+        let key = MergeKey::new(true, hash1, hash2);
         assert!(key.keep_tombstones);
         assert_eq!(key.curr_hash, hash1);
         assert_eq!(key.snap_hash, hash2);

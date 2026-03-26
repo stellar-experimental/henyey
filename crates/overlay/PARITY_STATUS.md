@@ -3,23 +3,23 @@
 **Crate**: `henyey-overlay`
 **Upstream**: `stellar-core/src/overlay/`
 **Overall Parity**: 92%
-**Last Updated**: 2026-03-05
+**Last Updated**: 2026-03-25
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
 | Authentication (PeerAuth, Hmac) | Full | HKDF key derivation, HMAC-SHA256 MAC |
-| Peer Connection (Peer, TCPPeer) | Full | Ping/pong RTT tracking, 2s auth timeout, keepalive |
-| OverlayManager | Full | 3s tick loop, DNS re-resolution, peer rotation, connection pool tracking |
+| Peer Connection (Peer, TCPPeer) | Partial | Core handshake and I/O complete; admin JSON and query throttle absent |
+| OverlayManager | Partial | Core peer lifecycle present; some peer-list and stats accessors absent |
 | Floodgate | Full | Message deduplication, ledger-based cleanup |
 | FlowControl | Full | Capacity tracking, throttling, SCP-aware trimming, CapacityGuard RAII |
 | ItemFetcher / Tracker | Full | Fetch lifecycle, retry, envelope tracking |
 | BanManager | Full | In-memory + SQLite persistence, auto-ban escalation, time-limited bans |
 | PeerManager | Full | SQLite persistence, backoff, type tracking, direction-filtered queries |
-| TxAdverts | Full | Queuing, batching, history cache |
+| TxAdverts | Partial | Queuing and batching complete; ops-flood ledger helper absent |
 | TxDemandsManager | Full | Demand scheduling, pull latency |
-| SurveyManager | Full | Encryption/signatures in app layer (survey_impl.rs) |
+| SurveyManager | Partial | Survey flow complete; JSON summary and limiter behavior simplified |
 | OverlayMetrics | Full | Counters and timers for all message types |
 | PeerBareAddress | Full | Mapped to PeerAddress in lib.rs |
 | MessageCodec (framing) | Full | Length-prefix with auth bit (bit 31) |
@@ -549,32 +549,31 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Overlay/Peer | 39 TEST_CASE / 87 SECTION | 2 #[test] (peer.rs) + 2 (connection.rs) | Significant gap; upstream has extensive handshake tests |
-| Flood | 1 TEST_CASE / 17 SECTION | 5 #[test] | Reasonable coverage |
-| FlowControl | (in OverlayTests) | 9 #[test] | Good coverage |
-| ItemFetcher | 2 TEST_CASE / 16 SECTION | 12 #[test] + 8 integration | Good coverage |
-| Tracker | 1 TEST_CASE / 8 SECTION | (in item_fetcher tests) | Covered |
-| PeerManager | 8 TEST_CASE / 38 SECTION | 7 #[test] | Moderate gap |
-| BanManager | (not separate) | 7 #[test] | Good coverage |
-| TCPPeer | 3 TEST_CASE / 5 SECTION | (in codec + connection tests) | Partial coverage |
-| SurveyManager | 5 TEST_CASE / 7 SECTION | 15 #[test] | Good coverage |
-| SurveyMessageLimiter | 1 TEST_CASE / 10 SECTION | (in survey tests) | Partial |
+| Overlay/Peer | 40 TEST_CASE / 87 SECTION | 34 #[test] (manager.rs) + 2 (peer.rs) + 4 (connection.rs) | Better coverage now, but upstream handshake matrix is still broader |
+| Flood | 1 TEST_CASE / 17 SECTION | 8 #[test] | Good single-module coverage |
+| FlowControl | Embedded in `OverlayTests.cpp` | 21 #[test] | Strong direct unit coverage |
+| ItemFetcher | 2 TEST_CASE / 16 SECTION | 12 #[test] + 8 integration | Good parity coverage |
+| Tracker | 1 TEST_CASE / 13 SECTION | Covered in `item_fetcher.rs` and integration tests | Adequate |
+| PeerManager | 8 TEST_CASE / 38 SECTION | 9 #[test] | Moderate gap remains in persistence edge cases |
+| BanManager | No dedicated upstream test file | 15 #[test] | Rust coverage is stronger than upstream organization suggests |
+| TCPPeer / framing | 4 TEST_CASE / 5 SECTION | 18 #[test] (codec.rs) + 4 (connection.rs) | Good framing coverage; fewer end-to-end socket scenarios |
+| SurveyManager | 5 TEST_CASE / 7 SECTION | 20 #[test] | Good unit coverage |
+| SurveyMessageLimiter | 1 TEST_CASE / 10 SECTION | Included in 20 `survey.rs` tests | Core limiter paths covered |
 | TxAdverts | 1 TEST_CASE / 5 SECTION | 9 #[test] | Good coverage |
-| OverlayManager | 4 TEST_CASE | 1 #[test] | Significant gap |
+| OverlayManager | 4 TEST_CASE / 0 SECTION | 34 #[test] | Strong unit coverage for startup, peer rotation, and bookkeeping |
 | OverlayTopology | 2 TEST_CASE / 7 SECTION | 0 | Not covered |
 | MessageDispatcher | N/A | 8 #[test] | Rust-specific |
 | Metrics | N/A | 12 #[test] | Rust-specific |
-| Auth | N/A | 3 #[test] | Basic coverage |
-| Codec | N/A | 7 #[test] | Good coverage |
-| TxDemands | N/A | 15 #[test] | Good coverage |
+| Auth | Covered indirectly in `OverlayTests.cpp` | 23 #[test] | Strong direct unit coverage |
+| Codec | Covered by `TCPPeerTests.cpp` and `OverlayTests.cpp` | 18 #[test] | Good coverage |
+| TxDemands | Covered indirectly by pull-mode overlay tests | 19 #[test] | Good direct unit coverage |
 
 ### Test Gaps
 
-- **Peer handshake and connection lifecycle**: Upstream has 39 TEST_CASE with 87 SECTION in OverlayTests.cpp covering extensive edge cases for handshake, version negotiation, error handling, etc. Rust has minimal tests here.
-- **PeerManager persistence**: Upstream has 8 TEST_CASE with 38 SECTION covering database operations, type updates, backoff scenarios. Rust has 7 tests.
+- **Peer handshake and connection lifecycle**: Upstream still has the broadest end-to-end matrix in `OverlayTests.cpp` and `TCPPeerTests.cpp`, especially around version negotiation, malformed traffic, and timeout behavior.
+- **PeerManager persistence**: Upstream has 8 TEST_CASE with 38 SECTION covering database serialization, selection, and backoff combinations; Rust has solid coverage but fewer scenario permutations.
 - **Multi-node topology**: Upstream has OverlayTopologyTests with 2 TEST_CASE / 7 SECTION for multi-node overlay scenarios. Rust has none.
-- **OverlayManager integration**: Upstream has 4 TEST_CASE for manager-level operations. Rust has 1 basic test.
-- **Network error handling**: Upstream TCPPeer tests cover error conditions, message size limits, and connection failures. Rust coverage is partial.
+- **Network error handling**: Upstream socket-level tests still cover more malformed-frame and live-connection failure scenarios than the current Rust suite.
 
 ## Parity Calculation
 

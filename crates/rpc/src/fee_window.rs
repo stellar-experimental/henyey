@@ -61,7 +61,7 @@ pub(crate) struct FeeDistribution {
 /// - Sort fees ascending
 /// - Mode = most-repeated value (ties broken by first occurrence)
 /// - Percentile P: `kth = ceil(p * count / 100)`, value = `fees[kth - 1]`
-pub(crate) fn compute_fee_distribution(fees: &mut Vec<u64>, ledger_count: u32) -> FeeDistribution {
+pub(crate) fn compute_fee_distribution(fees: &mut [u64], ledger_count: u32) -> FeeDistribution {
     if fees.is_empty() {
         return FeeDistribution::default();
     }
@@ -334,64 +334,56 @@ impl FeeWindows {
 ///
 /// Returns `(classic_fees, soroban_fees)` — vectors of per-transaction fee values.
 fn extract_fees_from_lcm(lcm: &LedgerCloseMeta) -> (Vec<u64>, Vec<u64>) {
-    // We need: (fee_charged, tx_apply_processing) for each tx.
-    // LCM V0/V1/V2 all have tx_processing entries with result + tx_apply_processing.
-
-    struct TxInfo<'a> {
-        fee_charged: i64,
-        num_ops: usize,
-        meta: &'a TransactionMeta,
-    }
-
-    // Helper: all LCM variants have tx_processing entries with
-    // `result.result.fee_charged`, `result.result.result`, and `tx_apply_processing`.
-    fn to_tx_info<'a>(result: &TransactionResultPair, meta: &'a TransactionMeta) -> TxInfo<'a> {
-        TxInfo {
-            fee_charged: result.result.fee_charged,
-            num_ops: count_ops_from_result(&result.result.result),
-            meta,
-        }
-    }
-
-    let infos: Vec<TxInfo> = match lcm {
-        LedgerCloseMeta::V0(v0) => v0
-            .tx_processing
-            .iter()
-            .map(|tp| to_tx_info(&tp.result, &tp.tx_apply_processing))
-            .collect(),
-        LedgerCloseMeta::V1(v1) => v1
-            .tx_processing
-            .iter()
-            .map(|tp| to_tx_info(&tp.result, &tp.tx_apply_processing))
-            .collect(),
-        LedgerCloseMeta::V2(v2) => v2
-            .tx_processing
-            .iter()
-            .map(|tp| to_tx_info(&tp.result, &tp.tx_apply_processing))
-            .collect(),
-    };
-
     let mut classic_fees = Vec::new();
     let mut soroban_fees = Vec::new();
 
-    for info in &infos {
-        if info.num_ops == 0 {
-            continue;
+    let mut extract_tx_fees = |result: &TransactionResultPair, meta: &TransactionMeta| {
+        let num_ops = count_ops_from_result(&result.result.result);
+        if num_ops == 0 {
+            return;
         }
 
-        let fee_charged = info.fee_charged as u64;
+        let fee_charged = result.result.fee_charged as u64;
 
         // Check if this is a Soroban transaction by looking for SorobanTransactionMetaExtV1
-        if let Some(inclusion_fee) = extract_soroban_inclusion_fee(info.meta, fee_charged) {
+        if let Some(inclusion_fee) = extract_soroban_inclusion_fee(meta, fee_charged) {
             soroban_fees.push(inclusion_fee);
         } else {
             // Classic: fee per operation
-            let fee_per_op = fee_charged / info.num_ops as u64;
+            let fee_per_op = fee_charged / num_ops as u64;
             classic_fees.push(fee_per_op);
+        }
+    };
+
+    match lcm {
+        LedgerCloseMeta::V0(v0) => {
+            for tx in v0.tx_processing.iter() {
+                extract_tx_fees(&tx.result, &tx.tx_apply_processing);
+            }
+        }
+        LedgerCloseMeta::V1(v1) => {
+            for tx in v1.tx_processing.iter() {
+                extract_tx_fees(&tx.result, &tx.tx_apply_processing);
+            }
+        }
+        LedgerCloseMeta::V2(v2) => {
+            for tx in v2.tx_processing.iter() {
+                extract_tx_fees(&tx.result, &tx.tx_apply_processing);
+            }
         }
     }
 
     (classic_fees, soroban_fees)
+}
+
+fn soroban_resource_fee(ext: &SorobanTransactionMetaExt) -> Option<u64> {
+    match ext {
+        SorobanTransactionMetaExt::V1(v1) => Some(
+            (v1.total_non_refundable_resource_fee_charged
+                + v1.total_refundable_resource_fee_charged) as u64,
+        ),
+        SorobanTransactionMetaExt::V0 => None,
+    }
 }
 
 /// Try to extract the Soroban inclusion fee from transaction metadata.
@@ -399,31 +391,13 @@ fn extract_fees_from_lcm(lcm: &LedgerCloseMeta) -> (Vec<u64>, Vec<u64>) {
 /// Returns `Some(inclusionFee)` if the transaction has Soroban meta with V1 ext
 /// (fee breakdown), or `None` if it's a classic transaction.
 fn extract_soroban_inclusion_fee(meta: &TransactionMeta, fee_charged: u64) -> Option<u64> {
-    match meta {
-        TransactionMeta::V3(v3) => {
-            let soroban = v3.soroban_meta.as_ref()?;
-            match &soroban.ext {
-                SorobanTransactionMetaExt::V1(v1) => {
-                    let resource_fee = v1.total_non_refundable_resource_fee_charged
-                        + v1.total_refundable_resource_fee_charged;
-                    Some(fee_charged.saturating_sub(resource_fee as u64))
-                }
-                SorobanTransactionMetaExt::V0 => None,
-            }
-        }
-        TransactionMeta::V4(v4) => {
-            let soroban = v4.soroban_meta.as_ref()?;
-            match &soroban.ext {
-                SorobanTransactionMetaExt::V1(v1) => {
-                    let resource_fee = v1.total_non_refundable_resource_fee_charged
-                        + v1.total_refundable_resource_fee_charged;
-                    Some(fee_charged.saturating_sub(resource_fee as u64))
-                }
-                SorobanTransactionMetaExt::V0 => None,
-            }
-        }
+    let resource_fee = match meta {
+        TransactionMeta::V3(v3) => soroban_resource_fee(&v3.soroban_meta.as_ref()?.ext),
+        TransactionMeta::V4(v4) => soroban_resource_fee(&v4.soroban_meta.as_ref()?.ext),
         _ => None,
-    }
+    }?;
+
+    Some(fee_charged.saturating_sub(resource_fee))
 }
 
 /// Count the number of operations from a `TransactionResultResult`.

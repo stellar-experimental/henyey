@@ -3,7 +3,7 @@
 **Crate**: `henyey-herder`
 **Upstream**: `stellar-core/src/herder/`
 **Overall Parity**: 77%
-**Last Updated**: 2026-03-05
+**Last Updated**: 2026-03-25
 
 ## Summary
 
@@ -12,7 +12,7 @@
 | Core Herder (state machine, envelope recv) | Partial | Missing metrics, quorum map reanalysis |
 | HerderSCPDriver (value validation, signing) | Partial | Missing SCP metrics, node weight, TxSet validity cache |
 | HerderPersistence (SCP state DB) | Partial | Missing `copySCPHistoryToStream`, `getNodeQuorumSet` |
-| HerderUtils (value extraction) | Full | All functions implemented |
+| HerderUtils (value extraction) | Partial | Missing validated hash/quorum-map helpers |
 | LedgerCloseData | Full | All accessors and XDR round-trip |
 | PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache |
 | QuorumTracker | Full | expand, rebuild, closest validators |
@@ -37,9 +37,9 @@
 | `LedgerCloseData.h` / `LedgerCloseData.cpp` | `ledger_close_data.rs` | Ledger close wrapper |
 | `PendingEnvelopes.h` / `PendingEnvelopes.cpp` | `pending.rs`, `fetching_envelopes.rs` | Split into two modules |
 | `QuorumTracker.h` / `QuorumTracker.cpp` | `quorum_tracker.rs` | Transitive quorum tracking |
-| `TransactionQueue.h` / `TransactionQueue.cpp` | `tx_queue.rs`, `tx_broadcast.rs` | Queue + broadcast split |
+| `TransactionQueue.h` / `TransactionQueue.cpp` | `tx_queue/mod.rs`, `tx_queue/selection.rs`, `tx_broadcast.rs` | Queue, selection, and broadcast split |
 | `TxQueueLimiter.h` / `TxQueueLimiter.cpp` | `tx_queue_limiter.rs` | Resource-aware limiting |
-| `TxSetFrame.h` / `TxSetFrame.cpp` | `tx_queue.rs` (TransactionSet) | Simplified; no ApplicableTxSetFrame |
+| `TxSetFrame.h` / `TxSetFrame.cpp` | `tx_queue/tx_set.rs` | Simplified; no ApplicableTxSetFrame |
 | `TxSetUtils.h` / `TxSetUtils.cpp` | `tx_set_utils.rs` | Filtering and validation utilities |
 | `SurgePricingUtils.h` / `SurgePricingUtils.cpp` | `surge_pricing.rs` | Lane configs + priority queue |
 | `Upgrades.h` / `Upgrades.cpp` | `upgrades.rs` | Upgrade scheduling |
@@ -86,6 +86,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `resolveNodeID()` | _(not implemented)_ | None |
 | `setUpgrades()` | _(not implemented)_ | None |
 | `getUpgradesJson()` | _(not implemented)_ | None |
+| `setFilteredAccounts()` | _(not implemented)_ | None |
 | `forceSCPStateIntoSyncWithLastClosedLedger()` | `force_externalize()` | Full |
 | `makeStellarValue()` | `scp_driver.make_stellar_value()` | Full |
 | `getJsonInfo()` | `json_api.rs` structures | Partial |
@@ -152,6 +153,9 @@ Corresponds to: `HerderSCPDriver.h`
 | `getHashOf()` | `compute_hash_node()` | Full |
 | `combineCandidates()` | `combine_candidates()` | Full |
 | `valueExternalized()` | `record_externalized()` | Full |
+| `hasUpgrades()` | `has_upgrades()` | Full |
+| `stripAllUpgrades()` | `strip_all_upgrades()` | Full |
+| `getUpgradeNominationTimeoutLimit()` | `get_upgrade_nomination_timeout_limit()` | Partial |
 | `nominate()` | handled in Herder | Full |
 | `getQSet()` | `get_quorum_set_by_hash()` | Full |
 | `ballotDidHearFromQuorum()` | _(not implemented)_ | None |
@@ -194,7 +198,9 @@ Corresponds to: `HerderUtils.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
+| `toStellarValue()` | `ScpDriver::parse_stellar_value()` | Full |
 | `getTxSetHashes()` | `get_tx_set_hashes_from_envelope()` | Full |
+| `getValidatedTxSetHashes()` | _(not implemented)_ | None |
 | `getStellarValues()` | `get_stellar_values()` | Full |
 | `toShortString()` | `to_short_string()`, `to_short_strkey()` | Full |
 | `toQuorumIntersectionMap()` | _(not implemented)_ | None |
@@ -272,7 +278,7 @@ Corresponds to: `TransactionQueue.h`
 | `isBanned()` | `is_banned()` | Full |
 | `getTx()` | `get_tx()` | Full |
 | `getTransactions()` | `get_transactions()` | Full |
-| `sourceAccountPending()` | _(not implemented)_ | None |
+| `sourceAccountPending()` | `Herder::source_account_pending()` | Full |
 | `getMaxQueueSizeOps()` | via config | Full |
 | `findAllAssetPairsInvolvedInPaymentLoops()` | _(not implemented)_ | None |
 | `canAdd()` | logic in `try_add()` | Full |
@@ -432,7 +438,6 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `sourceAccountPending()` | Medium | Account-level pending check |
 | `findAllAssetPairsInvolvedInPaymentLoops()` | Low | Arbitrage flood damping; flooding optimization only, does not affect consensus correctness |
 | `allowTxBroadcast()` arb damping | Low | Classic queue arbitrage filtering; flooding optimization only |
 | `ApplicableTxSetFrame` abstraction | Low | Validation done inline in `tx_set.rs`; functionally equivalent |
@@ -446,12 +451,13 @@ Features not yet implemented. These ARE counted against parity %.
 | `wrapEnvelope()` / `wrapStellarValue()` / `wrapValue()` | Low | Value wrapper pattern |
 | Ballot phase callbacks (7 methods) | Low | Logging/metrics callbacks |
 | `getPrepareStart()` / SCPTiming | Low | Consensus timing tracking |
+| `getUpgradeNominationTimeoutLimit()` | Medium | Uses a hard-coded default instead of runtime upgrade parameters |
 | `syncMetrics()` | Low | Metrics synchronization |
 | `isNewerNominationOrBallotSt()` | Medium | Envelope dedup optimization |
 | `resolveNodeID()` | Low | Config-based node name lookup |
 | `setUpgrades()` / `getUpgradesJson()` | Medium | Admin API for upgrade scheduling |
+| `setFilteredAccounts()` | Medium | Runtime filtered-account override API missing |
 | `checkAndMaybeReanalyzeQuorumMap()` | Low | Background quorum analysis |
-| `persistUpgrades()` / `restoreUpgrades()` | Low | Upgrade parameters persisted via Serde; functionally equivalent |
 | `getMoreSCPState()` | Low | Peer SCP state request |
 | `recomputeKeysToFilter()` | Low | Soroban footprint filtering |
 | `getMaxQueueSizeSorobanOps()` | Low | Soroban queue sizing |
@@ -459,6 +465,7 @@ Features not yet implemented. These ARE counted against parity %.
 | PendingEnvelopes cost tracking (4 methods) | Low | Per-validator cost analysis |
 | `HerderPersistence::getNodeQuorumSet()` | Low | Node-level quorum set lookup |
 | `HerderPersistence::getQuorumSet()` | Low | Hash-based quorum set lookup |
+| `HerderUtils::getValidatedTxSetHashes()` | Low | No strict variant that errors on malformed envelope values |
 | `HerderUtils::toQuorumIntersectionMap()` | Low | Quorum map conversion |
 | `HerderUtils::parseQuorumMapFromJson()` | Low | JSON quorum map parsing |
 | `TxSetXDRFrame::makeFromHistoryTransactions()` | Low | History tx set construction |
@@ -511,27 +518,27 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| HerderTests | 34 TEST_CASE / 222 SECTION | 18 unit + 3 lib tests | Major gap in integration-level tests |
-| PendingEnvelopesTests | 1 TEST_CASE / 18 SECTION | 5 unit + 6 fetching tests | Moderate coverage |
-| QuorumIntersectionTests | 28 TEST_CASE / 14 SECTION | 0 tests | Not implemented |
+| HerderTests | 38 TEST_CASE / 277 SECTION | 61 `#[test]` | Broad unit coverage, limited end-to-end flow tests |
+| PendingEnvelopesTests | 1 TEST_CASE / 20 SECTION | 22 `#[test]` | Good unit coverage; missing cost-tracking parity |
+| QuorumIntersectionTests | 28 TEST_CASE / 0 SECTION | 0 tests | Not implemented |
 | QuorumTrackerTests | 2 TEST_CASE / 10 SECTION | 10 unit tests | Good coverage |
-| TransactionQueueTests | 18 TEST_CASE / 155 SECTION | 63 unit + 11 integration tests | Good unit coverage; missing integration scenarios |
-| TxSetTests | 10 TEST_CASE / 55 SECTION | 16 parallel_tx_set_builder tests | Partial; missing ApplicableTxSetFrame tests |
-| UpgradesTests | 31 TEST_CASE / 107 SECTION | 16 unit tests | Major gap; missing ledger-integrated tests |
+| TransactionQueueTests | 18 TEST_CASE / 157 SECTION | 112 `#[test]` | Strong unit coverage; missing arb-damping scenarios |
+| TxSetTests | 10 TEST_CASE / 66 SECTION | 83 `#[test]` | Strong unit coverage; missing ApplicableTxSetFrame parity |
+| UpgradesTests | 29 TEST_CASE / 109 SECTION | 20 `#[test]` | Major gap; missing ledger-integrated config-upgrade tests |
 
 ### Test Gaps
 
 - **HerderTests**: Missing integration tests for full envelope processing flow, ledger close lifecycle, out-of-sync recovery, quorum map reanalysis, and upgrade scheduling
-- **TransactionQueue**: Missing tests for arbitrage damping, queue rebuild, and separate classic/soroban queue behavior
-- **TxSet**: Missing `ApplicableTxSetFrame` validation tests, phase ordering tests, and `prepareForApply()` round-trip tests
-- **Upgrades**: Missing ledger-integrated upgrade application tests, config upgrade set tests, and multi-validator upgrade coordination tests
+- **TransactionQueue**: Missing tests for arbitrage damping, filtered-account overrides, and full rebroadcast behavior
+- **TxSet**: Missing `ApplicableTxSetFrame` validation tests, phase ordering tests, and history-tx-set construction tests
+- **Upgrades**: Missing ledger-integrated upgrade application tests, config upgrade set tests, and nomination-timeout stripping behavior
 - **QuorumIntersection**: Entirely missing (not implemented)
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 131 |
-| Gaps (None + Partial) | 39 |
+| Implemented (Full) | 135 |
+| Gaps (None + Partial) | 41 |
 | Intentional Omissions | 12 |
-| **Parity** | **131 / (131 + 39) = 77%** |
+| **Parity** | **135 / (135 + 41) = 77%** |

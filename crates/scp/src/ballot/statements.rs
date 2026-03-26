@@ -499,7 +499,7 @@ impl BallotProtocol {
         }
     }
 
-    pub(super) fn check_heard_from_quorum<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) {
+    pub(super) fn check_heard_from_quorum<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) {
         let current = match self.current_ballot.as_ref() {
             Some(ballot) => ballot.clone(),
             None => return,

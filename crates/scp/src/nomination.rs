@@ -262,9 +262,9 @@ impl NominationProtocol {
     ///
     /// # Returns
     /// True if nomination was updated.
-    pub(crate) fn nominate<'a, D: SCPDriver>(
+    pub(crate) fn nominate<D: SCPDriver>(
         &mut self,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
         value: Value,
         prev_value: &Value,
         timedout: bool,
@@ -305,7 +305,7 @@ impl NominationProtocol {
     }
 
     /// Adopt values from round leaders' nominations.
-    fn adopt_leader_values<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) -> bool {
+    fn adopt_leader_values<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) -> bool {
         let mut updated = false;
         for leader in self.round_leaders.clone() {
             let Some(env) = self.latest_nominations.get(&leader) else {
@@ -332,11 +332,7 @@ impl NominationProtocol {
     /// Handles upgrade timeout logic: if too many timeouts have occurred
     /// and all current votes contain upgrades, strips upgrades from our
     /// value before voting (stellar-core lines 597-651).
-    fn vote_as_leader<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-        value: &Value,
-    ) -> bool {
+    fn vote_as_leader<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>, value: &Value) -> bool {
         if !self.round_leaders.contains(ctx.local_node_id) {
             return false;
         }
@@ -380,10 +376,10 @@ impl NominationProtocol {
     ///
     /// # Returns
     /// The state of the envelope after processing.
-    pub(crate) fn process_envelope<'a, D: SCPDriver>(
+    pub(crate) fn process_envelope<D: SCPDriver>(
         &mut self,
         envelope: &ScpEnvelope,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> EnvelopeState {
         let node_id = &envelope.statement.node_id;
 
@@ -580,7 +576,7 @@ impl NominationProtocol {
     /// 3. AFTER processEnvelope returns, check `isNewerStatement` against
     ///    `mLastEnvelope` (which the recursive call may have already updated)
     /// 4. Only set `mLastEnvelope` and emit if still newer
-    fn emit_nomination<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) {
+    fn emit_nomination<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) {
         let votes = Self::sorted_values(&self.votes);
         let accepted = Self::sorted_values(&self.accepted);
         let nomination = ScpNomination {
@@ -866,11 +862,7 @@ impl NominationProtocol {
         driver.compute_value_hash(slot_index, prev, self.round, value)
     }
 
-    fn update_round_leaders<'a, D: SCPDriver>(
-        &mut self,
-        ctx: &SlotContext<'a, D>,
-        prev_value: &Value,
-    ) {
+    fn update_round_leaders<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>, prev_value: &Value) {
         // stellar-core normalizes the quorum set, removing self and adjusting thresholds.
         // This ensures weight calculations and leader selection match stellar-core.
         let mut normalized_qs = ctx.local_quorum_set.clone();

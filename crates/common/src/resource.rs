@@ -326,20 +326,13 @@ impl ResourceType {
 /// assert_eq!(scaled.get_val(henyey_common::resource::ResourceType::Operations), 150);
 /// ```
 pub fn multiply_by_double(res: &Resource, m: f64) -> Resource {
-    let values: Vec<i64> = res
-        .values
-        .iter()
-        .map(|&v| {
-            let result = (v as f64) * m;
-            assert!(result >= 0.0, "multiply_by_double: negative result");
-            assert!(
-                is_representable_as_i64(result),
-                "multiply_by_double: result not representable as i64"
-            );
-            result as i64
-        })
-        .collect();
-    Resource::new(values)
+    scale_by_double(res, m, |result| {
+        assert!(
+            is_representable_as_i64(result),
+            "multiply_by_double: result not representable as i64"
+        );
+        result as i64
+    })
 }
 
 /// Multiplies each dimension of a resource by a double, saturating at i64::MAX.
@@ -361,20 +354,23 @@ pub fn multiply_by_double(res: &Resource, m: f64) -> Resource {
 /// // First dimension saturates to i64::MAX
 /// ```
 pub fn saturated_multiply_by_double(res: &Resource, m: f64) -> Resource {
+    scale_by_double(res, m, |result| {
+        if is_representable_as_i64(result) {
+            result as i64
+        } else {
+            i64::MAX
+        }
+    })
+}
+
+fn scale_by_double(res: &Resource, multiplier: f64, convert: impl Fn(f64) -> i64) -> Resource {
     let values: Vec<i64> = res
         .values
         .iter()
         .map(|&v| {
-            let result = (v as f64) * m;
-            assert!(
-                result >= 0.0,
-                "saturated_multiply_by_double: negative result"
-            );
-            if is_representable_as_i64(result) {
-                result as i64
-            } else {
-                i64::MAX
-            }
+            let result = (v as f64) * multiplier;
+            assert!(result >= 0.0, "scale_by_double: negative result");
+            convert(result)
         })
         .collect();
     Resource::new(values)

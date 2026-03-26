@@ -40,80 +40,69 @@ impl SqliteScpPersistence {
         format!("database error: {}", e)
     }
 
+    fn with_connection<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Connection) -> Result<T, DbError>,
+    ) -> Result<T, String> {
+        self.db.with_connection(f).map_err(Self::map_error)
+    }
+
     /// Save SCP state for a slot.
     pub fn save_scp_state(&self, slot: u64, state_json: &str) -> Result<(), String> {
-        self.db
-            .with_connection(|conn| {
-                conn.save_scp_slot_state(slot, state_json)?;
-                Ok(())
-            })
-            .map_err(Self::map_error)
+        self.with_connection(|conn| {
+            conn.save_scp_slot_state(slot, state_json)?;
+            Ok(())
+        })
     }
 
     /// Load SCP state for a slot.
     pub fn load_scp_state(&self, slot: u64) -> Result<Option<String>, String> {
-        self.db
-            .with_connection(|conn| conn.load_scp_slot_state(slot))
-            .map_err(Self::map_error)
+        self.with_connection(|conn| conn.load_scp_slot_state(slot))
     }
 
     /// Load SCP state for all slots.
     pub fn load_all_scp_states(&self) -> Result<Vec<(u64, String)>, String> {
-        self.db
-            .with_connection(|conn| conn.load_all_scp_slot_states())
-            .map_err(Self::map_error)
+        self.with_connection(|conn| conn.load_all_scp_slot_states())
     }
 
     /// Delete SCP state for slots below the given threshold.
     pub fn delete_scp_state_below(&self, slot: u64) -> Result<(), String> {
-        self.db
-            .with_connection(|conn| {
-                conn.delete_scp_slot_states_below(slot)?;
-                debug!("Deleted SCP state below slot {}", slot);
-                Ok(())
-            })
-            .map_err(Self::map_error)
+        self.with_connection(|conn| {
+            conn.delete_scp_slot_states_below(slot)?;
+            debug!("Deleted SCP state below slot {}", slot);
+            Ok(())
+        })
     }
 
     /// Save a transaction set.
     pub fn save_tx_set(&self, hash: &Hash, tx_set: &[u8]) -> Result<(), String> {
-        self.db
-            .with_connection(|conn| {
-                conn.save_tx_set_data(hash, tx_set)?;
-                Ok(())
-            })
-            .map_err(Self::map_error)
+        self.with_connection(|conn| {
+            conn.save_tx_set_data(hash, tx_set)?;
+            Ok(())
+        })
     }
 
     /// Load a transaction set.
     pub fn load_tx_set(&self, hash: &Hash) -> Result<Option<Vec<u8>>, String> {
-        self.db
-            .with_connection(|conn| conn.load_tx_set_data(hash))
-            .map_err(Self::map_error)
+        self.with_connection(|conn| conn.load_tx_set_data(hash))
     }
 
     /// Load all transaction sets.
     pub fn load_all_tx_sets(&self) -> Result<Vec<(Hash, Vec<u8>)>, String> {
-        self.db
-            .with_connection(|conn| conn.load_all_tx_set_data())
-            .map_err(Self::map_error)
+        self.with_connection(|conn| conn.load_all_tx_set_data())
     }
 
     /// Check if a transaction set exists.
     pub fn has_tx_set(&self, hash: &Hash) -> Result<bool, String> {
-        self.db
-            .with_connection(|conn| conn.has_tx_set_data(hash))
-            .map_err(Self::map_error)
+        self.with_connection(|conn| conn.has_tx_set_data(hash))
     }
 
     /// Delete transaction sets for slots below the given threshold.
     pub fn delete_tx_sets_below(&self, slot: u64) -> Result<(), String> {
-        self.db
-            .with_connection(|conn| {
-                conn.delete_old_tx_set_data(slot)?;
-                Ok(())
-            })
-            .map_err(Self::map_error)
+        self.with_connection(|conn| {
+            conn.delete_old_tx_set_data(slot)?;
+            Ok(())
+        })
     }
 }
 

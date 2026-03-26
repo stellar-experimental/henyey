@@ -9,7 +9,9 @@ use futures::stream::BoxStream;
 pub trait Clock: Send + Sync + 'static {
     fn now(&self) -> Instant;
 
-    fn system_now(&self) -> SystemTime;
+    fn system_now(&self) -> SystemTime {
+        SystemTime::now()
+    }
 
     fn sleep(&self, duration: Duration) -> BoxFuture<'static, ()> {
         Box::pin(tokio::time::sleep(duration))
@@ -31,10 +33,6 @@ pub struct RealClock;
 impl Clock for RealClock {
     fn now(&self) -> Instant {
         Instant::now()
-    }
-
-    fn system_now(&self) -> SystemTime {
-        SystemTime::now()
     }
 }
 
@@ -60,10 +58,6 @@ impl VirtualClock {
 impl Clock for VirtualClock {
     fn now(&self) -> Instant {
         self.base_instant + self.base_instant.elapsed()
-    }
-
-    fn system_now(&self) -> SystemTime {
-        SystemTime::now()
     }
 }
 

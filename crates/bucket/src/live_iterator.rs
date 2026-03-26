@@ -197,7 +197,7 @@ impl<'a> LiveEntriesIterator<'a> {
     }
 }
 
-impl<'a> Iterator for LiveEntriesIterator<'a> {
+impl Iterator for LiveEntriesIterator<'_> {
     type Item = Result<LedgerEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {

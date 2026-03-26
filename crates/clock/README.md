@@ -1,110 +1,99 @@
 # henyey-clock
 
-Clock abstractions for monotonic timing, async sleep, and periodic intervals.
+Clock abstractions for monotonic time, wall-clock reads, and async timer primitives.
 
 ## Overview
 
-`henyey-clock` provides a `Clock` trait and two concrete implementations that
-decouple timing-sensitive logic from direct wall-clock calls. By injecting a
-clock into higher-level components (`henyey-app`, `henyey-simulation`), the
-system can run against real time in production or against a controllable virtual
-clock in simulation and test harnesses. The crate corresponds to the
-`VirtualClock` facility in stellar-core's `src/util/Timer.h`.
+`henyey-clock` is a tiny utility crate that lets higher-level components depend on a
+clock interface instead of calling `Instant::now()` or `tokio::time` directly. It is
+used by crates such as `henyey-app` for runtime injection and by `henyey-simulation`
+when wiring simulated nodes. The crate is the closest Rust equivalent to
+stellar-core's `VirtualClock` API in `src/util/Timer.h`, but it intentionally only
+models timing operations, not the upstream event-loop and scheduler machinery.
 
 ## Architecture
 
 ```mermaid
 graph TD
-    T["Clock trait"]
-    R["RealClock"]
-    V["VirtualClock"]
-    A["henyey-app"]
-    S["henyey-simulation"]
-
-    R -->|implements| T
-    V -->|implements| T
-    A -->|Arc&lt;dyn Clock&gt;| T
-    S -->|VirtualClock| V
-    S -->|RealClock| R
+    A["henyey-app"] --> T["Clock trait"]
+    S["henyey-simulation"] --> T
+    R["RealClock"] -->|implements| T
+    V["VirtualClock"] -->|implements| T
+    T --> N["now() -> Instant"]
+    T --> W["system_now() -> SystemTime"]
+    T --> K["sleep()/interval()"]
+    K --> O["tokio::time"]
 ```
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `Clock` | Trait providing `now`, `system_now`, `sleep`, and `interval` |
-| `RealClock` | Production implementation backed by `std::time::Instant` and `tokio::time` |
-| `VirtualClock` | Simulation clock with a configurable base instant for controlled time progression |
+| `Clock` | Object-safe trait for monotonic time, system time, sleeps, and interval streams |
+| `RealClock` | Zero-sized production clock that reads `Instant::now()` directly |
+| `VirtualClock` | Clock that anchors `now()` to a stored base `Instant` while still advancing with elapsed real time |
 
 ## Usage
 
-### Basic production clock
-
 ```rust
 use henyey_clock::{Clock, RealClock};
-use std::time::Duration;
 
 let clock = RealClock;
-let t1 = clock.now();
-// ... do work ...
-let elapsed = t1.elapsed();
+let started = clock.now();
+let wall_time = clock.system_now();
+
+assert!(clock.now() >= started);
+let _ = wall_time;
 ```
 
-### Async sleep and interval
-
 ```rust
-use henyey_clock::{Clock, RealClock};
-use std::time::Duration;
 use futures::StreamExt;
+use henyey_clock::{Clock, RealClock};
+use std::time::Duration;
 
+# async fn example() {
 let clock = RealClock;
 
-// One-shot sleep
-clock.sleep(Duration::from_secs(1)).await;
+clock.sleep(Duration::from_millis(10)).await;
 
-// Periodic interval
-let mut ticks = clock.interval(Duration::from_millis(500));
-while let Some(()) = ticks.next().await {
-    // runs every 500ms
-}
+let mut ticks = clock.interval(Duration::from_secs(1));
+ticks.next().await;
+# }
 ```
-
-### Virtual clock for simulation
 
 ```rust
 use henyey_clock::{Clock, VirtualClock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-let mut clock = VirtualClock::new();
-// Shift the base instant to simulate time having passed
-clock.set_base_instant(Instant::now() - Duration::from_secs(60));
-let now = clock.now(); // reflects the shifted base
+fn elapsed_since<C: Clock>(clock: &C, start: Instant) -> Duration {
+    clock.now().saturating_duration_since(start)
+}
+
+let clock = VirtualClock::new();
+let start = clock.now();
+let _elapsed = elapsed_since(&clock, start);
+
+let _shared: Arc<dyn Clock> = Arc::new(clock);
 ```
 
 ## Module Layout
 
 | Module | Description |
 |--------|-------------|
-| `lib.rs` | `Clock` trait definition, `RealClock` and `VirtualClock` implementations, unit tests |
+| `src/lib.rs` | Defines the `Clock` trait, implements `RealClock` and `VirtualClock`, and contains unit tests for the exposed API |
 
 ## Design Notes
 
-- `VirtualClock::now()` computes time as `base_instant + base_instant.elapsed()`.
-  This means it still advances with real wall-clock time but from a shifted
-  origin. It does **not** freeze time — callers that need a frozen instant should
-  capture the return value of `now()`.
-- `sleep` and `interval` have default implementations on the trait that delegate
-  to `tokio::time`, so all implementors get async timing for free.
-- The crate deliberately avoids interior mutability; `set_base_instant` takes
-  `&mut self`, keeping clock mutation explicit and visible at the call site.
+- `sleep` and `interval` live as default trait methods, so new clock implementations only need to supply `now()` unless they need custom async timing behavior.
+- `VirtualClock` is not a manually stepped simulator clock; `now()` is derived from its stored base instant plus elapsed time, so it continues to advance after construction.
+- Real-time and virtual-time modes are split into separate Rust types instead of a single runtime mode enum, which keeps injection simple for `Arc<dyn Clock>` consumers.
 
 ## stellar-core Mapping
 
 | Rust | stellar-core |
 |------|--------------|
-| `Clock` trait | `VirtualClock` class (`src/util/Timer.h`) — the trait captures the timing interface that stellar-core's `VirtualClock` exposes |
-| `RealClock` | `VirtualClock` in `REAL_TIME` mode |
-| `VirtualClock` | `VirtualClock` in `VIRTUAL_TIME` mode |
+| `src/lib.rs` | `src/util/Timer.h`, `src/util/Timer.cpp` |
 
 ## Parity Status
 

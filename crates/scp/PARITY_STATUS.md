@@ -2,24 +2,24 @@
 
 **Crate**: `henyey-scp`
 **Upstream**: `stellar-core/src/scp/`
-**Overall Parity**: 100%
-**Last Updated**: 2026-03-17
+**Overall Parity**: 93%
+**Last Updated**: 2026-03-25
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
-| Ballot Protocol | Full | Complete state machine with all transitions |
-| Nomination Protocol | Full | Round leaders, priority, composite candidates |
+| Ballot Protocol | Partial | Core protocol complete; reporting helpers still diverge |
+| Nomination Protocol | Partial | Core protocol complete; node-state reporting is simpler |
 | Quorum Operations | Full | isQuorum, isVBlocking, findClosestVBlocking |
 | Quorum Set Validation | Full | Sanity checks, normalization, nesting limits |
-| SCP Coordinator | Full | Slot management, envelope routing, purging |
-| Slot Management | Full | Per-slot state, envelope processing, recovery |
-| SCPDriver Trait | Full | All callbacks mapped to trait methods |
+| SCP Coordinator | Partial | Reporting and range-based purge API differ |
+| Slot Management | Partial | Historical statement reporting is reduced |
+| SCPDriver Trait | Partial | `acceptedCommit()` callback not exposed |
 | Federated Agreement | Full | federatedAccept, federatedRatify |
 | State Recovery | Full | setStateFromEnvelope for crash recovery |
 | Timer Support | Full | Nomination and ballot timers |
-| JSON/Info Reporting | Full | Serde-based structured info types |
+| JSON/Info Reporting | Partial | Slot-centric serde output, fewer upstream knobs |
 | Statement Ordering | Full | Newer-statement comparisons for all types |
 | Display Formatting | Full | Node, ballot, envelope string formatting |
 
@@ -52,10 +52,10 @@ Corresponds to: `SCP.h`
 | `getLocalQuorumSet()` | `local_quorum_set()` | Full |
 | `getLocalNodeID()` | `local_node_id()` | Full |
 | `getLocalNode()` | Embedded in SCP struct | Full |
-| `getJsonInfo()` | `get_info()`, `get_all_slot_info()` | Full |
-| `getJsonQuorumInfo()` | `get_quorum_info()`, `get_quorum_info_for_node()` | Full |
-| `getMissingNodes()` | `get_missing_nodes()` | Full |
-| `purgeSlots()` | `purge_slots()` | Full |
+| `getJsonInfo()` | `get_info()`, `get_all_slot_info()` | Partial |
+| `getJsonQuorumInfo()` | `get_quorum_info()`, `get_quorum_info_for_node()` | Partial |
+| `getMissingNodes()` | `get_missing_nodes()` | Partial |
+| `purgeSlotsOutsideRange()` | `purge_slots()` | Partial |
 | `isValidator()` | `is_validator()` | Full |
 | `isSlotFullyValidated()` | `is_slot_fully_validated()` | Full |
 | `gotVBlocking()` | `got_v_blocking()` | Full |
@@ -95,7 +95,7 @@ Corresponds to: `Slot.h`
 | `getLatestMessage()` | `get_latest_envelope()` | Full |
 | `isNewerNominationOrBallotSt()` | Via `compare::is_newer_nomination_or_ballot_st()` | Full |
 | `getExternalizingState()` | `get_externalizing_state()` | Full |
-| `recordStatement()` | `record_statement()` | Full |
+| `recordStatement()` | Envelope history only | Partial |
 | `processEnvelope()` | `process_envelope()` | Full |
 | `abandonBallot()` | `abandon_ballot()` | Full |
 | `bumpState()` | `bump_state()`, `force_bump_state()` | Full |
@@ -107,8 +107,8 @@ Corresponds to: `Slot.h`
 | `getStatementCount()` | `get_statement_count()` | Full |
 | `gotVBlocking()` | `got_v_blocking()` | Full |
 | `getJsonInfo()` | `get_info()` | Full |
-| `getJsonQuorumInfo()` | `get_quorum_info()` | Full |
-| `getState()` | `get_node_state()`, `get_all_node_states()` | Full |
+| `getJsonQuorumInfo()` | `get_quorum_info()` | Partial |
+| `getState()` | `get_node_state()`, `get_all_node_states()` | Partial |
 | `getCompanionQuorumSetHashFromStatement()` | `get_companion_quorum_set_hash()` | Full |
 | `getStatementValues()` | `get_statement_values()` | Full |
 | `getQuorumSetFromStatement()` | Via driver callback | Full |
@@ -134,8 +134,8 @@ Corresponds to: `BallotProtocol.h`
 | `bumpState(Value, uint32)` | `bump_state()` / `bump_to_counter()` | Full |
 | `getJsonInfo()` | `get_info()` | Full |
 | `getState()` | `get_node_state()` | Full |
-| `getJsonQuorumInfo()` | Via Slot-level `get_quorum_info()` | Full |
-| `getCompanionQuorumSetHashFromStatement()` | `get_companion_quorum_set_hash()` | Full |
+| `getJsonQuorumInfo()` | Via Slot-level `get_quorum_info()` | Partial |
+| `getCompanionQuorumSetHashFromStatement()` | None | None |
 | `getWorkingBallot()` | `get_working_ballot()` | Full |
 | `getLastMessageSend()` | `get_last_envelope()` | Full |
 | `setStateFromEnvelope()` | `set_state_from_envelope()` | Full |
@@ -201,7 +201,7 @@ Corresponds to: `NominationProtocol.h`
 | `getLeaders()` | `get_round_leaders()` | Full |
 | `getLatestCompositeCandidate()` | `latest_composite()` | Full |
 | `getJsonInfo()` | `get_info()` | Full |
-| `getState()` | `get_node_state()` | Full |
+| `getState()` | `get_node_state()` | Partial |
 | `getLastMessageSend()` | `get_last_message_send()` | Full |
 | `setStateFromEnvelope()` | `set_state_from_envelope()` | Full |
 | `processCurrentState()` | `process_current_state()` | Full |
@@ -280,7 +280,7 @@ Corresponds to: `SCPDriver.h`
 | `startedBallotProtocol()` | `started_ballot_protocol()` | Full |
 | `acceptedBallotPrepared()` | `accepted_ballot_prepared()` | Full |
 | `confirmedBallotPrepared()` | `confirmed_ballot_prepared()` | Full |
-| `acceptedCommit()` | `accepted_commit()` | Full |
+| `acceptedCommit()` | None | None |
 | `ballotDidHearFromQuorum()` | `ballot_did_hear_from_quorum()` | Full |
 | `ValidationLevel` enum | `ValidationLevel` enum | Full |
 | `hashHelper()` (private) | Inlined in `compute_hash_node()` / `compute_value_hash()` | Full |
@@ -338,7 +338,17 @@ Features excluded by design. These are NOT counted against parity %.
 
 ## Gaps
 
-No known gaps.
+| stellar-core Component | Priority | Notes |
+|------------------------|----------|-------|
+| `SCP::getJsonInfo()` | Medium | No aggregate `limit` / `fullKeys` API; Rust reports per-slot structs |
+| `SCP::getJsonQuorumInfo()` | Medium | No upstream-style `summary` / `fullKeys` / latest-slot form |
+| `SCP::getMissingNodes()` | Medium | Rust only reports against the local quorum set for an explicit slot |
+| `SCP::purgeSlotsOutsideRange()` | Medium | Only max-bound purging is exposed |
+| `Slot::recordStatement()` | Low | Historical statements lack timestamp / validated metadata |
+| `Slot::getJsonQuorumInfo()`, `Slot::getState()`, `NominationProtocol::getState()` | Medium | Node-state reporting is simpler than upstream's quorum diagnostics |
+| `BallotProtocol::getJsonQuorumInfo()` | Low | Only slot-level quorum reporting exists |
+| `BallotProtocol::getCompanionQuorumSetHashFromStatement()` | Low | Helper is not exposed as a public Rust API |
+| `SCPDriver::acceptedCommit()` | Low | No callback when a commit is accepted |
 
 ## Architectural Differences
 
@@ -358,14 +368,19 @@ No known gaps.
    - **Rationale**: Rust's ownership model and `Clone` trait handle value lifetimes without wrapper indirection. The performance cost of cloning XDR values is negligible compared to consensus round-trip times.
 
 4. **JSON reporting via serde**
-   - **stellar-core**: Uses `jsoncpp` library with manual `Json::Value` construction.
-   - **Rust**: Uses serde-derived structs (`SlotInfo`, `BallotInfo`, `NominationInfo`, `QuorumInfo`) with `#[derive(Serialize)]`.
-   - **Rationale**: Type-safe serialization with compile-time guarantees. Same semantic content with slightly different formatting.
+   - **stellar-core**: Exposes aggregate and node-targeted `Json::Value` helpers with `summary`, `fullKeys`, and latest-slot defaults.
+   - **Rust**: Uses serde-derived structs (`SlotInfo`, `BallotInfo`, `NominationInfo`, `QuorumInfo`) and separate slot/node accessors.
+   - **Rationale**: Type-safe serialization is simpler to maintain, but the surface is not yet API-compatible with upstream diagnostics.
 
 5. **Error handling**
    - **stellar-core**: Uses `releaseAssert()` for invariant violations and return values for flow control.
    - **Rust**: Uses `Result` types, `Option`, and `tracing` for error reporting. Invariant violations are logged rather than panicking.
    - **Rationale**: Graceful degradation instead of process abort. Allows the node to continue operating even if a single slot encounters an anomaly.
+
+6. **Historical slot reporting**
+   - **stellar-core**: Tracks `HistoricalStatement` records with timestamps and validation markers for debug output.
+   - **Rust**: Stores received envelopes per node and derives info views from current protocol state.
+   - **Rationale**: Keeps slot state smaller and consensus-focused, but leaves some upstream debug detail unimplemented.
 
 ## Test Coverage
 
@@ -392,13 +407,13 @@ No known gaps.
 
 ### Test Gaps
 
-No significant test gaps. The Rust test suite exceeds the upstream test count and covers all major protocol areas. The upstream `SCPTests.cpp` uses deeply nested SECTION blocks within TEST_CASE macros (165 SECTIONs in one file), while the Rust tests use flat `#[test]` functions with more granular coverage.
+No major consensus-algorithm test gaps are apparent. Remaining parity gaps are concentrated in reporting / helper APIs rather than the nomination or ballot state machines.
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 164 |
-| Gaps (None + Partial) | 0 |
+| Implemented (Full) | 153 |
+| Gaps (None + Partial) | 11 |
 | Intentional Omissions | 12 |
-| **Parity** | **164 / (164 + 0) = 100%** |
+| **Parity** | **153 / (153 + 11) = 93%** |

@@ -424,6 +424,59 @@ impl FlowControl {
             && state.byte_capacity.has_outbound_capacity(msg)
     }
 
+    fn peer_label(state: &FlowControlState) -> String {
+        state
+            .peer_id
+            .as_ref()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    fn enqueue_message_resources(
+        state: &mut FlowControlState,
+        msg: &StellarMessage,
+        tx_queue_byte_limit: usize,
+    ) -> bool {
+        match msg {
+            StellarMessage::Transaction(_) => {
+                let bytes = state.byte_capacity.get_msg_resource_count(msg) as usize;
+                if bytes > tx_queue_byte_limit {
+                    return false;
+                }
+                state.tx_queue_byte_count += bytes;
+            }
+            StellarMessage::FloodDemand(demand) => {
+                state.demand_queue_tx_hash_count += demand.tx_hashes.len();
+            }
+            StellarMessage::FloodAdvert(advert) => {
+                state.advert_queue_tx_hash_count += advert.tx_hashes.len();
+            }
+            _ => {}
+        }
+
+        true
+    }
+
+    fn dequeue_message_resources(state: &mut FlowControlState, msg: &StellarMessage) {
+        match msg {
+            StellarMessage::Transaction(_) => {
+                let bytes = state.byte_capacity.get_msg_resource_count(msg) as usize;
+                state.tx_queue_byte_count = state.tx_queue_byte_count.saturating_sub(bytes);
+            }
+            StellarMessage::FloodDemand(demand) => {
+                state.demand_queue_tx_hash_count = state
+                    .demand_queue_tx_hash_count
+                    .saturating_sub(demand.tx_hashes.len());
+            }
+            StellarMessage::FloodAdvert(advert) => {
+                state.advert_queue_tx_hash_count = state
+                    .advert_queue_tx_hash_count
+                    .saturating_sub(advert.tx_hashes.len());
+            }
+            _ => {}
+        }
+    }
+
     /// Release outbound capacity when receiving SEND_MORE_EXTENDED.
     pub fn maybe_release_capacity(&self, msg: &StellarMessage) {
         if let StellarMessage::SendMoreExtended(send_more) = msg {
@@ -470,23 +523,12 @@ impl FlowControl {
         let mut state = self.state.lock().unwrap();
         let queue_idx = priority as usize;
 
-        // Track resource counts
-        match &msg {
-            StellarMessage::Transaction(_) => {
-                let bytes = state.byte_capacity.get_msg_resource_count(&msg) as usize;
-                // Don't accept oversized transactions
-                if bytes > self.config.outbound_tx_queue_byte_limit {
-                    return;
-                }
-                state.tx_queue_byte_count += bytes;
-            }
-            StellarMessage::FloodDemand(demand) => {
-                state.demand_queue_tx_hash_count += demand.tx_hashes.len();
-            }
-            StellarMessage::FloodAdvert(advert) => {
-                state.advert_queue_tx_hash_count += advert.tx_hashes.len();
-            }
-            _ => {}
+        if !Self::enqueue_message_resources(
+            &mut state,
+            &msg,
+            self.config.outbound_tx_queue_byte_limit,
+        ) {
+            return;
         }
 
         // Add to queue
@@ -543,11 +585,7 @@ impl FlowControl {
         }
 
         if dropped > 0 {
-            let peer_str = state
-                .peer_id
-                .as_ref()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+            let peer_str = Self::peer_label(&state);
             trace!(
                 "Dropped {} {:?} messages to peer {}",
                 dropped,
@@ -710,24 +748,7 @@ impl FlowControl {
                     continue;
                 }
 
-                // Update resource counts
-                match msg {
-                    StellarMessage::Transaction(_) => {
-                        let bytes = state.byte_capacity.get_msg_resource_count(msg) as usize;
-                        state.tx_queue_byte_count = state.tx_queue_byte_count.saturating_sub(bytes);
-                    }
-                    StellarMessage::FloodDemand(demand) => {
-                        state.demand_queue_tx_hash_count = state
-                            .demand_queue_tx_hash_count
-                            .saturating_sub(demand.tx_hashes.len());
-                    }
-                    StellarMessage::FloodAdvert(advert) => {
-                        state.advert_queue_tx_hash_count = state
-                            .advert_queue_tx_hash_count
-                            .saturating_sub(advert.tx_hashes.len());
-                    }
-                    _ => {}
-                }
+                Self::dequeue_message_resources(&mut state, msg);
 
                 state.outbound_queues[queue_idx].pop_front();
             }
@@ -830,11 +851,7 @@ impl FlowControl {
     pub fn maybe_throttle_read(&self) -> bool {
         let mut state = self.state.lock().unwrap();
         if !state.message_capacity.can_read() || !state.byte_capacity.can_read() {
-            let peer_str = state
-                .peer_id
-                .as_ref()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+            let peer_str = Self::peer_label(&state);
             debug!("Throttle reading from peer {}", peer_str);
             state.last_throttle = Some(Instant::now());
             true
@@ -847,11 +864,7 @@ impl FlowControl {
     pub fn stop_throttling(&self) -> Option<std::time::Duration> {
         let mut state = self.state.lock().unwrap();
         if let Some(throttle_time) = state.last_throttle.take() {
-            let peer_str = state
-                .peer_id
-                .as_ref()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
+            let peer_str = Self::peer_label(&state);
             let duration = throttle_time.elapsed();
             debug!(
                 "Stop throttling reading from peer {}, was throttled for {:?}",

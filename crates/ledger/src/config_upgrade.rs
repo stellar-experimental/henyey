@@ -579,7 +579,6 @@ impl ConfigUpgradeSetFrame {
     ///
     /// Matches stellar-core `SorobanNetworkConfig::isValidConfigSettingEntry` from
     /// NetworkConfig.cpp.
-    #[allow(clippy::absurd_extreme_comparisons)]
     fn is_valid_config_setting_entry(entry: &ConfigSettingEntry, ledger_version: u32) -> bool {
         match entry {
             ConfigSettingEntry::ContractMaxSizeBytes(v) => *v >= min_config::MAX_CONTRACT_SIZE,
@@ -637,10 +636,8 @@ impl ConfigUpgradeSetFrame {
                         >= min_config::MINIMUM_PERSISTENT_ENTRY_LIFETIME
                     && archival.persistent_rent_rate_denominator > 0
                     && archival.temp_rent_rate_denominator > 0
-                    && archival.max_entries_to_archive >= min_config::MAX_ENTRIES_TO_ARCHIVE
                     && archival.live_soroban_state_size_window_sample_size
                         >= min_config::BUCKETLIST_SIZE_WINDOW_SAMPLE_SIZE
-                    && archival.eviction_scan_size >= min_config::EVICTION_SCAN_SIZE
                     && archival.starting_eviction_scan_level
                         >= min_config::STARTING_EVICTION_LEVEL
                     && archival.starting_eviction_scan_level < 12 // kNumLevels

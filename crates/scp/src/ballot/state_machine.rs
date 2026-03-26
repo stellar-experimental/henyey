@@ -7,10 +7,10 @@ use super::*;
 
 impl BallotProtocol {
     /// Try to advance the slot state based on received messages.
-    pub(super) fn advance_slot<'a, D: SCPDriver>(
+    pub(super) fn advance_slot<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> EnvelopeState {
         self.current_message_level = self.current_message_level.saturating_add(1);
         if self.current_message_level >= MAX_PROTOCOL_TRANSITIONS {
@@ -45,10 +45,10 @@ impl BallotProtocol {
         }
     }
 
-    fn attempt_accept_prepared<'a, D: SCPDriver>(
+    fn attempt_accept_prepared<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         if !matches!(self.phase, BallotPhase::Prepare | BallotPhase::Confirm) {
             return false;
@@ -98,10 +98,10 @@ impl BallotProtocol {
         false
     }
 
-    fn set_accept_prepared<'a, D: SCPDriver>(
+    fn set_accept_prepared<D: SCPDriver>(
         &mut self,
         ballot: ScpBallot,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         let mut did_work = self.set_prepared(ballot.clone(), ctx.driver, ctx.slot_index);
 
@@ -132,10 +132,10 @@ impl BallotProtocol {
         did_work
     }
 
-    fn attempt_confirm_prepared<'a, D: SCPDriver>(
+    fn attempt_confirm_prepared<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         if self.phase != BallotPhase::Prepare {
             return false;
@@ -157,10 +157,10 @@ impl BallotProtocol {
     }
 
     /// Find the highest ballot that a quorum has confirmed prepared.
-    fn find_highest_confirmed_prepared<'a, D: SCPDriver>(
+    fn find_highest_confirmed_prepared<D: SCPDriver>(
         &self,
         candidates: &[ScpBallot],
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> Option<(ScpBallot, usize)> {
         for (idx, ballot) in candidates.iter().enumerate().rev() {
             if let Some(high) = &self.high_ballot {
@@ -182,12 +182,12 @@ impl BallotProtocol {
     }
 
     /// Find the lowest commit ballot among candidates up to new_h.
-    fn find_lowest_commit_ballot<'a, D: SCPDriver>(
+    fn find_lowest_commit_ballot<D: SCPDriver>(
         &self,
         candidates: &[ScpBallot],
         new_h_ballot: &ScpBallot,
         new_h_index: usize,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> ScpBallot {
         let mut new_c = ScpBallot {
             counter: 0,
@@ -235,11 +235,11 @@ impl BallotProtocol {
         new_c
     }
 
-    fn set_confirm_prepared<'a, D: SCPDriver>(
+    fn set_confirm_prepared<D: SCPDriver>(
         &mut self,
         new_c: ScpBallot,
         new_h: ScpBallot,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         let mut did_work = false;
         self.value_override = Some(new_h.value.clone());
@@ -274,10 +274,10 @@ impl BallotProtocol {
         did_work
     }
 
-    fn attempt_accept_commit<'a, D: SCPDriver>(
+    fn attempt_accept_commit<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         if !matches!(self.phase, BallotPhase::Prepare | BallotPhase::Confirm) {
             return false;
@@ -331,11 +331,11 @@ impl BallotProtocol {
         false
     }
 
-    fn set_accept_commit<'a, D: SCPDriver>(
+    fn set_accept_commit<D: SCPDriver>(
         &mut self,
         c: ScpBallot,
         h: ScpBallot,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         let mut did_work = false;
         self.value_override = Some(h.value.clone());
@@ -375,10 +375,10 @@ impl BallotProtocol {
         did_work
     }
 
-    fn attempt_confirm_commit<'a, D: SCPDriver>(
+    fn attempt_confirm_commit<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         if self.phase != BallotPhase::Confirm {
             return false;
@@ -420,11 +420,11 @@ impl BallotProtocol {
         self.set_confirm_commit(c, h, ctx)
     }
 
-    pub(super) fn set_confirm_commit<'a, D: SCPDriver>(
+    pub(super) fn set_confirm_commit<D: SCPDriver>(
         &mut self,
         c: ScpBallot,
         h: ScpBallot,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         self.commit = Some(c.clone());
         self.high_ballot = Some(h.clone());
@@ -441,7 +441,7 @@ impl BallotProtocol {
         true
     }
 
-    fn attempt_bump<'a, D: SCPDriver>(&mut self, ctx: &SlotContext<'a, D>) -> bool {
+    fn attempt_bump<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) -> bool {
         if !matches!(self.phase, BallotPhase::Prepare | BallotPhase::Confirm) {
             return false;
         }
@@ -483,10 +483,10 @@ impl BallotProtocol {
     /// Matches stellar-core `abandonBallot(n)` which checks `mSlot.getLatestCompositeCandidate()`
     /// first, then falls back to `mCurrentBallot->value`, then calls `bumpState(value, n)`.
     /// This properly emits envelopes and checks heard-from-quorum (via `bump_state`).
-    pub(crate) fn abandon_ballot<'a, D: SCPDriver>(
+    pub(crate) fn abandon_ballot<D: SCPDriver>(
         &mut self,
         counter: u32,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         // stellar-core priority: composite candidate first, then current ballot value
         let value = self

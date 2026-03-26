@@ -3,7 +3,7 @@
 **Crate**: `henyey-tx`
 **Upstream**: `stellar-core/src/transactions/`
 **Overall Parity**: 97%
-**Last Updated**: 2026-03-17
+**Last Updated**: 2026-03-26
 
 ## Summary
 
@@ -22,7 +22,7 @@
 | Sponsorship Utils | Full | Inline in state.rs |
 | Per-Operation Rollback | Full | Savepoint matches nested LedgerTxn |
 | Soroban Fee Computation | Partial | Static surge pricing fee computation not implemented |
-| Flooding Validation | None | validateSorobanTxForFlooding not needed |
+| Flooding Validation | None | Overlay admission checks omitted |
 | Parallel Execution | None | Not implemented by design |
 
 ## File Mapping
@@ -99,6 +99,9 @@ Corresponds to: `TransactionFrameBase.h`, `TransactionFrame.h`
 | `isRestoreFootprintTx()` | Internal check | Full |
 | `getRefundableFee()` | `refundable_fee()` | Full |
 | `getMemo()` | `memo()` | Full |
+| `validateSorobanMemo()` | `validate_soroban_memo()` | Full |
+| `validateHostFn()` | `validate_host_fn()` | Full |
+| `validateSorobanOpsConsistency()` | `is_valid_structure()` | Full |
 | `getTimeBounds()` | `preconditions()` | Full |
 | `getLedgerBounds()` | `preconditions()` | Full |
 | `getMinSeqNum()` | `min_seq_num()` | Full |
@@ -450,6 +453,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `insertKeysForTxApply()` | Prefetch optimization; not needed with in-memory state |
 | `insertLedgerKeysToPrefetch()` | Prefetch optimization; not needed with in-memory state |
 | `validateSorobanTxForFlooding()` | Flooding/overlay concern; not needed for execution |
+| `validateAccountFilterForFlooding()` | Flooding/overlay concern; not needed for execution |
 | `validateSorobanMemo()` | Flooding validation; not needed for execution |
 | `XDRProvidesValidFee()` | Flooding validation; not needed for execution |
 | `getSize()` | Internal optimization metric |
@@ -475,7 +479,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `setInsufficientFeeErrorWithFeeCharged()` | Low | Used in tx acceptance queue flow |
 | `hasMuxedAccount()` (TransactionUtils) | Low | Muxed account detection on envelope |
 | `getUpperBoundCloseTimeOffset()` | Low | Close time offset computation for validation |
-| `validateSorobanOpsConsistency()` | Low | Validates Soroban tx has exactly one Soroban op; checked implicitly |
 
 ## Architectural Differences
 
@@ -544,14 +547,14 @@ Features not yet implemented. These ARE counted against parity %.
 | EndSponsoring | 1 TEST_CASE / 2 SECTION | 15 #[test] (shared) | Shared sponsorship tests |
 | SignatureUtils | 2 TEST_CASE / 0 SECTION | 15 #[test] | Good coverage |
 | ParallelApply | 4 TEST_CASE / 0 SECTION | 0 #[test] | N/A (not implemented) |
-| State management | - | 57 #[test] | Rust-only: savepoint, rollback, offer index |
+| State management | - | 61 #[test] | Rust-only: savepoint, rollback, offer index |
 | Entry store | - | 45 #[test] | Rust-only: generic entry store |
 | Meta building | - | 20 #[test] | Rust-only: TransactionMeta construction |
 | Lumen reconciler | - | 17 #[test] | Rust-only: SAC event reconciliation |
 | Result tracking | - | 31 #[test] | Rust-only: MutableTransactionResult |
 | Live execution | - | 28 #[test] | Rust-only: fee/seq/refund flow |
 | History apply | - | 20 #[test] | Rust-only: catchup mode |
-| Frame properties | - | 42 #[test] | Rust-only: envelope accessors |
+| Frame properties | - | 52 #[test] | Rust-only: envelope accessors, Soroban validation helpers |
 | Validation | - | 28 #[test] | Rust-only: precondition checks |
 | Soroban types | - | 2 #[test] | Rust-only: protocol type mapping |
 | Soroban errors | - | 15 #[test] | Rust-only: error code mapping |
@@ -564,7 +567,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Error types | - | 12 #[test] | Rust-only: error mapping |
 | Operation dispatch | - | 61 #[test] | Rust-only: operation routing and helpers |
 
-**Total: 130 TEST_CASE / 1,672 SECTION upstream vs. 883 #[test] in Rust**
+**Total: 130 TEST_CASE / 1,672 SECTION upstream vs. 899 #[test] in Rust**
 
 ### Test Gaps
 
@@ -663,13 +666,13 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 195 |
-| Gaps (None + Partial) | 7 |
-| Intentional Omissions | 29 |
-| **Parity** | **195 / (195 + 7) = 97%** |
+| Implemented (Full) | 196 |
+| Gaps (None + Partial) | 6 |
+| Intentional Omissions | 30 |
+| **Parity** | **196 / (196 + 6) = 97%** |
 
-Breakdown of the 195 implemented items:
-- TransactionFrame accessors/methods: 26
+Breakdown of the 196 implemented items:
+- TransactionFrame accessors/methods: 29
 - Validation functions: 13
 - SignatureChecker functions: 10
 - MutableTransactionResult functions: 16
@@ -689,11 +692,10 @@ Breakdown of the 195 implemented items:
 - LumenEventReconciler: 1
 - SignatureUtils (verify functions): 4
 
-Breakdown of the 7 gaps:
+Breakdown of the 6 gaps:
 - `computeSorobanResourceFee()` (static fee computation)
 - `computePreApplySorobanResourceFee()`
 - `checkValidWithOptionallyChargedFee()`
 - `setInsufficientFeeErrorWithFeeCharged()`
 - `hasMuxedAccount()`
 - `getUpperBoundCloseTimeOffset()`
-- `validateSorobanOpsConsistency()` (explicit check)

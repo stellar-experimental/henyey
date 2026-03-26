@@ -67,7 +67,7 @@ mod settings_upgrade;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use stellar_xdr::curr::WriteXdr;
@@ -1002,6 +1002,13 @@ fn init_logging(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn create_parent_dir(path: &Path) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
 /// Creates a [`HistoryArchive`] from the first enabled archive in config.
 fn first_archive(config: &AppConfig) -> anyhow::Result<henyey_history::HistoryArchive> {
     config
@@ -1249,11 +1256,7 @@ async fn cmd_run(
         let db_path = &config.database.path;
 
         // Ensure data directory exists.
-        if let Some(parent) = db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+        create_parent_dir(db_path)?;
 
         let needs_init = !db_path.exists();
 
@@ -1385,11 +1388,7 @@ async fn cmd_new_db(
     tracing::info!(path = ?db_path, "Creating new database");
 
     // Ensure parent directory exists
-    if let Some(parent) = db_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
+    create_parent_dir(db_path)?;
 
     // Create the database
     let db = henyey_db::Database::open(db_path)?;
@@ -2665,9 +2664,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
                 Some(config.network.passphrase.clone()),
             )?;
             let root_path = publish_dir.join(root_has_path());
-            if let Some(parent) = root_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            create_parent_dir(&root_path)?;
             fs::write(&root_path, has.to_json()?)?;
             Some(publish_dir)
         };
@@ -2701,9 +2698,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
                 Some(config.network.passphrase.clone()),
             )?;
             let root_path = path.join(root_has_path());
-            if let Some(parent) = root_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            create_parent_dir(&root_path)?;
             fs::write(&root_path, has.to_json()?)?;
             println!("OK ({})", url);
             published_any = true;
@@ -2818,9 +2813,7 @@ fn write_scp_history_file(
     use stellar_xdr::curr::Limits;
 
     let path = base_dir.join(checkpoint_path("scp", checkpoint, "xdr.gz"));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    create_parent_dir(&path)?;
     let file = std::fs::File::create(&path)?;
     let mut encoder = GzEncoder::new(file, Compression::default());
 

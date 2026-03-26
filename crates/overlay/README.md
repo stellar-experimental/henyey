@@ -1,184 +1,170 @@
 # henyey-overlay
 
-P2P overlay networking layer for Stellar node communication.
+P2P overlay networking for Stellar peer communication.
 
 ## Overview
 
-This crate implements the Stellar overlay network protocol, enabling nodes to
-communicate for consensus, transaction propagation, and state synchronization.
-It corresponds to stellar-core's `src/overlay/` subsystem and provides
-authenticated peer connections (X25519 + HMAC-SHA256), message routing with
-duplicate detection, flow control via SendMore/SendMoreExtended, pull-mode
-transaction flooding, and SQLite-backed peer/ban persistence.
+`henyey-overlay` implements the node-to-node networking layer used by henyey for peer discovery, authenticated transport, flooding, fetches, and topology survey traffic. It sits between the application/herder layers and raw sockets, and maps closely to stellar-core's `src/overlay/` subsystem while using Tokio tasks, channels, and SQLite-backed peer/ban persistence.
 
 ## Architecture
 
 ```mermaid
-graph TD
-    OM[OverlayManager] -->|spawns| LT[Listener Task]
-    OM -->|spawns| CT[Connector Task]
-    OM -->|spawns| AT[Advertiser Task]
-
-    LT -->|accepts| P1[Peer Task]
-    CT -->|connects| P2[Peer Task]
-
-    P1 -->|authenticated msgs| BC[Broadcast Channel]
-    P2 -->|authenticated msgs| BC
-    P1 -->|SCP msgs| SCP[SCP Channel]
-    P2 -->|SCP msgs| SCP
-    P1 -->|fetch responses| FR[Fetch Response Channel]
-    P2 -->|fetch responses| FR
-
-    P1 & P2 -->|flood msgs| FG[FloodGate]
-    P1 & P2 -->|capacity| FC[FlowControl]
-
-    subgraph Persistence
-        PM[PeerManager / SQLite]
-        BM[BanManager / SQLite]
-    end
+flowchart TD
+    C[OverlayConfig + LocalNode] --> OM[OverlayManager]
+    OM --> L[Listener]
+    OM --> T[Tick Loop]
+    OM --> A[Peer Advertiser]
+    L --> P[Peer Tasks]
+    T --> P
+    P --> AU[AuthContext]
+    P --> FC[FlowControl]
+    P --> FG[FloodGate]
+    P --> BC[Broadcast Channel]
+    P --> SCP[SCP Channel]
+    P --> FETCH[Fetch Response Channel]
+    OM --> PM[PeerManager]
+    OM --> BM[BanManager]
+    P --> CONN[Connection / MessageCodec]
 ```
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `OverlayManager` | Central coordinator managing peer connections, message routing, and peer discovery |
-| `OverlayConfig` | Configuration for connection limits, timeouts, network passphrase, and known peers |
-| `LocalNode` | Local node identity (secret key, protocol versions, network ID) |
-| `Peer` | Fully authenticated connection to a single remote peer |
-| `PeerAddress` | Host:port endpoint address for a Stellar node |
-| `PeerId` | Ed25519 public key identifier for a peer |
-| `AuthContext` | Authentication handshake state machine with X25519 key exchange and HMAC keys |
-| `Connection` | Low-level TCP connection with length-prefixed XDR message framing |
-| `FloodGate` | Tracks seen message hashes to prevent duplicate flooding |
-| `FlowControl` | Bandwidth management via SendMore/SendMoreExtended capacity tracking |
-| `MessageDispatcher` | Routes fetch-protocol messages (GetTxSet, ScpQuorumset, DontHave) with caching |
-| `ItemFetcher` | Fetches missing items (tx sets, quorum sets) from peers with retry and timeout |
-| `BanManager` | Persistent peer ban list backed by SQLite |
-| `PeerManager` | SQLite-backed peer address storage with failure tracking and backoff |
-| `TxAdverts` | Manages outgoing/incoming transaction flood adverts with batching |
-| `TxDemandsManager` | Tracks transaction demand lifecycle with retries and latency metrics |
-| `SurveyManager` | Time-sliced network topology survey collection and reporting |
-| `ConnectionFactory` | Trait abstracting TCP transport for connect and bind operations |
-| `TcpConnectionFactory` | Default `ConnectionFactory` implementation using real TCP sockets |
-| `LoopbackConnectionFactory` | In-process `ConnectionFactory` using `tokio::io::duplex` for testing |
-| `OverlayError` | Error enum covering connection, auth, codec, and protocol failures |
-| `PeerEvent` | Enum (`Connected` / `Failed`) for peer connection lifecycle notifications |
-| `PeerType` | Enum distinguishing `Inbound` vs `Outbound` peer connections |
-| `MessageHandler` | Trait for processing incoming Stellar messages from peers |
-| `OverlayMetrics` | Thread-safe atomic counters and timers for overlay statistics |
+| `OverlayManager` | Starts listener/tick tasks, owns peer handles, and exposes the main send/subscribe API. |
+| `OverlayConfig` | Configures peer limits, network identity, known peers, persistence hooks, and validator/watcher behavior. |
+| `LocalNode` | Local signing identity plus overlay and ledger protocol versions used in `HELLO`. |
+| `Peer` | Owns a single authenticated connection and performs the HELLO/AUTH handshake plus message I/O. |
+| `PeerInfo` | Immutable per-connection metadata such as peer ID, address, versions, and direction. |
+| `PeerAddress` | Host/port address used for dialing, advertising, and peer database storage. |
+| `PeerId` | Ed25519 public-key identity wrapper with XDR, hex, and strkey helpers. |
+| `AuthContext` | Stateful overlay authentication engine for cert verification, HKDF key derivation, and MAC sequencing. |
+| `Connection` | Framed transport over TCP or test IO, built on `MessageCodec`. |
+| `ConnectionPool` | Tracks pending and authenticated inbound/outbound slots, including preferred-peer overflow for inbound peers. |
+| `FloodGate` | Deduplicates flood traffic and tracks which peers have already seen a message. |
+| `FlowControl` | Enforces per-peer message/byte credit, priority queues, and `SEND_MORE_EXTENDED` accounting. |
+| `ItemFetcher` | Tracks missing tx sets or quorum sets and retries requests across peers. |
+| `MessageDispatcher` | Handles `GetTxSet`, `ScpQuorumset`, `DontHave`, and related fetch protocol messages with caches. |
+| `PeerManager` | SQLite-backed peer address store with type tracking and exponential backoff. |
+| `BanManager` | In-memory plus optional SQLite ban list with permanent and timed bans. |
+| `TxAdverts` | Queues and batches `FloodAdvert` transaction hashes for pull-mode flooding. |
+| `TxDemandsManager` | Schedules `FloodDemand` retries and records transaction pull latency. |
+| `SurveyManager` | Manages the collect/report lifecycle for time-sliced overlay surveys. |
+| `OverlayMetrics` | Atomic counters and timers for overlay activity, throttling, flooding, and pull latency. |
+| `ConnectionFactory` | Transport abstraction used by `OverlayManager` for real TCP or in-process loopback tests. |
 
 ## Usage
 
-### Starting the overlay
+### Start the overlay and consume general traffic
 
 ```rust
-use henyey_overlay::{OverlayConfig, OverlayManager, LocalNode, PeerAddress};
 use henyey_crypto::SecretKey;
+use henyey_overlay::{LocalNode, OverlayConfig, OverlayManager, PeerAddress};
 
-let secret_key = SecretKey::generate();
-let local_node = LocalNode::new_testnet(secret_key);
+let secret = SecretKey::generate();
+let local_node = LocalNode::new_testnet(secret);
 
 let mut config = OverlayConfig::testnet();
 config.known_peers.push(PeerAddress::new("validator.example.com", 11625));
 
-let mut manager = OverlayManager::new(config, local_node)?;
-manager.start().await?;
+let mut overlay = OverlayManager::new(config, local_node)?;
+overlay.start().await?;
 
-// Subscribe to incoming messages
-let mut rx = manager.subscribe();
+let mut rx = overlay.subscribe();
 while let Ok(msg) = rx.recv().await {
-    println!("Received {:?} from {}", msg.message, msg.from_peer);
+    println!("{} -> {:?}", msg.from_peer, msg.message);
 }
+
+overlay.shutdown().await?;
+# Ok::<(), henyey_overlay::OverlayError>(())
 ```
 
-### Broadcasting and sending
+### Use the dedicated SCP and fetch-response subscriptions
 
 ```rust
-use stellar_xdr::curr::StellarMessage;
+let scp_rx = overlay.subscribe_scp().await.expect("SCP receiver already taken");
+let fetch_rx = overlay
+    .subscribe_fetch_responses()
+    .await
+    .expect("fetch receiver already taken");
 
-// Broadcast to all peers
-let sent_count = manager.broadcast(tx_msg).await?;
+let catchup_rx = overlay.subscribe_catchup();
 
-// Send to a specific peer
-manager.send_to(&peer_id, message).await?;
-
-// Request SCP state from all peers
-manager.request_scp_state(ledger_seq).await?;
+overlay.request_scp_state(0).await?;
+# let _ = (scp_rx, fetch_rx, catchup_rx);
+# Ok::<(), henyey_overlay::OverlayError>(())
 ```
 
-### Watcher mode
+### Use watcher mode or an in-process transport
 
 ```rust
+use std::sync::Arc;
+use henyey_overlay::{LoopbackConnectionFactory, OverlayManager};
+
 let mut config = OverlayConfig::testnet();
-config.is_validator = false;  // Drops flood messages (TX, FloodAdvert, FloodDemand, Survey)
-config.listen_enabled = false; // Don't accept inbound connections
+config.is_validator = false;
+config.listen_enabled = false;
+
+let factory = Arc::new(LoopbackConnectionFactory::default());
+let overlay = OverlayManager::new_with_connection_factory(config, local_node, factory)?;
+
+// Watchers still participate in transaction flooding; only survey traffic is dropped.
+# let _ = overlay;
+# Ok::<(), henyey_overlay::OverlayError>(())
 ```
 
 ## Module Layout
 
 | Module | Description |
 |--------|-------------|
-| `lib.rs` | Public API, re-exports, `OverlayConfig`, `LocalNode`, `PeerAddress`, `PeerId` |
-| `manager.rs` | `OverlayManager` -- connection lifecycle, message routing, peer discovery |
-| `peer.rs` | `Peer` -- authenticated connection handling, send/recv, statistics |
-| `auth.rs` | `AuthContext` -- X25519 key exchange, HKDF key derivation, HMAC-SHA256 MACs |
-| `codec.rs` | `MessageCodec` -- 4-byte length-prefixed XDR framing with auth bit |
-| `connection.rs` | `Connection`, `Listener`, `ConnectionPool` -- TCP connection management |
-| `flood.rs` | `FloodGate` -- BLAKE2b-256 message hash tracking with TTL expiry |
-| `flow_control.rs` | `FlowControl` -- SendMore/SendMoreExtended capacity and priority queuing |
-| `item_fetcher.rs` | `ItemFetcher`, `Tracker` -- fetch missing tx sets/quorum sets with retry |
-| `message_handlers.rs` | `MessageDispatcher` -- routes GetTxSet, ScpQuorumset, DontHave; caches results |
-| `ban_manager.rs` | `BanManager` -- in-memory + SQLite persistent ban list |
-| `peer_manager.rs` | `PeerManager` -- SQLite peer storage, failure counts, backoff scheduling |
-| `tx_adverts.rs` | `TxAdverts` -- outgoing/incoming advert queuing, history cache, batch flush |
-| `tx_demands.rs` | `TxDemandsManager` -- demand status tracking, linear backoff retries, latency |
-| `survey.rs` | `SurveyManager` -- time-sliced network survey lifecycle and data collection |
-| `metrics.rs` | `OverlayMetrics` -- atomic counters/timers for messages, bytes, errors, latency |
-| `connection_factory.rs` | `ConnectionFactory` trait, `TcpConnectionFactory` -- transport abstraction |
-| `loopback.rs` | `LoopbackConnectionFactory` -- in-process transport for testing |
-| `error.rs` | `OverlayError` enum with thiserror |
+| `lib.rs` | Public API surface, core config/types, and re-exports. |
+| `auth.rs` | Overlay authentication certificates, HKDF key setup, MAC wrapping, and handshake state. |
+| `ban_manager.rs` | Persistent and in-memory peer bans, including timed auto-bans. |
+| `codec.rs` | Length-prefixed XDR framing with the overlay auth bit. |
+| `connection.rs` | Raw connections, listeners, split send/recv halves, and connection-slot accounting. |
+| `connection_factory.rs` | Transport abstraction trait plus the default TCP implementation. |
+| `error.rs` | `OverlayError` and retry/fatal classification helpers. |
+| `flood.rs` | Flood deduplication, peer exclusion, TTL cleanup, and message hashing. |
+| `flow_control.rs` | Priority outbound queues, message/byte capacity tracking, and `CapacityGuard`. |
+| `item_fetcher.rs` | `ItemFetcher` and `Tracker` state machines for missing tx/quorum set retrieval. |
+| `loopback.rs` | In-process loopback transport for tests and simulations. |
+| `manager.rs` | `OverlayManager`, task orchestration, peer loop, routing, keepalive, and discovery. |
+| `message_handlers.rs` | Fetch-protocol dispatcher and local caches for tx sets and quorum sets. |
+| `metrics.rs` | Atomic counters and timers for overlay observability. |
+| `peer.rs` | Authenticated peer lifecycle, handshake ordering, and per-peer stats. |
+| `peer_manager.rs` | SQLite peer database, type promotion, and exponential backoff scheduling. |
+| `survey.rs` | Survey state machine, limiter, and collected/finalized topology data. |
+| `tx_adverts.rs` | Pull-mode advertisement batching, retry queues, and history cache. |
+| `tx_demands.rs` | Demand scheduling, retry/backoff policy, and pull latency tracking. |
 
 ## Design Notes
 
-- **Channel separation**: SCP messages are routed through a dedicated unbounded
-  `mpsc` channel, and fetch responses (TxSet, ScpQuorumset, DontHave) through a
-  bounded `mpsc` channel, rather than the main `broadcast` channel. This prevents
-  consensus-critical messages from being lost when the broadcast channel overflows
-  during high transaction traffic.
-
-- **Watcher filtering**: When `is_validator` is false, flood messages
-  (Transaction, FloodAdvert, FloodDemand, Survey) are dropped at the peer loop
-  before entering any channel, reducing channel pressure by ~90% on mainnet.
-
-- **SharedPeerState**: Spawned background tasks (listener, connector, per-peer
-  loops) share state through a `SharedPeerState` struct rather than cloning
-  15+ individual `Arc` fields, keeping function signatures manageable.
-
-- **Ping keepalive**: The peer loop sends `GetScpQuorumSet` with a synthetic
-  hash every 5 seconds (matching stellar-core's `RECURRENT_TIMER_PERIOD`) to
-  prevent the remote peer's 30-second idle timeout from triggering.
+- Dedicated delivery paths matter: SCP messages use an unbounded channel and fetch responses use a separate bounded channel, so consensus and catchup traffic do not compete with generic broadcast traffic.
+- PEERS exchange is asymmetric: only the acceptor sends `PEERS`, and duplicate or wrong-direction `PEERS` messages cause the connection to be dropped to match stellar-core.
+- Flow control is enforced in the hot path with `CapacityGuard`; a peer that sends flood traffic after exhausting granted credit is dropped immediately.
+- Watcher mode is intentionally narrow in this crate: non-validators still participate in transaction pull-mode flooding and only survey traffic is filtered at the overlay layer.
 
 ## stellar-core Mapping
 
 | Rust | stellar-core |
 |------|--------------|
 | `manager.rs` | `src/overlay/OverlayManager.h`, `OverlayManagerImpl.cpp` |
-| `peer.rs`, `connection.rs` | `src/overlay/Peer.h`, `TCPPeer.h` |
-| `auth.rs` | `src/overlay/PeerAuth.h`, `Hmac.h` |
-| `codec.rs` | XDR framing in `TCPPeer.cpp` |
-| `flood.rs` | `src/overlay/Floodgate.h` |
-| `flow_control.rs` | `src/overlay/FlowControl.h`, `FlowControlCapacity.h` |
-| `item_fetcher.rs` | `src/overlay/ItemFetcher.h`, `Tracker.h` |
-| `message_handlers.rs` | fetch handlers in `Peer.cpp` |
-| `ban_manager.rs` | `src/overlay/BanManager.h`, `BanManagerImpl.h` |
-| `peer_manager.rs` | `src/overlay/PeerManager.h`, `RandomPeerSource.h` |
-| `tx_adverts.rs` | `src/overlay/TxAdverts.h` |
-| `tx_demands.rs` | `src/overlay/TxDemandsManager.h` |
-| `survey.rs` | `src/overlay/SurveyManager.h`, `SurveyDataManager.h` |
-| `metrics.rs` | `src/overlay/OverlayMetrics.h` |
-| `connection_factory.rs` | No direct equivalent (stellar-core uses `TCPPeer` directly) |
-| `loopback.rs` | `src/overlay/LoopbackPeer.h` (test-only in stellar-core) |
+| `peer.rs` | `src/overlay/Peer.h`, `Peer.cpp`, `TCPPeer.h`, `TCPPeer.cpp` |
+| `auth.rs` | `src/overlay/PeerAuth.h`, `PeerAuth.cpp`, `Hmac.h`, `Hmac.cpp` |
+| `codec.rs` | Framing logic in `src/overlay/TCPPeer.cpp` |
+| `connection.rs` | `src/overlay/PeerDoor.h`, `PeerDoor.cpp`, parts of `TCPPeer.cpp` |
+| `flood.rs` | `src/overlay/Floodgate.h`, `Floodgate.cpp` |
+| `flow_control.rs` | `src/overlay/FlowControl.h`, `FlowControl.cpp`, `FlowControlCapacity.h`, `FlowControlCapacity.cpp` |
+| `item_fetcher.rs` | `src/overlay/ItemFetcher.h`, `ItemFetcher.cpp`, `Tracker.h`, `Tracker.cpp` |
+| `message_handlers.rs` | Fetch-related handlers in `src/overlay/Peer.cpp` |
+| `ban_manager.rs` | `src/overlay/BanManager.h`, `BanManagerImpl.h`, `BanManagerImpl.cpp` |
+| `peer_manager.rs` | `src/overlay/PeerManager.h`, `PeerManager.cpp`, `RandomPeerSource.h`, `RandomPeerSource.cpp` |
+| `tx_adverts.rs` | `src/overlay/TxAdverts.h`, `TxAdverts.cpp` |
+| `tx_demands.rs` | `src/overlay/TxDemandsManager.h`, `TxDemandsManager.cpp` |
+| `survey.rs` | `src/overlay/SurveyManager.h`, `SurveyManager.cpp`, `SurveyDataManager.h`, `SurveyDataManager.cpp`, `SurveyMessageLimiter.*` |
+| `metrics.rs` | `src/overlay/OverlayMetrics.h`, `OverlayMetrics.cpp` |
+| `loopback.rs` | `src/overlay/LoopbackPeer.h` (test support) |
+| `connection_factory.rs` | No direct equivalent; stellar-core wires transport directly into `TCPPeer`/`PeerDoor` |
 
 ## Parity Status
 

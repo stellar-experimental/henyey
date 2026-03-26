@@ -119,6 +119,26 @@ pub struct TransactionExecutionRequest {
     pub should_apply: bool,
 }
 
+impl TransactionExecutionRequest {
+    pub fn from_envelope(
+        tx_envelope: &TransactionEnvelope,
+        base_fee: u32,
+        soroban_prng_seed: Option<[u8; 32]>,
+        deduct_fee: bool,
+        fee_source_pre_state: Option<LedgerEntry>,
+        should_apply: bool,
+    ) -> Self {
+        Self {
+            tx_envelope: Arc::new(tx_envelope.clone()),
+            base_fee,
+            soroban_prng_seed,
+            deduct_fee,
+            fee_source_pre_state,
+            should_apply,
+        }
+    }
+}
+
 struct OperationExecutionRequest<'a> {
     op: &'a stellar_xdr::curr::Operation,
     source: &'a AccountId,
@@ -1767,14 +1787,16 @@ impl TransactionExecutor {
         soroban_prng_seed: Option<[u8; 32]>,
         deduct_fee: bool,
     ) -> Result<TransactionExecutionResult> {
-        self.execute_transaction_with_fee_mode_and_pre_state(
+        self.execute_transaction_with_arc(
             snapshot,
-            tx_envelope,
-            base_fee,
-            soroban_prng_seed,
-            deduct_fee,
-            None,
-            true, // should_apply: always execute body in sequential path
+            TransactionExecutionRequest::from_envelope(
+                tx_envelope,
+                base_fee,
+                soroban_prng_seed,
+                deduct_fee,
+                None,
+                true, // should_apply: always execute body in sequential path
+            ),
         )
     }
 
@@ -2615,49 +2637,14 @@ impl TransactionExecutor {
         }
     }
 
-    /// Execute a transaction with configurable fee deduction and optional pre-fee state.
+    /// Execute a transaction with a pre-built execution request.
     ///
     /// This is the main orchestrator that calls `pre_apply()` for validation,
     /// fee charging, signer removal, and sequence bumping, then conditionally
     /// calls through to the operation body execution phase.
     ///
-    /// When `deduct_fee` is false, fee validation still occurs but no fee
-    /// processing changes are applied to the state or delta.
-    ///
-    /// When `should_apply` is false, the transaction's pre-apply phase executes
-    /// normally, but the operation body is **not** executed. This matches
-    /// stellar-core's `parallelApply` which returns `{false, {}}` immediately
-    /// when `!txResult.isSuccess()` after `preParallelApply` determined
-    /// insufficient balance.
-    ///
-    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` should be provided
-    /// with the fee source account state BEFORE fee processing. This is used for the STATE entry
-    /// in tx_changes_before to match stellar-core behavior.
-    #[allow(clippy::too_many_arguments)]
-    pub fn execute_transaction_with_fee_mode_and_pre_state(
-        &mut self,
-        snapshot: &SnapshotHandle,
-        tx_envelope: &TransactionEnvelope,
-        base_fee: u32,
-        soroban_prng_seed: Option<[u8; 32]>,
-        deduct_fee: bool,
-        fee_source_pre_state: Option<LedgerEntry>,
-        should_apply: bool,
-    ) -> Result<TransactionExecutionResult> {
-        self.execute_transaction_with_request(
-            snapshot,
-            TransactionExecutionRequest {
-                tx_envelope: Arc::new(tx_envelope.clone()),
-                base_fee,
-                soroban_prng_seed,
-                deduct_fee,
-                fee_source_pre_state,
-                should_apply,
-            },
-        )
-    }
-
-    /// Execute a transaction from a shared Arc envelope (avoids cloning the envelope).
+    /// Use `TransactionExecutionRequest::from_envelope` for call sites that start
+    /// from an owned or borrowed envelope.
     pub fn execute_transaction_with_arc(
         &mut self,
         snapshot: &SnapshotHandle,
@@ -3984,7 +3971,7 @@ pub struct DeltaSlice<'a> {
     end: DeltaSnapshot,
 }
 
-impl<'a> DeltaSlice<'a> {
+impl DeltaSlice<'_> {
     pub fn created(&self) -> &[LedgerEntry] {
         &self.delta.created_entries()[self.start.created..self.end.created]
     }

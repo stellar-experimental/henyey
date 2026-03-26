@@ -100,40 +100,45 @@ struct EvictionScanResult {
     ran: bool,
 }
 
+struct EvictionScanContext<'a> {
+    config: &'a ReplayConfig,
+    header: &'a LedgerHeader,
+    eviction_iterator: Option<EvictionIterator>,
+    eviction_settings: &'a StateArchivalSettings,
+    init_entries: &'a [LedgerEntry],
+    live_entries: &'a [LedgerEntry],
+    dead_entries: &'a [LedgerKey],
+}
+
 /// Run incremental eviction scan for protocol 23+ and resolve candidates.
 ///
 /// Returns evicted keys, archived entries, and the updated iterator position.
 /// If eviction is disabled or the protocol version is too low, returns an empty result.
 #[allow(clippy::too_many_arguments)]
 fn run_eviction_scan(
-    config: &ReplayConfig,
-    header: &LedgerHeader,
     bucket_list: &mut henyey_bucket::BucketList,
-    eviction_iterator: Option<EvictionIterator>,
-    eviction_settings: &StateArchivalSettings,
-    init_entries: &[LedgerEntry],
-    live_entries: &[LedgerEntry],
-    dead_entries: &[LedgerKey],
+    context: EvictionScanContext<'_>,
 ) -> Result<EvictionScanResult> {
-    if !config.run_eviction
-        || protocol_version_is_before(header.ledger_version, ProtocolVersion::V23)
+    if !context.config.run_eviction
+        || protocol_version_is_before(context.header.ledger_version, ProtocolVersion::V23)
     {
         return Ok(EvictionScanResult {
             evicted_keys: Vec::new(),
             archived_entries: Vec::new(),
-            updated_iterator: eviction_iterator,
+            updated_iterator: context.eviction_iterator,
             ran: false,
         });
     }
 
-    let iter = eviction_iterator
-        .unwrap_or_else(|| EvictionIterator::new(eviction_settings.starting_eviction_scan_level));
+    let iter = context.eviction_iterator.unwrap_or_else(|| {
+        EvictionIterator::new(context.eviction_settings.starting_eviction_scan_level)
+    });
     let eviction_result = bucket_list
-        .scan_for_eviction_incremental(iter, header.ledger_seq, eviction_settings)
+        .scan_for_eviction_incremental(iter, context.header.ledger_seq, context.eviction_settings)
         .map_err(HistoryError::Bucket)?;
 
     tracing::info!(
-        ledger_seq = header.ledger_seq,
+        ledger_seq = context.header.ledger_seq,
         bytes_scanned = eviction_result.bytes_scanned,
         candidates = eviction_result.candidates.len(),
         end_level = eviction_result.end_iterator.bucket_list_level,
@@ -151,15 +156,16 @@ fn run_eviction_scan(
     //
     // Parity: stellar-core passes `ltx.getAllKeysWithoutSealing()` which
     // contains ALL modified keys. We build the equivalent.
-    let modified_keys: std::collections::HashSet<LedgerKey> = init_entries
+    let modified_keys: std::collections::HashSet<LedgerKey> = context
+        .init_entries
         .iter()
-        .chain(live_entries.iter())
+        .chain(context.live_entries.iter())
         .map(|entry| henyey_common::entry_to_key(entry))
-        .chain(dead_entries.iter().cloned())
+        .chain(context.dead_entries.iter().cloned())
         .collect();
 
     let resolved =
-        eviction_result.resolve(eviction_settings.max_entries_to_archive, &modified_keys);
+        eviction_result.resolve(context.eviction_settings.max_entries_to_archive, &modified_keys);
 
     Ok(EvictionScanResult {
         evicted_keys: resolved.evicted_keys,
@@ -940,14 +946,16 @@ pub fn replay_ledger_with_execution(
     // This matches stellar-core's behavior: eviction is determined by TTL state
     // from the current bucket list, then evicted entries are added as DEAD entries
     let eviction = run_eviction_scan(
-        config,
-        header,
         bucket_list,
-        eviction_iterator.clone(),
-        &eviction_settings,
-        &init_entries,
-        &live_entries,
-        &dead_entries,
+        EvictionScanContext {
+            config,
+            header,
+            eviction_iterator: eviction_iterator.clone(),
+            eviction_settings: &eviction_settings,
+            init_entries: &init_entries,
+            live_entries: &live_entries,
+            dead_entries: &dead_entries,
+        },
     )?;
 
     // Combine transaction dead entries with evicted entries

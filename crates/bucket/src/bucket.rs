@@ -1072,7 +1072,7 @@ pub enum BucketIter<'a> {
     Empty,
 }
 
-impl<'a> Iterator for BucketIter<'a> {
+impl Iterator for BucketIter<'_> {
     type Item = BucketEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1107,7 +1107,7 @@ pub struct InMemoryOffsetIter<'a> {
     start_offset: u64,
 }
 
-impl<'a> Iterator for BucketOffsetIter<'a> {
+impl Iterator for BucketOffsetIter<'_> {
     /// (entry, total_record_size)
     type Item = (BucketEntry, u64);
 

@@ -477,9 +477,9 @@ impl BallotProtocol {
     }
 
     /// Start the ballot protocol with a value from nomination.
-    pub(crate) fn bump<'a, D: SCPDriver>(
+    pub(crate) fn bump<D: SCPDriver>(
         &mut self,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
         value: Value,
         force: bool,
     ) -> bool {
@@ -500,9 +500,9 @@ impl BallotProtocol {
     /// Bump ballot counter on timeout.
     ///
     /// This matches the stellar-core `ballotProtocolTimerExpired` → `abandonBallot(0)` flow.
-    pub(crate) fn bump_timeout<'a, D: SCPDriver>(
+    pub(crate) fn bump_timeout<D: SCPDriver>(
         &mut self,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
         composite_candidate: Option<&Value>,
     ) -> bool {
         // Sync composite candidate from caller before abandoning
@@ -511,10 +511,10 @@ impl BallotProtocol {
     }
 
     /// Process a ballot protocol envelope.
-    pub(crate) fn process_envelope<'a, D: SCPDriver>(
+    pub(crate) fn process_envelope<D: SCPDriver>(
         &mut self,
         envelope: &ScpEnvelope,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> EnvelopeState {
         let node_id = &envelope.statement.node_id;
 
@@ -694,9 +694,9 @@ impl BallotProtocol {
     ///
     /// # Returns
     /// True if the ballot was bumped, false if the operation failed.
-    pub(crate) fn bump_state<'a, D: SCPDriver>(
+    pub(crate) fn bump_state<D: SCPDriver>(
         &mut self,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
         value: Value,
         counter: u32,
     ) -> bool {
@@ -742,10 +742,10 @@ impl BallotProtocol {
     }
 
     /// Test helper: expose advance_slot for testing.
-    pub(crate) fn advance_slot_for_test<'a, D: SCPDriver>(
+    pub(crate) fn advance_slot_for_test<D: SCPDriver>(
         &mut self,
         hint: &ScpStatement,
-        ctx: &SlotContext<'a, D>,
+        ctx: &SlotContext<'_, D>,
     ) -> EnvelopeState {
         self.advance_slot(hint, ctx)
     }

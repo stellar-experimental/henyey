@@ -4,12 +4,13 @@ Pure Rust cryptographic primitives for henyey (Stellar Core).
 
 ## Overview
 
-This crate provides all cryptographic operations needed by a Stellar Core
-implementation, entirely in Rust with no C/C++ dependencies (no libsodium).
-It corresponds to the `src/crypto/` directory in upstream stellar-core and is
-designed to produce deterministic, bit-compatible results with the C++
-implementation. Other henyey crates depend on `henyey-crypto` for signing,
-hashing, key encoding, and encryption.
+This crate provides the cryptographic building blocks used across henyey,
+including Ed25519 signing, SHA-256 and BLAKE2 hashing, StrKey handling,
+Curve25519 key agreement, and sealed-box encryption. It corresponds to the
+`src/crypto/` directory in upstream stellar-core and aims for deterministic,
+bit-compatible behavior with the C++ implementation. Other crates rely on it
+for transaction signatures, overlay session keys, signer-key construction, and
+survey payload encryption.
 
 ## Architecture
 
@@ -108,8 +109,8 @@ assert_eq!(plaintext, b"secret");
 | `lib.rs` | Crate root; module declarations and public re-exports |
 | `keys.rs` | `PublicKey`, `SecretKey`, `Signature` types with Ed25519 operations, XDR conversions, and `account_id_to_strkey` |
 | `hash.rs` | SHA-256, BLAKE2b-256, HMAC-SHA256, HKDF, and XDR hashing (`xdr_sha256`) in single-shot and streaming modes |
-| `signature.rs` | Cached signature verification via `SigVerifyCache` (BLAKE2-keyed LRU, 250K entries), `sign_hash`, and `verify_hash_from_raw_key` |
-| `signer_key.rs` | Construction and inspection of XDR `SignerKey` variants (Ed25519, PreAuthTx, HashX, SignedPayload) |
+| `signature.rs` | Process-global cached signature verification helpers, plus `sign_hash` and `verify_hash_from_raw_key` |
+| `signer_key.rs` | Construction and inspection helpers for XDR `SignerKey` variants, including Ed25519, PreAuthTx, HashX, and signed-payload keys |
 | `short_hash.rs` | Process-global SipHash-2-4 for deterministic bucket list ordering |
 | `curve25519.rs` | Curve25519 ECDH key exchange for P2P overlay session key agreement |
 | `sealed_box.rs` | Sealed box encryption/decryption for anonymous survey payloads (Ed25519 and Curve25519 key variants) |

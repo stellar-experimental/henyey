@@ -7,7 +7,7 @@ use stellar_xdr::curr::LedgerUpgrade;
 use super::types::{ConnectParams, UpgradeItem};
 
 /// Parse connect endpoint parameters into a PeerAddress.
-pub fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress, String> {
+pub(super) fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress, String> {
     if let Some(addr) = params.addr.as_ref() {
         let (host, port) = addr
             .split_once(':')
@@ -28,7 +28,7 @@ pub fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress, Strin
 }
 
 /// Parse a peer_id or node parameter into a PeerId.
-pub fn parse_peer_id_params(
+pub(super) fn parse_peer_id_params(
     peer_id: &Option<String>,
     node: &Option<String>,
 ) -> Result<PeerId, String> {
@@ -40,7 +40,7 @@ pub fn parse_peer_id_params(
 }
 
 /// Parse a string (hex or strkey) into a PeerId.
-pub fn parse_peer_id(value: &str) -> Result<PeerId, String> {
+pub(super) fn parse_peer_id(value: &str) -> Result<PeerId, String> {
     if let Ok(bytes) = hex::decode(value) {
         if let Ok(raw) = <[u8; 32]>::try_from(bytes.as_slice()) {
             return Ok(PeerId::from_bytes(raw));
@@ -53,7 +53,7 @@ pub fn parse_peer_id(value: &str) -> Result<PeerId, String> {
 }
 
 /// Convert a NodeId to its strkey representation.
-pub fn node_id_to_strkey(node_id: &stellar_xdr::curr::NodeId) -> Option<String> {
+pub(super) fn node_id_to_strkey(node_id: &stellar_xdr::curr::NodeId) -> Option<String> {
     match &node_id.0 {
         stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => {
             CryptoPublicKey::from_bytes(&key.0)
@@ -64,12 +64,12 @@ pub fn node_id_to_strkey(node_id: &stellar_xdr::curr::NodeId) -> Option<String> 
 }
 
 /// Convert a PeerId to its strkey representation.
-pub fn peer_id_to_strkey(peer_id: PeerId) -> Option<String> {
+pub(super) fn peer_id_to_strkey(peer_id: PeerId) -> Option<String> {
     node_id_to_strkey(&stellar_xdr::curr::NodeId(peer_id.0))
 }
 
 /// Map a LedgerUpgrade to an UpgradeItem for JSON serialization.
-pub fn map_upgrade_item(upgrade: LedgerUpgrade) -> Option<UpgradeItem> {
+pub(super) fn map_upgrade_item(upgrade: LedgerUpgrade) -> Option<UpgradeItem> {
     match upgrade {
         LedgerUpgrade::Version(value) => Some(UpgradeItem {
             r#type: "protocol_version".to_string(),

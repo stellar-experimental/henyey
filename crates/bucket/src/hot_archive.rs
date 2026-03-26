@@ -715,7 +715,7 @@ pub enum HotArchiveIter<'a> {
     Empty,
 }
 
-impl<'a> Iterator for HotArchiveIter<'a> {
+impl Iterator for HotArchiveIter<'_> {
     type Item = HotArchiveBucketEntry;
 
     fn next(&mut self) -> Option<Self::Item> {

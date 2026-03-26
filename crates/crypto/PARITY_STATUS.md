@@ -3,7 +3,7 @@
 **Crate**: `henyey-crypto`
 **Upstream**: `stellar-core/src/crypto/`
 **Overall Parity**: 69%
-**Last Updated**: 2026-03-17
+**Last Updated**: 2026-03-25
 
 ## Summary
 
@@ -275,7 +275,7 @@ Features not yet implemented. These ARE counted against parity %.
 | SHA-256 Hashing | 5 TEST_CASE (incl. 2 bench) | 15 #[test] | Rust has more granular tests |
 | BLAKE2 Hashing | 5 TEST_CASE (incl. 2 bench) | (included in hash.rs) | 3 BLAKE2-specific tests in hash.rs |
 | HMAC / HKDF | 2 TEST_CASE | 7 #[test] | Good coverage on both sides |
-| Signing / Verification | 3 TEST_CASE (incl. 2 bench) | 5 #[test] (keys + signature) | Upstream has Ed25519 test vectors |
+| Signing / Verification | 5 TEST_CASE (incl. 2 bench, 2 vector suites) | 5 #[test] (keys + signature) | Upstream has much deeper vector coverage |
 | StrKey | 2 TEST_CASE, 5 SECTION | Covered by `stellar_strkey` | Rust relies on external crate's tests |
 | Short Hash | 3 TEST_CASE (incl. 2 bench) | 5 #[test] | Comparable coverage |
 | Hex | Included in CryptoTests | 8 #[test] | Rust has dedicated hex tests |

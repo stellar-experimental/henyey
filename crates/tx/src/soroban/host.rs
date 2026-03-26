@@ -33,12 +33,12 @@ use soroban_env_host25::{
 // soroban-env-host P25's transitive stellar-xdr 25.0.0, so the Rust types are
 // identical and no conversion is needed for the P25 path.
 use stellar_xdr::curr::{
-    AccountId, DiagnosticEvent, HostFunction, LedgerEntry, LedgerKey, Limits, ReadXdr, ScVal,
-    SorobanAuthorizationEntry, SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
+    DiagnosticEvent, LedgerEntry, LedgerKey, Limits, ReadXdr, ScVal, SorobanTransactionData,
+    SorobanTransactionDataExt, WriteXdr,
 };
 
 use super::error::convert_host_error_p24_to_p25;
-use super::SorobanConfig;
+use super::HostFunctionInvocation;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 
@@ -376,7 +376,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     }
 }
 
-impl<'a> soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'a> {
+impl soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'_> {
     fn get(
         &self,
         key: &Rc<LedgerKey>,
@@ -560,73 +560,35 @@ define_wasm_compilation_context!(
 /// module cache. When provided, the cache is reused across transactions, avoiding
 /// repeated WASM compilation. This matches stellar-core's SharedModuleCacheCompiler.
 ///
-/// # Arguments
-///
-/// * `host_function` - The host function to execute
-/// * `auth_entries` - Authorization entries for the invocation
-/// * `source` - Source account for the transaction
-/// * `state` - Ledger state manager for reading entries
-/// * `context` - Ledger context with sequence, close time, etc.
-/// * `soroban_data` - Soroban transaction data with footprint and resources
-/// * `soroban_config` - Network configuration with cost parameters
-/// * `module_cache` - Optional pre-populated module cache for WASM reuse
-/// * `hot_archive` - Optional hot archive lookup for Protocol 23+ entry restoration
-#[allow(clippy::too_many_arguments)]
+/// The invocation request bundles the host function, authorization, ledger context,
+/// Soroban config, and optional shared caches required for execution.
 pub fn execute_host_function_with_cache(
-    host_function: &HostFunction,
-    auth_entries: &[SorobanAuthorizationEntry],
-    source: &AccountId,
-    state: &LedgerStateManager,
-    context: &LedgerContext,
-    soroban_data: &SorobanTransactionData,
-    soroban_config: &SorobanConfig,
-    module_cache: Option<&PersistentModuleCache>,
-    hot_archive: Option<&dyn super::HotArchiveLookup>,
-    ttl_key_cache: Option<&super::TtlKeyCache>,
+    request: HostFunctionInvocation<'_>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
-    if protocol_version_starts_from(context.protocol_version, ProtocolVersion::V25) {
-        let cache = module_cache
+    let protocol_version = request.context.protocol_version;
+    if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
+        let cache = request
+            .module_cache
             .unwrap_or_else(|| panic!("Module cache must be provided for Soroban TX execution"));
         let p25_cache = cache.as_p25().unwrap_or_else(|| {
             panic!(
                 "Module cache is not P25 but protocol version is {}",
-                context.protocol_version
+                protocol_version
             )
         });
-        return execute_host_function_p25(
-            host_function,
-            auth_entries,
-            source,
-            state,
-            context,
-            soroban_data,
-            soroban_config,
-            Some(p25_cache),
-            hot_archive,
-            ttl_key_cache,
-        );
+        return execute_host_function_p25(request, Some(p25_cache));
     }
-    let cache = module_cache
+    let cache = request
+        .module_cache
         .unwrap_or_else(|| panic!("Module cache must be provided for Soroban TX execution"));
     let p24_cache = cache.as_p24().unwrap_or_else(|| {
         panic!(
             "Module cache is not P24 but protocol version is {}",
-            context.protocol_version
+            protocol_version
         )
     });
     tracing::debug!("Dispatching to P24 path");
-    execute_host_function_p24(
-        host_function,
-        auth_entries,
-        source,
-        state,
-        context,
-        soroban_data,
-        soroban_config,
-        Some(p24_cache),
-        hot_archive,
-        ttl_key_cache,
-    )
+    execute_host_function_p24(request, Some(p24_cache))
 }
 
 /// Create a setup error with zero consumed resources (for errors before budget exists).
@@ -641,19 +603,23 @@ fn make_xdr_setup_error() -> SorobanExecutionError {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_host_function_p24(
-    host_function: &HostFunction,
-    auth_entries: &[SorobanAuthorizationEntry],
-    source: &AccountId,
-    state: &LedgerStateManager,
-    context: &LedgerContext,
-    soroban_data: &SorobanTransactionData,
-    soroban_config: &SorobanConfig,
+    request: HostFunctionInvocation<'_>,
     existing_cache: Option<&ModuleCache>,
-    hot_archive: Option<&dyn super::HotArchiveLookup>,
-    ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
+    let HostFunctionInvocation {
+        host_function,
+        auth_entries,
+        source,
+        state,
+        context,
+        soroban_data,
+        soroban_config,
+        hot_archive,
+        ttl_key_cache,
+        ..
+    } = request;
+
     // Create budget with network cost parameters.
     let instruction_limit = soroban_data.resources.instructions as u64;
     let memory_limit = soroban_config.tx_max_memory_bytes;
@@ -1034,20 +1000,24 @@ fn execute_host_function_p24(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_host_function_p25(
-    host_function: &HostFunction,
-    auth_entries: &[SorobanAuthorizationEntry],
-    source: &AccountId,
-    state: &LedgerStateManager,
-    context: &LedgerContext,
-    soroban_data: &SorobanTransactionData,
-    soroban_config: &SorobanConfig,
+    request: HostFunctionInvocation<'_>,
     existing_cache: Option<&ModuleCacheP25>,
-    hot_archive: Option<&dyn super::HotArchiveLookup>,
-    ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     use soroban_env_host25::{budget::Budget, e2e_invoke, fees::compute_rent_fee};
+
+    let HostFunctionInvocation {
+        host_function,
+        auth_entries,
+        source,
+        state,
+        context,
+        soroban_data,
+        soroban_config,
+        hot_archive,
+        ttl_key_cache,
+        ..
+    } = request;
 
     let make_setup_error = |e: HostErrorP25| SorobanExecutionError {
         host_error: e,

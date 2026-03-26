@@ -90,15 +90,12 @@ fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::cur
     Ok(())
 }
 
-fn normalize_ops_v0(ops: &mut stellar_xdr::curr::VecM<stellar_xdr::curr::OperationMeta>) {
+fn normalize_ops<T>(
+    ops: &mut stellar_xdr::curr::VecM<T>,
+    mut changes: impl FnMut(&mut T) -> &mut LedgerEntryChanges,
+) {
     for op in ops.iter_mut() {
-        let _ = sort_changes(&mut op.changes);
-    }
-}
-
-fn normalize_ops_v2(ops: &mut stellar_xdr::curr::VecM<stellar_xdr::curr::OperationMetaV2>) {
-    for op in ops.iter_mut() {
-        let _ = sort_changes(&mut op.changes);
+        let _ = sort_changes(changes(op));
     }
 }
 
@@ -116,26 +113,26 @@ pub fn normalize_transaction_meta(
 ) -> Result<(), stellar_xdr::curr::Error> {
     match meta {
         TransactionMeta::V0(ops) => {
-            normalize_ops_v0(ops);
+            normalize_ops(ops, |op| &mut op.changes);
         }
         TransactionMeta::V1(v1) => {
             sort_changes(&mut v1.tx_changes)?;
-            normalize_ops_v0(&mut v1.operations);
+            normalize_ops(&mut v1.operations, |op| &mut op.changes);
         }
         TransactionMeta::V2(v2) => {
             sort_changes(&mut v2.tx_changes_before)?;
             sort_changes(&mut v2.tx_changes_after)?;
-            normalize_ops_v0(&mut v2.operations);
+            normalize_ops(&mut v2.operations, |op| &mut op.changes);
         }
         TransactionMeta::V3(v3) => {
             sort_changes(&mut v3.tx_changes_before)?;
             sort_changes(&mut v3.tx_changes_after)?;
-            normalize_ops_v0(&mut v3.operations);
+            normalize_ops(&mut v3.operations, |op| &mut op.changes);
         }
         TransactionMeta::V4(v4) => {
             sort_changes(&mut v4.tx_changes_before)?;
             sort_changes(&mut v4.tx_changes_after)?;
-            normalize_ops_v2(&mut v4.operations);
+            normalize_ops(&mut v4.operations, |op| &mut op.changes);
         }
     }
     Ok(())

@@ -1,14 +1,14 @@
 use serde::Serialize;
 
 /// JSON-RPC 2.0 error codes.
-pub const INVALID_REQUEST: i32 = -32600;
-pub const METHOD_NOT_FOUND: i32 = -32601;
-pub const INVALID_PARAMS: i32 = -32602;
-pub const INTERNAL_ERROR: i32 = -32603;
+pub(crate) const INVALID_REQUEST: i32 = -32600;
+pub(crate) const METHOD_NOT_FOUND: i32 = -32601;
+pub(crate) const INVALID_PARAMS: i32 = -32602;
+pub(crate) const INTERNAL_ERROR: i32 = -32603;
 
 /// JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, Serialize)]
-pub struct JsonRpcError {
+pub(crate) struct JsonRpcError {
     pub code: i32,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -16,35 +16,27 @@ pub struct JsonRpcError {
 }
 
 impl JsonRpcError {
-    pub fn invalid_request(msg: impl Into<String>) -> Self {
+    fn new(code: i32, message: impl Into<String>) -> Self {
         Self {
-            code: INVALID_REQUEST,
-            message: msg.into(),
+            code,
+            message: message.into(),
             data: None,
         }
     }
 
-    pub fn method_not_found(method: &str) -> Self {
-        Self {
-            code: METHOD_NOT_FOUND,
-            message: format!("method not found: {}", method),
-            data: None,
-        }
+    pub(crate) fn invalid_request(msg: impl Into<String>) -> Self {
+        Self::new(INVALID_REQUEST, msg)
     }
 
-    pub fn invalid_params(msg: impl Into<String>) -> Self {
-        Self {
-            code: INVALID_PARAMS,
-            message: msg.into(),
-            data: None,
-        }
+    pub(crate) fn method_not_found(method: &str) -> Self {
+        Self::new(METHOD_NOT_FOUND, format!("method not found: {}", method))
     }
 
-    pub fn internal(msg: impl Into<String>) -> Self {
-        Self {
-            code: INTERNAL_ERROR,
-            message: msg.into(),
-            data: None,
-        }
+    pub(crate) fn invalid_params(msg: impl Into<String>) -> Self {
+        Self::new(INVALID_PARAMS, msg)
+    }
+
+    pub(crate) fn internal(msg: impl Into<String>) -> Self {
+        Self::new(INTERNAL_ERROR, msg)
     }
 }

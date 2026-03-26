@@ -38,11 +38,11 @@ pub(super) fn delta_snapshot(state: &LedgerStateManager) -> DeltaSnapshot {
     }
 }
 
-pub(super) fn delta_slice_between<'a>(
-    delta: &'a henyey_tx::LedgerDelta,
+pub(super) fn delta_slice_between(
+    delta: &henyey_tx::LedgerDelta,
     start: DeltaSnapshot,
     end: DeltaSnapshot,
-) -> DeltaSlice<'a> {
+) -> DeltaSlice<'_> {
     DeltaSlice { delta, start, end }
 }
 

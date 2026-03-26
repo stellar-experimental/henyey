@@ -1,145 +1,106 @@
 # stellar-core Parity Status
 
 **Crate**: `henyey`
-**Upstream**: `stellar-core/src/main/` (CLI subset only)
-**Overall Parity**: 54%
-**Last Updated**: 2026-03-17
+**Upstream**: `stellar-core/src/main/`
+**Overall Parity**: 56%
+**Last Updated**: 2026-03-26
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
-| CLI Entrypoint / Dispatch | Full | `main()` + `handleCommandLine()` via clap |
-| Node Operation (`run`) | Full | Watcher/validator/full modes |
-| Catchup (`catchup`) | Full | Minimal/complete/recent modes, parallelism |
-| Database Commands | Full | `new-db`, `upgrade-db` |
-| History Publish (`publish`) | Full | Local and remote (put command) archives |
-| History Verification | Full | `verify-checkpoints`, `verify-history` |
-| Key Generation | Full | `new-keypair` (genSeed equivalent) |
-| HTTP Command | Full | `http-command` to local node |
-| Self-Check | Full | Header chain, bucket hash, crypto benchmark |
-| Dump Ledger | Full | `dump-ledger` with type/modified filters |
-| Apply Load | Full | `apply-load` with ledger-limits and max-sac-tps modes |
-| Load Generation | Full | `generateLoad` via HTTP command handler bridge |
-| Quorum Intersection | Partial | V1 brute-force only; V2 SAT-solver not implemented |
-| Key/Crypto Utilities | Partial | `convert-id` implemented; `sec-to-pub`, `sign-transaction` not yet |
-| XDR Tools | None | `decode-xdr`/`encode-xdr` removed; `dump-xdr` not implemented |
-| Diagnostic CLI Commands | None | `diag-bucket-stats`, `merge-bucketlist`, `dump-archival-stats` etc. |
-| Settings Upgrade Transactions | None | `get-settings-upgrade-txs` not implemented |
+| CLI entrypoint and dispatch | Full | `clap`-based dispatch covers the core command flow |
+| Node lifecycle commands | Full | `run`, `catchup`, `publish`, `new-db`, `upgrade-db` work |
+| History and offline admin | Full | `new-hist`, `offline-info`, `verify-checkpoints` implemented |
+| HTTP/admin compatibility | Full | `http-command`, `self-check`, `dump-ledger`, `force-scp` implemented |
+| Key and ID helpers | Full | `convert-id` and seed generation both exist |
+| Quorum intersection analysis | Partial | V1 JSON check only; SAT solver path absent |
+| Settings upgrade transactions | Partial | Command exists, but helper behavior diverges in details |
+| Load and benchmark tooling | Partial | `apply-load` exists; `pregenerate-loadgen-txs` absent |
+| XDR inspection and signing tools | None | `print-xdr`, `dump-xdr`, `sign-transaction` absent |
+| Diagnostic maintenance commands | None | Bucket, archival, asset-supply diagnostics absent |
+| History/reporting extras | None | Publish-queue and last-checkpoint reporting absent |
 
 ## File Mapping
 
 | stellar-core File | Rust Module | Notes |
 |--------------------|-------------|-------|
-| `CommandLine.h` / `CommandLine.cpp` | `main.rs` | CLI commands and argument parsing |
-| `main.cpp` | `main.rs` | Process entrypoint, initialization |
-| `ApplicationUtils.h` / `ApplicationUtils.cpp` | `main.rs` | run, catchup, publish, selfCheck, dumpLedger |
-| `StellarCoreVersion.h` | `main.rs` (via `clap` version) | Version string |
-| `dumpxdr.h` / `dumpxdr.cpp` | -- | Removed from Rust; was partial |
+| `main.cpp` | `main.rs` | Process entrypoint and startup wiring |
+| `CommandLine.h` / `CommandLine.cpp` | `main.rs` | CLI parsing, dispatch, and top-level command handlers |
+| `ApplicationUtils.h` / `ApplicationUtils.cpp` | `main.rs` | CLI command wrappers delegate into `henyey-app` and sibling crates |
+| `SettingsUpgradeUtils.h` / `SettingsUpgradeUtils.cpp` | `settings_upgrade.rs` | Soroban settings-upgrade transaction builder |
+| `dumpxdr.h` / `dumpxdr.cpp` | `main.rs`, `settings_upgrade.rs` | Generic XDR tools are missing; only settings-upgrade signing pieces were ported |
 
 ## Component Mapping
 
-### CLI Entrypoint (`main.rs`)
+### CLI Core (`main.rs`)
 
 Corresponds to: `CommandLine.h`, `main.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `main()` | `main()` | Full |
-| `handleCommandLine()` | `main()` + clap dispatch | Full |
+| `handleCommandLine()` | `Cli::parse()` + command dispatch in `main()` | Full |
 | `runVersion()` | `cmd_version()` | Full |
-| `writeWithTextFlow()` | clap help formatting | Full |
-| `checkXDRFileIdentity()` | -- | Omitted |
-| `checkStellarCoreMajorVersionProtocolIdentity()` | -- | Omitted |
+| `writeWithTextFlow()` | `clap` help generation | Full |
 
-### CLI Commands (`main.rs`)
+### Operational Commands (`main.rs`)
 
-Corresponds to: `CommandLine.cpp`
-
-#### Node Operation
+Corresponds to: `CommandLine.cpp`, `ApplicationUtils.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `run()` | `cmd_run()` | Full |
-| `runCatchup()` | `cmd_catchup()` | Full |
-| `runNewDB()` | `cmd_new_db()` | Full |
+| `run()` / `setupApp()` / `runApp()` | `cmd_run()` | Full |
+| `runCatchup()` / `catchup()` | `cmd_catchup()` | Full |
+| `runNewDB()` / `initializeDatabase()` | `cmd_new_db()` | Full |
 | `runUpgradeDB()` | `cmd_upgrade_db()` | Full |
-| `runPublish()` | `cmd_publish_history()` | Full |
-| `runOfflineInfo()` | `cmd_offline_info()` | Full |
-| `runSelfCheck()` | `cmd_self_check()` | Full |
-| `runHttpCommand()` | `cmd_http_command()` | Full |
-
-#### History and Verification
-
-| stellar-core | Rust | Status |
-|--------------|------|--------|
+| `runPublish()` / `publish()` | `cmd_publish_history()` | Full |
 | `runWriteVerifiedCheckpointHashes()` | `cmd_verify_checkpoints()` | Full |
-| `runCheckQuorumIntersection()` | `cmd_check_quorum_intersection()` | Partial |
-| `runNewHist()` | `cmd_new_hist()` | Full |
-| `runReportLastHistoryCheckpoint()` | -- | None |
-| `runPrintPublishQueue()` | -- | None |
-
-#### Key and Crypto Utilities
-
-| stellar-core | Rust | Status |
-|--------------|------|--------|
-| `runGenSeed()` | `cmd_new_keypair()` | Full |
+| `runNewHist()` / `initializeHistories()` | `cmd_new_hist()` | Full |
+| `runOfflineInfo()` / `showOfflineInfo()` | `cmd_offline_info()` | Full |
+| `runHttpCommand()` / `httpCommand()` | `cmd_http_command()` | Full |
+| `runSelfCheck()` / `selfCheck()` | `cmd_self_check()` | Full |
+| `runDumpLedger()` / `dumpLedger()` | `cmd_dump_ledger()` | Full |
+| `runForceSCP()` / `setForceSCPFlag()` | `cmd_force_scp()` | Full |
 | `runConvertId()` | `cmd_convert_id()` | Full |
-| `runSecToPub()` | -- | None |
-| `runSignTransaction()` | -- | None |
-
-#### XDR and Diagnostic Tools
-
-| stellar-core | Rust | Status |
-|--------------|------|--------|
-| `runDumpLedger()` | `cmd_dump_ledger()` | Full |
-| `runPrintXdr()` | -- | None |
-| `runEncodeAsset()` | -- | None |
-| `runDumpXDR()` | -- | None |
-| `runDumpWasm()` | -- | None |
-| `diagBucketStats()` | -- | None |
-| `runMergeBucketList()` | -- | None |
-| `runDumpStateArchivalStatistics()` | -- | None |
-
-#### Load Testing
-
-| stellar-core | Rust | Status |
-|--------------|------|--------|
+| `runGenSeed()` / `genSeed()` | `cmd_new_keypair()` | Full |
 | `runApplyLoad()` | `cmd_apply_load()` | Full |
-| `runGenerateSyntheticLoad()` | `loadgen_runner::SimulationLoadGenRunner` | Full |
-
-#### Other Commands
-
-| stellar-core | Rust | Status |
-|--------------|------|--------|
-| `runForceSCP()` | `cmd_force_scp()` | Full |
-| `runReplayDebugMeta()` | -- | None |
-| `getSettingsUpgradeTransactions()` | -- | None |
 
 ### Quorum Intersection (`quorum_intersection.rs`)
 
-Corresponds to: `CommandLine.cpp` (`runCheckQuorumIntersection`)
+Corresponds to: `CommandLine.cpp` (`runCheckQuorumIntersection`), `ApplicationUtils.h` (`checkQuorumIntersectionFromJson`)
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| V1 brute-force intersection check | `check_quorum_intersection_from_json()` | Full |
-| V2 SAT-based intersection check | -- | None |
-| `--analyze-critical-groups` | -- | None |
-| `--time-limit-ms` / `--memory-limit-bytes` | -- | None |
-| `--result-json` output | -- | None |
+| `runCheckQuorumIntersection()` / `checkQuorumIntersectionFromJson()` | `check_quorum_intersection_from_json()` | Partial |
 
-### XDR Utilities
+### Settings Upgrade Transactions (`settings_upgrade.rs`)
 
-Corresponds to: `dumpxdr.h` / `dumpxdr.cpp`
+Corresponds to: `SettingsUpgradeUtils.h`, `CommandLine.cpp` (`getSettingsUpgradeTransactions`)
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `dumpXdrStream()` | -- | None |
-| `printXdr()` | -- | None |
-| `signtxns()` | -- | None |
-| `signtxn()` | -- | None |
-| `priv2pub()` | -- | None |
-| `readFile()` | -- | None |
+| `getSettingsUpgradeTransactions()` + `getWasmRestoreTx()` + `getUploadTx()` + `getCreateTx()` + `getInvokeTx()` | `settings_upgrade::run()` and helpers | Partial |
+
+### Diagnostics and XDR Tools (`main.rs`)
+
+Corresponds to: `CommandLine.cpp`, `dumpxdr.h`
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `runPrintPublishQueue()` | -- | None |
+| `runReportLastHistoryCheckpoint()` | -- | None |
+| `runReplayDebugMeta()` | -- | None |
+| `runGenerateSyntheticLoad()` (`pregenerate-loadgen-txs`) | -- | None |
+| `runCalculateAssetSupply()` | -- | None |
+| `runMergeBucketList()` | -- | None |
+| `runDumpStateArchivalStatistics()` | -- | None |
+| `runDumpWasm()` | -- | None |
+| `runPrintXdr()` / `printXdr()` | -- | None |
+| `runDumpXDR()` / `dumpXdrStream()` | -- | None |
+| `runEncodeAsset()` | -- | None |
+| `runSecToPub()` / `priv2pub()` | -- | None |
+| `runSignTransaction()` / `signtxn()` / `signtxns()` | -- | None |
 
 ## Intentional Omissions
 
@@ -147,13 +108,14 @@ Features excluded by design. These are NOT counted against parity %.
 
 | stellar-core Component | Reason |
 |------------------------|--------|
-| `checkXDRFileIdentity()` | Pure Rust implementation has no C++/Rust XDR bridge to validate |
-| `checkStellarCoreMajorVersionProtocolIdentity()` | Different versioning scheme; Rust uses Cargo.toml version |
-| `runLoadXDR()` (BUILD_TESTS) | Test-only; Rust test framework used instead |
-| `runRebuildLedgerFromBuckets()` (BUILD_TESTS) | Test-only infrastructure |
-| `runFuzz()` / `runGenFuzz()` (BUILD_TESTS) | Would use `cargo-fuzz` if needed |
-| `runTest()` (BUILD_TESTS) | Uses `cargo test` instead |
-| Tracy memory tracking | C++-specific profiling; Rust uses different tooling |
+| `checkXDRFileIdentity()` | Pure Rust build uses one XDR stack, so C++/Rust hash cross-checks are unnecessary |
+| `checkStellarCoreMajorVersionProtocolIdentity()` | Cargo versioning and protocol gating replace upstream release-tag validation |
+| `loadXdr()` / `rebuildLedgerFromBuckets()` | `BUILD_TESTS`-only utilities; workspace uses regular Rust tests instead |
+| `runFuzz()` / `runGenFuzz()` / `runTest()` | Fuzzing and test execution are handled by Cargo tooling, not the binary |
+| `minimalDBForInMemoryMode()` / `canRebuildInMemoryLedgerFromBuckets()` | In-memory mode is deprecated and intentionally unsupported |
+| `setAuthenticatedLedgerHashPair()` | `--start-at-ledger` and `--start-at-hash` are accepted only as no-op compat flags |
+| `applyBucketsForLCL()` | Ledger rebuild internals live in lower crates rather than the CLI binary |
+| `getStellarCoreMajorReleaseVersion()` | Helper is unnecessary because `cmd_version()` emits Rust-owned version strings directly |
 
 ## Gaps
 
@@ -161,73 +123,62 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `runSecToPub()` / `priv2pub()` | Medium | Derive public key from secret (removed from Rust, should re-add) |
-| `runSignTransaction()` / `signtxn()` | Medium | Sign a transaction envelope (removed from Rust, should re-add) |
-| `runPrintXdr()` / `printXdr()` | Low | Decode and pretty-print XDR (removed from Rust) |
-| `runEncodeAsset()` | Low | Encode asset to XDR (removed from Rust) |
-| `runReplayDebugMeta()` | Low | Apply ledgers from local debug metadata files |
-| `runDumpXDR()` / `dumpXdrStream()` | Low | Stream and dump XDR files |
-| `runDumpWasm()` | Low | Dump WASM blobs from ledger state |
-| `diagBucketStats()` | Low | Per-account bucket statistics |
-| `runMergeBucketList()` | Low | Write diagnostic merged bucket list |
-| `runDumpStateArchivalStatistics()` | Low | Print state archival statistics |
-| `runReportLastHistoryCheckpoint()` | Low | Report info about last archive checkpoint |
-| `getSettingsUpgradeTransactions()` | Low | Generate settings upgrade transaction set |
-| `runPrintPublishQueue()` | Low | Print scheduled publish checkpoints |
-| V2 SAT-based quorum intersection | Medium | `check-quorum-intersection --v2` with SAT solver |
-| `signtxns()` (batch sign) | Low | Batch transaction signing |
-| `readFile()` | Low | Generic XDR file reader |
+| `runCheckQuorumIntersection()` V2 mode | Medium | Missing `--v2`, SAT solver, result JSON, critical-groups, and resource limits |
+| `getSettingsUpgradeTransactions()` parity details | Medium | No upstream-style `ConfigUpgradeSet` validation; contract salt is fixed instead of generated |
+| `runSecToPub()` / `priv2pub()` | Medium | No dedicated secret-to-public compatibility command |
+| `runSignTransaction()` / `signtxn()` / `signtxns()` | Medium | Generic transaction signing CLI is absent outside settings-upgrade flow |
+| `runPrintXdr()` / `runDumpXDR()` / `runEncodeAsset()` | Low | XDR inspection and encoding helpers are not exposed |
+| `runDumpWasm()` | Low | No CLI to extract WASM blobs from ledger state |
+| `runMergeBucketList()` / `runDumpStateArchivalStatistics()` / `runCalculateAssetSupply()` / `diagBucketStats()` | Low | Diagnostic maintenance commands are still missing |
+| `runPrintPublishQueue()` / `runReportLastHistoryCheckpoint()` | Low | Archive/reporting helper commands are not implemented |
+| `runReplayDebugMeta()` | Low | No local debug-meta replay path |
+| `runGenerateSyntheticLoad()` (`pregenerate-loadgen-txs`) | Low | No standalone transaction pre-generation command |
 
 ## Architectural Differences
 
-1. **CLI Framework**
-   - **stellar-core**: Uses `clara` (lightweight C++ argument parser) with manual command registration and help formatting.
-   - **Rust**: Uses `clap` with derive macros for declarative command definitions and automatic help generation.
-   - **Rationale**: `clap` is the standard Rust CLI framework and provides better ergonomics, auto-completion, and type safety.
+1. **CLI framework**
+   - **stellar-core**: Uses `clara` with manually registered command handlers.
+   - **Rust**: Uses `clap` derive parsing and enum-based dispatch.
+   - **Rationale**: `clap` is the idiomatic Rust choice and keeps the command surface centralized.
 
-2. **Command Organization**
-   - **stellar-core**: All commands are flat at the top level (`stellar-core <command>`).
-   - **Rust**: All commands are also flat at the top level. Previously had an `offline` subcommand grouping but this was flattened to match stellar-core's approach.
-   - **Rationale**: Flat commands are simpler and match the upstream CLI experience.
+2. **Delegation boundary**
+   - **stellar-core**: `src/main/` owns both CLI glue and much of the application bootstrapping logic.
+   - **Rust**: `crates/henyey` stays thin and delegates most runtime work to `henyey-app`, `henyey-history`, and related crates.
+   - **Rationale**: The workspace splits orchestration, ledger logic, and CLI wiring into separate crates for maintainability.
 
-3. **Configuration Loading**
-   - **stellar-core**: Uses `ConfigOption` struct with per-command config parsing; config file defaults to `stellar-core.cfg`.
-   - **Rust**: Global `--config`, `--testnet`, `--mainnet` flags parsed before command dispatch; supports TOML with built-in network defaults.
-   - **Rationale**: Global config flags are simpler and avoid repetition across commands.
+3. **Startup validation**
+   - **stellar-core**: Performs explicit XDR identity and release/protocol checks during process startup.
+   - **Rust**: Relies on a single Rust XDR implementation and compile-time workspace versioning.
+   - **Rationale**: The Rust binary has no mixed-language bridge that needs runtime identity validation.
 
-4. **Process Initialization**
-   - **stellar-core**: `main.cpp` performs XDR identity checks, sodium init, backtrace setup, and version/protocol identity verification before dispatching commands.
-   - **Rust**: `main()` initializes logging and loads config; no XDR identity checks needed (pure Rust, single XDR crate). Signal handlers and panic hooks are set up by the Rust runtime.
-   - **Rationale**: Pure Rust eliminates the need for C++/Rust XDR bridge validation. Rust's panic infrastructure replaces explicit backtrace management.
+4. **Runtime model**
+   - **stellar-core**: Runs command handlers on a synchronous virtual-clock stack.
+   - **Rust**: Uses `tokio` and async command handlers for networked operations.
+   - **Rationale**: Async I/O is the natural fit for Rust service code and keeps compatibility servers simple.
 
-5. **Async Runtime**
-   - **stellar-core**: Synchronous command execution (blocking I/O via `asio`/virtual clock).
-   - **Rust**: `#[tokio::main]` with async command handlers for network operations.
-   - **Rationale**: Rust's async ecosystem is idiomatic and provides native non-blocking I/O.
-
-6. **CDP Integration (Rust-only)**
-   - **stellar-core**: No equivalent offline verification tools.
-   - **Rust**: `verify-execution` and `debug-bucket-entry` commands compare transaction execution against CDP (Crypto Data Platform) metadata from stellar-core production data.
-   - **Rationale**: These tools provide parity testing against production stellar-core output without requiring a live network connection.
+5. **Settings-upgrade transaction generation**
+   - **stellar-core**: Builds upgrade transactions with upstream validation helpers and a generated contract salt.
+   - **Rust**: Bundles the same upgrade WASM and fee structure, but uses a fixed salt and skips upstream validation checks.
+   - **Rationale**: The command was ported for practical compatibility first; exact helper parity is still incomplete.
 
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| CLI Parsing | 0 TEST_CASE | 8 #[test] | Rust has explicit CLI parsing + loadgen mode tests |
-| Config | 8 TEST_CASE / 18 SECTION | 0 #[test] | Config tests are in `henyey-app` crate |
-| Command Handler | 3 TEST_CASE / 25 SECTION | 0 #[test] | HTTP handler tests in `henyey-app` |
-| Application Utils | 4 TEST_CASE / 5 SECTION | 0 #[test] | Catchup/run logic tested via integration |
-| Self-Check | 1 TEST_CASE | 0 #[test] | Self-check tested manually |
-| Query Server | 1 TEST_CASE / 9 SECTION | 0 #[test] | No query server in Rust |
-| Quorum Intersection | 0 TEST_CASE | 5 #[test] | Rust has dedicated quorum intersection tests |
-| Load Generation | 0 TEST_CASE | 3 #[test] | Loadgen runner parse_mode tests |
+| CLI parsing and dispatch | 0 TEST_CASE / 0 SECTION | 5 `#[test]` | Basic `clap` command parsing is covered |
+| Load-generation mode parsing | 0 TEST_CASE / 0 SECTION | 5 `#[test]` | Covers compatibility spellings and deprecated `create` mode |
+| Application-utils style helpers | 4 TEST_CASE / 5 SECTION | 6 `#[test]` | Rust focuses on genesis/database helper behavior |
+| Config and command-handler compatibility | 14 TEST_CASE / 48 SECTION | 0 `#[test]` | Most equivalent coverage lives in `henyey-app`, not this crate |
+| Self-check | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No direct regression tests for the CLI command |
+| Quorum intersection | 0 TEST_CASE / 0 SECTION | 5 `#[test]` | Only the V1 JSON path is exercised |
+| Settings upgrade transactions | 0 TEST_CASE / 0 SECTION | 0 `#[test]` | No direct coverage for `get-settings-upgrade-txs` yet |
 
 ### Test Gaps
 
-- **Config tests**: stellar-core has 8 TEST_CASE with 18 SECTIONs for configuration parsing and validation. Config testing in Rust is handled in the `henyey-app` crate, not in this CLI crate.
-- **Command handler tests**: stellar-core has 3 TEST_CASE with 25 SECTIONs for HTTP command handler behavior. These tests exist in `henyey-app` for the Rust implementation.
-- **Application utils tests**: stellar-core tests catchup configuration parsing, version extraction, and related utilities. Not covered in the CLI crate.
+- `get-settings-upgrade-txs` has no crate-local regression tests, despite several parity-sensitive fee and XDR details.
+- `check-quorum-intersection` only tests the brute-force V1 path; none of the missing V2/JSON-output behavior is covered.
+- `self-check`, `print-publish-queue`, and `report-last-history-checkpoint` have no direct CLI-crate tests.
+- Compatibility-heavy config and HTTP command behavior is tested mainly in `henyey-app`, leaving this crate light on end-to-end command coverage.
 
 ## Verification Results
 
@@ -279,12 +230,7 @@ The `verify-execution` tool compares transaction execution against CDP (Crypto D
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 20 |
-| Gaps (None + Partial) | 17 |
-| Intentional Omissions | 7 |
-| **Parity** | **20 / (20 + 17) = 54%** |
-
-Note: Parity increased from 51% to 54% because `apply-load` and `generate-load`
-(synthetic load generation) were implemented. Previously listed as intentional
-omissions ("Benchmarking infrastructure; out of scope"), both are now fully functional
-via `cmd_apply_load()` and the `loadgen_runner::SimulationLoadGenRunner` module.
+| Implemented (Full) | 19 |
+| Gaps (None + Partial) | 15 |
+| Intentional Omissions | 8 |
+| **Parity** | **19 / (19 + 15) = 56%** |

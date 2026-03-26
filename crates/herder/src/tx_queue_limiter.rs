@@ -17,7 +17,7 @@ use henyey_common::{NetworkId, Resource};
 use henyey_tx::TransactionFrame;
 
 use crate::surge_pricing::{
-    DexLimitingLaneConfig, SorobanGenericLaneConfig, SurgePricingLaneConfig,
+    DexLimitingLaneConfig, QueueEntry, SorobanGenericLaneConfig, SurgePricingLaneConfig,
     SurgePricingPriorityQueue, VisitTxResult, GENERIC_LANE,
 };
 use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
@@ -113,6 +113,29 @@ pub struct TxQueueLimiter {
 }
 
 impl TxQueueLimiter {
+    fn lane_config(&self) -> Box<dyn SurgePricingLaneConfig + Send + Sync> {
+        if self.is_soroban {
+            Box::new(SorobanGenericLaneConfig::new(self.max_resources.clone()))
+        } else {
+            Box::new(DexLimitingLaneConfig::new(
+                self.max_resources.clone(),
+                self.max_dex_operations.clone(),
+            ))
+        }
+    }
+
+    fn make_queue(&self, seed: u64) -> SurgePricingPriorityQueue {
+        SurgePricingPriorityQueue::new(self.lane_config(), seed)
+    }
+
+    fn frame_for(&self, tx: &QueuedTransaction) -> TransactionFrame {
+        TransactionFrame::from_owned_with_network(tx.envelope.clone(), self.network_id)
+    }
+
+    fn queue_entry(tx: &QueuedTransaction) -> QueueEntry {
+        QueueEntry::new(tx.clone(), 0)
+    }
+
     /// Create a new transaction queue limiter.
     ///
     /// # Arguments
@@ -169,47 +192,17 @@ impl TxQueueLimiter {
 
     /// Reset the transaction queue with new limits.
     pub fn reset(&mut self, _ledger_version: u32) {
-        let lane_config: Box<dyn SurgePricingLaneConfig + Send + Sync> = if self.is_soroban {
-            Box::new(SorobanGenericLaneConfig::new(self.max_resources.clone()))
-        } else {
-            Box::new(DexLimitingLaneConfig::new(
-                self.max_resources.clone(),
-                self.max_dex_operations.clone(),
-            ))
-        };
-
         let seed = rand::random::<u64>();
-        self.txs = Some(SurgePricingPriorityQueue::new(
-            Box::new(DexLimitingLaneConfig::new(
-                self.max_resources.clone(),
-                self.max_dex_operations.clone(),
-            )),
-            seed,
-        ));
-        self.lane_config = Some(lane_config);
+        self.txs = Some(self.make_queue(seed));
+        self.lane_config = Some(self.lane_config());
         self.reset_eviction_state();
     }
 
     /// Reset the flood priority queue.
     pub fn reset_best_fee_txs(&mut self, _ledger_version: u32, seed: u64) {
-        let lane_config: Box<dyn SurgePricingLaneConfig + Send + Sync> = if self.is_soroban {
-            Box::new(SorobanGenericLaneConfig::new(self.max_resources.clone()))
-        } else {
-            Box::new(DexLimitingLaneConfig::new(
-                self.max_resources.clone(),
-                self.max_dex_operations.clone(),
-            ))
-        };
-
         // For flood queue, we want highest priority first (different seed for tie-breaking)
-        self.txs_to_flood = Some(SurgePricingPriorityQueue::new(
-            Box::new(DexLimitingLaneConfig::new(
-                self.max_resources.clone(),
-                self.max_dex_operations.clone(),
-            )),
-            seed,
-        ));
-        self.flood_lane_config = Some(lane_config);
+        self.txs_to_flood = Some(self.make_queue(seed));
+        self.flood_lane_config = Some(self.lane_config());
     }
 
     /// Reset eviction state tracking.
@@ -228,7 +221,7 @@ impl TxQueueLimiter {
     /// Panics if the transaction type (Soroban vs classic) doesn't match
     /// the limiter configuration.
     pub fn add_transaction(&mut self, tx: &QueuedTransaction, ledger_version: u32) {
-        let frame = TransactionFrame::from_owned_with_network(tx.envelope.clone(), self.network_id);
+        let frame = self.frame_for(tx);
         assert_eq!(
             frame.is_soroban(),
             self.is_soroban,
@@ -247,7 +240,7 @@ impl TxQueueLimiter {
 
     /// Remove a transaction from the limiter.
     pub fn remove_transaction(&mut self, tx: &QueuedTransaction, ledger_version: u32) {
-        let frame = TransactionFrame::from_owned_with_network(tx.envelope.clone(), self.network_id);
+        let frame = self.frame_for(tx);
         let lane = self
             .lane_config
             .as_ref()
@@ -256,11 +249,11 @@ impl TxQueueLimiter {
 
         if let Some(ref mut txs) = self.txs {
             // Create a queue entry to find and remove
-            let entry = crate::surge_pricing::QueueEntry::new(tx.clone(), 0);
+            let entry = Self::queue_entry(tx);
             txs.remove_entry(lane, &entry, ledger_version, &self.network_id);
         }
         if let Some(ref mut flood) = self.txs_to_flood {
-            let entry = crate::surge_pricing::QueueEntry::new(tx.clone(), 0);
+            let entry = Self::queue_entry(tx);
             flood.remove_entry(lane, &entry, ledger_version, &self.network_id);
         }
     }
@@ -290,8 +283,7 @@ impl TxQueueLimiter {
         ledger_version: u32,
         broadcast_seed: u64,
     ) -> (bool, i64) {
-        let frame =
-            TransactionFrame::from_owned_with_network(new_tx.envelope.clone(), self.network_id);
+        let frame = self.frame_for(new_tx);
         assert_eq!(
             frame.is_soroban(),
             self.is_soroban,
@@ -299,8 +291,7 @@ impl TxQueueLimiter {
         );
 
         if let Some(old) = old_tx {
-            let old_frame =
-                TransactionFrame::from_owned_with_network(old.envelope.clone(), self.network_id);
+            let old_frame = self.frame_for(old);
             assert_eq!(
                 old_frame.is_soroban(),
                 frame.is_soroban(),
@@ -350,8 +341,7 @@ impl TxQueueLimiter {
 
         // Calculate old tx discount for replace-by-fee
         let old_tx_discount = old_tx.map(|old| {
-            let old_frame =
-                TransactionFrame::from_owned_with_network(old.envelope.clone(), self.network_id);
+            let old_frame = self.frame_for(old);
             self.lane_config
                 .as_ref()
                 .map(|c| c.tx_resources(&old_frame, ledger_version))
@@ -393,8 +383,7 @@ impl TxQueueLimiter {
     ) where
         F: FnMut(&QueuedTransaction),
     {
-        let frame =
-            TransactionFrame::from_owned_with_network(tx_to_fit.envelope.clone(), self.network_id);
+        let frame = self.frame_for(tx_to_fit);
         let tx_to_fit_lane = self
             .lane_config
             .as_ref()
@@ -408,8 +397,7 @@ impl TxQueueLimiter {
             .unwrap_or_else(|| Resource::new(vec![tx_to_fit.op_count as i64]));
 
         for (tx, evicted_due_to_lane_limit) in txs_to_evict {
-            let evict_frame =
-                TransactionFrame::from_owned_with_network(tx.envelope.clone(), self.network_id);
+            let evict_frame = self.frame_for(tx);
             let evict_lane = self
                 .lane_config
                 .as_ref()

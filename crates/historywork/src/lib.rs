@@ -52,17 +52,24 @@
 //!
 //! ```rust,ignore
 //! use henyey_historywork::{HistoryWorkBuilder, SharedHistoryState};
-//! use henyey_work::WorkScheduler;
+//! use henyey_work::{WorkScheduler, WorkSchedulerConfig};
+//! use std::path::PathBuf;
 //!
 //! // Create shared state for work items
 //! let state: SharedHistoryState = Default::default();
 //!
 //! // Build and register work items
-//! let builder = HistoryWorkBuilder::new(archive, checkpoint, state.clone());
+//! let builder = HistoryWorkBuilder::new(
+//!     archive,
+//!     checkpoint,
+//!     state.clone(),
+//!     PathBuf::from("/tmp/buckets"),
+//! );
+//! let mut scheduler = WorkScheduler::new(WorkSchedulerConfig::default());
 //! let work_ids = builder.register(&mut scheduler);
 //!
 //! // Run the scheduler to completion
-//! scheduler.run_to_completion().await?;
+//! scheduler.run_until_done().await;
 //!
 //! // Extract downloaded data for catchup
 //! let checkpoint_data = build_checkpoint_data(&state).await?;
@@ -921,6 +928,9 @@ fn serialize_entries<T: WriteXdr>(entries: &[T]) -> Result<Vec<u8>> {
 /// `MAX_CONCURRENT_SUBPROCESSES` limit.
 const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 
+/// Publish work retries, matching the crate's current mirror-upload policy.
+const PUBLISH_RETRIES: u32 = 2;
+
 /// Returns non-empty, non-zero bucket hashes from a History Archive State.
 ///
 /// Filters out the zero hash and the hash of the empty bucket, which are
@@ -942,10 +952,6 @@ fn find_header<'a>(
         .iter()
         .find(|header| header.header.ledger_seq == ledger_seq)
         .ok_or_else(|| format!("no header found for {missing_label} at ledger {ledger_seq}"))
-}
-
-fn checkpoint_frequency() -> u32 {
-    henyey_history::checkpoint_frequency()
 }
 
 /// The well-known path for stellar history (``.well-known/stellar-history.json``).
@@ -1283,7 +1289,7 @@ impl Work for PublishBucketsWork {
 /// );
 ///
 /// let id = scheduler.add_work(Box::new(work), vec![], RETRY_A_FEW);
-/// scheduler.run_to_completion().await?;
+/// scheduler.run_until_done().await;
 /// ```
 pub struct CheckSingleLedgerHeaderWork {
     archive: Arc<HistoryArchive>,
@@ -1432,7 +1438,7 @@ pub struct PublishWorkIds {
 /// let publish_ids = builder.register_publish(&mut scheduler, writer, download_ids);
 ///
 /// // Run all work to completion
-/// scheduler.run_to_completion().await?;
+/// scheduler.run_until_done().await;
 ///
 /// // Build checkpoint data from completed downloads
 /// let data = build_checkpoint_data(&state).await?;
@@ -1579,7 +1585,7 @@ impl HistoryWorkBuilder {
                 Arc::clone(&self.state),
             )),
             vec![deps.has],
-            2,
+            PUBLISH_RETRIES,
         );
 
         let buckets_id = scheduler.add_work(
@@ -1588,7 +1594,7 @@ impl HistoryWorkBuilder {
                 Arc::clone(&self.state),
             )),
             vec![deps.buckets],
-            2,
+            PUBLISH_RETRIES,
         );
 
         let headers_id = scheduler.add_work(
@@ -1599,7 +1605,7 @@ impl HistoryWorkBuilder {
                 HistoryFileType::Ledger,
             )),
             vec![deps.headers],
-            2,
+            PUBLISH_RETRIES,
         );
 
         let transactions_id = scheduler.add_work(
@@ -1610,7 +1616,7 @@ impl HistoryWorkBuilder {
                 HistoryFileType::Transactions,
             )),
             vec![deps.transactions],
-            2,
+            PUBLISH_RETRIES,
         );
 
         let results_id = scheduler.add_work(
@@ -1621,7 +1627,7 @@ impl HistoryWorkBuilder {
                 HistoryFileType::Results,
             )),
             vec![deps.tx_results],
-            2,
+            PUBLISH_RETRIES,
         );
 
         let scp_id = scheduler.add_work(
@@ -1632,7 +1638,7 @@ impl HistoryWorkBuilder {
                 HistoryFileType::Scp,
             )),
             vec![deps.scp_history],
-            2,
+            PUBLISH_RETRIES,
         );
 
         PublishWorkIds {
@@ -1727,7 +1733,7 @@ impl CheckpointRange {
 
     /// Returns the number of checkpoints in this range.
     pub fn count(&self) -> usize {
-        let freq = checkpoint_frequency();
+        let freq = henyey_history::checkpoint_frequency();
         let first_idx = self.first / freq;
         let last_idx = self.last / freq;
         (last_idx - first_idx + 1) as usize
@@ -1735,7 +1741,7 @@ impl CheckpointRange {
 
     /// Returns an iterator over all checkpoint ledger sequences in this range.
     pub fn iter(&self) -> impl Iterator<Item = u32> {
-        let freq = checkpoint_frequency();
+        let freq = henyey_history::checkpoint_frequency();
         (self.first..=self.last).step_by(freq as usize)
     }
 
@@ -1744,7 +1750,7 @@ impl CheckpointRange {
     /// The first ledger is the start of the first checkpoint
     /// and the last ledger is `last` (the end of the last checkpoint).
     pub fn ledger_range(&self) -> (u32, u32) {
-        let freq = checkpoint_frequency();
+        let freq = henyey_history::checkpoint_frequency();
         let first_ledger = if self.first <= freq {
             1
         } else {
@@ -2015,7 +2021,7 @@ async fn download_checkpoint_file(
 /// let state = builder.state();
 /// let ids = builder.register(&mut scheduler);
 ///
-/// scheduler.run_to_completion().await?;
+/// scheduler.run_until_done().await;
 ///
 /// // Access downloaded data from state
 /// let guard = state.lock().await;

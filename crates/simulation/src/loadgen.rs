@@ -320,13 +320,22 @@ impl TxGenerator {
         }
     }
 
+    fn soroban_builder(&self) -> SorobanTxBuilder {
+        SorobanTxBuilder::new(self.network_passphrase.clone())
+    }
+
+    fn next_source_sequence(&mut self, account_id: u64, ledger_num: u32) -> (SecretKey, i64) {
+        let source = self.find_account(account_id, ledger_num);
+        (source.secret_key.clone(), source.next_sequence_number())
+    }
+
     /// Look up or create an account in the cache.
     ///
     /// Matches stellar-core `TxGenerator::findAccount()`.
     /// For the root account, uses the network root secret key.
     /// For numbered accounts, creates a deterministic keypair from `"TestAccount-{id}"`.
     pub fn find_account(&mut self, account_id: u64, ledger_num: u32) -> &mut TestAccount {
-        if !self.accounts.contains_key(&account_id) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.accounts.entry(account_id) {
             let account = if account_id == ROOT_ACCOUNT_ID {
                 let network_id = NetworkId::from_passphrase(&self.network_passphrase);
                 let sk = SecretKey::from_seed(network_id.as_bytes());
@@ -351,7 +360,7 @@ impl TxGenerator {
                 }
                 account
             };
-            self.accounts.insert(account_id, account);
+            entry.insert(account);
         }
         self.accounts.get_mut(&account_id).unwrap()
     }
@@ -539,10 +548,8 @@ impl TxGenerator {
         let wasm_size = DEFAULT_WASM_SIZE;
         let wasm =
             SorobanTxBuilder::random_wasm(wasm_size, deterministic_rand(account_id, ledger_num));
-        let source = self.find_account(account_id, ledger_num);
-        let seq = source.next_sequence_number();
-        let sk = source.secret_key.clone();
-        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
+        let builder = self.soroban_builder();
         let envelope = builder.upload_wasm_tx(&sk, seq, &wasm, inclusion_fee)?;
         Ok((account_id, envelope))
     }
@@ -558,10 +565,8 @@ impl TxGenerator {
         max_fee_rate: Option<u32>,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let fee = self.generate_fee(max_fee_rate, 1, account_id);
-        let source = self.find_account(account_id, ledger_num);
-        let seq = source.next_sequence_number();
-        let sk = source.secret_key.clone();
-        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
+        let builder = self.soroban_builder();
         let envelope = builder.upload_wasm_tx(&sk, seq, wasm, fee)?;
         Ok((account_id, envelope))
     }
@@ -578,10 +583,8 @@ impl TxGenerator {
         max_fee_rate: Option<u32>,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let fee = self.generate_fee(max_fee_rate, 1, account_id);
-        let source = self.find_account(account_id, ledger_num);
-        let seq = source.next_sequence_number();
-        let sk = source.secret_key.clone();
-        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
+        let builder = self.soroban_builder();
         let envelope = builder.create_contract_tx(&sk, seq, wasm_hash, salt, fee)?;
         Ok((account_id, envelope))
     }
@@ -634,11 +637,8 @@ impl TxGenerator {
 
         // Refresh the account's sequence number before building (matching stellar-core)
         self.load_account(account_id);
-        let source = self.find_account(account_id, ledger_num);
-        let seq = source.next_sequence_number();
-        let sk = source.secret_key.clone();
-
-        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
+        let builder = self.soroban_builder();
         let envelope = builder.invoke_contract_tx(
             &sk,
             seq,
@@ -669,10 +669,8 @@ impl TxGenerator {
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let id = account_id.unwrap_or(ROOT_ACCOUNT_ID);
         let fee = self.generate_fee(max_fee_rate, 1, id);
-        let source = self.find_account(id, ledger_num);
-        let seq = source.next_sequence_number();
-        let sk = source.secret_key.clone();
-        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let (sk, seq) = self.next_source_sequence(id, ledger_num);
+        let builder = self.soroban_builder();
         let envelope = builder.create_sac_tx(&sk, seq, asset, fee)?;
         Ok((id, envelope))
     }
@@ -692,9 +690,8 @@ impl TxGenerator {
         let fee = self.generate_fee(max_fee_rate, 1, from_account_id);
         let source = self.find_account(from_account_id, ledger_num);
         let from_address = make_account_address(&source.secret_key.public_key());
-        let seq = source.next_sequence_number();
-        let sk = source.secret_key.clone();
-        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let (sk, seq) = (source.secret_key.clone(), source.next_sequence_number());
+        let builder = self.soroban_builder();
         let envelope = builder.invoke_sac_transfer_tx(
             &sk,
             seq,
@@ -728,10 +725,8 @@ impl TxGenerator {
             .into_iter()
             .map(|a| ScVal::Address(a))
             .collect();
-        let source = self.find_account(source_account_id, ledger_num);
-        let seq = source.next_sequence_number();
-        let sk = source.secret_key.clone();
-        let builder = SorobanTxBuilder::new(self.network_passphrase.clone());
+        let (sk, seq) = self.next_source_sequence(source_account_id, ledger_num);
+        let builder = self.soroban_builder();
         let envelope = builder.invoke_batch_transfer_tx(
             &sk,
             seq,

@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-ledger`
 **Upstream**: `stellar-core/src/ledger/`
-**Overall Parity**: 90%
-**Last Updated**: 2026-03-17
+**Overall Parity**: 94%
+**Last Updated**: 2026-03-26
 
 ## Summary
 
@@ -19,7 +19,7 @@
 | Fee / Reserve Calculations | Full | Liabilities, sponsorship |
 | Offer Sorting / Comparison | Full | OfferDescriptor, AssetPair |
 | In-Memory Soroban State | Full | Contract data/code with TTL |
-| Config Upgrade Handling | Full | Validation and application |
+| Config Upgrade Handling | Full | Validation, apply, and protocol upgrade synthesis |
 | LedgerTxn Nested Transactions | Partial | Savepoints cover operation rollback |
 | Parallel Apply / Threading | Partial | Parallel cluster execution via tokio; no ApplyState phase machine |
 | Soroban Metrics | None | No metrics collection |
@@ -201,11 +201,12 @@ Corresponds to: `LedgerManagerImpl.h` (transaction execution), `NetworkConfig.h`
 | `LedgerCloseMetaFrame` construction | Meta building in `execution/meta.rs` | Full |
 | `LedgerCloseMetaFrame::populateTxSet()` | Part of close meta generation | Full |
 | `LedgerCloseMetaFrame::populateEvictedEntries()` | Eviction meta in close pipeline | Full |
-| `SorobanNetworkConfig::createLedgerEntriesForV20()` | Not implemented | None |
-| `SorobanNetworkConfig::createCostTypesForV21()` | Not implemented | None |
-| `SorobanNetworkConfig::createCostTypesForV22()` | Not implemented | None |
-| `SorobanNetworkConfig::createCostTypesForV25()` | Not implemented | None |
-| `SorobanNetworkConfig::createAndUpdateLedgerEntriesForV23()` | Not implemented | None |
+| `SorobanNetworkConfig::createLedgerEntriesForV20()` | `create_ledger_entries_for_v20()` in `manager.rs` | Full |
+| `SorobanNetworkConfig::createCostTypesForV21()` | `create_cost_types_for_v21()` in `manager.rs` | Full |
+| `SorobanNetworkConfig::createCostTypesForV22()` | `create_cost_types_for_v22()` in `manager.rs` | Full |
+| `SorobanNetworkConfig::createCostTypesForV25()` | `create_cost_types_for_v25()` in `manager.rs` | Full |
+| `SorobanNetworkConfig::createAndUpdateLedgerEntriesForV23()` | `create_and_update_ledger_entries_for_v23()` in `manager.rs` | Full |
+| `SorobanNetworkConfig::updateCostTypesForV26()` | Not implemented | None |
 
 ### config_upgrade.rs (`config_upgrade.rs`)
 
@@ -327,6 +328,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `InternalLedgerEntry` / `InternalLedgerKey` (generalized types) | Simplified to direct `LedgerEntry`/`LedgerKey`; sponsorship/seqnum tracked differently |
 | `ThreadInvariant` class | Not needed; Rust ownership model provides thread safety |
 | `LedgerTxn` full nested transaction model | Delta+savepoint model covers all use cases in the execution pipeline |
+| `SorobanNetworkConfig::updateCostTypesForV26()` | Protocol 26 is out of scope; project targets stellar-core v25 parity |
 
 ## Gaps
 
@@ -342,9 +344,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `LedgerManager::syncMetrics()` | Low | Metrics publishing |
 | `LedgerManagerImpl::prefetchTransactionData()` | Low | Performance optimization |
 | `LedgerManagerImpl::setupLedgerCloseMetaStream()` | Low | Debug meta streaming |
-| `SorobanNetworkConfig::createLedgerEntriesForV20()` | Medium | Genesis config initialization |
-| `SorobanNetworkConfig::createCostTypesForV21/V22/V25()` | Medium | Protocol upgrade config creation |
-| `SorobanNetworkConfig::createAndUpdateLedgerEntriesForV23()` | Medium | Protocol 23 upgrade config |
 | `CompleteConstLedgerState` as unified type | Low | Immutable state wrapper |
 
 ## Architectural Differences
@@ -409,13 +408,13 @@ The ledger crate has been verified against testnet for ledger close correctness.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 131 |
-| Gaps (None + Partial) | 14 |
-| Intentional Omissions | 30 |
-| **Parity** | **131 / (131 + 14) = 90%** |
+| Implemented (Full) | 136 |
+| Gaps (None + Partial) | 9 |
+| Intentional Omissions | 31 |
+| **Parity** | **136 / (136 + 9) = 94%** |
 
-The 131 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (21, including `commonPreApply`→`pre_apply`, `preParallelApply`→`pre_apply`, `parallelApply`→`apply_body`), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7).
+The 136 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (21, including `commonPreApply`→`pre_apply`, `preParallelApply`→`pre_apply`, `parallelApply`→`apply_body`), config upgrade (11, including the v20/v21/v22/v23/v25 network-config synthesis paths), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7).
 
-The 14 gap items include: timing utilities (2), metrics methods (2), SorobanNetworkConfig creation functions (5), ApplyState phase machine (1), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), meta streaming (1).
+The 9 gap items include: timing utilities (2), metrics methods (2), ApplyState phase machine (1), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), and meta streaming (1).
 
-The 30 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant), features handled by other crates (catchup, checkpoint ranges, app state machine), and architectural choices (LedgerTxn nested model replaced by delta+savepoint).
+The 31 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant), features handled by other crates (catchup, checkpoint ranges, app state machine), protocol-26-only upgrade helpers, and architectural choices (LedgerTxn nested model replaced by delta+savepoint).

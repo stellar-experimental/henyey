@@ -137,6 +137,20 @@ async fn resolve_peer_list(peers: &[PeerAddress]) -> (Vec<PeerAddress>, bool) {
     (resolved, errors)
 }
 
+fn spawn_dns_resolution(
+    known_peers: Vec<PeerAddress>,
+    preferred_peers: Vec<PeerAddress>,
+) -> JoinHandle<ResolvedPeers> {
+    tokio::spawn(async move {
+        let (known, known_err) = resolve_peer_list(&known_peers).await;
+        let (_pref, pref_err) = resolve_peer_list(&preferred_peers).await;
+        ResolvedPeers {
+            known,
+            errors: known_err || pref_err,
+        }
+    })
+}
+
 /// Compute the ping hash for a given nanosecond timestamp.
 ///
 /// Creates a SHA-256 hash of the timestamp in little-endian bytes, matching
@@ -1043,18 +1057,9 @@ impl OverlayManager {
             let mut dns_next_resolve_at = Instant::now(); // Resolve immediately on first tick
 
             // Trigger initial DNS resolution.
-            let mut dns_resolve_handle: Option<JoinHandle<ResolvedPeers>> = {
-                let kp = config_known_peers.clone();
-                let pp = preferred_peers.clone();
-                Some(tokio::spawn(async move {
-                    let (known, known_err) = resolve_peer_list(&kp).await;
-                    let (_pref, pref_err) = resolve_peer_list(&pp).await;
-                    ResolvedPeers {
-                        known,
-                        errors: known_err || pref_err,
-                    }
-                }))
-            };
+            let mut dns_resolve_handle: Option<JoinHandle<ResolvedPeers>> = Some(
+                spawn_dns_resolution(config_known_peers.clone(), preferred_peers.clone()),
+            );
 
             loop {
                 tokio::select! {
@@ -1129,16 +1134,10 @@ impl OverlayManager {
                 // G7: Trigger new DNS resolution if timer has elapsed and no
                 // resolution is in flight.
                 if dns_resolve_handle.is_none() && Instant::now() >= dns_next_resolve_at {
-                    let kp = config_known_peers.clone();
-                    let pp = preferred_peers.clone();
-                    dns_resolve_handle = Some(tokio::spawn(async move {
-                        let (known, known_err) = resolve_peer_list(&kp).await;
-                        let (_pref, pref_err) = resolve_peer_list(&pp).await;
-                        ResolvedPeers {
-                            known,
-                            errors: known_err || pref_err,
-                        }
-                    }));
+                    dns_resolve_handle = Some(spawn_dns_resolution(
+                        config_known_peers.clone(),
+                        preferred_peers.clone(),
+                    ));
                 }
 
                 let now = Instant::now();

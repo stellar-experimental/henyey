@@ -262,7 +262,6 @@ fn format_unix_timestamp(secs: u64) -> String {
 
 /// Convert days since 1970-01-01 to `(year, month, day)`.
 /// Algorithm from Howard Hinnant's `civil_from_days`.
-#[allow(clippy::manual_range_contains)]
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;

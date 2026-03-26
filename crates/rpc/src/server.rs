@@ -113,10 +113,7 @@ async fn fee_window_poller(
             window_latest + 1
         };
 
-        let metas = match app.database().with_connection(|conn| {
-            use henyey_db::LedgerCloseMetaQueries;
-            conn.load_ledger_close_metas_in_range(start, current_ledger + 1, retention)
-        }) {
+        let metas = match load_fee_window_metas(&app, start, current_ledger + 1, retention) {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to load LCMs for fee window");
@@ -124,13 +121,9 @@ async fn fee_window_poller(
             }
         };
 
-        let mut gap_found = false;
         if let Err(e) = ingest_metas_with_gap_recovery(&windows, &metas) {
             tracing::warn!(error = %e, "Multiple gaps in LCM data");
             windows.reset();
-            gap_found = true;
-        }
-        if gap_found {
             // Already handled the gap above, continue to next poll cycle
             continue;
         }
@@ -170,12 +163,7 @@ fn bulk_load_fees(app: &App, windows: &FeeWindows, retention: u32) -> Result<(),
     }
 
     let start = current.saturating_sub(retention).max(1);
-    let metas = app
-        .database()
-        .with_connection(|conn| {
-            use henyey_db::LedgerCloseMetaQueries;
-            conn.load_ledger_close_metas_in_range(start, current + 1, retention)
-        })
+    let metas = load_fee_window_metas(app, start, current + 1, retention)
         .map_err(|e| format!("DB error loading LCMs: {e}"))?;
 
     tracing::info!(
@@ -192,6 +180,22 @@ fn bulk_load_fees(app: &App, windows: &FeeWindows, retention: u32) -> Result<(),
     Ok(())
 }
 
+fn load_fee_window_metas(
+    app: &App,
+    start: u32,
+    end: u32,
+    retention: u32,
+) -> Result<Vec<(u32, Vec<u8>)>, henyey_db::DbError> {
+    app.database().with_connection(|conn| {
+        use henyey_db::LedgerCloseMetaQueries;
+        conn.load_ledger_close_metas_in_range(start, end, retention)
+    })
+}
+
+fn ok_json_response(resp: JsonRpcResponse) -> (StatusCode, Json<JsonRpcResponse>) {
+    (StatusCode::OK, Json(resp))
+}
+
 /// Single axum handler for all JSON-RPC requests.
 async fn rpc_handler(
     State(ctx): State<Arc<RpcContext>>,
@@ -199,36 +203,33 @@ async fn rpc_handler(
 ) -> (StatusCode, Json<JsonRpcResponse>) {
     // Reject batch requests (JSON arrays)
     if body.first().copied() == Some(b'[') {
-        let resp = JsonRpcResponse::error(
+        return ok_json_response(JsonRpcResponse::error(
             serde_json::Value::Null,
             JsonRpcError::invalid_request("batch requests are not supported"),
-        );
-        return (StatusCode::OK, Json(resp));
+        ));
     }
 
     // Parse the request body
     let request: JsonRpcRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(e) => {
-            let resp = JsonRpcResponse::error(
+            return ok_json_response(JsonRpcResponse::error(
                 serde_json::Value::Null,
                 JsonRpcError::invalid_request(format!("invalid JSON: {}", e)),
-            );
-            return (StatusCode::OK, Json(resp));
+            ));
         }
     };
 
     // Validate jsonrpc version
     if request.jsonrpc != "2.0" {
-        let resp = JsonRpcResponse::error(
+        return ok_json_response(JsonRpcResponse::error(
             request.id,
             JsonRpcError::invalid_request("jsonrpc must be \"2.0\""),
-        );
-        return (StatusCode::OK, Json(resp));
+        ));
     }
 
     let resp = dispatch::dispatch(&ctx, &request.method, request.id, request.params).await;
-    (StatusCode::OK, Json(resp))
+    ok_json_response(resp)
 }
 
 #[cfg(test)]

@@ -1,164 +1,142 @@
 # henyey-bucket
 
-BucketList implementation for storing and managing Stellar ledger state.
+BucketList storage, merging, indexing, and archival for Stellar ledger state.
 
 ## Overview
 
-The BucketList is Stellar's canonical on-disk data structure for storing ledger state. It organizes all ledger entries into a hierarchical structure of immutable "bucket" files, enabling efficient incremental updates, integrity verification, and state archival. This crate provides a complete Rust implementation compatible with stellar-core's bucket format and semantics, corresponding to the `src/bucket/` directory in stellar-core.
-
-The bucket list consists of 11 levels (0-10), where each level contains two buckets (`curr` and `snap`). Lower levels update more frequently and contain recent data; higher levels contain older, more stable data. This log-structured merge tree (LSM) design optimizes for append-heavy workloads while maintaining efficient lookups.
+`henyey-bucket` implements Stellar's bucket subsystem: immutable bucket files, the 11-level live `BucketList`, the 11-level hot-archive bucket list for archived Soroban state, disk-backed indexing for large buckets, and the snapshot/query helpers used by catchup and state inspection. It is the Rust counterpart to `stellar-core/src/bucket/`, and sits between ledger-state producers/consumers and the on-disk bucket files managed by `BucketManager`.
 
 ## Architecture
 
 ```mermaid
 graph TD
-    BSM[BucketSnapshotManager] --> BLS[BucketListSnapshot]
-    BSM --> HABS[HotArchiveBucketListSnapshot]
-    BLS --> BL[BucketList<br>11 levels]
-    HABS --> HABL[HotArchiveBucketList<br>11 levels]
-    BL --> BLev[BucketLevel<br>curr + snap]
-    HABL --> HALev[HotArchiveBucketLevel<br>curr + snap]
-    BLev --> B[Bucket]
-    HALev --> HAB[HotArchiveBucket]
-    B --> IM[InMemory<br>Vec of entries]
-    B --> DB[DiskBucket<br>mmap + index]
-    DB --> LBI[LiveBucketIndex]
-    DB --> BBF[BucketBloomFilter]
-    LBI --> IMI[InMemoryIndex]
-    LBI --> DI[DiskIndex]
-    BL --> FB[FutureBucket<br>async merge]
-    FB --> MRG[merge module]
+    L[Closed ledger changes] --> BL[BucketList::add_batch]
+    BL --> L0[Level 0 in-memory merge]
+    BL --> SP[Spill scheduling]
+    SP --> AM[Async higher-level merges]
+    AM --> BM[BucketManager]
+    BM --> BF[.bucket.xdr files]
+    BF --> DB[DiskBucket]
+    DB --> IDX[LiveBucketIndex + bloom filter]
+    BL --> SNAP[Bucket snapshots]
+    SNAP --> Q[Search/query APIs]
+    BL --> EV[Eviction scan]
+    EV --> HA[HotArchiveBucketList]
 ```
 
 ## Key Types
 
 | Type | Description |
 |------|-------------|
-| `BucketEntry` | Entry stored in a bucket: Live, Dead, Init (CAP-0020), or Metadata |
-| `Bucket` | Immutable container of sorted entries, identified by SHA-256 hash. In-memory or disk-backed storage |
-| `BucketList` | Complete 11-level bucket list for live ledger state |
-| `BucketLevel` | Single level with `curr`, `snap`, and optional pending merge result |
-| `HotArchiveBucketList` | Separate 11-level bucket list for archived persistent Soroban entries |
-| `HotArchiveBucket` | Bucket storing HotArchiveBucketEntry variants (Archived, Live, Metaentry) |
-| `BucketManager` | Manages bucket files on disk: creation, loading, caching, merging, GC |
-| `DiskBucket` | Memory-efficient disk-backed bucket using mmap with compact index |
-| `LiveBucketIndex` | Facade selecting InMemoryIndex (small) or DiskIndex (large) by bucket size |
-| `BucketBloomFilter` | Binary fuse filter (BinaryFuse16) for fast negative lookups |
-| `FutureBucket` | Async merge state machine: Clear, HashOutput, HashInputs, LiveOutput, LiveInputs |
-| `BucketSnapshotManager` | Thread-safe snapshot manager with RwLock for concurrent reads |
-| `SearchableBucketListSnapshot` | Query wrapper for key lookup, batched queries, inflation winners, type scanning |
-| `BucketApplicator` | Chunked entry application during catchup with deduplication and progress tracking |
-| `EvictionIterator` | Tracks incremental scan position for Soroban state archival |
-| `StateArchivalSettings` | Configuration for eviction scans (scan size, starting level, max entries) |
-| `MergeIterator` | Lazy streaming merge of two sorted bucket iterators |
-| `LiveEntriesIterator` | Memory-efficient streaming over all live entries with HashSet deduplication |
-| `BucketMergeMap` | Merge deduplication: tracks input-to-output relationships for reattachment |
-| `RandomEvictionCache` | LRU-style cache for frequently-accessed account entries |
-| `MergeCounters` | Thread-safe merge operation statistics via atomics |
-| `BucketListMetrics` | Aggregate entry counts by type and durability |
+| `BucketEntry` | XDR bucket entry enum: live, dead, init, or metadata. |
+| `Bucket` | Immutable live bucket with in-memory or disk-backed storage. |
+| `BucketLevel` | One live bucket-list level containing `curr`, `snap`, and pending merge state. |
+| `BucketList` | Full 11-level live bucket list for canonical ledger state. |
+| `HotArchiveBucket` | Immutable bucket for archived Soroban entries and restore markers. |
+| `HotArchiveBucketList` | 11-level hot-archive bucket list used for persistent Soroban archival. |
+| `BucketManager` | Owns bucket files on disk, cacheing, loading, merge output promotion, and GC. |
+| `DiskBucket` | Mmap-backed live bucket reader with on-demand entry loads. |
+| `LiveBucketIndex` | Facade over `InMemoryIndex` and `DiskIndex` for fast lookups and scans. |
+| `FutureBucket` | Serializable future-merge wrapper used for HAS-compatible restart/reattach flows. |
+| `BucketSnapshotManager` | Thread-safe holder for current and historical live/hot-archive snapshots. |
+| `SearchableBucketListSnapshot` | Query wrapper for point lookups, batch loads, pool scans, and inflation queries. |
+| `BucketApplicator` | Chunked catchup applicator that deduplicates entries before DB writes. |
+| `BucketMergeMap` | Completed-merge map used for merge deduplication and reattachment. |
+| `MergeCounters` | Atomic counters for merge timing and merge-behavior statistics. |
 
 ## Usage
 
-### Creating and Using a BucketList
+### Add a ledger batch and query the result
 
 ```rust
-use henyey_bucket::{BucketList, BucketEntry, BucketManager};
-use stellar_xdr::curr::BucketListType;
+use henyey_bucket::BucketList;
+use stellar_xdr::curr::{BucketListType, LedgerEntry, LedgerKey};
 
-let manager = BucketManager::new("/path/to/buckets".into())?;
 let mut bucket_list = BucketList::new();
 
-// Add entries from a closed ledger
 bucket_list.add_batch(
     ledger_seq,
     protocol_version,
     BucketListType::Live,
-    init_entries,   // newly created
-    live_entries,   // updated
-    dead_entries,   // deleted
+    init_entries,   // Vec<LedgerEntry>
+    live_entries,   // Vec<LedgerEntry>
+    dead_entries,   // Vec<LedgerKey>
 )?;
 
-// Look up an entry
-if let Some(entry) = bucket_list.get(&key)? {
-    // Process the entry
-}
+let entry: Option<LedgerEntry> = bucket_list.get(&some_key)?;
 ```
 
-### Merging Buckets
+### Merge buckets explicitly
 
 ```rust
-use henyey_bucket::{merge_buckets, merge_buckets_with_options};
+use henyey_bucket::merge_buckets_with_options;
 
-// Basic merge (normalizes Init -> Live)
-let merged = merge_buckets(&old_bucket, &new_bucket, keep_dead, max_protocol)?;
-
-// Merge with explicit normalization control
 let merged = merge_buckets_with_options(
     &old_bucket,
     &new_bucket,
-    keep_dead_entries,
-    max_protocol_version,
-    normalize_init_entries,  // false for same-level merges
+    true,   // keep tombstones
+    25,     // max protocol version
+    false,  // do not normalize INIT when staying within a level
 )?;
 ```
 
-### Eviction Scanning (Soroban)
+### Stream live entries or run an eviction scan
 
 ```rust
-use henyey_bucket::{EvictionIterator, StateArchivalSettings};
+use std::collections::HashSet;
 
-let mut iter = EvictionIterator::default();
-let settings = StateArchivalSettings {
-    eviction_scan_size: 100_000,
-    starting_eviction_scan_level: 6,
-    max_entries_to_archive: 1000,
+use henyey_bucket::{
+    default_state_archival_settings, EvictionIterator, EvictionIteratorExt,
 };
 
-let result = bucket_list.scan_for_eviction_incremental(
-    iter, current_ledger, &settings, &ttl_lookup_fn,
+for entry in bucket_list.live_entries_iter() {
+    let entry = entry?;
+    // process entry
+}
+
+let mut settings = default_state_archival_settings();
+settings.eviction_scan_size = 100_000;
+
+let scan = bucket_list.scan_for_eviction_incremental(
+    EvictionIterator::with_default_level(),
+    current_ledger,
+    &settings,
 )?;
 
-// Process: result.archived_entries, result.evicted_keys
-iter = result.end_iterator;
+let resolved = scan.resolve(settings.max_entries_to_archive, &HashSet::new());
 ```
 
 ## Module Layout
 
 | Module | Description |
 |--------|-------------|
-| `lib.rs` | Crate root: re-exports all public types and protocol version constants |
-| `entry.rs` | `BucketEntry` enum, key/type comparison (`compare_keys`, `ledger_entry_data_type`, `ledger_key_type`), eviction helpers |
-| `bucket.rs` | `Bucket` struct with in-memory and disk-backed storage modes |
-| `bucket_list.rs` | `BucketList`, `BucketLevel`, spill mechanics, hash computation, async merge orchestration |
-| `merge.rs` | Bucket merging with CAP-0020 INITENTRY semantics, two-pointer merge algorithm |
-| `hot_archive.rs` | `HotArchiveBucketList` and `HotArchiveBucket` for Soroban state archival |
-| `manager.rs` | `BucketManager`: disk lifecycle, caching, GC, state operations |
-| `snapshot.rs` | Thread-safe snapshots: `BucketSnapshotManager`, `SearchableBucketListSnapshot` |
-| `index.rs` | `InMemoryIndex`, `DiskIndex`, `LiveBucketIndex`, type ranges, asset-pool mapping |
-| `index_persistence.rs` | Serialization of `DiskIndex` to `.index` files for fast startup |
-| `disk_bucket.rs` | `DiskBucket`: mmap-based bucket with on-demand entry loading |
-| `bloom_filter.rs` | `BucketBloomFilter` using BinaryFuse16 with SipHash-2-4 |
-| `future_bucket.rs` | `FutureBucket` state machine for async merge operations |
-| `iterator.rs` | `BucketInputIterator`, `BucketOutputIterator` for streaming file I/O |
-| `live_iterator.rs` | `LiveEntriesIterator`: memory-efficient streaming over live entries |
-| `eviction.rs` | Eviction scan logic, `EvictionIterator`, level math utilities |
-| `cache.rs` | `RandomEvictionCache` for frequently-accessed account entries |
-| `applicator.rs` | `BucketApplicator` for chunked catchup entry application |
-| `merge_map.rs` | `BucketMergeMap` for merge deduplication and reattachment |
-| `metrics.rs` | `MergeCounters`, `EvictionCounters`, `BucketListMetrics` |
-| `error.rs` | `BucketError` enum |
+| `lib.rs` | Crate root and public re-exports. |
+| `applicator.rs` | Chunked bucket application during catchup. |
+| `bloom_filter.rs` | Binary fuse filter wrapper for fast negative lookups. |
+| `bucket.rs` | Core live `Bucket` type and in-memory/disk-backed storage abstraction. |
+| `bucket_list.rs` | Live bucket-list levels, spill logic, lookups, scans, and merge orchestration. |
+| `cache.rs` | Random-eviction per-bucket cache for account entries. |
+| `disk_bucket.rs` | Streaming/mmap reader and lookup implementation for large bucket files. |
+| `entry.rs` | `BucketEntry` helpers, ordering, and Soroban TTL/eviction utilities. |
+| `error.rs` | `BucketError` definitions. |
+| `eviction.rs` | Eviction iterator math, settings helpers, and scan-resolution types. |
+| `future_bucket.rs` | Serializable future-merge state and merge reattachment helpers. |
+| `hot_archive.rs` | Hot-archive bucket type, merge semantics, and hot-archive bucket list. |
+| `index.rs` | In-memory and page-based disk indexes plus counters and pool mappings. |
+| `index_persistence.rs` | Serialization of `DiskIndex` sidecar `.index` files. |
+| `iterator.rs` | Legacy gzip-based streaming iterators and merge-input helpers. |
+| `live_iterator.rs` | Streaming deduplicated iteration over live entries in a bucket list. |
+| `manager.rs` | Bucket file lifecycle management, caching, loading, merging, and cleanup. |
+| `merge.rs` | Two-way merge logic, CAP-0020 semantics, and streaming merge-to-file paths. |
+| `merge_map.rs` | Completed/in-flight merge tracking for deduplication. |
+| `metrics.rs` | Merge, eviction, and bucket-list metric counters. |
+| `snapshot.rs` | Thread-safe live and hot-archive snapshot/query types. |
 
 ## Design Notes
 
-- **Merge semantics (CAP-0020)**: `Init + Dead` annihilates both entries; `Dead + Init` produces `Live`. This prevents tombstone accumulation when entries are created and deleted within the same merge window. The `normalize_init_entries` flag controls whether `Init` entries are converted to `Live` during inter-level merges.
-
-- **Level 0 optimization**: Level 0 merges are synchronous and in-memory (via `merge_in_memory`) because they happen every 2 ledgers and must complete within ledger close time. Levels 1+ use background tokio tasks (`FutureBucket`) since they are less frequent and can tolerate latency.
-
-- **Disk-backed storage**: For mainnet catchup where buckets contain millions of entries, `DiskBucket` uses memory-mapped I/O with a compact index. Small buckets (< 10K entries) use `InMemoryIndex` with per-key offsets; large buckets use `DiskIndex` with page-based ranges and a bloom filter for fast negative lookups.
-
-- **XDR file format**: The canonical on-disk format is uncompressed XDR with RFC 5531 record marking (`<hash>.bucket.xdr`). The legacy gzip format (`<hash>.bucket.gz`) is supported for backward compatibility. Uncompressed files enable random-access seeks for disk-backed indexing.
-
-- **Spill schedule**: Levels spill based on ledger sequence boundaries. `level_size(N) = 4^(N+1)` and `level_half(N) = level_size(N) / 2`. A level spills when the ledger sequence is at a half or full size boundary. Level 10 never spills.
+- Level 0 is special: it keeps in-memory entry vectors so the hottest merge path avoids disk I/O, while higher levels spill through background merges.
+- The canonical on-disk format is uncompressed `.bucket.xdr` with XDR record marks; disk-backed buckets and index persistence are built around that format.
+- Eviction is intentionally two-phase: the scan collects candidates within a byte budget, and `EvictionResult::resolve()` later applies modified-key filtering and `max_entries_to_archive` limits to match stellar-core sequencing.
 
 ## stellar-core Mapping
 
@@ -167,22 +145,22 @@ iter = result.end_iterator;
 | `bucket.rs` | `src/bucket/Bucket.cpp`, `src/bucket/LiveBucket.cpp` |
 | `bucket_list.rs` | `src/bucket/BucketList.cpp`, `src/bucket/LiveBucketList.cpp` |
 | `manager.rs` | `src/bucket/BucketManager.cpp` |
-| `entry.rs` | `src/bucket/BucketUtils.h` (key comparison) |
-| `merge.rs` | `src/bucket/Bucket.cpp` (merge logic), `src/bucket/LiveBucket.cpp` |
+| `entry.rs` | `src/bucket/BucketUtils.h`, `src/bucket/LedgerCmp.h` |
+| `merge.rs` | `src/bucket/Bucket.cpp`, `src/bucket/LiveBucket.cpp` |
 | `hot_archive.rs` | `src/bucket/HotArchiveBucket.cpp`, `src/bucket/HotArchiveBucketList.cpp` |
 | `snapshot.rs` | `src/bucket/BucketSnapshotManager.cpp`, `src/bucket/SearchableBucketListSnapshot.cpp` |
 | `index.rs` | `src/bucket/LiveBucketIndex.cpp`, `src/bucket/DiskIndex.cpp`, `src/bucket/InMemoryIndex.cpp` |
 | `index_persistence.rs` | `src/bucket/BucketIndexUtils.cpp` |
-| `disk_bucket.rs` | `src/bucket/BucketIndex.cpp` (file access) |
-| `bloom_filter.rs` | `src/bucket/BinaryFuseFilter.h` |
+| `disk_bucket.rs` | `src/bucket/BucketIndex.cpp` |
 | `future_bucket.rs` | `src/bucket/FutureBucket.cpp` |
 | `iterator.rs` | `src/bucket/BucketInputIterator.cpp`, `src/bucket/BucketOutputIterator.cpp` |
-| `eviction.rs` | `src/bucket/BucketListBase.cpp` (eviction scan) |
-| `cache.rs` | `src/bucket/RandomEvictionCache.h` |
 | `applicator.rs` | `src/bucket/BucketApplicator.cpp` |
 | `merge_map.rs` | `src/bucket/BucketMergeMap.cpp` |
-| `metrics.rs` | `src/bucket/MergeCounters.h`, `src/bucket/BucketListBase.h` (metrics) |
-| `live_iterator.rs` | `src/bucket/BucketApplicator.cpp` (iteration pattern) |
+| `cache.rs` | `src/util/RandomEvictionCache.h` |
+| `metrics.rs` | `src/bucket/BucketUtils.h`, `src/bucket/BucketListBase.h` |
+| `eviction.rs` | `src/bucket/BucketListBase.cpp` |
+| `bloom_filter.rs` | `src/bucket/BinaryFuseFilter.h` |
+| `live_iterator.rs` | `src/bucket/BucketApplicator.cpp` |
 
 ## Parity Status
 

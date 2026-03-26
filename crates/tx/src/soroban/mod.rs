@@ -98,7 +98,27 @@ pub use host::{
 pub use storage::{SorobanStorage, StorageEntry, StorageKey};
 
 use sha2::{Digest, Sha256};
-use stellar_xdr::curr::{Hash, LedgerEntry, LedgerKey, Limits, SorobanTransactionData, WriteXdr};
+use stellar_xdr::curr::{
+    AccountId, Hash, HostFunction, LedgerEntry, LedgerKey, Limits, SorobanAuthorizationEntry,
+    SorobanTransactionData, WriteXdr,
+};
+
+use crate::{state::LedgerStateManager, validation::LedgerContext};
+
+/// Bundles the inputs needed to execute a Soroban host function.
+#[derive(Clone, Copy)]
+pub struct HostFunctionInvocation<'a> {
+    pub host_function: &'a HostFunction,
+    pub auth_entries: &'a [SorobanAuthorizationEntry],
+    pub source: &'a AccountId,
+    pub state: &'a LedgerStateManager,
+    pub context: &'a LedgerContext,
+    pub soroban_data: &'a SorobanTransactionData,
+    pub soroban_config: &'a SorobanConfig,
+    pub module_cache: Option<&'a PersistentModuleCache>,
+    pub hot_archive: Option<&'a dyn HotArchiveLookup>,
+    pub ttl_key_cache: Option<&'a TtlKeyCache>,
+}
 
 /// Bundles the optional Soroban parameters that thread through operation execution.
 ///
@@ -116,7 +136,7 @@ pub struct SorobanContext<'a> {
     pub ttl_key_cache: Option<&'a TtlKeyCache>,
 }
 
-impl<'a> SorobanContext<'a> {
+impl SorobanContext<'_> {
     /// Create a context with no Soroban data (for non-Soroban transactions).
     pub fn none() -> Self {
         Self {

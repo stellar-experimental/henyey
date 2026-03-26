@@ -3547,14 +3547,16 @@ fn test_should_apply_false_skips_operation_body() {
     // Execute with should_apply=false and deduct_fee=false, simulating the
     // parallel Soroban path where pre-deduction found insufficient balance.
     let result = executor
-        .execute_transaction_with_fee_mode_and_pre_state(
+        .execute_transaction_with_arc(
             &snapshot,
-            &envelope,
-            100,
-            Some([0u8; 32]), // soroban_prng_seed
-            false,           // deduct_fee=false (fees pre-deducted in parallel path)
-            None,            // no fee_source_pre_state
-            false,           // should_apply=false — this is what we're testing
+            TransactionExecutionRequest::from_envelope(
+                &envelope,
+                100,
+                Some([0u8; 32]), // soroban_prng_seed
+                false,           // deduct_fee=false (fees pre-deducted in parallel path)
+                None,            // no fee_source_pre_state
+                false,           // should_apply=false — this is what we're testing
+            ),
         )
         .expect("execute should not error");
 

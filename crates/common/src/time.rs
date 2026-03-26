@@ -46,10 +46,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// assert!(now > 1704067200);
 /// ```
 pub fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_secs()
+    duration_since_unix_epoch().as_secs()
 }
 
 /// Returns the current Unix timestamp in milliseconds.
@@ -67,10 +64,13 @@ pub fn current_timestamp() -> u64 {
 /// assert!(now_ms > 1704067200000);
 /// ```
 pub fn current_timestamp_ms() -> u64 {
+    duration_since_unix_epoch().as_millis() as u64
+}
+
+fn duration_since_unix_epoch() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
-        .as_millis() as u64
 }
 
 /// Converts a Unix timestamp (seconds since 1970) to a [`SystemTime`].

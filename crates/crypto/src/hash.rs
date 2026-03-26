@@ -161,6 +161,22 @@ pub fn blake2(data: &[u8]) -> Hash256 {
 /// Type alias for HMAC-SHA256.
 type HmacSha256 = Hmac<Sha256>;
 
+fn new_hmac(key: &[u8]) -> HmacSha256 {
+    HmacSha256::new_from_slice(key).expect("HMAC accepts any key length")
+}
+
+fn finalize_hmac(mac: HmacSha256) -> [u8; 32] {
+    mac.finalize().into_bytes().into()
+}
+
+fn hmac_sha256_chunks(key: &[u8], chunks: &[&[u8]]) -> [u8; 32] {
+    let mut mac = new_hmac(key);
+    for chunk in chunks {
+        mac.update(chunk);
+    }
+    finalize_hmac(mac)
+}
+
 /// Computes the HMAC-SHA256 of data with a given key.
 ///
 /// # Arguments
@@ -181,10 +197,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// let mac = hmac_sha256(&key, b"message");
 /// ```
 pub fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
-    mac.update(data);
-    let result = mac.finalize();
-    result.into_bytes().into()
+    hmac_sha256_chunks(key, &[data])
 }
 
 /// Verifies an HMAC-SHA256 in constant time.
@@ -213,7 +226,7 @@ pub fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 /// assert!(!hmac_sha256_verify(&mac, &key, b"tampered"));
 /// ```
 pub fn hmac_sha256_verify(mac: &[u8; 32], key: &[u8; 32], data: &[u8]) -> bool {
-    let mut verifier = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut verifier = new_hmac(key);
     verifier.update(data);
     verifier.verify_slice(mac).is_ok()
 }
@@ -269,11 +282,8 @@ pub fn hkdf_extract(ikm: &[u8]) -> [u8; 32] {
 /// let key = hkdf_expand(&prk, b"context");
 /// ```
 pub fn hkdf_expand(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(prk).expect("HMAC accepts any key length");
-    mac.update(info);
-    mac.update(&[0x01]); // Counter byte for first (and only) block
-    let result = mac.finalize();
-    result.into_bytes().into()
+    let counter = [0x01];
+    hmac_sha256_chunks(prk, &[info, &counter])
 }
 
 /// Full HKDF key derivation (extract + expand).
