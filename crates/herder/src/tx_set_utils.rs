@@ -319,8 +319,8 @@ fn remove_txs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use henyey_common::NetworkId;
     use crate::tx_queue::FeeBalanceProvider;
+    use henyey_common::NetworkId;
     use stellar_xdr::curr::{
         AccountId, Asset, DecoratedSignature, LedgerBounds, Memo, MuxedAccount, Operation,
         OperationBody, PaymentOp, Preconditions, PreconditionsV2, PublicKey, SequenceNumber,
@@ -973,13 +973,8 @@ mod tests {
         provider.set_balance([10u8; 32], 500);
         provider.set_balance([20u8; 32], 100);
 
-        let invalid =
-            get_invalid_tx_list(&[tx_a1, tx_a2, tx_b], &ctx, &bounds, Some(&provider));
-        assert_eq!(
-            invalid.len(),
-            1,
-            "only source B's tx should be invalid"
-        );
+        let invalid = get_invalid_tx_list(&[tx_a1, tx_a2, tx_b], &ctx, &bounds, Some(&provider));
+        assert_eq!(invalid.len(), 1, "only source B's tx should be invalid");
     }
 
     #[test]

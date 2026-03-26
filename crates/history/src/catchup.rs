@@ -2097,9 +2097,7 @@ impl CatchupManager {
 
         let final_header = ledger_manager.current_header();
         let final_hash = ledger_manager.current_header_hash();
-        let ledgers_applied = final_header
-            .ledger_seq
-            .saturating_sub(download_from);
+        let ledgers_applied = final_header.ledger_seq.saturating_sub(download_from);
 
         Ok((final_header, final_hash, ledgers_applied))
     }
@@ -2525,11 +2523,7 @@ mod tests {
             },
         ];
         for err in &fatal_errors {
-            assert!(
-                err.is_fatal_catchup_failure(),
-                "expected fatal: {}",
-                err
-            );
+            assert!(err.is_fatal_catchup_failure(), "expected fatal: {}", err);
         }
     }
 

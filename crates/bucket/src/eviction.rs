@@ -811,15 +811,12 @@ mod tests {
     // --- EvictionResult::resolve() tests ---
 
     use stellar_xdr::curr::{
-        ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash,
-        LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyContractData,
-        LedgerKeyTtl, ScAddress, ScVal,
+        ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, Hash, LedgerEntry,
+        LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyContractData, LedgerKeyTtl, ScAddress,
+        ScVal,
     };
 
-    fn make_contract_data_candidate(
-        key_bytes: [u8; 32],
-        is_temporary: bool,
-    ) -> EvictionCandidate {
+    fn make_contract_data_candidate(key_bytes: [u8; 32], is_temporary: bool) -> EvictionCandidate {
         let data_key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: ScAddress::Contract(ContractId(Hash(key_bytes))),
             key: ScVal::Void,

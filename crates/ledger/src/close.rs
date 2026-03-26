@@ -391,8 +391,7 @@ impl TransactionSetVariant {
                             txs.extend(sorted_for_apply_sequential(phase_txs, set_hash));
                         }
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
-                            let base_fee =
-                                base_fee_to_u32(parallel.base_fee);
+                            let base_fee = base_fee_to_u32(parallel.base_fee);
                             txs.extend(sorted_for_apply_parallel(
                                 parallel.execution_stages.as_slice(),
                                 set_hash,
@@ -760,8 +759,7 @@ impl TransactionSetVariant {
                             all_txs.extend(sorted);
                         }
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
-                            let base_fee =
-                                base_fee_to_u32(parallel.base_fee);
+                            let base_fee = base_fee_to_u32(parallel.base_fee);
                             let stages: ParallelStages = Vec::from(parallel.execution_stages)
                                 .into_iter()
                                 .map(|stage| {
@@ -849,8 +847,7 @@ impl TransactionSetVariant {
                             all_txs.extend(sorted);
                         }
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
-                            let base_fee =
-                                base_fee_to_u32(parallel.base_fee);
+                            let base_fee = base_fee_to_u32(parallel.base_fee);
                             let stages = sorted_stages_for_parallel(
                                 parallel.execution_stages.as_slice(),
                                 hash,

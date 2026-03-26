@@ -1076,7 +1076,9 @@ impl App {
                 let window = Duration::from_secs(close_time_secs * max_slots);
                 let allowed = {
                     let mut map = self.scp_state_query_info.write().await;
-                    let info = map.entry(msg.from_peer.clone()).or_insert_with(QueryInfo::new);
+                    let info = map
+                        .entry(msg.from_peer.clone())
+                        .or_insert_with(QueryInfo::new);
                     if info.allow(window, GET_SCP_STATE_MAX_RATE) {
                         info.num_queries += 1;
                         true
