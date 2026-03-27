@@ -4022,10 +4022,13 @@ impl LedgerCloseContext<'_> {
             );
         }
 
-        // Also set the raw upgrades in scp_value.upgrades for correct header hash
-        // The upgrades need to be XDR-encoded as UpgradeType (opaque bytes)
+        // Also set the raw upgrades in scp_value.upgrades for correct header hash.
+        // The upgrades need to be XDR-encoded as UpgradeType (opaque bytes).
+        // Note: we use upgrade_ctx.upgrades (not close_data.upgrades) because
+        // close_data.upgrades is drained by std::mem::take in apply_upgrades_to_delta
+        // to build UpgradeEntryMeta.
         let raw_upgrades: Vec<stellar_xdr::curr::UpgradeType> = self
-            .close_data
+            .upgrade_ctx
             .upgrades
             .iter()
             .filter_map(|upgrade| {
@@ -6662,5 +6665,67 @@ mod tests {
         assert_eq!(mem_params[11].const_term, 130065); // VmInstantiation
         assert_eq!(mem_params[11].linear_term, 5064);
         assert_eq!(mem_params[16].const_term, 181); // RecoverEcdsaSecp256k1Key
+    }
+
+    /// Regression test: build_and_hash_header must encode upgrades from upgrade_ctx,
+    /// not from close_data.upgrades (which is drained by std::mem::take in
+    /// apply_upgrades_to_delta before build_and_hash_header runs).
+    #[test]
+    fn test_header_scp_value_upgrades_populated_after_drain() {
+        use stellar_xdr::curr::{LedgerUpgrade, Limits, ReadXdr};
+
+        let manager = LedgerManager::new(
+            "Test SDF Network ; September 2015".to_string(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut ctx = make_test_close_context(&manager, 2);
+
+        // Simulate what begin_close does: add upgrades to both close_data and upgrade_ctx.
+        let upgrades = vec![
+            LedgerUpgrade::Version(25),
+            LedgerUpgrade::BaseReserve(5_000_000),
+        ];
+        ctx.close_data.upgrades = upgrades.clone();
+        for u in &upgrades {
+            ctx.upgrade_ctx.add_upgrade(u.clone());
+        }
+
+        // Simulate what apply_upgrades_to_delta does: drain close_data.upgrades.
+        let _drained = std::mem::take(&mut ctx.close_data.upgrades);
+        assert!(
+            ctx.close_data.upgrades.is_empty(),
+            "upgrades should be drained"
+        );
+        assert_eq!(
+            ctx.upgrade_ctx.upgrades.len(),
+            2,
+            "upgrade_ctx should still have upgrades"
+        );
+
+        // build_and_hash_header should use upgrade_ctx.upgrades, not close_data.upgrades.
+        let (header, _hash) = ctx
+            .build_and_hash_header(Hash256::ZERO, Hash256::ZERO, false, false)
+            .expect("build_and_hash_header should succeed");
+
+        // Verify scp_value.upgrades is populated (not empty).
+        assert_eq!(
+            header.scp_value.upgrades.len(),
+            2,
+            "scp_value.upgrades must contain the 2 upgrades (version + base_reserve)"
+        );
+
+        // Verify the actual upgrade content.
+        let decoded: Vec<LedgerUpgrade> = header
+            .scp_value
+            .upgrades
+            .iter()
+            .map(|u| LedgerUpgrade::from_xdr(&u.0, Limits::none()).unwrap())
+            .collect();
+        assert!(matches!(decoded[0], LedgerUpgrade::Version(25)));
+        assert!(matches!(decoded[1], LedgerUpgrade::BaseReserve(5_000_000)));
     }
 }

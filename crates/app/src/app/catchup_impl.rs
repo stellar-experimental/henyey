@@ -484,54 +484,74 @@ impl App {
     }
 
     /// Get the latest checkpoint from history archives.
+    ///
+    /// When the archive reports no checkpoints yet (ledger 0), retries with
+    /// backoff. This handles the startup race in quickstart local mode where
+    /// the captive core starts before the validator has published its first
+    /// checkpoint.
     async fn get_latest_checkpoint(&self) -> anyhow::Result<u32> {
-        tracing::info!("Querying history archives for latest checkpoint");
+        const MAX_RETRIES: u32 = 30;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
-        // Try each configured archive to get the current ledger
-        for archive_config in &self.config.history.archives {
-            match HistoryArchive::new(&archive_config.url) {
-                Ok(archive) => {
-                    match archive.get_current_ledger().await {
-                        Ok(ledger) => {
-                            tracing::info!(
-                                ledger,
-                                archive = %archive_config.url,
-                                "Got current ledger from archive"
-                            );
-                            // Round down to the latest completed checkpoint
-                            let checkpoint =
-                                henyey_history::checkpoint::latest_checkpoint_before_or_at(ledger)
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!(
-                                            "No checkpoint available for ledger {}",
-                                            ledger
-                                        )
-                                    })?;
-                            return Ok(checkpoint);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                archive = %archive_config.url,
-                                error = %e,
-                                "Failed to get current ledger from archive"
-                            );
-                            continue;
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                tracing::info!(attempt, "Waiting for archive to publish first checkpoint");
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+
+            tracing::info!("Querying history archives for latest checkpoint");
+
+            for archive_config in &self.config.history.archives {
+                match HistoryArchive::new(&archive_config.url) {
+                    Ok(archive) => {
+                        match archive.get_current_ledger().await {
+                            Ok(ledger) => {
+                                tracing::info!(
+                                    ledger,
+                                    archive = %archive_config.url,
+                                    "Got current ledger from archive"
+                                );
+                                // Round down to the latest completed checkpoint
+                                match henyey_history::checkpoint::latest_checkpoint_before_or_at(
+                                    ledger,
+                                ) {
+                                    Some(checkpoint) => return Ok(checkpoint),
+                                    None => {
+                                        // No checkpoint yet (ledger 0 or before first checkpoint).
+                                        // Retry — the validator hasn't published yet.
+                                        tracing::info!(
+                                            ledger,
+                                            "Archive has no completed checkpoint yet, will retry"
+                                        );
+                                        break; // Break inner loop, retry outer
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    archive = %archive_config.url,
+                                    error = %e,
+                                    "Failed to get current ledger from archive"
+                                );
+                                continue;
+                            }
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        archive = %archive_config.url,
-                        error = %e,
-                        "Failed to create archive client"
-                    );
-                    continue;
+                    Err(e) => {
+                        tracing::warn!(
+                            archive = %archive_config.url,
+                            error = %e,
+                            "Failed to create archive client"
+                        );
+                        continue;
+                    }
                 }
             }
         }
 
         Err(anyhow::anyhow!(
-            "Failed to get current ledger from any archive"
+            "No checkpoint available after {} retries — archive may not be publishing",
+            MAX_RETRIES
         ))
     }
 
