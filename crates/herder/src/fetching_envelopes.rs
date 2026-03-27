@@ -479,9 +479,12 @@ impl FetchingEnvelopes {
         // EXTERNALIZE envelopes to be stuck in fetching state even after
         // their tx_set arrives, because the quorum set dependency appears unmet.
 
-        // Clear fetchers - pending requests for old slots are stale
+        // Clear tx_set fetcher — pending requests for old slots are stale.
         self.tx_set_fetcher.clear();
-        self.quorum_set_fetcher.clear();
+        // Keep quorum_set_fetcher — same reasoning as quorum_set_cache above.
+        // Clearing the fetcher discards trackers for in-flight quorum set
+        // requests, so envelopes waiting on those quorum sets would be stuck
+        // in "fetching" state until a new envelope re-triggers the fetch.
 
         let kept_tx_sets = self.tx_set_cache.len();
         let kept_slots = self.slots.len();
