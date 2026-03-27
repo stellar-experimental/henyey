@@ -445,6 +445,40 @@ impl CatchupManager {
         self.emit_meta_ext_v1 = enabled;
     }
 
+    /// Emit `LedgerCloseMeta` to both the streaming callback and SQLite.
+    ///
+    /// During catchup replay, meta must be persisted to the `ledger_close_meta`
+    /// table so that consumers querying SQLite (e.g., RPC `getTransactions`,
+    /// `getLedgers`) see entries for the replayed range. The streaming callback
+    /// (if configured) writes the meta to the fd:3 pipe for captive core
+    /// consumers like stellar-rpc and horizon.
+    fn emit_meta(&self, ledger_seq: u32, meta: LedgerCloseMeta) {
+        // Persist to SQLite first (to_xdr borrows &self on meta, no clone needed).
+        match meta.to_xdr(Limits::none()) {
+            Ok(meta_xdr) => {
+                if let Err(err) = self.db.store_ledger_close_meta(ledger_seq, &meta_xdr) {
+                    warn!(
+                        error = %err,
+                        ledger_seq,
+                        "Failed to persist LedgerCloseMeta during catchup"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    ledger_seq,
+                    "Failed to serialize LedgerCloseMeta during catchup"
+                );
+            }
+        }
+
+        // Stream to external consumers (fd:3 pipe).
+        if let Some(ref callback) = self.meta_callback {
+            callback(meta);
+        }
+    }
+
     /// Catch up to a specific target ledger.
     ///
     /// This is the main entry point for the catchup process. It will:
@@ -559,18 +593,13 @@ impl CatchupManager {
             // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.
             // Captive core consumers (stellar-rpc, horizon) need at least one
             // frame on fd:3 to know core is initialized.
-            if let Some(ref callback) = self.meta_callback {
-                let meta = build_bucket_apply_meta(
-                    &checkpoint_header,
-                    checkpoint_hash,
-                    self.emit_meta_ext_v1,
-                );
-                info!(
-                    "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
-                    checkpoint_header.ledger_seq
-                );
-                callback(meta);
-            }
+            let meta =
+                build_bucket_apply_meta(&checkpoint_header, checkpoint_hash, self.emit_meta_ext_v1);
+            info!(
+                "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
+                checkpoint_header.ledger_seq
+            );
+            self.emit_meta(checkpoint_header.ledger_seq, meta);
 
             (checkpoint_header, checkpoint_hash, 0)
         } else {
@@ -771,14 +800,12 @@ impl CatchupManager {
             // Captive core consumers (stellar-rpc, horizon) read metadata from
             // fd:3 and need at least one frame to know the core is initialized.
             // Without this, the Go SDK times out and kills the process.
-            if let Some(ref callback) = self.meta_callback {
-                let meta = build_bucket_apply_meta(&header, hash, self.emit_meta_ext_v1);
-                info!(
-                    "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
-                    header.ledger_seq
-                );
-                callback(meta);
-            }
+            let meta = build_bucket_apply_meta(&header, hash, self.emit_meta_ext_v1);
+            info!(
+                "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
+                header.ledger_seq
+            );
+            self.emit_meta(header.ledger_seq, meta);
 
             (header, hash, 0)
         } else {
@@ -969,18 +996,13 @@ impl CatchupManager {
             // Emit synthetic LedgerCloseMeta for the bucket-applied ledger.
             // Captive core consumers (stellar-rpc, horizon) need at least one
             // frame on fd:3 to know core is initialized.
-            if let Some(ref callback) = self.meta_callback {
-                let meta = build_bucket_apply_meta(
-                    &checkpoint_header,
-                    checkpoint_hash,
-                    self.emit_meta_ext_v1,
-                );
-                info!(
-                    "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
-                    checkpoint_header.ledger_seq
-                );
-                callback(meta);
-            }
+            let meta =
+                build_bucket_apply_meta(&checkpoint_header, checkpoint_hash, self.emit_meta_ext_v1);
+            info!(
+                "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
+                checkpoint_header.ledger_seq
+            );
+            self.emit_meta(checkpoint_header.ledger_seq, meta);
 
             (checkpoint_header, checkpoint_hash, 0)
         } else {
@@ -2236,12 +2258,10 @@ impl CatchupManager {
                 }
             }
 
-            // Stream metadata to external consumers (e.g., stellar-rpc's meta pipe
-            // in bounded replay mode: `catchup --metadata-output-stream fd:3`).
-            if let Some(ref callback) = self.meta_callback {
-                if let Some(meta) = result.meta {
-                    callback(meta);
-                }
+            // Emit metadata to SQLite and external consumers (e.g., stellar-rpc's
+            // meta pipe in bounded replay mode: `catchup --metadata-output-stream fd:3`).
+            if let Some(meta) = result.meta {
+                self.emit_meta(data.header.ledger_seq, meta);
             }
 
             debug!(
