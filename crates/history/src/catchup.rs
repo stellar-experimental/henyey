@@ -65,11 +65,11 @@ use henyey_ledger::{LedgerCloseData, LedgerManager, TransactionSetVariant};
 use henyey_tx::TransactionFrame;
 use stellar_xdr::curr::LedgerCloseMeta;
 use stellar_xdr::curr::{
-    GeneralizedTransactionSet, Hash, LedgerCloseMetaExt, LedgerCloseMetaV2, LedgerHeader,
-    LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerUpgrade, Limits, ReadXdr,
-    ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
-    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionResultPair,
-    TransactionResultSet, TransactionSet, TransactionSetV1, WriteXdr,
+    ExtensionPoint, GeneralizedTransactionSet, Hash, LedgerCloseMetaExt, LedgerCloseMetaExtV1,
+    LedgerCloseMetaV2, LedgerHeader, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
+    LedgerUpgrade, Limits, ReadXdr, ScpHistoryEntry, TransactionHistoryEntry,
+    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+    TransactionResultPair, TransactionResultSet, TransactionSet, TransactionSetV1, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -364,6 +364,9 @@ pub struct CatchupManager {
     /// produced by `close_ledger`. Used by stellar-rpc's bounded replay mode
     /// (`catchup --metadata-output-stream fd:3`).
     meta_callback: Option<MetaCallback>,
+    /// When true, synthetic bucket-apply meta uses `LedgerCloseMetaExtV1`
+    /// (matching the live mode setting `EMIT_LEDGER_CLOSE_META_EXT_V1`).
+    emit_meta_ext_v1: bool,
 }
 
 impl CatchupManager {
@@ -383,6 +386,7 @@ impl CatchupManager {
             replay_config: ReplayConfig::default(),
             network_passphrase: None,
             meta_callback: None,
+            emit_meta_ext_v1: false,
         }
     }
 
@@ -400,6 +404,7 @@ impl CatchupManager {
             replay_config: ReplayConfig::default(),
             network_passphrase: None,
             meta_callback: None,
+            emit_meta_ext_v1: false,
         }
     }
 
@@ -429,6 +434,15 @@ impl CatchupManager {
     /// to stream meta over the `--metadata-output-stream` pipe.
     pub fn set_meta_callback(&mut self, callback: MetaCallback) {
         self.meta_callback = Some(callback);
+    }
+
+    /// Configure whether synthetic bucket-apply meta should use ExtV1.
+    ///
+    /// Must match the `emit_ledger_close_meta_ext_v1` setting used by the
+    /// live ledger close path so captive core consumers see a consistent
+    /// meta extension version.
+    pub fn set_emit_meta_ext_v1(&mut self, enabled: bool) {
+        self.emit_meta_ext_v1 = enabled;
     }
 
     /// Catch up to a specific target ledger.
@@ -546,7 +560,11 @@ impl CatchupManager {
             // Captive core consumers (stellar-rpc, horizon) need at least one
             // frame on fd:3 to know core is initialized.
             if let Some(ref callback) = self.meta_callback {
-                let meta = build_bucket_apply_meta(&checkpoint_header, checkpoint_hash);
+                let meta = build_bucket_apply_meta(
+                    &checkpoint_header,
+                    checkpoint_hash,
+                    self.emit_meta_ext_v1,
+                );
                 info!(
                     "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
                     checkpoint_header.ledger_seq
@@ -754,7 +772,7 @@ impl CatchupManager {
             // fd:3 and need at least one frame to know the core is initialized.
             // Without this, the Go SDK times out and kills the process.
             if let Some(ref callback) = self.meta_callback {
-                let meta = build_bucket_apply_meta(&header, hash);
+                let meta = build_bucket_apply_meta(&header, hash, self.emit_meta_ext_v1);
                 info!(
                     "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
                     header.ledger_seq
@@ -952,7 +970,11 @@ impl CatchupManager {
             // Captive core consumers (stellar-rpc, horizon) need at least one
             // frame on fd:3 to know core is initialized.
             if let Some(ref callback) = self.meta_callback {
-                let meta = build_bucket_apply_meta(&checkpoint_header, checkpoint_hash);
+                let meta = build_bucket_apply_meta(
+                    &checkpoint_header,
+                    checkpoint_hash,
+                    self.emit_meta_ext_v1,
+                );
                 info!(
                     "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
                     checkpoint_header.ledger_seq
@@ -2498,9 +2520,21 @@ fn load_disk_backed_hot_archive_bucket_closure(
 /// captive core consumers (stellar-rpc, horizon) still need at least one
 /// metadata frame on fd:3 to know the core is initialized. This constructs
 /// a V2 meta with the checkpoint header and empty transaction/upgrade data.
-fn build_bucket_apply_meta(header: &LedgerHeader, hash: Hash256) -> LedgerCloseMeta {
+fn build_bucket_apply_meta(
+    header: &LedgerHeader,
+    hash: Hash256,
+    emit_ext_v1: bool,
+) -> LedgerCloseMeta {
+    let ext = if emit_ext_v1 {
+        LedgerCloseMetaExt::V1(LedgerCloseMetaExtV1 {
+            ext: ExtensionPoint::V0,
+            soroban_fee_write1_kb: 0,
+        })
+    } else {
+        LedgerCloseMetaExt::V0
+    };
     LedgerCloseMeta::V2(LedgerCloseMetaV2 {
-        ext: LedgerCloseMetaExt::V0,
+        ext,
         ledger_header: LedgerHeaderHistoryEntry {
             hash: Hash(hash.0),
             header: header.clone(),

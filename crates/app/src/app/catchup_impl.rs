@@ -337,9 +337,9 @@ impl App {
         self.herder.trim_scp_driver_caches(new_lcl as u64);
         self.herder.trim_fetching_caches(new_lcl as u64);
 
-        // Clear pending envelopes for slots <= new_lcl - they are stale after catchup.
-        // Note: we keep pending envelopes for slots > new_lcl as they may still be
-        // waiting for tx_sets that we just preserved above.
+        // Clear all pending envelopes — they are stale after catchup.
+        // Envelopes for future slots arrive via the fetching_envelopes path
+        // (which is trimmed, not cleared), so clearing pending_envelopes is safe.
         self.herder.clear_pending_envelopes();
 
         // On Linux, ask glibc to return freed memory to the OS.
@@ -668,6 +668,10 @@ impl App {
                 }
             }));
         }
+
+        // Propagate the meta extension setting so synthetic bucket-apply
+        // frames match the live-mode LedgerCloseMetaExt version.
+        catchup_manager.set_emit_meta_ext_v1(self.config.metadata.emit_ledger_close_meta_ext_v1);
 
         // Run catchup
         progress.set_phase(CatchupPhase::DownloadingBuckets);
