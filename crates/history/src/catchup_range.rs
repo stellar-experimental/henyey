@@ -239,14 +239,18 @@ impl CatchupRange {
 
         // Case 2: count >= full replay count — full replay from current state.
         //
-        // When lcl == genesis, prefer bucket-apply over full replay. Replaying
-        // through protocol upgrades from genesis (e.g. 0→25) produces different
-        // state hashes than the live network because `apply_upgrades_to_delta`
-        // creates intermediate config entries that differ from the validator's
-        // live upgrade path. stellar-core handles this the same way: online
-        // catchup always involves a bucket-apply step, never raw replay from
-        // genesis.
-        if count >= full_replay_count && lcl > GENESIS_LEDGER_SEQ {
+        // When lcl == genesis AND mode is Minimal, prefer bucket-apply over
+        // full replay. Replaying through protocol upgrades from genesis (e.g.
+        // 0→25) produces different state hashes than the live network because
+        // `apply_upgrades_to_delta` creates intermediate config entries that
+        // differ from the validator's live upgrade path.
+        //
+        // However, for Complete mode (CATCHUP_COMPLETE=true, used by galexie),
+        // the consumer needs metadata for every ledger from genesis. Allow
+        // replay from genesis in that case — the state hash difference doesn't
+        // matter because captive core consumers don't verify bucket list hashes.
+        if count >= full_replay_count && (lcl > GENESIS_LEDGER_SEQ || mode == CatchupMode::Complete)
+        {
             return Self::replay_only(full_replay);
         }
 
@@ -260,8 +264,10 @@ impl CatchupRange {
         let first_in_checkpoint = first_ledger_in_checkpoint_containing(target_start);
 
         // Case 4: target start is in first checkpoint, full replay
-        // (only when we already have post-upgrade state from a prior catchup)
-        if first_in_checkpoint <= GENESIS_LEDGER_SEQ && lcl > GENESIS_LEDGER_SEQ {
+        // (when we already have post-upgrade state, or when mode is Complete)
+        if first_in_checkpoint <= GENESIS_LEDGER_SEQ
+            && (lcl > GENESIS_LEDGER_SEQ || mode == CatchupMode::Complete)
+        {
             return Self::replay_only(full_replay);
         }
 
@@ -515,16 +521,29 @@ mod tests {
     #[test]
     fn test_complete_from_genesis_to_checkpoint() {
         // Quickstart captive core scenario: CATCHUP_COMPLETE from genesis to a
-        // checkpoint. Must use bucket-apply, NOT replay from genesis, because
-        // replaying through protocol upgrades from genesis (0→25) produces
-        // different state hashes than the live validator.
-        //
-        // With accelerated checkpoint frequency (8): checkpoints at 7, 15, 23...
-        // Use default frequency (64): checkpoints at 63, 127, 191...
+        // checkpoint. Must use full replay from genesis so captive core consumers
+        // (galexie) receive metadata for every ledger. The state hash difference
+        // from replaying through protocol upgrades doesn't matter for captive
+        // core consumers since they don't verify bucket list hashes.
         let range = CatchupRange::calculate(1, 63, CatchupMode::Complete);
         assert!(
+            !range.apply_buckets(),
+            "Complete mode should replay from genesis, not bucket-apply"
+        );
+        assert!(range.replay_ledgers());
+        assert_eq!(range.replay_first(), 2);
+        assert_eq!(range.replay_count(), 62);
+    }
+
+    #[test]
+    fn test_minimal_from_genesis_to_checkpoint() {
+        // Minimal mode from genesis to a checkpoint should use bucket-apply
+        // (no replay) — replaying through protocol upgrades produces different
+        // state hashes than the live network.
+        let range = CatchupRange::calculate(1, 63, CatchupMode::Minimal);
+        assert!(
             range.apply_buckets(),
-            "should use bucket-apply, not replay from genesis"
+            "Minimal mode from genesis should use bucket-apply"
         );
         assert!(!range.replay_ledgers());
         assert_eq!(range.bucket_apply_ledger(), 63);
