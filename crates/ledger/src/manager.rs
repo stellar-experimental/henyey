@@ -4159,21 +4159,23 @@ impl LedgerCloseContext<'_> {
         // Parity: In stellar-core, eviction runs after config upgrades (sealLedgerTxnAndStoreInBucketsAndDB),
         // so it reads the post-upgrade StateArchival settings. We use load_state_archival_settings()
         // which checks the delta first (containing any upgrade changes) before the snapshot.
-        let eviction_settings =
-            if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
-                tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    "Loading state archival settings"
-                );
-                let settings = self.load_state_archival_settings().unwrap_or_default();
-                tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
-                    "Loaded state archival settings"
-                );
-                Some(settings)
-            } else {
-                None
-            };
+        // Gate on prev_version (initialLedgerVers) to match stellar-core: on the upgrade
+        // ledger (e.g. protocol 0→25), eviction does NOT run.
+        let eviction_settings = if protocol_version_starts_from(prev_version, ProtocolVersion::V23)
+        {
+            tracing::debug!(
+                ledger_seq = self.close_data.ledger_seq,
+                "Loading state archival settings"
+            );
+            let settings = self.load_state_archival_settings().unwrap_or_default();
+            tracing::debug!(
+                ledger_seq = self.close_data.ledger_seq,
+                "Loaded state archival settings"
+            );
+            Some(settings)
+        } else {
+            None
+        };
 
         // Categorize delta entries for bucket list update (single pass) before acquiring write lock.
         // Drains entries from the delta (moving instead of cloning), saving ~50K clone operations.
@@ -4288,7 +4290,7 @@ impl LedgerCloseContext<'_> {
             let mut eviction_us: u64 = 0;
             let mut evicted_meta_keys: Vec<LedgerKey> = Vec::new();
 
-            if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+            if protocol_version_starts_from(prev_version, ProtocolVersion::V23) {
                 let hot_archive_guard = self.manager.hot_archive_bucket_list.read();
                 if hot_archive_guard.is_some() {
                     drop(hot_archive_guard); // Release read lock before write operations
@@ -4441,7 +4443,8 @@ impl LedgerCloseContext<'_> {
             // IMPORTANT: Per stellar-core, we snapshot the state size BEFORE flushing
             // the updated entries into in-memory state. So the snapshot taken at ledger N
             // will have the state size for ledger N-1. This is a protocol implementation detail.
-            if protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
+            // Gate on prev_version (initialLedgerVers): on the upgrade ledger, this does NOT run.
+            if prev_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
                 // Check if window entry was already added by transaction execution
                 let has_window_entry = live_entries.iter().any(|e| {
                     matches!(
@@ -4507,7 +4510,9 @@ impl LedgerCloseContext<'_> {
             // Update in-memory Soroban state with changes from this ledger.
             // This happens AFTER computing state size window (see comment above).
             let soroban_state_start = std::time::Instant::now();
-            if protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
+            // Gate on prev_version (initialLedgerVers): on the upgrade ledger, the
+            // in-memory Soroban state update via this path does NOT run.
+            if prev_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
                 // Load rent config for accurate code size calculation
                 let rent_config = self.manager.load_soroban_rent_config(&bucket_list);
                 let mut soroban_state = self.manager.soroban_state.write();
@@ -4766,9 +4771,10 @@ impl LedgerCloseContext<'_> {
             };
             let hot_archive_us = hot_archive_start.elapsed().as_micros() as u64;
 
-            // Prepare data for background eviction scan (snapshot while we hold the lock)
+            // Prepare data for background eviction scan (snapshot while we hold the lock).
+            // Gate on prev_version (initialLedgerVers) to match stellar-core.
             let bg_eviction_data =
-                if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+                if protocol_version_starts_from(prev_version, ProtocolVersion::V23) {
                     eviction_settings.map(|settings| {
                         let snapshot =
                             BucketListSnapshot::new(&bucket_list, self.prev_header.clone());
@@ -4909,33 +4915,34 @@ impl LedgerCloseContext<'_> {
 
         // Compute average Soroban state size from the LiveSorobanStateSizeWindow.
         // Parity: NetworkConfig.cpp:1812 — average of all window entries.
-        let avg_soroban_state_size =
-            if protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION {
-                let bl = self.manager.bucket_list.read();
-                let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-                    config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
-                });
-                bl.get(&window_key)
-                    .ok()
-                    .flatten()
-                    .and_then(|entry| {
-                        if let LedgerEntryData::ConfigSetting(
-                            ConfigSettingEntry::LiveSorobanStateSizeWindow(window),
-                        ) = &entry.data
-                        {
-                            if window.is_empty() {
-                                return Some(0u64);
-                            }
-                            let sum: u64 = window.iter().copied().sum();
-                            Some(sum / window.len() as u64)
-                        } else {
-                            None
+        // Gate on prev_version (initialLedgerVers) to match stellar-core L1693.
+        let avg_soroban_state_size = if prev_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
+        {
+            let bl = self.manager.bucket_list.read();
+            let window_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
+            });
+            bl.get(&window_key)
+                .ok()
+                .flatten()
+                .and_then(|entry| {
+                    if let LedgerEntryData::ConfigSetting(
+                        ConfigSettingEntry::LiveSorobanStateSizeWindow(window),
+                    ) = &entry.data
+                    {
+                        if window.is_empty() {
+                            return Some(0u64);
                         }
-                    })
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+                        let sum: u64 = window.iter().copied().sum();
+                        Some(sum / window.len() as u64)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         let meta_start = std::time::Instant::now();
         // Move tx_set and scp_history out of close_data to avoid cloning 50K envelopes
