@@ -466,11 +466,16 @@ fn scan_and_merge(
     let mut ttl_count = 0u64;
     let mut config_count = 0u64;
 
-    // Sort level indices by total bucket size descending for better load balancing:
-    // large levels (which take longest) start immediately, small levels fill gaps.
+    // Choose scan order based on worker count:
+    // - Single worker: scan in level order (0 → 10) so the main thread can merge
+    //   and free each result immediately, avoiding buffering all results in memory.
+    // - Multiple workers: scan largest levels first for better load balancing,
+    //   since the main thread can absorb out-of-order completions.
     let mut sorted_indices: Vec<usize> = (0..num_levels).collect();
-    sorted_indices
-        .sort_by_key(|&i| std::cmp::Reverse(level_pairs[i].0.len() + level_pairs[i].1.len()));
+    if num_workers > 1 {
+        sorted_indices
+            .sort_by_key(|&i| std::cmp::Reverse(level_pairs[i].0.len() + level_pairs[i].1.len()));
+    }
 
     // Workers atomically claim slots in the sorted array.
     let next_claim = AtomicUsize::new(0);
