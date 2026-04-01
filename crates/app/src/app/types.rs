@@ -246,6 +246,7 @@ pub struct ScpSlotSnapshot {
     pub slot_index: u64,
     pub is_externalized: bool,
     pub is_nominating: bool,
+    pub fully_validated: Option<bool>,
     pub ballot_phase: String,
     pub nomination_round: u32,
     pub ballot_round: Option<u32>,

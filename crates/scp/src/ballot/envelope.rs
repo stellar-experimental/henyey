@@ -3,7 +3,7 @@
 use super::*;
 
 impl BallotProtocol {
-    pub(super) fn send_latest_envelope<D: SCPDriver>(&mut self, driver: &Arc<D>) {
+    pub(crate) fn send_latest_envelope<D: SCPDriver>(&mut self, driver: &Arc<D>) {
         if self.current_message_level != 0 {
             return;
         }

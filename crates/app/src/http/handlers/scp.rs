@@ -33,6 +33,7 @@ impl From<crate::app::ScpSlotSnapshot> for ScpSlotInfo {
             slot_index: snapshot.slot_index,
             is_externalized: snapshot.is_externalized,
             is_nominating: snapshot.is_nominating,
+            fully_validated: snapshot.fully_validated,
             ballot_phase: snapshot.ballot_phase,
             nomination_round: snapshot.nomination_round,
             ballot_round: snapshot.ballot_round,

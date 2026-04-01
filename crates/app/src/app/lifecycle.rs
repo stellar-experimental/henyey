@@ -381,6 +381,12 @@ impl App {
                     self.set_phase(4); // 4 = scp_broadcast
                     if let Some(envelope) = envelope {
                         let slot = envelope.statement.slot_index;
+                        let pledge_type = match &envelope.statement.pledges {
+                            ScpStatementPledges::Nominate(_) => "NOMINATE",
+                            ScpStatementPledges::Prepare(_) => "PREPARE",
+                            ScpStatementPledges::Confirm(_) => "CONFIRM",
+                            ScpStatementPledges::Externalize(_) => "EXTERNALIZE",
+                        };
                         let sample = {
                             let mut latency = self.scp_latency.write().await;
                             latency.record_self_sent(slot, self.clock.now())
@@ -394,10 +400,17 @@ impl App {
                             match overlay.broadcast(msg).await {
                                 Ok(count) => {
                                     self.scp_messages_sent.fetch_add(1, Ordering::Relaxed);
-                                    tracing::debug!(slot, peers = count, "Broadcast SCP envelope");
+                                    match pledge_type {
+                                        "NOMINATE" => self.scp_nominate_sent.fetch_add(1, Ordering::Relaxed),
+                                        "PREPARE" => self.scp_prepare_sent.fetch_add(1, Ordering::Relaxed),
+                                        "CONFIRM" => self.scp_confirm_sent.fetch_add(1, Ordering::Relaxed),
+                                        "EXTERNALIZE" => self.scp_externalize_sent.fetch_add(1, Ordering::Relaxed),
+                                        _ => 0,
+                                    };
+                                    tracing::info!(slot, peers = count, pledge_type, "Broadcast SCP envelope");
                                 }
                                 Err(e) => {
-                                    tracing::warn!(slot, error = %e, "Failed to broadcast SCP envelope");
+                                    tracing::warn!(slot, error = %e, pledge_type, "Failed to broadcast SCP envelope");
                                 }
                             }
                         }
@@ -587,6 +600,11 @@ impl App {
                     let heard_from_quorum = self.herder.heard_from_quorum(quorum_check_slot);
                     let is_v_blocking = self.herder.is_v_blocking(quorum_check_slot);
 
+                    let scp_sent = self.scp_messages_sent.load(Ordering::Relaxed);
+                    let nom_sent = self.scp_nominate_sent.load(Ordering::Relaxed);
+                    let prep_sent = self.scp_prepare_sent.load(Ordering::Relaxed);
+                    let conf_sent = self.scp_confirm_sent.load(Ordering::Relaxed);
+                    let ext_sent = self.scp_externalize_sent.load(Ordering::Relaxed);
                     tracing::info!(
                         tracking_slot,
                         ledger,
@@ -597,6 +615,11 @@ impl App {
                         scp_total = scp_messages_received,
                         scp_since_last = scp_messages_received - scp_messages_last_heartbeat,
                         scp_silent_secs = last_scp_message_at.elapsed().as_secs(),
+                        scp_sent,
+                        scp_sent_nom = nom_sent,
+                        scp_sent_prep = prep_sent,
+                        scp_sent_conf = conf_sent,
+                        scp_sent_ext = ext_sent,
                         "Heartbeat"
                     );
                     scp_messages_last_heartbeat = scp_messages_received;

@@ -573,6 +573,7 @@ impl<D: SCPDriver> SCP<D> {
             ballot_phase: slot.ballot_phase(),
             nomination_round: slot.nomination().round(),
             ballot_round: slot.ballot_counter(),
+            fully_validated: Some(slot.is_fully_validated()),
         })
     }
 
@@ -903,6 +904,12 @@ pub struct SlotState {
     /// The ballot counter increases on timeouts to help the network
     /// converge on a common ballot.
     pub ballot_round: Option<u32>,
+
+    /// Whether this slot is fully validated (not `MaybeValid`).
+    ///
+    /// A fully validated slot will broadcast its envelopes to peers.
+    /// This is `None` if the information is unavailable.
+    pub fully_validated: Option<bool>,
 }
 
 #[cfg(test)]

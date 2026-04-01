@@ -92,14 +92,15 @@ use henyey_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
 use stellar_xdr::curr::{
     Curve25519Public, DontHave, EncryptedBody, FloodAdvert, FloodDemand, Hash, LedgerCloseMeta,
     LedgerScpMessages, LedgerUpgrade, MessageType, ReadXdr, ScpEnvelope, ScpHistoryEntry,
-    ScpHistoryEntryV0, SignedTimeSlicedSurveyResponseMessage, StellarMessage, StellarValue,
-    StellarValueExt, SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseBody,
-    SurveyResponseMessage, TimeSlicedPeerDataList, TimeSlicedSurveyRequestMessage,
-    TimeSlicedSurveyResponseMessage, TimeSlicedSurveyStartCollectingMessage,
-    TimeSlicedSurveyStopCollectingMessage, TopologyResponseBodyV2, TransactionHistoryEntry,
-    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-    TransactionMeta, TransactionResultPair, TransactionResultSet, TransactionSet, TxAdvertVector,
-    TxDemandVector, UpgradeType, VecM, WriteXdr,
+    ScpHistoryEntryV0, ScpStatementPledges, SignedTimeSlicedSurveyResponseMessage, StellarMessage,
+    StellarValue, StellarValueExt, SurveyMessageCommandType, SurveyRequestMessage,
+    SurveyResponseBody, SurveyResponseMessage, TimeSlicedPeerDataList,
+    TimeSlicedSurveyRequestMessage, TimeSlicedSurveyResponseMessage,
+    TimeSlicedSurveyStartCollectingMessage, TimeSlicedSurveyStopCollectingMessage,
+    TopologyResponseBodyV2, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionMeta,
+    TransactionResultPair, TransactionResultSet, TransactionSet, TxAdvertVector, TxDemandVector,
+    UpgradeType, VecM, WriteXdr,
 };
 use x25519_dalek::{PublicKey as CurvePublicKey, StaticSecret as CurveSecretKey};
 
@@ -281,6 +282,11 @@ pub struct App {
     last_externalized_slot: AtomicU64,
     /// Count of SCP envelopes broadcast by this node.
     scp_messages_sent: AtomicU64,
+    /// Per-type SCP broadcast counters for heartbeat diagnostics.
+    scp_nominate_sent: AtomicU64,
+    scp_prepare_sent: AtomicU64,
+    scp_confirm_sent: AtomicU64,
+    scp_externalize_sent: AtomicU64,
     /// Count of SCP envelopes received by this node.
     scp_messages_received: AtomicU64,
     /// Number of attempts to trigger the next consensus round.
@@ -642,6 +648,10 @@ impl App {
             syncing_ledgers: RwLock::new(BTreeMap::new()),
             last_externalized_slot: AtomicU64::new(0),
             scp_messages_sent: AtomicU64::new(0),
+            scp_nominate_sent: AtomicU64::new(0),
+            scp_prepare_sent: AtomicU64::new(0),
+            scp_confirm_sent: AtomicU64::new(0),
+            scp_externalize_sent: AtomicU64::new(0),
             scp_messages_received: AtomicU64::new(0),
             consensus_trigger_attempts: AtomicU64::new(0),
             consensus_trigger_successes: AtomicU64::new(0),
@@ -1589,6 +1599,7 @@ impl App {
                     slot_index: state.slot_index,
                     is_externalized: state.is_externalized,
                     is_nominating: state.is_nominating,
+                    fully_validated: state.fully_validated,
                     ballot_phase: format!("{:?}", state.ballot_phase),
                     nomination_round: state.nomination_round,
                     ballot_round: state.ballot_round,

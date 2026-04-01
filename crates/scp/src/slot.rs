@@ -219,6 +219,12 @@ impl Slot {
         }
         if self.ballot.get_externalized_value().is_some() {
             self.sync_externalized_value_from_ballot();
+            // sync_externalized_value_from_ballot resets fully_validated = true.
+            // The EXTERNALIZE envelope was already recorded by set_confirm_commit →
+            // emit_current_state, but send_latest_envelope was blocked because
+            // fully_validated was still false (set by MaybeValid during validation).
+            // Now that fully_validated is true, emit the pending EXTERNALIZE.
+            self.ballot.send_latest_envelope(driver);
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Ballot);
         }
@@ -444,7 +450,7 @@ impl Slot {
             return EnvelopeState::Invalid;
         }
 
-        if validation == crate::ValidationLevel::MaybeValid {
+        if validation == crate::ValidationLevel::MaybeValid && self.externalized_value.is_none() {
             self.set_fully_validated(false);
         }
 
