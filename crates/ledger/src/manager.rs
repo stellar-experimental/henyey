@@ -430,6 +430,204 @@ fn merge_level_results(
     }
 }
 
+/// Streaming scan-and-merge: fuses the scan and merge phases into a single pass.
+///
+/// Instead of building an intermediate `LevelScanResult` per level and then merging it,
+/// this function processes each bucket entry inline and merges it directly into the
+/// final accumulators (soroban state, offer map, etc.) as it's read from the bucket.
+///
+/// This eliminates the double-buffering that occurs when a large `LevelScanResult`
+/// (e.g. level 10 with ~12M entries) coexists in memory alongside the growing final state
+/// during the merge transition.
+///
+/// Cross-level dedup uses the same `global_seen` / `global_ttl_seen` sets as the
+/// parallel path. Intra-level dedup uses a per-level `seen_keys` set that is reset
+/// between levels. Levels are processed in order (0 → 10) so that lower-numbered
+/// levels (newer data) correctly shadow higher-numbered levels.
+///
+/// This path is used when `scan_thread_count == 1`.
+fn scan_and_merge_streaming(
+    level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
+    protocol_version: u32,
+    soroban_enabled: bool,
+    rent_config: &Option<crate::soroban_state::SorobanRentConfig>,
+    module_cache: Option<PersistentModuleCache>,
+) -> CacheInitResult {
+    let module_cache_arc = module_cache.map(Arc::new);
+
+    let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
+    let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
+    let mut pool_share_tl_account_index: HashMap<AccountId, HashSet<PoolId>> = HashMap::new();
+    let mut global_seen: HashSet<LedgerKey> = HashSet::new();
+    let mut global_ttl_seen: HashSet<Hash> = HashSet::new();
+
+    let mut offer_count = 0u64;
+    let mut code_count = 0u64;
+    let mut data_count = 0u64;
+    let mut ttl_count = 0u64;
+    let mut config_count = 0u64;
+
+    for (level_idx, (curr, snap)) in level_pairs.iter().enumerate() {
+        let level_start = std::time::Instant::now();
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::new();
+        let mut level_entry_count = 0u64;
+        let mut level_ttl_count = 0u64;
+
+        // Scan curr first, then snap (curr shadows snap within a level)
+        for bucket in [curr.as_ref(), snap.as_ref()] {
+            for entry in bucket.iter() {
+                let key = match entry.key() {
+                    Some(k) => k,
+                    None => continue, // metadata
+                };
+
+                // Filter to scan-relevant types only
+                let is_scan_relevant = matches!(
+                    &key,
+                    LedgerKey::Offer(_)
+                        | LedgerKey::ContractCode(_)
+                        | LedgerKey::ContractData(_)
+                        | LedgerKey::Ttl(_)
+                        | LedgerKey::ConfigSetting(_)
+                ) || matches!(&key, LedgerKey::Trustline(tl_key)
+                    if matches!(tl_key.asset, stellar_xdr::curr::TrustLineAsset::PoolShare(_)));
+                if !is_scan_relevant {
+                    continue;
+                }
+
+                // Intra-level dedup: curr shadows snap
+                if seen_keys.contains(&key) {
+                    continue;
+                }
+
+                // Skip soroban types if not enabled
+                if !soroban_enabled && !matches!(&key, LedgerKey::Offer(_)) {
+                    continue;
+                }
+
+                seen_keys.insert(key.clone());
+
+                if let BucketEntry::Liveentry(ref le) | BucketEntry::Initentry(ref le) = entry {
+                    // Compile contracts via the shared module cache
+                    if let LedgerEntryData::ContractCode(ref contract_code) = le.data {
+                        if let Some(ref cache) = module_cache_arc {
+                            cache.add_contract(contract_code.code.as_slice(), protocol_version);
+                        }
+                    }
+
+                    // TTL entries: cross-level dedup and merge inline
+                    if let LedgerEntryData::Ttl(ref ttl) = le.data {
+                        let key_hash = ttl.key_hash.clone();
+                        if global_ttl_seen.insert(key_hash.clone()) {
+                            let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
+                                key_hash: key_hash.clone(),
+                            };
+                            let ttl_data = crate::soroban_state::TtlData::new(
+                                ttl.live_until_ledger_seq,
+                                le.last_modified_ledger_seq,
+                            );
+                            if let Err(e) = soroban_state.create_ttl(&ttl_key, ttl_data) {
+                                tracing::trace!(error = %e, "Failed to add TTL to soroban state (may be pending)");
+                            } else {
+                                ttl_count += 1;
+                                level_ttl_count += 1;
+                            }
+                        }
+                    } else {
+                        // Non-TTL live entry: cross-level dedup and merge inline
+                        if !global_seen.insert(key.clone()) {
+                            continue;
+                        }
+                        match &le.data {
+                            LedgerEntryData::Offer(ref offer) => {
+                                let offer_id = offer.offer_id;
+                                mem_offers.insert(offer_id, le.clone());
+                                offer_count += 1;
+                                level_entry_count += 1;
+                            }
+                            LedgerEntryData::Trustline(ref tl) => {
+                                if let stellar_xdr::curr::TrustLineAsset::PoolShare(ref pool_id) =
+                                    tl.asset
+                                {
+                                    pool_share_tl_account_index
+                                        .entry(tl.account_id.clone())
+                                        .or_default()
+                                        .insert(pool_id.clone());
+                                }
+                                level_entry_count += 1;
+                            }
+                            LedgerEntryData::ContractCode(_) => {
+                                if let Err(e) = soroban_state.create_contract_code(
+                                    le.clone(),
+                                    protocol_version,
+                                    rent_config.as_ref(),
+                                ) {
+                                    tracing::warn!(error = %e, "Failed to add contract code to soroban state");
+                                } else {
+                                    code_count += 1;
+                                    level_entry_count += 1;
+                                }
+                            }
+                            LedgerEntryData::ContractData(_) => {
+                                if let Err(e) = soroban_state.create_contract_data(le.clone()) {
+                                    tracing::warn!(error = %e, "Failed to add contract data to soroban state");
+                                } else {
+                                    data_count += 1;
+                                    level_entry_count += 1;
+                                }
+                            }
+                            LedgerEntryData::ConfigSetting(_) => {
+                                if let Err(e) = soroban_state.process_entry_create(
+                                    le,
+                                    protocol_version,
+                                    rent_config.as_ref(),
+                                ) {
+                                    tracing::warn!(error = %e, "Failed to add config setting to soroban state");
+                                } else {
+                                    config_count += 1;
+                                    level_entry_count += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                } else if let BucketEntry::Deadentry(_) = entry {
+                    // Dead keys shadow live entries at higher (older) levels.
+                    if let LedgerKey::Ttl(ref ttl_key) = key {
+                        global_ttl_seen.insert(ttl_key.key_hash.clone());
+                    }
+                    global_seen.insert(key);
+                }
+            }
+        }
+
+        // Per-level seen_keys is dropped here, freeing intra-level dedup memory
+        // before scanning the next level.
+        info!(
+            level = level_idx,
+            entries = level_entry_count,
+            ttls = level_ttl_count,
+            elapsed_ms = level_start.elapsed().as_millis() as u64,
+            "scan_and_merge_streaming: level scan+merge complete"
+        );
+    }
+
+    info!(
+        offer_count,
+        code_count, data_count, ttl_count, config_count, "scan_and_merge_streaming: complete"
+    );
+
+    let module_cache = module_cache_arc
+        .map(|arc| Arc::try_unwrap(arc).unwrap_or_else(|arc| PersistentModuleCache::clone(&arc)));
+
+    CacheInitResult {
+        offers: mem_offers,
+        pool_share_tl_account_index,
+        module_cache,
+        soroban_state,
+    }
+}
+
 /// Bounded-parallel scan-and-merge: up to `scan_thread_count` threads scan levels
 /// concurrently while the main thread merges completed results in level order (0 → 10).
 ///
@@ -438,7 +636,9 @@ fn merge_level_results(
 ///
 /// Memory is bounded to N concurrent raw `LevelScanResult`s plus accumulated final state,
 /// because the main thread merges and drops each raw HashMap before the window slides forward.
-/// With N=1 this is equivalent to the previous sequential loop.
+///
+/// When `scan_thread_count == 1`, delegates to `scan_and_merge_streaming` which fuses the
+/// scan and merge phases to avoid allocating intermediate `LevelScanResult` buffers entirely.
 fn scan_and_merge(
     level_pairs: &[(Arc<henyey_bucket::Bucket>, Arc<henyey_bucket::Bucket>)],
     protocol_version: u32,
@@ -450,9 +650,24 @@ fn scan_and_merge(
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
-    let module_cache_arc = module_cache.map(Arc::new);
     let num_levels = level_pairs.len();
     let num_workers = scan_thread_count.min(num_levels).max(1);
+
+    // Single-worker fast path: streaming scan-and-merge to avoid double-buffering.
+    // This eliminates the intermediate LevelScanResult allocation, which is critical
+    // for memory-constrained environments (e.g. CI with 15GB RAM) where level 10
+    // alone can have ~12M entries.
+    if num_workers == 1 {
+        return scan_and_merge_streaming(
+            level_pairs,
+            protocol_version,
+            soroban_enabled,
+            rent_config,
+            module_cache,
+        );
+    }
+
+    let module_cache_arc = module_cache.map(Arc::new);
 
     let mut soroban_state = crate::soroban_state::InMemorySorobanState::new();
     let mut mem_offers: HashMap<i64, LedgerEntry> = HashMap::new();
@@ -5743,6 +5958,546 @@ mod tests {
             expected.soroban_state.contract_data_count(),
             "contract data count must match"
         );
+    }
+
+    // ---- Streaming scan-and-merge tests (scan_thread_count=1) ----
+
+    #[test]
+    fn test_streaming_scan_empty_bucket_list() {
+        let bl = BucketList::new();
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert!(result.offers.is_empty());
+        assert!(result.soroban_state.is_empty());
+    }
+
+    #[test]
+    fn test_streaming_scan_offers() {
+        let mut bl = BucketList::new();
+        let offer1 = make_offer_entry(1, [1u8; 32]);
+        let offer2 = make_offer_entry(2, [2u8; 32]);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer1, offer2],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert_eq!(result.offers.len(), 2);
+        assert!(result.offers.contains_key(&1));
+        assert!(result.offers.contains_key(&2));
+    }
+
+    #[test]
+    fn test_streaming_scan_contract_data() {
+        let mut bl = BucketList::new();
+        let cd1 = make_contract_data_entry([10u8; 32]);
+        let cd2 = make_contract_data_entry([20u8; 32]);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![cd1, cd2],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert_eq!(result.soroban_state.contract_data_count(), 2);
+    }
+
+    #[test]
+    fn test_streaming_scan_ttl_entries() {
+        let mut bl = BucketList::new();
+        // Add contract data entries with corresponding TTLs
+        let cd1 = make_contract_data_entry([30u8; 32]);
+        let cd2 = make_contract_data_entry([31u8; 32]);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![cd1, cd2],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert_eq!(
+            result.soroban_state.contract_data_count(),
+            2,
+            "should have 2 contract data entries"
+        );
+    }
+
+    #[test]
+    fn test_streaming_scan_mixed_types() {
+        let mut bl = BucketList::new();
+        let offer = make_offer_entry(1, [1u8; 32]);
+        let cd = make_contract_data_entry([10u8; 32]);
+        let ttl = make_ttl_entry([30u8; 32], 1000);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer, cd, ttl],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert_eq!(result.offers.len(), 1);
+        assert_eq!(result.soroban_state.contract_data_count(), 1);
+        assert!(
+            !result.soroban_state.is_empty(),
+            "soroban state should contain the TTL entry"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_dead_entry_shadows_live() {
+        let mut bl = BucketList::new();
+        // Add an offer at ledger 1
+        let offer = make_offer_entry(1, [1u8; 32]);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer.clone()],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        // Kill it at ledger 2
+        let dead_key = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: make_account_id([1u8; 32]),
+            offer_id: 1,
+        });
+        bl.add_batch(
+            2,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![],
+            vec![dead_key],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert!(
+            result.offers.is_empty(),
+            "dead entry should shadow the live offer"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_newer_level_shadows_older() {
+        let mut bl = BucketList::new();
+        // Add offer at ledger 1 (will end up at a higher/older level after merges)
+        let offer_v1 = make_offer_entry(1, [1u8; 32]);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer_v1],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        // Modify same offer (same key) at later ledger with different amount
+        let mut offer_v2 = make_offer_entry(1, [1u8; 32]);
+        if let LedgerEntryData::Offer(ref mut o) = offer_v2.data {
+            o.amount = 9999;
+        }
+        bl.add_batch(
+            2,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![offer_v2],
+            vec![],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert_eq!(result.offers.len(), 1);
+        // The newer version (amount=9999) should win
+        if let LedgerEntryData::Offer(ref o) = result.offers[&1].data {
+            assert_eq!(o.amount, 9999, "newer level should shadow older level");
+        } else {
+            panic!("expected offer entry");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_many_entries_across_levels() {
+        let mut bl = BucketList::new();
+        for i in 1u32..=20 {
+            let offer = make_offer_entry(i as i64, [i as u8; 32]);
+            bl.add_batch(
+                i,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![offer],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert_eq!(result.offers.len(), 20);
+    }
+
+    #[test]
+    fn test_streaming_pre_soroban_protocol() {
+        let mut bl = BucketList::new();
+        let pre_soroban_protocol = 19; // Before Soroban was enabled
+        let offer = make_offer_entry(1, [1u8; 32]);
+        let cd = make_contract_data_entry([10u8; 32]);
+        bl.add_batch(
+            1,
+            pre_soroban_protocol,
+            BucketListType::Live,
+            vec![offer, cd],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, pre_soroban_protocol, 1);
+        // Offers should still be scanned even without Soroban
+        assert_eq!(result.offers.len(), 1);
+        // Contract data should not be scanned when Soroban is disabled
+        assert_eq!(result.soroban_state.contract_data_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_intra_level_dedup() {
+        // Within a single level, curr shadows snap. If the same key appears
+        // in both curr and snap, only the curr version should be kept.
+        let mut bl = BucketList::new();
+        // Add offer at ledger 1 (goes into snap after ledger 2 closes)
+        let offer_v1 = make_offer_entry(1, [1u8; 32]);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer_v1],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        // Modify same offer at ledger 2 (same key, different amount) — goes into curr
+        let mut offer_v2 = make_offer_entry(1, [1u8; 32]);
+        if let LedgerEntryData::Offer(ref mut o) = offer_v2.data {
+            o.amount = 7777;
+        }
+        bl.add_batch(
+            2,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![offer_v2],
+            vec![],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert_eq!(result.offers.len(), 1, "should have exactly one offer");
+        if let LedgerEntryData::Offer(ref o) = result.offers[&1].data {
+            assert_eq!(
+                o.amount, 7777,
+                "curr should shadow snap within the same level"
+            );
+        } else {
+            panic!("expected offer entry");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_cross_level_dedup() {
+        // If the same key appears in different levels, the lower-numbered
+        // (newer) level should win.
+        let mut bl = BucketList::new();
+        // Create offer at ledger 1
+        let offer_v1 = make_offer_entry(1, [1u8; 32]);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer_v1],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        // Update same offer across several more ledgers to push data to higher levels
+        for i in 2u32..=8 {
+            let mut offer = make_offer_entry(1, [1u8; 32]);
+            if let LedgerEntryData::Offer(ref mut o) = offer.data {
+                o.amount = i as i64 * 1000;
+            }
+            bl.add_batch(
+                i,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![],
+                vec![offer],
+                vec![],
+            )
+            .unwrap();
+        }
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        // Should have exactly 1 offer (all were for offer_id=1)
+        assert_eq!(result.offers.len(), 1);
+        // The newest version (amount=8000) should win
+        if let LedgerEntryData::Offer(ref o) = result.offers[&1].data {
+            assert_eq!(
+                o.amount, 8000,
+                "most recent version should win across levels"
+            );
+        } else {
+            panic!("expected offer entry");
+        }
+    }
+
+    #[test]
+    fn test_streaming_pool_share_trustline_indexing() {
+        let mut bl = BucketList::new();
+        let pool_hash = stellar_xdr::curr::PoolId(Hash([99u8; 32]));
+        let account = make_account_id([1u8; 32]);
+        let tl_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Trustline(stellar_xdr::curr::TrustLineEntry {
+                account_id: account.clone(),
+                asset: stellar_xdr::curr::TrustLineAsset::PoolShare(pool_hash.clone()),
+                balance: 100,
+                limit: 1000,
+                flags: 0,
+                ext: stellar_xdr::curr::TrustLineEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![tl_entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        assert!(
+            result
+                .pool_share_tl_account_index
+                .get(&account)
+                .map_or(false, |pools| pools.contains(&pool_hash)),
+            "pool share trustline should be indexed"
+        );
+    }
+
+    #[test]
+    fn test_streaming_config_settings() {
+        let mut bl = BucketList::new();
+        let config_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ConfigSetting(
+                stellar_xdr::curr::ConfigSettingEntry::ContractMaxSizeBytes(16384),
+            ),
+            ext: LedgerEntryExt::V0,
+        };
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![config_entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+
+        let result = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        // Config settings are loaded into soroban_state
+        assert!(
+            !result.soroban_state.is_empty(),
+            "config settings should be loaded into soroban state"
+        );
+    }
+
+    // ---- Streaming vs parallel equivalence tests ----
+
+    /// Helper: assert two `CacheInitResult`s are equivalent.
+    fn assert_cache_init_results_equivalent(
+        streaming: &CacheInitResult,
+        parallel: &CacheInitResult,
+        label: &str,
+    ) {
+        assert_eq!(
+            streaming.offers.len(),
+            parallel.offers.len(),
+            "{}: offer count mismatch",
+            label
+        );
+        for (id, _) in &parallel.offers {
+            assert!(
+                streaming.offers.contains_key(id),
+                "{}: offer {} missing from streaming result",
+                label,
+                id
+            );
+        }
+        assert_eq!(
+            streaming.pool_share_tl_account_index.len(),
+            parallel.pool_share_tl_account_index.len(),
+            "{}: pool share index count mismatch",
+            label
+        );
+        assert_eq!(
+            streaming.soroban_state.contract_data_count(),
+            parallel.soroban_state.contract_data_count(),
+            "{}: contract data count mismatch",
+            label
+        );
+        assert_eq!(
+            streaming.soroban_state.contract_code_count(),
+            parallel.soroban_state.contract_code_count(),
+            "{}: contract code count mismatch",
+            label
+        );
+    }
+
+    #[test]
+    fn test_streaming_vs_parallel_empty() {
+        let bl = BucketList::new();
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        assert_cache_init_results_equivalent(&streaming, &parallel, "empty");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_vs_parallel_offers_only() {
+        let mut bl = BucketList::new();
+        for i in 1i64..=5 {
+            let offer = make_offer_entry(i, [i as u8; 32]);
+            bl.add_batch(
+                i as u32,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![offer],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        assert_cache_init_results_equivalent(&streaming, &parallel, "offers_only");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_vs_parallel_mixed_types() {
+        let mut bl = BucketList::new();
+        for i in 1u32..=8 {
+            let offer = make_offer_entry(i as i64, [i as u8; 32]);
+            let cd = make_contract_data_entry([(i + 100) as u8; 32]);
+            let ttl = make_ttl_entry([(i + 200) as u8; 32], i * 1000);
+            bl.add_batch(
+                i,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![offer, cd, ttl],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        assert_cache_init_results_equivalent(&streaming, &parallel, "mixed_types");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_vs_parallel_with_dead_entries() {
+        let mut bl = BucketList::new();
+        // Add offers
+        for i in 1i64..=5 {
+            let offer = make_offer_entry(i, [i as u8; 32]);
+            bl.add_batch(
+                i as u32,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![offer],
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        }
+        // Kill offers 2 and 4
+        let dead2 = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: make_account_id([2u8; 32]),
+            offer_id: 2,
+        });
+        let dead4 = LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
+            seller_id: make_account_id([4u8; 32]),
+            offer_id: 4,
+        });
+        bl.add_batch(
+            6,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![],
+            vec![],
+            vec![dead2, dead4],
+        )
+        .unwrap();
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        assert_cache_init_results_equivalent(&streaming, &parallel, "with_dead_entries");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_streaming_vs_parallel_cross_level_overwrites() {
+        let mut bl = BucketList::new();
+        // Create offer and contract data at ledger 1
+        let offer_init = make_offer_entry(1, [1u8; 32]);
+        let cd_init = make_contract_data_entry([1u8; 32]);
+        bl.add_batch(
+            1,
+            TEST_PROTOCOL,
+            BucketListType::Live,
+            vec![offer_init, cd_init],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        // Repeatedly overwrite the same entries to create cross-level duplicates
+        for i in 2u32..=16 {
+            let mut offer = make_offer_entry(1, [1u8; 32]);
+            if let LedgerEntryData::Offer(ref mut o) = offer.data {
+                o.amount = i as i64 * 100;
+            }
+            let cd = make_contract_data_entry([1u8; 32]);
+            bl.add_batch(
+                i,
+                TEST_PROTOCOL,
+                BucketListType::Live,
+                vec![],
+                vec![offer, cd],
+                vec![],
+            )
+            .unwrap();
+        }
+        let streaming = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 1);
+        let parallel = scan_bucket_list_for_caches(&bl, TEST_PROTOCOL, 2);
+        assert_cache_init_results_equivalent(&streaming, &parallel, "cross_level_overwrites");
     }
 
     #[test]
