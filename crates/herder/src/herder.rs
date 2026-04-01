@@ -1257,44 +1257,6 @@ impl Herder {
                             // Advance tracking slot
                             self.advance_tracking_slot(slot);
                         }
-                    } else if let stellar_xdr::curr::ScpStatementPledges::Externalize(ext) =
-                        &envelope.statement.pledges
-                    {
-                        // SCP didn't reach consensus internally, but we received an EXTERNALIZE
-                        // envelope for a slot that hasn't been externalized yet. This handles
-                        // the case where we're a validator not in the network's quorum - we can
-                        // still follow the network's consensus by accepting EXTERNALIZE messages
-                        // from trusted nodes (sender already verified to be in our transitive quorum).
-                        //
-                        // This is safe because:
-                        // 1. The sender's signature was verified
-                        // 2. The sender is in our transitive quorum (checked in receive_scp_envelope)
-                        // 3. EXTERNALIZE messages represent finalized consensus
-                        //
-                        // The condition slot == tracking ensures we only do this for the "next"
-                        // slot we're trying to close, not for slots way in the future (which
-                        // would be caught by the fast-forward path).
-                        let tracking = self.tracking_slot();
-                        if slot == tracking {
-                            info!(
-                                slot,
-                                sender = ?envelope.statement.node_id,
-                                "Accepting EXTERNALIZE from trusted validator (following network consensus)"
-                            );
-                            let value = ext.commit.value.clone();
-                            self.scp_driver.record_externalized(slot, value.clone());
-                            self.scp_driver
-                                .cleanup_externalized(self.config.max_externalized_slots);
-
-                            // Force SCP to externalize so it's consistent
-                            scp.force_externalize(slot, value.clone());
-
-                            // Store for next round's priority calculation
-                            *self.prev_value.write() = value;
-
-                            // Advance tracking slot
-                            self.advance_tracking_slot(slot);
-                        }
                     }
                     return EnvelopeState::Valid;
                 }
@@ -3112,6 +3074,123 @@ mod tests {
             result_other,
             EnvelopeState::Invalid,
             "stale close time for non-next-consensus slot at genesis should be rejected"
+        );
+    }
+
+    // =========================================================================
+    // SCP ballot protocol participation tests
+    // =========================================================================
+
+    /// Creates a signed EXTERNALIZE envelope from a specific secret key,
+    /// with a properly signed StellarValue (STELLAR_VALUE_SIGNED).
+    fn make_signed_externalize_from(slot: u64, herder: &Herder, secret: &SecretKey) -> ScpEnvelope {
+        let public = secret.public_key();
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*public.as_bytes()),
+        ));
+
+        // Use the value helper that caches the tx set and signs properly
+        let value = make_valid_value_with_cached_tx_set(herder, secret);
+
+        let statement = ScpStatement {
+            node_id: node_id.clone(),
+            slot_index: slot,
+            pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                commit: ScpBallot { counter: 1, value },
+                n_h: 1,
+                commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            }),
+        };
+
+        sign_statement(&statement, herder, secret)
+    }
+
+    #[test]
+    fn test_externalize_goes_through_scp_for_validator() {
+        // Verify that a validator processes EXTERNALIZE for the current tracking
+        // slot through SCP (not force-externalize). This is the key behavioral
+        // change: SCP processes the EXTERNALIZE internally, which allows the
+        // node to participate in the ballot protocol and send its own messages.
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]));
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set);
+
+        let tracking = herder.tracking_slot(); // 101
+
+        // Track emitted envelopes to verify SCP participation
+        let emitted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let emitted_clone = emitted.clone();
+        herder.scp_driver.set_envelope_sender(move |env| {
+            emitted_clone.lock().unwrap().push(env);
+        });
+
+        // Process EXTERNALIZE through SCP — should externalize via SCP consensus
+        let envelope = make_signed_externalize_from(tracking, &herder, &other_secret);
+        let result = herder.receive_scp_envelope(envelope);
+
+        assert_eq!(result, EnvelopeState::Valid);
+
+        // SCP should have externalized the slot internally
+        let scp = herder.scp().expect("validator has scp");
+        assert!(
+            scp.is_slot_externalized(tracking),
+            "SCP should externalize when receiving valid EXTERNALIZE"
+        );
+
+        // Herder should have recorded the externalization
+        assert_eq!(
+            herder.latest_externalized_slot(),
+            Some(tracking),
+            "herder should record externalized slot"
+        );
+        assert_eq!(
+            herder.tracking_slot(),
+            tracking + 1,
+            "tracking slot should advance after externalization"
+        );
+
+        // Verify SCP emitted ballot messages (EXTERNALIZE) — proves the node
+        // participates in the ballot protocol instead of force-externalizing
+        let msgs = emitted.lock().unwrap();
+        assert!(
+            !msgs.is_empty(),
+            "SCP should emit ballot messages when processing EXTERNALIZE"
+        );
+        // The emitted message should be an EXTERNALIZE from our local node
+        let has_externalize = msgs
+            .iter()
+            .any(|env| matches!(env.statement.pledges, ScpStatementPledges::Externalize(_)));
+        assert!(
+            has_externalize,
+            "SCP should emit its own EXTERNALIZE message"
         );
     }
 }

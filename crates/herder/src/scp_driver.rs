@@ -820,7 +820,7 @@ impl ScpDriver {
             let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
             if !self.has_tx_set(&tx_set_hash) {
                 debug!("Missing transaction set: {}", tx_set_hash);
-                return ValueValidation::MaybeValid;
+                return ValueValidation::Invalid;
             }
             if let Some(tx_set) = self.tx_set_cache.get(&tx_set_hash) {
                 // Parity: verify hash integrity
@@ -2085,6 +2085,97 @@ mod cache_tests {
         assert!(driver.has_tx_set(&tx_set.hash));
         assert!(driver.get_tx_set(&tx_set.hash).is_some());
         assert!(driver.get_pending_tx_sets().is_empty());
+    }
+
+    /// Create a signed StellarValue for testing validate_value_impl.
+    fn make_signed_stellar_value(
+        network_id: &Hash256,
+        secret: &henyey_crypto::SecretKey,
+        tx_set_hash: [u8; 32],
+        close_time: u64,
+    ) -> stellar_xdr::curr::Value {
+        use stellar_xdr::curr::{
+            EnvelopeType, LedgerCloseValueSignature, Limits, NodeId as XdrNodeId, StellarValue,
+            StellarValueExt, TimePoint, WriteXdr,
+        };
+
+        let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash);
+        let ct = TimePoint(close_time);
+
+        // Sign: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).unwrap());
+        sign_data.extend_from_slice(&xdr_tx_set_hash.to_xdr(Limits::none()).unwrap());
+        sign_data.extend_from_slice(&ct.to_xdr(Limits::none()).unwrap());
+        let sig = secret.sign(&sign_data);
+
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*secret.public_key().as_bytes()),
+        ));
+
+        let sv = StellarValue {
+            tx_set_hash: xdr_tx_set_hash,
+            close_time: ct,
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id,
+                signature: stellar_xdr::curr::Signature(
+                    sig.0.to_vec().try_into().unwrap_or_default(),
+                ),
+            }),
+        };
+        stellar_xdr::curr::Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap())
+    }
+
+    #[test]
+    fn test_validate_value_returns_invalid_for_missing_tx_set() {
+        // When validating a value for LCL+1 (current ledger) and the tx set is
+        // not cached, validate_value should return Invalid (matching stellar-core).
+        let secret = henyey_crypto::SecretKey::from_seed(&[42u8; 32]);
+        let network_id = Hash256::hash(b"test-network");
+
+        let config = ScpDriverConfig {
+            node_id: secret.public_key(),
+            ..make_config(4)
+        };
+        let driver = ScpDriver::new(config, network_id);
+
+        // Set tracking state: LCL is at slot 0, so slot 1 is LCL+1 (current ledger)
+        driver.set_tracking_state(true, 1, 1);
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let tx_set_hash = [99u8; 32];
+
+        // Create a signed value with a tx_set_hash that is NOT cached
+        let value = make_signed_stellar_value(&network_id, &secret, tx_set_hash, now);
+
+        let result = driver.validate_value_impl(1, &value);
+        assert_eq!(
+            result,
+            ValueValidation::Invalid,
+            "missing tx set for current ledger should return Invalid, not MaybeValid"
+        );
+
+        // Now cache the tx set and re-validate — should pass the tx set check
+        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+        // The tx_set created by TransactionSet::new computes its own hash,
+        // so we need to use that hash in the value
+        let tx_set_hash_real = tx_set.hash;
+        driver.cache_tx_set(tx_set);
+
+        let value2 = make_signed_stellar_value(&network_id, &secret, tx_set_hash_real.0, now);
+        let result2 = driver.validate_value_impl(1, &value2);
+        // Should NOT be Invalid (the tx set is now available)
+        // It may be MaybeValid or Valid depending on other checks
+        assert_ne!(
+            result2,
+            ValueValidation::Invalid,
+            "with tx set cached, validation should not return Invalid"
+        );
     }
 }
 
