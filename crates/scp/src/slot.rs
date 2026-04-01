@@ -191,7 +191,14 @@ impl Slot {
 
         if let Some(value) = self.ballot.get_externalized_value() {
             self.externalized_value = Some(value.clone());
-            self.set_fully_validated(true);
+            // Restore fully_validated for validators so that the pending
+            // EXTERNALIZE envelope can be emitted.  Non-validators start
+            // with fully_validated=false and stellar-core never sets it
+            // back to true (mFullyValidated is only set false in
+            // BallotProtocol::processEnvelope, never set true after init).
+            if self.is_validator {
+                self.set_fully_validated(true);
+            }
         }
     }
 
