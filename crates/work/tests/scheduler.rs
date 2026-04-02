@@ -5,16 +5,11 @@
 //! - Retry behavior
 //! - Cancellation handling
 //! - Metrics and snapshots
-//! - Callback wrappers
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use henyey_work::{
-    Work, WorkContext, WorkOutcome, WorkScheduler, WorkSchedulerConfig, WorkSequence, WorkState,
-    WorkWithCallback,
-};
+use henyey_work::{Work, WorkContext, WorkOutcome, WorkScheduler, WorkSchedulerConfig, WorkState};
 
 // ============================================================================
 // Test Work Item Implementations
@@ -159,75 +154,6 @@ async fn test_retry_then_success() {
 }
 
 // ============================================================================
-// Sequence Tests
-// ============================================================================
-
-/// Verifies that WorkSequence creates proper dependency chains.
-#[tokio::test]
-async fn test_work_sequence_ordering() {
-    let log = Arc::new(Mutex::new(Vec::new()));
-
-    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
-        max_concurrency: 1,
-        retry_delay: Duration::from_millis(1),
-        event_tx: None,
-    });
-
-    let mut sequence = WorkSequence::new();
-
-    // Add steps to the sequence
-    for i in 0..2 {
-        let work = Box::new(LogWork {
-            name: format!("step-{}", i),
-            log: Arc::clone(&log),
-        });
-        sequence.push(&mut scheduler, work, 0);
-    }
-
-    scheduler.run_until_done().await;
-
-    // Verify steps executed in order
-    assert_eq!(log.lock().unwrap().as_slice(), ["step-0", "step-1"]);
-}
-
-// ============================================================================
-// Callback Tests
-// ============================================================================
-
-/// Verifies that WorkWithCallback invokes the callback after execution.
-#[tokio::test]
-async fn test_work_callback() {
-    let callback_count = Arc::new(AtomicU32::new(0));
-    let log = Arc::new(Mutex::new(Vec::new()));
-
-    let callback: Arc<dyn Fn(&WorkOutcome, &WorkContext) + Send + Sync> = {
-        let callback_count = Arc::clone(&callback_count);
-        Arc::new(move |_outcome: &WorkOutcome, _ctx: &WorkContext| {
-            callback_count.fetch_add(1, Ordering::SeqCst);
-        })
-    };
-
-    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
-        max_concurrency: 1,
-        retry_delay: Duration::from_millis(1),
-        event_tx: None,
-    });
-
-    let work = Box::new(LogWork {
-        name: "callback".to_string(),
-        log: Arc::clone(&log),
-    });
-    let wrapped = WorkWithCallback::new(work, Arc::clone(&callback));
-    let _ = scheduler.add_work(Box::new(wrapped), vec![], 0);
-
-    scheduler.run_until_done().await;
-
-    // Verify the callback was invoked exactly once
-    assert_eq!(callback_count.load(Ordering::SeqCst), 1);
-    assert_eq!(log.lock().unwrap().as_slice(), ["callback"]);
-}
-
-// ============================================================================
 // Cancellation Tests
 // ============================================================================
 
@@ -291,10 +217,4 @@ async fn test_metrics_snapshot() {
     assert_eq!(metrics.total, 1);
     assert_eq!(metrics.success, 1);
     assert_eq!(metrics.failed, 0);
-
-    // Verify snapshot
-    let snapshot = scheduler.snapshot();
-    assert_eq!(snapshot.len(), 1);
-    assert_eq!(snapshot[0].name, "metrics");
-    assert_eq!(snapshot[0].state, WorkState::Success);
 }

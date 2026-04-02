@@ -866,13 +866,7 @@ impl Slot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{PublicKey, Uint256};
-
-    fn make_node_id(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
-    }
+    use crate::test_utils::{make_node_id, MockDriver};
 
     fn make_quorum_set() -> ScpQuorumSet {
         ScpQuorumSet {
@@ -999,44 +993,9 @@ mod tests {
 
     #[test]
     fn test_abandon_ballot() {
-        use crate::driver::{SCPDriver, ValidationLevel};
         use std::sync::Arc;
-        use std::time::Duration;
 
-        struct AbandonDriver;
-        impl SCPDriver for AbandonDriver {
-            fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
-                ValidationLevel::FullyValidated
-            }
-            fn combine_candidates(&self, _: u64, _: &[Value]) -> Option<Value> {
-                None
-            }
-            fn extract_valid_value(&self, _: u64, _: &Value) -> Option<Value> {
-                None
-            }
-            fn emit_envelope(&self, _: &ScpEnvelope) {}
-            fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
-                None
-            }
-            fn nominating_value(&self, _: u64, _: &Value) {}
-            fn value_externalized(&self, _: u64, _: &Value) {}
-            fn ballot_did_prepare(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
-            fn ballot_did_confirm(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
-            fn compute_hash_node(&self, _: u64, _: &Value, _: bool, _: u32, _: &NodeId) -> u64 {
-                0
-            }
-            fn compute_value_hash(&self, _: u64, _: &Value, _: u32, _: &Value) -> u64 {
-                0
-            }
-            fn compute_timeout(&self, _: u32, _: bool) -> Duration {
-                Duration::from_secs(1)
-            }
-            fn sign_envelope(&self, _: &mut ScpEnvelope) {}
-            fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
-                true
-            }
-        }
-        let driver = Arc::new(AbandonDriver);
+        let driver = Arc::new(MockDriver::bare());
 
         let node = make_node_id(1);
         let quorum_set = make_quorum_set();
@@ -1501,44 +1460,8 @@ mod tests {
     // S9: purge_slots keeps slot_to_keep
     #[test]
     fn test_purge_slots_keeps_slot_to_keep() {
-        use crate::driver::{SCPDriver, ValidationLevel};
         use crate::SCP;
         use std::sync::Arc;
-        use std::time::Duration;
-
-        struct DummyDriver;
-        impl SCPDriver for DummyDriver {
-            fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
-                ValidationLevel::FullyValidated
-            }
-            fn combine_candidates(&self, _: u64, _: &[Value]) -> Option<Value> {
-                None
-            }
-            fn emit_envelope(&self, _: &ScpEnvelope) {}
-            fn nominating_value(&self, _: u64, _: &Value) {}
-            fn extract_valid_value(&self, _: u64, _: &Value) -> Option<Value> {
-                None
-            }
-            fn value_externalized(&self, _: u64, _: &Value) {}
-            fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
-                None
-            }
-            fn ballot_did_prepare(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
-            fn ballot_did_confirm(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
-            fn compute_hash_node(&self, _: u64, _: &Value, _: bool, _: u32, _: &NodeId) -> u64 {
-                1
-            }
-            fn compute_value_hash(&self, _: u64, _: &Value, _: u32, _: &Value) -> u64 {
-                1
-            }
-            fn compute_timeout(&self, _: u32, _: bool) -> Duration {
-                Duration::from_secs(1)
-            }
-            fn sign_envelope(&self, _: &mut ScpEnvelope) {}
-            fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
-                true
-            }
-        }
 
         let node = make_node_id(1);
         let quorum_set = ScpQuorumSet {
@@ -1546,7 +1469,7 @@ mod tests {
             validators: vec![node.clone()].try_into().unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         };
-        let driver = Arc::new(DummyDriver);
+        let driver = Arc::new(MockDriver::bare());
         let scp = SCP::new(node, true, quorum_set, driver);
 
         // Create slots 1 through 10
@@ -1573,44 +1496,8 @@ mod tests {
     // S9: purge_slots without slot_to_keep behaves normally
     #[test]
     fn test_purge_slots_without_keep() {
-        use crate::driver::{SCPDriver, ValidationLevel};
         use crate::SCP;
         use std::sync::Arc;
-        use std::time::Duration;
-
-        struct DummyDriver2;
-        impl SCPDriver for DummyDriver2 {
-            fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
-                ValidationLevel::FullyValidated
-            }
-            fn combine_candidates(&self, _: u64, _: &[Value]) -> Option<Value> {
-                None
-            }
-            fn emit_envelope(&self, _: &ScpEnvelope) {}
-            fn nominating_value(&self, _: u64, _: &Value) {}
-            fn extract_valid_value(&self, _: u64, _: &Value) -> Option<Value> {
-                None
-            }
-            fn value_externalized(&self, _: u64, _: &Value) {}
-            fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
-                None
-            }
-            fn ballot_did_prepare(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
-            fn ballot_did_confirm(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
-            fn compute_hash_node(&self, _: u64, _: &Value, _: bool, _: u32, _: &NodeId) -> u64 {
-                1
-            }
-            fn compute_value_hash(&self, _: u64, _: &Value, _: u32, _: &Value) -> u64 {
-                1
-            }
-            fn compute_timeout(&self, _: u32, _: bool) -> Duration {
-                Duration::from_secs(1)
-            }
-            fn sign_envelope(&self, _: &mut ScpEnvelope) {}
-            fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
-                true
-            }
-        }
 
         let node = make_node_id(1);
         let quorum_set = ScpQuorumSet {
@@ -1618,7 +1505,7 @@ mod tests {
             validators: vec![node.clone()].try_into().unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         };
-        let driver = Arc::new(DummyDriver2);
+        let driver = Arc::new(MockDriver::bare());
         let scp = SCP::new(node, true, quorum_set, driver);
 
         for i in 1..=10 {
@@ -1640,8 +1527,6 @@ mod tests {
     #[should_panic(expected = "maximum number of transitions reached in advanceSlot")]
     fn test_advance_slot_recursion_panic() {
         use crate::ballot::BallotProtocol;
-        use crate::driver::{SCPDriver, ValidationLevel};
-        use std::time::Duration;
 
         let node = make_node_id(1);
         let quorum_set = make_quorum_set();
@@ -1670,41 +1555,7 @@ mod tests {
             pledges: ScpStatementPledges::Prepare(prep),
         };
 
-        struct PanicDriver;
-        impl SCPDriver for PanicDriver {
-            fn validate_value(&self, _: u64, _: &Value, _: bool) -> ValidationLevel {
-                ValidationLevel::FullyValidated
-            }
-            fn combine_candidates(&self, _: u64, _: &[Value]) -> Option<Value> {
-                None
-            }
-            fn emit_envelope(&self, _: &ScpEnvelope) {}
-            fn nominating_value(&self, _: u64, _: &Value) {}
-            fn extract_valid_value(&self, _: u64, _: &Value) -> Option<Value> {
-                None
-            }
-            fn value_externalized(&self, _: u64, _: &Value) {}
-            fn get_quorum_set(&self, _: &NodeId) -> Option<ScpQuorumSet> {
-                None
-            }
-            fn ballot_did_prepare(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
-            fn ballot_did_confirm(&self, _: u64, _: &stellar_xdr::curr::ScpBallot) {}
-            fn compute_hash_node(&self, _: u64, _: &Value, _: bool, _: u32, _: &NodeId) -> u64 {
-                1
-            }
-            fn compute_value_hash(&self, _: u64, _: &Value, _: u32, _: &Value) -> u64 {
-                1
-            }
-            fn compute_timeout(&self, _: u32, _: bool) -> Duration {
-                Duration::from_secs(1)
-            }
-            fn sign_envelope(&self, _: &mut ScpEnvelope) {}
-            fn verify_envelope(&self, _: &ScpEnvelope) -> bool {
-                true
-            }
-        }
-
-        let driver = std::sync::Arc::new(PanicDriver);
+        let driver = std::sync::Arc::new(MockDriver::bare());
         let ctx = SlotContext {
             local_node_id: &node,
             local_quorum_set: &quorum_set,

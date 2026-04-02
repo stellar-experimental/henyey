@@ -54,6 +54,8 @@ mod quorum;
 pub mod quorum_config;
 mod scp;
 mod slot;
+#[cfg(test)]
+pub(crate) mod test_utils;
 
 // Re-export main types
 pub use ballot::{get_working_ballot, BallotPhase};

@@ -21,8 +21,6 @@
 //!
 //! - [`Work`]: The trait that all schedulable work items must implement.
 //! - [`WorkScheduler`]: The core scheduler that manages work execution.
-//! - [`WorkSequence`]: A helper for building linear chains of dependent work.
-//! - [`WorkWithCallback`]: A wrapper that invokes a callback after work completes.
 //!
 //! # Example
 //!
@@ -99,12 +97,8 @@
 //! `Send`. Shared state between work items should use appropriate synchronization
 //! primitives (e.g., `Arc<Mutex<T>>`, channels).
 
-mod callback;
 mod scheduler;
-mod sequence;
 mod types;
 
-pub use callback::WorkWithCallback;
-pub use scheduler::{WorkScheduler, WorkSchedulerConfig, WorkSchedulerMetrics, WorkSnapshot};
-pub use sequence::WorkSequence;
+pub use scheduler::{WorkScheduler, WorkSchedulerConfig, WorkSchedulerMetrics};
 pub use types::{Work, WorkContext, WorkEvent, WorkId, WorkOutcome, WorkState};

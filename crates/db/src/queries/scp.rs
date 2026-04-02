@@ -290,29 +290,8 @@ fn tx_set_key(hash: &Hash) -> String {
     format!("{TX_SET_KEY_PREFIX}{}", hex::encode(hash.0))
 }
 
-fn set_storestate_value(conn: &Connection, key: &str, value: &str) -> Result<(), DbError> {
-    conn.execute(
-        "INSERT OR REPLACE INTO storestate (statename, state) VALUES (?1, ?2)",
-        params![key, value],
-    )?;
-    Ok(())
-}
-
-fn load_storestate_value(conn: &Connection, key: &str) -> Result<Option<String>, DbError> {
-    let result = conn
-        .query_row(
-            "SELECT state FROM storestate WHERE statename = ?1",
-            params![key],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(result)
-}
-
-fn delete_storestate_value(conn: &Connection, key: &str) -> Result<(), DbError> {
-    conn.execute("DELETE FROM storestate WHERE statename = ?1", params![key])?;
-    Ok(())
-}
+/// Delegates to [`StateQueries`] methods to avoid duplicating storestate SQL.
+use super::state::StateQueries;
 
 fn parse_slot_key(key: &str) -> Option<u64> {
     key.strip_prefix(&format!("{}:", state_keys::SCP_STATE))?
@@ -361,11 +340,11 @@ pub trait ScpStatePersistenceQueries {
 
 impl ScpStatePersistenceQueries for Connection {
     fn save_scp_slot_state(&self, slot: u64, state_json: &str) -> Result<(), DbError> {
-        set_storestate_value(self, &scp_slot_state_key(slot), state_json)
+        self.set_state(&scp_slot_state_key(slot), state_json)
     }
 
     fn load_scp_slot_state(&self, slot: u64) -> Result<Option<String>, DbError> {
-        load_storestate_value(self, &scp_slot_state_key(slot))
+        self.get_state(&scp_slot_state_key(slot))
     }
 
     fn load_all_scp_slot_states(&self) -> Result<Vec<(u64, String)>, DbError> {
@@ -393,7 +372,7 @@ impl ScpStatePersistenceQueries for Connection {
     fn delete_scp_slot_states_below(&self, slot: u64) -> Result<(), DbError> {
         for (stored_slot, _) in self.load_all_scp_slot_states()? {
             if stored_slot < slot {
-                delete_storestate_value(self, &scp_slot_state_key(stored_slot))?;
+                self.delete_state(&scp_slot_state_key(stored_slot))?;
             }
         }
         Ok(())
@@ -401,11 +380,11 @@ impl ScpStatePersistenceQueries for Connection {
 
     fn save_tx_set_data(&self, hash: &Hash, data: &[u8]) -> Result<(), DbError> {
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
-        set_storestate_value(self, &tx_set_key(hash), &encoded)
+        self.set_state(&tx_set_key(hash), &encoded)
     }
 
     fn load_tx_set_data(&self, hash: &Hash) -> Result<Option<Vec<u8>>, DbError> {
-        load_storestate_value(self, &tx_set_key(hash))?
+        self.get_state(&tx_set_key(hash))?
             .map(|encoded| decode_tx_set_data(&encoded))
             .transpose()
     }

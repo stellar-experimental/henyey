@@ -11,7 +11,7 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```ignore
 //! use henyey_crypto::{pre_auth_tx_key, hash_x_key, ed25519_payload_key};
 //! use stellar_xdr::curr::SignerKey;
 //!
@@ -25,9 +25,12 @@
 //! let signer: SignerKey = ed25519_payload_key(&pubkey, payload);
 //! ```
 
+#[cfg(test)]
 use crate::{sha256, Hash256};
+#[cfg(test)]
 use stellar_xdr::curr::{BytesM, SignerKey, SignerKeyEd25519SignedPayload, Uint256};
 
+#[cfg(test)]
 fn uint256_signer_key(key: fn(Uint256) -> SignerKey, bytes: [u8; 32]) -> SignerKey {
     key(Uint256(bytes))
 }
@@ -48,7 +51,7 @@ fn uint256_signer_key(key: fn(Uint256) -> SignerKey, bytes: [u8; 32]) -> SignerK
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::{pre_auth_tx_key, sha256};
 /// use stellar_xdr::curr::SignerKey;
 ///
@@ -56,7 +59,8 @@ fn uint256_signer_key(key: fn(Uint256) -> SignerKey, bytes: [u8; 32]) -> SignerK
 /// let tx_hash = sha256(b"transaction contents");
 /// let signer: SignerKey = pre_auth_tx_key(&tx_hash);
 /// ```
-pub fn pre_auth_tx_key(tx_hash: &Hash256) -> SignerKey {
+#[cfg(test)]
+fn pre_auth_tx_key(tx_hash: &Hash256) -> SignerKey {
     uint256_signer_key(SignerKey::PreAuthTx, tx_hash.0)
 }
 
@@ -79,7 +83,7 @@ pub fn pre_auth_tx_key(tx_hash: &Hash256) -> SignerKey {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::hash_x_key;
 /// use stellar_xdr::curr::SignerKey;
 ///
@@ -88,7 +92,8 @@ pub fn pre_auth_tx_key(tx_hash: &Hash256) -> SignerKey {
 ///
 /// // Later, reveal the preimage to authorize operations
 /// ```
-pub fn hash_x_key(preimage: &[u8]) -> SignerKey {
+#[cfg(test)]
+fn hash_x_key(preimage: &[u8]) -> SignerKey {
     hash_x_key_from_hash(&sha256(preimage))
 }
 
@@ -105,7 +110,8 @@ pub fn hash_x_key(preimage: &[u8]) -> SignerKey {
 /// # Returns
 ///
 /// A [`SignerKey`] of type `HashX` containing the provided hash.
-pub fn hash_x_key_from_hash(hash: &Hash256) -> SignerKey {
+#[cfg(test)]
+fn hash_x_key_from_hash(hash: &Hash256) -> SignerKey {
     uint256_signer_key(SignerKey::HashX, hash.0)
 }
 
@@ -130,7 +136,7 @@ pub fn hash_x_key_from_hash(hash: &Hash256) -> SignerKey {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::ed25519_payload_key;
 /// use stellar_xdr::curr::SignerKey;
 ///
@@ -138,7 +144,8 @@ pub fn hash_x_key_from_hash(hash: &Hash256) -> SignerKey {
 /// let payload = b"memo:1234";
 /// let signer: SignerKey = ed25519_payload_key(&pubkey, payload);
 /// ```
-pub fn ed25519_payload_key(ed25519_pubkey: &[u8; 32], payload: &[u8]) -> SignerKey {
+#[cfg(test)]
+fn ed25519_payload_key(ed25519_pubkey: &[u8; 32], payload: &[u8]) -> SignerKey {
     SignerKey::Ed25519SignedPayload(SignerKeyEd25519SignedPayload {
         ed25519: Uint256(*ed25519_pubkey),
         payload: BytesM::try_from(payload.to_vec()).expect("payload must be <= 64 bytes"),
@@ -160,14 +167,15 @@ pub fn ed25519_payload_key(ed25519_pubkey: &[u8; 32], payload: &[u8]) -> SignerK
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::ed25519_key;
 /// use stellar_xdr::curr::SignerKey;
 ///
 /// let pubkey = [1u8; 32]; // Ed25519 public key
 /// let signer: SignerKey = ed25519_key(&pubkey);
 /// ```
-pub fn ed25519_key(ed25519_pubkey: &[u8; 32]) -> SignerKey {
+#[cfg(test)]
+fn ed25519_key(ed25519_pubkey: &[u8; 32]) -> SignerKey {
     uint256_signer_key(SignerKey::Ed25519, *ed25519_pubkey)
 }
 
@@ -184,7 +192,8 @@ pub fn ed25519_key(ed25519_pubkey: &[u8; 32]) -> SignerKey {
 /// # Returns
 ///
 /// `Some([u8; 32])` containing the Ed25519 public key, or `None`.
-pub fn get_ed25519_from_signer_key(signer_key: &SignerKey) -> Option<[u8; 32]> {
+#[cfg(test)]
+fn get_ed25519_from_signer_key(signer_key: &SignerKey) -> Option<[u8; 32]> {
     match signer_key {
         SignerKey::Ed25519(key) => Some(key.0),
         SignerKey::Ed25519SignedPayload(payload) => Some(payload.ed25519.0),

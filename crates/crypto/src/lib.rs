@@ -8,9 +8,9 @@
 //! - **Ed25519 signatures**: Key generation, signing, and verification via [`SecretKey`] and [`PublicKey`]
 //! - **SHA-256 hashing**: Single-shot ([`sha256`]) and streaming ([`Sha256Hasher`]) hash computation
 //! - **BLAKE2 hashing**: Single-shot ([`fn@blake2`]) hash computation
-//! - **HMAC-SHA256**: Message authentication via [`hmac_sha256`] and [`hmac_sha256_verify`]
-//! - **HKDF**: Key derivation via [`hkdf_extract`], [`hkdf_expand`], and [`hkdf()`]
-//! - **XDR hashing**: [`xdr_sha256`] for hashing XDR-encoded values
+//! - **HMAC-SHA256**: Message authentication codes (internal)
+//! - **HKDF**: Key derivation (internal)
+//! - **XDR hashing**: Hashing of XDR-encoded values
 //! - **StrKey encoding**: Via re-exported [`stellar_strkey`] crate, plus convenience helpers on key types
 //! - **Short hashing**: SipHash-2-4 for deterministic ordering in bucket lists and ledger state
 //! - **Sealed boxes**: Curve25519-based encryption for survey payloads
@@ -50,7 +50,7 @@
 mod curve25519;
 mod error;
 mod hash;
-pub mod hex;
+pub(crate) mod hex;
 mod keys;
 mod random;
 mod sealed_box;
@@ -62,11 +62,10 @@ pub use curve25519::*;
 pub use error::CryptoError;
 pub use hash::*;
 pub use keys::*;
-pub use random::*;
+pub(crate) use random::*;
 pub use sealed_box::*;
 pub use short_hash::*;
 pub use signature::*;
-pub use signer_key::*;
 pub use stellar_strkey;
 
 // Re-export Hash256 from common for convenience

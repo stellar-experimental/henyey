@@ -49,7 +49,6 @@ tracing.workspace = true
 
 # Error handling
 anyhow.workspace = true
-thiserror.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

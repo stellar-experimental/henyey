@@ -472,6 +472,16 @@ enum OutboundMessage {
     Shutdown,
 }
 
+/// Bundled connection parameters for the tick-loop helpers
+/// (`connect_preferred_peers`, `fill_outbound_slots`).
+struct TickConnectCtx {
+    local_node: LocalNode,
+    connect_timeout: u64,
+    auth_timeout: u64,
+    target_outbound: usize,
+    connection_factory: Arc<dyn ConnectionFactory>,
+}
+
 /// Shared state passed to spawned peer tasks.
 ///
 /// Bundles all `Arc`-wrapped state that background tasks need, avoiding
@@ -507,7 +517,7 @@ struct SharedPeerState {
 impl SharedPeerState {
     /// Send a peer event if a subscriber is registered.
     async fn send_peer_event(&self, event: PeerEvent) {
-        if let Some(tx) = self.peer_event_tx.clone() {
+        if let Some(tx) = self.peer_event_tx.as_ref() {
             let _ = tx.send(event).await;
         }
     }
@@ -831,6 +841,78 @@ impl OverlayManager {
         Ok(())
     }
 
+    /// Send a PEERS advertisement to a newly accepted inbound peer.
+    async fn send_peers_to_inbound_peer(
+        peer: &mut Peer,
+        peer_id: &PeerId,
+        peer_info: &PeerInfo,
+        shared: &SharedPeerState,
+    ) {
+        let outbound_snapshot = shared.advertised_outbound_peers.read().clone();
+        let inbound_snapshot = shared.advertised_inbound_peers.read().clone();
+        let exclude = PeerAddress::from(peer_info.address);
+        if let Some(message) = OverlayManager::build_peers_message(
+            &outbound_snapshot,
+            &inbound_snapshot,
+            Some(&exclude),
+        ) {
+            if peer.is_ready() {
+                if let Err(e) = peer.send(message).await {
+                    debug!("Failed to send peers to {}: {}", peer_id, e);
+                }
+            }
+        }
+    }
+
+    /// Handle a successfully accepted inbound connection through its full
+    /// lifecycle: validation, PEERS message, peer-loop, and cleanup.
+    async fn handle_accepted_inbound_peer(
+        mut peer: Peer,
+        shared: SharedPeerState,
+        pool: Arc<ConnectionPool>,
+    ) {
+        let peer_id = peer.id().clone();
+        if shared.banned_peers.read().contains(&peer_id) {
+            warn!("Rejected banned peer {}", peer_id);
+            peer.close().await;
+            pool.release_pending();
+            return;
+        }
+        if shared.peers.contains_key(&peer_id) {
+            debug!("Rejected duplicate inbound peer {}", peer_id);
+            peer.close().await;
+            pool.release_pending();
+            return;
+        }
+        // Handshake succeeded: promote from pending to authenticated
+        pool.mark_authenticated();
+        info!("Accepted peer: {}", peer_id);
+
+        let peer_info = peer.info().clone();
+        shared
+            .send_peer_event(PeerEvent::Connected(
+                PeerAddress::from(peer_info.address),
+                PeerType::Inbound,
+            ))
+            .await;
+
+        Self::send_peers_to_inbound_peer(&mut peer, &peer_id, &peer_info, &shared).await;
+
+        let (outbound_rx, flow_control) = Self::register_peer(&peer, &peer_id, peer_info, &shared);
+
+        Self::run_peer_loop(
+            peer_id.clone(),
+            peer,
+            outbound_rx,
+            flow_control,
+            shared.clone(),
+        )
+        .await;
+
+        shared.cleanup_peer(&peer_id);
+        pool.release_authenticated();
+    }
+
     /// Start the connection listener.
     async fn start_listener(&mut self) -> Result<()> {
         let listener = self
@@ -865,68 +947,8 @@ impl OverlayManager {
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
                                     match Peer::accept(connection, local_node, auth_timeout).await {
-                                        Ok(mut peer) => {
-                                            let peer_id = peer.id().clone();
-                                            if shared.banned_peers.read().contains(&peer_id) {
-                                                warn!("Rejected banned peer {}", peer_id);
-                                                peer.close().await;
-                                                pool.release_pending();
-                                                return;
-                                            }
-                                            if shared.peers.contains_key(&peer_id) {
-                                                debug!("Rejected duplicate inbound peer {}", peer_id);
-                                                peer.close().await;
-                                                pool.release_pending();
-                                                return;
-                                            }
-                                            // Handshake succeeded: promote from pending to authenticated
-                                            pool.mark_authenticated();
-                                            info!("Accepted peer: {}", peer_id);
-
-                                            let peer_info = peer.info().clone();
-                                            shared.send_peer_event(PeerEvent::Connected(
-                                                PeerAddress::from(peer_info.address),
-                                                PeerType::Inbound,
-                                            )).await;
-
-                                            // Send Peers message directly (we still own the peer)
-                                            let outbound_snapshot =
-                                                shared.advertised_outbound_peers.read().clone();
-                                            let inbound_snapshot =
-                                                shared.advertised_inbound_peers.read().clone();
-                                            let exclude = PeerAddress::from(peer_info.address);
-                                            if let Some(message) =
-                                                OverlayManager::build_peers_message(
-                                                    &outbound_snapshot,
-                                                    &inbound_snapshot,
-                                                    Some(&exclude),
-                                                )
-                                            {
-                                                if peer.is_ready() {
-                                                    if let Err(e) = peer.send(message).await {
-                                                        debug!(
-                                                            "Failed to send peers to {}: {}",
-                                                            peer_id, e
-                                                        );
-                                                    }
-                                                }
-                                            }
-
-                                            let (outbound_rx, flow_control) =
-                                                Self::register_peer(&peer, &peer_id, peer_info, &shared);
-
-                                            // Run peer loop (peer is moved, not locked)
-                                            Self::run_peer_loop(
-                                                peer_id.clone(),
-                                                peer,
-                                                outbound_rx,
-                                                flow_control,
-                                                shared.clone(),
-                                            ).await;
-
-                                            // Cleanup
-                                            shared.cleanup_peer(&peer_id);
-                                            pool.release_authenticated();
+                                        Ok(peer) => {
+                                            Self::handle_accepted_inbound_peer(peer, shared, pool).await;
                                         }
                                         Err(e) => {
                                             warn!("Failed to accept peer: {}", e);
@@ -962,7 +984,6 @@ impl OverlayManager {
         Ok(())
     }
 
-    /// Start the outbound connector.
     /// Start the periodic tick loop for overlay maintenance.
     ///
     /// Runs every 3 seconds (PEER_AUTHENTICATION_TIMEOUT + 1), matching
@@ -975,17 +996,19 @@ impl OverlayManager {
     /// 5. Fills remaining outbound slots from known peers
     fn start_tick_loop(&mut self) {
         let shared = self.shared_state();
-        let local_node = self.local_node.clone();
         let pool = Arc::clone(&self.outbound_pool);
         let known_peers = Arc::clone(&self.known_peers);
         let preferred_peers = self.config.preferred_peers.clone();
-        let target_outbound = self.config.target_outbound_peers;
         let max_outbound = self.config.max_outbound_peers;
-        let connect_timeout = self.config.connect_timeout_secs;
-        let auth_timeout = self.config.auth_timeout_secs;
-        let connection_factory = Arc::clone(&self.connection_factory);
         let config_known_peers = self.config.known_peers.clone();
         let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
+        let ctx = TickConnectCtx {
+            local_node: self.local_node.clone(),
+            connect_timeout: self.config.connect_timeout_secs,
+            auth_timeout: self.config.auth_timeout_secs,
+            target_outbound: self.config.target_outbound_peers,
+            connection_factory: Arc::clone(&self.connection_factory),
+        };
 
         let handle = tokio::spawn(async move {
             let mut retry_after: HashMap<PeerAddress, Instant> = HashMap::new();
@@ -995,11 +1018,9 @@ impl OverlayManager {
             let mut last_out_of_sync_reconnect: Option<Instant> = None;
 
             // G7: DNS re-resolution state.
-            // Matches stellar-core's mResolvedPeers future, mResolvingPeersWithBackoff,
-            // and mResolvingPeersRetryCount.
             let mut dns_resolving_with_backoff = true;
             let mut dns_retry_count: u32 = 0;
-            let mut dns_next_resolve_at = Instant::now(); // Resolve immediately on first tick
+            let mut dns_next_resolve_at = Instant::now();
 
             // Trigger initial DNS resolution.
             let mut dns_resolve_handle: Option<JoinHandle<ResolvedPeers>> = Some(
@@ -1019,10 +1040,7 @@ impl OverlayManager {
                     break;
                 }
 
-                // G8: When not tracking consensus and outbound slots are full,
-                // periodically drop a random non-preferred outbound peer to
-                // try fresh connections (matches stellar-core
-                // updateTimerAndMaybeDropRandomPeer).
+                // G8: Maybe drop a random non-preferred outbound peer when out of sync.
                 let tracking = shared.is_tracking.load(Ordering::Relaxed);
                 Self::maybe_drop_random_peer(
                     &shared.peers,
@@ -1033,51 +1051,16 @@ impl OverlayManager {
                     &mut last_out_of_sync_reconnect,
                 );
 
-                // G7: Check if background DNS resolution has completed.
-                if let Some(ref handle) = dns_resolve_handle {
-                    if handle.is_finished() {
-                        let handle = dns_resolve_handle.take().unwrap();
-                        match handle.await {
-                            Ok(result) => {
-                                // Update known peers with resolved addresses.
-                                {
-                                    let mut kp = known_peers.write();
-                                    // Merge resolved known peers (add new, keep existing).
-                                    for addr in &result.known {
-                                        if !kp
-                                            .iter()
-                                            .any(|p| p.host == addr.host && p.port == addr.port)
-                                        {
-                                            kp.push(addr.clone());
-                                        }
-                                    }
-                                }
+                // G7: Collect completed DNS resolution and schedule next.
+                Self::maybe_collect_dns_result(
+                    &mut dns_resolve_handle,
+                    &known_peers,
+                    &mut dns_resolving_with_backoff,
+                    &mut dns_retry_count,
+                    &mut dns_next_resolve_at,
+                )
+                .await;
 
-                                // Calculate next resolve delay based on success/failure.
-                                let (delay, new_backoff, new_retry) = compute_dns_backoff_delay(
-                                    dns_resolving_with_backoff,
-                                    dns_retry_count,
-                                    result.errors,
-                                );
-                                dns_resolving_with_backoff = new_backoff;
-                                dns_retry_count = new_retry;
-
-                                dns_next_resolve_at = Instant::now() + delay;
-                                debug!(
-                                    "DNS resolution complete (errors={}), next in {:?}",
-                                    result.errors, delay
-                                );
-                            }
-                            Err(e) => {
-                                error!("DNS resolution task panicked: {}", e);
-                                dns_next_resolve_at = Instant::now() + PEER_IP_RESOLVE_RETRY_DELAY;
-                            }
-                        }
-                    }
-                }
-
-                // G7: Trigger new DNS resolution if timer has elapsed and no
-                // resolution is in flight.
                 if dns_resolve_handle.is_none() && Instant::now() >= dns_next_resolve_at {
                     dns_resolve_handle = Some(spawn_dns_resolution(
                         config_known_peers.clone(),
@@ -1092,125 +1075,419 @@ impl OverlayManager {
                     continue;
                 }
 
-                let mut remaining = available;
-
-                // Preferred peers first
-                for addr in &preferred_peers {
-                    if remaining == 0 {
-                        break;
-                    }
-
-                    if let Some(next) = retry_after.get(addr) {
-                        if *next > now {
-                            continue;
-                        }
-                    }
-
-                    if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
-                        continue;
-                    }
-
-                    if !pool.try_reserve() {
-                        // Preferred peer eviction: evict youngest non-preferred
-                        // outbound peer to make room (matches stellar-core behavior).
-                        let evicted = Self::maybe_evict_for_preferred(
-                            &shared.peers,
-                            &shared.peer_info_cache,
-                            &preferred_peers,
-                        );
-                        if evicted {
-                            // Give the evicted peer task time to clean up and
-                            // release its pool slot.
-                            tokio::time::sleep(Duration::from_millis(100)).await;
-                        }
-                        if !pool.try_reserve() {
-                            debug!("Outbound peer limit reached (even after eviction attempt)");
-                            remaining = 0;
-                            break;
-                        }
-                    }
-
-                    let timeout = connect_timeout.max(auth_timeout);
-                    match Self::connect_outbound_inner(
-                        &addr,
-                        local_node.clone(),
-                        timeout,
-                        Arc::clone(&pool),
-                        shared.clone(),
-                        Arc::clone(&connection_factory),
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            retry_after.remove(addr);
-                            remaining = remaining.saturating_sub(1);
-                        }
-                        Err(e) => {
-                            warn!("Failed to connect to preferred peer {}: {}", addr, e);
-                            retry_after.insert(addr.clone(), now + OUTBOUND_CONNECT_RETRY_DELAY);
-                        }
-                    }
-                }
+                // Connect to preferred peers first.
+                let remaining = Self::connect_preferred_peers(
+                    &preferred_peers,
+                    &mut retry_after,
+                    now,
+                    available,
+                    &pool,
+                    &shared,
+                    &ctx,
+                )
+                .await;
 
                 let outbound_count = Self::count_outbound_peers(&shared.peer_info_cache);
-                if remaining == 0 || outbound_count >= target_outbound {
+                if remaining == 0 || outbound_count >= ctx.target_outbound {
                     continue;
                 }
 
-                let mut known_snapshot = known_peers.read().clone();
-                known_snapshot.shuffle(&mut rand::thread_rng());
-
-                // Fill remaining outbound slots with known peers up to target_outbound.
-                for addr in &known_snapshot {
-                    if remaining == 0 {
-                        break;
-                    }
-
-                    let outbound_now = Self::count_outbound_peers(&shared.peer_info_cache);
-                    if outbound_now >= target_outbound {
-                        break;
-                    }
-
-                    if let Some(next) = retry_after.get(addr) {
-                        if *next > now {
-                            continue;
-                        }
-                    }
-
-                    if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
-                        continue;
-                    }
-
-                    if !pool.try_reserve() {
-                        debug!("Outbound peer limit reached");
-                        break;
-                    }
-
-                    let timeout = connect_timeout.max(auth_timeout);
-                    match Self::connect_outbound_inner(
-                        addr,
-                        local_node.clone(),
-                        timeout,
-                        Arc::clone(&pool),
-                        shared.clone(),
-                        Arc::clone(&connection_factory),
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            retry_after.remove(addr);
-                            remaining = remaining.saturating_sub(1);
-                        }
-                        Err(e) => {
-                            debug!("Failed to connect to peer {}: {}", addr, e);
-                            retry_after.insert(addr.clone(), now + OUTBOUND_CONNECT_RETRY_DELAY);
-                        }
-                    }
-                }
+                // Fill remaining outbound slots from known peers.
+                Self::fill_outbound_slots(
+                    &known_peers,
+                    &mut retry_after,
+                    now,
+                    remaining,
+                    &pool,
+                    &shared,
+                    &ctx,
+                )
+                .await;
             }
         });
 
         self.connector_handle = Some(handle);
+    }
+
+    /// Check if a background DNS resolution has completed and apply results.
+    ///
+    /// Merges newly-resolved peers into `known_peers` and computes the next
+    /// resolve delay using backoff logic. Returns the updated DNS state.
+    async fn maybe_collect_dns_result(
+        dns_resolve_handle: &mut Option<JoinHandle<ResolvedPeers>>,
+        known_peers: &RwLock<Vec<PeerAddress>>,
+        dns_resolving_with_backoff: &mut bool,
+        dns_retry_count: &mut u32,
+        dns_next_resolve_at: &mut Instant,
+    ) {
+        let handle_ref = match dns_resolve_handle.as_ref() {
+            Some(h) if h.is_finished() => dns_resolve_handle.take().unwrap(),
+            _ => return,
+        };
+        match handle_ref.await {
+            Ok(result) => {
+                // Merge resolved known peers (add new, keep existing).
+                {
+                    let mut kp = known_peers.write();
+                    for addr in &result.known {
+                        if !kp
+                            .iter()
+                            .any(|p| p.host == addr.host && p.port == addr.port)
+                        {
+                            kp.push(addr.clone());
+                        }
+                    }
+                }
+
+                let (delay, new_backoff, new_retry) = compute_dns_backoff_delay(
+                    *dns_resolving_with_backoff,
+                    *dns_retry_count,
+                    result.errors,
+                );
+                *dns_resolving_with_backoff = new_backoff;
+                *dns_retry_count = new_retry;
+                *dns_next_resolve_at = Instant::now() + delay;
+                debug!(
+                    "DNS resolution complete (errors={}), next in {:?}",
+                    result.errors, delay
+                );
+            }
+            Err(e) => {
+                error!("DNS resolution task panicked: {}", e);
+                *dns_next_resolve_at = Instant::now() + PEER_IP_RESOLVE_RETRY_DELAY;
+            }
+        }
+    }
+
+    /// Try connecting to each preferred peer that isn't already connected.
+    ///
+    /// Evicts youngest non-preferred outbound peer if the pool is full.
+    /// Returns how many slots remain after connecting.
+    async fn connect_preferred_peers(
+        preferred_peers: &[PeerAddress],
+        retry_after: &mut HashMap<PeerAddress, Instant>,
+        now: Instant,
+        mut remaining: usize,
+        pool: &Arc<ConnectionPool>,
+        shared: &SharedPeerState,
+        ctx: &TickConnectCtx,
+    ) -> usize {
+        for addr in preferred_peers {
+            if remaining == 0 {
+                break;
+            }
+
+            if let Some(next) = retry_after.get(addr) {
+                if *next > now {
+                    continue;
+                }
+            }
+
+            if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
+                continue;
+            }
+
+            if !pool.try_reserve() {
+                let evicted = Self::maybe_evict_for_preferred(
+                    &shared.peers,
+                    &shared.peer_info_cache,
+                    preferred_peers,
+                );
+                if evicted {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                if !pool.try_reserve() {
+                    debug!("Outbound peer limit reached (even after eviction attempt)");
+                    return 0;
+                }
+            }
+
+            let timeout = ctx.connect_timeout.max(ctx.auth_timeout);
+            match Self::connect_outbound_inner(
+                addr,
+                ctx.local_node.clone(),
+                timeout,
+                Arc::clone(pool),
+                shared.clone(),
+                Arc::clone(&ctx.connection_factory),
+            )
+            .await
+            {
+                Ok(_) => {
+                    retry_after.remove(addr);
+                    remaining = remaining.saturating_sub(1);
+                }
+                Err(e) => {
+                    warn!("Failed to connect to preferred peer {}: {}", addr, e);
+                    retry_after.insert(addr.clone(), now + OUTBOUND_CONNECT_RETRY_DELAY);
+                }
+            }
+        }
+        remaining
+    }
+
+    /// Fill remaining outbound slots from the shuffled known-peer list.
+    async fn fill_outbound_slots(
+        known_peers: &RwLock<Vec<PeerAddress>>,
+        retry_after: &mut HashMap<PeerAddress, Instant>,
+        now: Instant,
+        mut remaining: usize,
+        pool: &Arc<ConnectionPool>,
+        shared: &SharedPeerState,
+        ctx: &TickConnectCtx,
+    ) {
+        let mut known_snapshot = known_peers.read().clone();
+        known_snapshot.shuffle(&mut rand::thread_rng());
+
+        for addr in &known_snapshot {
+            if remaining == 0 {
+                break;
+            }
+
+            let outbound_now = Self::count_outbound_peers(&shared.peer_info_cache);
+            if outbound_now >= ctx.target_outbound {
+                break;
+            }
+
+            if let Some(next) = retry_after.get(addr) {
+                if *next > now {
+                    continue;
+                }
+            }
+
+            if Self::has_outbound_connection_to(&shared.peer_info_cache, addr) {
+                continue;
+            }
+
+            if !pool.try_reserve() {
+                debug!("Outbound peer limit reached");
+                break;
+            }
+
+            let timeout = ctx.connect_timeout.max(ctx.auth_timeout);
+            match Self::connect_outbound_inner(
+                addr,
+                ctx.local_node.clone(),
+                timeout,
+                Arc::clone(pool),
+                shared.clone(),
+                Arc::clone(&ctx.connection_factory),
+            )
+            .await
+            {
+                Ok(_) => {
+                    retry_after.remove(addr);
+                    remaining = remaining.saturating_sub(1);
+                }
+                Err(e) => {
+                    debug!("Failed to connect to peer {}: {}", addr, e);
+                    retry_after.insert(addr.clone(), now + OUTBOUND_CONNECT_RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    /// Check whether the peer has exceeded idle or straggler timeouts.
+    ///
+    /// Returns `true` if the peer should be dropped.
+    fn check_peer_timeouts(
+        peer_id: &PeerId,
+        last_read: Instant,
+        last_write: Instant,
+        flow_control: &FlowControl,
+        total_messages: u64,
+        scp_messages: u64,
+    ) -> bool {
+        const PEER_TIMEOUT: Duration = Duration::from_secs(30);
+        const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
+        // OVERLAY_SPEC §8.5 — drop peer if no SEND_MORE_EXTENDED for this long.
+        const PEER_SEND_MODE_IDLE_TIMEOUT_SECS: u64 = 60;
+
+        let now = Instant::now();
+        if now.duration_since(last_read) >= PEER_TIMEOUT
+            && now.duration_since(last_write) >= PEER_TIMEOUT
+        {
+            warn!(
+                "Dropping peer {} due to idle timeout (total_msgs={}, scp_msgs={})",
+                peer_id, total_messages, scp_messages
+            );
+            return true;
+        }
+        if now.duration_since(last_write) >= PEER_STRAGGLER_TIMEOUT {
+            warn!(
+                "Dropping peer {} due to straggler timeout (total_msgs={}, scp_msgs={})",
+                peer_id, total_messages, scp_messages
+            );
+            return true;
+        }
+        if flow_control.no_outbound_capacity_timeout(PEER_SEND_MODE_IDLE_TIMEOUT_SECS) {
+            warn!(
+                "Dropping peer {} due to PEER_SEND_MODE_IDLE_TIMEOUT (no SEND_MORE_EXTENDED for {}s)",
+                peer_id, PEER_SEND_MODE_IDLE_TIMEOUT_SECS
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Send a ping (GetScpQuorumset with a random hash) if due and idle.
+    ///
+    /// Returns `true` if a message was written (so the caller can update `last_write`).
+    async fn maybe_send_ping(peer: &mut Peer, peer_id: &PeerId, ping: &mut PingTracker) -> bool {
+        if !peer.is_connected() || !ping.is_idle() {
+            return false;
+        }
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let hash = compute_ping_hash(now_nanos);
+        let ping_msg = StellarMessage::GetScpQuorumset(hash.clone());
+        if let Err(e) = peer.send(ping_msg).await {
+            debug!("Failed to send ping to {}: {}", peer_id, e);
+            false
+        } else {
+            ping.record_sent(hash);
+            true
+        }
+    }
+
+    /// Log periodic per-peer diagnostics (every 60s on the ping interval).
+    fn maybe_log_peer_stats(
+        peer_id: &PeerId,
+        total_messages: u64,
+        scp_messages: u64,
+        ping: &PingTracker,
+        last_stats_log: &mut Instant,
+    ) {
+        if last_stats_log.elapsed() >= Duration::from_secs(60) {
+            let rtt_str = ping
+                .last_rtt
+                .map(|d| format!("{}ms", d.as_millis()))
+                .unwrap_or_else(|| "n/a".to_string());
+            debug!(
+                "Peer {} stats: total_msgs={}, scp_msgs={}, rtt={}",
+                peer_id, total_messages, scp_messages, rtt_str
+            );
+            *last_stats_log = Instant::now();
+        }
+    }
+
+    /// Handle a received `SendMoreExtended` message: release outbound capacity
+    /// and drain queued messages. Returns `Err` if the drain send fails (peer
+    /// should be dropped), `Ok(true)` if any messages were written, `Ok(false)`
+    /// otherwise.
+    async fn handle_send_more_extended(
+        peer: &mut Peer,
+        peer_id: &PeerId,
+        message: &StellarMessage,
+        flow_control: &FlowControl,
+    ) -> std::result::Result<bool, ()> {
+        if let StellarMessage::SendMoreExtended(sme) = message {
+            debug!(
+                "Peer {} sent SEND_MORE_EXTENDED: num_messages={}, num_bytes={}",
+                peer_id, sme.num_messages, sme.num_bytes
+            );
+            flow_control.maybe_release_capacity(message);
+            match Self::send_flow_controlled_batch(peer, flow_control).await {
+                Ok(sent) => Ok(sent),
+                Err(e) => {
+                    debug!("Failed to drain queue to {}: {}", peer_id, e);
+                    Err(())
+                }
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Route a received message to the appropriate subscribers.
+    ///
+    /// Applies all filtering rules (handshake, flow-control, watcher, rate
+    /// limit, flood-gate dedup) and forwards surviving messages. Returns
+    /// `true` if the message was SCP (so the caller can bump the SCP counter).
+    fn route_received_message(
+        message: &StellarMessage,
+        peer_id: &PeerId,
+        peer: &mut Peer,
+        state: &SharedPeerState,
+        is_validator: bool,
+        received_peers: &mut bool,
+        ping: &mut PingTracker,
+    ) -> Option<bool> {
+        let msg_type = helpers::message_type_name(message);
+
+        // OVERLAY_SPEC §7.2: PEERS message validation.
+        match validate_incoming_peers(peer.direction(), *received_peers, message) {
+            PeersValidation::NotPeers => {}
+            PeersValidation::AcceptFirst => {
+                *received_peers = true;
+            }
+            PeersValidation::RejectWrongDirection => {
+                warn!(
+                    "Peer {} sent PEERS but we are the responder — dropping (OVERLAY_SPEC §7.2)",
+                    peer_id
+                );
+                return None; // signal break
+            }
+            PeersValidation::RejectDuplicate => {
+                warn!(
+                    "Peer {} sent duplicate PEERS — dropping (OVERLAY_SPEC §7.2)",
+                    peer_id
+                );
+                return None; // signal break
+            }
+        }
+
+        if helpers::is_handshake_message(message) {
+            debug!(
+                "Ignoring handshake message from authenticated peer {}",
+                peer_id
+            );
+            return Some(false);
+        }
+
+        if should_skip_generic_routing(message) {
+            return Some(false);
+        }
+
+        // Watcher filter: drop non-essential flood messages for non-validator nodes.
+        if !is_validator && helpers::is_watcher_droppable(message) {
+            trace!("Watcher: dropping {} from {}", msg_type, peer_id);
+            return Some(false);
+        }
+
+        // Global rate limiter (henyey-specific, SCP bypasses).
+        if !matches!(message, StellarMessage::ScpMessage(_)) && !state.flood_gate.allow_message() {
+            debug!("Dropping message due to global rate limit");
+            return Some(false);
+        }
+
+        let message_size = msg_body_size(message);
+        if helpers::is_flood_message(message) {
+            let hash = compute_message_hash(message);
+            let lcl = state.last_closed_ledger.load(Ordering::Relaxed);
+            let unique = state
+                .flood_gate
+                .record_seen(hash, Some(peer_id.clone()), lcl);
+            peer.record_flood_stats(unique, message_size);
+            let is_scp = matches!(message, StellarMessage::ScpMessage(_));
+            if !unique && !is_scp {
+                return Some(false);
+            }
+        } else if is_fetch_message(message) {
+            peer.record_fetch_stats(true, message_size);
+            log_fetch_message(message, peer_id, ping);
+        }
+
+        // Forward to subscribers.
+        let overlay_msg = OverlayMessage {
+            from_peer: peer_id.clone(),
+            message: message.clone(),
+            received_at: Instant::now(),
+        };
+        let is_scp = state.route_to_subscribers(overlay_msg);
+        Some(is_scp)
     }
 
     /// Run the peer message loop.
@@ -1225,9 +1502,7 @@ impl OverlayManager {
         flow_control: Arc<FlowControl>,
         state: SharedPeerState,
     ) {
-        let flood_gate = &state.flood_gate;
         let running = &state.running;
-        let last_closed_ledger = &state.last_closed_ledger;
         let is_validator = state.is_validator;
 
         // Send initial SendMoreExtended to grant the peer our full reading capacity.
@@ -1249,10 +1524,6 @@ impl OverlayManager {
         // Idle/straggler timeout tracking (matches stellar-core Peer::recurrentTimerExpired).
         let mut last_read = Instant::now();
         let mut last_write = Instant::now();
-        const PEER_TIMEOUT: Duration = Duration::from_secs(30);
-        const PEER_STRAGGLER_TIMEOUT: Duration = Duration::from_secs(120);
-        // OVERLAY_SPEC §8.5 — drop peer if no SEND_MORE_EXTENDED for this long.
-        const PEER_SEND_MODE_IDLE_TIMEOUT_SECS: u64 = 60;
 
         // Track message counts for periodic diagnostics
         let mut total_messages: u64 = 0;
@@ -1357,12 +1628,6 @@ impl OverlayManager {
 
                             // Flow control: RAII guard locks capacity on creation,
                             // releases on drop (or explicit finish()).
-                            //
-                            // If the peer has exceeded its capacity (sent more
-                            // flood messages than we granted via SEND_MORE), we
-                            // drop it immediately — matching stellar-core's
-                            // `Peer::beginMessageProcessing` which calls
-                            // `drop("unexpected flood message, peer at capacity")`.
                             let capacity_guard = match crate::flow_control::CapacityGuard::new(
                                 Arc::clone(&flow_control),
                                 message.clone(),
@@ -1382,131 +1647,37 @@ impl OverlayManager {
                                 }
                             };
 
-                            // Handle flow control messages: release outbound capacity
-                            // and drain queued messages that now have capacity.
+                            // Handle flow control messages.
                             match &message {
                                 StellarMessage::SendMore(_) => {
-                                    // Spec: OVERLAY_SPEC §7.6.1 — SEND_MORE (non-extended)
-                                    // is deprecated. Receiving it MUST drop the connection.
                                     warn!("Peer {} sent deprecated SEND_MORE, dropping connection", peer_id);
                                     break;
                                 }
-                                StellarMessage::SendMoreExtended(sme) => {
-                                    debug!("Peer {} sent SEND_MORE_EXTENDED: num_messages={}, num_bytes={}", peer_id, sme.num_messages, sme.num_bytes);
-                                    flow_control.maybe_release_capacity(&message);
-                                    // Drain queued messages now that we have more outbound capacity
-                                    match Self::send_flow_controlled_batch(&mut peer, &flow_control).await {
-                                        Ok(sent) => {
-                                            if sent { last_write = Instant::now(); }
-                                        }
-                                        Err(e) => {
-                                            debug!("Failed to drain queue to {}: {}", peer_id, e);
-                                            break;
-                                        }
+                                StellarMessage::SendMoreExtended(_) => {
+                                    match Self::handle_send_more_extended(&mut peer, &peer_id, &message, &flow_control).await {
+                                        Ok(sent) => { if sent { last_write = Instant::now(); } }
+                                        Err(()) => break,
                                     }
                                 }
                                 _ => {}
                             }
 
-                            // Route message — the CapacityGuard ensures
-                            // end_message_processing runs even on early exit.
-                            // OVERLAY_SPEC §7.2: PEERS message validation.
-                            // - Only the responder sends PEERS, so if we ARE the
-                            //   responder (Inbound direction) and receive PEERS from
-                            //   the initiator, drop the connection.
-                            // - At most one PEERS message per connection.
-                            match validate_incoming_peers(peer.direction(), received_peers, &message)
-                            {
-                                PeersValidation::NotPeers => {}
-                                PeersValidation::AcceptFirst => {
-                                    received_peers = true;
-                                    // PEERS messages are validated here and forwarded
-                                    // to app-layer discovery via the generic channel.
-                                }
-                                PeersValidation::RejectWrongDirection => {
-                                    warn!(
-                                        "Peer {} sent PEERS but we are the responder — dropping (OVERLAY_SPEC §7.2)",
-                                        peer_id
-                                    );
-                                    break;
-                                }
-                                PeersValidation::RejectDuplicate => {
-                                    warn!(
-                                        "Peer {} sent duplicate PEERS — dropping (OVERLAY_SPEC §7.2)",
-                                        peer_id
-                                    );
-                                    break;
-                                }
-                            }
-
-                            'route: {
-                                if helpers::is_handshake_message(&message) {
-                                    debug!("Ignoring handshake message from authenticated peer {}", peer_id);
-                                    break 'route;
-                                }
-
-                                // Handshake and flow-control messages are handled locally, not routed.
-                                if should_skip_generic_routing(&message) {
-                                    break 'route;
-                                }
-
-                                // Watcher filter: drop non-essential flood messages for non-validator nodes.
-                                if !is_validator && helpers::is_watcher_droppable(&message) {
-                                    trace!("Watcher: dropping {} from {}", msg_type, peer_id);
-                                    break 'route;
-                                }
-
-                                // Global rate limiter: defense-in-depth against aggregate flood.
-                                //
-                                // Note: stellar-core does NOT have a global rate limiter — it
-                                // relies solely on per-peer flow control (SEND_MORE capacity,
-                                // enforced above via CapacityGuard).  This global limiter is
-                                // a henyey-specific addition that provides extra protection
-                                // against pathological many-peer floods.  SCP messages are
-                                // consensus-critical and bypass this check.
-                                if !matches!(message, StellarMessage::ScpMessage(_)) && !flood_gate.allow_message() {
-                                    debug!("Dropping message due to global rate limit");
-                                    break 'route;
-                                }
-
-                                let message_size = msg_body_size(&message);
-                                if helpers::is_flood_message(&message) {
-                                    let hash = compute_message_hash(&message);
-                                    let lcl = last_closed_ledger.load(Ordering::Relaxed);
-                                    let unique = flood_gate.record_seen(hash, Some(peer_id.clone()), lcl);
-                                    peer.record_flood_stats(unique, message_size);
-                                    // SCP messages bypass flood gate dedup on the
-                                    // receiving side.  SCP dedup is handled by the
-                                    // herder (pending_envelopes), matching stellar-core
-                                    // where SCP messages from GetScpState responses are
-                                    // processed without flood gate checks.  Without
-                                    // this, re-requested SCP state after a gap is
-                                    // silently dropped because the original EXTERNALIZE
-                                    // was already seen (even though the herder may not
-                                    // have recorded it due to a missing tx_set).
-                                    let is_scp = matches!(message, StellarMessage::ScpMessage(_));
-                                    if !unique && !is_scp {
-                                        break 'route;
-                                    }
-                                } else if is_fetch_message(&message) {
-                                    peer.record_fetch_stats(true, message_size);
-                                    log_fetch_message(&message, &peer_id, &mut ping);
-                                }
-
-                                // Forward to subscribers
-                                let overlay_msg = OverlayMessage {
-                                    from_peer: peer_id.clone(),
-                                    message: message.clone(),
-                                    received_at: Instant::now(),
-                                };
-
-                                if state.route_to_subscribers(overlay_msg) {
-                                    scp_messages += 1;
-                                }
+                            // Route message through filtering and dispatch.
+                            // `None` signals the peer should be dropped.
+                            match Self::route_received_message(
+                                &message,
+                                &peer_id,
+                                &mut peer,
+                                &state,
+                                is_validator,
+                                &mut received_peers,
+                                &mut ping,
+                            ) {
+                                None => break,
+                                Some(is_scp) => { if is_scp { scp_messages += 1; } }
                             }
 
                             // Flow control: finish guard to get send-more capacity.
-                            // Consume the guard and maybe send SEND_MORE_EXTENDED.
                             {
                                 let send_more_cap = capacity_guard.finish();
                                 if send_more_cap.should_send() && peer.is_connected() {
@@ -1534,56 +1705,17 @@ impl OverlayManager {
 
                 // Periodic tasks: ping, timeout checks
                 _ = periodic_interval.tick() => {
-                    let now = Instant::now();
-
-                    // Idle/straggler timeout check
-                    if now.duration_since(last_read) >= PEER_TIMEOUT
-                        && now.duration_since(last_write) >= PEER_TIMEOUT
-                    {
-                        warn!("Dropping peer {} due to idle timeout (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
-                        break;
-                    }
-                    if now.duration_since(last_write) >= PEER_STRAGGLER_TIMEOUT {
-                        warn!("Dropping peer {} due to straggler timeout (total_msgs={}, scp_msgs={})", peer_id, total_messages, scp_messages);
-                        break;
-                    }
-                    // Spec: OVERLAY_SPEC §8.5 — PEER_SEND_MODE_IDLE_TIMEOUT:
-                    // if the peer has not sent SEND_MORE_EXTENDED while we have
-                    // no outbound capacity, drop the connection.
-                    if flow_control.no_outbound_capacity_timeout(PEER_SEND_MODE_IDLE_TIMEOUT_SECS) {
-                        warn!("Dropping peer {} due to PEER_SEND_MODE_IDLE_TIMEOUT (no SEND_MORE_EXTENDED for {}s)", peer_id, PEER_SEND_MODE_IDLE_TIMEOUT_SECS);
+                    if Self::check_peer_timeouts(&peer_id, last_read, last_write, &flow_control, total_messages, scp_messages) {
                         break;
                     }
 
-                    // Ping every 5 seconds (every 5 ticks).
-                    // Only send if no ping is already outstanding (matches
-                    // stellar-core: `mPingSentTime == PING_NOT_SENT`).
                     ticks_since_ping += 1;
                     if ticks_since_ping >= 5 {
                         ticks_since_ping = 0;
-                        if peer.is_connected() && ping.is_idle() {
-                            let now_nanos = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_nanos();
-                            let hash = compute_ping_hash(now_nanos);
-                            let ping_msg = StellarMessage::GetScpQuorumset(hash.clone());
-                            if let Err(e) = peer.send(ping_msg).await {
-                                debug!("Failed to send ping to {}: {}", peer_id, e);
-                            } else {
-                                ping.record_sent(hash);
-                                last_write = Instant::now();
-                            }
+                        if Self::maybe_send_ping(&mut peer, &peer_id, &mut ping).await {
+                            last_write = Instant::now();
                         }
-
-                        // Periodic stats (every 60s, checked on ping interval)
-                        if last_stats_log.elapsed() >= Duration::from_secs(60) {
-                            let rtt_str = ping.last_rtt
-                                .map(|d| format!("{}ms", d.as_millis()))
-                                .unwrap_or_else(|| "n/a".to_string());
-                            debug!("Peer {} stats: total_msgs={}, scp_msgs={}, rtt={}", peer_id, total_messages, scp_messages, rtt_str);
-                            last_stats_log = Instant::now();
-                        }
+                        Self::maybe_log_peer_stats(&peer_id, total_messages, scp_messages, &ping, &mut last_stats_log);
                     }
                 }
             }
@@ -2049,6 +2181,7 @@ impl OverlayManager {
         let shared_clone = shared.clone();
         let pool_clone = Arc::clone(&pool);
         let handle = tokio::spawn(async move {
+            // Clone again for run_peer_loop (takes ownership); originals used for cleanup.
             Self::run_peer_loop(
                 peer_id_clone.clone(),
                 peer,
@@ -2432,6 +2565,70 @@ impl OverlayManager {
         self.send_to(peer_id, message).await
     }
 
+    /// Connect to a discovered peer, run its peer loop, then clean up.
+    ///
+    /// Used by `add_peer` for background connections discovered via Peers messages.
+    async fn run_discovered_peer_connection(
+        addr: PeerAddress,
+        local_node: LocalNode,
+        connect_timeout: u64,
+        pool: Arc<ConnectionPool>,
+        shared: SharedPeerState,
+        connection_factory: Arc<dyn ConnectionFactory>,
+    ) {
+        let connection = match connection_factory.connect(&addr, connect_timeout).await {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("Failed to connect to discovered peer {}: {}", addr, e);
+                shared
+                    .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
+                    .await;
+                pool.release_pending();
+                return;
+            }
+        };
+
+        let peer =
+            match Peer::connect_with_connection(&addr, connection, local_node, connect_timeout)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("Failed to connect to discovered peer {}: {}", addr, e);
+                    shared
+                        .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
+                        .await;
+                    pool.release_pending();
+                    return;
+                }
+            };
+
+        let peer_id = peer.id().clone();
+        info!("Connected to discovered peer: {} at {}", peer_id, addr);
+
+        pool.mark_authenticated();
+        shared
+            .send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
+            .await;
+
+        let peer_info = peer.info().clone();
+        let (outbound_rx, flow_control) = Self::register_peer(&peer, &peer_id, peer_info, &shared);
+
+        // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
+
+        Self::run_peer_loop(
+            peer_id.clone(),
+            peer,
+            outbound_rx,
+            flow_control,
+            shared.clone(),
+        )
+        .await;
+
+        shared.cleanup_peer(&peer_id);
+        pool.release_authenticated();
+    }
+
     /// Add a peer to connect to.
     ///
     /// This is used for peer discovery when we receive a Peers message.
@@ -2472,70 +2669,15 @@ impl OverlayManager {
 
         let peer_handles = Arc::clone(&shared.peer_handles);
         let peer_handle = tokio::spawn(async move {
-            match connection_factory.connect(&addr, connect_timeout).await {
-                Ok(connection) => {
-                    match Peer::connect_with_connection(
-                        &addr,
-                        connection,
-                        local_node,
-                        connect_timeout,
-                    )
-                    .await
-                    {
-                        Ok(peer) => {
-                            let peer_id = peer.id().clone();
-                            info!("Connected to discovered peer: {} at {}", peer_id, addr);
-
-                            // Handshake succeeded: promote from pending to authenticated
-                            pool.mark_authenticated();
-
-                            shared
-                                .send_peer_event(PeerEvent::Connected(
-                                    addr.clone(),
-                                    PeerType::Outbound,
-                                ))
-                                .await;
-
-                            let peer_info = peer.info().clone();
-                            let (outbound_rx, flow_control) =
-                                Self::register_peer(&peer, &peer_id, peer_info, &shared);
-
-                            // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
-
-                            // Run peer loop (peer is moved, not locked)
-                            Self::run_peer_loop(
-                                peer_id.clone(),
-                                peer,
-                                outbound_rx,
-                                flow_control,
-                                shared.clone(),
-                            )
-                            .await;
-
-                            // Cleanup
-                            shared.cleanup_peer(&peer_id);
-                            pool.release_authenticated();
-                        }
-                        Err(e) => {
-                            debug!("Failed to connect to discovered peer {}: {}", addr, e);
-                            shared
-                                .send_peer_event(PeerEvent::Failed(
-                                    addr.clone(),
-                                    PeerType::Outbound,
-                                ))
-                                .await;
-                            pool.release_pending();
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!("Failed to connect to discovered peer {}: {}", addr, e);
-                    shared
-                        .send_peer_event(PeerEvent::Failed(addr.clone(), PeerType::Outbound))
-                        .await;
-                    pool.release_pending();
-                }
-            }
+            Self::run_discovered_peer_connection(
+                addr,
+                local_node,
+                connect_timeout,
+                pool,
+                shared,
+                connection_factory,
+            )
+            .await;
         });
 
         peer_handles.write().push(peer_handle);

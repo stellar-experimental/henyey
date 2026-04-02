@@ -307,11 +307,7 @@ impl FeeWindows {
         let lcm = LedgerCloseMeta::from_xdr(meta_bytes, Limits::none())
             .map_err(|e| format!("failed to parse LedgerCloseMeta: {e}"))?;
 
-        let ledger_seq = match &lcm {
-            LedgerCloseMeta::V0(v0) => v0.ledger_header.header.ledger_seq,
-            LedgerCloseMeta::V1(v1) => v1.ledger_header.header.ledger_seq,
-            LedgerCloseMeta::V2(v2) => v2.ledger_header.header.ledger_seq,
-        };
+        let ledger_seq = crate::util::ledger_header_entry(&lcm).header.ledger_seq;
 
         let (classic_fees, soroban_fees) = extract_fees_from_lcm(&lcm);
 

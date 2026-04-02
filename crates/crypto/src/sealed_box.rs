@@ -25,7 +25,7 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```ignore
 //! use henyey_crypto::{SecretKey, seal_to_public_key, open_from_secret_key};
 //!
 //! let recipient_secret = SecretKey::generate();
@@ -43,7 +43,9 @@
 use crypto_box::{PublicKey as CurvePublicKey, SecretKey as CurveSecretKey};
 use rand::rngs::OsRng;
 
-use crate::{CryptoError, PublicKey, SecretKey};
+use crate::CryptoError;
+#[cfg(test)]
+use crate::{PublicKey, SecretKey};
 
 fn seal(curve_pk: CurvePublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let mut rng = OsRng;
@@ -67,7 +69,8 @@ fn open(curve_sk: CurveSecretKey, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoEr
 ///
 /// Returns [`CryptoError::EncryptionFailed`] if encryption fails (rare, typically
 /// only on RNG failure).
-pub fn seal_to_public_key(recipient: &PublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+#[cfg(test)]
+fn seal_to_public_key(recipient: &PublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     seal(
         CurvePublicKey::from(recipient.to_curve25519_bytes()),
         plaintext,
@@ -98,10 +101,8 @@ pub fn seal_to_curve25519_public_key(
 /// - The ciphertext was tampered with
 /// - The wrong key was used
 /// - The ciphertext is malformed
-pub fn open_from_secret_key(
-    recipient: &SecretKey,
-    ciphertext: &[u8],
-) -> Result<Vec<u8>, CryptoError> {
+#[cfg(test)]
+fn open_from_secret_key(recipient: &SecretKey, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     open(
         CurveSecretKey::from(recipient.to_curve25519_bytes()),
         ciphertext,

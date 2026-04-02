@@ -2342,12 +2342,6 @@ impl TransactionExecutor {
         let fee_deduct_us = fee_deduct_start.elapsed().as_micros() as u64;
 
         let tx_changes_before: LedgerEntryChanges;
-        let seq_created;
-        let seq_updated;
-        let seq_deleted;
-        let mut signer_created = Vec::new();
-        let mut signer_updated = Vec::new();
-        let mut signer_deleted = Vec::new();
 
         // For fee bump transactions in two-phase mode, stellar-core's
         // FeeBumpTransactionFrame::apply() ALWAYS calls removeOneTimeSignerKeyFromFeeSource()
@@ -2418,92 +2412,11 @@ impl TransactionExecutor {
         // Remove one-time (PreAuthTx) signers from all source accounts.
         // This must happen AFTER the signature check above so PreAuthTx signers
         // are still present when their weight is evaluated.
-        let signer_removal_start = std::time::Instant::now();
-        let mut signer_changes = empty_entry_changes();
-        if self.protocol_version != 7 {
-            let mut source_accounts = Vec::new();
-            source_accounts.push(inner_source_id.clone());
-            for op in frame.operations().iter() {
-                if let Some(ref source) = op.source_account {
-                    source_accounts.push(henyey_tx::muxed_to_account_id(source));
-                }
-            }
-            source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
-            source_accounts.dedup_by(|a, b| a.0 == b.0);
+        let (signer_changes, signer_created, signer_updated, signer_deleted, signer_removal_us) =
+            self.remove_one_time_signers_phase(&frame, &inner_source_id, &outer_hash);
 
-            let delta_before_signers = delta_snapshot(&self.state);
-            let mut signer_state_overrides = HashMap::new();
-            for account_id in &source_accounts {
-                let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                    account_id: account_id.clone(),
-                });
-                if let Some(entry) = self.state.get_entry(&key) {
-                    signer_state_overrides.insert(key, entry);
-                }
-            }
-
-            self.state.remove_one_time_signers_from_all_sources(
-                &outer_hash,
-                &source_accounts,
-                self.protocol_version,
-            );
-            self.state.flush_modified_entries();
-            let delta_after_signers = delta_snapshot(&self.state);
-            let delta_slice = delta_slice_between(
-                self.state.delta(),
-                delta_before_signers,
-                delta_after_signers,
-            );
-            signer_created = delta_slice.created().to_vec();
-            signer_updated = delta_slice.updated().to_vec();
-            signer_deleted = delta_slice.deleted().to_vec();
-            signer_changes = build_entry_changes_with_state_overrides(
-                &self.state,
-                &signer_created,
-                &signer_updated,
-                &signer_deleted,
-                &signer_state_overrides,
-            );
-        }
-        let signer_removal_us = signer_removal_start.elapsed().as_micros() as u64;
-
-        let seq_bump_start = std::time::Instant::now();
-        let delta_before_seq = delta_snapshot(&self.state);
-        // Capture the current account state BEFORE modification for STATE entry.
-        // We can't use snapshot_entry() here because the snapshot might not exist yet.
-        // After flush_modified_entries, the snapshot is updated to the post-modification
-        // value, so we need to save the original here.
-        let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: inner_source_id.clone(),
-        });
-        let seq_state_override = self.state.get_entry(&inner_source_key);
-
-        if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-            // CAP-0021: Set the account's seq_num to the transaction's seq_num.
-            // This handles the case where minSeqNum allows sequence gaps - the
-            // account's final seq must be the tx's seq, not just account_seq + 1.
-            acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
-            henyey_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
-        }
-        self.state.flush_modified_entries();
-        let delta_after_seq = delta_snapshot(&self.state);
-        let delta_slice =
-            delta_slice_between(self.state.delta(), delta_before_seq, delta_after_seq);
-        // Use the pre-modification snapshot for STATE entry via state_overrides.
-        let mut seq_state_overrides = HashMap::new();
-        if let Some(entry) = seq_state_override {
-            seq_state_overrides.insert(inner_source_key, entry);
-        }
-        let seq_changes = build_entry_changes_with_state_overrides(
-            &self.state,
-            delta_slice.created(),
-            delta_slice.updated(),
-            delta_slice.deleted(),
-            &seq_state_overrides,
-        );
-        seq_created = delta_slice.created().to_vec();
-        seq_updated = delta_slice.updated().to_vec();
-        seq_deleted = delta_slice.deleted().to_vec();
+        let (seq_changes, seq_created, seq_updated, seq_deleted, seq_bump_us) =
+            self.bump_sequence_phase(&frame, &inner_source_id);
 
         // Merge all changes into tx_changes_before.
         // Order: fee_bump_wrapper_changes (fee source), seq_changes (inner source seq bump).
@@ -2516,12 +2429,9 @@ impl TransactionExecutor {
         combined.extend(signer_changes.iter().cloned());
         combined.extend(seq_changes.iter().cloned());
         tx_changes_before = combined.try_into().unwrap_or_default();
-        // Persist sequence updates so failed transactions still consume sequence numbers.
-        self.state.commit();
 
         // Commit pre-apply changes so rollback doesn't revert them.
         self.state.commit();
-        let seq_bump_us = seq_bump_start.elapsed().as_micros() as u64;
         let fee_seq_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us;
 
         Ok(Ok(PreApplyResult {
@@ -2798,41 +2708,7 @@ impl TransactionExecutor {
             }
         }
 
-        // Set up lazy entry loader for offer dependency loading.
-        // Instead of preloading all offer dependencies upfront (which requires
-        // O(n) bucket list lookups for all offers in each asset pair), the
-        // entry_loader enables on-demand loading during offer crossing.
-        let snapshot_for_loader = snapshot.clone();
-        self.state.set_entry_loader(std::sync::Arc::new(move |key| {
-            snapshot_for_loader
-                .get_entry(key)
-                .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
-        }));
-
-        // Set up batch entry loader for loading multiple entries in a single
-        // bucket list pass. This is used by path payment operations to batch-load
-        // seller account + trustlines together (~3x faster than separate lookups).
-        let snapshot_for_batch = snapshot.clone();
-        self.state
-            .set_batch_entry_loader(std::sync::Arc::new(move |keys| {
-                snapshot_for_batch
-                    .load_entries(keys)
-                    .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
-            }));
-
-        // Set up pool-share-trustlines-by-account loader (defense in depth).
-        // This mirrors the offers loader pattern: `find_pool_share_trustlines_for_asset`
-        // calls `ensure_pool_share_trustlines_loaded` which uses this loader to
-        // discover pool IDs from the secondary index.  Even if the pre-loading in
-        // `load_operation_accounts` is bypassed (e.g. by a future code path), the
-        // state manager will load pool share TLs on demand before iterating.
-        let snapshot_for_pool_shares = snapshot.clone();
-        self.state
-            .set_pool_share_tls_by_account_loader(std::sync::Arc::new(move |account_id| {
-                snapshot_for_pool_shares
-                    .pool_share_tls_by_account(account_id)
-                    .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
-            }));
+        self.setup_entry_loaders(snapshot);
 
         // Execute operations
         let mut operation_results = Vec::new();
@@ -3021,149 +2897,14 @@ impl TransactionExecutor {
 
                         // For Soroban operations, extract restored entries (hot archive and live BL)
                         let (restored_entries, footprint) = if op_type.is_soroban() {
-                            let mut restored = RestoredEntries::default();
-
-                            // Get live BL restorations from the Soroban execution result
-                            if let Some(meta) = &op_exec.soroban_meta {
-                                for live_bl_restore in &meta.live_bucket_list_restores {
-                                    restored
-                                        .live_bucket_list
-                                        .insert(live_bl_restore.key.clone());
-                                    restored.live_bucket_list_entries.insert(
-                                        live_bl_restore.key.clone(),
-                                        live_bl_restore.entry.clone(),
-                                    );
-                                    // Also track the TTL entry
-                                    restored
-                                        .live_bucket_list
-                                        .insert(live_bl_restore.ttl_key.clone());
-                                    restored.live_bucket_list_entries.insert(
-                                        live_bl_restore.ttl_key.clone(),
-                                        live_bl_restore.ttl_entry.clone(),
-                                    );
-                                }
-                            }
-
-                            // Get hot archive keys from two sources:
-                            // 1. For InvokeHostFunction: from actual_restored_indices (filtered by host)
-                            // 2. For RestoreFootprint: from soroban_meta.hot_archive_restores
-                            // NOTE: We must exclude live BL restore keys from the hot archive set.
-                            // Live BL restores are entries that exist in the live bucket list with
-                            // expired TTL but haven't been evicted yet - these are NOT hot archive
-                            // restores and should not be added to HotArchiveBucketList::add_batch.
-                            let actual_restored_indices = op_exec
-                                .soroban_meta
-                                .as_ref()
-                                .map(|m| m.actual_restored_indices.as_slice())
-                                .unwrap_or(&[]);
-                            let mut hot_archive = extract_hot_archive_restored_keys(
+                            let restored = collect_soroban_restored_entries(
+                                &op_exec.soroban_meta,
                                 soroban_data,
                                 op_type,
-                                actual_restored_indices,
+                                &op_result,
+                                &delta_slice,
+                                &mut collected_hot_archive_keys,
                             );
-                            // For RestoreFootprint, get hot archive keys and entries from the meta
-                            if let Some(meta) = &op_exec.soroban_meta {
-                                for ha_restore in &meta.hot_archive_restores {
-                                    hot_archive.insert(ha_restore.key.clone());
-                                    // Also store the entry for RESTORED meta emission
-                                    restored
-                                        .hot_archive_entries
-                                        .insert(ha_restore.key.clone(), ha_restore.entry.clone());
-                                }
-                            }
-                            let ha_before = hot_archive.len();
-                            hot_archive.retain(|k| !restored.live_bucket_list.contains(k));
-                            let ha_after_live_bl = hot_archive.len();
-
-                            // Also exclude keys that were listed in archived_soroban_entries but
-                            // were already restored by a previous TX in this ledger. These entries
-                            // go into `updated` (not `created`) because they already exist in state.
-                            // We only want RESTORED emission for entries actually being created/restored
-                            // in THIS transaction.
-                            let created_keys: HashSet<LedgerKey> = delta_slice
-                                .created()
-                                .iter()
-                                .map(|entry| henyey_common::entry_to_key(entry))
-                                .collect();
-                            // For transaction meta emission: only emit RESTORED for keys in created
-                            // Keep original set for bucket list operations
-                            let hot_archive_for_bucket_list = hot_archive.clone();
-                            // For RestoreFootprint, the data entries are prefetched from hot archive
-                            // into state, so they won't be in `created_keys` (only the TTL is created).
-                            // We need to emit RESTORED for all hot archive keys without filtering.
-                            // For InvokeHostFunction, we filter by created_keys because the auto-restore
-                            // creates the entries during execution.
-                            let hot_archive_for_meta: HashSet<LedgerKey> =
-                                if op_type == OperationType::RestoreFootprint {
-                                    // Don't filter - all hot archive keys should emit RESTORED
-                                    hot_archive.clone()
-                                } else {
-                                    // Filter by created_keys for InvokeHostFunction
-                                    hot_archive
-                                        .iter()
-                                        .filter(|k| created_keys.contains(k))
-                                        .cloned()
-                                        .collect()
-                                };
-                            let ha_after = hot_archive_for_meta.len();
-                            // Log when we filter out entries
-                            if ha_before != ha_after {
-                                tracing::debug!(
-                                    ha_before,
-                                    ha_after_live_bl,
-                                    ha_after,
-                                    live_bl_count = restored.live_bucket_list.len(),
-                                    created_count = created_keys.len(),
-                                    ?hot_archive,
-                                    ?created_keys,
-                                    op_type = ?op_type,
-                                    "Filtered hot archive keys: live BL restores and already-restored entries"
-                                );
-                            }
-                            // For transaction meta purposes, also add the corresponding TTL keys.
-                            // When a ContractData/ContractCode entry is restored from hot archive,
-                            // its TTL entry should also be emitted as RESTORED (not CREATED).
-                            // Use the filtered set (hot_archive_for_meta) which only includes entries
-                            // actually being created/restored in this TX.
-                            // NOTE: We don't add TTL keys to collected_hot_archive_keys because
-                            // HotArchiveBucketList::add_batch only receives data/code entries.
-                            use sha2::{Digest, Sha256};
-                            let ttl_keys: Vec<_> = hot_archive_for_meta
-                                .iter()
-                                .filter_map(|key| {
-                                    // Compute key hash as SHA256 of key XDR
-                                    let key_bytes = key.to_xdr(Limits::none()).ok()?;
-                                    let key_hash =
-                                        stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
-                                    Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                                        key_hash,
-                                    }))
-                                })
-                                .collect();
-                            // Collect data/code keys only for HotArchiveBucketList::add_batch.
-                            // All hot archive keys (already filtered by live BL above) should be
-                            // passed to the bucket list. This is true for both RestoreFootprint
-                            // and InvokeHostFunction - the hot archive needs to remove ALL entries
-                            // that were restored, regardless of whether the contract then modifies
-                            // them (which would put them in `updated` rather than `created`).
-                            // The `created_keys` filtering above is only for transaction meta
-                            // emission (RESTORED vs UPDATED), not for bucket list operations.
-                            //
-                            // IMPORTANT: Only collect hot archive keys for SUCCESSFUL operations.
-                            // In stellar-core, handleArchivedEntry writes the restoration to
-                            // mOpState (a nested LedgerTxn), but if the operation fails, that
-                            // nested LedgerTxn is rolled back, canceling the restorations and
-                            // preventing any HOT_ARCHIVE_LIVE tombstones from being written.
-                            // For failed operations, we must not add keys to the hot archive
-                            // batch — doing so would produce spurious HOT_ARCHIVE_LIVE tombstones
-                            // in the hot archive bucket list, causing a bucket_list_hash mismatch.
-                            if is_operation_success(&op_result) {
-                                collected_hot_archive_keys
-                                    .extend(hot_archive_for_bucket_list.iter().cloned());
-                            }
-                            // Add filtered keys (including TTL) to restored.hot_archive for meta conversion
-                            restored.hot_archive.extend(hot_archive_for_meta);
-                            restored.hot_archive.extend(ttl_keys);
                             (restored, soroban_data.map(|d| &d.resources.footprint))
                         } else {
                             (RestoredEntries::default(), None)
@@ -3262,76 +3003,24 @@ impl TransactionExecutor {
         }
 
         if !all_success {
-            let tx_hash = frame
-                .hash(&self.network_id)
-                .map(|hash| hash.to_hex())
-                .unwrap_or_else(|_| "unknown".to_string());
-            debug!(
-                tx_hash = %tx_hash,
-                fee_source = %account_id_to_strkey(&fee_source_id),
-                inner_source = %account_id_to_strkey(&inner_source_id),
-                results = ?operation_results,
-                "Transaction failed; rolling back changes"
-            );
-            self.state.rollback();
-            restore_delta_entries(
-                &mut self.state,
-                &fee_entries.created,
-                &fee_entries.updated,
-                &fee_entries.deleted,
-            );
-            // Re-add the fee to the delta after rollback.
-            // rollback() restores the delta from the snapshot taken BEFORE fee deduction,
-            // so we must explicitly re-add this transaction's fee to preserve it.
-            // This ensures failed transactions still contribute their fees to the fee pool.
-            if deduct_fee && fee > 0 {
-                self.state.delta_mut().add_fee(fee);
-            }
-            restore_delta_entries(
-                &mut self.state,
-                &seq_entries.created,
-                &seq_entries.updated,
-                &seq_entries.deleted,
-            );
-            restore_delta_entries(
-                &mut self.state,
-                &signer_entries.created,
-                &signer_entries.updated,
-                &signer_entries.deleted,
+            self.rollback_failed_tx(
+                &frame,
+                &fee_source_id,
+                &inner_source_id,
+                &operation_results,
+                deduct_fee,
+                fee,
+                &fee_entries,
+                &seq_entries,
+                &signer_entries,
+                &mut refundable_fee_tracker,
             );
             op_changes.clear();
             op_events.clear();
             diagnostic_events.clear();
             soroban_return_value = None;
-
-            // Reset the refundable fee tracker when transaction fails.
-            // This mirrors stellar-core's behavior where setError() calls resetConsumedFee(),
-            // ensuring the full max_refundable_fee is refunded on any transaction failure.
-            if let Some(tracker) = refundable_fee_tracker.as_mut() {
-                tracing::debug!(
-                    ledger_seq = self.ledger_seq,
-                    is_soroban = frame.is_soroban(),
-                    max_refundable_fee = tracker.max_refundable_fee,
-                    consumed_before_reset = tracker.consumed_refundable_fee,
-                    "Resetting fee tracker due to tx failure"
-                );
-                tracker.reset();
-            }
         } else {
-            self.state.commit();
-
-            // Update module cache with any newly created contract code.
-            // This ensures subsequent transactions can use VmCachedInstantiation
-            // (cheap) instead of VmInstantiation (expensive) for contracts
-            // deployed in this transaction.
-            // Only scan entries created by THIS TX (not all prior TXs in the cluster)
-            // to avoid O(n²) iteration over the growing delta.
-            let created = self.state.delta().created_entries();
-            for entry in &created[pre_tx_created_count..] {
-                if let stellar_xdr::curr::LedgerEntryData::ContractCode(cc) = &entry.data {
-                    self.add_contract_to_cache(cc.code.as_slice());
-                }
-            }
+            self.commit_successful_tx(pre_tx_created_count);
         }
 
         let commit_phase_us = meta_phase_start.elapsed().as_micros() as u64;
@@ -3953,6 +3642,269 @@ impl TransactionExecutor {
     pub fn state_mut(&mut self) -> &mut LedgerStateManager {
         &mut self.state
     }
+
+    /// Set up lazy entry loaders on the state manager for on-demand loading
+    /// during operation execution.
+    ///
+    /// This configures three loaders:
+    /// - **Entry loader**: loads a single entry from the snapshot (used during offer crossing)
+    /// - **Batch entry loader**: loads multiple entries in one pass (used by path payments)
+    /// - **Pool-share TLs loader**: discovers pool share trustlines by account
+    fn setup_entry_loaders(&mut self, snapshot: &SnapshotHandle) {
+        let snapshot_for_loader = snapshot.clone();
+        self.state.set_entry_loader(std::sync::Arc::new(move |key| {
+            snapshot_for_loader
+                .get_entry(key)
+                .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
+        }));
+
+        let snapshot_for_batch = snapshot.clone();
+        self.state
+            .set_batch_entry_loader(std::sync::Arc::new(move |keys| {
+                snapshot_for_batch
+                    .load_entries(keys)
+                    .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
+            }));
+
+        let snapshot_for_pool_shares = snapshot.clone();
+        self.state
+            .set_pool_share_tls_by_account_loader(std::sync::Arc::new(move |account_id| {
+                snapshot_for_pool_shares
+                    .pool_share_tls_by_account(account_id)
+                    .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
+            }));
+    }
+
+    /// Roll back state changes for a failed transaction and restore pre-apply entries.
+    ///
+    /// When a transaction fails, this method:
+    /// 1. Rolls back all operation-level state changes
+    /// 2. Restores fee, sequence, and signer entries from the pre-apply phase
+    /// 3. Re-adds the fee to the delta (so failed TXs still contribute fees)
+    /// 4. Resets the refundable fee tracker (full refund on failure)
+    #[allow(clippy::too_many_arguments)]
+    fn rollback_failed_tx(
+        &mut self,
+        frame: &TransactionFrame,
+        fee_source_id: &AccountId,
+        inner_source_id: &AccountId,
+        operation_results: &[OperationResult],
+        deduct_fee: bool,
+        fee: i64,
+        fee_entries: &DeltaEntries,
+        seq_entries: &DeltaEntries,
+        signer_entries: &DeltaEntries,
+        refundable_fee_tracker: &mut Option<RefundableFeeTracker>,
+    ) {
+        let tx_hash = frame
+            .hash(&self.network_id)
+            .map(|hash| hash.to_hex())
+            .unwrap_or_else(|_| "unknown".to_string());
+        debug!(
+            tx_hash = %tx_hash,
+            fee_source = %account_id_to_strkey(fee_source_id),
+            inner_source = %account_id_to_strkey(inner_source_id),
+            results = ?operation_results,
+            "Transaction failed; rolling back changes"
+        );
+        self.state.rollback();
+        restore_delta_entries(
+            &mut self.state,
+            &fee_entries.created,
+            &fee_entries.updated,
+            &fee_entries.deleted,
+        );
+        // Re-add the fee to the delta after rollback.
+        // rollback() restores the delta from the snapshot taken BEFORE fee deduction,
+        // so we must explicitly re-add this transaction's fee to preserve it.
+        // This ensures failed transactions still contribute their fees to the fee pool.
+        if deduct_fee && fee > 0 {
+            self.state.delta_mut().add_fee(fee);
+        }
+        restore_delta_entries(
+            &mut self.state,
+            &seq_entries.created,
+            &seq_entries.updated,
+            &seq_entries.deleted,
+        );
+        restore_delta_entries(
+            &mut self.state,
+            &signer_entries.created,
+            &signer_entries.updated,
+            &signer_entries.deleted,
+        );
+
+        // Reset the refundable fee tracker when transaction fails.
+        // This mirrors stellar-core's behavior where setError() calls resetConsumedFee(),
+        // ensuring the full max_refundable_fee is refunded on any transaction failure.
+        if let Some(tracker) = refundable_fee_tracker.as_mut() {
+            tracing::debug!(
+                ledger_seq = self.ledger_seq,
+                is_soroban = frame.is_soroban(),
+                max_refundable_fee = tracker.max_refundable_fee,
+                consumed_before_reset = tracker.consumed_refundable_fee,
+                "Resetting fee tracker due to tx failure"
+            );
+            tracker.reset();
+        }
+    }
+
+    /// Commit a successful transaction and update the module cache.
+    ///
+    /// After all operations succeed, commits the state changes and scans
+    /// newly created entries for contract code to add to the module cache
+    /// (enabling `VmCachedInstantiation` for subsequent transactions).
+    fn commit_successful_tx(&mut self, pre_tx_created_count: usize) {
+        self.state.commit();
+
+        // Update module cache with any newly created contract code.
+        // Only scan entries created by THIS TX (not all prior TXs in the cluster)
+        // to avoid O(n²) iteration over the growing delta.
+        let created = self.state.delta().created_entries();
+        for entry in &created[pre_tx_created_count..] {
+            if let stellar_xdr::curr::LedgerEntryData::ContractCode(cc) = &entry.data {
+                self.add_contract_to_cache(cc.code.as_slice());
+            }
+        }
+    }
+
+    /// Remove one-time (PreAuthTx) signers from all source accounts.
+    ///
+    /// Returns (signer_changes, signer_created, signer_updated, signer_deleted, duration_us).
+    fn remove_one_time_signers_phase(
+        &mut self,
+        frame: &TransactionFrame,
+        inner_source_id: &AccountId,
+        outer_hash: &Hash256,
+    ) -> (
+        LedgerEntryChanges,
+        Vec<LedgerEntry>,
+        Vec<LedgerEntry>,
+        Vec<LedgerKey>,
+        u64,
+    ) {
+        let signer_removal_start = std::time::Instant::now();
+        if self.protocol_version == 7 {
+            let us = signer_removal_start.elapsed().as_micros() as u64;
+            return (
+                empty_entry_changes(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                us,
+            );
+        }
+
+        let mut source_accounts = Vec::new();
+        source_accounts.push(inner_source_id.clone());
+        for op in frame.operations().iter() {
+            if let Some(ref source) = op.source_account {
+                source_accounts.push(henyey_tx::muxed_to_account_id(source));
+            }
+        }
+        source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
+        source_accounts.dedup_by(|a, b| a.0 == b.0);
+
+        let delta_before_signers = delta_snapshot(&self.state);
+        let mut signer_state_overrides = HashMap::new();
+        for account_id in &source_accounts {
+            let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: account_id.clone(),
+            });
+            if let Some(entry) = self.state.get_entry(&key) {
+                signer_state_overrides.insert(key, entry);
+            }
+        }
+
+        self.state.remove_one_time_signers_from_all_sources(
+            outer_hash,
+            &source_accounts,
+            self.protocol_version,
+        );
+        self.state.flush_modified_entries();
+        let delta_after_signers = delta_snapshot(&self.state);
+        let delta_slice = delta_slice_between(
+            self.state.delta(),
+            delta_before_signers,
+            delta_after_signers,
+        );
+        let signer_created = delta_slice.created().to_vec();
+        let signer_updated = delta_slice.updated().to_vec();
+        let signer_deleted = delta_slice.deleted().to_vec();
+        let signer_changes = build_entry_changes_with_state_overrides(
+            &self.state,
+            &signer_created,
+            &signer_updated,
+            &signer_deleted,
+            &signer_state_overrides,
+        );
+        let us = signer_removal_start.elapsed().as_micros() as u64;
+        (
+            signer_changes,
+            signer_created,
+            signer_updated,
+            signer_deleted,
+            us,
+        )
+    }
+
+    /// Bump the transaction source account's sequence number and capture delta changes.
+    ///
+    /// Returns (seq_changes, seq_created, seq_updated, seq_deleted, duration_us).
+    fn bump_sequence_phase(
+        &mut self,
+        frame: &TransactionFrame,
+        inner_source_id: &AccountId,
+    ) -> (
+        LedgerEntryChanges,
+        Vec<LedgerEntry>,
+        Vec<LedgerEntry>,
+        Vec<LedgerKey>,
+        u64,
+    ) {
+        let seq_bump_start = std::time::Instant::now();
+        let delta_before_seq = delta_snapshot(&self.state);
+        // Capture the current account state BEFORE modification for STATE entry.
+        // We can't use snapshot_entry() here because the snapshot might not exist yet.
+        // After flush_modified_entries, the snapshot is updated to the post-modification
+        // value, so we need to save the original here.
+        let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: inner_source_id.clone(),
+        });
+        let seq_state_override = self.state.get_entry(&inner_source_key);
+
+        if let Some(acc) = self.state.get_account_mut(inner_source_id) {
+            // CAP-0021: Set the account's seq_num to the transaction's seq_num.
+            // This handles the case where minSeqNum allows sequence gaps - the
+            // account's final seq must be the tx's seq, not just account_seq + 1.
+            acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+            henyey_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
+        }
+        self.state.flush_modified_entries();
+        let delta_after_seq = delta_snapshot(&self.state);
+        let delta_slice =
+            delta_slice_between(self.state.delta(), delta_before_seq, delta_after_seq);
+        // Use the pre-modification snapshot for STATE entry via state_overrides.
+        let mut seq_state_overrides = HashMap::new();
+        if let Some(entry) = seq_state_override {
+            seq_state_overrides.insert(inner_source_key, entry);
+        }
+        let seq_changes = build_entry_changes_with_state_overrides(
+            &self.state,
+            delta_slice.created(),
+            delta_slice.updated(),
+            delta_slice.deleted(),
+            &seq_state_overrides,
+        );
+        let seq_created = delta_slice.created().to_vec();
+        let seq_updated = delta_slice.updated().to_vec();
+        let seq_deleted = delta_slice.deleted().to_vec();
+        // Persist sequence updates so failed transactions still consume sequence numbers.
+        self.state.commit();
+
+        let us = seq_bump_start.elapsed().as_micros() as u64;
+        (seq_changes, seq_created, seq_updated, seq_deleted, us)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4047,6 +3999,166 @@ pub struct RestoredEntries {
     /// For live BL restores, maps data/code keys to their entry values.
     /// These are needed to emit RESTORED for data/code that wasn't directly modified.
     live_bucket_list_entries: HashMap<LedgerKey, LedgerEntry>,
+}
+
+/// Collect restored entries for a Soroban operation from both the hot archive
+/// and the live bucket list.
+///
+/// This processes the operation's Soroban meta to determine which entries were
+/// restored, filters out live BL restores from the hot archive set, computes
+/// TTL keys for restored entries, and accumulates hot archive keys for the
+/// bucket list batch.
+///
+/// # Arguments
+/// - `soroban_meta`: The Soroban execution metadata (may contain restore info)
+/// - `soroban_data`: The transaction's Soroban resource data
+/// - `op_type`: The operation type (RestoreFootprint vs InvokeHostFunction)
+/// - `op_result`: The operation result (only successful ops contribute to hot archive)
+/// - `delta_slice`: The delta slice for this operation (used to determine created keys)
+/// - `collected_hot_archive_keys`: Accumulator for hot archive keys across all ops
+fn collect_soroban_restored_entries(
+    soroban_meta: &Option<henyey_tx::operations::execute::SorobanOperationMeta>,
+    soroban_data: Option<&SorobanTransactionData>,
+    op_type: OperationType,
+    op_result: &OperationResult,
+    delta_slice: &DeltaSlice<'_>,
+    collected_hot_archive_keys: &mut HashSet<LedgerKey>,
+) -> RestoredEntries {
+    use sha2::{Digest, Sha256};
+
+    let mut restored = RestoredEntries::default();
+
+    // Get live BL restorations from the Soroban execution result
+    if let Some(meta) = soroban_meta {
+        for live_bl_restore in &meta.live_bucket_list_restores {
+            restored
+                .live_bucket_list
+                .insert(live_bl_restore.key.clone());
+            restored
+                .live_bucket_list_entries
+                .insert(live_bl_restore.key.clone(), live_bl_restore.entry.clone());
+            // Also track the TTL entry
+            restored
+                .live_bucket_list
+                .insert(live_bl_restore.ttl_key.clone());
+            restored.live_bucket_list_entries.insert(
+                live_bl_restore.ttl_key.clone(),
+                live_bl_restore.ttl_entry.clone(),
+            );
+        }
+    }
+
+    // Get hot archive keys from two sources:
+    // 1. For InvokeHostFunction: from actual_restored_indices (filtered by host)
+    // 2. For RestoreFootprint: from soroban_meta.hot_archive_restores
+    // NOTE: We must exclude live BL restore keys from the hot archive set.
+    // Live BL restores are entries that exist in the live bucket list with
+    // expired TTL but haven't been evicted yet - these are NOT hot archive
+    // restores and should not be added to HotArchiveBucketList::add_batch.
+    let actual_restored_indices = soroban_meta
+        .as_ref()
+        .map(|m| m.actual_restored_indices.as_slice())
+        .unwrap_or(&[]);
+    let mut hot_archive =
+        extract_hot_archive_restored_keys(soroban_data, op_type, actual_restored_indices);
+    // For RestoreFootprint, get hot archive keys and entries from the meta
+    if let Some(meta) = soroban_meta {
+        for ha_restore in &meta.hot_archive_restores {
+            hot_archive.insert(ha_restore.key.clone());
+            // Also store the entry for RESTORED meta emission
+            restored
+                .hot_archive_entries
+                .insert(ha_restore.key.clone(), ha_restore.entry.clone());
+        }
+    }
+    let ha_before = hot_archive.len();
+    hot_archive.retain(|k| !restored.live_bucket_list.contains(k));
+    let ha_after_live_bl = hot_archive.len();
+
+    // Also exclude keys that were listed in archived_soroban_entries but
+    // were already restored by a previous TX in this ledger. These entries
+    // go into `updated` (not `created`) because they already exist in state.
+    // We only want RESTORED emission for entries actually being created/restored
+    // in THIS transaction.
+    let created_keys: HashSet<LedgerKey> = delta_slice
+        .created()
+        .iter()
+        .map(|entry| henyey_common::entry_to_key(entry))
+        .collect();
+    // For transaction meta emission: only emit RESTORED for keys in created
+    // Keep original set for bucket list operations
+    let hot_archive_for_bucket_list = hot_archive.clone();
+    // For RestoreFootprint, the data entries are prefetched from hot archive
+    // into state, so they won't be in `created_keys` (only the TTL is created).
+    // We need to emit RESTORED for all hot archive keys without filtering.
+    // For InvokeHostFunction, we filter by created_keys because the auto-restore
+    // creates the entries during execution.
+    let hot_archive_for_meta: HashSet<LedgerKey> = if op_type == OperationType::RestoreFootprint {
+        // Don't filter - all hot archive keys should emit RESTORED
+        hot_archive.clone()
+    } else {
+        // Filter by created_keys for InvokeHostFunction
+        hot_archive
+            .iter()
+            .filter(|k| created_keys.contains(k))
+            .cloned()
+            .collect()
+    };
+    let ha_after = hot_archive_for_meta.len();
+    // Log when we filter out entries
+    if ha_before != ha_after {
+        tracing::debug!(
+            ha_before,
+            ha_after_live_bl,
+            ha_after,
+            live_bl_count = restored.live_bucket_list.len(),
+            created_count = created_keys.len(),
+            ?hot_archive,
+            ?created_keys,
+            op_type = ?op_type,
+            "Filtered hot archive keys: live BL restores and already-restored entries"
+        );
+    }
+    // For transaction meta purposes, also add the corresponding TTL keys.
+    // When a ContractData/ContractCode entry is restored from hot archive,
+    // its TTL entry should also be emitted as RESTORED (not CREATED).
+    // Use the filtered set (hot_archive_for_meta) which only includes entries
+    // actually being created/restored in this TX.
+    // NOTE: We don't add TTL keys to collected_hot_archive_keys because
+    // HotArchiveBucketList::add_batch only receives data/code entries.
+    let ttl_keys: Vec<_> = hot_archive_for_meta
+        .iter()
+        .filter_map(|key| {
+            // Compute key hash as SHA256 of key XDR
+            let key_bytes = key.to_xdr(Limits::none()).ok()?;
+            let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
+            Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash }))
+        })
+        .collect();
+    // Collect data/code keys only for HotArchiveBucketList::add_batch.
+    // All hot archive keys (already filtered by live BL above) should be
+    // passed to the bucket list. This is true for both RestoreFootprint
+    // and InvokeHostFunction - the hot archive needs to remove ALL entries
+    // that were restored, regardless of whether the contract then modifies
+    // them (which would put them in `updated` rather than `created`).
+    // The `created_keys` filtering above is only for transaction meta
+    // emission (RESTORED vs UPDATED), not for bucket list operations.
+    //
+    // IMPORTANT: Only collect hot archive keys for SUCCESSFUL operations.
+    // In stellar-core, handleArchivedEntry writes the restoration to
+    // mOpState (a nested LedgerTxn), but if the operation fails, that
+    // nested LedgerTxn is rolled back, canceling the restorations and
+    // preventing any HOT_ARCHIVE_LIVE tombstones from being written.
+    // For failed operations, we must not add keys to the hot archive
+    // batch — doing so would produce spurious HOT_ARCHIVE_LIVE tombstones
+    // in the hot archive bucket list, causing a bucket_list_hash mismatch.
+    if is_operation_success(op_result) {
+        collected_hot_archive_keys.extend(hot_archive_for_bucket_list.iter().cloned());
+    }
+    // Add filtered keys (including TTL) to restored.hot_archive for meta conversion
+    restored.hot_archive.extend(hot_archive_for_meta);
+    restored.hot_archive.extend(ttl_keys);
+    restored
 }
 
 // Re-export ThresholdLevel from henyey_common for use in this module and submodules.

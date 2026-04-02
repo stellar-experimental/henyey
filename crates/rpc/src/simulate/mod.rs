@@ -1047,23 +1047,7 @@ fn insert_sim_xdr_field<T: WriteXdr + serde::Serialize>(
     val: &T,
     format: XdrFormat,
 ) -> Result<(), JsonRpcError> {
-    match format {
-        XdrFormat::Base64 => {
-            let bytes = val
-                .to_xdr(Limits::none())
-                .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
-            obj.insert(
-                base_name.to_string(),
-                serde_json::Value::String(BASE64.encode(&bytes)),
-            );
-        }
-        XdrFormat::Json => {
-            let json_val = serde_json::to_value(val)
-                .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
-            obj.insert(format!("{base_name}Json"), json_val);
-        }
-    }
-    Ok(())
+    util::insert_xdr_field_styled(obj, base_name, val, format, util::XdrKeyStyle::Unsuffixed)
 }
 
 /// Insert an array of XDR values with simulate-specific naming.
@@ -1076,33 +1060,13 @@ fn insert_sim_xdr_array_field<T: WriteXdr + serde::Serialize>(
     items: &[T],
     format: XdrFormat,
 ) -> Result<(), JsonRpcError> {
-    match format {
-        XdrFormat::Base64 => {
-            let encoded: Vec<serde_json::Value> = items
-                .iter()
-                .map(|item| {
-                    item.to_xdr(Limits::none())
-                        .map(|b| serde_json::Value::String(BASE64.encode(&b)))
-                        .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))
-                })
-                .collect::<Result<_, _>>()?;
-            obj.insert(base_name.to_string(), serde_json::Value::Array(encoded));
-        }
-        XdrFormat::Json => {
-            let json_items: Vec<serde_json::Value> = items
-                .iter()
-                .map(|item| {
-                    serde_json::to_value(item)
-                        .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))
-                })
-                .collect::<Result<_, _>>()?;
-            obj.insert(
-                format!("{base_name}Json"),
-                serde_json::Value::Array(json_items),
-            );
-        }
-    }
-    Ok(())
+    util::insert_xdr_array_field_styled(
+        obj,
+        base_name,
+        items,
+        format,
+        util::XdrKeyStyle::Unsuffixed,
+    )
 }
 
 // ---------------------------------------------------------------------------

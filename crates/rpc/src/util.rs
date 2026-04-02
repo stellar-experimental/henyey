@@ -3,8 +3,8 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Serialize;
 use stellar_xdr::curr::{
-    DiagnosticEvent, LedgerKey, Limits, ReadXdr, TransactionMeta, TransactionResultCode,
-    TransactionResultPair, WriteXdr,
+    DiagnosticEvent, LedgerCloseMeta, LedgerHeaderHistoryEntry, LedgerKey, Limits, ReadXdr,
+    TransactionMeta, TransactionResultCode, TransactionResultPair, WriteXdr,
 };
 
 use crate::error::JsonRpcError;
@@ -44,6 +44,30 @@ pub(crate) fn parse_format(params: &serde_json::Value) -> Result<XdrFormat, Json
     }
 }
 
+/// Controls how the JSON key is derived from `base_name` in XDR insert helpers.
+///
+/// Most RPC methods use [`Suffixed`](XdrKeyStyle::Suffixed) (`envelopeXdr` / `envelopeJson`).
+/// The `simulateTransaction` endpoint uses [`Unsuffixed`](XdrKeyStyle::Unsuffixed)
+/// (`transactionData` in base64 mode, `transactionDataJson` in JSON mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XdrKeyStyle {
+    /// Base64 key = `"{base_name}Xdr"`, JSON key = `"{base_name}Json"`.
+    Suffixed,
+    /// Base64 key = `"{base_name}"` (unsuffixed), JSON key = `"{base_name}Json"`.
+    Unsuffixed,
+}
+
+/// Build the JSON key for a given base name, format, and key style.
+fn xdr_key(base_name: &str, format: XdrFormat, style: XdrKeyStyle) -> String {
+    match format {
+        XdrFormat::Base64 => match style {
+            XdrKeyStyle::Suffixed => format!("{base_name}Xdr"),
+            XdrKeyStyle::Unsuffixed => base_name.to_string(),
+        },
+        XdrFormat::Json => format!("{base_name}Json"),
+    }
+}
+
 /// Insert an XDR field into a JSON object with the correct key name.
 ///
 /// When format is `Base64`, inserts `"{base_name}Xdr": "<base64>"`.
@@ -56,20 +80,31 @@ pub(crate) fn insert_xdr_field<T: WriteXdr + Serialize>(
     val: &T,
     format: XdrFormat,
 ) -> Result<(), JsonRpcError> {
+    insert_xdr_field_styled(obj, base_name, val, format, XdrKeyStyle::Suffixed)
+}
+
+/// Insert an XDR field with explicit key style control.
+///
+/// See [`XdrKeyStyle`] for the difference between suffixed and unsuffixed keys.
+pub(crate) fn insert_xdr_field_styled<T: WriteXdr + Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base_name: &str,
+    val: &T,
+    format: XdrFormat,
+    style: XdrKeyStyle,
+) -> Result<(), JsonRpcError> {
+    let key = xdr_key(base_name, format, style);
     match format {
         XdrFormat::Base64 => {
             let bytes = val
                 .to_xdr(Limits::none())
                 .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
-            obj.insert(
-                format!("{base_name}Xdr"),
-                serde_json::Value::String(BASE64.encode(&bytes)),
-            );
+            obj.insert(key, serde_json::Value::String(BASE64.encode(&bytes)));
         }
         XdrFormat::Json => {
             let json_val = serde_json::to_value(val)
                 .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
-            obj.insert(format!("{base_name}Json"), json_val);
+            obj.insert(key, json_val);
         }
     }
     Ok(())
@@ -113,6 +148,20 @@ pub(crate) fn insert_xdr_array_field<T: WriteXdr + Serialize>(
     items: &[T],
     format: XdrFormat,
 ) -> Result<(), JsonRpcError> {
+    insert_xdr_array_field_styled(obj, base_name, items, format, XdrKeyStyle::Suffixed)
+}
+
+/// Insert an array of XDR items with explicit key style control.
+///
+/// See [`XdrKeyStyle`] for the difference between suffixed and unsuffixed keys.
+pub(crate) fn insert_xdr_array_field_styled<T: WriteXdr + Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base_name: &str,
+    items: &[T],
+    format: XdrFormat,
+    style: XdrKeyStyle,
+) -> Result<(), JsonRpcError> {
+    let key = xdr_key(base_name, format, style);
     match format {
         XdrFormat::Base64 => {
             let encoded: Vec<serde_json::Value> = items
@@ -123,7 +172,7 @@ pub(crate) fn insert_xdr_array_field<T: WriteXdr + Serialize>(
                         .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))
                 })
                 .collect::<Result<_, _>>()?;
-            obj.insert(format!("{base_name}Xdr"), serde_json::Value::Array(encoded));
+            obj.insert(key, serde_json::Value::Array(encoded));
         }
         XdrFormat::Json => {
             let json_items: Vec<serde_json::Value> = items
@@ -133,13 +182,24 @@ pub(crate) fn insert_xdr_array_field<T: WriteXdr + Serialize>(
                         .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))
                 })
                 .collect::<Result<_, _>>()?;
-            obj.insert(
-                format!("{base_name}Json"),
-                serde_json::Value::Array(json_items),
-            );
+            obj.insert(key, serde_json::Value::Array(json_items));
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// LedgerCloseMeta helpers
+// ---------------------------------------------------------------------------
+
+/// Extract the [`LedgerHeaderHistoryEntry`] reference from any version of
+/// [`LedgerCloseMeta`].
+pub(crate) fn ledger_header_entry(lcm: &LedgerCloseMeta) -> &LedgerHeaderHistoryEntry {
+    match lcm {
+        LedgerCloseMeta::V0(v0) => &v0.ledger_header,
+        LedgerCloseMeta::V1(v1) => &v1.ledger_header,
+        LedgerCloseMeta::V2(v2) => &v2.ledger_header,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -7,7 +7,7 @@ use axum::{
     routing::get,
     Router,
 };
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use flate2::{write::GzEncoder, Compression};
 use henyey_common::Hash256;
 use henyey_history::verify;
 use henyey_history::{
@@ -15,7 +15,7 @@ use henyey_history::{
     archive_state::{HASBucketLevel, HistoryArchiveState},
     paths::{bucket_path, checkpoint_path},
 };
-use henyey_historywork::{HistoryWorkBuilder, HistoryWorkState, LocalArchiveWriter};
+use henyey_historywork::{HistoryWorkBuilder, HistoryWorkState};
 use henyey_ledger::TransactionSetVariant;
 use henyey_work::{WorkScheduler, WorkSchedulerConfig};
 use stellar_xdr::curr::{
@@ -42,14 +42,6 @@ fn record_marked(entries: &[Vec<u8>]) -> Vec<u8> {
         out.extend_from_slice(entry);
     }
     out
-}
-
-fn gunzip_bytes(data: &[u8]) -> Vec<u8> {
-    use std::io::Read;
-    let mut decoder = GzDecoder::new(data);
-    let mut output = Vec::new();
-    decoder.read_to_end(&mut output).expect("gunzip read");
-    output
 }
 
 fn make_header(
@@ -117,7 +109,7 @@ async fn test_history_work_chain() {
     let header_xdr_raw = header_entry
         .to_xdr(stellar_xdr::curr::Limits::none())
         .expect("xdr");
-    let header_xdr = record_marked(&[header_xdr_raw.clone()]);
+    let header_xdr = record_marked(&[header_xdr_raw]);
 
     let has = HistoryArchiveState {
         version: 2,
@@ -151,7 +143,7 @@ async fn test_history_work_chain() {
     let tx_entry_xdr_raw = tx_entry
         .to_xdr(stellar_xdr::curr::Limits::none())
         .expect("tx entry xdr");
-    let tx_entry_xdr = record_marked(&[tx_entry_xdr_raw.clone()]);
+    let tx_entry_xdr = record_marked(&[tx_entry_xdr_raw]);
     fixtures.insert(
         checkpoint_path("transactions", checkpoint, "xdr.gz"),
         gzip_bytes(&tx_entry_xdr),
@@ -165,7 +157,7 @@ async fn test_history_work_chain() {
     let tx_result_entry_xdr_raw = tx_result_entry
         .to_xdr(stellar_xdr::curr::Limits::none())
         .expect("tx result entry xdr");
-    let tx_result_entry_xdr = record_marked(&[tx_result_entry_xdr_raw.clone()]);
+    let tx_result_entry_xdr = record_marked(&[tx_result_entry_xdr_raw]);
     fixtures.insert(
         checkpoint_path("results", checkpoint, "xdr.gz"),
         gzip_bytes(&tx_result_entry_xdr),
@@ -181,7 +173,7 @@ async fn test_history_work_chain() {
     let scp_entry_xdr_raw = scp_entry
         .to_xdr(stellar_xdr::curr::Limits::none())
         .expect("scp entry xdr");
-    let scp_entry_xdr = record_marked(&[scp_entry_xdr_raw.clone()]);
+    let scp_entry_xdr = record_marked(&[scp_entry_xdr_raw]);
     fixtures.insert(
         checkpoint_path("scp", checkpoint, "xdr.gz"),
         gzip_bytes(&scp_entry_xdr),
@@ -233,11 +225,7 @@ async fn test_history_work_chain() {
         Arc::clone(&state),
         bucket_download_dir.path().to_path_buf(),
     );
-    let ids = builder.register(&mut scheduler);
-
-    let publish_dir = tempfile::tempdir().expect("publish dir");
-    let writer = Arc::new(LocalArchiveWriter::new(publish_dir.path().to_path_buf()));
-    builder.register_publish(&mut scheduler, writer, ids);
+    builder.register(&mut scheduler);
 
     scheduler.run_until_done().await;
 
@@ -253,48 +241,4 @@ async fn test_history_work_chain() {
     assert_eq!(guard.scp_history.len(), 1);
     assert!(guard.progress.stage.is_some());
     assert!(!guard.progress.message.is_empty());
-
-    let has_path = publish_dir
-        .path()
-        .join(checkpoint_path("history", checkpoint, "json"));
-    let bucket_file = publish_dir.path().join(bucket_path(&bucket_hash));
-    let headers_file = publish_dir
-        .path()
-        .join(checkpoint_path("ledger", checkpoint, "xdr.gz"));
-    let transactions_file =
-        publish_dir
-            .path()
-            .join(checkpoint_path("transactions", checkpoint, "xdr.gz"));
-    let results_file = publish_dir
-        .path()
-        .join(checkpoint_path("results", checkpoint, "xdr.gz"));
-    let scp_file = publish_dir
-        .path()
-        .join(checkpoint_path("scp", checkpoint, "xdr.gz"));
-    assert!(has_path.exists());
-    assert!(bucket_file.exists());
-    assert!(headers_file.exists());
-    assert!(transactions_file.exists());
-    assert!(results_file.exists());
-    assert!(scp_file.exists());
-
-    let has_payload = std::fs::read_to_string(&has_path).expect("read has");
-    let parsed_has = HistoryArchiveState::from_json(&has_payload).expect("parse has");
-    assert_eq!(parsed_has.current_ledger, checkpoint);
-    assert_eq!(parsed_has.current_buckets.len(), 1);
-
-    let bucket_payload = std::fs::read(&bucket_file).expect("read bucket");
-    assert_eq!(gunzip_bytes(&bucket_payload), bucket_data);
-
-    let headers_payload = std::fs::read(&headers_file).expect("read ledger headers");
-    assert_eq!(gunzip_bytes(&headers_payload), header_xdr_raw);
-
-    let transactions_payload = std::fs::read(&transactions_file).expect("read transactions");
-    assert_eq!(gunzip_bytes(&transactions_payload), tx_entry_xdr_raw);
-
-    let results_payload = std::fs::read(&results_file).expect("read results");
-    assert_eq!(gunzip_bytes(&results_payload), tx_result_entry_xdr_raw);
-
-    let scp_payload = std::fs::read(&scp_file).expect("read scp");
-    assert_eq!(gunzip_bytes(&scp_payload), scp_entry_xdr_raw);
 }
