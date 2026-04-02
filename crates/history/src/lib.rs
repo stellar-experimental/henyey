@@ -334,8 +334,8 @@ impl HistoryManager {
 
 /// Summary result of a successful catchup operation.
 ///
-/// This provides high-level statistics about the catchup process. For the
-/// full state needed to initialize the ledger manager, see [`CatchupOutput`].
+/// Provides high-level statistics about the catchup process. The caller
+/// can query the `LedgerManager` for the current header, bucket lists, etc.
 #[derive(Debug)]
 pub struct CatchupResult {
     /// The ledger sequence that was caught up to.
@@ -364,16 +364,6 @@ impl std::fmt::Display for CatchupResult {
             self.ledgers_applied
         )
     }
-}
-
-/// Complete output of a catchup operation.
-///
-/// The `LedgerManager` is initialized directly inside the catchup pipeline,
-/// so this struct only carries summary statistics. The caller can query
-/// the `LedgerManager` for the current header, bucket lists, etc.
-pub struct CatchupOutput {
-    /// Summary statistics of the catchup operation.
-    pub result: CatchupResult,
 }
 
 /// Testnet archive configuration.

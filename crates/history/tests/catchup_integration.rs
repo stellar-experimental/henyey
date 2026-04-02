@@ -229,7 +229,7 @@ async fn test_catchup_against_local_archive_checkpoint() {
         .await
         .expect("catchup");
 
-    assert_eq!(output.result.ledger_seq, checkpoint);
-    assert_eq!(output.result.buckets_downloaded, 1);
-    assert_eq!(output.result.ledgers_applied, 0);
+    assert_eq!(output.ledger_seq, checkpoint);
+    assert_eq!(output.buckets_downloaded, 1);
+    assert_eq!(output.ledgers_applied, 0);
 }

@@ -342,8 +342,8 @@ async fn test_catchup_replay_bucket_hash_verification() {
         .await
         .expect("catchup");
 
-    assert_eq!(output.result.ledger_seq, target);
-    assert_eq!(output.result.ledgers_applied, 1);
+    assert_eq!(output.ledger_seq, target);
+    assert_eq!(output.ledgers_applied, 1);
     // Verify the ledger manager advanced to the target ledger
     let final_header = ledger_manager.current_header();
     assert_eq!(final_header.ledger_seq, target);

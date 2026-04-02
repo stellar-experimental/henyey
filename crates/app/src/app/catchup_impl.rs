@@ -250,7 +250,7 @@ impl App {
         }
 
         tracing::info!(
-            ledger_seq = output.result.ledger_seq,
+            ledger_seq = output.ledger_seq,
             "Ledger manager initialized from catchup"
         );
 
@@ -263,7 +263,7 @@ impl App {
         {
             let mut buffer = self.syncing_ledgers.write().await;
             let old_count = buffer.len();
-            let new_lcl = output.result.ledger_seq;
+            let new_lcl = output.ledger_seq;
             // Keep ledgers > new_lcl (i.e., remove ledgers <= new_lcl)
             buffer.retain(|seq, _| *seq > new_lcl);
             let kept_count = buffer.len();
@@ -331,7 +331,7 @@ impl App {
         // cache their tx_sets. After catchup, we need those tx_sets to apply the
         // buffered ledgers. If we clear them, peers may have already evicted those
         // old tx_sets, causing "DontHave" responses and sync failures.
-        let new_lcl = output.result.ledger_seq;
+        let new_lcl = output.ledger_seq;
         self.herder.trim_scp_driver_caches(new_lcl as u64);
         self.herder.trim_fetching_caches(new_lcl as u64);
 
@@ -363,7 +363,7 @@ impl App {
         // Update cache with the ledger we caught up to (it's a checkpoint)
         {
             let mut cache = self.cached_archive_checkpoint.write().await;
-            *cache = Some((output.result.ledger_seq, self.clock.now()));
+            *cache = Some((output.ledger_seq, self.clock.now()));
         }
 
         // Populate syncing_ledgers from externalized cache before returning.
@@ -439,15 +439,12 @@ impl App {
         // while the main loop is still closing buffered ledgers.
         *self.last_catchup_completed_at.write().await = Some(self.clock.now());
 
-        let final_ledger = self
-            .get_current_ledger()
-            .await
-            .unwrap_or(output.result.ledger_seq);
+        let final_ledger = self.get_current_ledger().await.unwrap_or(output.ledger_seq);
         Ok(CatchupResult {
             ledger_seq: final_ledger,
-            ledger_hash: output.result.ledger_hash,
-            buckets_applied: output.result.buckets_downloaded,
-            ledgers_replayed: output.result.ledgers_applied,
+            ledger_hash: output.ledger_hash,
+            buckets_applied: output.buckets_downloaded,
+            ledgers_replayed: output.ledgers_applied,
         })
     }
 
@@ -561,7 +558,7 @@ impl App {
         progress: Arc<CatchupProgress>,
         existing_state: Option<ExistingBucketState>,
         override_lcl: Option<u32>,
-    ) -> anyhow::Result<CatchupOutput> {
+    ) -> anyhow::Result<HistoryCatchupResult> {
         use crate::logging::CatchupPhase;
 
         // Phase 1: Create history archives from config
@@ -735,14 +732,14 @@ impl App {
         }
 
         // Update progress with bucket count
-        progress.set_total_buckets(output.result.buckets_downloaded);
-        for _ in 0..output.result.buckets_downloaded {
+        progress.set_total_buckets(output.buckets_downloaded);
+        for _ in 0..output.buckets_downloaded {
             progress.bucket_downloaded();
         }
 
         // Update ledger progress
         progress.set_phase(CatchupPhase::ReplayingLedgers);
-        for _ in 0..output.result.ledgers_applied {
+        for _ in 0..output.ledgers_applied {
             progress.ledger_applied();
         }
 
