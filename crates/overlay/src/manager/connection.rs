@@ -4,6 +4,7 @@
 //! `connect_outbound_inner`, `run_discovered_peer_connection`, `add_peer`,
 //! and related helpers.
 
+use super::peer_loop::make_error_msg;
 use super::{OutboundMessage, OverlayManager, SharedPeerState};
 use crate::{
     connection::ConnectionPool,
@@ -15,6 +16,7 @@ use crate::{
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use stellar_xdr::curr::ErrorCode;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -75,6 +77,11 @@ impl OverlayManager {
 
     /// Handle a successfully accepted inbound connection through its full
     /// lifecycle: validation, PEERS message, peer-loop, and cleanup.
+    ///
+    /// Matches stellar-core `Peer::recvAuth()` (Peer.cpp:1913-1970):
+    /// 1. sendAuth + sendPeers (always, even if we will reject)
+    /// 2. acceptAuthenticatedPeer — reject with ERR_LOAD if slots are full
+    /// 3. Start flow control and peer loop
     pub(super) async fn handle_accepted_inbound_peer(
         mut peer: Peer,
         shared: SharedPeerState,
@@ -93,19 +100,37 @@ impl OverlayManager {
             pool.release_pending();
             return;
         }
-        // Handshake succeeded: promote from pending to authenticated
-        pool.mark_authenticated();
-        info!("Accepted peer: {}", peer_id);
 
         let peer_info = peer.info().clone();
+
+        // Always send PEERS before checking slot limits.
+        // Matches stellar-core: sendPeers() is called before acceptAuthenticatedPeer().
+        // This ensures crawlers and other peers get topology data even when rejected.
+        Self::send_peers_to_inbound_peer(&mut peer, &peer_id, &peer_info, &shared).await;
+
+        // Check if we have room for this authenticated peer.
+        // Matches stellar-core acceptAuthenticatedPeer (OverlayManagerImpl.cpp:206).
+        if !pool.try_promote_to_authenticated() {
+            info!(
+                "Non-preferred inbound authenticated peer {} rejected because all \
+                 available slots are taken",
+                peer_id
+            );
+            let err_msg = make_error_msg(ErrorCode::Load, "peer rejected");
+            let _ = peer.send(err_msg).await;
+            peer.close().await;
+            pool.release_pending();
+            return;
+        }
+
+        info!("Accepted peer: {}", peer_id);
+
         shared
             .send_peer_event(PeerEvent::Connected(
                 PeerAddress::from(peer_info.address),
                 PeerType::Inbound,
             ))
             .await;
-
-        Self::send_peers_to_inbound_peer(&mut peer, &peer_id, &peer_info, &shared).await;
 
         let (outbound_rx, flow_control) = Self::register_peer(&peer, &peer_id, peer_info, &shared);
 
@@ -144,6 +169,12 @@ impl OverlayManager {
                         match result {
                             Ok(connection) => {
                                 let peer_ip = connection.remote_addr().ip();
+                                // Reserve a pending slot. We allow the handshake to proceed
+                                // even when authenticated slots are full — the actual
+                                // authenticated limit is checked in
+                                // handle_accepted_inbound_peer after PEERS is sent.
+                                // This matches stellar-core, which always completes the
+                                // handshake and sends PEERS before rejecting with ERR_LOAD.
                                 if !pool.try_reserve_with_ip(Some(peer_ip)) {
                                     warn!("Inbound peer limit reached, rejecting connection from {}", peer_ip);
                                     continue;

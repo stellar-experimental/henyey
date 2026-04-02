@@ -446,8 +446,13 @@ impl Listener {
 /// by up to `possibly_preferred_extra` slots, matching upstream's
 /// `Config::POSSIBLY_PREFERRED_EXTRA`.
 pub struct ConnectionPool {
-    /// Maximum number of connections allowed.
+    /// Maximum number of authenticated connections allowed.
     max_connections: usize,
+    /// Maximum additional pending (handshaking) connections allowed beyond
+    /// `max_connections`. This allows incoming peers to complete the handshake
+    /// and receive PEERS even when all authenticated slots are full, matching
+    /// stellar-core's behavior of always sending PEERS before ERR_LOAD.
+    max_pending_extra: usize,
     /// Extra slots for connections from preferred IP addresses.
     possibly_preferred_extra: usize,
     /// Set of preferred IP addresses that qualify for extra slots.
@@ -462,11 +467,17 @@ pub struct ConnectionPool {
     authenticated_count: AtomicUsize,
 }
 
+/// Default extra pending slots beyond `max_connections`.
+/// Allows incoming connections to complete handshake and receive PEERS
+/// even when all authenticated slots are full.
+const DEFAULT_MAX_PENDING_EXTRA: usize = 32;
+
 impl ConnectionPool {
     /// Creates a new connection pool with the given limit.
     pub fn new(max_connections: usize) -> Self {
         Self {
             max_connections,
+            max_pending_extra: DEFAULT_MAX_PENDING_EXTRA,
             possibly_preferred_extra: 0,
             preferred_ips: parking_lot::RwLock::new(HashSet::new()),
             current_count: AtomicUsize::new(0),
@@ -483,6 +494,7 @@ impl ConnectionPool {
     ) -> Self {
         Self {
             max_connections,
+            max_pending_extra: DEFAULT_MAX_PENDING_EXTRA,
             possibly_preferred_extra,
             preferred_ips: parking_lot::RwLock::new(preferred_ips),
             current_count: AtomicUsize::new(0),
@@ -491,9 +503,9 @@ impl ConnectionPool {
         }
     }
 
-    /// Returns true if there's room for another connection.
+    /// Returns true if there's room for another connection (including pending headroom).
     pub fn can_accept(&self) -> bool {
-        self.current_count.load(Ordering::Relaxed) < self.max_connections
+        self.current_count.load(Ordering::Relaxed) < self.max_connections + self.max_pending_extra
     }
 
     /// Attempts to reserve a connection slot.
@@ -507,30 +519,33 @@ impl ConnectionPool {
 
     /// Attempts to reserve a connection slot, with optional preferred IP check.
     ///
-    /// If `ip` is provided and matches a preferred IP, the connection may be
-    /// allowed even when the pool is at `max_connections`, up to
-    /// `max_connections + possibly_preferred_extra`.
+    /// The total connection limit is `max_connections + max_pending_extra`,
+    /// allowing incoming peers to complete handshake and receive PEERS even
+    /// when all authenticated slots are full. Preferred IPs get additional
+    /// slots via `possibly_preferred_extra`.
     ///
-    /// The reserved slot starts as "pending" (unauthenticated). Call
-    /// [`mark_authenticated`] after the handshake completes.
+    /// The reserved slot starts as "pending" (unauthenticated). After
+    /// handshake and PEERS exchange, call [`try_promote_to_authenticated`]
+    /// to check the authenticated limit.
     pub fn try_reserve_with_ip(&self, ip: Option<IpAddr>) -> bool {
         let mut current = self.current_count.load(Ordering::Relaxed);
         loop {
-            let effective_max = if current >= self.max_connections {
+            // Base limit: authenticated max + pending headroom
+            let base_max = self.max_connections + self.max_pending_extra;
+            let effective_max = if current >= base_max {
                 // Over the base limit -- only allow if IP is preferred
-                // and we haven't exceeded the extra slots
                 if let Some(ref addr) = ip {
                     let preferred = self.preferred_ips.read();
                     if preferred.contains(addr) {
-                        self.max_connections + self.possibly_preferred_extra
+                        base_max + self.possibly_preferred_extra
                     } else {
-                        self.max_connections
+                        base_max
                     }
                 } else {
-                    self.max_connections
+                    base_max
                 }
             } else {
-                self.max_connections
+                base_max
             };
 
             if current >= effective_max {
@@ -585,6 +600,24 @@ impl ConnectionPool {
         self.authenticated_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Try to promote a pending connection to authenticated.
+    ///
+    /// Returns true if authenticated_count < max_connections and the promotion
+    /// succeeded. Returns false if all authenticated slots are full (the
+    /// connection remains pending and the caller should reject with ERR_LOAD).
+    ///
+    /// Matches stellar-core `acceptAuthenticatedPeer`
+    /// (OverlayManagerImpl.cpp:206): PEERS are already sent by this point,
+    /// so crawlers get topology data even when rejected.
+    pub fn try_promote_to_authenticated(&self) -> bool {
+        let authenticated = self.authenticated_count.load(Ordering::Relaxed);
+        if authenticated >= self.max_connections {
+            return false;
+        }
+        self.mark_authenticated();
+        true
+    }
+
     /// Returns the current number of connections (pending + authenticated).
     pub fn count(&self) -> usize {
         self.current_count.load(Ordering::Relaxed)
@@ -627,24 +660,38 @@ mod tests {
         assert_eq!(pool.count(), 2);
         assert_eq!(pool.pending_count(), 2);
 
-        assert!(!pool.try_reserve());
-        assert!(!pool.can_accept());
+        // Can still reserve more (pending headroom allows handshake + PEERS)
+        assert!(pool.try_reserve());
+        assert_eq!(pool.count(), 3);
 
         // Promote one to authenticated
         pool.mark_authenticated();
-        assert_eq!(pool.pending_count(), 1);
+        assert_eq!(pool.pending_count(), 2);
         assert_eq!(pool.authenticated_count(), 1);
-        assert_eq!(pool.count(), 2); // total unchanged
+        assert_eq!(pool.count(), 3); // total unchanged
 
-        // Release the pending one
+        // try_promote_to_authenticated succeeds (1 < max_connections=2)
+        assert!(pool.try_promote_to_authenticated());
+        assert_eq!(pool.authenticated_count(), 2);
+        assert_eq!(pool.pending_count(), 1); // one pending remains
+
+        // try_promote_to_authenticated fails (2 >= max_connections=2)
+        assert!(!pool.try_promote_to_authenticated());
+
+        // Release the remaining pending one
         pool.release_pending();
-        assert_eq!(pool.count(), 1);
+        assert_eq!(pool.count(), 2);
         assert_eq!(pool.pending_count(), 0);
-        assert_eq!(pool.authenticated_count(), 1);
+        assert_eq!(pool.authenticated_count(), 2);
 
-        // Release the authenticated one
+        // Release an authenticated one
         pool.release_authenticated();
         assert!(pool.can_accept());
+        assert_eq!(pool.count(), 1);
+        assert_eq!(pool.authenticated_count(), 1);
+
+        // Release the last one
+        pool.release_authenticated();
         assert_eq!(pool.count(), 0);
         assert_eq!(pool.pending_count(), 0);
         assert_eq!(pool.authenticated_count(), 0);
@@ -652,9 +699,11 @@ mod tests {
 
     #[test]
     fn test_connection_pool_preferred_ip() {
+        // Use max_pending_extra=0 to test preferred IP behavior in isolation
         let preferred: std::collections::HashSet<std::net::IpAddr> =
             vec!["10.0.0.1".parse().unwrap()].into_iter().collect();
-        let pool = ConnectionPool::with_preferred(2, 2, preferred);
+        let mut pool = ConnectionPool::with_preferred(2, 2, preferred);
+        pool.max_pending_extra = 0; // disable pending headroom for this test
 
         // Fill to base limit
         assert!(pool.try_reserve()); // 1
@@ -680,12 +729,39 @@ mod tests {
 
     #[test]
     fn test_connection_pool_no_ip_at_limit() {
-        let pool = ConnectionPool::new(2);
+        let mut pool = ConnectionPool::new(2);
+        pool.max_pending_extra = 0; // disable pending headroom for this test
         assert!(pool.try_reserve());
         assert!(pool.try_reserve());
 
-        // try_reserve_with_ip(None) should also fail at limit
+        // try_reserve_with_ip(None) should fail at limit when no pending headroom
         assert!(!pool.try_reserve_with_ip(None));
+    }
+
+    #[test]
+    fn test_connection_pool_pending_headroom() {
+        // With max_connections=2 and default pending extra (32),
+        // we can accept many pending connections beyond the auth limit.
+        let pool = ConnectionPool::new(2);
+
+        // Fill authenticated slots
+        assert!(pool.try_reserve());
+        pool.mark_authenticated();
+        assert!(pool.try_reserve());
+        pool.mark_authenticated();
+        assert_eq!(pool.authenticated_count(), 2);
+
+        // We can still accept pending connections (for handshake + PEERS)
+        assert!(pool.try_reserve());
+        assert_eq!(pool.pending_count(), 1);
+
+        // But promotion fails since authenticated is at max
+        assert!(!pool.try_promote_to_authenticated());
+        assert_eq!(pool.authenticated_count(), 2);
+
+        // Release the pending one (simulates sending ERR_LOAD + close)
+        pool.release_pending();
+        assert_eq!(pool.count(), 2);
     }
 
     #[tokio::test]
