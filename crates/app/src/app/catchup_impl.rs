@@ -61,27 +61,25 @@ impl App {
         // Check if we're already at or past the target
         let current = self.get_current_ledger().await.unwrap_or(0);
 
-        // Safety: for Ledger targets, verify the archive has the required checkpoint.
-        // Replay from current+1 to target_ledger needs all checkpoint files covering
-        // that range.  If the checkpoint containing target_ledger hasn't been published
-        // (i.e., it's beyond the latest externalized slot), the download will 404.
+        // Note: we previously aborted here when the target checkpoint appeared
+        // unpublished (target_cp > latest_externalized). However, latest_externalized
+        // is a local counter that freezes when the node is stuck — the archive may
+        // have the checkpoint even though our local counter hasn't reached it.
+        // Aborting here caused permanent deadlocks after post-catchup gaps.
+        // Instead, proceed with the catchup attempt. If the archive truly doesn't
+        // have the checkpoint, the download will 404 and we'll get a graceful error.
         if matches!(target, CatchupTarget::Ledger(_)) && current > 0 {
             let target_cp = checkpoint_containing(target_ledger);
             let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
             if target_cp as u64 > latest_ext {
-                tracing::warn!(
+                tracing::info!(
                     target_ledger,
                     target_checkpoint = target_cp,
                     latest_externalized = latest_ext,
                     current_ledger = current,
-                    "Catchup target requires unpublished checkpoint — aborting"
+                    "Catchup target checkpoint may not be published yet \
+                     (latest_ext is local and may be stale) — proceeding anyway"
                 );
-                return Ok(CatchupResult {
-                    ledger_seq: current,
-                    ledger_hash: Hash256::default(),
-                    buckets_applied: 0,
-                    ledgers_replayed: 0,
-                });
             }
         }
 
