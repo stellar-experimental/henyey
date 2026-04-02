@@ -4017,6 +4017,42 @@ mod tests {
         assert_eq!(pending.len(), 2);
     }
 
+    /// Dynamic Soroban resource limits override static config.
+    #[test]
+    fn test_effective_queue_soroban_resources_dynamic_override() {
+        let static_limit = Resource::new(vec![100; NUM_SOROBAN_TX_RESOURCES]);
+        let config = TxQueueConfig {
+            max_queue_soroban_resources: Some(static_limit.clone()),
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Before any dynamic update, effective returns the static config value.
+        let eff = queue.effective_queue_soroban_resources().unwrap();
+        assert_eq!(eff, static_limit);
+
+        // After dynamic update, the dynamic value takes precedence.
+        let dynamic_limit = Resource::new(vec![999; NUM_SOROBAN_TX_RESOURCES]);
+        queue.update_soroban_resource_limits(dynamic_limit.clone());
+        let eff = queue.effective_queue_soroban_resources().unwrap();
+        assert_eq!(eff, dynamic_limit);
+    }
+
+    /// Without static config, effective returns None until dynamic update.
+    #[test]
+    fn test_effective_queue_soroban_resources_none_without_config() {
+        let queue = TransactionQueue::with_defaults();
+
+        // No static config and no dynamic update → None.
+        assert!(queue.effective_queue_soroban_resources().is_none());
+
+        // After dynamic update, the dynamic value is returned.
+        let dynamic_limit = Resource::new(vec![500; NUM_SOROBAN_TX_RESOURCES]);
+        queue.update_soroban_resource_limits(dynamic_limit.clone());
+        let eff = queue.effective_queue_soroban_resources().unwrap();
+        assert_eq!(eff, dynamic_limit);
+    }
+
     /// ban() must clean up account_states (transaction, fees, empty entries)
     /// so the account can submit new transactions after the ban expires.
     #[test]
