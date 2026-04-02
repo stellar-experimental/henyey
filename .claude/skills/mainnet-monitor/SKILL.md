@@ -17,6 +17,22 @@ checking and bug fixing.
 **Mainnet operation is explicitly authorized** — this overrides the
 testnet-only guideline in CLAUDE.md.
 
+## Configurations
+
+Two validator configs exist. The skill always uses the RPC-enabled config
+for validator mode so that RPC health and pruning can be monitored:
+
+| Config | Mode | RPC | Maintenance | Use when |
+|--------|------|-----|-------------|----------|
+| `configs/validator-mainnet-rpc.toml` | validator | port 8000, retention 360 ledgers | every 900s, count 50000 | Default for `/mainnet-monitor` |
+| `configs/validator-mainnet.toml` | validator | none | none | Not used by this skill |
+| `configs/mainnet.toml` | watcher | none | none | `/mainnet-monitor --watcher` |
+
+Key ports:
+- **8009** — overlay peer port (non-standard; advertised in HELLO messages)
+- **8000** — Soroban JSON-RPC (validator mode only, via `[rpc]` config)
+- **11627** — admin HTTP API (`/info`, `/scp`, `/maintenance`)
+
 ## Investigation Policy
 
 **Every anomaly must be investigated to root cause.** When a check reveals
@@ -57,20 +73,21 @@ doesn't change when it should — you MUST investigate. Specifically:
    If a process is found, print its PID and ask whether to attach to its
    existing log or kill and restart it. If attaching, skip to step 7.
 
-5. Select config and command based on `$MODE`:
+5. Select config based on `$MODE` and start the node in the background:
    - **validator** (default):
      ```
-     ~/data/<session-id>/cargo-target/release/henyey run --validator \
+     RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey \
+       --mainnet run --validator \
        -c configs/validator-mainnet-rpc.toml \
-       2>&1 | tee ~/data/<session-id>/logs/monitor.log
+       > ~/data/<session-id>/logs/monitor.log 2>&1 &
      ```
    - **watcher**:
      ```
-     ~/data/<session-id>/cargo-target/release/henyey run \
+     RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey \
+       --mainnet run \
        -c configs/mainnet.toml \
-       2>&1 | tee ~/data/<session-id>/logs/monitor.log
+       > ~/data/<session-id>/logs/monitor.log 2>&1 &
      ```
-   Start the node in the background.
 
 6. Wait 10 seconds, then tail the last 30 lines of the log to confirm
    the node is starting (look for "Starting", "Catching up", or ledger
@@ -90,13 +107,46 @@ doesn't change when it should — you MUST investigate. Specifically:
    ════════════════════════════════
    ```
 
-8. Schedule the monitoring loop by invoking `/loop` with a fully
-   self-contained prompt. Substitute the real `<session-id>`, `<RUN_CMD>`
-   (the full run command from step 5), and `<MODE>` before calling `/loop`:
+8. Schedule the monitoring loop by invoking `/loop` with the self-contained
+   prompt below. Before calling `/loop`, substitute:
+   - `<session-id>` — the session ID from step 1
+   - `<MODE>` — `validator` or `watcher`
+   - `<CONFIG>` — the config file path from step 5
+   - `<RPC_PORT>` — `8000` for validator mode, `none` for watcher mode
 
    ```
-   /loop 10m Check the henyey mainnet monitor log at ~/data/<session-id>/logs/monitor.log. Run: tail -n 500 ~/data/<session-id>/logs/monitor.log. Scan for: (1) hash mismatches (lines containing "hash mismatch", "HashMismatch", or differing expected/actual hashes), (2) panics or crashes ("panic", "thread.*panicked", "SIGABRT", "SIGSEGV"), (3) ERROR-level log lines, (4) assertion failures ("assertion failed"), (5) stuck ledger progression (same ledger number for the last 10+ minutes). Also check if the process is alive: pgrep -af 'henyey.*run'. If the process is not running, restart it in the background: <RUN_CMD>. Check resource usage: (6) memory — run: ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1) and convert to MB; if RSS exceeds 12 GB, flag as HIGH MEMORY and investigate per the Resource Investigation section, (7) disk — run: df -h ~/data | tail -1; if usage exceeds 85%, flag as LOW DISK and investigate per the Resource Investigation section, (8) session disk — run: du -s ~/data/<session-id>/ and the mainnet data directory (typically ~/data/mainnet/) and convert to human-readable; if session+mainnet data has grown by more than 20 GB since the last check or exceeds 200 GB total, flag as SESSION DISK HIGH and investigate per the Resource Investigation section. (9) RPC pruning check — run: curl -s -X POST http://localhost:8000 -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'. Parse the JSON response for oldestLedger, latestLedger, and ledgerRetentionWindow. Verify: RPC is responding (non-empty response), status is "healthy", latestLedger - oldestLedger <= retention_window + 100 (allow ~100 ledger slack for maintenance cycle timing). If latestLedger - oldestLedger > retention_window + 500, flag as PRUNING STALLED — pruning is not keeping up, and investigate per the Pruning Stalled section. If RPC is not responding, flag as RPC DOWN and attempt to check if the process is still running. (10) memory report — parse the latest "Memory report summary" line from the log: grep 'Memory report summary' ~/data/<session-id>/logs/monitor.log | tail -1. Extract the structured fields: jemalloc_allocated_mb, jemalloc_resident_mb, fragmentation_pct, heap_components_mb, mmap_mb, unaccounted_mb, unaccounted_sign. If fragmentation_pct > 50, flag as HIGH FRAGMENTATION and investigate per the Resource Investigation section. If unaccounted_mb > 1000 (with unaccounted_sign "+"), flag as HIGH UNACCOUNTED MEMORY and investigate — this means ~1 GB+ of heap allocations are not tracked by any component. (11) OBSRVR Radar check (validator mode only) — get the node's public key from the /info endpoint: curl -s http://localhost:11627/info and extract the public_key field. Then query the OBSRVR API: curl -s https://radar.withobsrvr.com/api/v1/nodes/<PUBLIC_KEY>. Parse the JSON for: active, isValidating, statistics.active24HoursPercentage, statistics.validating24HoursPercentage, lag. If isValidating is false and the node has been running for more than 30 minutes, flag as NOT VALIDATING ON OBSRVR and investigate per the OBSRVR Not Validating section. If validating24HoursPercentage < 50 and the node has been running for more than 6 hours, flag as LOW VALIDATION RATE and investigate. If lag > 500, flag as HIGH LAG ON OBSRVR. If the API returns an error or the node is not found, note it but do not flag (the API may be temporarily unavailable). For ANY anomaly detected (threshold exceeded, unexpected warnings, values not changing as expected), you MUST investigate to root cause by reading source code, checking logs, and tracing the code path. Never dismiss an issue as "expected" or "probably fine". The investigation sections below describe starting points, but always follow the evidence wherever it leads — including into the source code. If everything looks healthy, print one line: MONITOR OK — L<latest-ledger> — <timestamp> — mode: <MODE> — session: <session-id> — mem: <RSS_MB>MB (allocated: <alloc>MB, resident: <jemalloc_resident>MB, frag: <pct>%) — components: <heap_components>MB heap + <mmap>MB mmap, unaccounted: <sign><unaccounted>MB — disk: <used>/<total> (<pct>%) — session+data: <size> — rpc: healthy oldestL=<X> latestL=<Y> window=<Z> — obsrvr: validating=<Y/N> val24h=<pct>% lag=<N>. If a bug is found, follow the Bug Fix Workflow: (1) identify the failing ledger number and error type from the log, (2) reproduce offline: ~/data/<session-id>/cargo-target/release/henyey --mainnet verify-execution --from LEDGER --to LEDGER --stop-on-error --show-diff --cache-dir ~/data/<session-id>/cache, (3) write a failing unit test that isolates the bug — it must fail before the fix, (4) fix the code in the main worktree, (5) verify the unit test passes, (6) run cargo test --all to check for regressions, (7) commit fix and regression test together with an imperative message, (8) git push (if rejected: git pull --rebase && git push), (9) run /review-fix --apply on the commit, (10) rebuild: CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release, (11) kill the old henyey process and restart it in the background: <RUN_CMD>, (12) report the fix: ledger number, error type, commit hash, one-line summary.
+   /loop 10m <LOOP_PROMPT>
    ```
+
+   See the **Loop Prompt Template** section below for the full prompt text.
+
+## Loop Prompt Template
+
+This is the self-contained prompt passed to `/loop`. It must include all
+check logic because cron jobs run in fresh contexts without access to this
+skill file.
+
+```
+Check the henyey mainnet monitor log at ~/data/<session-id>/logs/monitor.log.
+
+CHECKS:
+(1) Log scan — run: tail -n 500 ~/data/<session-id>/logs/monitor.log. Scan for: hash mismatches ("hash mismatch", "HashMismatch", differing expected/actual hashes), panics/crashes ("panic", "thread.*panicked", "SIGABRT", "SIGSEGV"), ERROR-level log lines, assertion failures ("assertion failed").
+(2) Ledger progression — from the last 2+ Heartbeat lines, verify the ledger number is advancing. If the same ledger appears for 10+ minutes, flag as STUCK.
+(3) Process alive — run: pgrep -af 'henyey.*run'. If not running, restart: RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey --mainnet run -c <CONFIG> > ~/data/<session-id>/logs/monitor.log 2>&1 &
+(4) Memory — run: ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1) and convert to MB. If RSS > 12 GB, flag HIGH MEMORY. If RSS > 16 GB or free memory < 4 GB, restart the node.
+(5) Disk — run: df -h ~/data | tail -1. If usage > 85%, flag LOW DISK.
+(6) Session disk — run: du -sh ~/data/<session-id>/ and du -sh ~/data/mainnet/. If combined > 200 GB, flag SESSION DISK HIGH.
+(7) Memory report — run: grep 'Memory report summary' ~/data/<session-id>/logs/monitor.log | tail -1. Extract jemalloc_allocated_mb, jemalloc_resident_mb, fragmentation_pct, heap_components_mb, mmap_mb, unaccounted_mb, unaccounted_sign. If fragmentation_pct > 50, flag HIGH FRAGMENTATION. If unaccounted_mb > 1000 with sign "+", note it (known jemalloc overhead, not a bug — but verify heap_components is stable; if heap_components is growing, investigate).
+(8) RPC health (validator mode only, port <RPC_PORT>) — run: curl -s -X POST http://localhost:<RPC_PORT> -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'. Verify: response is non-empty, status is "healthy". Check pruning: latestLedger - oldestLedger should be <= retention_window + 100. If gap > retention_window + 500, flag PRUNING STALLED. If RPC is not responding, flag RPC DOWN.
+(9) OBSRVR Radar (validator mode only) — get public key from: curl -s http://localhost:11627/info (extract public_key). Then: curl -s https://radar.withobsrvr.com/api/v1/nodes/<PUBLIC_KEY>. Check: isValidating (if false and node running > 30 min, flag NOT VALIDATING), validating24HoursPercentage (if < 50 and running > 6 hours, flag LOW VALIDATION RATE), lag (if > 500, flag HIGH LAG). If API errors, note but don't flag.
+
+INVESTIGATION: For ANY anomaly, investigate to root cause — read source code, check logs, trace code paths. Never dismiss as "expected". See the mainnet-monitor skill's Resource Investigation sections for detailed procedures.
+
+BUG FIX WORKFLOW: If a hash mismatch, error, or crash is found: (1) identify failing ledger and error type, (2) reproduce offline: ~/data/<session-id>/cargo-target/release/henyey --mainnet verify-execution --from LEDGER --to LEDGER --stop-on-error --show-diff --cache-dir ~/data/<session-id>/cache, (3) write a failing unit test, (4) fix the code, (5) verify test passes, (6) cargo test --all, (7) commit with imperative message, (8) git push (if rejected: git pull --rebase && git push), (9) /review-fix --apply, (10) rebuild: CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release, (11) restart node with same command from check (3), (12) report: ledger, error type, commit hash, summary.
+
+OUTPUT: If healthy, print one line:
+MONITOR OK — L<ledger> — <timestamp> — mode: <MODE> — session: <session-id> — mem: <RSS_MB>MB (allocated: <alloc>MB, resident: <resident>MB, frag: <pct>%) — components: <heap>MB heap + <mmap>MB mmap, unaccounted: <sign><unaccounted>MB — disk: <used>/<total> (<pct>%) — session+data: <size> — rpc: <healthy oldestL=X latestL=Y window=Z | N/A> — obsrvr: <validating=Y/N val24h=pct% lag=N | N/A>
+```
 
 ## Bug Fix Workflow
 
@@ -190,11 +240,11 @@ These are fundamental data structures, not leaks.
    - Report: `RESOURCE ACTION — restarted node due to memory pressure
      (RSS was <X> GB at L<ledger>)`.
 
-6. **If RSS is between 12–16 GB and stable (not growing)**: Flag it but
+6. **If RSS is between 12-16 GB and stable (not growing)**: Flag it but
    do not restart. Report: `RESOURCE WARNING — RSS <X> GB at L<ledger>,
    stable — monitoring`.
 
-### Session Disk Growth (> 200 GB or +20 GB between checks)
+### Session Disk Growth (> 200 GB total)
 
 This tracks disk consumed specifically by this monitor session and its
 mainnet data, independent of other processes on the machine.
@@ -238,7 +288,8 @@ mainnet data, independent of other processes on the machine.
 ### Pruning Stalled
 
 When the gap between `latestLedger` and `oldestLedger` significantly exceeds
-the configured `retention_window` (360 ledgers):
+the configured `retention_window` (check the `[rpc]` section in the config
+for the exact value; default is 360 ledgers):
 
 1. **Check if maintenance is running** — look for "Performing database
    maintenance" or "Maintenance complete" in recent logs:
@@ -390,9 +441,5 @@ When stopping (user interrupts):
 - **Push after every fix commit** — do not accumulate unpushed commits.
 - All commits must include the appropriate `Co-authored-by` trailer per
   CLAUDE.md.
-- **Investigate every anomaly to root cause.** Never dismiss warnings,
-  threshold breaches, or unexpected values as "expected" or "transient".
-  Read the source code, trace the code path, and either fix the issue or
-  document exactly why the behavior is correct (with code references).
 - This skill does NOT manage sweepers or code maintenance. Use
   `/production-ops` for the full workload.
