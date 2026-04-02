@@ -67,8 +67,10 @@ use henyey_db::{
 use henyey_herder::{
     drift_tracker::CloseTimeDriftTracker,
     flow_control::compute_max_tx_size,
+    get_invalid_tx_list,
     sync_recovery::{SyncRecoveryCallback, SyncRecoveryHandle, SyncRecoveryManager},
-    EnvelopeState, Herder, HerderConfig, HerderStats, TxQueueConfig,
+    CloseTimeBounds, EnvelopeState, Herder, HerderConfig, HerderStats, TxQueueConfig,
+    TxSetValidationContext,
 };
 use henyey_history::{
     build_history_archive_state, checkpoint_containing, checkpoint_frequency, is_checkpoint_ledger,
@@ -118,6 +120,10 @@ const MAX_TX_SET_REQUESTS_PER_TICK: usize = 32;
 /// If no ledger closes within this time while we have buffered ledgers waiting,
 /// we trigger out-of-sync recovery.
 const CONSENSUS_STUCK_TIMEOUT_SECS: u64 = 35;
+
+/// Pool ledger multiplier: queue limits = per-ledger limits × this factor.
+/// Matches stellar-core's `poolLedgerMultiplier` default (2).
+const POOL_LEDGER_MULTIPLIER: u32 = 2;
 
 /// Faster timeout when all peers report DontHave or disconnect.
 /// This allows us to trigger catchup sooner when we know peers don't have the tx sets.
@@ -779,9 +785,14 @@ impl App {
             pending_config: Default::default(),
             tx_queue_config: TxQueueConfig {
                 network_id: henyey_common::NetworkId(config.network_id()),
+                max_size: 1000 * POOL_LEDGER_MULTIPLIER as usize,
                 max_dex_ops: config.surge_pricing.max_dex_tx_operations,
                 max_classic_bytes: Some(config.surge_pricing.classic_byte_allowance),
                 max_soroban_bytes: Some(config.surge_pricing.soroban_byte_allowance),
+                max_queue_ops: Some(1000 * POOL_LEDGER_MULTIPLIER),
+                max_queue_classic_bytes: Some(
+                    config.surge_pricing.classic_byte_allowance * POOL_LEDGER_MULTIPLIER,
+                ),
                 ..Default::default()
             },
             local_quorum_set,

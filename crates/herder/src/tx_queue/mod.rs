@@ -594,6 +594,9 @@ pub struct TransactionQueue {
     /// (gated on BUILD_TESTS / #ifdef BUILD_TESTS).
     #[cfg(any(test, feature = "test-utils"))]
     skip_fee_balance_check: std::sync::atomic::AtomicBool,
+    /// Dynamic Soroban resource limits, updated after each ledger close from
+    /// `SorobanNetworkInfo`.  Takes precedence over `config.max_queue_soroban_resources`.
+    dynamic_queue_soroban_resources: RwLock<Option<Resource>>,
 }
 
 /// Default ban depth (number of ledgers transactions stay banned).
@@ -643,6 +646,7 @@ impl TransactionQueue {
             fee_balance_provider: RwLock::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             skip_fee_balance_check: std::sync::atomic::AtomicBool::new(false),
+            dynamic_queue_soroban_resources: RwLock::new(None),
         }
     }
 
@@ -657,6 +661,36 @@ impl TransactionQueue {
     /// Clear the fee balance provider.
     pub fn clear_fee_balance_provider(&self) {
         *self.fee_balance_provider.write() = None;
+    }
+
+    /// Get the fee balance provider (for post-close invalidation).
+    pub fn get_fee_balance_provider(&self) -> Option<Arc<dyn FeeBalanceProvider>> {
+        self.fee_balance_provider.read().clone()
+    }
+
+    /// Return all queued transaction envelopes (for post-close invalidation).
+    pub fn pending_envelopes(&self) -> Vec<TransactionEnvelope> {
+        let by_hash = self.by_hash.read();
+        by_hash.values().map(|qt| qt.envelope.clone()).collect()
+    }
+
+    /// Update Soroban resource limits dynamically after ledger close.
+    ///
+    /// Called with limits derived from `SorobanNetworkInfo` multiplied by
+    /// the pool ledger multiplier.
+    pub fn update_soroban_resource_limits(&self, resources: Resource) {
+        *self.dynamic_queue_soroban_resources.write() = Some(resources);
+    }
+
+    /// Return the effective Soroban resource limits for queue admission.
+    /// Prefers the dynamic value (updated each ledger close) over the static config.
+    fn effective_queue_soroban_resources(&self) -> Option<Resource> {
+        let dynamic = self.dynamic_queue_soroban_resources.read();
+        if dynamic.is_some() {
+            dynamic.clone()
+        } else {
+            self.config.max_queue_soroban_resources.clone()
+        }
     }
 
     /// Test-only: skip fee balance validation in try_add.
@@ -1037,8 +1071,8 @@ impl TransactionQueue {
         }
 
         if queued_is_soroban {
-            if let Some(limit) = &self.config.max_queue_soroban_resources {
-                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
+            if let Some(limit) = self.effective_queue_soroban_resources() {
+                let lane_config = SorobanGenericLaneConfig::new(limit);
                 let mut lane_fees = self.soroban_lane_evicted_inclusion_fee.write();
                 if self.fee_below_lane_threshold(&lane_config, &mut lane_fees, queued_frame, queued)
                 {
@@ -1090,7 +1124,7 @@ impl TransactionQueue {
         }
 
         if queued_is_soroban {
-            if let Some(limit) = &self.config.max_queue_soroban_resources {
+            if let Some(limit) = self.effective_queue_soroban_resources() {
                 let lane_config = SorobanGenericLaneConfig::new(limit.clone());
                 let filter = |tx: &QueuedTransaction| {
                     let frame = henyey_tx::TransactionFrame::from_owned_with_network(
@@ -1110,7 +1144,7 @@ impl TransactionQueue {
                 }) else {
                     return Err(TxQueueResult::QueueFull);
                 };
-                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
+                let lane_config = SorobanGenericLaneConfig::new(limit);
                 self.record_lane_evictions(
                     &lane_config,
                     &self.soroban_lane_evicted_inclusion_fee,
@@ -3817,6 +3851,81 @@ mod tests {
             TxQueueResult::Added,
             "new tx from same account should not get TryAgainLater"
         );
+    }
+
+    /// Sequence-based removal: a queued tx with seq=1 should be removed when
+    /// an applied tx with seq=7 for the same account is processed.
+    #[test]
+    fn test_remove_applied_sequence_based_supersedes() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut queued_tx = make_test_envelope(200, 1);
+        set_source(&mut queued_tx, 42);
+        assert_eq!(queue.try_add(queued_tx.clone()), TxQueueResult::Added);
+        let queued_hash = full_hash(&queued_tx);
+        assert!(queue.contains(&queued_hash));
+
+        let mut applied_tx = make_test_envelope(300, 1);
+        set_source(&mut applied_tx, 42);
+        if let TransactionEnvelope::Tx(ref mut env) = applied_tx {
+            env.tx.seq_num = SequenceNumber(7);
+        }
+
+        queue.remove_applied(&[(applied_tx.clone(), 7)]);
+
+        assert!(
+            !queue.contains(&queued_hash),
+            "queued tx with seq=1 should be removed when applied tx has seq=7"
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// Sequence-based removal should NOT remove a queued tx whose seq_num
+    /// is higher than the applied one.
+    #[test]
+    fn test_remove_applied_sequence_based_no_supersede_higher_seq() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut queued_tx = make_test_envelope(200, 1);
+        set_source(&mut queued_tx, 43);
+        if let TransactionEnvelope::Tx(ref mut env) = queued_tx {
+            env.tx.seq_num = SequenceNumber(10);
+        }
+        assert_eq!(queue.try_add(queued_tx.clone()), TxQueueResult::Added);
+        let queued_hash = full_hash(&queued_tx);
+
+        let mut applied_tx = make_test_envelope(300, 1);
+        set_source(&mut applied_tx, 43);
+        if let TransactionEnvelope::Tx(ref mut env) = applied_tx {
+            env.tx.seq_num = SequenceNumber(5);
+        }
+
+        queue.remove_applied(&[(applied_tx.clone(), 5)]);
+
+        assert!(
+            queue.contains(&queued_hash),
+            "queued tx with seq=10 should NOT be removed when applied tx has seq=5"
+        );
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// pending_envelopes returns all queued transaction envelopes.
+    #[test]
+    fn test_pending_envelopes() {
+        let queue = TransactionQueue::with_defaults();
+
+        assert!(queue.pending_envelopes().is_empty());
+
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 10);
+        let mut tx2 = make_test_envelope(300, 1);
+        set_source(&mut tx2, 20);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+
+        let pending = queue.pending_envelopes();
+        assert_eq!(pending.len(), 2);
     }
 
     /// ban() must clean up account_states (transaction, fees, empty entries)

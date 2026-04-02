@@ -1465,14 +1465,16 @@ impl Herder {
     pub fn ledger_closed(
         &self,
         slot: SlotIndex,
-        applied_tx_hashes: &[Hash256],
+        applied_txs: &[(TransactionEnvelope, i64)],
         applied_upgrades: &[UpgradeType],
         close_time: u64,
     ) {
-        debug!(slot, txs = applied_tx_hashes.len(), "Ledger closed");
+        debug!(slot, txs = applied_txs.len(), "Ledger closed");
 
-        // Remove applied transactions from queue
-        self.tx_queue.remove_applied_by_hash(applied_tx_hashes);
+        // Remove applied transactions from queue (sequence-based: removes
+        // any queued tx where seq <= applied seq for the same source account,
+        // matching stellar-core's removeApplied behaviour).
+        self.tx_queue.remove_applied(applied_txs);
 
         // Clear consumed upgrade parameters so they are not proposed again.
         // Mirrors stellar-core HerderImpl::processExternalized() -> removeUpgrades().

@@ -1559,8 +1559,10 @@ impl App {
             }
         }
 
-        // Separate successful and failed transactions for queue management.
-        let mut applied_hashes = Vec::new();
+        // Build (envelope, seq_num) pairs for all txs (applied + failed) so
+        // sequence-based removal drops superseded queued txs for the same account.
+        // Also collect failed hashes for banning.
+        let mut all_txs: Vec<(TransactionEnvelope, i64)> = Vec::new();
         let mut failed_hashes = Vec::new();
         for (tx, tx_result) in pending
             .tx_set
@@ -1568,16 +1570,17 @@ impl App {
             .iter()
             .zip(result.tx_results.iter())
         {
-            if let Some(hash) = self.tx_hash(tx) {
-                use stellar_xdr::curr::TransactionResultResult;
-                let is_success = matches!(
-                    tx_result.result.result,
-                    TransactionResultResult::TxSuccess(_)
-                        | TransactionResultResult::TxFeeBumpInnerSuccess(_)
-                );
-                if is_success {
-                    applied_hashes.push(hash);
-                } else {
+            let seq_num = envelope_sequence_number(tx);
+            all_txs.push((tx.clone(), seq_num));
+
+            use stellar_xdr::curr::TransactionResultResult;
+            let is_success = matches!(
+                tx_result.result.result,
+                TransactionResultResult::TxSuccess(_)
+                    | TransactionResultResult::TxFeeBumpInnerSuccess(_)
+            );
+            if !is_success {
+                if let Some(hash) = self.tx_hash(tx) {
                     failed_hashes.push(hash);
                 }
             }
@@ -1588,13 +1591,11 @@ impl App {
             self.ledger_tx_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        // Pass both applied and failed hashes so account_states are cleared
-        // for all transactions, allowing the account to submit new ones.
-        let mut all_hashes = applied_hashes.clone();
-        all_hashes.extend_from_slice(&failed_hashes);
+        // Sequence-based removal: drops any queued tx where seq <= applied seq
+        // for the same source account (matches stellar-core removeApplied).
         self.herder.ledger_closed(
             pending.ledger_seq as u64,
-            &all_hashes,
+            &all_txs,
             &pending.upgrades,
             pending.close_time,
         );
@@ -1655,6 +1656,23 @@ impl App {
             result.header.base_fee,
         );
 
+        // Update dynamic Soroban resource limits for queue admission.
+        if let Some(info) = self.soroban_network_info() {
+            let m = POOL_LEDGER_MULTIPLIER as i64;
+            let soroban_limit = henyey_common::Resource::new(vec![
+                info.ledger_max_tx_count as i64 * m,
+                info.ledger_max_instructions * m,
+                info.ledger_max_read_ledger_entries as i64 * m,
+                info.ledger_max_read_bytes as i64 * m,
+                info.ledger_max_write_ledger_entries as i64 * m,
+                info.ledger_max_write_bytes as i64 * m,
+                info.ledger_max_tx_size_bytes as i64 * m,
+            ]);
+            self.herder
+                .tx_queue()
+                .update_soroban_resource_limits(soroban_limit);
+        }
+
         let shift_result = self.herder.tx_queue().shift();
         if shift_result.unbanned_count > 0 || shift_result.evicted_due_to_age > 0 {
             tracing::debug!(
@@ -1662,6 +1680,41 @@ impl App {
                 evicted = shift_result.evicted_due_to_age,
                 "Shifted transaction ban queue"
             );
+        }
+
+        // Post-close invalidation: re-validate remaining queued txs against
+        // updated ledger state. Mirrors stellar-core updateQueue:
+        // getInvalidTxList → ban.
+        {
+            let pending_envs = self.herder.tx_queue().pending_envelopes();
+            if !pending_envs.is_empty() {
+                let ctx = TxSetValidationContext {
+                    next_ledger_seq: pending.ledger_seq + 1,
+                    close_time: result.header.scp_value.close_time.0,
+                    base_fee: result.header.base_fee,
+                    base_reserve: result.header.base_reserve,
+                    protocol_version: result.header.ledger_version,
+                    network_id: NetworkId(self.network_id()),
+                };
+                let fee_provider = self.herder.tx_queue().get_fee_balance_provider();
+                let invalid = get_invalid_tx_list(
+                    &pending_envs,
+                    &ctx,
+                    &CloseTimeBounds::exact(),
+                    fee_provider.as_deref(),
+                );
+                if !invalid.is_empty() {
+                    let invalid_hashes: Vec<Hash256> = invalid
+                        .iter()
+                        .filter_map(|env| Hash256::hash_xdr(env).ok())
+                        .collect();
+                    tracing::debug!(
+                        count = invalid_hashes.len(),
+                        "Banning invalid queued txs after ledger close"
+                    );
+                    self.herder.tx_queue().ban(&invalid_hashes);
+                }
+            }
         }
 
         // Update current ledger tracking.
@@ -1705,5 +1758,16 @@ impl App {
             .store(false, Ordering::SeqCst);
 
         true
+    }
+}
+
+/// Extract the sequence number from a `TransactionEnvelope`.
+fn envelope_sequence_number(envelope: &TransactionEnvelope) -> i64 {
+    match envelope {
+        TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
+        TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+        },
     }
 }
