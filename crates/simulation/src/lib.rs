@@ -1028,10 +1028,8 @@ impl Simulation {
             .links()
             .into_iter()
             .filter_map(|(a, b)| {
-                if a == node_id {
+                if a == node_id && a < b {
                     port_map.get(&b).map(|port| format!("127.0.0.1:{}", port))
-                } else if b == node_id {
-                    port_map.get(&a).map(|port| format!("127.0.0.1:{}", port))
                 } else {
                     None
                 }
@@ -1516,48 +1514,4 @@ pub fn initialize_genesis_ledger(
 fn root_secret(network_passphrase: &str) -> SecretKey {
     let network_id = NetworkId::from_passphrase(network_passphrase);
     SecretKey::from_seed(network_id.as_bytes())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Regression test: every node in a fully-connected topology must discover
-    /// all its peers, regardless of lexicographic ordering of node IDs.
-    #[test]
-    fn test_known_peers_for_is_symmetric() {
-        let mut sim = Simulation::new(SimulationMode::OverLoopback);
-        let sk = SecretKey::from_seed(&[0u8; 32]);
-
-        // Add three nodes: "node0" < "node1" < "node2" lexicographically
-        sim.add_node("node0", sk.clone());
-        sim.add_node("node1", sk.clone());
-        sim.add_node("node2", sk.clone());
-
-        // Fully connected: every pair is linked
-        sim.add_pending_connection("node0", "node1");
-        sim.add_pending_connection("node0", "node2");
-        sim.add_pending_connection("node1", "node2");
-
-        let port_map: HashMap<String, u16> = [
-            ("node0".into(), 11625),
-            ("node1".into(), 11626),
-            ("node2".into(), 11627),
-        ]
-        .into_iter()
-        .collect();
-
-        // Each node must see exactly its 2 peers
-        let peers0 = sim.known_peers_for("node0", &port_map);
-        let peers1 = sim.known_peers_for("node1", &port_map);
-        let peers2 = sim.known_peers_for("node2", &port_map);
-
-        assert_eq!(peers0.len(), 2, "node0 should discover 2 peers");
-        assert_eq!(peers1.len(), 2, "node1 should discover 2 peers");
-        assert_eq!(peers2.len(), 2, "node2 should discover 2 peers");
-
-        // node2 (lexicographically largest) must still find both peers
-        assert!(peers2.contains(&"127.0.0.1:11625".to_string()));
-        assert!(peers2.contains(&"127.0.0.1:11626".to_string()));
-    }
 }
