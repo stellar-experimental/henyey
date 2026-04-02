@@ -585,7 +585,7 @@ mod tests {
         let peer = make_peer_id(1);
 
         // Record a demand
-        manager.record_demands(&[hash.clone()], &peer);
+        manager.record_demands(std::slice::from_ref(&hash), &peer);
 
         // Should discard since we already demanded from this peer
         let status = manager.demand_status(&hash, &peer);
@@ -603,7 +603,7 @@ mod tests {
         let peer2 = make_peer_id(2);
 
         // Record demand from peer1
-        manager.record_demands(&[hash.clone()], &peer1);
+        manager.record_demands(std::slice::from_ref(&hash), &peer1);
 
         // Immediately should be retry_later (backoff not expired)
         let status = manager.demand_status(&hash, &peer2);
@@ -629,7 +629,7 @@ mod tests {
         // Demand from max_retry_count peers
         for i in 0..2 {
             let peer = make_peer_id(i);
-            manager.record_demands(&[hash.clone()], &peer);
+            manager.record_demands(std::slice::from_ref(&hash), &peer);
             sleep(Duration::from_millis(5)); // Wait for backoff
         }
 
@@ -673,7 +673,7 @@ mod tests {
         let peer = make_peer_id(1);
 
         // Record demand
-        manager.record_demands(&[hash.clone()], &peer);
+        manager.record_demands(std::slice::from_ref(&hash), &peer);
 
         // Record receipt
         let latency = manager.record_tx_received(&hash, &peer);
@@ -698,7 +698,7 @@ mod tests {
         let peer = make_peer_id(1);
 
         // Record demand
-        manager.record_demands(&[hash.clone()], &peer);
+        manager.record_demands(std::slice::from_ref(&hash), &peer);
 
         // Cleanup should not remove yet (not old enough)
         let result = manager.cleanup_old_demands();

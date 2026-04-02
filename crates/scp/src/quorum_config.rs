@@ -93,19 +93,17 @@ impl std::error::Error for QuorumConfigError {}
 
 /// Convert a QuorumSetConfig to an XDR ScpQuorumSet.
 pub fn config_to_quorum_set(config: &QuorumSetConfig) -> Result<ScpQuorumSet, QuorumConfigError> {
-    // Parse validators
-    let mut validators = Vec::new();
-    for key_str in &config.validators {
-        let node_id = parse_node_id(key_str)?;
-        validators.push(node_id);
-    }
+    let validators = config
+        .validators
+        .iter()
+        .map(|key_str| parse_node_id(key_str))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    // Recursively parse inner sets
-    let mut inner_sets = Vec::new();
-    for inner_config in &config.inner_sets {
-        let inner_qs = config_to_quorum_set(inner_config)?;
-        inner_sets.push(inner_qs);
-    }
+    let inner_sets = config
+        .inner_sets
+        .iter()
+        .map(config_to_quorum_set)
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Calculate threshold from percentage
     let total = validators.len() + inner_sets.len();
@@ -277,16 +275,20 @@ pub mod known_validators {
     pub const MINIMUM_SAFE_THRESHOLD_PERCENT: u32 = 51;
 }
 
-/// Create a testnet quorum set configuration.
-pub fn testnet_quorum_config() -> QuorumSetConfig {
+fn recommended_quorum_config(validators: &[&str]) -> QuorumSetConfig {
     QuorumSetConfig {
         threshold_percent: known_validators::RECOMMENDED_THRESHOLD_PERCENT.into(),
-        validators: known_validators::TESTNET_VALIDATORS
+        validators: validators
             .iter()
-            .map(|s| s.to_string())
+            .map(|validator| validator.to_string())
             .collect(),
         inner_sets: Vec::new(),
     }
+}
+
+/// Create a testnet quorum set configuration.
+pub fn testnet_quorum_config() -> QuorumSetConfig {
+    recommended_quorum_config(known_validators::TESTNET_VALIDATORS)
 }
 
 /// Create a mainnet quorum set configuration using SDF validators.
@@ -294,14 +296,7 @@ pub fn testnet_quorum_config() -> QuorumSetConfig {
 /// Note: For production, you should configure your own quorum set
 /// based on validators you trust. This is just a starting point.
 pub fn mainnet_sdf_quorum_config() -> QuorumSetConfig {
-    QuorumSetConfig {
-        threshold_percent: known_validators::RECOMMENDED_THRESHOLD_PERCENT.into(),
-        validators: known_validators::MAINNET_SDF_VALIDATORS
-            .iter()
-            .map(|s| s.to_string())
-            .collect(),
-        inner_sets: Vec::new(),
-    }
+    recommended_quorum_config(known_validators::MAINNET_SDF_VALIDATORS)
 }
 
 /// Convert a NodeId to a strkey string (G... format).

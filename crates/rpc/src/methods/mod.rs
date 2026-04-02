@@ -8,4 +8,5 @@ pub(crate) mod health;
 pub(crate) mod latest_ledger;
 pub(crate) mod network;
 pub(crate) mod send_transaction;
+pub(crate) mod transaction_response;
 pub(crate) mod version_info;

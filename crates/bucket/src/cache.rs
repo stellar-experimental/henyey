@@ -17,7 +17,7 @@
 //! synchronized to prevent data races.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -128,7 +128,7 @@ pub struct RandomEvictionCache {
     /// Current cache size in bytes (atomic for lock-free reads).
     current_bytes: AtomicUsize,
     /// Whether the cache is initialized and active.
-    active: AtomicUsize,
+    active: AtomicBool,
 }
 
 /// Inner cache state protected by mutex.
@@ -176,24 +176,45 @@ impl RandomEvictionCache {
             max_bytes,
             max_entries,
             current_bytes: AtomicUsize::new(0),
-            active: AtomicUsize::new(0), // Not active initially
+            active: AtomicBool::new(false), // Not active initially
         }
     }
 
     /// Checks if the cache is active.
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Acquire) != 0
+        self.active.load(Ordering::Acquire)
     }
 
     /// Activates the cache.
     pub fn activate(&self) {
-        self.active.store(1, Ordering::Release);
+        self.active.store(true, Ordering::Release);
     }
 
     /// Deactivates the cache and clears all entries.
     pub fn deactivate(&self) {
-        self.active.store(0, Ordering::Release);
+        self.active.store(false, Ordering::Release);
         self.clear();
+    }
+
+    fn adjust_current_bytes(&self, old_size: usize, new_size: usize) {
+        match new_size.cmp(&old_size) {
+            std::cmp::Ordering::Greater => {
+                self.current_bytes
+                    .fetch_add(new_size - old_size, Ordering::Relaxed);
+            }
+            std::cmp::Ordering::Less => {
+                self.current_bytes
+                    .fetch_sub(old_size - new_size, Ordering::Relaxed);
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+    }
+
+    fn remove_entry_at(&self, inner: &mut CacheInner, key: &LedgerKey, vec_index: usize) {
+        let entry = inner.entries.remove(key).unwrap();
+        self.current_bytes
+            .fetch_sub(entry.size_bytes, Ordering::Relaxed);
+        Self::swap_remove_key(inner, vec_index);
     }
 
     /// Checks if an entry type should be cached.
@@ -245,16 +266,8 @@ impl RandomEvictionCache {
         if let Some(existing) = inner.entries.get_mut(&key) {
             let old_size = existing.size_bytes;
             let new_entry = CacheEntry::new(entry, access_count, existing.vec_index);
-            let new_size = new_entry.size_bytes;
             *existing = new_entry;
-            let size_diff = new_size as isize - old_size as isize;
-            if size_diff > 0 {
-                self.current_bytes
-                    .fetch_add(size_diff as usize, Ordering::Relaxed);
-            } else if size_diff < 0 {
-                self.current_bytes
-                    .fetch_sub((-size_diff) as usize, Ordering::Relaxed);
-            }
+            self.adjust_current_bytes(old_size, existing.size_bytes);
             return;
         }
 
@@ -286,10 +299,8 @@ impl RandomEvictionCache {
         }
 
         let mut inner = self.inner.lock();
-        if let Some(entry) = inner.entries.remove(key) {
-            self.current_bytes
-                .fetch_sub(entry.size_bytes, Ordering::Relaxed);
-            Self::swap_remove_key(&mut inner, entry.vec_index);
+        if let Some(vec_index) = inner.entries.get(key).map(|entry| entry.vec_index) {
+            self.remove_entry_at(&mut inner, key, vec_index);
         }
     }
 
@@ -323,12 +334,7 @@ impl RandomEvictionCache {
 
         // Remove from hashmap
         let victim_key = inner.keys[victim_idx].clone();
-        let entry = inner.entries.remove(&victim_key).unwrap();
-        self.current_bytes
-            .fetch_sub(entry.size_bytes, Ordering::Relaxed);
-
-        // Swap-remove from keys vec
-        Self::swap_remove_key(inner, victim_idx);
+        self.remove_entry_at(inner, &victim_key, victim_idx);
     }
 
     /// Swap-removes a key from the keys vec at `idx`, updating the swapped

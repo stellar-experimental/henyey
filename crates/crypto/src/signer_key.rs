@@ -28,6 +28,10 @@
 use crate::{sha256, Hash256};
 use stellar_xdr::curr::{BytesM, SignerKey, SignerKeyEd25519SignedPayload, Uint256};
 
+fn uint256_signer_key(key: fn(Uint256) -> SignerKey, bytes: [u8; 32]) -> SignerKey {
+    key(Uint256(bytes))
+}
+
 /// Creates a pre-authorized transaction signer key from a transaction hash.
 ///
 /// This signer allows a transaction to be authorized if its hash matches the
@@ -53,7 +57,7 @@ use stellar_xdr::curr::{BytesM, SignerKey, SignerKeyEd25519SignedPayload, Uint25
 /// let signer: SignerKey = pre_auth_tx_key(&tx_hash);
 /// ```
 pub fn pre_auth_tx_key(tx_hash: &Hash256) -> SignerKey {
-    SignerKey::PreAuthTx(Uint256(tx_hash.0))
+    uint256_signer_key(SignerKey::PreAuthTx, tx_hash.0)
 }
 
 /// Creates a hash(x) signer key from a preimage.
@@ -85,7 +89,7 @@ pub fn pre_auth_tx_key(tx_hash: &Hash256) -> SignerKey {
 /// // Later, reveal the preimage to authorize operations
 /// ```
 pub fn hash_x_key(preimage: &[u8]) -> SignerKey {
-    SignerKey::HashX(Uint256(sha256(preimage).0))
+    hash_x_key_from_hash(&sha256(preimage))
 }
 
 /// Creates a hash(x) signer key from an already-computed hash.
@@ -102,7 +106,7 @@ pub fn hash_x_key(preimage: &[u8]) -> SignerKey {
 ///
 /// A [`SignerKey`] of type `HashX` containing the provided hash.
 pub fn hash_x_key_from_hash(hash: &Hash256) -> SignerKey {
-    SignerKey::HashX(Uint256(hash.0))
+    uint256_signer_key(SignerKey::HashX, hash.0)
 }
 
 /// Creates an Ed25519 signed payload signer key.
@@ -164,7 +168,7 @@ pub fn ed25519_payload_key(ed25519_pubkey: &[u8; 32], payload: &[u8]) -> SignerK
 /// let signer: SignerKey = ed25519_key(&pubkey);
 /// ```
 pub fn ed25519_key(ed25519_pubkey: &[u8; 32]) -> SignerKey {
-    SignerKey::Ed25519(Uint256(*ed25519_pubkey))
+    uint256_signer_key(SignerKey::Ed25519, *ed25519_pubkey)
 }
 
 /// Extracts the Ed25519 public key from a SignerKey, if applicable.

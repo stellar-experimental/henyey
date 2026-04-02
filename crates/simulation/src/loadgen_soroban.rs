@@ -153,11 +153,7 @@ impl SorobanTxBuilder {
         let code_key = LedgerKey::ContractCode(LedgerKeyContractCode {
             hash: Hash(wasm_hash.0),
         });
-        let instance_key = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(Hash(contract_id.0))),
-            key: ScVal::LedgerKeyContractInstance,
-            durability: ContractDataDurability::Persistent,
-        });
+        let instance_key = contract_instance_key(&contract_id);
 
         // Auth entry for the deployer
         let auth = SorobanAuthorizationEntry {
@@ -199,7 +195,7 @@ impl SorobanTxBuilder {
         sequence: i64,
         invocation: ContractInvocation,
     ) -> anyhow::Result<TransactionEnvelope> {
-        let contract_address = ScAddress::Contract(ContractId(Hash(invocation.contract_id.0)));
+        let contract_address = make_contract_address(&invocation.contract_id);
 
         let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address,
@@ -257,11 +253,7 @@ impl SorobanTxBuilder {
 
         let contract_id = compute_contract_id(&preimage, &self.network_passphrase)?;
 
-        let instance_key = LedgerKey::ContractData(LedgerKeyContractData {
-            contract: ScAddress::Contract(ContractId(Hash(contract_id.0))),
-            key: ScVal::LedgerKeyContractInstance,
-            durability: ContractDataDurability::Persistent,
-        });
+        let instance_key = contract_instance_key(&contract_id);
 
         let host_fn = HostFunction::CreateContract(CreateContractArgs {
             contract_id_preimage: preimage,
@@ -309,7 +301,7 @@ impl SorobanTxBuilder {
             credentials: SorobanCredentials::SourceAccount,
             root_invocation: SorobanAuthorizedInvocation {
                 function: SorobanAuthorizedFunction::ContractFn(InvokeContractArgs {
-                    contract_address: ScAddress::Contract(ContractId(Hash(transfer.contract_id.0))),
+                    contract_address: make_contract_address(&transfer.contract_id),
                     function_name: ScSymbol("transfer".try_into().unwrap()),
                     args: args.clone().try_into().unwrap_or_default(),
                 }),
@@ -317,7 +309,7 @@ impl SorobanTxBuilder {
             },
         };
 
-        let contract_address = ScAddress::Contract(ContractId(Hash(transfer.contract_id.0)));
+        let contract_address = make_contract_address(&transfer.contract_id);
 
         let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address,
@@ -350,7 +342,7 @@ impl SorobanTxBuilder {
             ScAddress::Contract(_) => {
                 read_write_keys.push(LedgerKey::ContractData(
                     stellar_xdr::curr::LedgerKeyContractData {
-                        contract: ScAddress::Contract(ContractId(Hash(transfer.contract_id.0))),
+                        contract: make_contract_address(&transfer.contract_id),
                         key: ScVal::Vec(Some(stellar_xdr::curr::ScVec(
                             vec![
                                 ScVal::Symbol(ScSymbol("Balance".try_into().unwrap())),
@@ -410,7 +402,7 @@ impl SorobanTxBuilder {
         )));
         let args = vec![transfer.sac_address, dest_vec];
 
-        let contract_address = ScAddress::Contract(ContractId(Hash(transfer.contract_id.0)));
+        let contract_address = make_contract_address(&transfer.contract_id);
 
         let host_fn = HostFunction::InvokeContract(InvokeContractArgs {
             contract_address,
@@ -583,7 +575,7 @@ pub fn make_u64(value: u64) -> ScVal {
 /// Build a `LedgerKey` for a contract instance.
 pub fn contract_instance_key(contract_id: &Hash256) -> LedgerKey {
     LedgerKey::ContractData(LedgerKeyContractData {
-        contract: ScAddress::Contract(ContractId(Hash(contract_id.0))),
+        contract: make_contract_address(contract_id),
         key: ScVal::LedgerKeyContractInstance,
         durability: ContractDataDurability::Persistent,
     })

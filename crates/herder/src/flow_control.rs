@@ -30,6 +30,12 @@ pub const MAX_CLASSIC_TX_SIZE_BYTES: u32 = 100 * 1024; // 100 KB
 /// Matches `FLOW_CONTROL_BYTES_EXTRA_BUFFER` in stellar-core (`Herder.cpp`).
 pub const FLOW_CONTROL_BYTES_EXTRA_BUFFER: u32 = 2000;
 
+/// Default multiplier for computing reading capacity from max transaction size.
+pub const DEFAULT_READING_CAPACITY_MULTIPLIER: u32 = 300;
+
+/// Default number of transactions to request in each send-more batch.
+pub const DEFAULT_SEND_MORE_BATCH_COUNT: u32 = 40;
+
 /// Compute the maximum transaction size.
 ///
 /// For protocols without Soroban, returns [`MAX_CLASSIC_TX_SIZE_BYTES`].
@@ -157,8 +163,8 @@ impl Default for FlowControlConfig {
             max_tx_size: MAX_CLASSIC_TX_SIZE_BYTES,
             max_classic_tx_size: MAX_CLASSIC_TX_SIZE_BYTES,
             extra_buffer: FLOW_CONTROL_BYTES_EXTRA_BUFFER,
-            reading_capacity: MAX_CLASSIC_TX_SIZE_BYTES * 300,
-            send_more_batch_size: MAX_CLASSIC_TX_SIZE_BYTES * 40,
+            reading_capacity: MAX_CLASSIC_TX_SIZE_BYTES * DEFAULT_READING_CAPACITY_MULTIPLIER,
+            send_more_batch_size: MAX_CLASSIC_TX_SIZE_BYTES * DEFAULT_SEND_MORE_BATCH_COUNT,
         }
     }
 }
@@ -179,10 +185,16 @@ impl FlowControlConfig {
         configured_batch_size: u32,
     ) -> Self {
         let max_tx_size = compute_max_tx_size(protocol_version, soroban_tx_max_size_bytes);
-        let reading_capacity =
-            compute_reading_capacity(configured_reading_capacity, max_tx_size, 300);
-        let send_more_batch_size =
-            compute_send_more_batch_size(configured_batch_size, max_tx_size, 40);
+        let reading_capacity = compute_reading_capacity(
+            configured_reading_capacity,
+            max_tx_size,
+            DEFAULT_READING_CAPACITY_MULTIPLIER,
+        );
+        let send_more_batch_size = compute_send_more_batch_size(
+            configured_batch_size,
+            max_tx_size,
+            DEFAULT_SEND_MORE_BATCH_COUNT,
+        );
 
         Self {
             max_tx_size,

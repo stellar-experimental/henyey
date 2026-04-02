@@ -379,16 +379,7 @@ impl TransactionSetVariant {
                 for phase in set_v1.phases.iter() {
                     match phase {
                         stellar_xdr::curr::TransactionPhase::V0(components) => {
-                            let mut phase_txs = Vec::new();
-                            for comp in components.iter() {
-                                match comp {
-                                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
-                                        let base_fee = base_fee_to_u32(c.base_fee);
-                                        phase_txs.extend(c.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)));
-                                    }
-                                }
-                            }
-                            txs.extend(sorted_for_apply_sequential(phase_txs, set_hash));
+                            txs.extend(sorted_component_txs(components.iter(), set_hash));
                         }
                         stellar_xdr::curr::TransactionPhase::V1(parallel) => {
                             let base_fee = base_fee_to_u32(parallel.base_fee);
@@ -426,16 +417,7 @@ impl TransactionSetVariant {
                 let mut txs = Vec::new();
                 for phase in set_v1.phases.iter() {
                     if let stellar_xdr::curr::TransactionPhase::V0(components) = phase {
-                        let mut phase_txs = Vec::new();
-                        for comp in components.iter() {
-                            match comp {
-                                stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
-                                    let base_fee = base_fee_to_u32(c.base_fee);
-                                    phase_txs.extend(c.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)));
-                                }
-                            }
-                        }
-                        txs.extend(sorted_for_apply_sequential(phase_txs, set_hash));
+                        txs.extend(sorted_component_txs(components.iter(), set_hash));
                     }
                 }
                 txs
@@ -526,6 +508,44 @@ fn tx_sequence_number(tx: &TransactionEnvelope) -> i64 {
             stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
         },
     }
+}
+
+fn collect_component_txs<'a>(
+    components: impl IntoIterator<Item = &'a stellar_xdr::curr::TxSetComponent>,
+) -> Vec<TxWithFee> {
+    let mut txs = Vec::new();
+    for component in components {
+        let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(component) =
+            component;
+        let base_fee = base_fee_to_u32(component.base_fee);
+        txs.extend(component.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)));
+    }
+    txs
+}
+
+fn sorted_component_txs<'a>(
+    components: impl IntoIterator<Item = &'a stellar_xdr::curr::TxSetComponent>,
+    set_hash: Hash256,
+) -> Vec<TxWithFee> {
+    sorted_for_apply_sequential(collect_component_txs(components), set_hash)
+}
+
+fn extend_flattened_parallel_stages(all_txs: &mut Vec<TxWithFee>, stages: &ParallelStages) {
+    for stage in stages {
+        for cluster in stage {
+            all_txs.extend(cluster.iter().cloned());
+        }
+    }
+}
+
+fn build_tx_meta(all_txs: &[TxWithFee]) -> Vec<TxMeta> {
+    all_txs
+        .iter()
+        .map(|(env, _)| TxMeta {
+            fee_source: crate::execution::fee_source_account_id(env),
+            is_soroban: envelope_is_soroban(env),
+        })
+        .collect()
 }
 
 fn sorted_for_apply_sequential(txs: Vec<TxWithFee>, set_hash: Hash256) -> Vec<TxWithFee> {
@@ -742,19 +762,21 @@ impl TransactionSetVariant {
                 for phase in Vec::from(set_v1.phases) {
                     match phase {
                         stellar_xdr::curr::TransactionPhase::V0(components) => {
-                            let mut phase_txs = Vec::new();
-                            for comp in Vec::from(components) {
-                                match comp {
-                                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
-                                        let base_fee =
-                                            base_fee_to_u32(c.base_fee);
-                                        phase_txs.extend(
-                                            Vec::from(c.txs).into_iter().map(|tx| (Arc::new(tx), base_fee)),
-                                        );
-                                    }
-                                }
-                            }
-                            let sorted = sorted_for_apply_sequential(phase_txs, hash);
+                            let sorted = sorted_for_apply_sequential(
+                                Vec::from(components)
+                                    .into_iter()
+                                    .flat_map(|component| {
+                                        let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                            component,
+                                        ) = component;
+                                        let base_fee = base_fee_to_u32(component.base_fee);
+                                        Vec::from(component.txs)
+                                            .into_iter()
+                                            .map(move |tx| (Arc::new(tx), base_fee))
+                                    })
+                                    .collect(),
+                                hash,
+                            );
                             classic_txs = sorted.clone();
                             all_txs.extend(sorted);
                         }
@@ -775,11 +797,7 @@ impl TransactionSetVariant {
                                 })
                                 .collect();
 
-                            for stage in &stages {
-                                for cluster in stage {
-                                    all_txs.extend(cluster.iter().cloned());
-                                }
-                            }
+                            extend_flattened_parallel_stages(&mut all_txs, &stages);
 
                             if !stages.is_empty() {
                                 soroban_phase = Some(SorobanPhaseStructure { base_fee, stages });
@@ -792,13 +810,7 @@ impl TransactionSetVariant {
             }
         };
 
-        let tx_meta = all_txs
-            .iter()
-            .map(|(env, _)| TxMeta {
-                fee_source: crate::execution::fee_source_account_id(env),
-                is_soroban: envelope_is_soroban(env),
-            })
-            .collect();
+        let tx_meta = build_tx_meta(&all_txs);
 
         PreparedTxSet {
             hash,
@@ -830,19 +842,7 @@ impl TransactionSetVariant {
                 for phase in set_v1.phases.iter() {
                     match phase {
                         stellar_xdr::curr::TransactionPhase::V0(components) => {
-                            let mut phase_txs = Vec::new();
-                            for comp in components.iter() {
-                                match comp {
-                                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
-                                        let base_fee =
-                                            base_fee_to_u32(c.base_fee);
-                                        phase_txs.extend(
-                                            c.txs.iter().cloned().map(|tx| (Arc::new(tx), base_fee)),
-                                        );
-                                    }
-                                }
-                            }
-                            let sorted = sorted_for_apply_sequential(phase_txs, hash);
+                            let sorted = sorted_component_txs(components.iter(), hash);
                             classic_txs = sorted.clone();
                             all_txs.extend(sorted);
                         }
@@ -855,11 +855,7 @@ impl TransactionSetVariant {
                             );
 
                             // Flatten stages into all_txs
-                            for stage in &stages {
-                                for cluster in stage {
-                                    all_txs.extend(cluster.iter().cloned());
-                                }
-                            }
+                            extend_flattened_parallel_stages(&mut all_txs, &stages);
 
                             if !stages.is_empty() {
                                 soroban_phase = Some(SorobanPhaseStructure { base_fee, stages });
@@ -872,13 +868,7 @@ impl TransactionSetVariant {
             }
         };
 
-        let tx_meta = all_txs
-            .iter()
-            .map(|(env, _)| TxMeta {
-                fee_source: crate::execution::fee_source_account_id(env),
-                is_soroban: envelope_is_soroban(env),
-            })
-            .collect();
+        let tx_meta = build_tx_meta(&all_txs);
 
         PreparedTxSet {
             hash,

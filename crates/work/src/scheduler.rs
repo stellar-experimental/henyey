@@ -148,6 +148,35 @@ pub struct WorkScheduler {
     dependents: HashMap<WorkId, Vec<WorkId>>,
 }
 
+/// Queue of pending work IDs with duplicate suppression.
+struct PendingQueue {
+    ids: VecDeque<WorkId>,
+    queued: HashSet<WorkId>,
+}
+
+impl PendingQueue {
+    fn new(ids: VecDeque<WorkId>) -> Self {
+        let queued = ids.iter().copied().collect();
+        Self { ids, queued }
+    }
+
+    fn pop(&mut self) -> Option<WorkId> {
+        let id = self.ids.pop_front()?;
+        self.queued.remove(&id);
+        Some(id)
+    }
+
+    fn push(&mut self, id: WorkId) {
+        if self.queued.insert(id) {
+            self.ids.push_back(id);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+}
+
 /// Aggregate metrics for the work scheduler.
 ///
 /// Provides a point-in-time summary of the scheduler's state, useful for
@@ -477,8 +506,7 @@ impl WorkScheduler {
     pub async fn run_until_done_with_cancel(&mut self, cancel: CancellationToken) {
         let (tx, mut rx) = mpsc::channel::<WorkCompletion>(COMPLETION_CHANNEL_CAPACITY);
         let mut running = HashSet::new();
-        let mut queue = self.ready_queue();
-        let mut queued: HashSet<WorkId> = queue.iter().copied().collect();
+        let mut queue = PendingQueue::new(self.pending_queue());
 
         let mut cancel_requested = false;
 
@@ -489,10 +517,9 @@ impl WorkScheduler {
             }
 
             while running.len() < self.config.max_concurrency {
-                let Some(id) = queue.pop_front() else {
+                let Some(id) = queue.pop() else {
                     break;
                 };
-                queued.remove(&id);
                 if running.contains(&id) {
                     continue;
                 }
@@ -524,13 +551,11 @@ impl WorkScheduler {
 
             match self.handle_completion(completion) {
                 CompletionAction::Done { completed_id } => {
-                    self.enqueue_dependents(completed_id, &mut queue, &mut queued, &running);
+                    self.enqueue_dependents(completed_id, &mut queue, &running);
                 }
                 CompletionAction::Retry { id, delay } => {
                     tokio::time::sleep(delay).await;
-                    if queued.insert(id) {
-                        queue.push_back(id);
-                    }
+                    queue.push(id);
                 }
                 CompletionAction::None => {}
             }
@@ -541,9 +566,9 @@ impl WorkScheduler {
 
     /// Returns all work IDs that are currently in the Pending state.
     ///
-    /// This forms the initial ready queue; actual runnability is determined
+    /// This forms the initial pending queue; actual runnability is determined
     /// by checking dependency satisfaction in [`can_run`](Self::can_run).
-    fn ready_queue(&self) -> VecDeque<WorkId> {
+    fn pending_queue(&self) -> VecDeque<WorkId> {
         self.entries
             .keys()
             .filter(|id| self.state_or_pending(**id) == WorkState::Pending)
@@ -616,8 +641,7 @@ impl WorkScheduler {
     fn enqueue_dependents(
         &self,
         completed_id: WorkId,
-        queue: &mut VecDeque<WorkId>,
-        queued: &mut HashSet<WorkId>,
+        queue: &mut PendingQueue,
         running: &HashSet<WorkId>,
     ) {
         let Some(children) = self.dependents.get(&completed_id) else {
@@ -630,8 +654,8 @@ impl WorkScheduler {
             if self.state_or_pending(child) != WorkState::Pending {
                 continue;
             }
-            if self.can_run(child) && queued.insert(child) {
-                queue.push_back(child);
+            if self.can_run(child) {
+                queue.push(child);
             }
         }
     }

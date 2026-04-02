@@ -1368,7 +1368,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::I32(7),
         };
         state.create_contract_data(cd_entry);
@@ -1443,7 +1443,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::I32(1),
         };
         state.create_contract_data(cd_entry);
@@ -1585,7 +1585,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::I32(999),
         };
         state.create_contract_data(cd_entry);
@@ -1799,7 +1799,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::I32(1),
         };
 
@@ -1812,7 +1812,7 @@ mod tests {
         let key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
         });
 
         let change = StorageChange {
@@ -1827,7 +1827,7 @@ mod tests {
         let no_restored_keys = std::collections::HashSet::new();
         apply_soroban_storage_change(&mut state, &change, &no_restored_keys, None);
         assert!(state
-            .get_contract_data(&contract_id, &contract_key, durability.clone())
+            .get_contract_data(&contract_id, &contract_key, durability)
             .is_some());
 
         let ttl_key = crate::soroban::compute_key_hash(&key);
@@ -1870,7 +1870,7 @@ mod tests {
         let key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
         });
 
         let ttl_key_hash = crate::soroban::compute_key_hash(&key);
@@ -1887,7 +1887,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::I32(100),
         };
         state.create_contract_data(cd_entry);
@@ -1909,7 +1909,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::I32(100),
         };
         state2.create_contract_data(cd_entry);
@@ -1924,7 +1924,7 @@ mod tests {
                 ext: ExtensionPoint::V0,
                 contract: contract_id.clone(),
                 key: contract_key.clone(),
-                durability: durability.clone(),
+                durability,
                 val: ScVal::I32(200), // Different value
             }),
             ext: LedgerEntryExt::V0,
@@ -2061,7 +2061,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: ScVal::U32(42),
-            durability: durability.clone(),
+            durability,
             val: ScVal::Bytes(large_val_bytes.try_into().unwrap()),
         };
 
@@ -2106,7 +2106,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: ScVal::U32(42),
-            durability: durability.clone(),
+            durability,
             val: ScVal::I32(123),
         };
 
@@ -2168,14 +2168,14 @@ mod tests {
         let key = LedgerKey::ContractData(LedgerKeyContractData {
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
         });
 
         let cd_entry = ContractDataEntry {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::I32(42),
         };
 
@@ -2218,7 +2218,7 @@ mod tests {
             // uses create vs update based on the flag.
             assert!(
                 state
-                    .get_contract_data(&contract_id, &contract_key, durability.clone())
+                    .get_contract_data(&contract_id, &contract_key, durability)
                     .is_some(),
                 "Entry should exist in state"
             );
@@ -2244,7 +2244,7 @@ mod tests {
             // Verify entry is in state but NOT in delta
             assert!(
                 state
-                    .get_contract_data(&contract_id, &contract_key, durability.clone())
+                    .get_contract_data(&contract_id, &contract_key, durability)
                     .is_some(),
                 "Entry should exist in state"
             );
@@ -2662,7 +2662,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::Bytes(large_val.try_into().unwrap()),
         };
         state.create_contract_data(cd_entry);
@@ -2727,7 +2727,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::Bytes(large_val.try_into().unwrap()),
         };
         state.create_contract_data(cd_entry);
@@ -2788,7 +2788,7 @@ mod tests {
             ext: ExtensionPoint::V0,
             contract: contract_id.clone(),
             key: contract_key.clone(),
-            durability: durability.clone(),
+            durability,
             val: ScVal::I32(42),
         };
         state.create_contract_data(cd_entry);

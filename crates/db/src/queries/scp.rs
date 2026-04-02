@@ -23,6 +23,8 @@ use stellar_xdr::curr::{
 use crate::error::DbError;
 use crate::schema::state_keys;
 
+const TX_SET_KEY_PREFIX: &str = "txset:";
+
 /// Query trait for SCP consensus state operations.
 ///
 /// Provides methods for persisting and retrieving SCP envelopes and quorum sets.
@@ -280,6 +282,49 @@ fn node_id_hex(node_id: &NodeId) -> String {
     }
 }
 
+fn scp_slot_state_key(slot: u64) -> String {
+    format!("{}:{slot}", state_keys::SCP_STATE)
+}
+
+fn tx_set_key(hash: &Hash) -> String {
+    format!("{TX_SET_KEY_PREFIX}{}", hex::encode(hash.0))
+}
+
+fn set_storestate_value(conn: &Connection, key: &str, value: &str) -> Result<(), DbError> {
+    conn.execute(
+        "INSERT OR REPLACE INTO storestate (statename, state) VALUES (?1, ?2)",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn load_storestate_value(conn: &Connection, key: &str) -> Result<Option<String>, DbError> {
+    let result = conn
+        .query_row(
+            "SELECT state FROM storestate WHERE statename = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(result)
+}
+
+fn delete_storestate_value(conn: &Connection, key: &str) -> Result<(), DbError> {
+    conn.execute("DELETE FROM storestate WHERE statename = ?1", params![key])?;
+    Ok(())
+}
+
+fn parse_slot_key(key: &str) -> Option<u64> {
+    key.strip_prefix(&format!("{}:", state_keys::SCP_STATE))?
+        .parse()
+        .ok()
+}
+
+fn decode_tx_set_data(encoded: &str) -> Result<Vec<u8>, DbError> {
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+        .map_err(|e| DbError::Integrity(format!("Invalid base64 tx set data: {}", e)))
+}
+
 /// Extended query trait for SCP state persistence (crash recovery).
 ///
 /// These methods support the herder's SCP state persistence for crash recovery.
@@ -316,33 +361,18 @@ pub trait ScpStatePersistenceQueries {
 
 impl ScpStatePersistenceQueries for Connection {
     fn save_scp_slot_state(&self, slot: u64, state_json: &str) -> Result<(), DbError> {
-        // Use storestate table with a slot-specific key
-        let key = format!("{}:{}", state_keys::SCP_STATE, slot);
-        self.execute(
-            "INSERT OR REPLACE INTO storestate (statename, state) VALUES (?1, ?2)",
-            params![key, state_json],
-        )?;
-        Ok(())
+        set_storestate_value(self, &scp_slot_state_key(slot), state_json)
     }
 
     fn load_scp_slot_state(&self, slot: u64) -> Result<Option<String>, DbError> {
-        let key = format!("{}:{}", state_keys::SCP_STATE, slot);
-        let result = self
-            .query_row(
-                "SELECT state FROM storestate WHERE statename = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(result)
+        load_storestate_value(self, &scp_slot_state_key(slot))
     }
 
     fn load_all_scp_slot_states(&self) -> Result<Vec<(u64, String)>, DbError> {
-        let prefix = format!("{}:", state_keys::SCP_STATE);
         let mut stmt = self.prepare(
             "SELECT statename, state FROM storestate WHERE statename LIKE ?1 ORDER BY statename",
         )?;
-        let pattern = format!("{}%", prefix);
+        let pattern = format!("{}:%", state_keys::SCP_STATE);
         let rows = stmt.query_map(params![pattern], |row| {
             let key: String = row.get(0)?;
             let state: String = row.get(1)?;
@@ -352,10 +382,7 @@ impl ScpStatePersistenceQueries for Connection {
         let mut results = Vec::new();
         for row in rows {
             let (key, state) = row?;
-            let Some(slot_str) = key.strip_prefix(&prefix) else {
-                continue;
-            };
-            let Ok(slot) = slot_str.parse::<u64>() else {
+            let Some(slot) = parse_slot_key(&key) else {
                 continue;
             };
             results.push((slot, state));
@@ -364,65 +391,29 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn delete_scp_slot_states_below(&self, slot: u64) -> Result<(), DbError> {
-        let prefix = format!("{}:", state_keys::SCP_STATE);
-        let mut stmt = self.prepare("SELECT statename FROM storestate WHERE statename LIKE ?1")?;
-        let pattern = format!("{}%", prefix);
-        let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
-
-        let mut keys_to_delete = Vec::new();
-        for row in rows {
-            let key = row?;
-            let Some(slot_str) = key.strip_prefix(&prefix) else {
-                continue;
-            };
-            let Ok(key_slot) = slot_str.parse::<u64>() else {
-                continue;
-            };
-            if key_slot < slot {
-                keys_to_delete.push(key);
+        for (stored_slot, _) in self.load_all_scp_slot_states()? {
+            if stored_slot < slot {
+                delete_storestate_value(self, &scp_slot_state_key(stored_slot))?;
             }
-        }
-
-        for key in keys_to_delete {
-            self.execute("DELETE FROM storestate WHERE statename = ?1", params![key])?;
         }
         Ok(())
     }
 
     fn save_tx_set_data(&self, hash: &Hash, data: &[u8]) -> Result<(), DbError> {
-        // Use a txsets-style table but store by hash
-        // For simplicity, we'll use the storestate table with a "txset:" prefix
-        let key = format!("txset:{}", hex::encode(hash.0));
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, data);
-        self.execute(
-            "INSERT OR REPLACE INTO storestate (statename, state) VALUES (?1, ?2)",
-            params![key, encoded],
-        )?;
-        Ok(())
+        set_storestate_value(self, &tx_set_key(hash), &encoded)
     }
 
     fn load_tx_set_data(&self, hash: &Hash) -> Result<Option<Vec<u8>>, DbError> {
-        let key = format!("txset:{}", hex::encode(hash.0));
-        let result: Option<String> = self
-            .query_row(
-                "SELECT state FROM storestate WHERE statename = ?1",
-                params![key],
-                |row| row.get(0),
-            )
-            .optional()?;
-        result
-            .map(|encoded| {
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
-                    .map_err(|e| DbError::Integrity(format!("Invalid base64 tx set data: {}", e)))
-            })
+        load_storestate_value(self, &tx_set_key(hash))?
+            .map(|encoded| decode_tx_set_data(&encoded))
             .transpose()
     }
 
     fn load_all_tx_set_data(&self) -> Result<Vec<(Hash, Vec<u8>)>, DbError> {
-        let prefix = "txset:";
         let mut stmt =
             self.prepare("SELECT statename, state FROM storestate WHERE statename LIKE ?1")?;
-        let pattern = format!("{}%", prefix);
+        let pattern = format!("{TX_SET_KEY_PREFIX}%");
         let rows = stmt.query_map(params![pattern], |row| {
             let key: String = row.get(0)?;
             let state: String = row.get(1)?;
@@ -432,7 +423,7 @@ impl ScpStatePersistenceQueries for Connection {
         let mut results = Vec::new();
         for row in rows {
             let (key, encoded) = row?;
-            let Some(hash_hex) = key.strip_prefix(prefix) else {
+            let Some(hash_hex) = key.strip_prefix(TX_SET_KEY_PREFIX) else {
                 continue;
             };
             let Ok(hash_bytes) = hex::decode(hash_hex) else {
@@ -441,9 +432,7 @@ impl ScpStatePersistenceQueries for Connection {
             let Ok(hash_arr): Result<[u8; 32], _> = hash_bytes.try_into() else {
                 continue;
             };
-            let Ok(data) =
-                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &encoded)
-            else {
+            let Ok(data) = decode_tx_set_data(&encoded) else {
                 continue;
             };
             results.push((Hash(hash_arr), data));
@@ -452,7 +441,7 @@ impl ScpStatePersistenceQueries for Connection {
     }
 
     fn has_tx_set_data(&self, hash: &Hash) -> Result<bool, DbError> {
-        let key = format!("txset:{}", hex::encode(hash.0));
+        let key = tx_set_key(hash);
         let count: i32 = self.query_row(
             "SELECT COUNT(*) FROM storestate WHERE statename = ?1",
             params![key],

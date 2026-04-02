@@ -130,11 +130,8 @@ impl MessageCodec {
         // G14: Bit 31 (0x80000000) is the AUTH_MSG_FLAG from stellar-core
         // (Peer.h:AUTH_MSG_FLAG_PULL_MODE_REQUESTED). HELLO messages don't
         // have the auth bit; all others do.
-        let is_authenticated = match message {
-            AuthenticatedMessage::V0(v0) => {
-                !matches!(v0.message, stellar_xdr::curr::StellarMessage::Hello(_))
-            }
-        };
+        let AuthenticatedMessage::V0(v0) = message;
+        let is_authenticated = !matches!(v0.message, stellar_xdr::curr::StellarMessage::Hello(_));
 
         let xdr_bytes = message.to_xdr(Limits::none())?;
         let len = xdr_bytes.len() as u32;

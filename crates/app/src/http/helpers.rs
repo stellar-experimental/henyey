@@ -70,23 +70,16 @@ pub(super) fn peer_id_to_strkey(peer_id: PeerId) -> Option<String> {
 
 /// Map a LedgerUpgrade to an UpgradeItem for JSON serialization.
 pub(super) fn map_upgrade_item(upgrade: LedgerUpgrade) -> Option<UpgradeItem> {
-    match upgrade {
-        LedgerUpgrade::Version(value) => Some(UpgradeItem {
-            r#type: "protocol_version".to_string(),
-            value,
-        }),
-        LedgerUpgrade::BaseFee(value) => Some(UpgradeItem {
-            r#type: "base_fee".to_string(),
-            value,
-        }),
-        LedgerUpgrade::BaseReserve(value) => Some(UpgradeItem {
-            r#type: "base_reserve".to_string(),
-            value,
-        }),
-        LedgerUpgrade::MaxTxSetSize(value) => Some(UpgradeItem {
-            r#type: "max_tx_set_size".to_string(),
-            value,
-        }),
-        _ => None,
-    }
+    let (r#type, value) = match upgrade {
+        LedgerUpgrade::Version(value) => ("protocol_version", value),
+        LedgerUpgrade::BaseFee(value) => ("base_fee", value),
+        LedgerUpgrade::BaseReserve(value) => ("base_reserve", value),
+        LedgerUpgrade::MaxTxSetSize(value) => ("max_tx_set_size", value),
+        _ => return None,
+    };
+
+    Some(UpgradeItem {
+        r#type: r#type.to_string(),
+        value,
+    })
 }

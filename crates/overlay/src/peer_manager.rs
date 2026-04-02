@@ -866,7 +866,7 @@ mod tests {
         let outbound = manager.load_random_peers(&outbound_query, 10);
         assert_eq!(outbound.len(), 3);
         for addr in &outbound {
-            let port: u8 = addr.host.split('.').last().unwrap().parse().unwrap();
+            let port: u8 = addr.host.split('.').next_back().unwrap().parse().unwrap();
             assert!(port >= 4, "expected outbound peer, got {}", addr);
         }
 
@@ -879,7 +879,7 @@ mod tests {
         let inbound = manager.load_random_peers(&inbound_query, 10);
         assert_eq!(inbound.len(), 3);
         for addr in &inbound {
-            let port: u8 = addr.host.split('.').last().unwrap().parse().unwrap();
+            let port: u8 = addr.host.split('.').next_back().unwrap().parse().unwrap();
             assert!(port <= 3, "expected inbound peer, got {}", addr);
         }
     }

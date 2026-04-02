@@ -516,7 +516,6 @@ mod tests {
         assert_eq!(ACCOUNT_SUBENTRY_LIMIT, 1000);
         assert_eq!(MAX_SIGNERS, 20);
         assert_eq!(MAX_INT64, i64::MAX);
-        assert!(NEAR_MAX_INT64 < MAX_INT64);
-        assert!(NEAR_MAX_INT64 > MAX_INT64 - 2_000_000);
+        assert_eq!(NEAR_MAX_INT64, i64::MAX - 1_000_000);
     }
 }

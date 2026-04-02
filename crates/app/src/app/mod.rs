@@ -1398,7 +1398,7 @@ impl App {
     /// Matches stellar-core's `isLoadgenTx` bypass in `TransactionQueue::canAdd()`
     /// which skips both tx validation and fee balance checks for loadgen txs
     /// (gated on `#ifdef BUILD_TESTS`).
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(feature = "test-utils")]
     pub fn set_skip_fee_balance_check(&self, skip: bool) {
         self.herder.tx_queue().set_skip_fee_balance_check(skip);
     }
@@ -3601,7 +3601,7 @@ mod tests {
         // for when the heuristic is correct.
         let advanced_latest_ext = target_checkpoint as u64 + 1;
         assert!(
-            !(target_checkpoint as u64 > advanced_latest_ext),
+            target_checkpoint as u64 <= advanced_latest_ext,
             "When latest_ext advances past checkpoint, normal catchup should trigger"
         );
     }

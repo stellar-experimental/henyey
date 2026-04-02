@@ -18,12 +18,10 @@ pub trait Clock: Send + Sync + 'static {
     }
 
     fn interval(&self, period: Duration) -> BoxStream<'static, ()> {
-        let interval = tokio::time::interval(period);
-        let stream = unfold(interval, |mut interval| async move {
+        Box::pin(unfold(tokio::time::interval(period), |mut interval| async move {
             interval.tick().await;
             Some(((), interval))
-        });
-        Box::pin(stream)
+        }))
     }
 }
 
@@ -46,12 +44,6 @@ impl Default for VirtualClock {
         Self {
             base_instant: Instant::now(),
         }
-    }
-}
-
-impl VirtualClock {
-    pub fn new() -> Self {
-        Self::default()
     }
 }
 

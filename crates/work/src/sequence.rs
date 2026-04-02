@@ -57,6 +57,10 @@ impl WorkSequence {
         Self::default()
     }
 
+    fn next_deps(&self) -> Vec<WorkId> {
+        self.ids.last().copied().into_iter().collect()
+    }
+
     /// Adds a work item to the sequence.
     ///
     /// The work item will depend on the previously added item (if any).
@@ -77,12 +81,7 @@ impl WorkSequence {
         work: Box<dyn Work + Send>,
         retries: u32,
     ) -> WorkId {
-        let deps = self
-            .ids
-            .last()
-            .copied()
-            .map_or_else(Vec::new, |id| vec![id]);
-        let id = scheduler.add_work(work, deps, retries);
+        let id = scheduler.add_work(work, self.next_deps(), retries);
         self.ids.push(id);
         id
     }

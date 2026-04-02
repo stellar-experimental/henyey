@@ -327,42 +327,64 @@ impl HistoryQueries for Connection {
             })
         };
 
-        // Build WHERE clause and parameter list dynamically to avoid
-        // duplicating the full query across four branches.
-        let mut sql = String::from(
-            "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status \
-             FROM txhistory WHERE ",
-        );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(tx_index) = start_tx_index {
-            // Cursor-based: start after (start_ledger, tx_index)
-            sql.push_str("(ledgerseq > ? OR (ledgerseq = ? AND txindex > ?)) AND ledgerseq < ?");
-            param_values.push(Box::new(start_ledger));
-            param_values.push(Box::new(start_ledger));
-            param_values.push(Box::new(tx_index));
-            param_values.push(Box::new(end_ledger));
-        } else {
-            // Start from beginning of start_ledger
-            sql.push_str("ledgerseq >= ? AND ledgerseq < ?");
-            param_values.push(Box::new(start_ledger));
-            param_values.push(Box::new(end_ledger));
+        match (start_tx_index, status_filter) {
+            (Some(tx_index), Some(status)) => {
+                let mut stmt = self.prepare(
+                    "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status FROM txhistory \
+                     WHERE (ledgerseq > ?1 OR (ledgerseq = ?2 AND txindex > ?3)) \
+                     AND ledgerseq < ?4 AND status = ?5 \
+                     ORDER BY ledgerseq ASC, txindex ASC LIMIT ?6",
+                )?;
+                let rows = stmt.query_map(
+                    params![
+                        start_ledger,
+                        start_ledger,
+                        tx_index,
+                        end_ledger,
+                        status,
+                        limit
+                    ],
+                    map_row,
+                )?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(DbError::from)
+            }
+            (Some(tx_index), None) => {
+                let mut stmt = self.prepare(
+                    "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status FROM txhistory \
+                     WHERE (ledgerseq > ?1 OR (ledgerseq = ?2 AND txindex > ?3)) \
+                     AND ledgerseq < ?4 \
+                     ORDER BY ledgerseq ASC, txindex ASC LIMIT ?5",
+                )?;
+                let rows = stmt.query_map(
+                    params![start_ledger, start_ledger, tx_index, end_ledger, limit],
+                    map_row,
+                )?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(DbError::from)
+            }
+            (None, Some(status)) => {
+                let mut stmt = self.prepare(
+                    "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status FROM txhistory \
+                     WHERE ledgerseq >= ?1 AND ledgerseq < ?2 AND status = ?3 \
+                     ORDER BY ledgerseq ASC, txindex ASC LIMIT ?4",
+                )?;
+                let rows =
+                    stmt.query_map(params![start_ledger, end_ledger, status, limit], map_row)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(DbError::from)
+            }
+            (None, None) => {
+                let mut stmt = self.prepare(
+                    "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status FROM txhistory \
+                     WHERE ledgerseq >= ?1 AND ledgerseq < ?2 \
+                     ORDER BY ledgerseq ASC, txindex ASC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![start_ledger, end_ledger, limit], map_row)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(DbError::from)
+            }
         }
-
-        if let Some(status) = status_filter {
-            sql.push_str(" AND status = ?");
-            param_values.push(Box::new(status));
-        }
-
-        sql.push_str(" ORDER BY ledgerseq ASC, txindex ASC LIMIT ?");
-        param_values.push(Box::new(limit));
-
-        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = self.prepare(&sql)?;
-        let rows = stmt.query_map(params_refs.as_slice(), map_row)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(DbError::from)
     }
 
     fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {

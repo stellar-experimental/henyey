@@ -114,7 +114,6 @@ struct EvictionScanContext<'a> {
 ///
 /// Returns evicted keys, archived entries, and the updated iterator position.
 /// If eviction is disabled or the protocol version is too low, returns an empty result.
-#[allow(clippy::too_many_arguments)]
 fn run_eviction_scan(
     bucket_list: &mut henyey_bucket::BucketList,
     context: EvictionScanContext<'_>,

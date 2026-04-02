@@ -83,6 +83,9 @@ const PEER_IP_RESOLVE_DELAY: Duration = Duration::from_secs(600);
 /// Matches stellar-core `PEER_IP_RESOLVE_RETRY_DELAY`.
 const PEER_IP_RESOLVE_RETRY_DELAY: Duration = Duration::from_secs(10);
 
+/// Delay before retrying a failed outbound connection attempt.
+const OUTBOUND_CONNECT_RETRY_DELAY: Duration = Duration::from_secs(10);
+
 /// Result of a background DNS resolution of configured peers.
 struct ResolvedPeers {
     /// Successfully resolved known peers (hostname → IP:port).
@@ -1144,7 +1147,7 @@ impl OverlayManager {
                         }
                         Err(e) => {
                             warn!("Failed to connect to preferred peer {}: {}", addr, e);
-                            retry_after.insert(addr.clone(), now + Duration::from_secs(10));
+                            retry_after.insert(addr.clone(), now + OUTBOUND_CONNECT_RETRY_DELAY);
                         }
                     }
                 }
@@ -1200,7 +1203,7 @@ impl OverlayManager {
                         }
                         Err(e) => {
                             debug!("Failed to connect to peer {}: {}", addr, e);
-                            retry_after.insert(addr.clone(), now + Duration::from_secs(10));
+                            retry_after.insert(addr.clone(), now + OUTBOUND_CONNECT_RETRY_DELAY);
                         }
                     }
                 }

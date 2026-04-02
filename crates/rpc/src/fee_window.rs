@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn test_compute_fee_distribution_empty() {
-        let dist = compute_fee_distribution(&mut vec![], 0);
+        let dist = compute_fee_distribution(&mut [], 0);
         assert_eq!(dist.fee_count, 0);
         assert_eq!(dist.ledger_count, 0);
         assert_eq!(dist.min, 0);

@@ -302,7 +302,9 @@ mod loadgen_runner {
                         inner.network_passphrase.clone(),
                     ));
                 }
-                let generator = guard.as_mut().unwrap();
+                let Some(generator) = guard.as_mut() else {
+                    unreachable!("load generator must exist after initialization");
+                };
 
                 let result = generator.generate_load(&mut config).await;
 

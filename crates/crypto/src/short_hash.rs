@@ -96,6 +96,12 @@ fn expand_seed_to_key(seed: u32) -> [u8; KEY_BYTES] {
     key
 }
 
+fn compute_hash_with_key(key: &[u8; KEY_BYTES], bytes: &[u8]) -> u64 {
+    let mut hasher = SipHasher24::new_with_key(key);
+    hasher.write(bytes);
+    hasher.finish()
+}
+
 /// Seeds the short hash key with a deterministic value.
 ///
 /// This is used for tests and replay scenarios where deterministic ordering
@@ -136,9 +142,7 @@ pub fn seed(seed: u32) -> Result<(), CryptoError> {
 pub fn compute_hash(bytes: &[u8]) -> u64 {
     let mut state = key_state().lock().expect("short hash lock poisoned");
     state.have_hashed = true;
-    let mut hasher = SipHasher24::new_with_key(&state.key);
-    hasher.write(bytes);
-    hasher.finish()
+    compute_hash_with_key(&state.key, bytes)
 }
 
 /// Computes a SipHash-2-4 hash of an XDR-encoded value.
@@ -177,12 +181,6 @@ mod tests {
         *state = KeyState::new();
     }
 
-    fn compute_hash_with_key(key: [u8; KEY_BYTES], bytes: &[u8]) -> u64 {
-        let mut hasher = SipHasher24::new_with_key(&key);
-        hasher.write(bytes);
-        hasher.finish()
-    }
-
     #[test]
     fn test_siphash_vector() {
         let _guard = test_guard();
@@ -192,7 +190,7 @@ mod tests {
             0x0e, 0x0f,
         ];
         let msg = [0u8; 0];
-        let got = compute_hash_with_key(key, &msg);
+        let got = compute_hash_with_key(&key, &msg);
         let expected = 0x726fdb47dd0e0e31u64;
         assert_eq!(got, expected);
     }
@@ -216,7 +214,7 @@ mod tests {
         let seed_value = 0x12345678;
         seed(seed_value).expect("seed");
         let key = expand_seed_to_key(seed_value);
-        let expected = compute_hash_with_key(key, b"");
+        let expected = compute_hash_with_key(&key, b"");
         let got = compute_hash(b"");
         assert_eq!(got, expected);
     }

@@ -361,7 +361,7 @@ fn resolve_deposit_asset(
             .map_err(|_| LiquidityPoolDepositResultCode::Underfunded)?,
         _ if is_issuer(source, asset) => i64::MAX,
         _ => trustline
-            .map(|tl| trustline_balance_after_liabilities(tl))
+            .map(trustline_balance_after_liabilities)
             .unwrap_or(0),
     };
 

@@ -181,7 +181,7 @@ impl SorobanBudget {
     pub fn charge_cpu(&mut self, instructions: u64) -> Result<(), BudgetError> {
         self.cpu_used = self.cpu_used.saturating_add(instructions);
         if self.cpu_used > self.limits.cpu_instructions {
-            Err(BudgetError::CpuLimitExceeded)
+            Err(BudgetError::Cpu)
         } else {
             Ok(())
         }
@@ -191,7 +191,7 @@ impl SorobanBudget {
     pub fn charge_mem(&mut self, bytes: u64) -> Result<(), BudgetError> {
         self.mem_used = self.mem_used.saturating_add(bytes);
         if self.mem_used > self.limits.memory_bytes {
-            Err(BudgetError::MemoryLimitExceeded)
+            Err(BudgetError::Memory)
         } else {
             Ok(())
         }
@@ -201,7 +201,7 @@ impl SorobanBudget {
     pub fn charge_read(&mut self, bytes: u64) -> Result<(), BudgetError> {
         self.read_bytes_used = self.read_bytes_used.saturating_add(bytes);
         if self.read_bytes_used > self.limits.read_bytes {
-            Err(BudgetError::ReadLimitExceeded)
+            Err(BudgetError::Read)
         } else {
             Ok(())
         }
@@ -211,7 +211,7 @@ impl SorobanBudget {
     pub fn charge_write(&mut self, bytes: u64) -> Result<(), BudgetError> {
         self.write_bytes_used = self.write_bytes_used.saturating_add(bytes);
         if self.write_bytes_used > self.limits.write_bytes {
-            Err(BudgetError::WriteLimitExceeded)
+            Err(BudgetError::Write)
         } else {
             Ok(())
         }
@@ -248,22 +248,22 @@ impl SorobanBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetError {
     /// CPU instruction limit exceeded.
-    CpuLimitExceeded,
+    Cpu,
     /// Memory limit exceeded.
-    MemoryLimitExceeded,
+    Memory,
     /// Read bytes limit exceeded.
-    ReadLimitExceeded,
+    Read,
     /// Write bytes limit exceeded.
-    WriteLimitExceeded,
+    Write,
 }
 
 impl std::fmt::Display for BudgetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::CpuLimitExceeded => write!(f, "CPU instruction limit exceeded"),
-            Self::MemoryLimitExceeded => write!(f, "memory limit exceeded"),
-            Self::ReadLimitExceeded => write!(f, "read bytes limit exceeded"),
-            Self::WriteLimitExceeded => write!(f, "write bytes limit exceeded"),
+            Self::Cpu => write!(f, "CPU instruction limit exceeded"),
+            Self::Memory => write!(f, "memory limit exceeded"),
+            Self::Read => write!(f, "read bytes limit exceeded"),
+            Self::Write => write!(f, "write bytes limit exceeded"),
         }
     }
 }
@@ -321,7 +321,7 @@ mod tests {
 
         // Exceeds limit
         let result = budget.charge_mem(1);
-        assert!(matches!(result, Err(BudgetError::MemoryLimitExceeded)));
+        assert!(matches!(result, Err(BudgetError::Memory)));
     }
 
     /// Test read bytes budget tracking.
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(budget.read_bytes_used, 200);
 
         let result = budget.charge_read(1);
-        assert!(matches!(result, Err(BudgetError::ReadLimitExceeded)));
+        assert!(matches!(result, Err(BudgetError::Read)));
     }
 
     /// Test write bytes budget tracking.
@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(budget.write_bytes_used, 150);
 
         let result = budget.charge_write(1);
-        assert!(matches!(result, Err(BudgetError::WriteLimitExceeded)));
+        assert!(matches!(result, Err(BudgetError::Write)));
     }
 
     /// Test budget reset.

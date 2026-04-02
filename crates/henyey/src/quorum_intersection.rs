@@ -46,6 +46,8 @@ use henyey_scp::{is_quorum, is_quorum_slice};
 use serde::Deserialize;
 use stellar_xdr::curr::{NodeId, ScpQuorumSet};
 
+type QuorumMap = HashMap<NodeId, ScpQuorumSet>;
+
 /// JSON representation of the network configuration for quorum intersection analysis.
 #[derive(Debug, Deserialize)]
 struct QuorumIntersectionJson {
@@ -100,7 +102,7 @@ fn parse_qset(entry: &QsetEntry) -> anyhow::Result<ScpQuorumSet> {
 /// - The file cannot be read
 /// - The JSON is malformed
 /// - Any node ID or quorum set is invalid
-fn load_quorum_map(path: &Path) -> anyhow::Result<HashMap<NodeId, ScpQuorumSet>> {
+fn load_quorum_map(path: &Path) -> anyhow::Result<QuorumMap> {
     let payload = fs::read_to_string(path)?;
     let json: QuorumIntersectionJson =
         serde_json::from_str(&payload).map_err(|e| anyhow::anyhow!("parse error: {}", e))?;
@@ -120,7 +122,7 @@ fn load_quorum_map(path: &Path) -> anyhow::Result<HashMap<NodeId, ScpQuorumSet>>
 /// A set of nodes is a quorum if every node in the set has its quorum slice
 /// requirements satisfied by the set. This function picks an arbitrary node
 /// from the set and uses SCP's `is_quorum` check.
-fn is_quorum_for_set(nodes: &HashSet<NodeId>, qmap: &HashMap<NodeId, ScpQuorumSet>) -> bool {
+fn is_quorum_for_set(nodes: &HashSet<NodeId>, qmap: &QuorumMap) -> bool {
     let Some(first) = nodes.iter().next() else {
         return false;
     };
@@ -156,18 +158,18 @@ const MAX_QUORUM_INTERSECTION_NODES: usize = 20;
 /// # Panics
 ///
 /// Panics if the network has more than [`MAX_QUORUM_INTERSECTION_NODES`] nodes.
-fn network_enjoys_quorum_intersection(qmap: &HashMap<NodeId, ScpQuorumSet>) -> bool {
+fn network_enjoys_quorum_intersection(qmap: &QuorumMap) -> bool {
     let nodes: Vec<NodeId> = qmap.keys().cloned().collect();
     if nodes.is_empty() {
         return false;
     }
-    if nodes.len() > MAX_QUORUM_INTERSECTION_NODES {
-        panic!(
-            "Quorum intersection analysis only supports up to {} nodes, got {}",
-            MAX_QUORUM_INTERSECTION_NODES,
-            nodes.len()
-        );
-    }
+
+    assert!(
+        nodes.len() <= MAX_QUORUM_INTERSECTION_NODES,
+        "Quorum intersection analysis only supports up to {} nodes, got {}",
+        MAX_QUORUM_INTERSECTION_NODES,
+        nodes.len()
+    );
 
     // Enumerate all possible quorums by checking every subset
     let mut quorums: Vec<HashSet<NodeId>> = Vec::new();

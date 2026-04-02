@@ -71,14 +71,6 @@ fn compute_cache_key(pubkey: &[u8; 32], sig: &[u8; 64], hash: &[u8; 32]) -> [u8;
     hasher.finalize().into()
 }
 
-fn cached_verify_result(result: bool) -> Result<(), CryptoError> {
-    if result {
-        Ok(())
-    } else {
-        Err(CryptoError::InvalidSignature)
-    }
-}
-
 /// Signs a hash value.
 ///
 /// This signs the raw 32 bytes of the hash. Use this when signing transaction
@@ -112,7 +104,11 @@ pub fn verify_hash_from_raw_key(
             .read()
             .expect("signature cache lock poisoned");
         if let Some(result) = cache.get(&cache_key) {
-            return cached_verify_result(result);
+            return if result {
+                Ok(())
+            } else {
+                Err(CryptoError::InvalidSignature)
+            };
         }
     }
 

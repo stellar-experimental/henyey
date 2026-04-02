@@ -33,6 +33,15 @@ use henyey_crypto::{sha256, SecretKey};
 /// This is the same binary embedded in stellar-core via `soroban_test_wasms::WRITE_BYTES`.
 const WRITE_BYTES_WASM: &[u8] = include_bytes!("../wasm/soroban_write_upgrade_bytes_contract.wasm");
 
+fn single_operation(body: OperationBody) -> VecM<Operation, 100> {
+    vec![Operation {
+        source_account: None,
+        body,
+    }]
+    .try_into()
+    .unwrap()
+}
+
 fn build_soroban_envelope(
     public_key: &Uint256,
     seq_num: i64,
@@ -91,14 +100,11 @@ fn get_wasm_restore_tx(
         seq_num,
         fee,
         resource_fee,
-        vec![Operation {
-            source_account: None,
-            body: OperationBody::RestoreFootprint(stellar_xdr::curr::RestoreFootprintOp {
+        single_operation(OperationBody::RestoreFootprint(
+            stellar_xdr::curr::RestoreFootprintOp {
                 ext: stellar_xdr::curr::ExtensionPoint::V0,
-            }),
-        }]
-        .try_into()
-        .unwrap(),
+            },
+        )),
         resources,
     );
 
@@ -106,11 +112,7 @@ fn get_wasm_restore_tx(
 }
 
 /// Build the WASM upload transaction (tx 2 of 4).
-fn get_upload_tx(
-    public_key: &Uint256,
-    seq_num: i64,
-    _add_resource_fee: i64,
-) -> (TransactionEnvelope, LedgerKey) {
+fn get_upload_tx(public_key: &Uint256, seq_num: i64) -> (TransactionEnvelope, LedgerKey) {
     let wasm = WRITE_BYTES_WASM.to_vec();
     let wasm_hash = sha256(&wasm);
 
@@ -137,15 +139,12 @@ fn get_upload_tx(
         seq_num,
         fee,
         resource_fee,
-        vec![Operation {
-            source_account: None,
-            body: OperationBody::InvokeHostFunction(stellar_xdr::curr::InvokeHostFunctionOp {
+        single_operation(OperationBody::InvokeHostFunction(
+            stellar_xdr::curr::InvokeHostFunctionOp {
                 host_function: HostFunction::UploadContractWasm(wasm.try_into().unwrap()),
                 auth: VecM::default(),
-            }),
-        }]
-        .try_into()
-        .unwrap(),
+            },
+        )),
         resources,
     );
 
@@ -233,15 +232,12 @@ fn get_create_tx(
         seq_num,
         fee,
         resource_fee,
-        vec![Operation {
-            source_account: None,
-            body: OperationBody::InvokeHostFunction(stellar_xdr::curr::InvokeHostFunctionOp {
+        single_operation(OperationBody::InvokeHostFunction(
+            stellar_xdr::curr::InvokeHostFunctionOp {
                 host_function: HostFunction::CreateContract(create_args),
                 auth: vec![auth].try_into().unwrap(),
-            }),
-        }]
-        .try_into()
-        .unwrap(),
+            },
+        )),
         resources,
     );
 
@@ -313,15 +309,12 @@ fn get_invoke_tx(
         seq_num,
         fee,
         resource_fee,
-        vec![Operation {
-            source_account: None,
-            body: OperationBody::InvokeHostFunction(stellar_xdr::curr::InvokeHostFunctionOp {
+        single_operation(OperationBody::InvokeHostFunction(
+            stellar_xdr::curr::InvokeHostFunctionOp {
                 host_function: HostFunction::InvokeContract(invoke_args),
                 auth: VecM::default(),
-            }),
-        }]
-        .try_into()
-        .unwrap(),
+            },
+        )),
         resources,
     );
 
@@ -420,7 +413,7 @@ pub fn run(
         get_wasm_restore_tx(&public_key, seq_num + 1, add_resource_fee);
 
     // Note: stellar-core passes 0 for addResourceFee to getUploadTx
-    let (mut upload_tx, contract_code_key) = get_upload_tx(&public_key, seq_num + 2, 0);
+    let (mut upload_tx, contract_code_key) = get_upload_tx(&public_key, seq_num + 2);
 
     let (mut create_tx, contract_source_ref_key, contract_id) = get_create_tx(
         &public_key,
@@ -490,7 +483,7 @@ pub fn run(
 
 /// Read a secret key from stdin, trimming whitespace.
 fn read_secret_from_stdin() -> anyhow::Result<String> {
-    let mut input = String::new();
-    std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
-    Ok(input.trim().to_string())
+    Ok(std::io::read_to_string(std::io::stdin())?
+        .trim()
+        .to_string())
 }

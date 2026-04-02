@@ -256,28 +256,28 @@ pub fn get_issuer(asset: &Asset) -> Result<&AccountId, NoIssuerError> {
     }
 }
 
+fn credit_asset_to_trustline_asset(asset: &Asset) -> Option<TrustLineAsset> {
+    match asset {
+        Asset::Native => None,
+        Asset::CreditAlphanum4(a) => Some(TrustLineAsset::CreditAlphanum4(a.clone())),
+        Asset::CreditAlphanum12(a) => Some(TrustLineAsset::CreditAlphanum12(a.clone())),
+    }
+}
+
 /// Convert an [`Asset`] to its [`TrustLineAsset`] equivalent.
 ///
 /// The `Asset` enum has three variants (Native, CreditAlphanum4, CreditAlphanum12),
 /// while `TrustLineAsset` adds PoolShare. This conversion maps the three common
 /// variants directly.
 pub fn asset_to_trustline_asset(asset: &Asset) -> TrustLineAsset {
-    match asset {
-        Asset::Native => TrustLineAsset::Native,
-        Asset::CreditAlphanum4(a) => TrustLineAsset::CreditAlphanum4(a.clone()),
-        Asset::CreditAlphanum12(a) => TrustLineAsset::CreditAlphanum12(a.clone()),
-    }
+    credit_asset_to_trustline_asset(asset).unwrap_or(TrustLineAsset::Native)
 }
 
 /// Convert a non-native [`Asset`] to its [`TrustLineAsset`] equivalent.
 ///
 /// Returns `None` for native assets, since native assets do not have trustlines.
 pub fn non_native_asset_to_trustline_asset(asset: &Asset) -> Option<TrustLineAsset> {
-    match asset {
-        Asset::Native => None,
-        Asset::CreditAlphanum4(a) => Some(TrustLineAsset::CreditAlphanum4(a.clone())),
-        Asset::CreditAlphanum12(a) => Some(TrustLineAsset::CreditAlphanum12(a.clone())),
-    }
+    credit_asset_to_trustline_asset(asset)
 }
 
 /// Get the issuer of a TrustLineAsset.
@@ -473,6 +473,41 @@ mod tests {
         assert_eq!(asset_to_string(&Asset::Native), "XLM");
         assert_eq!(asset_to_string(&make_asset4("USD", 1)), "USD");
         assert_eq!(asset_to_string(&make_asset12("MYTOKEN", 1)), "MYTOKEN");
+    }
+
+    #[test]
+    fn test_asset_to_trustline_asset() {
+        assert_eq!(
+            asset_to_trustline_asset(&Asset::Native),
+            TrustLineAsset::Native
+        );
+        assert_eq!(
+            asset_to_trustline_asset(&make_asset4("USD", 1)),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: make_account_id(1),
+            })
+        );
+        assert_eq!(
+            asset_to_trustline_asset(&make_asset12("MYTOKEN", 1)),
+            TrustLineAsset::CreditAlphanum12(AlphaNum12 {
+                asset_code: AssetCode12(*b"MYTOKEN\0\0\0\0\0"),
+                issuer: make_account_id(1),
+            })
+        );
+    }
+
+    #[test]
+    fn test_non_native_asset_to_trustline_asset() {
+        assert_eq!(non_native_asset_to_trustline_asset(&Asset::Native), None);
+        assert!(matches!(
+            non_native_asset_to_trustline_asset(&make_asset4("USD", 1)),
+            Some(TrustLineAsset::CreditAlphanum4(_))
+        ));
+        assert!(matches!(
+            non_native_asset_to_trustline_asset(&make_asset12("MYTOKEN", 1)),
+            Some(TrustLineAsset::CreditAlphanum12(_))
+        ));
     }
 
     #[test]

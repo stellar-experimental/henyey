@@ -184,40 +184,15 @@ impl CloseTimeDriftTracker {
     /// Computes the 75th percentile of drift values and returns a warning
     /// if it exceeds the threshold. Clears the window afterward.
     fn check_and_clear_drift(&mut self) -> Option<String> {
-        // Collect drift values for entries that have both times recorded
-        let mut drifts: Vec<i64> = self
-            .window
-            .values()
-            .filter_map(|entry| {
-                entry.externalized_close_time.map(|network| {
-                    // Drift = network time - local time
-                    // Positive drift means network is ahead of local clock
-                    // Negative drift means local clock is ahead of network
-                    network as i64 - entry.local_close_time as i64
-                })
-            })
-            .collect();
-
-        let result = if !drifts.is_empty() {
-            // Sort to compute percentile
-            drifts.sort();
-
-            // Compute 75th percentile
-            let p75_index = (drifts.len() as f64 * 0.75).ceil() as usize - 1;
-            let p75_index = p75_index.min(drifts.len() - 1);
-            let drift_p75 = drifts[p75_index];
-
-            if drift_p75.abs() > self.threshold {
-                Some(format!(
+        let result = self
+            .sorted_completed_drifts()
+            .and_then(|drifts| match drift_p75(&drifts) {
+                Some(drift_p75) if drift_p75.abs() > self.threshold => Some(format!(
                     "{} Close time local drift is: {} seconds",
                     POSSIBLY_BAD_LOCAL_CLOCK, drift_p75
-                ))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+                )),
+                _ => None,
+            });
 
         // Clear the window after checking
         self.window.clear();
@@ -243,29 +218,13 @@ impl CloseTimeDriftTracker {
     /// Returns (min_drift, max_drift, median_drift, p75_drift) in seconds,
     /// or None if there are no completed entries.
     pub fn get_drift_stats(&self) -> Option<DriftStats> {
-        let mut drifts: Vec<i64> = self
-            .window
-            .values()
-            .filter_map(|entry| {
-                entry
-                    .externalized_close_time
-                    .map(|network| network as i64 - entry.local_close_time as i64)
-            })
-            .collect();
-
-        if drifts.is_empty() {
-            return None;
-        }
-
-        drifts.sort();
+        let drifts = self.sorted_completed_drifts()?;
 
         let min = drifts[0];
         let max = drifts[drifts.len() - 1];
         let median_index = drifts.len() / 2;
         let median = drifts[median_index];
-        let p75_index = (drifts.len() as f64 * 0.75).ceil() as usize - 1;
-        let p75_index = p75_index.min(drifts.len() - 1);
-        let p75 = drifts[p75_index];
+        let p75 = drift_p75(&drifts).expect("non-empty drift list has a p75 value");
 
         Some(DriftStats {
             min,
@@ -275,6 +234,41 @@ impl CloseTimeDriftTracker {
             sample_count: drifts.len(),
         })
     }
+
+    fn sorted_completed_drifts(&self) -> Option<Vec<i64>> {
+        let mut drifts: Vec<i64> = self.window.values().filter_map(DriftEntry::drift).collect();
+
+        if drifts.is_empty() {
+            return None;
+        }
+
+        drifts.sort();
+        Some(drifts)
+    }
+}
+
+impl DriftEntry {
+    fn drift(&self) -> Option<i64> {
+        self.externalized_close_time.map(|network| {
+            // Drift = network time - local time
+            // Positive drift means network is ahead of local clock
+            // Negative drift means local clock is ahead of network
+            network as i64 - self.local_close_time as i64
+        })
+    }
+}
+
+fn drift_p75(drifts: &[i64]) -> Option<i64> {
+    percentile_value(drifts, 0.75)
+}
+
+fn percentile_value(values: &[i64], percentile: f64) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+
+    let index = ((values.len() as f64 * percentile).ceil() as usize).saturating_sub(1);
+    Some(values[index.min(values.len() - 1)])
 }
 
 /// Statistics about clock drift.

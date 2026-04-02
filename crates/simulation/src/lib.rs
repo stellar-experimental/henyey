@@ -146,7 +146,7 @@ impl Simulation {
         let node = SimNode {
             node_id: node_id.clone(),
             secret_key,
-            clock: VirtualClock::new(),
+            clock: VirtualClock::default(),
             ledger_seq: 1,
             ledger_hash: Hash256::hash(node_id.as_bytes()),
         };

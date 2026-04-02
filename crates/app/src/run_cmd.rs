@@ -84,6 +84,7 @@ impl std::fmt::Display for RunMode {
 /// Configuration options for the run command.
 ///
 /// Controls the running mode, synchronization behavior, and catchup policy.
+#[derive(Clone)]
 pub struct RunOptions {
     /// Running mode (full, validator, or watcher).
     pub mode: RunMode,
@@ -124,20 +125,6 @@ impl std::fmt::Debug for RunOptions {
     }
 }
 
-impl Clone for RunOptions {
-    fn clone(&self) -> Self {
-        Self {
-            mode: self.mode,
-            force_catchup: self.force_catchup,
-            wait_for_sync: self.wait_for_sync,
-            max_ledger_age: self.max_ledger_age,
-            #[cfg(feature = "loadgen")]
-            loadgen_runner_factory: self.loadgen_runner_factory.clone(),
-            extra_server_spawner: self.extra_server_spawner.clone(),
-        }
-    }
-}
-
 impl Default for RunOptions {
     fn default() -> Self {
         Self {
@@ -165,7 +152,6 @@ impl RunOptions {
     pub fn watcher() -> Self {
         Self {
             mode: RunMode::Watcher,
-            force_catchup: false,
             wait_for_sync: false,
             ..Default::default()
         }
@@ -606,7 +592,7 @@ impl NodeRunner {
             consensus_state: stats.state.to_string(),
             pending_tx_count: stats.pending_transactions,
             uptime_secs: self.start_time.elapsed().as_secs(),
-            state: format!("{}", self.app.state().await),
+            state: self.app.state().await.to_string(),
         }
     }
 

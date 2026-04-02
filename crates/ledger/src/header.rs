@@ -138,43 +138,20 @@ pub fn skip_list_target_seq(current_seq: u32, skip_index: usize) -> Option<u32> 
         return None;
     }
 
+    fn round_back(current_seq: u32, interval: u32) -> u32 {
+        let rem = current_seq % interval;
+        if rem == 0 { interval } else { rem }
+    }
+
     let delta = match skip_index {
-        0 => 1, // Previous ledger
-        1 => {
-            // Points back by at most 4
-            let rem = current_seq % 4;
-            if rem == 0 {
-                4
-            } else {
-                rem
-            }
-        }
-        2 => {
-            // Points back by at most 16
-            let rem = current_seq % 16;
-            if rem == 0 {
-                16
-            } else {
-                rem
-            }
-        }
-        3 => {
-            // Points back by at most 64
-            let rem = current_seq % 64;
-            if rem == 0 {
-                64
-            } else {
-                rem
-            }
-        }
+        0 => 1,
+        1 => round_back(current_seq, 4),
+        2 => round_back(current_seq, 16),
+        3 => round_back(current_seq, 64),
         _ => return None,
     };
 
-    if current_seq >= delta {
-        Some(current_seq - delta)
-    } else {
-        None
-    }
+    current_seq.checked_sub(delta)
 }
 
 /// Verify that a ledger header correctly chains to its predecessor.

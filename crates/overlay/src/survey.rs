@@ -864,7 +864,12 @@ mod tests {
         let peer2 = make_peer_id(2);
         let peer3 = make_peer_id(3);
 
-        manager.start_collecting(12345, 0, &[peer2.clone()], &[peer3.clone()]);
+        manager.start_collecting(
+            12345,
+            0,
+            std::slice::from_ref(&peer2),
+            std::slice::from_ref(&peer3),
+        );
 
         // Wrong nonce should fail
         assert!(!manager.stop_collecting(99999, 0, &[], &[]));

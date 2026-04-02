@@ -1081,10 +1081,9 @@ mod tests {
     /// When minSeqNum is used, transactions can have sequence gaps (tx seq > account seq + 1).
     /// The account's final sequence must equal the transaction's sequence number.
     ///
-    /// Bug found: At ledger 28110, a transaction with minSeqNum had:
-    ///   - account_seq = 120722940755968
-    ///   - tx_seq = 120722940755970 (gap of 1)
-    /// We incorrectly set account seq to 968+1=969 instead of 970.
+    /// Bug found at ledger 28110: a transaction with minSeqNum had account_seq =
+    /// 120722940755968 and tx_seq = 120722940755970, but we incorrectly set the
+    /// account sequence to 968 + 1 = 969 instead of 970.
     #[test]
     fn test_process_seq_num_with_sequence_gap_cap_0021() {
         let mut ctx = make_test_context_with_state(21);

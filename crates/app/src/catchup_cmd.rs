@@ -158,7 +158,7 @@ pub struct ParsedCatchupTarget {
 /// - "12345/100" -> CatchupTarget::Ledger(12345) with Recent(100) mode
 /// - "12345/max" -> CatchupTarget::Ledger(12345) with Complete mode
 pub fn parse_target(target: &str) -> anyhow::Result<CatchupTarget> {
-    Ok(parse_target_with_mode(target)?.target)
+    parse_target_with_mode(target).map(|parsed| parsed.target)
 }
 
 /// Parse a target ledger specification including optional count for mode.

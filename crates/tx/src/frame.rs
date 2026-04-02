@@ -1051,7 +1051,7 @@ mod tests {
     fn test_frame_with_network() {
         let envelope = create_test_transaction();
         let network = NetworkId::testnet();
-        let frame = TransactionFrame::from_owned_with_network(envelope, network.clone());
+        let frame = TransactionFrame::from_owned_with_network(envelope, network);
 
         // Hash should be computed with the network ID
         let hash_result = frame.hash(&network);

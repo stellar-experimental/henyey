@@ -60,32 +60,36 @@ pub async fn handle(
             obj.insert("status".into(), json!("TRY_AGAIN_LATER"));
         }
         henyey_herder::TxQueueResult::Invalid(code) => {
-            obj.insert("status".into(), json!("ERROR"));
-            let error_result = build_error_result(code);
-            util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
-            insert_empty_diagnostic_events(&mut obj, format);
+            insert_error_response(&mut obj, format, code)?;
         }
         henyey_herder::TxQueueResult::Banned => {
-            obj.insert("status".into(), json!("ERROR"));
-            let error_result = build_error_result(Some(TransactionResultCode::TxTooLate));
-            util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
-            insert_empty_diagnostic_events(&mut obj, format);
+            insert_error_response(&mut obj, format, Some(TransactionResultCode::TxTooLate))?;
         }
         henyey_herder::TxQueueResult::FeeTooLow => {
-            obj.insert("status".into(), json!("ERROR"));
-            let error_result = build_error_result(Some(TransactionResultCode::TxInsufficientFee));
-            util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
-            insert_empty_diagnostic_events(&mut obj, format);
+            insert_error_response(
+                &mut obj,
+                format,
+                Some(TransactionResultCode::TxInsufficientFee),
+            )?;
         }
         henyey_herder::TxQueueResult::Filtered => {
-            obj.insert("status".into(), json!("ERROR"));
-            let error_result = build_error_result(Some(TransactionResultCode::TxFailed));
-            util::insert_xdr_field(&mut obj, "errorResult", &error_result, format)?;
-            insert_empty_diagnostic_events(&mut obj, format);
+            insert_error_response(&mut obj, format, Some(TransactionResultCode::TxFailed))?;
         }
     }
 
     Ok(serde_json::Value::Object(obj))
+}
+
+fn insert_error_response(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    format: XdrFormat,
+    code: Option<TransactionResultCode>,
+) -> Result<(), JsonRpcError> {
+    obj.insert("status".into(), json!("ERROR"));
+    let error_result = build_error_result(code);
+    util::insert_xdr_field(obj, "errorResult", &error_result, format)?;
+    insert_empty_diagnostic_events(obj, format);
+    Ok(())
 }
 
 /// Insert an empty diagnosticEvents array into the response.

@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use stellar_xdr::curr::{TransactionEnvelope, TransactionMeta, TransactionResult};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -102,11 +101,6 @@ pub async fn handle(
     let mut last_cursor = String::new();
 
     for record in &records {
-        let status = util::determine_tx_status(&record.result);
-
-        // Detect fee bump from the envelope
-        let fee_bump = util::is_fee_bump_envelope(&record.body);
-
         // Application order is 1-based (txindex is 0-based in DB)
         let application_order = record.tx_index + 1;
 
@@ -117,42 +111,12 @@ pub async fn handle(
         let toid = util::toid_encode(record.ledger_seq, application_order, 0);
         last_cursor = toid.to_string();
 
-        let mut obj = serde_json::Map::new();
-        obj.insert("status".into(), json!(status));
-        obj.insert("applicationOrder".into(), json!(application_order));
-        obj.insert("feeBump".into(), json!(fee_bump));
-        obj.insert("ledger".into(), json!(record.ledger_seq));
-        obj.insert("createdAt".into(), json!(created_at));
-        obj.insert("txHash".into(), json!(record.tx_id));
-
-        // Envelope XDR
-        util::insert_raw_xdr_field::<TransactionEnvelope>(
-            &mut obj,
-            "envelope",
-            &record.body,
+        let obj = super::transaction_response::build_transaction_object(
+            record,
+            json!(created_at),
             format,
+            true,
         )?;
-
-        // Result XDR
-        let result_bytes =
-            util::extract_result_xdr(&record.result).unwrap_or_else(|| record.result.clone());
-        util::insert_raw_xdr_field::<TransactionResult>(&mut obj, "result", &result_bytes, format)?;
-
-        // Result meta XDR
-        if let Some(ref meta_bytes) = record.meta {
-            util::insert_raw_xdr_field::<TransactionMeta>(
-                &mut obj,
-                "resultMeta",
-                meta_bytes,
-                format,
-            )?;
-        }
-
-        // Diagnostic events
-        if let Some(ref meta_bytes) = record.meta {
-            util::insert_diagnostic_events(&mut obj, meta_bytes, format)?;
-        }
-
         transactions.push(serde_json::Value::Object(obj));
     }
 

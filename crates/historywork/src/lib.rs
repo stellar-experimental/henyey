@@ -288,27 +288,6 @@ pub(crate) struct GetHistoryArchiveStateWork {
     state: SharedHistoryState,
 }
 
-impl GetHistoryArchiveStateWork {
-    /// Creates a new HAS download work item.
-    ///
-    /// # Arguments
-    ///
-    /// * `archive` - The history archive to fetch from
-    /// * `checkpoint` - The checkpoint ledger sequence number
-    /// * `state` - Shared state to store the downloaded HAS
-    pub(crate) fn new(
-        archive: Arc<HistoryArchive>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-    ) -> Self {
-        Self {
-            archive,
-            checkpoint,
-            state,
-        }
-    }
-}
-
 #[async_trait]
 impl Work for GetHistoryArchiveStateWork {
     fn name(&self) -> &str {
@@ -352,27 +331,6 @@ pub(crate) struct DownloadBucketsWork {
     archive: Arc<HistoryArchive>,
     state: SharedHistoryState,
     bucket_dir: PathBuf,
-}
-
-impl DownloadBucketsWork {
-    /// Creates a new bucket download work item.
-    ///
-    /// # Arguments
-    ///
-    /// * `archive` - The history archive to fetch buckets from
-    /// * `state` - Shared state containing the HAS
-    /// * `bucket_dir` - Directory where bucket files will be saved
-    pub(crate) fn new(
-        archive: Arc<HistoryArchive>,
-        state: SharedHistoryState,
-        bucket_dir: PathBuf,
-    ) -> Self {
-        Self {
-            archive,
-            state,
-            bucket_dir,
-        }
-    }
 }
 
 /// Downloads a single bucket, verifies its hash, and saves it to disk.
@@ -511,27 +469,6 @@ pub(crate) struct DownloadLedgerHeadersWork {
     state: SharedHistoryState,
 }
 
-impl DownloadLedgerHeadersWork {
-    /// Creates a new ledger headers download work item.
-    ///
-    /// # Arguments
-    ///
-    /// * `archive` - The history archive to fetch headers from
-    /// * `checkpoint` - The checkpoint ledger sequence number
-    /// * `state` - Shared state where headers will be stored
-    pub(crate) fn new(
-        archive: Arc<HistoryArchive>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-    ) -> Self {
-        Self {
-            archive,
-            checkpoint,
-            state,
-        }
-    }
-}
-
 #[async_trait]
 impl Work for DownloadLedgerHeadersWork {
     fn name(&self) -> &str {
@@ -583,27 +520,6 @@ pub(crate) struct DownloadTransactionsWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
     state: SharedHistoryState,
-}
-
-impl DownloadTransactionsWork {
-    /// Creates a new transactions download work item.
-    ///
-    /// # Arguments
-    ///
-    /// * `archive` - The history archive to fetch transactions from
-    /// * `checkpoint` - The checkpoint ledger sequence number
-    /// * `state` - Shared state where transactions will be stored
-    pub(crate) fn new(
-        archive: Arc<HistoryArchive>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-    ) -> Self {
-        Self {
-            archive,
-            checkpoint,
-            state,
-        }
-    }
 }
 
 #[async_trait]
@@ -681,27 +597,6 @@ pub(crate) struct DownloadTxResultsWork {
     state: SharedHistoryState,
 }
 
-impl DownloadTxResultsWork {
-    /// Creates a new transaction results download work item.
-    ///
-    /// # Arguments
-    ///
-    /// * `archive` - The history archive to fetch results from
-    /// * `checkpoint` - The checkpoint ledger sequence number
-    /// * `state` - Shared state where results will be stored
-    pub(crate) fn new(
-        archive: Arc<HistoryArchive>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-    ) -> Self {
-        Self {
-            archive,
-            checkpoint,
-            state,
-        }
-    }
-}
-
 #[async_trait]
 impl Work for DownloadTxResultsWork {
     fn name(&self) -> &str {
@@ -776,27 +671,6 @@ pub(crate) struct DownloadScpHistoryWork {
     archive: Arc<HistoryArchive>,
     checkpoint: u32,
     state: SharedHistoryState,
-}
-
-impl DownloadScpHistoryWork {
-    /// Creates a new SCP history download work item.
-    ///
-    /// # Arguments
-    ///
-    /// * `archive` - The history archive to fetch SCP history from
-    /// * `checkpoint` - The checkpoint ledger sequence number
-    /// * `state` - Shared state where SCP history will be stored
-    pub(crate) fn new(
-        archive: Arc<HistoryArchive>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-    ) -> Self {
-        Self {
-            archive,
-            checkpoint,
-            state,
-        }
-    }
 }
 
 #[async_trait]
@@ -979,27 +853,6 @@ pub(crate) struct PublishHistoryArchiveStateWork {
     state: SharedHistoryState,
 }
 
-impl PublishHistoryArchiveStateWork {
-    /// Creates a new HAS publish work item.
-    ///
-    /// # Arguments
-    ///
-    /// * `writer` - The archive writer to publish to
-    /// * `checkpoint` - The checkpoint ledger sequence number
-    /// * `state` - Shared state containing the HAS to publish
-    pub(crate) fn new(
-        writer: Arc<dyn ArchiveWriter>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-    ) -> Self {
-        Self {
-            writer,
-            checkpoint,
-            state,
-        }
-    }
-}
-
 #[async_trait]
 impl Work for PublishHistoryArchiveStateWork {
     fn name(&self) -> &str {
@@ -1063,18 +916,6 @@ pub(crate) struct PublishBucketsWork {
     state: SharedHistoryState,
 }
 
-impl PublishBucketsWork {
-    /// Creates a new bucket publish work item.
-    ///
-    /// # Arguments
-    ///
-    /// * `writer` - The archive writer to publish to
-    /// * `state` - Shared state containing the buckets to publish
-    pub(crate) fn new(writer: Arc<dyn ArchiveWriter>, state: SharedHistoryState) -> Self {
-        Self { writer, state }
-    }
-}
-
 impl HistoryFileType {
     /// Returns the string representation used in archive paths.
     pub fn type_string(&self) -> &'static str {
@@ -1127,23 +968,6 @@ pub(crate) struct PublishXdrWork {
     checkpoint: u32,
     state: SharedHistoryState,
     file_type: HistoryFileType,
-}
-
-impl PublishXdrWork {
-    /// Creates a new publish work item for the given history file type.
-    pub(crate) fn new(
-        writer: Arc<dyn ArchiveWriter>,
-        checkpoint: u32,
-        state: SharedHistoryState,
-        file_type: HistoryFileType,
-    ) -> Self {
-        Self {
-            writer,
-            checkpoint,
-            state,
-            file_type,
-        }
-    }
 }
 
 #[async_trait]
@@ -1485,64 +1309,64 @@ impl HistoryWorkBuilder {
     /// [`HistoryWorkIds`] containing the scheduler IDs for all registered work.
     pub fn register(&self, scheduler: &mut WorkScheduler) -> HistoryWorkIds {
         let has_id = scheduler.add_work(
-            Box::new(GetHistoryArchiveStateWork::new(
-                Arc::clone(&self.archive),
-                self.checkpoint,
-                Arc::clone(&self.state),
-            )),
+            Box::new(GetHistoryArchiveStateWork {
+                archive: Arc::clone(&self.archive),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+            }),
             vec![],
             RETRY_A_FEW,
         );
 
         // Spec: CATCHUP_SPEC §9.1 — bucket downloads use RETRY_A_LOT (32).
         let buckets_id = scheduler.add_work(
-            Box::new(DownloadBucketsWork::new(
-                Arc::clone(&self.archive),
-                Arc::clone(&self.state),
-                self.bucket_dir.clone(),
-            )),
+            Box::new(DownloadBucketsWork {
+                archive: Arc::clone(&self.archive),
+                state: Arc::clone(&self.state),
+                bucket_dir: self.bucket_dir.clone(),
+            }),
             vec![has_id],
             RETRY_A_LOT,
         );
 
         // Spec: CATCHUP_SPEC §9.1 — ledger header downloads use RETRY_A_LOT (32).
         let headers_id = scheduler.add_work(
-            Box::new(DownloadLedgerHeadersWork::new(
-                Arc::clone(&self.archive),
-                self.checkpoint,
-                Arc::clone(&self.state),
-            )),
+            Box::new(DownloadLedgerHeadersWork {
+                archive: Arc::clone(&self.archive),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+            }),
             vec![has_id],
             RETRY_A_LOT,
         );
 
         // Spec: CATCHUP_SPEC §9.1 — transaction file downloads use RETRY_A_LOT (32).
         let tx_id = scheduler.add_work(
-            Box::new(DownloadTransactionsWork::new(
-                Arc::clone(&self.archive),
-                self.checkpoint,
-                Arc::clone(&self.state),
-            )),
+            Box::new(DownloadTransactionsWork {
+                archive: Arc::clone(&self.archive),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+            }),
             vec![headers_id],
             RETRY_A_LOT,
         );
 
         let tx_results_id = scheduler.add_work(
-            Box::new(DownloadTxResultsWork::new(
-                Arc::clone(&self.archive),
-                self.checkpoint,
-                Arc::clone(&self.state),
-            )),
+            Box::new(DownloadTxResultsWork {
+                archive: Arc::clone(&self.archive),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+            }),
             vec![headers_id, tx_id],
             RETRY_A_LOT,
         );
 
         let scp_id = scheduler.add_work(
-            Box::new(DownloadScpHistoryWork::new(
-                Arc::clone(&self.archive),
-                self.checkpoint,
-                Arc::clone(&self.state),
-            )),
+            Box::new(DownloadScpHistoryWork {
+                archive: Arc::clone(&self.archive),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+            }),
             vec![headers_id],
             RETRY_A_FEW,
         );
@@ -1579,64 +1403,64 @@ impl HistoryWorkBuilder {
         deps: HistoryWorkIds,
     ) -> PublishWorkIds {
         let has_id = scheduler.add_work(
-            Box::new(PublishHistoryArchiveStateWork::new(
-                Arc::clone(&writer),
-                self.checkpoint,
-                Arc::clone(&self.state),
-            )),
+            Box::new(PublishHistoryArchiveStateWork {
+                writer: Arc::clone(&writer),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+            }),
             vec![deps.has],
             PUBLISH_RETRIES,
         );
 
         let buckets_id = scheduler.add_work(
-            Box::new(PublishBucketsWork::new(
-                Arc::clone(&writer),
-                Arc::clone(&self.state),
-            )),
+            Box::new(PublishBucketsWork {
+                writer: Arc::clone(&writer),
+                state: Arc::clone(&self.state),
+            }),
             vec![deps.buckets],
             PUBLISH_RETRIES,
         );
 
         let headers_id = scheduler.add_work(
-            Box::new(PublishXdrWork::new(
-                Arc::clone(&writer),
-                self.checkpoint,
-                Arc::clone(&self.state),
-                HistoryFileType::Ledger,
-            )),
+            Box::new(PublishXdrWork {
+                writer: Arc::clone(&writer),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+                file_type: HistoryFileType::Ledger,
+            }),
             vec![deps.headers],
             PUBLISH_RETRIES,
         );
 
         let transactions_id = scheduler.add_work(
-            Box::new(PublishXdrWork::new(
-                Arc::clone(&writer),
-                self.checkpoint,
-                Arc::clone(&self.state),
-                HistoryFileType::Transactions,
-            )),
+            Box::new(PublishXdrWork {
+                writer: Arc::clone(&writer),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+                file_type: HistoryFileType::Transactions,
+            }),
             vec![deps.transactions],
             PUBLISH_RETRIES,
         );
 
         let results_id = scheduler.add_work(
-            Box::new(PublishXdrWork::new(
-                Arc::clone(&writer),
-                self.checkpoint,
-                Arc::clone(&self.state),
-                HistoryFileType::Results,
-            )),
+            Box::new(PublishXdrWork {
+                writer: Arc::clone(&writer),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+                file_type: HistoryFileType::Results,
+            }),
             vec![deps.tx_results],
             PUBLISH_RETRIES,
         );
 
         let scp_id = scheduler.add_work(
-            Box::new(PublishXdrWork::new(
-                Arc::clone(&writer),
-                self.checkpoint,
-                Arc::clone(&self.state),
-                HistoryFileType::Scp,
-            )),
+            Box::new(PublishXdrWork {
+                writer: Arc::clone(&writer),
+                checkpoint: self.checkpoint,
+                state: Arc::clone(&self.state),
+                file_type: HistoryFileType::Scp,
+            }),
             vec![deps.scp_history],
             PUBLISH_RETRIES,
         );
@@ -1857,30 +1681,6 @@ pub(crate) struct BatchDownloadWork {
     state: SharedBatchDownloadState,
 }
 
-impl BatchDownloadWork {
-    /// Creates a new batch download work item.
-    ///
-    /// # Arguments
-    ///
-    /// * `archive` - The history archive to download from
-    /// * `range` - The checkpoint range to download
-    /// * `file_type` - The type of files to download
-    /// * `state` - Shared state where downloaded data will be stored
-    pub(crate) fn new(
-        archive: Arc<HistoryArchive>,
-        range: CheckpointRange,
-        file_type: HistoryFileType,
-        state: SharedBatchDownloadState,
-    ) -> Self {
-        Self {
-            archive,
-            range,
-            file_type,
-            state,
-        }
-    }
-}
-
 #[async_trait]
 impl Work for BatchDownloadWork {
     fn name(&self) -> &str {
@@ -2083,45 +1883,45 @@ impl BatchDownloadWorkBuilder {
     /// [`BatchDownloadWorkIds`] containing the scheduler IDs for all registered work.
     pub fn register(&self, scheduler: &mut WorkScheduler) -> BatchDownloadWorkIds {
         let headers_id = scheduler.add_work(
-            Box::new(BatchDownloadWork::new(
-                self.archive.clone(),
-                self.range,
-                HistoryFileType::Ledger,
-                self.state.clone(),
-            )),
+            Box::new(BatchDownloadWork {
+                archive: self.archive.clone(),
+                range: self.range,
+                file_type: HistoryFileType::Ledger,
+                state: self.state.clone(),
+            }),
             vec![],
             RETRY_A_LOT,
         );
 
         let transactions_id = scheduler.add_work(
-            Box::new(BatchDownloadWork::new(
-                self.archive.clone(),
-                self.range,
-                HistoryFileType::Transactions,
-                self.state.clone(),
-            )),
+            Box::new(BatchDownloadWork {
+                archive: self.archive.clone(),
+                range: self.range,
+                file_type: HistoryFileType::Transactions,
+                state: self.state.clone(),
+            }),
             vec![headers_id],
             RETRY_A_LOT,
         );
 
         let results_id = scheduler.add_work(
-            Box::new(BatchDownloadWork::new(
-                self.archive.clone(),
-                self.range,
-                HistoryFileType::Results,
-                self.state.clone(),
-            )),
+            Box::new(BatchDownloadWork {
+                archive: self.archive.clone(),
+                range: self.range,
+                file_type: HistoryFileType::Results,
+                state: self.state.clone(),
+            }),
             vec![headers_id, transactions_id],
             RETRY_A_LOT,
         );
 
         let scp_id = scheduler.add_work(
-            Box::new(BatchDownloadWork::new(
-                self.archive.clone(),
-                self.range,
-                HistoryFileType::Scp,
-                self.state.clone(),
-            )),
+            Box::new(BatchDownloadWork {
+                archive: self.archive.clone(),
+                range: self.range,
+                file_type: HistoryFileType::Scp,
+                state: self.state.clone(),
+            }),
             vec![headers_id],
             RETRY_A_FEW,
         );

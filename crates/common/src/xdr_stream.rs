@@ -23,6 +23,14 @@ use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
 const FRAME_CONTINUATION_BIT: u8 = 0x80;
 const MAX_FRAME_SIZE: u32 = 0x8000_0000;
 
+fn open_truncated_output_file(path: impl AsRef<Path>) -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(path)
+}
+
 /// Compute the XDR-encoded byte length of a value without heap allocation.
 ///
 /// Uses a counting writer that discards output bytes, avoiding the `Vec<u8>`
@@ -115,12 +123,8 @@ impl XdrOutputStream {
     /// Open an XDR output stream writing to a file path.
     ///
     /// The path can be a regular file or a named pipe (FIFO).
-    pub fn open(path: &str) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = open_truncated_output_file(path)?;
         Ok(Self {
             writer: BufWriter::new(Box::new(file)),
         })
@@ -184,12 +188,8 @@ impl DurableXdrOutputStream {
     /// Open a durable XDR output stream writing to a file path.
     ///
     /// Creates the file if it doesn't exist, truncates if it does.
-    pub fn open(path: &Path) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let file = open_truncated_output_file(path)?;
         Ok(Self {
             writer: BufWriter::new(file),
         })
@@ -233,7 +233,7 @@ pub struct XdrInputStream {
 
 impl XdrInputStream {
     /// Open an XDR input stream from a file path.
-    pub fn open(path: &str) -> io::Result<Self> {
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
         Ok(Self {
             reader: BufReader::new(Box::new(file)),
