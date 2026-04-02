@@ -1,69 +1,30 @@
-//! Ledger replay for history catchup and verification.
+//! Execution-based ledger replay.
 //!
-//! This module provides functions to replay ledgers from history archives,
-//! reconstructing ledger state by re-executing transactions or applying
-//! transaction metadata.
-//!
-//! # Replay Strategies
-//!
-//! There are two approaches to replaying ledgers:
-//!
-//! ## Re-execution Replay (`replay_ledger_with_execution`)
-//!
-//! Re-executes transactions against the current bucket list state. This:
-//!
-//! - Reconstructs state changes from transaction logic
-//! - Validates transaction set and result hashes against headers
-//! - Works with traditional archives (no `TransactionMeta` needed)
-//! - May produce slightly different internal results than original execution
-//!
-//! This is the **default approach** used during catchup.
-//!
-//! ## Metadata Replay (`replay_ledger`)
-//!
-//! Applies `TransactionMeta` directly from archives. This:
-//!
-//! - Uses exact entry changes from the original execution
-//! - Requires archives that include `TransactionMeta` (e.g., CDP)
-//! - Produces identical results to the original execution
-//! - Used for testing and specialized replay scenarios
-//!
-//! # Verification
-//!
-//! During replay, we verify:
-//!
-//! - Transaction set hash matches header's `scp_value.tx_set_hash`
-//! - Transaction result hash matches header's `tx_set_result_hash`
-//! - Bucket list hash matches header's `bucket_list_hash` (at checkpoints)
-//!
-//! # Protocol 23+ Eviction
-//!
-//! Starting with protocol 23, incremental eviction scan runs each ledger:
-//!
-//! 1. Scan portion of bucket list based on `EvictionIterator` position
-//! 2. Move expired entries from live bucket list to hot archive
-//! 3. Update `EvictionIterator` ConfigSettingEntry
-//! 4. Combined hash = SHA256(live_hash || hot_archive_hash)
+//! Re-executes transactions against the current bucket list state to
+//! reconstruct ledger entry changes. This is the default approach used
+//! during catchup.
 
 use crate::{is_checkpoint_ledger, verify, HistoryError, Result};
 use henyey_bucket::{EvictionIterator, EvictionIteratorExt};
 use henyey_common::protocol::{
     protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
 };
-use henyey_common::{Hash256, NetworkId};
+use henyey_common::Hash256;
 use henyey_ledger::{
     execution::{execute_transaction_set, load_soroban_config, SorobanContext},
     prepend_fee_event, EntryChange, LedgerDelta, LedgerError, LedgerSnapshot, SnapshotHandle,
     TransactionSetVariant,
 };
-use henyey_tx::soroban::PersistentModuleCache;
 use henyey_tx::{muxed_to_account_id, LedgerContext, TransactionFrame};
 use sha2::{Digest, Sha256};
 use stellar_xdr::curr::{
     BucketListType, ConfigSettingEntry, ConfigSettingId, LedgerEntry, LedgerEntryData,
     LedgerEntryExt, LedgerHeader, LedgerKey, LedgerKeyConfigSetting, StateArchivalSettings,
-    TransactionEnvelope, TransactionMeta, TransactionResultPair, TransactionResultSet, WriteXdr,
+    TransactionResultSet, WriteXdr,
 };
+
+use super::diff::log_tx_result_mismatch;
+use super::{LedgerReplayResult, ReplayConfig, ReplayExecutionContext};
 
 fn load_state_archival_settings(snapshot: &SnapshotHandle) -> Option<StateArchivalSettings> {
     let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
@@ -338,7 +299,7 @@ fn classify_delta_entries(
 /// on-chain ConfigSettingEntry to ensure correct compiled module memory cost
 /// calculation. If `None`, falls back to `Budget::default()` which may produce
 /// incorrect sizes.
-fn soroban_entry_size(
+pub(super) fn soroban_entry_size(
     entry: &LedgerEntry,
     protocol_version: u32,
     cost_params: Option<(
@@ -382,7 +343,7 @@ fn soroban_entry_size(
 /// - INIT (created): +size of new Soroban entries
 /// - LIVE (updated): +(new_size - old_size) for modified Soroban entries
 /// - DEAD (deleted): -size of removed Soroban entries
-fn compute_soroban_state_size_delta(
+pub(super) fn compute_soroban_state_size_delta(
     changes: &[EntryChange],
     protocol_version: u32,
     cost_params: Option<(
@@ -417,7 +378,7 @@ fn compute_soroban_state_size_delta(
 /// Updates occur when:
 /// - The sample size changes (window is resized)
 /// - We're at a sample boundary (seq % sample_period == 0)
-fn compute_soroban_state_size_window_entry(
+pub(super) fn compute_soroban_state_size_window_entry(
     seq: u32,
     bucket_list: &henyey_bucket::BucketList,
     soroban_state_size: u64,
@@ -499,159 +460,6 @@ fn compute_soroban_state_size_window_entry(
     })
 }
 
-/// The result of replaying a single ledger.
-///
-/// This contains both summary statistics and the actual ledger entry changes
-/// that should be applied to the bucket list.
-#[derive(Debug, Clone)]
-pub struct LedgerReplayResult {
-    /// The ledger sequence number that was replayed.
-    pub sequence: u32,
-
-    /// Protocol version active during this ledger.
-    pub protocol_version: u32,
-
-    /// SHA-256 hash of the ledger header.
-    pub ledger_hash: Hash256,
-
-    /// Number of transactions executed in this ledger.
-    pub tx_count: u32,
-
-    /// Total number of operations across all transactions.
-    pub op_count: u32,
-
-    /// Net change to the fee pool (positive = fees collected).
-    pub fee_pool_delta: i64,
-
-    /// Net change to total coins (should be 0 for conservation).
-    pub total_coins_delta: i64,
-
-    /// New entries to add to the bucket list with `INITENTRY` flag.
-    ///
-    /// Init entries represent newly created ledger entries that did not
-    /// exist before this ledger.
-    pub init_entries: Vec<LedgerEntry>,
-
-    /// Updated entries to add to the bucket list with `LIVEENTRY` flag.
-    ///
-    /// Live entries represent modifications to existing ledger entries.
-    pub live_entries: Vec<LedgerEntry>,
-
-    /// Keys of entries to mark as deleted with `DEADENTRY` flag.
-    pub dead_entries: Vec<LedgerKey>,
-
-    /// Detailed change records for state tracking.
-    ///
-    /// This provides before/after state for each changed entry.
-    pub changes: Vec<EntryChange>,
-
-    /// Updated eviction iterator position after this ledger.
-    ///
-    /// Only present when running eviction scan (protocol 23+).
-    /// Should be passed to the next ledger's replay call.
-    pub eviction_iterator: Option<EvictionIterator>,
-
-    /// Net change in Soroban state size (bytes) during this ledger.
-    ///
-    /// This includes:
-    /// - Added size from new ContractData/ContractCode entries (INIT)
-    /// - Size difference from updated entries (LIVE)
-    /// - Subtracted size from deleted entries (DEAD)
-    ///
-    /// Used for accurate `LiveSorobanStateSizeWindow` tracking during catchup.
-    pub soroban_state_size_delta: i64,
-}
-
-/// Configuration for ledger replay behavior and verification.
-///
-/// This controls what verification checks are performed during replay
-/// and whether optional features like event emission are enabled.
-#[derive(Debug, Clone)]
-pub struct ReplayConfig {
-    /// Verify that computed transaction results match header hashes.
-    ///
-    /// When enabled, the replay will fail if the transaction result set
-    /// hash does not match `header.tx_set_result_hash`. This is disabled
-    /// by default because re-execution may produce different result codes
-    /// than the original execution (especially for Soroban).
-    pub verify_results: bool,
-
-    /// Verify that bucket list hash matches header at checkpoints.
-    ///
-    /// This is the primary verification that ensures correct state
-    /// reconstruction. Verification only runs at checkpoint boundaries
-    /// (ledger % 64 == 63) because intermediate states may differ.
-    pub verify_bucket_list: bool,
-
-    /// Emit classic contract events during replay.
-    ///
-    /// When enabled, generates events for classic operations like
-    /// payments and trustline changes. Useful for indexers.
-    pub emit_classic_events: bool,
-
-    /// Generate Stellar asset events for pre-protocol 23 ledgers.
-    ///
-    /// Protocol 23 introduced standardized asset events. This option
-    /// generates equivalent events for earlier ledgers.
-    pub backfill_stellar_asset_events: bool,
-
-    /// Run incremental eviction scan during replay.
-    ///
-    /// Required for correct bucket list hash verification in protocol 23+.
-    /// The eviction scan moves expired entries from the live bucket list
-    /// to the hot archive bucket list.
-    pub run_eviction: bool,
-
-    /// Configuration for the eviction scan algorithm.
-    ///
-    /// Controls parameters like the starting level and scan rate.
-    pub eviction_settings: StateArchivalSettings,
-
-    /// Enable publish queue backpressure during replay.
-    ///
-    /// When true, replay pauses when the publish queue exceeds
-    /// `PUBLISH_QUEUE_MAX_SIZE` (16) and resumes when it drains to
-    /// `PUBLISH_QUEUE_UNBLOCK_APPLICATION` (8). CATCHUP_SPEC §5.6.
-    ///
-    /// This should be enabled for offline catchup modes to prevent
-    /// unbounded queue growth when replaying faster than publishing.
-    pub wait_for_publish: bool,
-}
-
-/// Inputs and mutable state needed for execution-based ledger replay.
-pub struct ReplayExecutionContext<'a> {
-    pub bucket_list: &'a mut henyey_bucket::BucketList,
-    pub hot_archive_bucket_list: &'a mut henyey_bucket::HotArchiveBucketList,
-    pub network_id: &'a NetworkId,
-    pub config: &'a ReplayConfig,
-    pub expected_tx_results: Option<&'a [TransactionResultPair]>,
-    pub eviction_iterator: Option<EvictionIterator>,
-    pub module_cache: Option<&'a PersistentModuleCache>,
-    pub soroban_state_size: Option<u64>,
-    pub prev_id_pool: u64,
-    pub offer_entries: Option<Vec<LedgerEntry>>,
-}
-
-impl Default for ReplayConfig {
-    fn default() -> Self {
-        Self {
-            // Transaction result verification is disabled by default because during
-            // replay we re-execute transactions without TransactionMeta from archives.
-            // Our execution may produce slightly different result codes than
-            // stellar-core, especially for Soroban contracts (e.g., Trapped vs
-            // ResourceLimitExceeded). The bucket list hash at checkpoints is the
-            // authoritative verification of correct ledger state.
-            verify_results: false,
-            verify_bucket_list: true,
-            emit_classic_events: false,
-            backfill_stellar_asset_events: false,
-            run_eviction: true,
-            eviction_settings: StateArchivalSettings::default(),
-            wait_for_publish: false,
-        }
-    }
-}
-
 fn combined_bucket_list_hash(
     live_bucket_list: &henyey_bucket::BucketList,
     hot_archive_bucket_list: &henyey_bucket::HotArchiveBucketList,
@@ -679,83 +487,6 @@ fn combined_bucket_list_hash(
         );
         live_hash
     }
-}
-
-/// Replays a single ledger from history data.
-///
-/// This applies the transaction results to extract ledger entry changes,
-/// which can then be applied to the bucket list.
-///
-/// # Arguments
-///
-/// * `header` - The ledger header
-/// * `tx_set` - The transaction set for this ledger
-/// * `tx_results` - The transaction results from history
-/// * `tx_metas` - Transaction metadata containing ledger entry changes
-/// * `config` - Replay configuration
-///
-/// # Returns
-///
-/// A `LedgerReplayResult` containing the changes to apply to ledger state.
-pub fn replay_ledger(
-    header: &LedgerHeader,
-    tx_set: &TransactionSetVariant,
-    tx_results: &[TransactionResultPair],
-    tx_metas: &[TransactionMeta],
-    config: &ReplayConfig,
-) -> Result<LedgerReplayResult> {
-    // Verify the transaction set hash matches the header
-    if config.verify_results {
-        verify::verify_tx_set(header, tx_set)?;
-
-        let result_set = TransactionResultSet {
-            results: tx_results
-                .to_vec()
-                .try_into()
-                .map_err(|_| HistoryError::CatchupFailed("tx result set too large".to_string()))?,
-        };
-        let xdr = result_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .map_err(|e| {
-                HistoryError::CatchupFailed(format!("failed to encode tx result set: {}", e))
-            })?;
-        verify::verify_tx_result_set(header, &xdr)?;
-    }
-
-    // Extract ledger entry changes from transaction metadata
-    let (init_entries, live_entries, dead_entries) = extract_ledger_changes(tx_metas)?;
-
-    // Count transactions and operations
-    let tx_count = tx_set.num_transactions() as u32;
-    let op_count = count_operations(tx_set);
-
-    // Compute the ledger hash
-    let ledger_hash = verify::compute_header_hash(header)?;
-
-    // Compute soroban state size delta for metadata-based replay.
-    // NOTE: This is an approximation since we don't have pre-update/pre-delete states.
-    // We add size for INIT entries, but can't accurately track LIVE (updates) or DEAD (deletes).
-    // For accurate tracking, use execution-based replay.
-    let mut soroban_state_size_delta: i64 = 0;
-    for entry in &init_entries {
-        soroban_state_size_delta += soroban_entry_size(entry, header.ledger_version, None);
-    }
-
-    Ok(LedgerReplayResult {
-        sequence: header.ledger_seq,
-        protocol_version: header.ledger_version,
-        ledger_hash,
-        tx_count,
-        op_count,
-        fee_pool_delta: 0,
-        total_coins_delta: 0,
-        init_entries,
-        live_entries,
-        dead_entries,
-        changes: Vec::new(),
-        eviction_iterator: None, // Metadata-based replay doesn't track eviction
-        soroban_state_size_delta,
-    })
 }
 
 /// Replay a ledger by re-executing transactions against the current bucket list.
@@ -1122,531 +853,59 @@ pub fn replay_ledger_with_execution(
     })
 }
 
-fn log_tx_result_mismatch(
-    header: &LedgerHeader,
-    expected: &[TransactionResultPair],
-    actual: &[TransactionResultPair],
-    transactions: &[(std::sync::Arc<TransactionEnvelope>, Option<u32>)],
-) {
-    use tracing::warn;
-
-    if expected.len() != actual.len() {
-        warn!(
-            ledger_seq = header.ledger_seq,
-            expected_len = expected.len(),
-            actual_len = actual.len(),
-            "Transaction result count mismatch"
-        );
-    }
-
-    let limit = expected.len().min(actual.len());
-    for (idx, (expected_item, actual_item)) in
-        expected.iter().zip(actual.iter()).take(limit).enumerate()
-    {
-        let expected_hash = Hash256::hash_xdr(expected_item).unwrap_or(Hash256::ZERO);
-        let actual_hash = Hash256::hash_xdr(actual_item).unwrap_or(Hash256::ZERO);
-        if expected_hash != actual_hash {
-            let expected_tx_hash = Hash256::from(expected_item.transaction_hash.0).to_hex();
-            let actual_tx_hash = Hash256::from(actual_item.transaction_hash.0).to_hex();
-            let expected_code = format!("{:?}", expected_item.result.result);
-            let actual_code = format!("{:?}", actual_item.result.result);
-            let expected_fee = expected_item.result.fee_charged;
-            let actual_fee = actual_item.result.fee_charged;
-            let expected_ext = format!("{:?}", expected_item.result.ext);
-            let actual_ext = format!("{:?}", actual_item.result.ext);
-            let op_summaries = transactions
-                .get(idx)
-                .map(|(tx, _)| summarize_operations(tx))
-                .unwrap_or_default();
-            warn!(
-                ledger_seq = header.ledger_seq,
-                index = idx,
-                expected_tx_hash = %expected_tx_hash,
-                actual_tx_hash = %actual_tx_hash,
-                expected_fee = %expected_fee,
-                actual_fee = %actual_fee,
-                expected_ext = %expected_ext,
-                actual_ext = %actual_ext,
-                expected_code = %expected_code,
-                actual_code = %actual_code,
-                expected_hash = %expected_hash.to_hex(),
-                actual_hash = %actual_hash.to_hex(),
-                operations = ?op_summaries,
-                "Transaction result mismatch"
-            );
-            break;
-        }
-    }
-}
-
-fn summarize_operations(tx: &TransactionEnvelope) -> Vec<String> {
-    let ops = match tx {
-        TransactionEnvelope::TxV0(env) => env.tx.operations.as_slice(),
-        TransactionEnvelope::Tx(env) => env.tx.operations.as_slice(),
-        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                inner.tx.operations.as_slice()
-            }
-        },
-    };
-
-    ops.iter()
-        .map(|op| {
-            let source = op.source_account.as_ref().map(|a| format!("{:?}", a));
-            let body = format!("{:?}", op.body);
-            format!("source={:?} body={}", source, body)
-        })
-        .collect()
-}
-
-/// Extract ledger entry changes from transaction metadata.
-///
-/// Returns (init_entries, live_entries, dead_entries) where:
-/// - init_entries: Entries that were created
-/// - live_entries: Entries that were updated or restored
-/// - dead_entries: Keys of entries that were deleted
-pub fn extract_ledger_changes(
-    tx_metas: &[TransactionMeta],
-) -> Result<(Vec<LedgerEntry>, Vec<LedgerEntry>, Vec<LedgerKey>)> {
-    let mut init_entries = Vec::new();
-    let mut live_entries = Vec::new();
-    let mut dead_entries = Vec::new();
-
-    for meta in tx_metas {
-        match meta {
-            TransactionMeta::V0(operations) => {
-                // V0: VecM<OperationMeta> - each OperationMeta has a changes field
-                for op_meta in operations.iter() {
-                    for change in op_meta.changes.iter() {
-                        process_ledger_entry_change(
-                            change,
-                            &mut init_entries,
-                            &mut live_entries,
-                            &mut dead_entries,
-                        );
-                    }
-                }
-            }
-            TransactionMeta::V1(v1) => {
-                // Process txChanges (before)
-                for change in v1.tx_changes.iter() {
-                    process_ledger_entry_change(
-                        change,
-                        &mut init_entries,
-                        &mut live_entries,
-                        &mut dead_entries,
-                    );
-                }
-                // Process operation changes
-                for op_changes in v1.operations.iter() {
-                    for change in op_changes.changes.iter() {
-                        process_ledger_entry_change(
-                            change,
-                            &mut init_entries,
-                            &mut live_entries,
-                            &mut dead_entries,
-                        );
-                    }
-                }
-            }
-            // V2, V3, and V4 share the same before/operations/after structure
-            TransactionMeta::V2(v2) => {
-                extract_before_ops_after_changes(
-                    &v2.tx_changes_before,
-                    v2.operations.iter().map(|op| &op.changes),
-                    &v2.tx_changes_after,
-                    &mut init_entries,
-                    &mut live_entries,
-                    &mut dead_entries,
-                );
-            }
-            TransactionMeta::V3(v3) => {
-                extract_before_ops_after_changes(
-                    &v3.tx_changes_before,
-                    v3.operations.iter().map(|op| &op.changes),
-                    &v3.tx_changes_after,
-                    &mut init_entries,
-                    &mut live_entries,
-                    &mut dead_entries,
-                );
-            }
-            TransactionMeta::V4(v4) => {
-                extract_before_ops_after_changes(
-                    &v4.tx_changes_before,
-                    v4.operations.iter().map(|op| &op.changes),
-                    &v4.tx_changes_after,
-                    &mut init_entries,
-                    &mut live_entries,
-                    &mut dead_entries,
-                );
-            }
-        }
-    }
-
-    Ok((init_entries, live_entries, dead_entries))
-}
-
-/// Extract changes from V2/V3/V4 meta which share tx_changes_before, operations, tx_changes_after.
-///
-/// The `op_changes` parameter accepts an iterator of `LedgerEntryChanges` references to handle
-/// both `OperationMeta` (V2/V3) and `OperationMetaV2` (V4), which differ in type but both
-/// have a `.changes` field of type `LedgerEntryChanges`.
-fn extract_before_ops_after_changes<'a>(
-    tx_changes_before: &stellar_xdr::curr::LedgerEntryChanges,
-    op_changes: impl Iterator<Item = &'a stellar_xdr::curr::LedgerEntryChanges>,
-    tx_changes_after: &stellar_xdr::curr::LedgerEntryChanges,
-    init_entries: &mut Vec<LedgerEntry>,
-    live_entries: &mut Vec<LedgerEntry>,
-    dead_entries: &mut Vec<LedgerKey>,
-) {
-    for change in tx_changes_before.iter() {
-        process_ledger_entry_change(change, init_entries, live_entries, dead_entries);
-    }
-    for changes in op_changes {
-        for change in changes.iter() {
-            process_ledger_entry_change(change, init_entries, live_entries, dead_entries);
-        }
-    }
-    for change in tx_changes_after.iter() {
-        process_ledger_entry_change(change, init_entries, live_entries, dead_entries);
-    }
-}
-
-/// Process a single ledger entry change.
-fn process_ledger_entry_change(
-    change: &stellar_xdr::curr::LedgerEntryChange,
-    init_entries: &mut Vec<LedgerEntry>,
-    live_entries: &mut Vec<LedgerEntry>,
-    dead_entries: &mut Vec<LedgerKey>,
-) {
-    use stellar_xdr::curr::LedgerEntryChange;
-
-    match change {
-        LedgerEntryChange::Created(entry) => {
-            init_entries.push(entry.clone());
-        }
-        LedgerEntryChange::Updated(entry) => {
-            live_entries.push(entry.clone());
-        }
-        LedgerEntryChange::Removed(key) => {
-            dead_entries.push(key.clone());
-        }
-        LedgerEntryChange::State(_) => {
-            // State entries represent the state before a change,
-            // we don't need to process them for replay
-        }
-        LedgerEntryChange::Restored(entry) => {
-            // Restored entries (from Soroban) are treated as live entries
-            live_entries.push(entry.clone());
-        }
-    }
-}
-
-/// Count the total number of operations in a transaction set.
-fn count_operations(tx_set: &TransactionSetVariant) -> u32 {
-    let mut count = 0;
-
-    for tx_env in tx_set.transactions().into_iter() {
-        use stellar_xdr::curr::TransactionEnvelope;
-        match tx_env {
-            TransactionEnvelope::TxV0(tx) => {
-                count += tx.tx.operations.len() as u32;
-            }
-            TransactionEnvelope::Tx(tx) => {
-                count += tx.tx.operations.len() as u32;
-            }
-            TransactionEnvelope::TxFeeBump(tx) => {
-                // Fee bump wraps an inner transaction
-                match &tx.tx.inner_tx {
-                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                        count += inner.tx.operations.len() as u32;
-                    }
-                }
-            }
-        }
-    }
-
-    count
-}
-
-/// Replay a batch of ledgers.
-///
-/// This is used during catchup to replay all ledgers from a checkpoint
-/// to the target ledger.
-///
-/// # Arguments
-///
-/// * `ledgers` - Slice of (header, tx_set, results, metas) tuples
-/// * `config` - Replay configuration
-/// * `progress_callback` - Optional callback for progress updates
-pub fn replay_ledgers<F>(
-    ledgers: &[(
-        LedgerHeader,
-        TransactionSetVariant,
-        Vec<TransactionResultPair>,
-        Vec<TransactionMeta>,
-    )],
-    config: &ReplayConfig,
-    mut progress_callback: Option<F>,
-) -> Result<Vec<LedgerReplayResult>>
-where
-    F: FnMut(u32, u32), // (current, total)
-{
-    let total = ledgers.len() as u32;
-    let mut results = Vec::with_capacity(ledgers.len());
-
-    for (i, (header, tx_set, tx_results, tx_metas)) in ledgers.iter().enumerate() {
-        let result = replay_ledger(header, tx_set, tx_results, tx_metas, config)?;
-        results.push(result);
-
-        if let Some(ref mut callback) = progress_callback {
-            callback(i as u32 + 1, total);
-        }
-    }
-
-    Ok(results)
-}
-
-/// Verify ledger consistency after replay.
-///
-/// Checks that the final bucket list hash matches the expected hash
-/// from the last replayed ledger header.
-pub fn verify_replay_consistency(
-    final_header: &LedgerHeader,
-    computed_bucket_list_hash: &Hash256,
-) -> Result<()> {
-    verify::verify_ledger_hash(final_header, computed_bucket_list_hash)
-}
-
-/// Apply replay results to the bucket list.
-///
-/// This takes the changes from ledger replay and applies them to the
-/// bucket list to update the ledger state.
-pub fn apply_replay_to_bucket_list(
-    bucket_list: &mut henyey_bucket::BucketList,
-    replay_result: &LedgerReplayResult,
-) -> Result<()> {
-    bucket_list
-        .add_batch(
-            replay_result.sequence,
-            replay_result.protocol_version,
-            BucketListType::Live,
-            replay_result.init_entries.clone(),
-            replay_result.live_entries.clone(),
-            replay_result.dead_entries.clone(),
-        )
-        .map_err(HistoryError::Bucket)
-}
-
-/// Prepare a ledger close based on replay data.
-///
-/// This is used when we've replayed history and want to set up the
-/// ledger manager to continue from that point.
-#[derive(Debug, Clone)]
-pub struct ReplayedLedgerState {
-    /// The ledger sequence we replayed to.
-    pub sequence: u32,
-    /// Hash of the final ledger.
-    pub ledger_hash: Hash256,
-    /// Hash of the bucket list.
-    pub bucket_list_hash: Hash256,
-    /// Close time of the final ledger.
-    pub close_time: u64,
-    /// Protocol version.
-    pub protocol_version: u32,
-    /// Base fee.
-    pub base_fee: u32,
-    /// Base reserve.
-    pub base_reserve: u32,
-}
-
-impl ReplayedLedgerState {
-    /// Create from a final ledger header after replay.
-    pub fn from_header(header: &LedgerHeader, ledger_hash: Hash256) -> Self {
-        Self {
-            sequence: header.ledger_seq,
-            ledger_hash,
-            bucket_list_hash: Hash256::from(header.bucket_list_hash.clone()),
-            close_time: header.scp_value.close_time.0,
-            protocol_version: header.ledger_version,
-            base_fee: header.base_fee,
-            base_reserve: header.base_reserve,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use henyey_bucket::{BucketList, HotArchiveBucketList};
     use henyey_common::NetworkId;
-    use stellar_xdr::curr::{
-        GeneralizedTransactionSet, Hash, StellarValue, TimePoint, TransactionResultSet,
-        TransactionSet, TransactionSetV1, VecM, WriteXdr,
-    };
+    use stellar_xdr::curr::{Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt};
 
-    fn make_test_header(seq: u32) -> LedgerHeader {
-        LedgerHeader {
-            ledger_version: 20,
-            previous_ledger_hash: Hash([0u8; 32]),
-            scp_value: StellarValue {
-                tx_set_hash: Hash([0u8; 32]),
-                close_time: TimePoint(1234567890),
-                upgrades: VecM::default(),
-                ext: stellar_xdr::curr::StellarValueExt::Basic,
-            },
-            tx_set_result_hash: Hash([0u8; 32]),
-            bucket_list_hash: Hash([0u8; 32]),
-            ledger_seq: seq,
-            total_coins: 0,
-            fee_pool: 0,
-            inflation_seq: 0,
-            id_pool: 0,
-            base_fee: 100,
-            base_reserve: 5000000,
-            max_tx_set_size: 100,
-            skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
-            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+    use super::super::tests::{make_empty_tx_set, make_test_header};
+
+    fn make_contract_data_entry(seq: u32, key_bytes: &[u8], val_bytes: &[u8]) -> LedgerEntry {
+        use stellar_xdr::curr::{
+            ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, ScAddress, ScVal,
+        };
+        LedgerEntry {
+            last_modified_ledger_seq: seq,
+            data: LedgerEntryData::ContractData(ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: ScAddress::Contract(ContractId(Hash(std::array::from_fn(|i| {
+                    key_bytes.get(i).copied().unwrap_or(0)
+                })))),
+                key: ScVal::Bytes(
+                    stellar_xdr::curr::ScBytes::try_from(key_bytes.to_vec()).unwrap(),
+                ),
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Bytes(
+                    stellar_xdr::curr::ScBytes::try_from(val_bytes.to_vec()).unwrap(),
+                ),
+            }),
+            ext: LedgerEntryExt::V0,
         }
     }
 
-    fn make_header_with_hashes(seq: u32, tx_set_hash: Hash, tx_result_hash: Hash) -> LedgerHeader {
-        let mut header = make_test_header(seq);
-        header.scp_value.tx_set_hash = tx_set_hash;
-        header.tx_set_result_hash = tx_result_hash;
-        header
-    }
-
-    fn make_empty_tx_set() -> TransactionSet {
-        TransactionSet {
-            previous_ledger_hash: Hash([0u8; 32]),
-            txs: VecM::default(),
+    fn make_account_entry(seq: u32) -> LedgerEntry {
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, AccountId, PublicKey, SequenceNumber, Thresholds,
+            Uint256,
+        };
+        LedgerEntry {
+            last_modified_ledger_seq: seq,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
+                balance: 1000000,
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: stellar_xdr::curr::String32::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: stellar_xdr::curr::VecM::default(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
         }
-    }
-
-    #[test]
-    fn test_replay_empty_ledger() {
-        let header = make_test_header(100);
-        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
-        let tx_results = vec![];
-        let tx_metas = vec![];
-
-        let config = ReplayConfig {
-            verify_results: false, // Skip verification for test
-            verify_bucket_list: false,
-            emit_classic_events: false,
-            backfill_stellar_asset_events: false,
-            run_eviction: false,
-            eviction_settings: StateArchivalSettings::default(),
-            wait_for_publish: false,
-        };
-
-        let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config).unwrap();
-
-        assert_eq!(result.sequence, 100);
-        assert_eq!(result.tx_count, 0);
-        assert_eq!(result.op_count, 0);
-        assert!(result.init_entries.is_empty());
-        assert!(result.live_entries.is_empty());
-        assert!(result.dead_entries.is_empty());
-    }
-
-    #[test]
-    fn test_count_operations_empty() {
-        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
-        assert_eq!(count_operations(&tx_set), 0);
-    }
-
-    #[test]
-    fn test_replayed_ledger_state_from_header() {
-        let header = make_test_header(42);
-        let hash = Hash256::hash(b"test");
-
-        let state = ReplayedLedgerState::from_header(&header, hash);
-
-        assert_eq!(state.sequence, 42);
-        assert_eq!(state.ledger_hash, hash);
-        assert_eq!(state.close_time, 1234567890);
-        assert_eq!(state.protocol_version, 20);
-        assert_eq!(state.base_fee, 100);
-    }
-
-    #[test]
-    fn test_replay_config_default() {
-        let config = ReplayConfig::default();
-        // verify_results is disabled by default because replay without TransactionMeta
-        // produces different results than stellar-core
-        assert!(!config.verify_results);
-        assert!(config.verify_bucket_list);
-    }
-
-    #[test]
-    fn test_replay_ledger_rejects_tx_set_hash_mismatch() {
-        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
-        let tx_results = vec![];
-        let tx_metas = vec![];
-
-        let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
-        let header = make_header_with_hashes(100, Hash([1u8; 32]), Hash(*tx_set_hash.as_bytes()));
-
-        // Must enable verify_results to test tx_set hash validation
-        let config = ReplayConfig {
-            verify_results: true,
-            ..ReplayConfig::default()
-        };
-        let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config);
-        assert!(matches!(result, Err(HistoryError::InvalidTxSetHash { .. })));
-    }
-
-    #[test]
-    fn test_replay_ledger_rejects_tx_result_hash_mismatch() {
-        let tx_set = TransactionSetVariant::Classic(make_empty_tx_set());
-        let tx_results = vec![];
-        let tx_metas = vec![];
-
-        let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
-
-        let header = make_header_with_hashes(100, Hash(*tx_set_hash.as_bytes()), Hash([2u8; 32]));
-
-        // Must enable verify_results to test tx_result hash validation
-        let config = ReplayConfig {
-            verify_results: true,
-            ..ReplayConfig::default()
-        };
-        let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config);
-        assert!(matches!(result, Err(HistoryError::VerificationFailed(_))));
-    }
-
-    #[test]
-    fn test_replay_ledger_accepts_generalized_tx_set() {
-        let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
-            previous_ledger_hash: Hash([0u8; 32]),
-            phases: VecM::default(),
-        });
-        let tx_set = TransactionSetVariant::Generalized(gen_set);
-        let tx_results = vec![];
-        let tx_metas = vec![];
-
-        let tx_set_hash = verify::compute_tx_set_hash(&tx_set).expect("tx set hash");
-
-        let result_set = TransactionResultSet {
-            results: VecM::default(),
-        };
-        let result_xdr = result_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .expect("tx result set xdr");
-        let result_hash = Hash256::hash(&result_xdr);
-
-        let header = make_header_with_hashes(
-            100,
-            Hash(*tx_set_hash.as_bytes()),
-            Hash(*result_hash.as_bytes()),
-        );
-
-        let config = ReplayConfig::default();
-        let result = replay_ledger(&header, &tx_set, &tx_results, &tx_metas, &config).unwrap();
-        assert_eq!(result.tx_count, 0);
-        assert_eq!(result.op_count, 0);
     }
 
     #[test]
@@ -1983,54 +1242,6 @@ mod tests {
                 assert_eq!(window_vec, vec![3000, 4000, 5000]);
             }
             _ => panic!("Expected LiveSorobanStateSizeWindow config entry"),
-        }
-    }
-
-    /// Helper to create a ContractData entry with specific size characteristics.
-    fn make_contract_data_entry(seq: u32, key_bytes: &[u8], val_bytes: &[u8]) -> LedgerEntry {
-        use stellar_xdr::curr::{
-            ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint, ScAddress, ScVal,
-        };
-        LedgerEntry {
-            last_modified_ledger_seq: seq,
-            data: LedgerEntryData::ContractData(ContractDataEntry {
-                ext: ExtensionPoint::V0,
-                contract: ScAddress::Contract(ContractId(Hash(std::array::from_fn(|i| {
-                    key_bytes.get(i).copied().unwrap_or(0)
-                })))),
-                key: ScVal::Bytes(
-                    stellar_xdr::curr::ScBytes::try_from(key_bytes.to_vec()).unwrap(),
-                ),
-                durability: ContractDataDurability::Persistent,
-                val: ScVal::Bytes(
-                    stellar_xdr::curr::ScBytes::try_from(val_bytes.to_vec()).unwrap(),
-                ),
-            }),
-            ext: LedgerEntryExt::V0,
-        }
-    }
-
-    /// Helper to create an Account entry (non-Soroban) for testing.
-    fn make_account_entry(seq: u32) -> LedgerEntry {
-        use stellar_xdr::curr::{
-            AccountEntry, AccountEntryExt, AccountId, PublicKey, SequenceNumber, Thresholds,
-            Uint256,
-        };
-        LedgerEntry {
-            last_modified_ledger_seq: seq,
-            data: LedgerEntryData::Account(AccountEntry {
-                account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
-                balance: 1000000,
-                seq_num: SequenceNumber(1),
-                num_sub_entries: 0,
-                inflation_dest: None,
-                flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
-                thresholds: Thresholds([1, 0, 0, 0]),
-                signers: stellar_xdr::curr::VecM::default(),
-                ext: AccountEntryExt::V0,
-            }),
-            ext: LedgerEntryExt::V0,
         }
     }
 
