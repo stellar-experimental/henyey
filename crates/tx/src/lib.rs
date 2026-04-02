@@ -141,7 +141,9 @@ pub use events::{
 pub use lumen_reconciler::{reconcile_events, LumenEventReconciler, ReconcilerConfig};
 
 // Re-export frame types
-pub use frame::{muxed_to_account_id, muxed_to_ed25519, TransactionFrame};
+pub use frame::{
+    envelope_sequence_number, muxed_to_account_id, muxed_to_ed25519, TransactionFrame,
+};
 
 // Re-export apply types and functions
 pub use apply::{

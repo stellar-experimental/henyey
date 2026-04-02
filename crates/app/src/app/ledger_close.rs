@@ -1781,14 +1781,3 @@ impl App {
         true
     }
 }
-
-/// Extract the sequence number from a `TransactionEnvelope`.
-fn envelope_sequence_number(envelope: &TransactionEnvelope) -> i64 {
-    match envelope {
-        TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
-        TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
-        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
-        },
-    }
-}

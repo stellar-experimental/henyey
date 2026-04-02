@@ -90,7 +90,7 @@ use henyey_overlay::{
     OverlayManager, OverlayMessage, PeerAddress, PeerId, PeerSnapshot, TcpConnectionFactory,
 };
 use henyey_scp::hash_quorum_set;
-use henyey_tx::TransactionFrame;
+use henyey_tx::{envelope_sequence_number, TransactionFrame};
 use henyey_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
 use stellar_xdr::curr::{
     Curve25519Public, DontHave, EncryptedBody, FloodAdvert, FloodDemand, Hash, LedgerCloseMeta,

@@ -787,6 +787,20 @@ pub fn muxed_to_ed25519(muxed: &MuxedAccount) -> &Uint256 {
     }
 }
 
+/// Extract the sequence number from a raw `TransactionEnvelope`.
+///
+/// For fee-bump transactions, returns the inner transaction's sequence number
+/// (the fee-bump wrapper does not carry its own sequence number).
+pub fn envelope_sequence_number(envelope: &TransactionEnvelope) -> i64 {
+    match envelope {
+        TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
+        TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
+        },
+    }
+}
+
 fn is_soroban_ledger_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
 }

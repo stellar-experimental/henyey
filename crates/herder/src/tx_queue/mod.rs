@@ -64,6 +64,7 @@ use crate::surge_pricing::{
     SurgePricingPriorityQueue, GENERIC_LANE,
 };
 use crate::Result;
+use henyey_tx::envelope_sequence_number;
 use rand::Rng;
 
 mod selection;
@@ -303,7 +304,7 @@ impl QueuedTransaction {
     }
 
     fn sequence_number(&self) -> i64 {
-        envelope_seq_num(&self.envelope)
+        envelope_sequence_number(&self.envelope)
     }
 
     pub(crate) fn account_key(&self) -> Vec<u8> {
@@ -517,17 +518,6 @@ fn fee_source_key(envelope: &TransactionEnvelope) -> Vec<u8> {
     account_id
         .to_xdr(stellar_xdr::curr::Limits::none())
         .unwrap_or_default()
-}
-
-/// Get sequence number from a TransactionEnvelope.
-fn envelope_seq_num(envelope: &TransactionEnvelope) -> i64 {
-    match envelope {
-        TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
-        TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
-        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.seq_num.0,
-        },
-    }
 }
 
 /// Check if envelope is a fee-bump transaction.
@@ -935,7 +925,7 @@ impl TransactionQueue {
                     return Err(TxQueueResult::Duplicate);
                 }
 
-                let current_seq = envelope_seq_num(&current_tx.envelope);
+                let current_seq = envelope_sequence_number(&current_tx.envelope);
                 if new_seq < current_seq {
                     return Err(TxQueueResult::Invalid(None));
                 }
@@ -1246,7 +1236,7 @@ impl TransactionQueue {
 
         // Per-account limit check: one transaction per account (sequence-number-source)
         let seq_source_key = account_key(&queued.envelope);
-        let new_seq = envelope_seq_num(&queued.envelope);
+        let new_seq = envelope_sequence_number(&queued.envelope);
         let is_fee_bump = is_fee_bump_envelope(&queued.envelope);
         let new_fee_source_key = fee_source_key(&queued.envelope);
 
