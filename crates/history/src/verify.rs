@@ -35,6 +35,7 @@
 use crate::{
     archive_state::HistoryArchiveState, checkpoint, HistoryError, Result, GENESIS_LEDGER_SEQ,
 };
+use henyey_bucket::BUCKET_LIST_LEVELS;
 use henyey_common::Hash256;
 use henyey_crypto::Sha256Hasher;
 use henyey_ledger::TransactionSetVariant;
@@ -383,13 +384,12 @@ pub fn verify_has_passphrase(has: &HistoryArchiveState, expected: &str) -> Resul
 /// The HAS contains bucket hashes for each level of the BucketList.
 /// This function verifies the structure is well-formed.
 pub fn verify_has_structure(has: &HistoryArchiveState) -> Result<()> {
-    // Spec: CATCHUP_SPEC §3.1 — the number of levels MUST equal 11.
-    const EXPECTED_BUCKET_LEVELS: usize = 11;
-    if has.current_buckets.len() != EXPECTED_BUCKET_LEVELS {
+    // Spec: CATCHUP_SPEC §3.1 — the number of levels MUST equal BUCKET_LIST_LEVELS.
+    if has.current_buckets.len() != BUCKET_LIST_LEVELS {
         return Err(HistoryError::VerificationFailed(format!(
             "HAS has {} bucket levels, expected {}",
             has.current_buckets.len(),
-            EXPECTED_BUCKET_LEVELS
+            BUCKET_LIST_LEVELS
         )));
     }
 

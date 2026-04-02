@@ -48,7 +48,7 @@ use crate::{
     checkpoint::is_checkpoint_ledger,
     paths, verify, HistoryError, Result,
 };
-use henyey_bucket::{BucketList, PendingMergeState};
+use henyey_bucket::{BucketList, PendingMergeState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
 use henyey_common::Hash256;
 use henyey_ledger::TransactionSetVariant;
 use std::path::{Path, PathBuf};
@@ -135,14 +135,14 @@ pub fn build_history_archive_state(
         .map(|level| {
             let next = match level.pending_merge_state() {
                 Some(PendingMergeState::Output(hash)) => HASBucketNext {
-                    state: 1, // FB_HASH_OUTPUT
+                    state: HAS_NEXT_STATE_OUTPUT,
                     output: Some(hash.to_hex()),
                     curr: None,
                     snap: None,
                     shadow: None,
                 },
                 Some(PendingMergeState::Inputs { curr, snap }) => HASBucketNext {
-                    state: 2, // FB_HASH_INPUTS
+                    state: HAS_NEXT_STATE_INPUTS,
                     output: None,
                     curr: Some(curr.to_hex()),
                     snap: Some(snap.to_hex()),
@@ -164,7 +164,7 @@ pub fn build_history_archive_state(
             .map(|level| {
                 let next = match level.pending_merge_output_hash() {
                     Some(hash) => HASBucketNext {
-                        state: 1, // FB_HASH_OUTPUT
+                        state: HAS_NEXT_STATE_OUTPUT,
                         output: Some(hash.to_hex()),
                         curr: None,
                         snap: None,
@@ -553,6 +553,7 @@ impl PublishManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use henyey_bucket::BUCKET_LIST_LEVELS;
     use tempfile::TempDir;
 
     #[test]
@@ -641,8 +642,12 @@ mod tests {
         // Build HAS
         let has = build_history_archive_state(7, &bl, None, None).unwrap();
 
-        // Verify HAS has 11 levels
-        assert_eq!(has.current_buckets.len(), 11, "HAS must have 11 levels");
+        // Verify HAS has BUCKET_LIST_LEVELS levels
+        assert_eq!(
+            has.current_buckets.len(),
+            BUCKET_LIST_LEVELS,
+            "HAS must have {BUCKET_LIST_LEVELS} levels"
+        );
         // No hot archive → version 1
         assert_eq!(has.version, 1);
 
@@ -742,9 +747,12 @@ mod tests {
 
         let has = build_history_archive_state(7, &bl, Some(&habl), None).unwrap();
 
-        assert_eq!(has.current_buckets.len(), 11);
+        assert_eq!(has.current_buckets.len(), BUCKET_LIST_LEVELS);
         assert!(has.hot_archive_buckets.is_some());
-        assert_eq!(has.hot_archive_buckets.as_ref().unwrap().len(), 11);
+        assert_eq!(
+            has.hot_archive_buckets.as_ref().unwrap().len(),
+            BUCKET_LIST_LEVELS
+        );
 
         // Compute combined hash from HAS the Go SDK way
         let compute_hash_from_levels = |levels: &[HASBucketLevel]| -> henyey_common::Hash256 {
@@ -821,7 +829,10 @@ mod tests {
         let has_v2 = build_history_archive_state(1, &bl, Some(&habl), None).unwrap();
         assert_eq!(has_v2.version, 2);
         assert!(has_v2.hot_archive_buckets.is_some());
-        assert_eq!(has_v2.hot_archive_buckets.as_ref().unwrap().len(), 11);
+        assert_eq!(
+            has_v2.hot_archive_buckets.as_ref().unwrap().len(),
+            BUCKET_LIST_LEVELS
+        );
     }
 
     /// Verify that HAS JSON omits hotArchiveBuckets when None (version 1),
@@ -857,7 +868,10 @@ mod tests {
         // Round-trip: deserialize and verify
         let reparsed: HistoryArchiveState = serde_json::from_str(&json_v2).unwrap();
         assert!(reparsed.hot_archive_buckets.is_some());
-        assert_eq!(reparsed.hot_archive_buckets.as_ref().unwrap().len(), 11);
+        assert_eq!(
+            reparsed.hot_archive_buckets.as_ref().unwrap().len(),
+            BUCKET_LIST_LEVELS
+        );
     }
 
     /// Verify that an empty HotArchiveBucketList produces a combined hash
@@ -937,7 +951,7 @@ mod tests {
             let hot_hash = match &has.hot_archive_buckets {
                 Some(levels) => go_sdk_hash_from_levels(levels),
                 None => {
-                    let zero_levels: Vec<HASBucketLevel> = (0..11)
+                    let zero_levels: Vec<HASBucketLevel> = (0..BUCKET_LIST_LEVELS)
                         .map(|_| HASBucketLevel {
                             curr: String::new(),
                             snap: String::new(),

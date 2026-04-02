@@ -3,6 +3,9 @@
 //! The History Archive State is a JSON file that describes the current state
 //! of a Stellar history archive, including the current ledger and bucket list hashes.
 
+use henyey_bucket::{
+    BUCKET_LIST_LEVELS, HAS_NEXT_STATE_CLEAR, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT,
+};
 use henyey_common::Hash256;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -40,7 +43,7 @@ fn collect_bucket_hashes(levels: &[HASBucketLevel], out: &mut Vec<Hash256>) {
                 out.push(h);
             }
         }
-        if level.next.state == 2 {
+        if level.next.state == HAS_NEXT_STATE_INPUTS {
             if let Some(ref curr) = level.next.curr {
                 if let Some(h) = parse_nonzero_hash(curr) {
                     out.push(h);
@@ -123,12 +126,12 @@ fn validate_future_bucket_hashes(
     next: &HASBucketNext,
 ) -> Result<(), HistoryError> {
     match next.state {
-        1 => {
+        HAS_NEXT_STATE_OUTPUT => {
             if let Some(output) = next.output.as_deref() {
                 validate_known_hash(known_hashes, level, "output", output)?;
             }
         }
-        2 => {
+        HAS_NEXT_STATE_INPUTS => {
             if let Some(curr) = next.curr.as_deref() {
                 validate_known_hash(known_hashes, level, "input curr", curr)?;
             }
@@ -284,7 +287,7 @@ impl HASBucketNext {
     /// state == 1 (FB_HASH_OUTPUT) means the merge is complete and the
     /// output hash is known.
     pub fn has_output_hash(&self) -> bool {
-        self.state == 1 && self.output.is_some()
+        self.state == HAS_NEXT_STATE_OUTPUT && self.output.is_some()
     }
 }
 
@@ -410,8 +413,8 @@ impl HistoryArchiveState {
         let hot_hash = if let Some(ref hot_levels) = self.hot_archive_buckets {
             hash_levels(hot_levels)?
         } else {
-            // No hot archive levels: compute hash of 11 all-zero levels
-            let zero_levels: Vec<HASBucketLevel> = (0..11)
+            // No hot archive levels: compute hash of all-zero levels
+            let zero_levels: Vec<HASBucketLevel> = (0..BUCKET_LIST_LEVELS)
                 .map(|_| HASBucketLevel {
                     curr: "0000000000000000000000000000000000000000000000000000000000000000"
                         .to_string(),
@@ -526,7 +529,7 @@ impl HistoryArchiveState {
     ) -> Result<(), HistoryError> {
         // Level 0 next must be clear
         if let Some(level0) = self.current_buckets.first() {
-            if level0.next.state != 0 {
+            if level0.next.state != HAS_NEXT_STATE_CLEAR {
                 return Err(HistoryError::VerificationFailed(
                     "level 0 next is not clear in HAS".to_string(),
                 ));
@@ -589,7 +592,7 @@ impl HistoryArchiveState {
     pub fn futures_all_clear(&self) -> bool {
         self.current_buckets
             .iter()
-            .all(|level| level.next.state == 0)
+            .all(|level| level.next.state == HAS_NEXT_STATE_CLEAR)
     }
 
     /// Check if all future bucket merges are resolved (state <= 1).
@@ -599,7 +602,7 @@ impl HistoryArchiveState {
     pub fn futures_all_resolved(&self) -> bool {
         self.current_buckets
             .iter()
-            .all(|level| level.next.state <= 1)
+            .all(|level| level.next.state <= HAS_NEXT_STATE_OUTPUT)
     }
 
     /// Resolve all completed futures: convert state 1 (output) to state 0 (clear).
@@ -608,7 +611,7 @@ impl HistoryArchiveState {
     /// future is cleared. This is used after restart to settle completed merges.
     pub fn resolve_all_futures(&mut self) {
         for level in &mut self.current_buckets {
-            if level.next.state == 1 {
+            if level.next.state == HAS_NEXT_STATE_OUTPUT {
                 level.next = HASBucketNext::default();
             }
         }
@@ -1213,7 +1216,7 @@ mod tests {
             None => {
                 // Go SDK: zero-initialized BucketList [11]struct{Curr: "", Snap: ""}
                 // SHA256 of empty bytes for each level, then SHA256 of all level hashes
-                let zero_levels: Vec<HASBucketLevel> = (0..11)
+                let zero_levels: Vec<HASBucketLevel> = (0..BUCKET_LIST_LEVELS)
                     .map(|_| HASBucketLevel {
                         curr: String::new(),
                         snap: String::new(),
@@ -1238,7 +1241,7 @@ mod tests {
     #[test]
     fn test_has_bucket_list_hash_round_trip_empty() {
         let zero = ZERO_HASH;
-        let levels: Vec<HASBucketLevel> = (0..11)
+        let levels: Vec<HASBucketLevel> = (0..BUCKET_LIST_LEVELS)
             .map(|_| HASBucketLevel {
                 curr: zero.to_string(),
                 snap: zero.to_string(),
@@ -1266,7 +1269,7 @@ mod tests {
         use sha2::{Digest, Sha256};
         let zero_hash = Hash256::ZERO;
         let mut level_hashes = Vec::new();
-        for _ in 0..11 {
+        for _ in 0..BUCKET_LIST_LEVELS {
             let mut h = Sha256::new();
             h.update(zero_hash.as_bytes());
             h.update(zero_hash.as_bytes());
@@ -1303,7 +1306,7 @@ mod tests {
     #[test]
     fn test_has_bucket_list_hash_round_trip_nonzero() {
         let zero = ZERO_HASH;
-        let mut levels: Vec<HASBucketLevel> = (0..11)
+        let mut levels: Vec<HASBucketLevel> = (0..BUCKET_LIST_LEVELS)
             .map(|_| HASBucketLevel {
                 curr: zero.to_string(),
                 snap: zero.to_string(),
@@ -1336,7 +1339,7 @@ mod tests {
         let zero_h = Hash256::ZERO;
 
         let mut all_level_hashes = Vec::new();
-        for i in 0..11 {
+        for i in 0..BUCKET_LIST_LEVELS {
             let (curr, snap) = if i == 0 { (&a, &b) } else { (&zero_h, &zero_h) };
             let mut h = Sha256::new();
             h.update(curr.as_bytes());

@@ -118,7 +118,7 @@ pub mod snapshot;
 pub use bucket::Bucket;
 pub use bucket_list::{
     BucketLevel, BucketList, BucketListStats, HasNextState, PendingMergeState, BUCKET_LIST_LEVELS,
-    HAS_NEXT_STATE_CLEAR, HAS_NEXT_STATE_OUTPUT,
+    HAS_NEXT_STATE_CLEAR, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT,
 };
 
 // ============================================================================

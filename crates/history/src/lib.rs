@@ -643,7 +643,7 @@ impl HistoryArchiveManager {
             curr: zero_hash.to_hex(),
             snap: zero_hash.to_hex(),
             next: HASBucketNext {
-                state: 0, // FB_CLEAR
+                state: henyey_bucket::HAS_NEXT_STATE_CLEAR,
                 output: None,
                 curr: None,
                 snap: None,
@@ -656,7 +656,7 @@ impl HistoryArchiveManager {
             server: Some("rs-stellar-core".to_string()),
             current_ledger: 0,
             network_passphrase: Some(self.network_passphrase.clone()),
-            current_buckets: vec![empty_level.clone(); 11],
+            current_buckets: vec![empty_level.clone(); henyey_bucket::BUCKET_LIST_LEVELS],
             hot_archive_buckets: None,
         };
 
