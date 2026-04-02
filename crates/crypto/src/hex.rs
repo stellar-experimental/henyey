@@ -12,7 +12,7 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```ignore
 //! use henyey_crypto::hex::{bin_to_hex, hex_abbrev, hex_to_bin, hex_to_bin_256};
 //!
 //! let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
@@ -30,6 +30,7 @@
 //! assert_eq!(decoded, bytes);
 //! ```
 
+#[cfg(test)]
 use crate::CryptoError;
 
 /// Hex-encode bytes as a lowercase hex string.
@@ -46,14 +47,15 @@ use crate::CryptoError;
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::hex::bin_to_hex;
 ///
 /// assert_eq!(bin_to_hex(&[0x00, 0xff, 0x10]), "00ff10");
 /// assert_eq!(bin_to_hex(&[]), "");
 /// ```
 #[inline]
-pub fn bin_to_hex(data: &[u8]) -> String {
+#[cfg(test)]
+fn bin_to_hex(data: &[u8]) -> String {
     hex::encode(data)
 }
 
@@ -72,14 +74,15 @@ pub fn bin_to_hex(data: &[u8]) -> String {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::hex::hex_abbrev;
 ///
 /// assert_eq!(hex_abbrev(&[0x01, 0x23, 0x45, 0x67]), "012345");
 /// assert_eq!(hex_abbrev(&[0xab, 0xcd]), "abcd");
 /// assert_eq!(hex_abbrev(&[]), "");
 /// ```
-pub fn hex_abbrev(data: &[u8]) -> String {
+#[cfg(test)]
+fn hex_abbrev(data: &[u8]) -> String {
     // Only encode up to 3 bytes (producing up to 6 hex characters)
     let prefix_len = data.len().min(3);
     bin_to_hex(&data[..prefix_len])
@@ -99,14 +102,15 @@ pub fn hex_abbrev(data: &[u8]) -> String {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::hex::hex_to_bin;
 ///
 /// assert_eq!(hex_to_bin("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
 /// assert_eq!(hex_to_bin("ABCD").unwrap(), vec![0xab, 0xcd]);
 /// assert!(hex_to_bin("xyz").is_err());
 /// ```
-pub fn hex_to_bin(hex_str: &str) -> Result<Vec<u8>, CryptoError> {
+#[cfg(test)]
+fn hex_to_bin(hex_str: &str) -> Result<Vec<u8>, CryptoError> {
     hex::decode(hex_str).map_err(|_| CryptoError::InvalidHex)
 }
 
@@ -124,7 +128,7 @@ pub fn hex_to_bin(hex_str: &str) -> Result<Vec<u8>, CryptoError> {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::hex::hex_to_bin_256;
 ///
 /// let hex = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -134,7 +138,8 @@ pub fn hex_to_bin(hex_str: &str) -> Result<Vec<u8>, CryptoError> {
 /// // Invalid length
 /// assert!(hex_to_bin_256("00").is_err());
 /// ```
-pub fn hex_to_bin_256(hex_str: &str) -> Result<[u8; 32], CryptoError> {
+#[cfg(test)]
+fn hex_to_bin_256(hex_str: &str) -> Result<[u8; 32], CryptoError> {
     let bytes = hex_to_bin(hex_str)?;
     bytes
         .try_into()
@@ -159,14 +164,15 @@ pub fn hex_to_bin_256(hex_str: &str) -> Result<[u8; 32], CryptoError> {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::hex::hex_to_hash256;
 ///
 /// let hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 /// let hash = hex_to_hash256(hex).unwrap();
 /// assert_eq!(hash.to_hex(), hex);
 /// ```
-pub fn hex_to_hash256(hex_str: &str) -> Result<henyey_common::Hash256, CryptoError> {
+#[cfg(test)]
+fn hex_to_hash256(hex_str: &str) -> Result<henyey_common::Hash256, CryptoError> {
     let bytes = hex_to_bin_256(hex_str)?;
     Ok(henyey_common::Hash256::from(bytes))
 }

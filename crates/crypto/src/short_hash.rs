@@ -26,7 +26,7 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```ignore
 //! use henyey_crypto::{compute_hash, initialize};
 //!
 //! // Initialize with a random key (optional, happens automatically)
@@ -81,7 +81,8 @@ fn key_state() -> &'static Mutex<KeyState> {
 /// # Panics
 ///
 /// Panics if the internal mutex is poisoned.
-pub fn initialize() {
+#[cfg(test)]
+fn initialize() {
     let mut state = key_state().lock().expect("short hash lock poisoned");
     state.key = random::random_bytes();
 }
@@ -139,7 +140,7 @@ pub fn seed(seed: u32) -> Result<(), CryptoError> {
 /// # Panics
 ///
 /// Panics if the internal mutex is poisoned.
-pub fn compute_hash(bytes: &[u8]) -> u64 {
+pub(crate) fn compute_hash(bytes: &[u8]) -> u64 {
     let mut state = key_state().lock().expect("short hash lock poisoned");
     state.have_hashed = true;
     compute_hash_with_key(&state.key, bytes)

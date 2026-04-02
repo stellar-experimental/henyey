@@ -225,48 +225,6 @@ pub struct WorkSchedulerMetrics {
     pub retries_left: u64,
 }
 
-/// A point-in-time snapshot of a single work item's state.
-///
-/// Used for debugging, monitoring, and introspection of the scheduler's
-/// internal state. Snapshots are independent copies that can be examined
-/// without affecting scheduler operation.
-///
-/// The `deps` and `dependents` fields show the dependency graph structure,
-/// which is useful for understanding why work items are blocked or not yet
-/// running.
-#[derive(Debug, Clone)]
-pub struct WorkSnapshot {
-    /// Unique identifier of this work item.
-    pub id: WorkId,
-
-    /// Human-readable name of the work item.
-    pub name: String,
-
-    /// Current state of the work item.
-    pub state: WorkState,
-
-    /// IDs of work items this one depends on (prerequisites).
-    pub deps: Vec<WorkId>,
-
-    /// IDs of work items that depend on this one (downstream).
-    pub dependents: Vec<WorkId>,
-
-    /// Number of execution attempts made so far (includes retries).
-    pub attempts: u32,
-
-    /// Remaining retry budget.
-    pub retries_left: u32,
-
-    /// Error message from the most recent failure, if any.
-    pub last_error: Option<String>,
-
-    /// Duration of the most recent execution attempt.
-    pub last_duration: Option<Duration>,
-
-    /// Cumulative execution time across all attempts.
-    pub total_duration: Duration,
-}
-
 /// Internal representation of a registered work item.
 struct WorkEntry {
     /// Human-readable name for logging and identification.
@@ -424,36 +382,9 @@ impl WorkScheduler {
         }
     }
 
-    /// Returns a snapshot of all work items in the scheduler.
-    ///
-    /// The snapshots are sorted by work ID. This is useful for debugging,
-    /// logging, and monitoring the scheduler's internal state. The returned
-    /// data is a copy and does not affect scheduler operation.
-    pub fn snapshot(&self) -> Vec<WorkSnapshot> {
-        let mut snapshots: Vec<WorkSnapshot> = self
-            .entries
-            .iter()
-            .map(|(id, entry)| WorkSnapshot {
-                id: *id,
-                name: entry.name.clone(),
-                state: self.state_or_pending(*id),
-                deps: entry.deps.clone(),
-                dependents: self.dependents.get(id).cloned().unwrap_or_default(),
-                attempts: entry.attempts,
-                retries_left: entry.retries_left,
-                last_error: entry.last_error.clone(),
-                last_duration: entry.last_duration,
-                total_duration: entry.total_duration,
-            })
-            .collect();
-        snapshots.sort_by_key(|snapshot| snapshot.id);
-        snapshots
-    }
-
     /// Returns aggregate metrics for all work items in the scheduler.
     ///
     /// This is a lightweight operation that scans all entries once.
-    /// For detailed per-item information, use [`snapshot`](Self::snapshot).
     pub fn metrics(&self) -> WorkSchedulerMetrics {
         let mut metrics = WorkSchedulerMetrics {
             total: self.entries.len(),

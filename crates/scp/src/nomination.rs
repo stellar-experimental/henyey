@@ -1027,7 +1027,9 @@ impl Default for NominationProtocol {
 mod tests {
     use super::*;
     use crate::driver::ValidationLevel;
+    use crate::test_utils::{make_node_id, make_quorum_set, make_value, MockDriver};
     use crate::SlotContext;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1087,104 +1089,6 @@ mod tests {
         assert!(nom.latest_composite().is_none());
     }
 
-    struct MockDriver {
-        quorum_set: ScpQuorumSet,
-        emit_count: AtomicU32,
-    }
-
-    impl MockDriver {
-        fn new(quorum_set: ScpQuorumSet) -> Self {
-            Self {
-                quorum_set,
-                emit_count: AtomicU32::new(0),
-            }
-        }
-    }
-
-    impl SCPDriver for MockDriver {
-        fn validate_value(
-            &self,
-            _slot_index: u64,
-            _value: &Value,
-            _nomination: bool,
-        ) -> ValidationLevel {
-            ValidationLevel::FullyValidated
-        }
-
-        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
-            candidates.first().cloned()
-        }
-
-        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
-            Some(value.clone())
-        }
-
-        fn emit_envelope(&self, _envelope: &ScpEnvelope) {
-            self.emit_count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
-            Some(self.quorum_set.clone())
-        }
-
-        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
-
-        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
-
-        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn compute_hash_node(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _is_priority: bool,
-            _round: u32,
-            _node_id: &NodeId,
-        ) -> u64 {
-            1
-        }
-
-        fn compute_value_hash(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _round: u32,
-            value: &Value,
-        ) -> u64 {
-            value.iter().map(|b| *b as u64).sum()
-        }
-
-        fn compute_timeout(&self, _round: u32, _is_nomination: bool) -> Duration {
-            Duration::from_millis(1)
-        }
-
-        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
-
-        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
-            true
-        }
-    }
-
-    fn make_node_id(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
-    }
-
-    fn make_quorum_set(validators: Vec<NodeId>, threshold: u32) -> ScpQuorumSet {
-        ScpQuorumSet {
-            threshold,
-            validators: validators.try_into().unwrap_or_default(),
-            inner_sets: vec![].try_into().unwrap(),
-        }
-    }
-
-    fn make_value(bytes: &[u8]) -> Value {
-        bytes.to_vec().try_into().unwrap()
-    }
-
     fn make_nomination_envelope(
         node_id: NodeId,
         slot_index: u64,
@@ -1212,7 +1116,7 @@ mod tests {
     fn test_nomination_rejects_unsorted_values() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let v1 = make_value(&[1]);
@@ -1226,7 +1130,7 @@ mod tests {
     fn test_nomination_rejects_non_monotonic_statement() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let v1 = make_value(&[1]);
@@ -1248,7 +1152,7 @@ mod tests {
         let node2 = make_node_id(2);
         let node3 = make_node_id(3);
         let quorum_set = make_quorum_set(vec![node.clone(), node2.clone(), node3.clone()], 2);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let value = make_value(&[9]);
@@ -1289,7 +1193,7 @@ mod tests {
         // Use a 2-of-2 quorum set so self-processing alone can't form quorum
         // (prevents immediate acceptance/ratification that would fill candidates).
         let quorum_set = make_quorum_set(vec![node.clone(), node2.clone()], 2);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
         let value = make_value(&[4]);
         let prev = make_value(&[0]);
@@ -1320,7 +1224,7 @@ mod tests {
         let local = make_node_id(1);
         let remote = make_node_id(2);
         let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let value_local = make_value(&[1]);
@@ -1352,7 +1256,7 @@ mod tests {
     fn test_nomination_process_current_state_includes_self_when_forced() {
         let local = make_node_id(1);
         let quorum_set = make_quorum_set(vec![local.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let value_local = make_value(&[3]);
@@ -1381,7 +1285,7 @@ mod tests {
         let node_b = make_node_id(3);
         let node_c = make_node_id(2);
         let quorum_set = make_quorum_set(vec![local.clone(), node_b.clone(), node_c.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let env_local = make_nomination_envelope(
@@ -1429,7 +1333,7 @@ mod tests {
         let local = make_node_id(1);
         let remote = make_node_id(2);
         let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let value = make_value(&[9]);
@@ -1467,7 +1371,7 @@ mod tests {
         let local = make_node_id(1);
         let remote = make_node_id(2);
         let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let value_a = make_value(&[1]);
@@ -1497,7 +1401,7 @@ mod tests {
         let local = make_node_id(1);
         let remote = make_node_id(2);
         let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let env_local = make_nomination_envelope(
@@ -1604,7 +1508,7 @@ mod tests {
     fn test_candidates_accessor() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         // Initially no candidates
@@ -2025,7 +1929,7 @@ mod tests {
     fn test_set_state_from_envelope_rejects_when_started() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         // Start nomination
@@ -2263,7 +2167,7 @@ mod tests {
         // Use a 2-of-2 quorum set so self-processing alone can't form quorum
         // (prevents immediate acceptance/ratification that would fill candidates).
         let quorum_set = make_quorum_set(vec![node.clone(), node2.clone()], 2);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
         let value = make_value(&[5]);

@@ -75,6 +75,121 @@ fn record_entry_type(counters: Option<&MergeCounters>, entry: &BucketEntry) {
     }
 }
 
+/// Core two-pointer merge loop for sorted bucket entries.
+///
+/// Merges entries from `old_iter` and `new_iter` (both sorted by key) using
+/// standard two-pointer merge with CAP-0020 semantics. Each entry to be
+/// included in the output is passed to `emit`.
+///
+/// This is the single source of truth for the merge loop logic. All merge
+/// variants (in-memory, to-file, streaming, iterator) call this function
+/// with different `emit` implementations.
+///
+/// # Arguments
+/// * `old_iter` - Iterator over entries from the older bucket
+/// * `new_iter` - Iterator over entries from the newer bucket
+/// * `keep_dead_entries` - Whether to keep dead entries in the output
+/// * `normalize_init_entries` - Whether to convert INIT entries to LIVE
+/// * `counters` - Optional merge counters for metrics
+/// * `emit` - Callback for each merged entry to include in output
+fn two_pointer_merge(
+    old_iter: impl Iterator<Item = BucketEntry>,
+    new_iter: impl Iterator<Item = BucketEntry>,
+    keep_dead_entries: bool,
+    normalize_init_entries: bool,
+    counters: Option<&MergeCounters>,
+    mut emit: impl FnMut(BucketEntry) -> Result<()>,
+) -> Result<()> {
+    // Filter out metadata from both iterators
+    let mut old_iter = old_iter.filter(|e| !e.is_metadata()).peekable();
+    let mut new_iter = new_iter.filter(|e| !e.is_metadata()).peekable();
+
+    loop {
+        // Check what's available from both sides
+        let has_old = old_iter.peek().is_some();
+        let has_new = new_iter.peek().is_some();
+
+        if !has_old && !has_new {
+            break;
+        }
+
+        if !has_new {
+            // Drain remaining old entries
+            let entry = old_iter.next().unwrap();
+            if should_keep_entry(&entry, keep_dead_entries) {
+                record_entry_type(counters, &entry);
+                emit(entry)?;
+            }
+            continue;
+        }
+
+        if !has_old {
+            // Drain remaining new entries
+            let entry = new_iter.next().unwrap();
+            if should_keep_entry(&entry, keep_dead_entries) {
+                let entry = maybe_normalize_entry(entry, normalize_init_entries);
+                record_entry_type(counters, &entry);
+                emit(entry)?;
+            }
+            continue;
+        }
+
+        // Both sides have entries — compare keys
+        let old_key = old_iter.peek().unwrap().key();
+        let new_key = new_iter.peek().unwrap().key();
+
+        match (old_key, new_key) {
+            (Some(ref ok), Some(ref nk)) => match compare_keys(ok, nk) {
+                Ordering::Less => {
+                    let entry = old_iter.next().unwrap();
+                    if should_keep_entry(&entry, keep_dead_entries) {
+                        record_entry_type(counters, &entry);
+                        emit(entry)?;
+                    }
+                }
+                Ordering::Greater => {
+                    let entry = new_iter.next().unwrap();
+                    if should_keep_entry(&entry, keep_dead_entries) {
+                        let entry = maybe_normalize_entry(entry, normalize_init_entries);
+                        record_entry_type(counters, &entry);
+                        emit(entry)?;
+                    }
+                }
+                Ordering::Equal => {
+                    let old_entry = old_iter.next().unwrap();
+                    let new_entry = new_iter.next().unwrap();
+                    if let Some(merged_entry) = merge_entries(
+                        &old_entry,
+                        &new_entry,
+                        keep_dead_entries,
+                        normalize_init_entries,
+                    ) {
+                        record_entry_type(counters, &merged_entry);
+                        emit(merged_entry)?;
+                    } else {
+                        // INIT+DEAD annihilation
+                        if let Some(c) = counters {
+                            c.record_annihilated();
+                        }
+                    }
+                }
+            },
+            (None, Some(_)) => {
+                old_iter.next();
+            }
+            (Some(_), None) => {
+                new_iter.next();
+            }
+            (None, None) => {
+                old_iter.next();
+                new_iter.next();
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Merge two buckets into a new bucket.
 ///
 /// The `new_bucket` contains newer entries that shadow entries in `old_bucket`.
@@ -186,8 +301,8 @@ fn merge_with_shadows_impl(
     // Extract metadata from the first entries of each bucket.
     let mut old_meta: Option<BucketMetadata> = None;
     let mut new_meta: Option<BucketMetadata> = None;
-    let mut old_current = advance_skip_metadata(&mut old_iter, &mut old_meta);
-    let mut new_current = advance_skip_metadata(&mut new_iter, &mut new_meta);
+    let old_first = advance_skip_metadata(&mut old_iter, &mut old_meta);
+    let new_first = advance_skip_metadata(&mut new_iter, &mut new_meta);
 
     tracing::trace!(
         old_hash = %old_bucket.hash(),
@@ -212,91 +327,14 @@ fn merge_with_shadows_impl(
         merged.push(meta.clone());
     }
 
-    // Two-pointer merge using streaming iterators
-    while old_current.is_some() && new_current.is_some() {
-        let old_entry = old_current.as_ref().unwrap();
-        let new_entry = new_current.as_ref().unwrap();
-
-        let old_key = old_entry.key();
-        let new_key = new_entry.key();
-
-        match (old_key, new_key) {
-            (Some(ref ok), Some(ref nk)) => {
-                match compare_keys(ok, nk) {
-                    Ordering::Less => {
-                        // Old entry comes first, no shadow.
-                        if should_keep_entry(old_entry, keep_dead_entries) {
-                            record_entry_type(counters, old_entry);
-                            maybe_put(
-                                old_entry.clone(),
-                                &mut shadow_cursors,
-                                keep_shadowed_lifecycle_entries,
-                                &mut merged,
-                                counters,
-                            );
-                        }
-                        old_current = next_non_meta(&mut old_iter);
-                    }
-                    Ordering::Greater => {
-                        // New entry comes first
-                        if should_keep_entry(new_entry, keep_dead_entries) {
-                            let entry =
-                                maybe_normalize_entry(new_entry.clone(), normalize_init_entries);
-                            record_entry_type(counters, &entry);
-                            maybe_put(
-                                entry,
-                                &mut shadow_cursors,
-                                keep_shadowed_lifecycle_entries,
-                                &mut merged,
-                                counters,
-                            );
-                        }
-                        new_current = next_non_meta(&mut new_iter);
-                    }
-                    Ordering::Equal => {
-                        // Keys match - new entry shadows old entry
-                        if let Some(merged_entry) = merge_entries(
-                            old_entry,
-                            new_entry,
-                            keep_dead_entries,
-                            normalize_init_entries,
-                        ) {
-                            record_entry_type(counters, &merged_entry);
-                            maybe_put(
-                                merged_entry,
-                                &mut shadow_cursors,
-                                keep_shadowed_lifecycle_entries,
-                                &mut merged,
-                                counters,
-                            );
-                        } else {
-                            // INIT+DEAD annihilation
-                            if let Some(c) = counters {
-                                c.record_annihilated();
-                            }
-                        }
-                        old_current = next_non_meta(&mut old_iter);
-                        new_current = next_non_meta(&mut new_iter);
-                    }
-                }
-            }
-            (None, Some(_)) => {
-                old_current = next_non_meta(&mut old_iter);
-            }
-            (Some(_), None) => {
-                new_current = next_non_meta(&mut new_iter);
-            }
-            (None, None) => {
-                old_current = next_non_meta(&mut old_iter);
-                new_current = next_non_meta(&mut new_iter);
-            }
-        }
-    }
-
-    // Drain remaining old entries
-    while let Some(entry) = old_current {
-        if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
-            record_entry_type(counters, &entry);
+    // Chain the already-consumed first entry with the rest of the iterator
+    two_pointer_merge(
+        old_first.into_iter().chain(old_iter),
+        new_first.into_iter().chain(new_iter),
+        keep_dead_entries,
+        normalize_init_entries,
+        counters,
+        |entry| {
             maybe_put(
                 entry,
                 &mut shadow_cursors,
@@ -304,25 +342,9 @@ fn merge_with_shadows_impl(
                 &mut merged,
                 counters,
             );
-        }
-        old_current = old_iter.next();
-    }
-
-    // Drain remaining new entries
-    while let Some(entry) = new_current {
-        if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
-            let entry = maybe_normalize_entry(entry, normalize_init_entries);
-            record_entry_type(counters, &entry);
-            maybe_put(
-                entry,
-                &mut shadow_cursors,
-                keep_shadowed_lifecycle_entries,
-                &mut merged,
-                counters,
-            );
-        }
-        new_current = new_iter.next();
-    }
+            Ok(())
+        },
+    )?;
 
     if merged.is_empty() {
         // In stellar-core, even a merge that results in no data entries still produces a bucket
@@ -404,8 +426,8 @@ pub fn merge_buckets_to_file_with_counters(
 
     let mut old_meta: Option<BucketMetadata> = None;
     let mut new_meta: Option<BucketMetadata> = None;
-    let mut old_current = advance_skip_metadata(&mut old_iter, &mut old_meta);
-    let mut new_current = advance_skip_metadata(&mut new_iter, &mut new_meta);
+    let old_first = advance_skip_metadata(&mut old_iter, &mut old_meta);
+    let new_first = advance_skip_metadata(&mut new_iter, &mut new_meta);
 
     let (_, output_meta) =
         build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)?;
@@ -444,82 +466,15 @@ pub fn merge_buckets_to_file_with_counters(
         write_entry(meta, &mut writer, &mut hasher, &mut entry_count)?;
     }
 
-    // Two-pointer merge
-    while old_current.is_some() && new_current.is_some() {
-        let old_entry = old_current.as_ref().unwrap();
-        let new_entry = new_current.as_ref().unwrap();
-
-        let old_key = old_entry.key();
-        let new_key = new_entry.key();
-
-        match (old_key, new_key) {
-            (Some(ref ok), Some(ref nk)) => match compare_keys(ok, nk) {
-                Ordering::Less => {
-                    if should_keep_entry(old_entry, keep_dead_entries) {
-                        record_entry_type(counters, old_entry);
-                        write_entry(old_entry, &mut writer, &mut hasher, &mut entry_count)?;
-                    }
-                    old_current = next_non_meta(&mut old_iter);
-                }
-                Ordering::Greater => {
-                    if should_keep_entry(new_entry, keep_dead_entries) {
-                        let entry =
-                            maybe_normalize_entry(new_entry.clone(), normalize_init_entries);
-                        record_entry_type(counters, &entry);
-                        write_entry(&entry, &mut writer, &mut hasher, &mut entry_count)?;
-                    }
-                    new_current = next_non_meta(&mut new_iter);
-                }
-                Ordering::Equal => {
-                    if let Some(merged_entry) = merge_entries(
-                        old_entry,
-                        new_entry,
-                        keep_dead_entries,
-                        normalize_init_entries,
-                    ) {
-                        record_entry_type(counters, &merged_entry);
-                        write_entry(&merged_entry, &mut writer, &mut hasher, &mut entry_count)?;
-                    } else {
-                        // INIT+DEAD annihilation
-                        if let Some(c) = counters {
-                            c.record_annihilated();
-                        }
-                    }
-                    old_current = next_non_meta(&mut old_iter);
-                    new_current = next_non_meta(&mut new_iter);
-                }
-            },
-            (None, Some(_)) => {
-                old_current = next_non_meta(&mut old_iter);
-            }
-            (Some(_), None) => {
-                new_current = next_non_meta(&mut new_iter);
-            }
-            (None, None) => {
-                old_current = next_non_meta(&mut old_iter);
-                new_current = next_non_meta(&mut new_iter);
-            }
-        }
-    }
-
-    // Drain remaining old entries
-    while let Some(entry) = old_current {
-        if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
-            record_entry_type(counters, &entry);
-            write_entry(&entry, &mut writer, &mut hasher, &mut entry_count)?;
-        }
-        old_current = old_iter.next();
-    }
-
-    // Drain remaining new entries
-    while let Some(entry) = new_current {
-        if !entry.is_metadata() && should_keep_entry(&entry, keep_dead_entries) {
-            let entry = maybe_normalize_entry(entry, normalize_init_entries);
-            record_entry_type(counters, &entry);
-            write_entry(&entry, &mut writer, &mut hasher, &mut entry_count)?;
-        }
-        new_current = new_iter.next();
-    }
+    // Two-pointer merge using shared implementation
+    two_pointer_merge(
+        old_first.into_iter().chain(old_iter),
+        new_first.into_iter().chain(new_iter),
+        keep_dead_entries,
+        normalize_init_entries,
+        counters,
+        |entry| write_entry(&entry, &mut writer, &mut hasher, &mut entry_count),
+    )?;
 
     // Flush and sync
     writer.flush()?;
@@ -647,24 +602,16 @@ pub fn merge_in_memory(
 
     // Reusable buffer for XDR serialization (avoids repeated allocations)
     let mut entry_buf: Vec<u8> = Vec::with_capacity(4096);
-    let mut key_buf: Vec<u8> = Vec::with_capacity(256);
 
     // Helper to add entry to output with incremental hashing
     // Uses reusable buffers to minimize allocations
-    let add_entry = |entry: BucketEntry,
-                     hasher: &mut Sha256,
-                     key_index: &mut HashMap<LedgerKey, usize>,
-                     all_entries: &mut Vec<BucketEntry>,
-                     entry_idx: &mut usize,
-                     entry_buf: &mut Vec<u8>,
-                     _key_buf: &mut Vec<u8>|
-     -> Result<()> {
+    let mut add_entry = |entry: BucketEntry| -> Result<()> {
         use stellar_xdr::curr::Limited;
 
         // Serialize entry for hash using reusable buffer
         entry_buf.clear();
         {
-            let mut limited = Limited::new(entry_buf as &mut Vec<u8>, Limits::none());
+            let mut limited = Limited::new(&mut entry_buf as &mut Vec<u8>, Limits::none());
             entry.write_xdr(&mut limited).map_err(|e| {
                 BucketError::Serialization(format!("Failed to serialize entry: {}", e))
             })?;
@@ -679,37 +626,18 @@ pub fn merge_in_memory(
         // Build key index for non-metadata entries
         if !entry.is_metadata() {
             if let Some(key) = entry.key() {
-                key_index.insert(key, *entry_idx);
+                key_index.insert(key, entry_idx);
             }
         }
 
         all_entries.push(entry);
-        *entry_idx += 1;
+        entry_idx += 1;
         Ok(())
     };
 
     // Add metadata first if present
     if let Some(ref meta) = output_meta {
-        add_entry(
-            meta.clone(),
-            &mut hasher,
-            &mut key_index,
-            &mut all_entries,
-            &mut entry_idx,
-            &mut entry_buf,
-            &mut key_buf,
-        )?;
-    }
-
-    // Set up indices, skipping metadata entries
-    let mut old_idx = 0;
-    let mut new_idx = 0;
-
-    while old_idx < old_entries.len() && old_entries[old_idx].is_metadata() {
-        old_idx += 1;
-    }
-    while new_idx < new_entries.len() && new_entries[new_idx].is_metadata() {
-        new_idx += 1;
+        add_entry(meta.clone())?;
     }
 
     // Level 0 always keeps tombstones (they may shadow entries in deeper levels)
@@ -717,110 +645,16 @@ pub fn merge_in_memory(
     // Level 0 does NOT normalize INIT entries (they stay INIT within the merge window)
     let normalize_init_entries = false;
 
-    // Merge entries with incremental hashing
-    while old_idx < old_entries.len() && new_idx < new_entries.len() {
-        let old_entry = &old_entries[old_idx];
-        let new_entry = &new_entries[new_idx];
-
-        let old_key = old_entry.key();
-        let new_key = new_entry.key();
-
-        match (old_key, new_key) {
-            (Some(ref ok), Some(ref nk)) => {
-                use crate::entry::compare_keys;
-                match compare_keys(ok, nk) {
-                    std::cmp::Ordering::Less => {
-                        if should_keep_entry(old_entry, keep_dead_entries) {
-                            add_entry(
-                                old_entry.clone(),
-                                &mut hasher,
-                                &mut key_index,
-                                &mut all_entries,
-                                &mut entry_idx,
-                                &mut entry_buf,
-                                &mut key_buf,
-                            )?;
-                        }
-                        old_idx += 1;
-                    }
-                    std::cmp::Ordering::Greater => {
-                        if should_keep_entry(new_entry, keep_dead_entries) {
-                            add_entry(
-                                maybe_normalize_entry(new_entry.clone(), normalize_init_entries),
-                                &mut hasher,
-                                &mut key_index,
-                                &mut all_entries,
-                                &mut entry_idx,
-                                &mut entry_buf,
-                                &mut key_buf,
-                            )?;
-                        }
-                        new_idx += 1;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        if let Some(merged_entry) = merge_entries(
-                            old_entry,
-                            new_entry,
-                            keep_dead_entries,
-                            normalize_init_entries,
-                        ) {
-                            add_entry(
-                                merged_entry,
-                                &mut hasher,
-                                &mut key_index,
-                                &mut all_entries,
-                                &mut entry_idx,
-                                &mut entry_buf,
-                                &mut key_buf,
-                            )?;
-                        }
-                        old_idx += 1;
-                        new_idx += 1;
-                    }
-                }
-            }
-            (None, Some(_)) => old_idx += 1,
-            (Some(_), None) => new_idx += 1,
-            (None, None) => {
-                old_idx += 1;
-                new_idx += 1;
-            }
-        }
-    }
-
-    // Add remaining old entries
-    while old_idx < old_entries.len() {
-        let entry = &old_entries[old_idx];
-        if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
-            add_entry(
-                entry.clone(),
-                &mut hasher,
-                &mut key_index,
-                &mut all_entries,
-                &mut entry_idx,
-                &mut entry_buf,
-                &mut key_buf,
-            )?;
-        }
-        old_idx += 1;
-    }
-
-    // Add remaining new entries
-    while new_idx < new_entries.len() {
-        let entry = &new_entries[new_idx];
-        if !entry.is_metadata() && should_keep_entry(entry, keep_dead_entries) {
-            add_entry(
-                maybe_normalize_entry(entry.clone(), normalize_init_entries),
-                &mut hasher,
-                &mut key_index,
-                &mut all_entries,
-                &mut entry_idx,
-                &mut entry_buf,
-                &mut key_buf,
-            )?;
-        }
-        new_idx += 1;
-    }
+    // Two-pointer merge using shared implementation
+    // Convert slice iteration to iterators (metadata filtered by two_pointer_merge)
+    two_pointer_merge(
+        old_entries.iter().cloned(),
+        new_entries.iter().cloned(),
+        keep_dead_entries,
+        normalize_init_entries,
+        None, // no counters for in-memory merge
+        |entry| add_entry(entry),
+    )?;
 
     // Handle empty result
     if all_entries.is_empty() {
@@ -1126,18 +960,10 @@ fn merge_entries(
 /// Note: Always normalizes `Init` entries to `Live` for backward compatibility.
 /// For more control, use `merge_buckets_with_options` instead.
 pub struct MergeIterator {
-    /// Entries from the older bucket (collected upfront).
-    old_entries: Vec<BucketEntry>,
-    /// Entries from the newer bucket (collected upfront).
-    new_entries: Vec<BucketEntry>,
-    /// Current index into old_entries.
-    old_idx: usize,
-    /// Current index into new_entries.
-    new_idx: usize,
-    /// Whether to keep dead entries in output.
-    keep_dead_entries: bool,
-    /// Metadata entry to emit first (if any).
-    output_metadata: Option<BucketEntry>,
+    /// Pre-computed merged entries.
+    merged_entries: Vec<BucketEntry>,
+    /// Current index into merged_entries.
+    idx: usize,
 }
 
 impl MergeIterator {
@@ -1157,13 +983,31 @@ impl MergeIterator {
             build_output_metadata(old_meta.as_ref(), new_meta.as_ref(), max_protocol_version)
                 .unwrap_or((0, None));
 
-        Self {
-            old_entries,
-            new_entries,
-            old_idx: 0,
-            new_idx: 0,
+        let mut merged_entries = Vec::with_capacity(old_entries.len() + new_entries.len());
+
+        // Add metadata first if present
+        if let Some(meta) = output_metadata {
+            merged_entries.push(meta);
+        }
+
+        // Use shared two-pointer merge with normalize_init_entries=true
+        // (MergeIterator always normalizes for backward compatibility)
+        two_pointer_merge(
+            old_entries.into_iter(),
+            new_entries.into_iter(),
             keep_dead_entries,
-            output_metadata,
+            true, // normalize_init_entries
+            None, // no counters
+            |entry| {
+                merged_entries.push(entry);
+                Ok(())
+            },
+        )
+        .expect("in-memory merge should not fail");
+
+        Self {
+            merged_entries,
+            idx: 0,
         }
     }
 }
@@ -1172,94 +1016,12 @@ impl Iterator for MergeIterator {
     type Item = BucketEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(meta) = self.output_metadata.take() {
-            while self.old_idx < self.old_entries.len()
-                && self.old_entries[self.old_idx].is_metadata()
-            {
-                self.old_idx += 1;
-            }
-            while self.new_idx < self.new_entries.len()
-                && self.new_entries[self.new_idx].is_metadata()
-            {
-                self.new_idx += 1;
-            }
-            return Some(meta);
-        }
-
-        loop {
-            // Check if we're done with both
-            if self.old_idx >= self.old_entries.len() && self.new_idx >= self.new_entries.len() {
-                return None;
-            }
-
-            // Only old entries left
-            if self.new_idx >= self.new_entries.len() {
-                let entry = self.old_entries[self.old_idx].clone();
-                self.old_idx += 1;
-                if !entry.is_metadata() {
-                    return Some(entry);
-                }
-                continue;
-            }
-
-            // Only new entries left
-            if self.old_idx >= self.old_entries.len() {
-                let entry = self.new_entries[self.new_idx].clone();
-                self.new_idx += 1;
-                if !entry.is_metadata() && should_keep_entry(&entry, self.keep_dead_entries) {
-                    return Some(normalize_entry(entry));
-                }
-                continue;
-            }
-
-            // Both have entries
-            let old_entry = &self.old_entries[self.old_idx];
-            let new_entry = &self.new_entries[self.new_idx];
-
-            let old_key = old_entry.key();
-            let new_key = new_entry.key();
-
-            match (old_key, new_key) {
-                (Some(ref ok), Some(ref nk)) => {
-                    match compare_keys(ok, nk) {
-                        Ordering::Less => {
-                            self.old_idx += 1;
-                            return Some(old_entry.clone());
-                        }
-                        Ordering::Greater => {
-                            self.new_idx += 1;
-                            if should_keep_entry(new_entry, self.keep_dead_entries) {
-                                return Some(normalize_entry(new_entry.clone()));
-                            }
-                            continue;
-                        }
-                        Ordering::Equal => {
-                            self.old_idx += 1;
-                            self.new_idx += 1;
-                            // Always normalize in MergeIterator for backward compatibility
-                            if let Some(merged) =
-                                merge_entries(old_entry, new_entry, self.keep_dead_entries, true)
-                            {
-                                return Some(merged);
-                            }
-                            continue;
-                        }
-                    }
-                }
-                (None, Some(_)) => {
-                    self.old_idx += 1;
-                    continue;
-                }
-                (Some(_), None) => {
-                    self.new_idx += 1;
-                    continue;
-                }
-                (None, None) => {
-                    self.old_idx += 1;
-                    self.new_idx += 1;
-                    continue;
-                }
-            }
+        if self.idx < self.merged_entries.len() {
+            let entry = self.merged_entries[self.idx].clone();
+            self.idx += 1;
+            Some(entry)
+        } else {
+            None
         }
     }
 }

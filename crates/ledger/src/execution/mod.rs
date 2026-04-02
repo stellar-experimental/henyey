@@ -49,30 +49,27 @@ use soroban_env_host_p25::fees::{
 
 use henyey_tx::{
     make_account_address, make_claimable_balance_address, make_muxed_account_address,
-    operations::OperationTypeExt,
     soroban::{PersistentModuleCache, SorobanConfig},
-    state::{get_account_seq_ledger, get_account_seq_time},
-    validation::{self, LedgerContext as ValidationContext},
-    ClassicEventConfig, LedgerContext, LedgerStateManager, OpEventManager, TransactionFrame,
-    TxError, TxEventManager,
+    validation, ClassicEventConfig, LedgerContext, LedgerStateManager, OpEventManager,
+    TransactionFrame, TxError, TxEventManager,
 };
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountId, AccountMergeResult,
-    AllowTrustOp, AlphaNum12, AlphaNum4, Asset, AssetCode, ClaimableBalanceEntry,
-    ClaimableBalanceId, ConfigSettingEntry, ConfigSettingId, ContractCostParams, ContractEvent,
-    CreateClaimableBalanceResult, DiagnosticEvent, ExtensionPoint, InflationResult,
-    InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
-    InnerTransactionResultResult, LedgerEntry, LedgerEntryChange, LedgerEntryChanges,
-    LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyConfigSetting,
-    LedgerKeyLiquidityPool, LedgerKeyTrustLine, Limits, LiquidityPoolEntry, LiquidityPoolEntryBody,
-    ManageBuyOfferResult, ManageSellOfferResult, MuxedAccount, OfferEntry, Operation,
-    OperationBody, OperationMetaV2, OperationResult, OperationResultTr, OperationType,
-    PathPaymentStrictReceiveResult, PathPaymentStrictSendResult, PoolId, Preconditions, ScAddress,
-    SignerKey, SorobanTransactionData, SorobanTransactionMetaExt, SorobanTransactionMetaExtV1,
-    SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent, TransactionEventStage,
-    TransactionMeta, TransactionMetaV4, TransactionResult, TransactionResultCode,
-    TransactionResultExt, TransactionResultMetaV1, TransactionResultPair, TransactionResultResult,
-    TrustLineAsset, TrustLineFlags, VecM, WriteXdr,
+    AccountEntry, AccountEntryExt, AccountId, AccountMergeResult, AllowTrustOp, AlphaNum12,
+    AlphaNum4, Asset, AssetCode, ClaimableBalanceEntry, ClaimableBalanceId, ConfigSettingEntry,
+    ConfigSettingId, ContractCostParams, ContractEvent, CreateClaimableBalanceResult,
+    DiagnosticEvent, ExtensionPoint, InflationResult, InnerTransactionResult,
+    InnerTransactionResultExt, InnerTransactionResultPair, InnerTransactionResultResult,
+    LedgerEntry, LedgerEntryChange, LedgerEntryChanges, LedgerEntryData, LedgerKey,
+    LedgerKeyClaimableBalance, LedgerKeyConfigSetting, LedgerKeyLiquidityPool, LedgerKeyTrustLine,
+    Limits, LiquidityPoolEntry, LiquidityPoolEntryBody, ManageBuyOfferResult,
+    ManageSellOfferResult, MuxedAccount, OfferEntry, Operation, OperationBody, OperationMetaV2,
+    OperationResult, OperationResultTr, OperationType, PathPaymentStrictReceiveResult,
+    PathPaymentStrictSendResult, PoolId, Preconditions, ScAddress, SignerKey,
+    SorobanTransactionData, SorobanTransactionMetaExt, SorobanTransactionMetaExtV1,
+    SorobanTransactionMetaV2, TransactionEnvelope, TransactionEvent, TransactionMeta,
+    TransactionMetaV4, TransactionResult, TransactionResultCode, TransactionResultExt,
+    TransactionResultMetaV1, TransactionResultPair, TransactionResultResult, TrustLineAsset, VecM,
+    WriteXdr,
 };
 use tracing::{debug, warn};
 
@@ -83,8 +80,11 @@ use crate::{LedgerError, Result};
 
 use henyey_bucket::HotArchiveBucketList;
 
+mod account_loading;
+mod apply;
 mod config;
 mod meta;
+mod preconditions;
 mod result_mapping;
 mod signatures;
 mod tx_set;
@@ -98,8 +98,8 @@ pub use tx_set::{
     execute_transaction_set_with_fee_mode, run_transactions_on_executor, RunTransactionsParams,
 };
 
+use apply::{RestoredEntries, AUTHORIZED_FLAG};
 use meta::*;
-use result_mapping::*;
 use signatures::*;
 
 /// Wrapper around HotArchiveBucketList that implements the HotArchiveLookup trait.
@@ -139,14 +139,14 @@ impl TransactionExecutionRequest {
     }
 }
 
-struct OperationExecutionRequest<'a> {
-    op: &'a stellar_xdr::curr::Operation,
-    source: &'a AccountId,
-    tx_source: &'a AccountId,
-    tx_seq: i64,
-    op_index: u32,
-    context: &'a LedgerContext,
-    soroban_data: Option<&'a stellar_xdr::curr::SorobanTransactionData>,
+pub(super) struct OperationExecutionRequest<'a> {
+    pub(super) op: &'a stellar_xdr::curr::Operation,
+    pub(super) source: &'a AccountId,
+    pub(super) tx_source: &'a AccountId,
+    pub(super) tx_seq: i64,
+    pub(super) op_index: u32,
+    pub(super) context: &'a LedgerContext,
+    pub(super) soroban_data: Option<&'a stellar_xdr::curr::SorobanTransactionData>,
 }
 
 impl HotArchiveLookupImpl {
@@ -252,12 +252,12 @@ pub struct SorobanNetworkInfo {
     pub ballot_timeout_increment_ms: u32,
 }
 
-struct RefundableFeeTracker {
-    non_refundable_fee: i64,
-    max_refundable_fee: i64,
-    consumed_event_size_bytes: u32,
-    consumed_rent_fee: i64,
-    consumed_refundable_fee: i64,
+pub(super) struct RefundableFeeTracker {
+    pub(super) non_refundable_fee: i64,
+    pub(super) max_refundable_fee: i64,
+    pub(super) consumed_event_size_bytes: u32,
+    pub(super) consumed_rent_fee: i64,
+    pub(super) consumed_refundable_fee: i64,
 }
 
 impl RefundableFeeTracker {
@@ -404,7 +404,10 @@ pub struct TransactionExecutionResult {
 pub type ExecutionFailure = TransactionResultCode;
 
 /// Create a failed `TransactionExecutionResult` with no fee charged or meta.
-fn failed_result(failure: TransactionResultCode, error: &str) -> TransactionExecutionResult {
+pub(super) fn failed_result(
+    failure: TransactionResultCode,
+    error: &str,
+) -> TransactionExecutionResult {
     TransactionExecutionResult {
         success: false,
         fee_charged: 0,
@@ -439,27 +442,27 @@ fn failed_result(failure: TransactionResultCode, error: &str) -> TransactionExec
 }
 
 /// Data returned by successful pre-fee validation of a transaction.
-struct ValidatedTransaction {
-    frame: TransactionFrame,
-    fee_source_id: AccountId,
-    inner_source_id: AccountId,
-    outer_hash: Hash256,
+pub(super) struct ValidatedTransaction {
+    pub(super) frame: TransactionFrame,
+    pub(super) fee_source_id: AccountId,
+    pub(super) inner_source_id: AccountId,
+    pub(super) outer_hash: Hash256,
     // Sub-component timings from validation (microseconds)
-    val_account_load_us: u64,
-    val_tx_hash_us: u64,
-    val_ed25519_us: u64,
-    val_other_us: u64,
+    pub(super) val_account_load_us: u64,
+    pub(super) val_tx_hash_us: u64,
+    pub(super) val_ed25519_us: u64,
+    pub(super) val_other_us: u64,
 }
 
 /// Validation failure with additional context about the validation level reached.
 /// This is used to determine whether the sequence number should still be bumped
 /// even though validation failed, matching stellar-core's ValidationType enum.
-struct ValidationFailure {
-    result: TransactionExecutionResult,
+pub(super) struct ValidationFailure {
+    pub(super) result: TransactionExecutionResult,
     /// Whether the validation passed the sequence check (equivalent to
     /// stellar-core's `cv >= kInvalidUpdateSeqNum`). When true, the sequence
     /// number should be bumped even though the TX failed validation.
-    past_seq_check: bool,
+    pub(super) past_seq_check: bool,
 }
 
 /// Result of the pre-apply phase of transaction execution.
@@ -473,55 +476,55 @@ struct ValidationFailure {
 /// The pre-apply phase validates the transaction, deducts fees (if applicable),
 /// removes one-time signers, bumps the sequence number, and commits these
 /// changes. The apply phase then executes operations using this context.
-struct PreApplyResult {
+pub(super) struct PreApplyResult {
     // Transaction identity
-    frame: TransactionFrame,
-    fee_source_id: AccountId,
-    inner_source_id: AccountId,
+    pub(super) frame: TransactionFrame,
+    pub(super) fee_source_id: AccountId,
+    pub(super) inner_source_id: AccountId,
 
     // Pre-apply outputs
-    tx_changes_before: LedgerEntryChanges,
-    fee_changes: LedgerEntryChanges,
-    refundable_fee_tracker: Option<RefundableFeeTracker>,
-    tx_event_manager: TxEventManager,
-    preflight_failure: Option<ExecutionFailure>,
-    sig_check_failure: Option<(Vec<OperationResult>, ExecutionFailure)>,
-    fee: i64,
+    pub(super) tx_changes_before: LedgerEntryChanges,
+    pub(super) fee_changes: LedgerEntryChanges,
+    pub(super) refundable_fee_tracker: Option<RefundableFeeTracker>,
+    pub(super) tx_event_manager: TxEventManager,
+    pub(super) preflight_failure: Option<ExecutionFailure>,
+    pub(super) sig_check_failure: Option<(Vec<OperationResult>, ExecutionFailure)>,
+    pub(super) fee: i64,
 
     // Rollback data (entry snapshots for restoring on op failure)
-    fee_entries: DeltaEntries,
-    seq_entries: DeltaEntries,
-    signer_entries: DeltaEntries,
+    pub(super) fee_entries: DeltaEntries,
+    pub(super) seq_entries: DeltaEntries,
+    pub(super) signer_entries: DeltaEntries,
 
     // Config carried forward
-    soroban_prng_seed: Option<[u8; 32]>,
-    base_fee: u32,
-    deduct_fee: bool,
+    pub(super) soroban_prng_seed: Option<[u8; 32]>,
+    pub(super) base_fee: u32,
+    pub(super) deduct_fee: bool,
 
     // Timing
-    validation_us: u64,
-    fee_seq_us: u64,
-    tx_timing_start: std::time::Instant,
+    pub(super) validation_us: u64,
+    pub(super) fee_seq_us: u64,
+    pub(super) tx_timing_start: std::time::Instant,
     // Validation sub-component timings (microseconds)
-    val_account_load_us: u64,
-    val_tx_hash_us: u64,
-    val_ed25519_us: u64,
-    val_other_us: u64,
+    pub(super) val_account_load_us: u64,
+    pub(super) val_tx_hash_us: u64,
+    pub(super) val_ed25519_us: u64,
+    pub(super) val_other_us: u64,
     // Fee/seq sub-component timings (microseconds)
-    fee_deduct_us: u64,
-    op_sig_check_us: u64,
-    signer_removal_us: u64,
-    seq_bump_us: u64,
+    pub(super) fee_deduct_us: u64,
+    pub(super) op_sig_check_us: u64,
+    pub(super) signer_removal_us: u64,
+    pub(super) seq_bump_us: u64,
     // Cached transaction hash from validation phase
-    tx_hash: Option<Hash256>,
+    pub(super) tx_hash: Option<Hash256>,
 }
 
 /// Snapshot of created/updated/deleted entries for a delta phase (fee, seq, signer).
 /// Used for rollback restoration when a transaction's operation body fails.
-struct DeltaEntries {
-    created: Vec<LedgerEntry>,
-    updated: Vec<LedgerEntry>,
-    deleted: Vec<LedgerKey>,
+pub(super) struct DeltaEntries {
+    pub(super) created: Vec<LedgerEntry>,
+    pub(super) updated: Vec<LedgerEntry>,
+    pub(super) deleted: Vec<LedgerKey>,
 }
 
 /// Context for executing transactions during ledger close.
@@ -1800,360 +1803,6 @@ impl TransactionExecutor {
         )
     }
 
-    /// Validate a transaction's structure, accounts, fees, preconditions, sequence,
-    /// and signatures before any state changes. Returns the validated data needed
-    /// for execution, or a `ValidationFailure` on validation failure.
-    fn validate_preconditions(
-        &mut self,
-        snapshot: &SnapshotHandle,
-        tx_envelope: &Arc<TransactionEnvelope>,
-        base_fee: u32,
-    ) -> Result<std::result::Result<ValidatedTransaction, ValidationFailure>> {
-        let val_start = std::time::Instant::now();
-        let frame = TransactionFrame::with_network(Arc::clone(tx_envelope), self.network_id);
-        let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
-        let inner_source_id = henyey_tx::muxed_to_account_id(&frame.inner_source_account());
-
-        // Helper to create a pre-seq-check failure (no sequence bump needed).
-        let pre_seq_fail = |failure, error| ValidationFailure {
-            result: failed_result(failure, error),
-            past_seq_check: false,
-        };
-        // Helper to create a post-seq-check failure (sequence bump needed).
-        let post_seq_fail = |failure, error| ValidationFailure {
-            result: failed_result(failure, error),
-            past_seq_check: true,
-        };
-
-        // Phase 1: Structure validation
-        if !frame.is_valid_structure() {
-            let failure = if frame.operations().is_empty() {
-                TransactionResultCode::TxMissingOperation
-            } else {
-                TransactionResultCode::TxMalformed
-            };
-            return Ok(Err(pre_seq_fail(failure, "Invalid transaction structure")));
-        }
-
-        // Phase 2: Account loading
-        let acct_load_start = std::time::Instant::now();
-        if !self.load_account(snapshot, &fee_source_id)? {
-            return Ok(Err(pre_seq_fail(
-                TransactionResultCode::TxNoAccount,
-                "Source account not found",
-            )));
-        }
-        if !self.load_account(snapshot, &inner_source_id)? {
-            return Ok(Err(pre_seq_fail(
-                TransactionResultCode::TxNoAccount,
-                "Source account not found",
-            )));
-        }
-
-        let fee_source_account = match self.state.get_account(&fee_source_id) {
-            Some(acc) => acc.clone(),
-            None => {
-                return Ok(Err(pre_seq_fail(
-                    TransactionResultCode::TxNoAccount,
-                    "Source account not found",
-                )))
-            }
-        };
-        let source_account = match self.state.get_account(&inner_source_id) {
-            Some(acc) => acc.clone(),
-            None => {
-                return Ok(Err(pre_seq_fail(
-                    TransactionResultCode::TxNoAccount,
-                    "Source account not found",
-                )))
-            }
-        };
-        let val_account_load_us = acct_load_start.elapsed().as_micros() as u64;
-
-        // Phase 3: Fee validation
-        if frame.is_fee_bump() {
-            let op_count = frame.operation_count() as i64;
-            let outer_op_count = std::cmp::max(1_i64, op_count + 1);
-            let outer_min_inclusion_fee = base_fee as i64 * outer_op_count;
-            let outer_inclusion_fee = frame.inclusion_fee();
-
-            if outer_inclusion_fee < outer_min_inclusion_fee {
-                return Ok(Err(pre_seq_fail(
-                    TransactionResultCode::TxInsufficientFee,
-                    "Insufficient fee",
-                )));
-            }
-
-            let (inner_inclusion_fee, inner_is_soroban) = match frame.envelope() {
-                TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
-                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                        let inner_env = TransactionEnvelope::Tx(inner.clone());
-                        let inner_frame =
-                            TransactionFrame::from_owned_with_network(inner_env, self.network_id);
-                        (inner_frame.inclusion_fee(), inner_frame.is_soroban())
-                    }
-                },
-                _ => (0, false),
-            };
-
-            if inner_inclusion_fee >= 0 {
-                let inner_min_inclusion_fee = base_fee as i64 * std::cmp::max(1_i64, op_count);
-                let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
-                let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
-                if v1 < v2 {
-                    return Ok(Err(pre_seq_fail(
-                        TransactionResultCode::TxInsufficientFee,
-                        "Insufficient fee",
-                    )));
-                }
-            } else {
-                let allow_negative_inner = inner_is_soroban;
-                if !allow_negative_inner {
-                    return Ok(Err(pre_seq_fail(
-                        TransactionResultCode::TxFailed,
-                        "Fee bump inner transaction invalid",
-                    )));
-                }
-            }
-        } else {
-            let required_fee = frame.operation_count() as u32 * base_fee;
-            if frame.fee() < required_fee {
-                return Ok(Err(pre_seq_fail(
-                    TransactionResultCode::TxInsufficientFee,
-                    "Insufficient fee",
-                )));
-            }
-        }
-
-        // Phase 4: Time/ledger bounds and precondition validation
-        let validation_ctx = ValidationContext::new(
-            self.ledger_seq,
-            self.close_time,
-            base_fee,
-            self.base_reserve,
-            self.protocol_version,
-            self.network_id,
-        );
-
-        if let Err(e) = validation::validate_time_bounds(&frame, &validation_ctx) {
-            return Ok(Err(pre_seq_fail(
-                match e {
-                    validation::ValidationError::TooEarly { .. } => {
-                        TransactionResultCode::TxTooEarly
-                    }
-                    validation::ValidationError::TooLate { .. } => TransactionResultCode::TxTooLate,
-                    _ => TransactionResultCode::TxFailed,
-                },
-                "Time bounds invalid",
-            )));
-        }
-
-        if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
-            return Ok(Err(pre_seq_fail(
-                match e {
-                    validation::ValidationError::BadLedgerBounds { min, max, current } => {
-                        if max > 0 && current > max {
-                            TransactionResultCode::TxTooLate
-                        } else if min > 0 && current < min {
-                            TransactionResultCode::TxTooEarly
-                        } else {
-                            TransactionResultCode::TxFailed
-                        }
-                    }
-                    _ => TransactionResultCode::TxFailed,
-                },
-                "Ledger bounds invalid",
-            )));
-        }
-
-        // Phase 5: Sequence number validation
-        // This combines stellar-core's isBadSeq (including min_seq_num) check.
-        if self.ledger_seq <= i32::MAX as u32 {
-            let starting_seq = (self.ledger_seq as i64) << 32;
-            if frame.sequence_number() == starting_seq {
-                return Ok(Err(pre_seq_fail(
-                    TransactionResultCode::TxBadSeq,
-                    "Bad sequence: equals starting sequence",
-                )));
-            }
-        }
-
-        let min_seq_num = match frame.preconditions() {
-            Preconditions::V2(cond) => cond.min_seq_num.map(|s| s.0),
-            _ => None,
-        };
-
-        let account_seq = source_account.seq_num.0;
-        let tx_seq = frame.sequence_number();
-
-        tracing::debug!(
-            account_seq,
-            tx_seq,
-            min_seq_num = ?min_seq_num,
-            preconditions_type = ?std::mem::discriminant(&frame.preconditions()),
-            "Sequence number validation"
-        );
-
-        let is_bad_seq = if let Some(min_seq) = min_seq_num {
-            account_seq < min_seq || account_seq >= tx_seq
-        } else {
-            account_seq == i64::MAX || account_seq + 1 != tx_seq
-        };
-
-        if is_bad_seq {
-            let error_msg = if let Some(min_seq) = min_seq_num {
-                format!(
-                    "Bad sequence: account seq {} not in valid range [minSeqNum={}, txSeq={})",
-                    account_seq, min_seq, tx_seq
-                )
-            } else {
-                format!(
-                    "Bad sequence: expected {}, got {}",
-                    account_seq.saturating_add(1),
-                    tx_seq
-                )
-            };
-            return Ok(Err(pre_seq_fail(
-                TransactionResultCode::TxBadSeq,
-                &error_msg,
-            )));
-        }
-
-        // --- Past this point, the sequence check has passed ---
-        // In stellar-core's commonValid, res = kInvalidUpdateSeqNum here.
-        // Failures after this point should still bump the sequence number.
-
-        // Phase 5b: Min seq age/gap checks (stellar-core's isTooEarlyForAccount)
-        if let Preconditions::V2(cond) = frame.preconditions() {
-            if cond.min_seq_age.0 > 0 {
-                let acc_seq_time = get_account_seq_time(&source_account);
-                let min_seq_age = cond.min_seq_age.0;
-                if min_seq_age > self.close_time || self.close_time - min_seq_age < acc_seq_time {
-                    return Ok(Err(post_seq_fail(
-                        TransactionResultCode::TxBadMinSeqAgeOrGap,
-                        "Minimum sequence age not met",
-                    )));
-                }
-            }
-
-            if cond.min_seq_ledger_gap > 0 {
-                let acc_seq_ledger = get_account_seq_ledger(&source_account);
-                let min_seq_ledger_gap = cond.min_seq_ledger_gap;
-                if min_seq_ledger_gap > self.ledger_seq
-                    || self.ledger_seq - min_seq_ledger_gap < acc_seq_ledger
-                {
-                    return Ok(Err(post_seq_fail(
-                        TransactionResultCode::TxBadMinSeqAgeOrGap,
-                        "Minimum sequence ledger gap not met",
-                    )));
-                }
-            }
-        }
-
-        // Phase 6: Signature validation
-        let sig_start = std::time::Instant::now();
-        if validation::validate_signatures(&frame, &validation_ctx).is_err() {
-            return Ok(Err(post_seq_fail(
-                TransactionResultCode::TxBadAuth,
-                "Invalid signature",
-            )));
-        }
-
-        let hash_start = std::time::Instant::now();
-        let outer_hash = frame
-            .hash(&self.network_id)
-            .map_err(|e| LedgerError::Internal(format!("tx hash error: {}", e)))?;
-        let val_tx_hash_us = hash_start.elapsed().as_micros() as u64;
-
-        let ed25519_start = std::time::Instant::now();
-        let outer_threshold = threshold_low(&fee_source_account);
-        if !has_sufficient_signer_weight(
-            &outer_hash,
-            frame.signatures(),
-            &fee_source_account,
-            outer_threshold,
-        ) {
-            tracing::debug!("Signature check failed: fee_source outer check");
-            return Ok(Err(post_seq_fail(
-                TransactionResultCode::TxBadAuth,
-                "Invalid signature",
-            )));
-        }
-
-        // NOTE: For fee-bump transactions, we deliberately do NOT check the inner
-        // transaction's signatures here. In stellar-core, fee is charged by
-        // processFeeSeqNum() BEFORE apply() re-validates inner signatures. If a
-        // prior transaction in the same ledger modifies the inner source's signer
-        // set, the inner sig check must fail at apply-time (after fee charging),
-        // not here. The check_operation_signatures call in execute_transaction_with_fee_mode
-        // handles inner sig validation after the fee has been deducted.
-
-        // For non-fee-bump TXs, the fee source IS the inner source. When they're
-        // the same account, the second weight check is identical to the first (same
-        // account, same threshold_low, same signatures, same hash). Skip it to avoid
-        // a redundant sig cache lookup (~5µs/TX × 12,500 TXs = ~62ms/cluster).
-        let required_weight = threshold_low(&source_account);
-        if !frame.is_fee_bump()
-            && fee_source_id != inner_source_id
-            && !has_sufficient_signer_weight(
-                &outer_hash,
-                frame.signatures(),
-                &source_account,
-                required_weight,
-            )
-        {
-            tracing::debug!(
-                required_weight = required_weight,
-                is_fee_bump = frame.is_fee_bump(),
-                master_weight = source_account.thresholds.0[0],
-                num_signers = source_account.signers.len(),
-                thresholds = ?source_account.thresholds.0,
-                "Signature check failed: source outer check"
-            );
-            return Ok(Err(post_seq_fail(
-                TransactionResultCode::TxBadAuth,
-                "Invalid signature",
-            )));
-        }
-
-        if let Preconditions::V2(cond) = frame.preconditions() {
-            if !cond.extra_signers.is_empty() {
-                let extra_hash = if frame.is_fee_bump() {
-                    fee_bump_inner_hash(&frame, &self.network_id)?
-                } else {
-                    outer_hash
-                };
-                let extra_signatures = if frame.is_fee_bump() {
-                    frame.inner_signatures()
-                } else {
-                    frame.signatures()
-                };
-                if !has_required_extra_signers(&extra_hash, extra_signatures, &cond.extra_signers) {
-                    return Ok(Err(post_seq_fail(
-                        TransactionResultCode::TxBadAuthExtra,
-                        "Missing extra signer",
-                    )));
-                }
-            }
-        }
-
-        let val_ed25519_us = ed25519_start.elapsed().as_micros() as u64;
-        let val_sig_total_us = sig_start.elapsed().as_micros() as u64;
-        let val_total_us = val_start.elapsed().as_micros() as u64;
-        let val_other_us = val_total_us.saturating_sub(val_account_load_us + val_sig_total_us);
-
-        Ok(Ok(ValidatedTransaction {
-            frame,
-            fee_source_id,
-            inner_source_id,
-            outer_hash,
-            val_account_load_us,
-            val_tx_hash_us,
-            val_ed25519_us,
-            val_other_us,
-        }))
-    }
-
     /// Pre-apply phase: validate, charge fees, remove one-time signers, bump sequence.
     ///
     /// This matches stellar-core's `commonPreApply` + `preParallelApply` flow.
@@ -2342,12 +1991,6 @@ impl TransactionExecutor {
         let fee_deduct_us = fee_deduct_start.elapsed().as_micros() as u64;
 
         let tx_changes_before: LedgerEntryChanges;
-        let seq_created;
-        let seq_updated;
-        let seq_deleted;
-        let mut signer_created = Vec::new();
-        let mut signer_updated = Vec::new();
-        let mut signer_deleted = Vec::new();
 
         // For fee bump transactions in two-phase mode, stellar-core's
         // FeeBumpTransactionFrame::apply() ALWAYS calls removeOneTimeSignerKeyFromFeeSource()
@@ -2418,92 +2061,11 @@ impl TransactionExecutor {
         // Remove one-time (PreAuthTx) signers from all source accounts.
         // This must happen AFTER the signature check above so PreAuthTx signers
         // are still present when their weight is evaluated.
-        let signer_removal_start = std::time::Instant::now();
-        let mut signer_changes = empty_entry_changes();
-        if self.protocol_version != 7 {
-            let mut source_accounts = Vec::new();
-            source_accounts.push(inner_source_id.clone());
-            for op in frame.operations().iter() {
-                if let Some(ref source) = op.source_account {
-                    source_accounts.push(henyey_tx::muxed_to_account_id(source));
-                }
-            }
-            source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
-            source_accounts.dedup_by(|a, b| a.0 == b.0);
+        let (signer_changes, signer_created, signer_updated, signer_deleted, signer_removal_us) =
+            self.remove_one_time_signers_phase(&frame, &inner_source_id, &outer_hash);
 
-            let delta_before_signers = delta_snapshot(&self.state);
-            let mut signer_state_overrides = HashMap::new();
-            for account_id in &source_accounts {
-                let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                    account_id: account_id.clone(),
-                });
-                if let Some(entry) = self.state.get_entry(&key) {
-                    signer_state_overrides.insert(key, entry);
-                }
-            }
-
-            self.state.remove_one_time_signers_from_all_sources(
-                &outer_hash,
-                &source_accounts,
-                self.protocol_version,
-            );
-            self.state.flush_modified_entries();
-            let delta_after_signers = delta_snapshot(&self.state);
-            let delta_slice = delta_slice_between(
-                self.state.delta(),
-                delta_before_signers,
-                delta_after_signers,
-            );
-            signer_created = delta_slice.created().to_vec();
-            signer_updated = delta_slice.updated().to_vec();
-            signer_deleted = delta_slice.deleted().to_vec();
-            signer_changes = build_entry_changes_with_state_overrides(
-                &self.state,
-                &signer_created,
-                &signer_updated,
-                &signer_deleted,
-                &signer_state_overrides,
-            );
-        }
-        let signer_removal_us = signer_removal_start.elapsed().as_micros() as u64;
-
-        let seq_bump_start = std::time::Instant::now();
-        let delta_before_seq = delta_snapshot(&self.state);
-        // Capture the current account state BEFORE modification for STATE entry.
-        // We can't use snapshot_entry() here because the snapshot might not exist yet.
-        // After flush_modified_entries, the snapshot is updated to the post-modification
-        // value, so we need to save the original here.
-        let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-            account_id: inner_source_id.clone(),
-        });
-        let seq_state_override = self.state.get_entry(&inner_source_key);
-
-        if let Some(acc) = self.state.get_account_mut(&inner_source_id) {
-            // CAP-0021: Set the account's seq_num to the transaction's seq_num.
-            // This handles the case where minSeqNum allows sequence gaps - the
-            // account's final seq must be the tx's seq, not just account_seq + 1.
-            acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
-            henyey_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
-        }
-        self.state.flush_modified_entries();
-        let delta_after_seq = delta_snapshot(&self.state);
-        let delta_slice =
-            delta_slice_between(self.state.delta(), delta_before_seq, delta_after_seq);
-        // Use the pre-modification snapshot for STATE entry via state_overrides.
-        let mut seq_state_overrides = HashMap::new();
-        if let Some(entry) = seq_state_override {
-            seq_state_overrides.insert(inner_source_key, entry);
-        }
-        let seq_changes = build_entry_changes_with_state_overrides(
-            &self.state,
-            delta_slice.created(),
-            delta_slice.updated(),
-            delta_slice.deleted(),
-            &seq_state_overrides,
-        );
-        seq_created = delta_slice.created().to_vec();
-        seq_updated = delta_slice.updated().to_vec();
-        seq_deleted = delta_slice.deleted().to_vec();
+        let (seq_changes, seq_created, seq_updated, seq_deleted, seq_bump_us) =
+            self.bump_sequence_phase(&frame, &inner_source_id);
 
         // Merge all changes into tx_changes_before.
         // Order: fee_bump_wrapper_changes (fee source), seq_changes (inner source seq bump).
@@ -2516,12 +2078,9 @@ impl TransactionExecutor {
         combined.extend(signer_changes.iter().cloned());
         combined.extend(seq_changes.iter().cloned());
         tx_changes_before = combined.try_into().unwrap_or_default();
-        // Persist sequence updates so failed transactions still consume sequence numbers.
-        self.state.commit();
 
         // Commit pre-apply changes so rollback doesn't revert them.
         self.state.commit();
-        let seq_bump_us = seq_bump_start.elapsed().as_micros() as u64;
         let fee_seq_us = tx_timing_start.elapsed().as_micros() as u64 - validation_us;
 
         Ok(Ok(PreApplyResult {
@@ -2693,1162 +2252,6 @@ impl TransactionExecutor {
         self.apply_body(snapshot, pre)
     }
 
-    /// Apply phase: execute operations, build meta, handle rollback on failure.
-    ///
-    /// This is the second half of transaction execution, consuming the
-    /// `PreApplyResult` produced by `pre_apply()`. It loads footprint entries,
-    /// executes each operation, handles rollback on failure (restoring
-    /// fee/seq/signer entries from the pre-apply phase), builds transaction
-    /// meta, and returns the final `TransactionExecutionResult`.
-    ///
-    /// This matches the body of stellar-core's `parallelApply` (for Soroban) /
-    /// `TransactionFrame::apply` (for classic) — everything after `commonPreApply`.
-    fn apply_body(
-        &mut self,
-        snapshot: &SnapshotHandle,
-        pre: PreApplyResult,
-    ) -> Result<TransactionExecutionResult> {
-        let PreApplyResult {
-            frame,
-            fee_source_id,
-            inner_source_id,
-            tx_changes_before,
-            fee_changes,
-            mut refundable_fee_tracker,
-            mut tx_event_manager,
-            preflight_failure,
-            sig_check_failure,
-            fee,
-            fee_entries,
-            seq_entries,
-            signer_entries,
-            soroban_prng_seed,
-            base_fee,
-            deduct_fee,
-            validation_us,
-            fee_seq_us,
-            tx_timing_start,
-            val_account_load_us,
-            val_tx_hash_us,
-            val_ed25519_us,
-            val_other_us,
-            fee_deduct_us,
-            op_sig_check_us,
-            signer_removal_us,
-            seq_bump_us,
-            tx_hash,
-        } = pre;
-
-        // Create ledger context for operation execution
-        let ledger_context = if let Some(prng_seed) = soroban_prng_seed {
-            LedgerContext::with_prng_seed(
-                self.ledger_seq,
-                self.close_time,
-                base_fee,
-                self.base_reserve,
-                self.protocol_version,
-                self.network_id,
-                prng_seed,
-            )
-        } else {
-            LedgerContext::new(
-                self.ledger_seq,
-                self.close_time,
-                base_fee,
-                self.base_reserve,
-                self.protocol_version,
-                self.network_id,
-            )
-        };
-
-        let soroban_data = frame.soroban_data();
-
-        // For Soroban transactions, load all footprint entries from the snapshot
-        // before executing operations. This ensures contract data, code, and TTLs
-        // are available to the Soroban host.
-        //
-        // NOTE: We no longer call clear_archived_entries_from_state() here because
-        // archived entries from the hot archive need to be available to the Soroban
-        // host for restoration. The previous approach of clearing them was designed
-        // for when all entries came from the live bucket list, but with hot archive
-        // support, archived entries are properly sourced and must be preserved.
-        if let Some(data) = soroban_data {
-            self.load_soroban_footprint(snapshot, &data.resources.footprint)?;
-        }
-
-        let footprint_us =
-            tx_timing_start.elapsed().as_micros() as u64 - validation_us - fee_seq_us;
-
-        self.state.clear_sponsorship_stack();
-
-        // Pre-load sponsor accounts for BeginSponsoringFutureReserves operations.
-        // When a BeginSponsoringFutureReserves operation is followed by other operations
-        // (like SetOptions), those subsequent operations may need to update the sponsor's
-        // num_sponsoring count. We must load these sponsor accounts before the operation
-        // loop so they're available when needed.
-        for op in frame.operations().iter() {
-            if let OperationBody::BeginSponsoringFutureReserves(_) = &op.body {
-                // The sponsor is the source of the BeginSponsoringFutureReserves operation
-                let op_source_muxed = op
-                    .source_account
-                    .clone()
-                    .unwrap_or_else(|| frame.inner_source_account());
-                let sponsor_id = henyey_tx::muxed_to_account_id(&op_source_muxed);
-                self.load_account(snapshot, &sponsor_id)?;
-            }
-        }
-
-        // Set up lazy entry loader for offer dependency loading.
-        // Instead of preloading all offer dependencies upfront (which requires
-        // O(n) bucket list lookups for all offers in each asset pair), the
-        // entry_loader enables on-demand loading during offer crossing.
-        let snapshot_for_loader = snapshot.clone();
-        self.state.set_entry_loader(std::sync::Arc::new(move |key| {
-            snapshot_for_loader
-                .get_entry(key)
-                .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
-        }));
-
-        // Set up batch entry loader for loading multiple entries in a single
-        // bucket list pass. This is used by path payment operations to batch-load
-        // seller account + trustlines together (~3x faster than separate lookups).
-        let snapshot_for_batch = snapshot.clone();
-        self.state
-            .set_batch_entry_loader(std::sync::Arc::new(move |keys| {
-                snapshot_for_batch
-                    .load_entries(keys)
-                    .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
-            }));
-
-        // Set up pool-share-trustlines-by-account loader (defense in depth).
-        // This mirrors the offers loader pattern: `find_pool_share_trustlines_for_asset`
-        // calls `ensure_pool_share_trustlines_loaded` which uses this loader to
-        // discover pool IDs from the secondary index.  Even if the pre-loading in
-        // `load_operation_accounts` is bypassed (e.g. by a future code path), the
-        // state manager will load pool share TLs on demand before iterating.
-        let snapshot_for_pool_shares = snapshot.clone();
-        self.state
-            .set_pool_share_tls_by_account_loader(std::sync::Arc::new(move |account_id| {
-                snapshot_for_pool_shares
-                    .pool_share_tls_by_account(account_id)
-                    .map_err(|e| henyey_tx::TxError::Internal(e.to_string()))
-            }));
-
-        // Execute operations
-        let mut operation_results = Vec::new();
-        let num_ops = frame.operations().len();
-        let mut op_changes = Vec::with_capacity(num_ops);
-        let mut op_events: Vec<Vec<ContractEvent>> = Vec::with_capacity(num_ops);
-        let mut diagnostic_events: Vec<DiagnosticEvent> = Vec::new();
-        let mut soroban_return_value = None;
-        let mut all_success = true;
-        let mut failure = None;
-        // Track pre-TX delta position so we only scan NEW created entries for contract cache.
-        let pre_tx_created_count = self.state.delta().created_entries().len();
-        // For multi-operation transactions, stellar-core records STATE/UPDATED
-        // for every accessed entry per operation, even if values are identical.
-        // For single-operation transactions, it only records if values changed.
-        self.state.set_multi_op_mode(num_ops > 1);
-
-        let tx_seq = frame.sequence_number();
-        // Collect hot archive restored keys across all operations (Protocol 23+)
-        // Use HashSet to deduplicate: when multiple TXs in the same ledger restore
-        // the same entry (e.g., same ContractCode), it should only be sent to
-        // HotArchiveBucketList::add_batch once as a single Live marker.
-        let mut collected_hot_archive_keys: HashSet<LedgerKey> = HashSet::new();
-        let mut op_type_timings: HashMap<OperationType, (u64, u32)> = HashMap::new();
-
-        // Apply the signature check result from above (checked before signer removal).
-        if let Some((op_results, sig_failure)) = sig_check_failure {
-            all_success = false;
-            operation_results = op_results;
-            failure = Some(sig_failure);
-        }
-
-        if let Some(preflight_failure) = preflight_failure {
-            all_success = false;
-            failure = Some(preflight_failure);
-        } else if all_success {
-            // Clone memo once before the loop — it's constant for the entire TX.
-            let tx_memo = frame.memo().clone();
-
-            for (op_index, op) in frame.operations().iter().enumerate() {
-                let op_type = OperationType::from_body(&op.body);
-
-                let op_source_muxed = op
-                    .source_account
-                    .clone()
-                    .unwrap_or_else(|| frame.inner_source_account());
-                let op_delta_before = delta_snapshot(&self.state);
-                self.state.begin_op_snapshot();
-                let op_timing_start = std::time::Instant::now();
-
-                // Load any accounts needed for this operation
-                self.load_operation_accounts(snapshot, op, &inner_source_id)?;
-
-                // Get operation source
-                let op_source = henyey_tx::muxed_to_account_id(&op_source_muxed);
-
-                let pre_claimable_balance = match &op.body {
-                    OperationBody::ClaimClaimableBalance(op_data) => self
-                        .state
-                        .get_claimable_balance(&op_data.balance_id)
-                        .cloned(),
-                    OperationBody::ClawbackClaimableBalance(op_data) => self
-                        .state
-                        .get_claimable_balance(&op_data.balance_id)
-                        .cloned(),
-                    _ => None,
-                };
-                let pre_pool = match &op.body {
-                    OperationBody::LiquidityPoolDeposit(op_data) => self
-                        .state
-                        .get_liquidity_pool(&op_data.liquidity_pool_id)
-                        .cloned(),
-                    OperationBody::LiquidityPoolWithdraw(op_data) => self
-                        .state
-                        .get_liquidity_pool(&op_data.liquidity_pool_id)
-                        .cloned(),
-                    _ => None,
-                };
-                let mut op_event_manager = OpEventManager::new(
-                    true,
-                    op_type.is_soroban(),
-                    self.protocol_version,
-                    self.network_id,
-                    tx_memo.clone(),
-                    self.classic_events,
-                );
-
-                // Execute the operation with a per-operation savepoint.
-                // If the operation fails, we roll back its state changes so
-                // subsequent operations see clean state (matching stellar-core LedgerTxn).
-                // For single-op TXs, skip savepoint creation — TX-level rollback handles failures.
-                let op_index = u32::try_from(op_index).unwrap_or(u32::MAX);
-
-                let op_savepoint = if num_ops == 1 {
-                    None
-                } else {
-                    Some(self.state.create_savepoint())
-                };
-                let result = self.execute_single_operation(OperationExecutionRequest {
-                    op,
-                    source: &op_source,
-                    tx_source: &inner_source_id,
-                    tx_seq,
-                    op_index,
-                    context: &ledger_context,
-                    soroban_data,
-                });
-
-                match result {
-                    Ok(mut op_exec) => {
-                        self.state.flush_modified_entries();
-                        let mut op_result = op_exec.result;
-
-                        // Debug: Log operation result for Soroban operations
-                        if op_type.is_soroban() {
-                            let is_success_before_refund_check = is_operation_success(&op_result);
-                            tracing::debug!(
-                                ledger_seq = self.ledger_seq,
-                                op_index,
-                                op_type = ?op_type,
-                                op_result = ?op_result,
-                                is_success = is_success_before_refund_check,
-                                has_soroban_meta = op_exec.soroban_meta.is_some(),
-                                "Soroban operation executed"
-                            );
-                        }
-
-                        if let Some(meta) = &op_exec.soroban_meta {
-                            if let Some(tracker) = refundable_fee_tracker.as_mut() {
-                                tracing::debug!(
-                                    ledger_seq = self.ledger_seq,
-                                    op_index,
-                                    rent_fee = meta.rent_fee,
-                                    event_size_bytes = meta.event_size_bytes,
-                                    max_refundable = tracker.max_refundable_fee,
-                                    consumed_rent = tracker.consumed_rent_fee,
-                                    consumed_refundable = tracker.consumed_refundable_fee,
-                                    "Refundable fee tracker pre-consume"
-                                );
-                                if !tracker.consume(
-                                    &frame,
-                                    self.protocol_version,
-                                    &self.soroban_config,
-                                    meta.event_size_bytes,
-                                    meta.rent_fee,
-                                ) {
-                                    tracing::debug!(
-                                        ledger_seq = self.ledger_seq,
-                                        op_index,
-                                        "InsufficientRefundableFee"
-                                    );
-                                    op_result = insufficient_refundable_fee_result(op);
-                                    all_success = false;
-                                    failure = Some(TransactionResultCode::TxFailed);
-                                }
-                            }
-                        }
-                        // Check if operation succeeded
-                        if !is_operation_success(&op_result) {
-                            all_success = false;
-                            tracing::debug!(
-                                ledger_seq = self.ledger_seq,
-                                op_index,
-                                op_type = ?op_type,
-                                op_result = ?op_result,
-                                "Operation failed"
-                            );
-                            if matches!(op_result, OperationResult::OpNotSupported) {
-                                failure = Some(TransactionResultCode::TxNotSupported);
-                            }
-                            // Roll back failed operation's state changes so subsequent
-                            // operations see clean state (matches stellar-core nested LedgerTxn).
-                            if let Some(sp) = op_savepoint {
-                                self.state.rollback_to_savepoint(sp);
-                            }
-                        }
-                        operation_results.push(op_result.clone());
-
-                        let op_delta_after = delta_snapshot(&self.state);
-                        let op_snapshots = self.state.end_op_snapshot();
-                        let delta_slice = delta_slice_between(
-                            self.state.delta(),
-                            op_delta_before,
-                            op_delta_after,
-                        );
-
-                        // For Soroban operations, extract restored entries (hot archive and live BL)
-                        let (restored_entries, footprint) = if op_type.is_soroban() {
-                            let mut restored = RestoredEntries::default();
-
-                            // Get live BL restorations from the Soroban execution result
-                            if let Some(meta) = &op_exec.soroban_meta {
-                                for live_bl_restore in &meta.live_bucket_list_restores {
-                                    restored
-                                        .live_bucket_list
-                                        .insert(live_bl_restore.key.clone());
-                                    restored.live_bucket_list_entries.insert(
-                                        live_bl_restore.key.clone(),
-                                        live_bl_restore.entry.clone(),
-                                    );
-                                    // Also track the TTL entry
-                                    restored
-                                        .live_bucket_list
-                                        .insert(live_bl_restore.ttl_key.clone());
-                                    restored.live_bucket_list_entries.insert(
-                                        live_bl_restore.ttl_key.clone(),
-                                        live_bl_restore.ttl_entry.clone(),
-                                    );
-                                }
-                            }
-
-                            // Get hot archive keys from two sources:
-                            // 1. For InvokeHostFunction: from actual_restored_indices (filtered by host)
-                            // 2. For RestoreFootprint: from soroban_meta.hot_archive_restores
-                            // NOTE: We must exclude live BL restore keys from the hot archive set.
-                            // Live BL restores are entries that exist in the live bucket list with
-                            // expired TTL but haven't been evicted yet - these are NOT hot archive
-                            // restores and should not be added to HotArchiveBucketList::add_batch.
-                            let actual_restored_indices = op_exec
-                                .soroban_meta
-                                .as_ref()
-                                .map(|m| m.actual_restored_indices.as_slice())
-                                .unwrap_or(&[]);
-                            let mut hot_archive = extract_hot_archive_restored_keys(
-                                soroban_data,
-                                op_type,
-                                actual_restored_indices,
-                            );
-                            // For RestoreFootprint, get hot archive keys and entries from the meta
-                            if let Some(meta) = &op_exec.soroban_meta {
-                                for ha_restore in &meta.hot_archive_restores {
-                                    hot_archive.insert(ha_restore.key.clone());
-                                    // Also store the entry for RESTORED meta emission
-                                    restored
-                                        .hot_archive_entries
-                                        .insert(ha_restore.key.clone(), ha_restore.entry.clone());
-                                }
-                            }
-                            let ha_before = hot_archive.len();
-                            hot_archive.retain(|k| !restored.live_bucket_list.contains(k));
-                            let ha_after_live_bl = hot_archive.len();
-
-                            // Also exclude keys that were listed in archived_soroban_entries but
-                            // were already restored by a previous TX in this ledger. These entries
-                            // go into `updated` (not `created`) because they already exist in state.
-                            // We only want RESTORED emission for entries actually being created/restored
-                            // in THIS transaction.
-                            let created_keys: HashSet<LedgerKey> = delta_slice
-                                .created()
-                                .iter()
-                                .map(|entry| henyey_common::entry_to_key(entry))
-                                .collect();
-                            // For transaction meta emission: only emit RESTORED for keys in created
-                            // Keep original set for bucket list operations
-                            let hot_archive_for_bucket_list = hot_archive.clone();
-                            // For RestoreFootprint, the data entries are prefetched from hot archive
-                            // into state, so they won't be in `created_keys` (only the TTL is created).
-                            // We need to emit RESTORED for all hot archive keys without filtering.
-                            // For InvokeHostFunction, we filter by created_keys because the auto-restore
-                            // creates the entries during execution.
-                            let hot_archive_for_meta: HashSet<LedgerKey> =
-                                if op_type == OperationType::RestoreFootprint {
-                                    // Don't filter - all hot archive keys should emit RESTORED
-                                    hot_archive.clone()
-                                } else {
-                                    // Filter by created_keys for InvokeHostFunction
-                                    hot_archive
-                                        .iter()
-                                        .filter(|k| created_keys.contains(k))
-                                        .cloned()
-                                        .collect()
-                                };
-                            let ha_after = hot_archive_for_meta.len();
-                            // Log when we filter out entries
-                            if ha_before != ha_after {
-                                tracing::debug!(
-                                    ha_before,
-                                    ha_after_live_bl,
-                                    ha_after,
-                                    live_bl_count = restored.live_bucket_list.len(),
-                                    created_count = created_keys.len(),
-                                    ?hot_archive,
-                                    ?created_keys,
-                                    op_type = ?op_type,
-                                    "Filtered hot archive keys: live BL restores and already-restored entries"
-                                );
-                            }
-                            // For transaction meta purposes, also add the corresponding TTL keys.
-                            // When a ContractData/ContractCode entry is restored from hot archive,
-                            // its TTL entry should also be emitted as RESTORED (not CREATED).
-                            // Use the filtered set (hot_archive_for_meta) which only includes entries
-                            // actually being created/restored in this TX.
-                            // NOTE: We don't add TTL keys to collected_hot_archive_keys because
-                            // HotArchiveBucketList::add_batch only receives data/code entries.
-                            use sha2::{Digest, Sha256};
-                            let ttl_keys: Vec<_> = hot_archive_for_meta
-                                .iter()
-                                .filter_map(|key| {
-                                    // Compute key hash as SHA256 of key XDR
-                                    let key_bytes = key.to_xdr(Limits::none()).ok()?;
-                                    let key_hash =
-                                        stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
-                                    Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                                        key_hash,
-                                    }))
-                                })
-                                .collect();
-                            // Collect data/code keys only for HotArchiveBucketList::add_batch.
-                            // All hot archive keys (already filtered by live BL above) should be
-                            // passed to the bucket list. This is true for both RestoreFootprint
-                            // and InvokeHostFunction - the hot archive needs to remove ALL entries
-                            // that were restored, regardless of whether the contract then modifies
-                            // them (which would put them in `updated` rather than `created`).
-                            // The `created_keys` filtering above is only for transaction meta
-                            // emission (RESTORED vs UPDATED), not for bucket list operations.
-                            //
-                            // IMPORTANT: Only collect hot archive keys for SUCCESSFUL operations.
-                            // In stellar-core, handleArchivedEntry writes the restoration to
-                            // mOpState (a nested LedgerTxn), but if the operation fails, that
-                            // nested LedgerTxn is rolled back, canceling the restorations and
-                            // preventing any HOT_ARCHIVE_LIVE tombstones from being written.
-                            // For failed operations, we must not add keys to the hot archive
-                            // batch — doing so would produce spurious HOT_ARCHIVE_LIVE tombstones
-                            // in the hot archive bucket list, causing a bucket_list_hash mismatch.
-                            if is_operation_success(&op_result) {
-                                collected_hot_archive_keys
-                                    .extend(hot_archive_for_bucket_list.iter().cloned());
-                            }
-                            // Add filtered keys (including TTL) to restored.hot_archive for meta conversion
-                            restored.hot_archive.extend(hot_archive_for_meta);
-                            restored.hot_archive.extend(ttl_keys);
-                            (restored, soroban_data.map(|d| &d.resources.footprint))
-                        } else {
-                            (RestoredEntries::default(), None)
-                        };
-
-                        let change_order = delta_slice.change_order();
-                        let ledger_changes = LedgerChanges {
-                            created: delta_slice.created(),
-                            updated: delta_slice.updated(),
-                            update_states: delta_slice.update_states(),
-                            deleted: delta_slice.deleted(),
-                            delete_states: delta_slice.delete_states(),
-                            change_order: &change_order,
-                            state_overrides: &op_snapshots,
-                            restored: &restored_entries,
-                        };
-                        let op_changes_local = build_entry_changes_with_hot_archive(
-                            &self.state,
-                            &ledger_changes,
-                            footprint,
-                            self.ledger_seq,
-                        );
-
-                        let mut op_events_final = Vec::new();
-                        if all_success && is_operation_success(&op_result) {
-                            if let Some(meta) = op_exec.soroban_meta.as_mut() {
-                                op_event_manager.set_events(std::mem::take(&mut meta.events));
-                                diagnostic_events
-                                    .extend(std::mem::take(&mut meta.diagnostic_events));
-                                soroban_return_value =
-                                    std::mem::take(&mut meta.return_value).or(soroban_return_value);
-                            }
-
-                            if !op_type.is_soroban() {
-                                emit_classic_events_for_operation(
-                                    &mut op_event_manager,
-                                    op,
-                                    &op_result,
-                                    &op_source_muxed,
-                                    &self.state,
-                                    pre_claimable_balance.as_ref(),
-                                    pre_pool.as_ref(),
-                                );
-                            }
-
-                            if op_event_manager.is_enabled() {
-                                op_events_final = op_event_manager.finalize();
-                            }
-                        }
-
-                        if all_success {
-                            op_changes.push(op_changes_local);
-                            op_events.push(op_events_final);
-                        } else {
-                            op_changes.push(empty_entry_changes());
-                            op_events.push(Vec::new());
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(sp) = op_savepoint {
-                            self.state.rollback_to_savepoint(sp);
-                        }
-                        self.state.end_op_snapshot();
-                        all_success = false;
-                        tracing::debug!(
-                            error = %e,
-                            op_index = op_index,
-                            op_type = ?OperationType::from_body(&op.body),
-                            ledger_seq = self.ledger_seq,
-                            "Operation execution returned Err (mapped to txInternalError)"
-                        );
-                        // stellar-core maps std::runtime_error during operation execution
-                        // to txINTERNAL_ERROR (not txNOT_SUPPORTED). The exception
-                        // aborts all remaining operations.
-                        failure = Some(TransactionResultCode::TxInternalError);
-                        break;
-                    }
-                }
-                let op_elapsed_us = op_timing_start.elapsed().as_micros() as u64;
-                let entry = op_type_timings.entry(op_type).or_insert((0u64, 0u32));
-                entry.0 += op_elapsed_us;
-                entry.1 += 1;
-            }
-        }
-
-        let ops_us = tx_timing_start.elapsed().as_micros() as u64
-            - validation_us
-            - fee_seq_us
-            - footprint_us;
-
-        let meta_phase_start = std::time::Instant::now();
-
-        if all_success && self.state.has_pending_sponsorship() {
-            all_success = false;
-            failure = Some(TransactionResultCode::TxBadSponsorship);
-        }
-
-        if !all_success {
-            let tx_hash = frame
-                .hash(&self.network_id)
-                .map(|hash| hash.to_hex())
-                .unwrap_or_else(|_| "unknown".to_string());
-            debug!(
-                tx_hash = %tx_hash,
-                fee_source = %account_id_to_strkey(&fee_source_id),
-                inner_source = %account_id_to_strkey(&inner_source_id),
-                results = ?operation_results,
-                "Transaction failed; rolling back changes"
-            );
-            self.state.rollback();
-            restore_delta_entries(
-                &mut self.state,
-                &fee_entries.created,
-                &fee_entries.updated,
-                &fee_entries.deleted,
-            );
-            // Re-add the fee to the delta after rollback.
-            // rollback() restores the delta from the snapshot taken BEFORE fee deduction,
-            // so we must explicitly re-add this transaction's fee to preserve it.
-            // This ensures failed transactions still contribute their fees to the fee pool.
-            if deduct_fee && fee > 0 {
-                self.state.delta_mut().add_fee(fee);
-            }
-            restore_delta_entries(
-                &mut self.state,
-                &seq_entries.created,
-                &seq_entries.updated,
-                &seq_entries.deleted,
-            );
-            restore_delta_entries(
-                &mut self.state,
-                &signer_entries.created,
-                &signer_entries.updated,
-                &signer_entries.deleted,
-            );
-            op_changes.clear();
-            op_events.clear();
-            diagnostic_events.clear();
-            soroban_return_value = None;
-
-            // Reset the refundable fee tracker when transaction fails.
-            // This mirrors stellar-core's behavior where setError() calls resetConsumedFee(),
-            // ensuring the full max_refundable_fee is refunded on any transaction failure.
-            if let Some(tracker) = refundable_fee_tracker.as_mut() {
-                tracing::debug!(
-                    ledger_seq = self.ledger_seq,
-                    is_soroban = frame.is_soroban(),
-                    max_refundable_fee = tracker.max_refundable_fee,
-                    consumed_before_reset = tracker.consumed_refundable_fee,
-                    "Resetting fee tracker due to tx failure"
-                );
-                tracker.reset();
-            }
-        } else {
-            self.state.commit();
-
-            // Update module cache with any newly created contract code.
-            // This ensures subsequent transactions can use VmCachedInstantiation
-            // (cheap) instead of VmInstantiation (expensive) for contracts
-            // deployed in this transaction.
-            // Only scan entries created by THIS TX (not all prior TXs in the cluster)
-            // to avoid O(n²) iteration over the growing delta.
-            let created = self.state.delta().created_entries();
-            for entry in &created[pre_tx_created_count..] {
-                if let stellar_xdr::curr::LedgerEntryData::ContractCode(cc) = &entry.data {
-                    self.add_contract_to_cache(cc.code.as_slice());
-                }
-            }
-        }
-
-        let commit_phase_us = meta_phase_start.elapsed().as_micros() as u64;
-
-        let post_fee_changes = empty_entry_changes();
-        let mut fee_refund = 0i64;
-        let mut soroban_fee_info = None;
-        if let Some(tracker) = refundable_fee_tracker {
-            // Extract fee tracking info for soroban meta before consuming tracker
-            soroban_fee_info = Some((
-                tracker.non_refundable_fee,
-                tracker.consumed_refundable_fee,
-                tracker.consumed_rent_fee,
-            ));
-            let refund = tracker.refund_amount();
-            let stage = TransactionEventStage::AfterAllTxs;
-            tx_event_manager.new_fee_event(&fee_source_id, -refund, stage);
-            fee_refund = refund;
-        }
-
-        let fee_refund_phase_us = meta_phase_start.elapsed().as_micros() as u64 - commit_phase_us;
-
-        let tx_events = tx_event_manager.finalize();
-        let tx_meta = build_transaction_meta(TransactionMetaParts {
-            tx_changes_before,
-            op_changes: op_changes,
-            op_events: op_events,
-            tx_events: tx_events,
-            soroban_return_value: soroban_return_value,
-            diagnostic_events: diagnostic_events,
-            soroban_fee_info: soroban_fee_info,
-            emit_soroban_tx_meta_ext_v1: self.emit_soroban_tx_meta_ext_v1,
-            enable_soroban_diagnostic_events: self.enable_soroban_diagnostic_events,
-        });
-
-        let meta_build_phase_us =
-            meta_phase_start.elapsed().as_micros() as u64 - commit_phase_us - fee_refund_phase_us;
-
-        let total_us = tx_timing_start.elapsed().as_micros() as u64;
-        let meta_us = total_us - validation_us - fee_seq_us - footprint_us - ops_us;
-
-        if total_us > 5000 || frame.is_soroban() {
-            // Build a compact string of per-op-type timings sorted by time desc
-            let mut op_timing_vec: Vec<_> = op_type_timings.iter().collect();
-            op_timing_vec.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
-            let op_timing_str: String = op_timing_vec
-                .iter()
-                .map(|(op, (us, count))| format!("{:?}:{}us×{}", op, us, count))
-                .collect::<Vec<_>>()
-                .join(",");
-            tracing::debug!(
-                ledger_seq = self.ledger_seq,
-                total_us,
-                validation_us,
-                val_account_load_us,
-                val_tx_hash_us,
-                val_ed25519_us,
-                val_other_us,
-                fee_seq_us,
-                fee_deduct_us,
-                op_sig_check_us,
-                signer_removal_us,
-                seq_bump_us,
-                footprint_us,
-                ops_us,
-                meta_us,
-                is_soroban = frame.is_soroban(),
-                num_ops = frame.operations().len(),
-                success = all_success,
-                op_timings = %op_timing_str,
-                "TX phase timing"
-            );
-        }
-
-        Ok(TransactionExecutionResult {
-            success: all_success,
-            fee_charged: fee.saturating_sub(fee_refund),
-            fee_refund,
-            operation_results,
-            error: if all_success {
-                None
-            } else {
-                Some("One or more operations failed".into())
-            },
-            failure: if all_success {
-                None
-            } else {
-                Some(failure.unwrap_or(TransactionResultCode::TxFailed))
-            },
-            tx_meta: Some(tx_meta),
-            fee_changes: Some(fee_changes),
-            post_fee_changes: Some(post_fee_changes),
-            // Convert HashSet back to Vec for the return type
-            hot_archive_restored_keys: collected_hot_archive_keys.into_iter().collect(),
-            op_type_timings,
-            exec_time_us: total_us,
-            validation_us,
-            fee_seq_us,
-            footprint_us,
-            ops_us,
-            meta_build_us: meta_us,
-            meta_commit_us: commit_phase_us,
-            meta_fee_refund_us: fee_refund_phase_us,
-            meta_build_phase_us,
-            val_account_load_us,
-            val_tx_hash_us,
-            val_ed25519_us,
-            val_other_us,
-            fee_deduct_us,
-            op_sig_check_us,
-            signer_removal_us,
-            seq_bump_us,
-            tx_hash,
-        })
-    }
-
-    /// Load accounts needed for an operation.
-    fn load_operation_accounts(
-        &mut self,
-        snapshot: &SnapshotHandle,
-        op: &stellar_xdr::curr::Operation,
-        source_id: &AccountId,
-    ) -> Result<()> {
-        let op_source = op
-            .source_account
-            .as_ref()
-            .map(henyey_tx::muxed_to_account_id)
-            .unwrap_or_else(|| source_id.clone());
-
-        // Load operation source if different from transaction source
-        if let Some(ref muxed) = op.source_account {
-            let op_source = henyey_tx::muxed_to_account_id(muxed);
-            self.load_account(snapshot, &op_source)?;
-        }
-
-        // Phase 1: Batch-load statically-known keys (shared with per-ledger prefetch).
-        // When the prefetch cache is populated, these lookups are cache hits.
-        // When called without prefetch (e.g., in tests), this provides the
-        // same batch-loading benefit as the per-ledger prefetch.
-        {
-            let mut static_keys = std::collections::HashSet::new();
-            henyey_tx::collect_prefetch_keys(&op.body, &op_source, &mut static_keys);
-            if !static_keys.is_empty() {
-                let keys_vec: Vec<LedgerKey> = static_keys.into_iter().collect();
-                self.batch_load_keys(snapshot, &keys_vec)?;
-            }
-        }
-
-        // Phase 2: Conditional/secondary loading that depends on loaded state
-        // or requires special semantics (e.g., load_account_without_record).
-        match &op.body {
-            OperationBody::CreateAccount(op_data) => {
-                self.load_account(snapshot, &op_data.destination)?;
-            }
-            OperationBody::BeginSponsoringFutureReserves(op_data) => {
-                self.load_account(snapshot, &op_data.sponsored_id)?;
-            }
-            OperationBody::AllowTrust(op_data) => {
-                let asset = allow_trust_asset(op_data, &op_source);
-                let mut keys = vec![make_account_key(&op_data.trustor)];
-                if let Some(tl_asset) = asset_to_trustline_asset(&asset) {
-                    keys.push(make_trustline_key(&op_data.trustor, &tl_asset));
-                }
-                self.batch_load_keys(snapshot, &keys)?;
-                // Load offers by account/asset so they can be removed if authorization is revoked
-                self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &asset)?;
-                // Load pool share trustlines so they can be redeemed if authorization is revoked
-                self.load_pool_share_trustlines_for_account_and_asset(
-                    snapshot,
-                    &op_data.trustor,
-                    &asset,
-                )?;
-            }
-            OperationBody::Payment(op_data) => {
-                let dest = henyey_tx::muxed_to_account_id(&op_data.destination);
-                let mut keys = vec![make_account_key(&dest)];
-                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
-                    keys.push(make_trustline_key(&op_source, &tl_asset));
-                    keys.push(make_trustline_key(&dest, &tl_asset));
-                }
-                if let Some(issuer) = asset_issuer_id(&op_data.asset) {
-                    keys.push(make_account_key(&issuer));
-                }
-                self.batch_load_keys(snapshot, &keys)?;
-            }
-            OperationBody::AccountMerge(dest) => {
-                let dest = henyey_tx::muxed_to_account_id(dest);
-                self.load_account(snapshot, &dest)?;
-            }
-            OperationBody::ClaimClaimableBalance(op_data) => {
-                self.load_claimable_balance(snapshot, &op_data.balance_id)?;
-                let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
-                    balance_id: op_data.balance_id.clone(),
-                });
-                if let Some(sponsor) = self.state.entry_sponsor(&key) {
-                    self.load_account(snapshot, &sponsor)?;
-                }
-                if let Some(entry) = self.state.get_claimable_balance(&op_data.balance_id) {
-                    let asset = entry.asset.clone();
-                    if let Some(tl_asset) = asset_to_trustline_asset(&asset) {
-                        self.load_trustline(snapshot, &op_source, &tl_asset)?;
-                        self.load_asset_issuer(snapshot, &asset)?;
-                    }
-                }
-            }
-            OperationBody::ClawbackClaimableBalance(op_data) => {
-                self.load_claimable_balance(snapshot, &op_data.balance_id)?;
-                let key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance {
-                    balance_id: op_data.balance_id.clone(),
-                });
-                if let Some(sponsor) = self.state.entry_sponsor(&key) {
-                    self.load_account(snapshot, &sponsor)?;
-                }
-            }
-            OperationBody::CreateClaimableBalance(op_data) => {
-                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
-                    self.load_trustline(snapshot, &op_source, &tl_asset)?;
-                }
-            }
-            OperationBody::SetTrustLineFlags(op_data) => {
-                let mut keys = vec![make_account_key(&op_data.trustor)];
-                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
-                    keys.push(make_trustline_key(&op_data.trustor, &tl_asset));
-                }
-                self.batch_load_keys(snapshot, &keys)?;
-                // Load offers by account/asset so they can be removed if authorization is revoked
-                self.load_offers_by_account_and_asset(snapshot, &op_data.trustor, &op_data.asset)?;
-                // Load pool share trustlines so they can be redeemed if authorization is revoked
-                self.load_pool_share_trustlines_for_account_and_asset(
-                    snapshot,
-                    &op_data.trustor,
-                    &op_data.asset,
-                )?;
-            }
-            OperationBody::Clawback(op_data) => {
-                let from_account = henyey_tx::muxed_to_account_id(&op_data.from);
-                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.asset) {
-                    self.load_trustline(snapshot, &from_account, &tl_asset)?;
-                }
-            }
-            OperationBody::ManageSellOffer(op_data) => {
-                let mut keys = Vec::new();
-                for asset in [&op_data.selling, &op_data.buying] {
-                    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
-                        keys.push(make_trustline_key(&op_source, &tl_asset));
-                    }
-                    if let Some(issuer) = asset_issuer_id(asset) {
-                        keys.push(make_account_key(&issuer));
-                    }
-                }
-                if op_data.offer_id != 0 {
-                    keys.push(LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
-                        seller_id: op_source.clone(),
-                        offer_id: op_data.offer_id,
-                    }));
-                }
-                self.batch_load_keys(snapshot, &keys)?;
-                if op_data.offer_id != 0 {
-                    self.load_offer_sponsor(snapshot, &op_source, op_data.offer_id)?;
-                }
-            }
-            OperationBody::CreatePassiveSellOffer(op_data) => {
-                let mut keys = Vec::new();
-                for asset in [&op_data.selling, &op_data.buying] {
-                    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
-                        keys.push(make_trustline_key(&op_source, &tl_asset));
-                    }
-                    if let Some(issuer) = asset_issuer_id(asset) {
-                        keys.push(make_account_key(&issuer));
-                    }
-                }
-                self.batch_load_keys(snapshot, &keys)?;
-            }
-            OperationBody::ManageBuyOffer(op_data) => {
-                let mut keys = Vec::new();
-                for asset in [&op_data.selling, &op_data.buying] {
-                    if let Some(tl_asset) = asset_to_trustline_asset(asset) {
-                        keys.push(make_trustline_key(&op_source, &tl_asset));
-                    }
-                    if let Some(issuer) = asset_issuer_id(asset) {
-                        keys.push(make_account_key(&issuer));
-                    }
-                }
-                if op_data.offer_id != 0 {
-                    keys.push(LedgerKey::Offer(stellar_xdr::curr::LedgerKeyOffer {
-                        seller_id: op_source.clone(),
-                        offer_id: op_data.offer_id,
-                    }));
-                }
-                self.batch_load_keys(snapshot, &keys)?;
-                if op_data.offer_id != 0 {
-                    self.load_offer_sponsor(snapshot, &op_source, op_data.offer_id)?;
-                }
-            }
-            OperationBody::PathPaymentStrictSend(op_data) => {
-                let dest = henyey_tx::muxed_to_account_id(&op_data.destination);
-                let mut keys = vec![make_account_key(&dest)];
-                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.send_asset) {
-                    keys.push(make_trustline_key(&op_source, &tl_asset));
-                }
-                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.dest_asset) {
-                    keys.push(make_trustline_key(&dest, &tl_asset));
-                }
-                if let Some(issuer) = asset_issuer_id(&op_data.send_asset) {
-                    keys.push(make_account_key(&issuer));
-                }
-                if let Some(issuer) = asset_issuer_id(&op_data.dest_asset) {
-                    keys.push(make_account_key(&issuer));
-                }
-                self.batch_load_keys(snapshot, &keys)?;
-                self.load_path_payment_pools(
-                    snapshot,
-                    &op_data.send_asset,
-                    &op_data.dest_asset,
-                    op_data.path.as_slice(),
-                )?;
-            }
-            OperationBody::PathPaymentStrictReceive(op_data) => {
-                let dest = henyey_tx::muxed_to_account_id(&op_data.destination);
-                let mut keys = vec![make_account_key(&dest)];
-                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.send_asset) {
-                    keys.push(make_trustline_key(&op_source, &tl_asset));
-                }
-                if let Some(tl_asset) = asset_to_trustline_asset(&op_data.dest_asset) {
-                    keys.push(make_trustline_key(&dest, &tl_asset));
-                }
-                if let Some(issuer) = asset_issuer_id(&op_data.send_asset) {
-                    keys.push(make_account_key(&issuer));
-                }
-                if let Some(issuer) = asset_issuer_id(&op_data.dest_asset) {
-                    keys.push(make_account_key(&issuer));
-                }
-                self.batch_load_keys(snapshot, &keys)?;
-                self.load_path_payment_pools(
-                    snapshot,
-                    &op_data.send_asset,
-                    &op_data.dest_asset,
-                    op_data.path.as_slice(),
-                )?;
-            }
-            OperationBody::LiquidityPoolDeposit(op_data) => {
-                self.load_liquidity_pool_dependencies(
-                    snapshot,
-                    &op_source,
-                    &op_data.liquidity_pool_id,
-                )?;
-            }
-            OperationBody::LiquidityPoolWithdraw(op_data) => {
-                self.load_liquidity_pool_dependencies(
-                    snapshot,
-                    &op_source,
-                    &op_data.liquidity_pool_id,
-                )?;
-            }
-            OperationBody::ChangeTrust(op_data) => {
-                // Load existing trustline if any
-                let tl_asset = match &op_data.line {
-                    stellar_xdr::curr::ChangeTrustAsset::Native => None,
-                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum4(a) => {
-                        Some(TrustLineAsset::CreditAlphanum4(a.clone()))
-                    }
-                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum12(a) => {
-                        Some(TrustLineAsset::CreditAlphanum12(a.clone()))
-                    }
-                    stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
-                        // Compute pool ID from params
-                        use sha2::{Digest, Sha256};
-                        let xdr = params
-                            .to_xdr(Limits::none())
-                            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
-                        let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
-                        Some(TrustLineAsset::PoolShare(pool_id))
-                    }
-                };
-                if let Some(ref tl_asset) = tl_asset {
-                    self.load_trustline(snapshot, &op_source, tl_asset)?;
-                    // If deleting a trustline (limit=0), load the sponsor account if it has one.
-                    // The sponsor's num_sponsoring needs to be decremented.
-                    if op_data.limit == 0 {
-                        let tl_key = LedgerKey::Trustline(LedgerKeyTrustLine {
-                            account_id: op_source.clone(),
-                            asset: tl_asset.clone(),
-                        });
-                        if let Some(sponsor) = self.state.entry_sponsor(&tl_key) {
-                            self.load_account(snapshot, &sponsor)?;
-                        }
-                    }
-                }
-                // Load issuer account for non-pool-share assets WITHOUT recording.
-                // stellar-core uses loadAccountWithoutRecord() for ChangeTrust issuer check
-                // which doesn't record the access in transaction changes.
-                // We still need to load the account into state so the existence check works.
-                match &op_data.line {
-                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum4(a) => {
-                        let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
-                        tracing::debug!(
-                            asset_code = %asset_code,
-                            issuer = ?a.issuer,
-                            "ChangeTrust: loading issuer for CreditAlphanum4 (without record)"
-                        );
-                        self.load_account_without_record(snapshot, &a.issuer)?;
-                    }
-                    stellar_xdr::curr::ChangeTrustAsset::CreditAlphanum12(a) => {
-                        let asset_code = String::from_utf8_lossy(a.asset_code.as_slice());
-                        tracing::debug!(
-                            asset_code = %asset_code,
-                            issuer = ?a.issuer,
-                            "ChangeTrust: loading issuer for CreditAlphanum12 (without record)"
-                        );
-                        self.load_account_without_record(snapshot, &a.issuer)?;
-                    }
-                    stellar_xdr::curr::ChangeTrustAsset::PoolShare(params) => {
-                        use sha2::{Digest, Sha256};
-                        let xdr = params
-                            .to_xdr(Limits::none())
-                            .map_err(|e| LedgerError::Serialization(e.to_string()))?;
-                        let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
-                        let stellar_xdr::curr::LiquidityPoolParameters::LiquidityPoolConstantProduct(cp) = params;
-                        let mut keys = vec![LedgerKey::LiquidityPool(LedgerKeyLiquidityPool {
-                            liquidity_pool_id: pool_id,
-                        })];
-                        if let Some(tl_asset) = asset_to_trustline_asset(&cp.asset_a) {
-                            keys.push(make_trustline_key(&op_source, &tl_asset));
-                        }
-                        if let Some(tl_asset) = asset_to_trustline_asset(&cp.asset_b) {
-                            keys.push(make_trustline_key(&op_source, &tl_asset));
-                        }
-                        self.batch_load_keys(snapshot, &keys)?;
-                    }
-                    _ => {}
-                }
-            }
-            OperationBody::ManageData(op_data) => {
-                // Load existing data entry if any (needed for updates and deletes)
-                self.load_data_raw(snapshot, &op_source, &op_data.data_name)?;
-            }
-            OperationBody::RevokeSponsorship(op_data) => {
-                // Load the target entry that sponsorship is being revoked from
-                use stellar_xdr::curr::RevokeSponsorshipOp;
-                match op_data {
-                    RevokeSponsorshipOp::LedgerEntry(ledger_key) => {
-                        // Load the entry directly by its key
-                        self.load_entry(snapshot, ledger_key)?;
-                        self.state.record_entry_access(ledger_key);
-                        // Also load owner/sponsor accounts that may be modified
-                        match ledger_key {
-                            LedgerKey::Account(k) => {
-                                self.load_account(snapshot, &k.account_id)?;
-                            }
-                            LedgerKey::Trustline(k) => {
-                                self.load_account(snapshot, &k.account_id)?;
-                            }
-                            LedgerKey::Offer(k) => {
-                                self.load_account(snapshot, &k.seller_id)?;
-                            }
-                            LedgerKey::Data(k) => {
-                                self.load_account(snapshot, &k.account_id)?;
-                            }
-                            LedgerKey::ClaimableBalance(k) => {
-                                // Load the claimable balance and its sponsor
-                                self.load_claimable_balance(snapshot, &k.balance_id)?;
-                            }
-                            _ => {}
-                        }
-                    }
-                    RevokeSponsorshipOp::Signer(signer_key) => {
-                        // Load the account that has the signer
-                        self.load_account(snapshot, &signer_key.account_id)?;
-                    }
-                }
-            }
-            OperationBody::SetOptions(op_data) => {
-                // If SetOptions sets an inflation_dest that differs from the source,
-                // we need to load that account to validate it exists.
-                // This matches stellar-core's loadAccountWithoutRecord() call.
-                if let Some(ref inflation_dest) = op_data.inflation_dest {
-                    if inflation_dest != &op_source {
-                        self.load_account(snapshot, inflation_dest)?;
-                    }
-                }
-
-                // If SetOptions modifies signers and the source account has sponsored signers,
-                // we need to load those sponsor accounts so we can update their num_sponsoring.
-                if op_data.signer.is_some() {
-                    // Collect sponsor IDs from the source account's signer_sponsoring_i_ds
-                    let sponsor_ids: Vec<AccountId> = self
-                        .state
-                        .get_account(&op_source)
-                        .and_then(|account| {
-                            if let AccountEntryExt::V1(v1) = &account.ext {
-                                if let AccountEntryExtensionV1Ext::V2(v2) = &v1.ext {
-                                    return Some(
-                                        v2.signer_sponsoring_i_ds
-                                            .iter()
-                                            .filter_map(|s| s.0.clone())
-                                            .collect(),
-                                    );
-                                }
-                            }
-                            None
-                        })
-                        .unwrap_or_default();
-
-                    // Load each sponsor account
-                    for sponsor_id in &sponsor_ids {
-                        self.load_account(snapshot, sponsor_id)?;
-                    }
-                }
-            }
-            _ => {
-                // Other operations typically work on source account
-            }
-        }
-
-        Ok(())
-    }
-
     /// Execute a single operation using the central dispatcher.
     fn execute_single_operation(
         &mut self,
@@ -3953,6 +2356,144 @@ impl TransactionExecutor {
     pub fn state_mut(&mut self) -> &mut LedgerStateManager {
         &mut self.state
     }
+
+    /// Remove one-time (PreAuthTx) signers from all source accounts.
+    ///
+    /// Returns (signer_changes, signer_created, signer_updated, signer_deleted, duration_us).
+    fn remove_one_time_signers_phase(
+        &mut self,
+        frame: &TransactionFrame,
+        inner_source_id: &AccountId,
+        outer_hash: &Hash256,
+    ) -> (
+        LedgerEntryChanges,
+        Vec<LedgerEntry>,
+        Vec<LedgerEntry>,
+        Vec<LedgerKey>,
+        u64,
+    ) {
+        let signer_removal_start = std::time::Instant::now();
+        if self.protocol_version == 7 {
+            let us = signer_removal_start.elapsed().as_micros() as u64;
+            return (
+                empty_entry_changes(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                us,
+            );
+        }
+
+        let mut source_accounts = Vec::new();
+        source_accounts.push(inner_source_id.clone());
+        for op in frame.operations().iter() {
+            if let Some(ref source) = op.source_account {
+                source_accounts.push(henyey_tx::muxed_to_account_id(source));
+            }
+        }
+        source_accounts.sort_by(|a, b| a.0.cmp(&b.0));
+        source_accounts.dedup_by(|a, b| a.0 == b.0);
+
+        let delta_before_signers = delta_snapshot(&self.state);
+        let mut signer_state_overrides = HashMap::new();
+        for account_id in &source_accounts {
+            let key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: account_id.clone(),
+            });
+            if let Some(entry) = self.state.get_entry(&key) {
+                signer_state_overrides.insert(key, entry);
+            }
+        }
+
+        self.state.remove_one_time_signers_from_all_sources(
+            outer_hash,
+            &source_accounts,
+            self.protocol_version,
+        );
+        self.state.flush_modified_entries();
+        let delta_after_signers = delta_snapshot(&self.state);
+        let delta_slice = delta_slice_between(
+            self.state.delta(),
+            delta_before_signers,
+            delta_after_signers,
+        );
+        let signer_created = delta_slice.created().to_vec();
+        let signer_updated = delta_slice.updated().to_vec();
+        let signer_deleted = delta_slice.deleted().to_vec();
+        let signer_changes = build_entry_changes_with_state_overrides(
+            &self.state,
+            &signer_created,
+            &signer_updated,
+            &signer_deleted,
+            &signer_state_overrides,
+        );
+        let us = signer_removal_start.elapsed().as_micros() as u64;
+        (
+            signer_changes,
+            signer_created,
+            signer_updated,
+            signer_deleted,
+            us,
+        )
+    }
+
+    /// Bump the transaction source account's sequence number and capture delta changes.
+    ///
+    /// Returns (seq_changes, seq_created, seq_updated, seq_deleted, duration_us).
+    fn bump_sequence_phase(
+        &mut self,
+        frame: &TransactionFrame,
+        inner_source_id: &AccountId,
+    ) -> (
+        LedgerEntryChanges,
+        Vec<LedgerEntry>,
+        Vec<LedgerEntry>,
+        Vec<LedgerKey>,
+        u64,
+    ) {
+        let seq_bump_start = std::time::Instant::now();
+        let delta_before_seq = delta_snapshot(&self.state);
+        // Capture the current account state BEFORE modification for STATE entry.
+        // We can't use snapshot_entry() here because the snapshot might not exist yet.
+        // After flush_modified_entries, the snapshot is updated to the post-modification
+        // value, so we need to save the original here.
+        let inner_source_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: inner_source_id.clone(),
+        });
+        let seq_state_override = self.state.get_entry(&inner_source_key);
+
+        if let Some(acc) = self.state.get_account_mut(inner_source_id) {
+            // CAP-0021: Set the account's seq_num to the transaction's seq_num.
+            // This handles the case where minSeqNum allows sequence gaps - the
+            // account's final seq must be the tx's seq, not just account_seq + 1.
+            acc.seq_num = stellar_xdr::curr::SequenceNumber(frame.sequence_number());
+            henyey_tx::state::update_account_seq_info(acc, self.ledger_seq, self.close_time);
+        }
+        self.state.flush_modified_entries();
+        let delta_after_seq = delta_snapshot(&self.state);
+        let delta_slice =
+            delta_slice_between(self.state.delta(), delta_before_seq, delta_after_seq);
+        // Use the pre-modification snapshot for STATE entry via state_overrides.
+        let mut seq_state_overrides = HashMap::new();
+        if let Some(entry) = seq_state_override {
+            seq_state_overrides.insert(inner_source_key, entry);
+        }
+        let seq_changes = build_entry_changes_with_state_overrides(
+            &self.state,
+            delta_slice.created(),
+            delta_slice.updated(),
+            delta_slice.deleted(),
+            &seq_state_overrides,
+        );
+        let seq_created = delta_slice.created().to_vec();
+        let seq_updated = delta_slice.updated().to_vec();
+        let seq_deleted = delta_slice.deleted().to_vec();
+        // Persist sequence updates so failed transactions still consume sequence numbers.
+        self.state.commit();
+
+        let us = seq_bump_start.elapsed().as_micros() as u64;
+        (seq_changes, seq_created, seq_updated, seq_deleted, us)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4026,27 +2567,6 @@ impl DeltaSlice<'_> {
             })
             .collect()
     }
-}
-
-const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
-
-/// Tracks entries restored from different sources per CAP-0066.
-#[derive(Debug, Default)]
-pub struct RestoredEntries {
-    /// Keys restored from hot archive (evicted entries).
-    /// These will have CREATED changes that should be converted to RESTORED.
-    hot_archive: HashSet<LedgerKey>,
-    /// For hot archive restores, maps data/code keys to their entry values.
-    /// These are needed to emit RESTORED for data/code that wasn't directly modified
-    /// (e.g., RestoreFootprint only creates TTL, but data entry needs RESTORED).
-    hot_archive_entries: HashMap<LedgerKey, LedgerEntry>,
-    /// Keys restored from live BucketList (expired TTL but not yet evicted).
-    /// TTL entries will have STATE+UPDATED that should be converted to RESTORED.
-    /// Associated data/code entries need RESTORED meta added even if not modified.
-    live_bucket_list: HashSet<LedgerKey>,
-    /// For live BL restores, maps data/code keys to their entry values.
-    /// These are needed to emit RESTORED for data/code that wasn't directly modified.
-    live_bucket_list_entries: HashMap<LedgerKey, LedgerEntry>,
 }
 
 // Re-export ThresholdLevel from henyey_common for use in this module and submodules.

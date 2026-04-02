@@ -146,28 +146,52 @@ struct ReadingCapacity {
     total_capacity: Option<u64>,
 }
 
-/// Flow control capacity tracking (message-based).
-struct FlowControlMessageCapacity {
+/// Flow control capacity tracking, parameterized by resource-counting strategy.
+///
+/// Used for both message-based capacity (where each message costs 1 unit) and
+/// byte-based capacity (where each message costs its serialized size in bytes).
+/// The `resource_counter` function pointer determines which unit is used.
+struct FlowControlCapacity {
     /// Current local reading capacity.
     capacity: ReadingCapacity,
+    /// Capacity limits (only used by byte-based tracking for tx size increases).
+    capacity_limits: Option<ReadingCapacity>,
     /// Outbound capacity (what the peer allows us to send).
     outbound_capacity: u64,
+    /// Returns the resource cost of a message (1 for messages, byte size for bytes).
+    resource_counter: fn(&StellarMessage) -> u64,
 }
 
-impl FlowControlMessageCapacity {
-    fn new(config: &FlowControlConfig) -> Self {
+impl FlowControlCapacity {
+    /// Create a message-based capacity tracker.
+    fn new_message(config: &FlowControlConfig) -> Self {
         Self {
             capacity: ReadingCapacity {
                 flood_capacity: config.peer_flood_reading_capacity,
                 total_capacity: Some(config.peer_reading_capacity),
             },
+            capacity_limits: None,
             outbound_capacity: 0,
+            resource_counter: |_| 1,
         }
     }
 
-    fn get_msg_resource_count(&self, _msg: &StellarMessage) -> u64 {
-        // Each message takes one unit of capacity
-        1
+    /// Create a byte-based capacity tracker.
+    fn new_bytes(initial_capacity: u64) -> Self {
+        let capacity_limits = ReadingCapacity {
+            flood_capacity: initial_capacity,
+            total_capacity: None,
+        };
+        Self {
+            capacity: capacity_limits,
+            capacity_limits: Some(capacity_limits),
+            outbound_capacity: 0,
+            resource_counter: msg_body_size,
+        }
+    }
+
+    fn get_msg_resource_count(&self, msg: &StellarMessage) -> u64 {
+        (self.resource_counter)(msg)
     }
 
     fn has_outbound_capacity(&self, msg: &StellarMessage) -> bool {
@@ -218,8 +242,8 @@ impl FlowControlMessageCapacity {
         released_flood_capacity
     }
 
-    fn release_outbound_capacity(&mut self, num_messages: u32) {
-        self.outbound_capacity += num_messages as u64;
+    fn release_outbound_capacity(&mut self, amount: u32) {
+        self.outbound_capacity += amount as u64;
     }
 
     fn can_read(&self) -> bool {
@@ -229,98 +253,21 @@ impl FlowControlMessageCapacity {
     fn get_outbound_capacity(&self) -> u64 {
         self.outbound_capacity
     }
-}
-
-/// Flow control capacity tracking (byte-based).
-struct FlowControlByteCapacity {
-    /// Current local reading capacity.
-    capacity: ReadingCapacity,
-    /// Capacity limits.
-    capacity_limits: ReadingCapacity,
-    /// Outbound capacity (what the peer allows us to send).
-    outbound_capacity: u64,
-}
-
-impl FlowControlByteCapacity {
-    fn new(initial_capacity: u64) -> Self {
-        let capacity_limits = ReadingCapacity {
-            flood_capacity: initial_capacity,
-            total_capacity: None,
-        };
-        Self {
-            capacity: capacity_limits,
-            capacity_limits,
-            outbound_capacity: 0,
-        }
-    }
-
-    fn get_msg_resource_count(&self, msg: &StellarMessage) -> u64 {
-        msg_body_size(msg)
-    }
-
-    fn has_outbound_capacity(&self, msg: &StellarMessage) -> bool {
-        self.outbound_capacity >= self.get_msg_resource_count(msg)
-    }
-
-    fn lock_outbound_capacity(&mut self, msg: &StellarMessage) {
-        if is_flow_controlled_message(msg) {
-            let count = self.get_msg_resource_count(msg);
-            debug_assert!(self.outbound_capacity >= count);
-            self.outbound_capacity = self.outbound_capacity.saturating_sub(count);
-        }
-    }
-
-    fn lock_local_capacity(&mut self, msg: &StellarMessage) -> bool {
-        let msg_resources = self.get_msg_resource_count(msg);
-
-        // Byte capacity doesn't track total capacity
-        if is_flow_controlled_message(msg) {
-            if self.capacity.flood_capacity < msg_resources {
-                return false;
-            }
-            self.capacity.flood_capacity -= msg_resources;
-        }
-
-        true
-    }
-
-    fn release_local_capacity(&mut self, msg: &StellarMessage) -> u64 {
-        let resources_freed = self.get_msg_resource_count(msg);
-        let mut released_flood_capacity = 0;
-
-        if is_flow_controlled_message(msg) {
-            released_flood_capacity = resources_freed;
-            self.capacity.flood_capacity += resources_freed;
-        }
-
-        released_flood_capacity
-    }
-
-    fn release_outbound_capacity(&mut self, num_bytes: u32) {
-        self.outbound_capacity += num_bytes as u64;
-    }
-
-    fn can_read(&self) -> bool {
-        // Byte capacity doesn't have total capacity limit
-        true
-    }
-
-    fn get_outbound_capacity(&self) -> u64 {
-        self.outbound_capacity
-    }
 
     fn handle_tx_size_increase(&mut self, increase: u32) {
-        self.capacity.flood_capacity += increase as u64;
-        self.capacity_limits.flood_capacity += increase as u64;
+        if let Some(ref mut limits) = self.capacity_limits {
+            self.capacity.flood_capacity += increase as u64;
+            limits.flood_capacity += increase as u64;
+        }
     }
 }
 
 /// Internal state protected by mutex.
 struct FlowControlState {
     /// Message capacity tracker.
-    message_capacity: FlowControlMessageCapacity,
+    message_capacity: FlowControlCapacity,
     /// Byte capacity tracker.
-    byte_capacity: FlowControlByteCapacity,
+    byte_capacity: FlowControlCapacity,
     /// Outbound queues by priority.
     outbound_queues: [VecDeque<QueuedOutboundMessage>; MessagePriority::COUNT],
     /// Transaction hash count in advert queue.
@@ -385,8 +332,8 @@ impl FlowControl {
 
         Self {
             state: Mutex::new(FlowControlState {
-                message_capacity: FlowControlMessageCapacity::new(&config),
-                byte_capacity: FlowControlByteCapacity::new(initial_bytes_capacity),
+                message_capacity: FlowControlCapacity::new_message(&config),
+                byte_capacity: FlowControlCapacity::new_bytes(initial_bytes_capacity),
                 outbound_queues: Default::default(),
                 advert_queue_tx_hash_count: 0,
                 demand_queue_tx_hash_count: 0,

@@ -755,11 +755,12 @@ impl BallotProtocol {
 mod tests {
     use super::*;
     use crate::driver::ValidationLevel;
+    use crate::test_utils::{make_node_id, make_quorum_set, make_value, MockDriver};
     use crate::SlotContext;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
-    use stellar_xdr::curr::{PublicKey, ScpNomination, Uint256, VecM};
+    use stellar_xdr::curr::{ScpNomination, VecM};
 
     /// Helper to construct a `SlotContext` from the old four-parameter pattern.
     macro_rules! ctx {
@@ -802,186 +803,6 @@ mod tests {
         assert_eq!(ballot_compare(&b2, &b1), std::cmp::Ordering::Greater);
         // Same counter, different value - compared by value
         assert_eq!(ballot_compare(&b1, &b3), std::cmp::Ordering::Less);
-    }
-
-    struct MockDriver {
-        quorum_set: ScpQuorumSet,
-        emit_count: AtomicU32,
-    }
-
-    impl MockDriver {
-        fn new(quorum_set: ScpQuorumSet) -> Self {
-            Self {
-                quorum_set,
-                emit_count: AtomicU32::new(0),
-            }
-        }
-    }
-
-    impl SCPDriver for MockDriver {
-        fn validate_value(
-            &self,
-            _slot_index: u64,
-            _value: &Value,
-            _nomination: bool,
-        ) -> ValidationLevel {
-            ValidationLevel::FullyValidated
-        }
-
-        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
-            candidates.first().cloned()
-        }
-
-        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
-            Some(value.clone())
-        }
-
-        fn emit_envelope(&self, _envelope: &ScpEnvelope) {
-            self.emit_count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
-            Some(self.quorum_set.clone())
-        }
-
-        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
-
-        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
-
-        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn compute_hash_node(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _is_priority: bool,
-            _round: u32,
-            _node_id: &NodeId,
-        ) -> u64 {
-            1
-        }
-
-        fn compute_value_hash(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _round: u32,
-            value: &Value,
-        ) -> u64 {
-            value.iter().map(|b| *b as u64).sum()
-        }
-
-        fn compute_timeout(&self, _round: u32, _is_nomination: bool) -> Duration {
-            Duration::from_millis(1)
-        }
-
-        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
-
-        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
-            true
-        }
-    }
-
-    struct QuorumCallbackDriver {
-        quorum_set: ScpQuorumSet,
-        heard_from_quorum: AtomicU32,
-    }
-
-    impl QuorumCallbackDriver {
-        fn new(quorum_set: ScpQuorumSet) -> Self {
-            Self {
-                quorum_set,
-                heard_from_quorum: AtomicU32::new(0),
-            }
-        }
-    }
-
-    impl SCPDriver for QuorumCallbackDriver {
-        fn validate_value(
-            &self,
-            _slot_index: u64,
-            _value: &Value,
-            _nomination: bool,
-        ) -> ValidationLevel {
-            ValidationLevel::FullyValidated
-        }
-
-        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
-            candidates.first().cloned()
-        }
-
-        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
-            Some(value.clone())
-        }
-
-        fn emit_envelope(&self, _envelope: &ScpEnvelope) {}
-
-        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
-            Some(self.quorum_set.clone())
-        }
-
-        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
-
-        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
-
-        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn ballot_did_hear_from_quorum(&self, _slot_index: u64, _ballot: &ScpBallot) {
-            self.heard_from_quorum.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn compute_hash_node(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _is_priority: bool,
-            _round: u32,
-            _node_id: &NodeId,
-        ) -> u64 {
-            1
-        }
-
-        fn compute_value_hash(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _round: u32,
-            value: &Value,
-        ) -> u64 {
-            value.iter().map(|b| *b as u64).sum()
-        }
-
-        fn compute_timeout(&self, _round: u32, _is_nomination: bool) -> Duration {
-            Duration::from_millis(1)
-        }
-
-        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
-
-        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
-            true
-        }
-    }
-
-    fn make_node_id(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
-    }
-
-    fn make_quorum_set(validators: Vec<NodeId>, threshold: u32) -> ScpQuorumSet {
-        ScpQuorumSet {
-            threshold,
-            validators: validators.try_into().unwrap_or_default(),
-            inner_sets: vec![].try_into().unwrap(),
-        }
-    }
-
-    fn make_value(bytes: &[u8]) -> Value {
-        bytes.to_vec().try_into().unwrap()
     }
 
     fn make_prepare_envelope(
@@ -1167,7 +988,7 @@ mod tests {
     fn test_ballot_rejects_non_ballot_pledges() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
         let env = make_nomination_envelope(make_node_id(2), 1, &quorum_set);
@@ -1181,7 +1002,7 @@ mod tests {
         let node_b = make_node_id(2);
         let node_c = make_node_id(3);
         let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone(), node_c.clone()], 2);
-        let driver = Arc::new(QuorumCallbackDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
         let value = make_value(&[1, 2, 3]);
@@ -1205,7 +1026,7 @@ mod tests {
     fn test_ballot_statement_ordering() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
         let value = make_value(&[7]);
         let ballot_value = ScpBallot { counter: 1, value };
@@ -1232,7 +1053,7 @@ mod tests {
     fn test_ballot_statement_ordering_confirm_counters() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
         let ballot_value = ScpBallot {
             counter: 2,
@@ -1277,7 +1098,7 @@ mod tests {
     fn test_ballot_statement_ordering_prepare_n_h() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
         let ballot_value = ScpBallot {
             counter: 3,
@@ -1332,7 +1153,7 @@ mod tests {
     fn test_ballot_statement_ordering_prepare_prepared() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
         let ballot_value = ScpBallot {
             counter: 3,
@@ -1389,7 +1210,7 @@ mod tests {
     fn test_ballot_statement_ordering_prepare_prepared_prime() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
         let ballot_value = ScpBallot {
             counter: 3,
@@ -1452,7 +1273,7 @@ mod tests {
     fn test_ballot_statement_ordering_confirm_n_h() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
         let ballot_value = ScpBallot {
             counter: 4,
@@ -1498,7 +1319,7 @@ mod tests {
         let node = make_node_id(1);
         let other = make_node_id(99);
         let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
         let value = make_value(&[5]);
 
@@ -1514,7 +1335,7 @@ mod tests {
         let local = make_node_id(1);
         let remote = make_node_id(2);
         let quorum_set = make_quorum_set(vec![local.clone(), remote.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
         let ballot_local = ScpBallot {
@@ -1550,7 +1371,7 @@ mod tests {
     fn test_ballot_process_current_state_includes_self_when_forced() {
         let local = make_node_id(1);
         let quorum_set = make_quorum_set(vec![local.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
         let ballot_local = ScpBallot {
@@ -1591,7 +1412,7 @@ mod tests {
             ],
             4,
         );
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
         let value = make_value(&[1]);
@@ -1698,7 +1519,7 @@ mod tests {
             ],
             4,
         );
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
         let value = make_value(&[9]);
@@ -1825,7 +1646,7 @@ mod tests {
     fn test_ballot_statement_sanity_prepare_constraints() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let ballot = BallotProtocol::new();
 
         let prepared = ScpBallot {
@@ -1902,7 +1723,7 @@ mod tests {
     fn test_ballot_statement_sanity_confirm_constraints() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let ballot = BallotProtocol::new();
 
         let conf = ScpStatementConfirm {
@@ -1928,7 +1749,7 @@ mod tests {
     fn test_ballot_statement_sanity_externalize_constraints() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let ballot = BallotProtocol::new();
 
         let env = make_externalize_envelope(
@@ -2056,7 +1877,7 @@ mod tests {
     fn test_ballot_rejects_unknown_quorum_set_hash() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let ballot = BallotProtocol::new();
 
         let other_qset = make_quorum_set(vec![make_node_id(2)], 1);
@@ -2227,7 +2048,7 @@ mod tests {
         let node = make_node_id(1);
         let other = make_node_id(99);
         let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
         let value = make_value(&[1, 2, 3]);
@@ -2253,7 +2074,7 @@ mod tests {
     fn test_bump_state_fails_when_externalized() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
         // Externalize via set_state_from_envelope
@@ -2287,7 +2108,7 @@ mod tests {
         let node = make_node_id(1);
         let other = make_node_id(99);
         let quorum_set = make_quorum_set(vec![node.clone(), other.clone()], 2);
-        let driver = Arc::new(MockDriver::new(quorum_set.clone()));
+        let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut ballot = BallotProtocol::new();
 
         let value = make_value(&[1, 2, 3]);

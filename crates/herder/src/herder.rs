@@ -1251,10 +1251,6 @@ impl Herder {
             return Err(HerderError::NotValidating);
         }
 
-        if !self.is_validator() {
-            return Err(HerderError::NotValidating);
-        }
-
         let slot = ledger_seq as u64;
         tracing::debug!("Triggering consensus for ledger {}", ledger_seq);
 

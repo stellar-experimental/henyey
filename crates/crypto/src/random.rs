@@ -11,7 +11,7 @@
 //!
 //! # Example
 //!
-//! ```
+//! ```ignore
 //! use henyey_crypto::{random_bytes, random_u64, fill_random};
 //!
 //! // Generate a fixed-size random array
@@ -33,20 +33,21 @@ use rand::{rngs::OsRng, RngCore};
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::random_bytes;
 ///
 /// let key: [u8; 32] = random_bytes();
 /// let nonce: [u8; 24] = random_bytes();
 /// ```
-pub fn random_bytes<const N: usize>() -> [u8; N] {
+pub(crate) fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     OsRng.fill_bytes(&mut bytes);
     bytes
 }
 
 /// Generates a random 64-bit unsigned integer.
-pub fn random_u64() -> u64 {
+#[cfg(test)]
+fn random_u64() -> u64 {
     OsRng.next_u64()
 }
 
@@ -56,13 +57,14 @@ pub fn random_u64() -> u64 {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::fill_random;
 ///
 /// let mut buffer = vec![0u8; 128];
 /// fill_random(&mut buffer);
 /// ```
-pub fn fill_random(dest: &mut [u8]) {
+#[cfg(test)]
+fn fill_random(dest: &mut [u8]) {
     OsRng.fill_bytes(dest);
 }
 

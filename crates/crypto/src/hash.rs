@@ -21,7 +21,7 @@
 //!
 //! # HMAC-SHA256
 //!
-//! ```
+//! ```ignore
 //! use henyey_crypto::{hmac_sha256, hmac_sha256_verify};
 //!
 //! let key = [0u8; 32];
@@ -31,7 +31,7 @@
 //!
 //! # HKDF Key Derivation
 //!
-//! ```
+//! ```ignore
 //! use henyey_crypto::{hkdf_extract, hkdf_expand};
 //!
 //! let ikm = b"input keying material";
@@ -43,6 +43,7 @@ use blake2::Blake2b;
 use henyey_common::Hash256;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
 use stellar_xdr::curr::WriteXdr;
 
 /// Computes the SHA-256 hash of the given data.
@@ -190,13 +191,13 @@ fn hmac_sha256_chunks(key: &[u8], chunks: &[&[u8]]) -> [u8; 32] {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::hmac_sha256;
 ///
 /// let key = [0u8; 32];
 /// let mac = hmac_sha256(&key, b"message");
 /// ```
-pub fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     hmac_sha256_chunks(key, &[data])
 }
 
@@ -217,7 +218,7 @@ pub fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::{hmac_sha256, hmac_sha256_verify};
 ///
 /// let key = [0u8; 32];
@@ -225,7 +226,8 @@ pub fn hmac_sha256(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 /// assert!(hmac_sha256_verify(&mac, &key, b"message"));
 /// assert!(!hmac_sha256_verify(&mac, &key, b"tampered"));
 /// ```
-pub fn hmac_sha256_verify(mac: &[u8; 32], key: &[u8; 32], data: &[u8]) -> bool {
+#[cfg(test)]
+fn hmac_sha256_verify(mac: &[u8; 32], key: &[u8; 32], data: &[u8]) -> bool {
     let mut verifier = new_hmac(key);
     verifier.update(data);
     verifier.verify_slice(mac).is_ok()
@@ -246,13 +248,13 @@ pub fn hmac_sha256_verify(mac: &[u8; 32], key: &[u8; 32], data: &[u8]) -> bool {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::hkdf_extract;
 ///
 /// let ikm = b"some input keying material";
 /// let prk = hkdf_extract(ikm);
 /// ```
-pub fn hkdf_extract(ikm: &[u8]) -> [u8; 32] {
+pub(crate) fn hkdf_extract(ikm: &[u8]) -> [u8; 32] {
     let zero_salt = [0u8; 32];
     hmac_sha256(&zero_salt, ikm)
 }
@@ -275,13 +277,14 @@ pub fn hkdf_extract(ikm: &[u8]) -> [u8; 32] {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::{hkdf_extract, hkdf_expand};
 ///
 /// let prk = hkdf_extract(b"ikm");
 /// let key = hkdf_expand(&prk, b"context");
 /// ```
-pub fn hkdf_expand(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
+#[cfg(test)]
+fn hkdf_expand(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
     let counter = [0x01];
     hmac_sha256_chunks(prk, &[info, &counter])
 }
@@ -301,12 +304,13 @@ pub fn hkdf_expand(prk: &[u8; 32], info: &[u8]) -> [u8; 32] {
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use henyey_crypto::hkdf;
 ///
 /// let derived = hkdf(b"input keying material", b"context");
 /// ```
-pub fn hkdf(ikm: &[u8], info: &[u8]) -> [u8; 32] {
+#[cfg(test)]
+fn hkdf(ikm: &[u8], info: &[u8]) -> [u8; 32] {
     let prk = hkdf_extract(ikm);
     hkdf_expand(&prk, info)
 }
@@ -333,7 +337,8 @@ pub fn hkdf(ikm: &[u8], info: &[u8]) -> [u8; 32] {
 /// let header: LedgerHeader = /* ... */;
 /// let hash = xdr_sha256(&header)?;
 /// ```
-pub fn xdr_sha256<T: WriteXdr>(value: &T) -> Result<Hash256, stellar_xdr::curr::Error> {
+#[cfg(test)]
+fn xdr_sha256<T: WriteXdr>(value: &T) -> Result<Hash256, stellar_xdr::curr::Error> {
     let bytes = value.to_xdr(stellar_xdr::curr::Limits::none())?;
     Ok(sha256(&bytes))
 }

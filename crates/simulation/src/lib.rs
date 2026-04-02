@@ -11,7 +11,6 @@ use anyhow::Context;
 use henyey_app::config::{ConfigBuilder, QuorumSetConfig};
 use henyey_app::{App, AppConfig, SimulationDebugStats};
 use henyey_clock::RealClock;
-use henyey_clock::VirtualClock;
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::SecretKey;
 use henyey_overlay::{ConnectionFactory, LoopbackConnectionFactory, TcpConnectionFactory};
@@ -57,7 +56,6 @@ fn seqs_within_spread(seqs: &[u32], min_ledger: u32, max_spread: u32) -> bool {
 pub struct SimNode {
     pub node_id: String,
     pub secret_key: SecretKey,
-    pub clock: VirtualClock,
     pub ledger_seq: u32,
     pub ledger_hash: Hash256,
 }
@@ -146,7 +144,6 @@ impl Simulation {
         let node = SimNode {
             node_id: node_id.clone(),
             secret_key,
-            clock: VirtualClock::default(),
             ledger_seq: 1,
             ledger_hash: Hash256::hash(node_id.as_bytes()),
         };

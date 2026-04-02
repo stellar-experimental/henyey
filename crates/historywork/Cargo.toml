@@ -16,7 +16,6 @@ async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 stellar-xdr.workspace = true
-flate2.workspace = true
 futures.workspace = true
 
 [dev-dependencies]

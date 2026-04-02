@@ -541,73 +541,14 @@ impl App {
         let ledger_manager = Arc::new(ledger_manager);
         tracing::info!("Ledger manager initialized");
 
-        // Create herder configuration
-        let freq = checkpoint_frequency();
-        let herder_config = HerderConfig {
-            max_pending_transactions: 1000,
-            is_validator: config.node.is_validator,
-            ledger_close_time: config
-                .testing
-                .ledger_close_time
-                .unwrap_or(if config.testing.accelerate_time { 1 } else { 5 }),
-            node_public_key: keypair.public_key(),
-            network_id: config.network_id(),
-            max_externalized_slots: freq as usize * 2,
-            max_tx_set_size: 1000,
-            pending_config: Default::default(),
-            tx_queue_config: TxQueueConfig {
-                network_id: henyey_common::NetworkId(config.network_id()),
-                max_dex_ops: config.surge_pricing.max_dex_tx_operations,
-                max_classic_bytes: Some(config.surge_pricing.classic_byte_allowance),
-                max_soroban_bytes: Some(config.surge_pricing.soroban_byte_allowance),
-                ..Default::default()
-            },
-            local_quorum_set,
-            proposed_upgrades: config.upgrades.to_ledger_upgrades(),
-            max_protocol_version: config.network.max_protocol_version,
-            checkpoint_frequency: freq as u64,
-        };
+        let herder_config = Self::build_herder_config(&config, &keypair, local_quorum_set);
 
         // Create herder (with or without secret key for signing)
         let survey_throttle = Duration::from_secs(herder_config.ledger_close_time as u64 * 3);
 
-        let herder = if config.node.is_validator {
-            Arc::new(Herder::with_secret_key(herder_config, keypair.clone()))
-        } else {
-            Arc::new(Herder::new(herder_config))
-        };
-        herder.set_ledger_manager(ledger_manager.clone());
-        herder
-            .tx_queue()
-            .set_fee_balance_provider(Arc::new(types::LedgerFeeBalanceProvider {
-                ledger_manager: ledger_manager.clone(),
-            }));
+        let herder = Self::init_herder(herder_config, &config, &keypair, &ledger_manager, &db);
 
-        if let Some(qs) = herder.local_quorum_set() {
-            let hash = hash_quorum_set(&qs);
-            if let Err(err) = db.store_scp_quorum_set(&hash, 0, &qs) {
-                tracing::warn!(error = %err, "Failed to store local quorum set");
-            }
-        }
-
-        // Initialize metadata stream if configured
-        let meta_stream =
-            if config.metadata.output_stream.is_some() || config.metadata.debug_ledgers > 0 {
-                match MetaStreamManager::new(&config.metadata, &bucket_dir) {
-                    Ok(ms) => {
-                        if ms.is_streaming() {
-                            tracing::info!("Metadata output stream initialized");
-                        }
-                        Some(ms)
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to initialize metadata stream");
-                        return Err(e.into());
-                    }
-                }
-            } else {
-                None
-            };
+        let meta_stream = Self::init_meta_stream(&config, &bucket_dir)?;
 
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
@@ -815,6 +756,201 @@ impl App {
         }
     }
 
+    /// Build the herder configuration from app config.
+    fn build_herder_config(
+        config: &AppConfig,
+        keypair: &henyey_crypto::SecretKey,
+        local_quorum_set: Option<stellar_xdr::curr::ScpQuorumSet>,
+    ) -> HerderConfig {
+        let freq = checkpoint_frequency();
+        HerderConfig {
+            max_pending_transactions: 1000,
+            is_validator: config.node.is_validator,
+            ledger_close_time: config
+                .testing
+                .ledger_close_time
+                .unwrap_or(if config.testing.accelerate_time { 1 } else { 5 }),
+            node_public_key: keypair.public_key(),
+            network_id: config.network_id(),
+            max_externalized_slots: freq as usize * 2,
+            max_tx_set_size: 1000,
+            pending_config: Default::default(),
+            tx_queue_config: TxQueueConfig {
+                network_id: henyey_common::NetworkId(config.network_id()),
+                max_dex_ops: config.surge_pricing.max_dex_tx_operations,
+                max_classic_bytes: Some(config.surge_pricing.classic_byte_allowance),
+                max_soroban_bytes: Some(config.surge_pricing.soroban_byte_allowance),
+                ..Default::default()
+            },
+            local_quorum_set,
+            proposed_upgrades: config.upgrades.to_ledger_upgrades(),
+            max_protocol_version: config.network.max_protocol_version,
+            checkpoint_frequency: freq as u64,
+        }
+    }
+
+    /// Create and wire up the Herder, storing the local quorum set in the DB.
+    fn init_herder(
+        config: HerderConfig,
+        app_config: &AppConfig,
+        keypair: &henyey_crypto::SecretKey,
+        ledger_manager: &Arc<LedgerManager>,
+        db: &henyey_db::Database,
+    ) -> Arc<Herder> {
+        let herder = if app_config.node.is_validator {
+            Arc::new(Herder::with_secret_key(config, keypair.clone()))
+        } else {
+            Arc::new(Herder::new(config))
+        };
+        herder.set_ledger_manager(ledger_manager.clone());
+        herder
+            .tx_queue()
+            .set_fee_balance_provider(Arc::new(types::LedgerFeeBalanceProvider {
+                ledger_manager: ledger_manager.clone(),
+            }));
+
+        if let Some(qs) = herder.local_quorum_set() {
+            let hash = hash_quorum_set(&qs);
+            if let Err(err) = db.store_scp_quorum_set(&hash, 0, &qs) {
+                tracing::warn!(error = %err, "Failed to store local quorum set");
+            }
+        }
+        herder
+    }
+
+    /// Initialize the metadata output stream, if configured.
+    fn init_meta_stream(
+        config: &AppConfig,
+        bucket_dir: &std::path::Path,
+    ) -> anyhow::Result<Option<MetaStreamManager>> {
+        if config.metadata.output_stream.is_some() || config.metadata.debug_ledgers > 0 {
+            match MetaStreamManager::new(&config.metadata, bucket_dir) {
+                Ok(ms) => {
+                    if ms.is_streaming() {
+                        tracing::info!("Metadata output stream initialized");
+                    }
+                    Ok(Some(ms))
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to initialize metadata stream");
+                    Err(e.into())
+                }
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Build genesis ledger entries (root account + optional test accounts).
+    ///
+    /// Mirrors the account creation logic in `initialize_genesis_ledger`.
+    fn build_genesis_entries(
+        passphrase: &str,
+        test_account_count: u32,
+        total_coins: i64,
+    ) -> Vec<stellar_xdr::curr::LedgerEntry> {
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+            PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
+        };
+
+        let network_id = NetworkId::from_passphrase(passphrase);
+        let root_secret = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
+        let root_public = root_secret.public_key();
+        let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            *root_public.as_bytes(),
+        )));
+
+        let (root_balance, test_balance) = if test_account_count > 0 {
+            let total_accounts = test_account_count as i64 + 1;
+            let base = total_coins / total_accounts;
+            let remainder = total_coins % total_accounts;
+            (base + remainder, base)
+        } else {
+            (total_coins, 0i64)
+        };
+
+        let make_entry = |account_id: AccountId, balance: i64| -> LedgerEntry {
+            LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: LedgerEntryData::Account(AccountEntry {
+                    account_id,
+                    balance,
+                    seq_num: SequenceNumber(0),
+                    num_sub_entries: 0,
+                    inflation_dest: None,
+                    flags: 0,
+                    home_domain: stellar_xdr::curr::String32::default(),
+                    thresholds: Thresholds([1, 0, 0, 0]),
+                    signers: VecM::default(),
+                    ext: AccountEntryExt::V0,
+                }),
+                ext: LedgerEntryExt::V0,
+            }
+        };
+
+        let mut entries = vec![make_entry(root_account_id, root_balance)];
+
+        for i in 0..test_account_count {
+            let name = format!("TestAccount-{}", i);
+            let seed = deterministic_seed(&name);
+            let secret = henyey_crypto::SecretKey::from_seed(&seed);
+            let public = secret.public_key();
+            let acct_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
+            entries.push(make_entry(acct_id, test_balance));
+        }
+
+        entries
+    }
+
+    /// Create the genesis bucket list and persist non-empty buckets to disk.
+    ///
+    /// Verifies the computed bucket list hash matches the expected header hash.
+    fn create_genesis_bucket_list(
+        bucket_dir: &std::path::Path,
+        genesis_entries: Vec<stellar_xdr::curr::LedgerEntry>,
+        header: &stellar_xdr::curr::LedgerHeader,
+    ) -> anyhow::Result<BucketList> {
+        use stellar_xdr::curr::BucketListType;
+
+        std::fs::create_dir_all(bucket_dir)?;
+
+        let mut bucket_list = BucketList::new();
+        bucket_list.set_bucket_dir(bucket_dir.to_path_buf());
+        bucket_list
+            .add_batch(1, 0, BucketListType::Live, genesis_entries, vec![], vec![])
+            .map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
+
+        // Persist all non-empty buckets to disk so they're available for
+        // history publishing and restart recovery.
+        for level in bucket_list.levels() {
+            for bucket in [&level.curr, &level.snap] {
+                if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
+                    let path =
+                        bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
+                    if !path.exists() {
+                        bucket
+                            .save_to_xdr_file(&path)
+                            .map_err(|e| anyhow::anyhow!("Failed to save genesis bucket: {}", e))?;
+                    }
+                }
+            }
+        }
+
+        // Verify hash matches
+        let computed_hash = bucket_list.hash();
+        let expected_hash = henyey_common::Hash256::from_bytes(header.bucket_list_hash.0);
+        if computed_hash != expected_hash {
+            anyhow::bail!(
+                "Genesis bucket list hash mismatch: computed {} vs header {}",
+                computed_hash,
+                expected_hash
+            );
+        }
+
+        Ok(bucket_list)
+    }
+
     /// Get the application configuration.
     pub fn config(&self) -> &AppConfig {
         &self.config
@@ -939,15 +1075,9 @@ impl App {
     /// with the root account entry (and test accounts if configured), and
     /// initializes the LedgerManager.
     pub async fn bootstrap_from_db(&self) -> anyhow::Result<()> {
-        use henyey_bucket::BucketList;
         use henyey_bucket::HotArchiveBucketList;
-        use henyey_common::NetworkId;
         use henyey_db::queries::LedgerQueries;
         use henyey_ledger::compute_header_hash;
-        use stellar_xdr::curr::{
-            AccountEntry, AccountEntryExt, AccountId, BucketListType, LedgerEntry, LedgerEntryData,
-            LedgerEntryExt, PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
-        };
 
         // Read LCL header from DB
         let (lcl_seq, header) = self.db.with_connection(|conn| {
@@ -963,105 +1093,14 @@ impl App {
         let header_hash = compute_header_hash(&header)
             .map_err(|e| anyhow::anyhow!("Failed to compute header hash: {}", e))?;
 
-        // Recreate the bucket list with the root account entry (and test accounts
-        // if GENESIS_TEST_ACCOUNT_COUNT > 0).
-        // For genesis (protocol 0), these are entries in level 0.
-        let genesis_test_account_count = self.config.testing.genesis_test_account_count;
-        let network_id = NetworkId::from_passphrase(&self.config.network.passphrase);
-        let root_secret = henyey_crypto::SecretKey::from_seed(network_id.as_bytes());
-        let root_public = root_secret.public_key();
-        let root_account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
-            *root_public.as_bytes(),
-        )));
-
-        // Compute per-account balance (same logic as initialize_genesis_ledger).
-        let (root_balance, test_balance) = if genesis_test_account_count > 0 {
-            let total_accounts = genesis_test_account_count as i64 + 1;
-            let base = header.total_coins / total_accounts;
-            let remainder = header.total_coins % total_accounts;
-            (base + remainder, base)
-        } else {
-            (header.total_coins, 0i64)
-        };
-
-        let root_entry = LedgerEntry {
-            last_modified_ledger_seq: 1,
-            data: LedgerEntryData::Account(AccountEntry {
-                account_id: root_account_id,
-                balance: root_balance,
-                seq_num: SequenceNumber(0),
-                num_sub_entries: 0,
-                inflation_dest: None,
-                flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
-                thresholds: Thresholds([1, 0, 0, 0]),
-                signers: VecM::default(),
-                ext: AccountEntryExt::V0,
-            }),
-            ext: LedgerEntryExt::V0,
-        };
-
-        let mut genesis_entries = vec![root_entry];
-
-        for i in 0..genesis_test_account_count {
-            let name = format!("TestAccount-{}", i);
-            let seed = deterministic_seed(&name);
-            let secret = henyey_crypto::SecretKey::from_seed(&seed);
-            let public = secret.public_key();
-            let acct_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
-            genesis_entries.push(LedgerEntry {
-                last_modified_ledger_seq: 1,
-                data: LedgerEntryData::Account(AccountEntry {
-                    account_id: acct_id,
-                    balance: test_balance,
-                    seq_num: SequenceNumber(0),
-                    num_sub_entries: 0,
-                    inflation_dest: None,
-                    flags: 0,
-                    home_domain: stellar_xdr::curr::String32::default(),
-                    thresholds: Thresholds([1, 0, 0, 0]),
-                    signers: VecM::default(),
-                    ext: AccountEntryExt::V0,
-                }),
-                ext: LedgerEntryExt::V0,
-            });
-        }
+        let genesis_entries = Self::build_genesis_entries(
+            &self.config.network.passphrase,
+            self.config.testing.genesis_test_account_count,
+            header.total_coins,
+        );
 
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
-        std::fs::create_dir_all(&bucket_dir)?;
-
-        let mut bucket_list = BucketList::new();
-        bucket_list.set_bucket_dir(bucket_dir.clone());
-        bucket_list
-            .add_batch(1, 0, BucketListType::Live, genesis_entries, vec![], vec![])
-            .map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
-
-        // Persist all non-empty buckets to disk so they're available for
-        // history publishing and restart recovery.
-        for level in bucket_list.levels() {
-            for bucket in [&level.curr, &level.snap] {
-                if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
-                    let path =
-                        bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
-                    if !path.exists() {
-                        bucket
-                            .save_to_xdr_file(&path)
-                            .map_err(|e| anyhow::anyhow!("Failed to save genesis bucket: {}", e))?;
-                    }
-                }
-            }
-        }
-
-        // Verify hash matches
-        let computed_hash = bucket_list.hash();
-        let expected_hash = henyey_common::Hash256::from_bytes(header.bucket_list_hash.0);
-        if computed_hash != expected_hash {
-            anyhow::bail!(
-                "Genesis bucket list hash mismatch: computed {} vs header {}",
-                computed_hash,
-                expected_hash
-            );
-        }
+        let bucket_list = Self::create_genesis_bucket_list(&bucket_dir, genesis_entries, &header)?;
 
         // Initialize LedgerManager
         let hot_archive = HotArchiveBucketList::new();
@@ -1738,9 +1777,9 @@ impl HerderCallback for App {
         let decoded_upgrades = decode_upgrades(upgrades);
         let mut close_data =
             LedgerCloseData::new(ledger_seq, tx_set_variant.clone(), close_time, prev_hash)
-                .with_stellar_value_ext(stellar_value_ext.clone());
+                .with_stellar_value_ext(stellar_value_ext);
         if !decoded_upgrades.is_empty() {
-            close_data = close_data.with_upgrades(decoded_upgrades.clone());
+            close_data = close_data.with_upgrades(decoded_upgrades);
         }
         if let Some(entry) = self.build_scp_history_entry(ledger_seq) {
             close_data = close_data.with_scp_history(vec![entry]);

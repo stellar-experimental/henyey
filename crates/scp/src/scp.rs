@@ -917,272 +917,24 @@ mod tests {
     use super::*;
     use crate::driver::ValidationLevel;
     use crate::quorum::hash_quorum_set;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use crate::test_utils::{
+        make_node_id, make_quorum_set, make_value, MockDriver, MockDriverBuilder, TimeoutMode,
+        ValueHashMode,
+    };
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use stellar_xdr::curr::{
-        PublicKey, ScpBallot, ScpNomination, ScpStatement, ScpStatementPledges,
-        ScpStatementPrepare, Uint256,
+        ScpBallot, ScpNomination, ScpStatement, ScpStatementPledges, ScpStatementPrepare,
     };
 
-    /// Mock driver for testing.
-    struct MockDriver {
-        emit_count: AtomicU32,
-    }
-
-    impl MockDriver {
-        fn new() -> Self {
-            Self {
-                emit_count: AtomicU32::new(0),
-            }
-        }
-    }
-
-    impl SCPDriver for MockDriver {
-        fn validate_value(
-            &self,
-            _slot_index: u64,
-            _value: &Value,
-            _nomination: bool,
-        ) -> ValidationLevel {
-            ValidationLevel::FullyValidated
-        }
-
-        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
-            candidates.first().cloned()
-        }
-
-        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
-            Some(value.clone())
-        }
-
-        fn emit_envelope(&self, _envelope: &ScpEnvelope) {
-            self.emit_count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
-            None
-        }
-
-        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
-
-        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
-
-        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn compute_hash_node(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _is_priority: bool,
-            _round: u32,
-            _node_id: &NodeId,
-        ) -> u64 {
-            1
-        }
-
-        fn compute_value_hash(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _round: u32,
-            _value: &Value,
-        ) -> u64 {
-            1
-        }
-
-        fn compute_timeout(&self, round: u32, _is_nomination: bool) -> Duration {
-            Duration::from_secs(1 + round as u64)
-        }
-
-        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
-
-        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
-            true
-        }
-    }
-
-    /// Driver that treats all values as MaybeValid.
-    struct MaybeValidDriver {
-        emit_count: AtomicU32,
-        quorum_set: ScpQuorumSet,
-    }
-
-    impl MaybeValidDriver {
-        fn new(quorum_set: ScpQuorumSet) -> Self {
-            Self {
-                emit_count: AtomicU32::new(0),
-                quorum_set,
-            }
-        }
-    }
-
-    impl SCPDriver for MaybeValidDriver {
-        fn validate_value(
-            &self,
-            _slot_index: u64,
-            _value: &Value,
-            _nomination: bool,
-        ) -> ValidationLevel {
-            ValidationLevel::MaybeValid
-        }
-
-        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
-            candidates.first().cloned()
-        }
-
-        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
-            Some(value.clone())
-        }
-
-        fn emit_envelope(&self, _envelope: &ScpEnvelope) {
-            self.emit_count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
-            Some(self.quorum_set.clone())
-        }
-
-        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
-
-        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
-
-        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn compute_hash_node(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _is_priority: bool,
-            _round: u32,
-            _node_id: &NodeId,
-        ) -> u64 {
-            1
-        }
-
-        fn compute_value_hash(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _round: u32,
-            _value: &Value,
-        ) -> u64 {
-            1
-        }
-
-        fn compute_timeout(&self, round: u32, _is_nomination: bool) -> Duration {
-            Duration::from_secs(1 + round as u64)
-        }
-
-        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
-
-        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
-            true
-        }
-    }
-
-    /// Driver that fully validates values and provides quorum set lookups.
-    struct QuorumAwareDriver {
-        quorum_set: ScpQuorumSet,
-    }
-
-    impl QuorumAwareDriver {
-        fn new(quorum_set: ScpQuorumSet) -> Self {
-            Self { quorum_set }
-        }
-    }
-
-    impl SCPDriver for QuorumAwareDriver {
-        fn validate_value(
-            &self,
-            _slot_index: u64,
-            _value: &Value,
-            _nomination: bool,
-        ) -> ValidationLevel {
-            ValidationLevel::FullyValidated
-        }
-
-        fn combine_candidates(&self, _slot_index: u64, candidates: &[Value]) -> Option<Value> {
-            candidates.first().cloned()
-        }
-
-        fn extract_valid_value(&self, _slot_index: u64, value: &Value) -> Option<Value> {
-            Some(value.clone())
-        }
-
-        fn emit_envelope(&self, _envelope: &ScpEnvelope) {}
-
-        fn get_quorum_set(&self, _node_id: &NodeId) -> Option<ScpQuorumSet> {
-            Some(self.quorum_set.clone())
-        }
-
-        fn nominating_value(&self, _slot_index: u64, _value: &Value) {}
-
-        fn value_externalized(&self, _slot_index: u64, _value: &Value) {}
-
-        fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn ballot_did_confirm(&self, _slot_index: u64, _ballot: &ScpBallot) {}
-
-        fn compute_hash_node(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _is_priority: bool,
-            _round: u32,
-            _node_id: &NodeId,
-        ) -> u64 {
-            1
-        }
-
-        fn compute_value_hash(
-            &self,
-            _slot_index: u64,
-            _prev_value: &Value,
-            _round: u32,
-            _value: &Value,
-        ) -> u64 {
-            1
-        }
-
-        fn compute_timeout(&self, round: u32, _is_nomination: bool) -> Duration {
-            Duration::from_secs(1 + round as u64)
-        }
-
-        fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
-
-        fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
-            true
-        }
-    }
-
-    fn make_node_id(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
-    }
-
-    fn make_quorum_set() -> ScpQuorumSet {
+    /// Convenience: empty quorum set for scp.rs tests that don't need quorum
+    /// logic.
+    fn make_empty_quorum_set() -> ScpQuorumSet {
         ScpQuorumSet {
             threshold: 1,
             validators: vec![].try_into().unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         }
-    }
-
-    fn make_quorum_set_with(validators: Vec<NodeId>, threshold: u32) -> ScpQuorumSet {
-        ScpQuorumSet {
-            threshold,
-            validators: validators.try_into().unwrap_or_default(),
-            inner_sets: vec![].try_into().unwrap(),
-        }
-    }
-
-    fn make_value(bytes: &[u8]) -> Value {
-        bytes.to_vec().try_into().unwrap()
     }
 
     fn make_prepare_envelope(
@@ -1234,8 +986,8 @@ mod tests {
 
     #[test]
     fn test_scp_new() {
-        let driver = Arc::new(MockDriver::new());
-        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
+        let driver = Arc::new(MockDriver::bare());
+        let scp = SCP::new(make_node_id(1), true, make_empty_quorum_set(), driver);
 
         assert!(scp.is_validator());
         assert_eq!(scp.slot_count(), 0);
@@ -1243,8 +995,8 @@ mod tests {
 
     #[test]
     fn test_force_externalize() {
-        let driver = Arc::new(MockDriver::new());
-        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
+        let driver = Arc::new(MockDriver::bare());
+        let scp = SCP::new(make_node_id(1), true, make_empty_quorum_set(), driver);
 
         let value: Value = vec![1, 2, 3].try_into().unwrap();
         scp.force_externalize(42, value.clone());
@@ -1261,9 +1013,18 @@ mod tests {
         // Use threshold=2 so that a single PREPARE from node_b doesn't form
         // a quorum for federated_accept (which would cascade to externalization
         // and set fully_validated=true, defeating the purpose of this test).
-        let quorum_set =
-            make_quorum_set_with(vec![node_a.clone(), node_b.clone(), node_c.clone()], 2);
-        let driver = Arc::new(MaybeValidDriver::new(quorum_set.clone()));
+        let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone(), node_c.clone()], 2);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .validation_level(ValidationLevel::MaybeValid)
+                .value_hash_mode(ValueHashMode::Fixed(1))
+                .timeout_mode(TimeoutMode::Linear {
+                    base: Duration::from_secs(1),
+                    step: Duration::from_secs(1),
+                })
+                .build(),
+        );
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver.clone());
 
         let ballot = ScpBallot {
@@ -1286,8 +1047,8 @@ mod tests {
     #[test]
     fn test_get_scp_state_includes_self_when_fully_validated() {
         let node_a = make_node_id(1);
-        let quorum_set = make_quorum_set_with(vec![node_a.clone()], 1);
-        let driver = Arc::new(MockDriver::new());
+        let quorum_set = make_quorum_set(vec![node_a.clone()], 1);
+        let driver = Arc::new(MockDriver::bare());
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
 
         let value = make_value(&[4, 5, 6]);
@@ -1301,8 +1062,17 @@ mod tests {
     #[test]
     fn test_nominate_solo_quorum_starts_ballot_without_peer_envelopes() {
         let node = make_node_id(1);
-        let quorum_set = make_quorum_set_with(vec![node.clone()], 1);
-        let driver = Arc::new(QuorumAwareDriver::new(quorum_set.clone()));
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .value_hash_mode(ValueHashMode::Fixed(1))
+                .timeout_mode(TimeoutMode::Linear {
+                    base: Duration::from_secs(1),
+                    step: Duration::from_secs(1),
+                })
+                .build(),
+        );
         let scp = SCP::new(node, true, quorum_set, driver);
 
         let value = make_value(&[9, 9, 9]);
@@ -1320,8 +1090,8 @@ mod tests {
     fn test_get_scp_state_orders_by_node_id() {
         let node_a = make_node_id(1);
         let node_b = make_node_id(2);
-        let quorum_set = make_quorum_set_with(vec![node_a.clone(), node_b.clone()], 1);
-        let driver = Arc::new(MockDriver::new());
+        let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone()], 1);
+        let driver = Arc::new(MockDriver::bare());
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
 
         let value_a = make_value(&[1]);
@@ -1340,8 +1110,8 @@ mod tests {
     fn test_get_scp_state_orders_by_slot() {
         let node_a = make_node_id(1);
         let node_b = make_node_id(2);
-        let quorum_set = make_quorum_set_with(vec![node_a.clone(), node_b.clone()], 1);
-        let driver = Arc::new(MockDriver::new());
+        let quorum_set = make_quorum_set(vec![node_a.clone(), node_b.clone()], 1);
+        let driver = Arc::new(MockDriver::bare());
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
 
         let env_slot2 = make_nomination_envelope(node_b.clone(), 2, &quorum_set, make_value(&[2]));
@@ -1356,8 +1126,8 @@ mod tests {
 
     #[test]
     fn test_purge_slots() {
-        let driver = Arc::new(MockDriver::new());
-        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
+        let driver = Arc::new(MockDriver::bare());
+        let scp = SCP::new(make_node_id(1), true, make_empty_quorum_set(), driver);
 
         // Create some slots
         for i in 1..=10 {
@@ -1386,7 +1156,17 @@ mod tests {
             validators: vec![node_a.clone(), node_b.clone()].try_into().unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         };
-        let driver = Arc::new(MaybeValidDriver::new(quorum_set.clone()));
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .validation_level(ValidationLevel::MaybeValid)
+                .value_hash_mode(ValueHashMode::Fixed(1))
+                .timeout_mode(TimeoutMode::Linear {
+                    base: Duration::from_secs(1),
+                    step: Duration::from_secs(1),
+                })
+                .build(),
+        );
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
 
         // No slot created yet
@@ -1404,8 +1184,8 @@ mod tests {
     #[test]
     fn test_get_cumulative_statement_count() {
         let node_a = make_node_id(1);
-        let quorum_set = make_quorum_set();
-        let driver = Arc::new(MockDriver::new());
+        let quorum_set = make_empty_quorum_set();
+        let driver = Arc::new(MockDriver::bare());
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
 
         // No slots, count should be 0
@@ -1433,7 +1213,17 @@ mod tests {
                 .unwrap(),
             inner_sets: vec![].try_into().unwrap(),
         };
-        let driver = Arc::new(MaybeValidDriver::new(quorum_set.clone()));
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .validation_level(ValidationLevel::MaybeValid)
+                .value_hash_mode(ValueHashMode::Fixed(1))
+                .timeout_mode(TimeoutMode::Linear {
+                    base: Duration::from_secs(1),
+                    step: Duration::from_secs(1),
+                })
+                .build(),
+        );
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
 
         // No slot yet - all nodes should be missing
@@ -1446,8 +1236,8 @@ mod tests {
     #[test]
     fn test_is_newer_statement() {
         let node_a = make_node_id(1);
-        let quorum_set = make_quorum_set();
-        let driver = Arc::new(MockDriver::new());
+        let quorum_set = make_empty_quorum_set();
+        let driver = Arc::new(MockDriver::bare());
         let scp = SCP::new(node_a.clone(), true, quorum_set.clone(), driver);
 
         // Create a nomination statement
@@ -1468,8 +1258,8 @@ mod tests {
 
     #[test]
     fn test_empty() {
-        let driver = Arc::new(MockDriver::new());
-        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
+        let driver = Arc::new(MockDriver::bare());
+        let scp = SCP::new(make_node_id(1), true, make_empty_quorum_set(), driver);
 
         // New SCP should be empty
         assert!(scp.empty());
@@ -1482,8 +1272,8 @@ mod tests {
 
     #[test]
     fn test_get_highest_known_slot() {
-        let driver = Arc::new(MockDriver::new());
-        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver);
+        let driver = Arc::new(MockDriver::bare());
+        let scp = SCP::new(make_node_id(1), true, make_empty_quorum_set(), driver);
 
         // No slots initially
         assert_eq!(scp.get_highest_known_slot(), None);
@@ -1500,8 +1290,13 @@ mod tests {
 
     #[test]
     fn test_driver_access() {
-        let driver = Arc::new(MockDriver::new());
-        let scp = SCP::new(make_node_id(1), true, make_quorum_set(), driver.clone());
+        let driver = Arc::new(MockDriver::bare());
+        let scp = SCP::new(
+            make_node_id(1),
+            true,
+            make_empty_quorum_set(),
+            driver.clone(),
+        );
 
         // Should be able to access the driver
         let retrieved = scp.driver();

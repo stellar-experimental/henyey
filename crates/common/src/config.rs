@@ -349,8 +349,8 @@ pub struct BucketListDbConfig {
     ///
     /// When non-zero, each DiskIndex bucket gets a proportional share of this
     /// budget for caching Account entries, reducing disk I/O during lookups.
-    /// Default: 0 (disabled).
-    #[serde(default)]
+    /// Default: 1024.
+    #[serde(default = "default_memory_for_caching_mb")]
     pub memory_for_caching_mb: usize,
 
     /// Whether to persist disk indexes alongside bucket files.
@@ -366,7 +366,7 @@ impl Default for BucketListDbConfig {
         Self {
             index_page_size_exponent: default_index_page_size_exponent(),
             index_cutoff_mb: default_index_cutoff_mb(),
-            memory_for_caching_mb: 1024,
+            memory_for_caching_mb: default_memory_for_caching_mb(),
             persist_index: default_persist_index(),
         }
     }
@@ -390,6 +390,10 @@ fn default_index_page_size_exponent() -> u32 {
 
 fn default_index_cutoff_mb() -> usize {
     20
+}
+
+fn default_memory_for_caching_mb() -> usize {
+    1024
 }
 
 fn default_persist_index() -> bool {

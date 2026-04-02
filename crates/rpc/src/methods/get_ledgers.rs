@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use stellar_xdr::curr::{LedgerCloseMeta, LedgerHeaderHistoryEntry, Limits, ReadXdr};
+use stellar_xdr::curr::{LedgerCloseMeta, Limits, ReadXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -70,7 +70,7 @@ pub async fn handle(
         let lcm = LedgerCloseMeta::from_xdr(meta_bytes.as_slice(), Limits::none())
             .map_err(|e| JsonRpcError::internal(format!("corrupt LedgerCloseMeta: {e}")))?;
 
-        let header_entry = extract_header_entry(&lcm);
+        let header_entry = util::ledger_header_entry(&lcm);
         let hash = hex::encode(header_entry.hash.0);
         let close_time = header_entry.header.scp_value.close_time.0;
 
@@ -139,13 +139,4 @@ fn validate_ledger_pagination(
     }
 
     Ok((start, limit))
-}
-
-/// Extract the LedgerHeaderHistoryEntry reference from a LedgerCloseMeta.
-fn extract_header_entry(lcm: &LedgerCloseMeta) -> &LedgerHeaderHistoryEntry {
-    match lcm {
-        LedgerCloseMeta::V0(v0) => &v0.ledger_header,
-        LedgerCloseMeta::V1(v1) => &v1.ledger_header,
-        LedgerCloseMeta::V2(v2) => &v2.ledger_header,
-    }
 }

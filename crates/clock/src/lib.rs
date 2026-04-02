@@ -37,25 +37,6 @@ impl Clock for RealClock {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct VirtualClock {
-    base_instant: Instant,
-}
-
-impl Default for VirtualClock {
-    fn default() -> Self {
-        Self {
-            base_instant: Instant::now(),
-        }
-    }
-}
-
-impl Clock for VirtualClock {
-    fn now(&self) -> Instant {
-        self.base_instant + self.base_instant.elapsed()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,14 +48,6 @@ mod tests {
         let t1 = clock.now();
         let t2 = clock.now();
         assert!(t2 >= t1);
-    }
-
-    #[test]
-    fn virtual_clock_base_instant_controls_now() {
-        let base = Instant::now() - Duration::from_secs(2);
-        let clock = VirtualClock { base_instant: base };
-        let now = clock.now();
-        assert!(now >= base + Duration::from_secs(2));
     }
 
     #[tokio::test]
