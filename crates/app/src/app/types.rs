@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use henyey_common::Hash256;
-use henyey_herder::Herder;
+use henyey_herder::{FeeBalanceProvider, Herder};
+use henyey_ledger::{LedgerManager, TransactionSetVariant};
 use henyey_overlay::{PeerId, ScpQueueCallback};
 use stellar_xdr::curr::{
     Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, TransactionEnvelope, UpgradeType,
@@ -19,7 +20,6 @@ use stellar_xdr::curr::{
 
 use crate::config::AppConfig;
 use crate::survey::SurveyPhase;
-use henyey_ledger::TransactionSetVariant;
 
 // ── Constants re-exported for sibling submodules ────────────────────────
 
@@ -638,6 +638,35 @@ impl ScpQueueCallback for HerderScpCallback {
 
     fn most_recent_checkpoint_seq(&self) -> u64 {
         self.herder.get_most_recent_checkpoint_seq()
+    }
+}
+
+// Adapter from the app's LedgerManager to the herder's FeeBalanceProvider trait.
+// Bridges ledger state into the transaction queue for fee-source affordability checks.
+//
+// Matches stellar-core TransactionQueue behavior: creates a LedgerSnapshot and calls
+// getAvailableBalance(header, feeSource) which computes:
+//   balance - minBalance - sellingLiabilities
+pub(super) struct LedgerFeeBalanceProvider {
+    pub ledger_manager: Arc<LedgerManager>,
+}
+
+impl FeeBalanceProvider for LedgerFeeBalanceProvider {
+    fn get_available_balance(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
+        let snapshot = self.ledger_manager.create_snapshot().ok()?;
+        let key = stellar_xdr::curr::LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let entry = snapshot.get_entry(&key).ok()??;
+        if let stellar_xdr::curr::LedgerEntryData::Account(acc) = &entry.data {
+            let base_reserve = snapshot.header().base_reserve;
+            Some(henyey_ledger::reserves::available_to_send(
+                acc,
+                base_reserve,
+            ))
+        } else {
+            None
+        }
     }
 }
 

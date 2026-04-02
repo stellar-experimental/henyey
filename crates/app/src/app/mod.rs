@@ -577,6 +577,11 @@ impl App {
             Arc::new(Herder::new(herder_config))
         };
         herder.set_ledger_manager(ledger_manager.clone());
+        herder
+            .tx_queue()
+            .set_fee_balance_provider(Arc::new(types::LedgerFeeBalanceProvider {
+                ledger_manager: ledger_manager.clone(),
+            }));
 
         if let Some(qs) = herder.local_quorum_set() {
             let hash = hash_quorum_set(&qs);
@@ -1386,6 +1391,16 @@ impl App {
             self.enqueue_tx_advert(&tx).await;
         }
         result
+    }
+
+    /// Test-only: skip fee balance validation for loadgen transactions.
+    ///
+    /// Matches stellar-core's `isLoadgenTx` bypass in `TransactionQueue::canAdd()`
+    /// which skips both tx validation and fee balance checks for loadgen txs
+    /// (gated on `#ifdef BUILD_TESTS`).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_skip_fee_balance_check(&self, skip: bool) {
+        self.herder.tx_queue().set_skip_fee_balance_check(skip);
     }
 
     pub fn herder_stats(&self) -> HerderStats {

@@ -588,6 +588,12 @@ pub struct TransactionQueue {
     /// When set, transactions are validated to ensure the fee-source has
     /// sufficient balance to cover all pending fees plus the new transaction fee.
     fee_balance_provider: RwLock<Option<Arc<dyn FeeBalanceProvider>>>,
+    /// Test-only: when true, skip fee balance validation in try_add.
+    /// Matches stellar-core's `isLoadgenTx` bypass in TransactionQueue::canAdd()
+    /// which skips both tx validation and fee balance checks for loadgen txs
+    /// (gated on BUILD_TESTS / #ifdef BUILD_TESTS).
+    #[cfg(any(test, feature = "test-utils"))]
+    skip_fee_balance_check: std::sync::atomic::AtomicBool,
 }
 
 /// Default ban depth (number of ledgers transactions stay banned).
@@ -635,6 +641,8 @@ impl TransactionQueue {
             account_states: RwLock::new(HashMap::new()),
             pending_depth,
             fee_balance_provider: RwLock::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            skip_fee_balance_check: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -649,6 +657,19 @@ impl TransactionQueue {
     /// Clear the fee balance provider.
     pub fn clear_fee_balance_provider(&self) {
         *self.fee_balance_provider.write() = None;
+    }
+
+    /// Test-only: skip fee balance validation in try_add.
+    ///
+    /// Matches stellar-core's `isLoadgenTx` bypass which skips both tx validation
+    /// and fee balance checks for loadgen transactions under `#ifdef BUILD_TESTS`.
+    /// In simulation tests, the pair topology may not execute create-account txs
+    /// before loadgen payments are submitted, so the fee source accounts may not
+    /// exist in the bucket list yet.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_skip_fee_balance_check(&self, skip: bool) {
+        self.skip_fee_balance_check
+            .store(skip, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Create with default configuration.
@@ -1260,43 +1281,55 @@ impl TransactionQueue {
 
         // Fee balance validation (if provider is set)
         // Check that fee-source has sufficient balance for total fees + new fee
+        //
+        // Parity: stellar-core TransactionQueue::canAdd() skips both tx validation
+        // and fee balance checks for loadgen txs under #ifdef BUILD_TESTS.
+        #[cfg(any(test, feature = "test-utils"))]
+        let skip_fee = self
+            .skip_fee_balance_check
+            .load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let skip_fee = false;
+
         if let Some(ref provider) = *self.fee_balance_provider.read() {
-            let fee_source_id = account_id_from_fee_source_key(&new_fee_source_key);
+            if !skip_fee {
+                let fee_source_id = account_id_from_fee_source_key(&new_fee_source_key);
 
-            // Calculate the net new fee being added
-            let net_new_fee = if let Some(ref old_tx) = replaced_tx {
-                let old_fee_source_key = fee_source_key(&old_tx.envelope);
-                if old_fee_source_key == new_fee_source_key {
-                    // Same fee source - only the difference is new
-                    (queued.total_fee as i64).saturating_sub(old_tx.total_fee as i64)
+                // Calculate the net new fee being added
+                let net_new_fee = if let Some(ref old_tx) = replaced_tx {
+                    let old_fee_source_key = fee_source_key(&old_tx.envelope);
+                    if old_fee_source_key == new_fee_source_key {
+                        // Same fee source - only the difference is new
+                        (queued.total_fee as i64).saturating_sub(old_tx.total_fee as i64)
+                    } else {
+                        // Different fee source - full new fee
+                        queued.total_fee as i64
+                    }
                 } else {
-                    // Different fee source - full new fee
                     queued.total_fee as i64
-                }
-            } else {
-                queued.total_fee as i64
-            };
+                };
 
-            // Get current total fees for this fee-source
-            let current_total_fees = {
-                let account_states = self.account_states.read();
-                account_states
-                    .get(&new_fee_source_key)
-                    .map(|s| s.total_fees)
-                    .unwrap_or(0)
-            };
+                // Get current total fees for this fee-source
+                let current_total_fees = {
+                    let account_states = self.account_states.read();
+                    account_states
+                        .get(&new_fee_source_key)
+                        .map(|s| s.total_fees)
+                        .unwrap_or(0)
+                };
 
-            // Check if fee-source has sufficient balance
-            if let Some(available) = provider.get_available_balance(&fee_source_id) {
-                // available - net_new_fee < current_total_fees means insufficient
-                if available.saturating_sub(net_new_fee) < current_total_fees {
-                    return TxQueueResult::Invalid(Some(
-                        henyey_tx::TxResultCode::TxInsufficientBalance,
-                    ));
+                // Check if fee-source has sufficient balance
+                if let Some(available) = provider.get_available_balance(&fee_source_id) {
+                    // available - net_new_fee < current_total_fees means insufficient
+                    if available.saturating_sub(net_new_fee) < current_total_fees {
+                        return TxQueueResult::Invalid(Some(
+                            henyey_tx::TxResultCode::TxInsufficientBalance,
+                        ));
+                    }
+                } else {
+                    // Account doesn't exist
+                    return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxNoAccount));
                 }
-            } else {
-                // Account doesn't exist
-                return TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxNoAccount));
             }
         }
 

@@ -911,6 +911,9 @@ impl Simulation {
         let app = Arc::new(app);
         app.set_self_arc().await;
         app.bootstrap_from_db().await?;
+        // All simulation transactions are loadgen txs — skip fee balance checks
+        // to match stellar-core's `isLoadgenTx` bypass in TransactionQueue::canAdd().
+        app.set_skip_fee_balance_check(true);
         Self::spawn_app_run_loop(app, data_dir, peer_port)
     }
 
@@ -946,6 +949,9 @@ impl Simulation {
             }
         }
 
+        // All simulation transactions are loadgen txs — skip fee balance checks
+        // to match stellar-core's `isLoadgenTx` bypass in TransactionQueue::canAdd().
+        app.set_skip_fee_balance_check(true);
         Self::spawn_app_run_loop(app, data_dir, peer_port)
     }
 

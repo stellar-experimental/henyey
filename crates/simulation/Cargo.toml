@@ -12,7 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
-henyey-app.workspace = true
+henyey-app = { workspace = true, features = ["test-utils"] }
 henyey-bucket.workspace = true
 henyey-clock.workspace = true
 henyey-common.workspace = true

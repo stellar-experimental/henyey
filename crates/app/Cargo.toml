@@ -13,6 +13,7 @@ path = "src/lib.rs"
 [features]
 default = []
 loadgen = []
+test-utils = ["henyey-herder/test-utils"]
 
 [dependencies]
 # Workspace crates
