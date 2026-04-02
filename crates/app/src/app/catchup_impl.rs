@@ -453,7 +453,7 @@ impl App {
 
     /// Get the latest checkpoint from history archives, using a cache to avoid repeated network calls.
     /// The cache is valid for ARCHIVE_CHECKPOINT_CACHE_SECS.
-    async fn get_cached_archive_checkpoint(&self) -> anyhow::Result<u32> {
+    pub(super) async fn get_cached_archive_checkpoint(&self) -> anyhow::Result<u32> {
         // Check cache first
         {
             let cache = self.cached_archive_checkpoint.read().await;
@@ -1887,30 +1887,38 @@ impl App {
             return;
         }
 
-        // When the target checkpoint hasn't been published yet, check if we
-        // can close sequentially from cached EXTERNALIZE. If not, fall through
-        // to do CatchupTarget::Current which queries the archive for whatever
-        // IS available. This avoids the dead zone where:
-        //   - The archive hasn't published the next checkpoint yet
-        //   - Peers have evicted EXTERNALIZE for the slots right after our LCL
-        //   - The node is stuck until the next checkpoint publishes (~5 min)
+        // When the target checkpoint is ahead of the latest externalized slot,
+        // it may not be published in the archive yet. Check the cached archive
+        // checkpoint to avoid blocking the event loop with 404 retries (~50s).
+        // If the archive hasn't published a checkpoint ahead of us, skip this
+        // attempt and let the cooldown timer retry after the archive catches up.
         if target_checkpoint > latest_externalized as u32 {
-            tracing::info!(
-                current_ledger,
-                target,
-                target_checkpoint,
-                latest_externalized,
-                "Target checkpoint not yet published; will target it directly and retry"
-            );
+            match self.get_cached_archive_checkpoint().await {
+                Ok(archive_latest) => {
+                    if archive_latest <= current_ledger {
+                        tracing::debug!(
+                            current_ledger,
+                            target_checkpoint,
+                            archive_latest,
+                            "Skipping externalized catchup: archive has no checkpoint ahead of us"
+                        );
+                        *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                        self.catchup_in_progress.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to query archive checkpoint, skipping externalized catchup"
+                    );
+                    *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                    self.catchup_in_progress.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
         }
 
-        // When the target checkpoint isn't published yet, target it directly
-        // with CatchupTarget::Ledger. Previously we fell back to
-        // CatchupTarget::Current, but that returns the archive's latest
-        // checkpoint — which we may have already passed during rapid close.
-        // This created a dead loop: catchup → "already at target" → retry.
-        // By targeting the future checkpoint, the download will 404 and retry
-        // until the archive publishes it, ensuring forward progress.
         let catchup_target = if target_checkpoint > latest_externalized as u32 {
             tracing::info!(
                 current_ledger,

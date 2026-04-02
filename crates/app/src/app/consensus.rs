@@ -354,8 +354,18 @@ impl App {
                             buffer
                                 .retain(|seq, info| *seq > current_ledger && info.tx_set.is_some());
                         }
-                        self.maybe_start_externalized_catchup(latest_externalized)
-                            .await;
+                        // Use trigger_recovery_catchup which targets the NEXT checkpoint
+                        // ahead of current_ledger. maybe_start_externalized_catchup would
+                        // bail because the gap is within TX_SET_REQUEST_WINDOW (≤12), and
+                        // even if it didn't, it targets checkpoint_containing(latest_ext-12)
+                        // which may equal current_ledger when we're on a checkpoint boundary.
+                        self.trigger_recovery_catchup(
+                            current_ledger,
+                            latest_externalized,
+                            gap,
+                            attempts,
+                        )
+                        .await;
                         return;
                     }
                 }
@@ -736,19 +746,40 @@ impl App {
 
         // Guard against concurrent catchup
         if !self.catchup_in_progress.swap(true, Ordering::SeqCst) {
-            self.set_state(AppState::CatchingUp).await;
-            self.herder.set_state(henyey_herder::HerderState::Syncing);
-
-            let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
-
             // Target the next checkpoint boundary after our current ledger.
             // CatchupTarget::Current returns the archive's latest checkpoint,
             // which we may have already passed during rapid close. This creates
             // a dead loop: recovery → catchup → "already at target" → recovery.
             // By targeting the next checkpoint AHEAD of us, the catchup will
-            // either succeed immediately (if the archive has it) or retry with
-            // 404s until the archive publishes it — but it will never no-op.
+            // succeed once the archive publishes it.
+            //
+            // Before starting, check if the archive has published that checkpoint.
+            // If not, skip to avoid blocking the event loop with ~50s of 404
+            // retries. The recovery manager will retry on the next tick.
             let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+
+            let archive_has_checkpoint = match self.get_cached_archive_checkpoint().await {
+                Ok(archive_latest) => archive_latest >= next_cp,
+                Err(_) => false,
+            };
+
+            if !archive_has_checkpoint {
+                tracing::info!(
+                    current_ledger,
+                    next_checkpoint = next_cp,
+                    "Recovery catchup skipped: archive hasn't published checkpoint yet"
+                );
+                self.catchup_in_progress.store(false, Ordering::SeqCst);
+                // Pre-arm recovery so it retries on next tick
+                self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                return;
+            }
+
+            self.set_state(AppState::CatchingUp).await;
+            self.herder.set_state(henyey_herder::HerderState::Syncing);
+
+            let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
+
             tracing::info!(
                 current_ledger,
                 next_checkpoint = next_cp,
