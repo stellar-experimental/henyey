@@ -39,7 +39,6 @@ use crate::{
     flood::{compute_message_hash, FloodGate, FloodGateStats},
     flow_control::{msg_body_size, FlowControl, FlowControlConfig, ScpQueueCallback},
     peer::{Peer, PeerInfo, PeerStats, PeerStatsSnapshot},
-    peer_manager::{BackOffUpdate, PeerManager, StoredPeerType},
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
 use dashmap::DashMap;
@@ -661,8 +660,6 @@ pub struct OverlayManager {
     last_closed_ledger: Arc<AtomicU32>,
     /// Optional callback for intelligent SCP queue trimming.
     scp_callback: Option<Arc<dyn ScpQueueCallback>>,
-    /// Optional peer manager for persistent peer storage.
-    peer_manager: Option<Arc<PeerManager>>,
     /// Whether the node is tracking consensus (set by the herder/app layer).
     /// When false, the overlay may drop random peers to try new connections.
     is_tracking: Arc<AtomicBool>,
@@ -747,7 +744,6 @@ impl OverlayManager {
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             last_closed_ledger: Arc::new(AtomicU32::new(0)),
             scp_callback: None,
-            peer_manager: config.peer_manager.clone(),
             is_tracking: Arc::new(AtomicBool::new(false)),
             connection_factory,
         })
@@ -815,60 +811,6 @@ impl OverlayManager {
 
         info!("Starting overlay manager");
         self.running.store(true, Ordering::Relaxed);
-
-        // G6: Purge dead peers from the peer database on startup.
-        // Matches stellar-core OverlayManagerImpl::start() → purgeDeadPeers()
-        // which removes peers with >= REALLY_DEAD_NUM_FAILURES_CUTOFF (120) failures.
-        if let Some(ref pm) = self.peer_manager {
-            const REALLY_DEAD_NUM_FAILURES_CUTOFF: u32 = 120;
-            if let Err(e) = pm.remove_peers_with_many_failures(REALLY_DEAD_NUM_FAILURES_CUTOFF) {
-                warn!("Failed to purge dead peers: {}", e);
-            } else {
-                info!(
-                    "Purged dead peers (>= {} failures)",
-                    REALLY_DEAD_NUM_FAILURES_CUTOFF
-                );
-            }
-        }
-
-        // G5: Store known_peers and preferred_peers into the peer database on startup
-        // with a hard reset (failures=0, next_attempt=now). Matches stellar-core
-        // OverlayManagerImpl::start() → storeConfigPeers().
-        if let Some(ref pm) = self.peer_manager {
-            for addr in &self.config.known_peers {
-                if let Err(e) = pm.ensure_exists(addr) {
-                    warn!("Failed to store known peer {}: {}", addr, e);
-                    continue;
-                }
-                if let Err(e) = pm.update(
-                    addr,
-                    StoredPeerType::Outbound,
-                    false,
-                    BackOffUpdate::HardReset,
-                ) {
-                    warn!("Failed to reset known peer {}: {}", addr, e);
-                }
-            }
-            for addr in &self.config.preferred_peers {
-                if let Err(e) = pm.ensure_exists(addr) {
-                    warn!("Failed to store preferred peer {}: {}", addr, e);
-                    continue;
-                }
-                if let Err(e) = pm.update(
-                    addr,
-                    StoredPeerType::Preferred,
-                    true,
-                    BackOffUpdate::HardReset,
-                ) {
-                    warn!("Failed to reset preferred peer {}: {}", addr, e);
-                }
-            }
-            info!(
-                "Stored {} known + {} preferred config peers",
-                self.config.known_peers.len(),
-                self.config.preferred_peers.len()
-            );
-        }
 
         // Start listener if enabled
         if self.config.listen_enabled {
@@ -2903,86 +2845,6 @@ mod tests {
             !would_timeout_with_ping,
             "ping refreshes last_write, preventing idle timeout"
         );
-    }
-
-    #[tokio::test]
-    async fn test_start_purges_dead_peers_g6() {
-        // G6: On startup, purge peers with >= 120 failures from the peer database.
-        use crate::peer_manager::PeerManager;
-
-        let pm = Arc::new(PeerManager::new_in_memory());
-
-        // Create peers with varying failure counts
-        let alive_addr = PeerAddress::new("1.2.3.1", 11625);
-        let dead_addr = PeerAddress::new("1.2.3.2", 11625);
-
-        pm.ensure_exists(&alive_addr).unwrap();
-        pm.ensure_exists(&dead_addr).unwrap();
-
-        // Give dead peer 120 failures
-        for _ in 0..120 {
-            pm.update_backoff(&dead_addr, crate::peer_manager::BackOffUpdate::Increase)
-                .unwrap();
-        }
-        assert_eq!(pm.peer_count(), 2);
-
-        // Start overlay with peer manager
-        let mut config = OverlayConfig::default();
-        config.listen_enabled = false;
-        config.peer_manager = Some(Arc::clone(&pm));
-        let secret = SecretKey::generate();
-        let local_node = LocalNode::new_testnet(secret);
-        let mut manager = OverlayManager::new(config, local_node).unwrap();
-        manager.start().await.unwrap();
-
-        // Dead peer should be purged, alive peer should remain
-        assert_eq!(pm.peer_count(), 1);
-        assert!(pm.load(&alive_addr).is_some());
-        assert!(pm.load(&dead_addr).is_none());
-
-        manager.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_start_stores_config_peers_g5() {
-        // G5: On startup, store known_peers and preferred_peers into the peer
-        // database with a hard reset (failures=0, next_attempt=now).
-        use crate::peer_manager::{PeerManager, StoredPeerType};
-
-        let pm = Arc::new(PeerManager::new_in_memory());
-        assert_eq!(pm.peer_count(), 0);
-
-        let known = PeerAddress::new("1.2.3.1", 11625);
-        let preferred = PeerAddress::new("1.2.3.2", 11625);
-
-        let mut config = OverlayConfig::default();
-        config.listen_enabled = false;
-        config.known_peers = vec![known.clone()];
-        config.preferred_peers = vec![preferred.clone()];
-        config.peer_manager = Some(Arc::clone(&pm));
-
-        let secret = SecretKey::generate();
-        let local_node = LocalNode::new_testnet(secret);
-        let mut manager = OverlayManager::new(config, local_node).unwrap();
-        manager.start().await.unwrap();
-
-        // Both should be stored
-        assert_eq!(pm.peer_count(), 2);
-
-        // Known peer should be stored as Outbound with 0 failures
-        let known_record = pm.load(&known).unwrap();
-        assert_eq!(known_record.num_failures, 0);
-        assert!(
-            known_record.peer_type == StoredPeerType::Outbound
-                || known_record.peer_type == StoredPeerType::Preferred
-        );
-
-        // Preferred peer should be stored as Preferred with 0 failures
-        let preferred_record = pm.load(&preferred).unwrap();
-        assert_eq!(preferred_record.num_failures, 0);
-        assert_eq!(preferred_record.peer_type, StoredPeerType::Preferred);
-
-        manager.shutdown().await.unwrap();
     }
 
     #[test]

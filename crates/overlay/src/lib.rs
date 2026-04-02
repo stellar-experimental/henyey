@@ -227,14 +227,6 @@ pub struct OverlayConfig {
     /// If set, the overlay manager will send [`PeerEvent`] notifications
     /// when peers connect or disconnect.
     pub peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
-
-    /// Optional peer manager for persistent peer storage.
-    ///
-    /// When provided, the overlay will:
-    /// - Store `known_peers` and `preferred_peers` on startup (G5)
-    /// - Purge peers with >= 120 failures on startup (G6)
-    /// - Use stored peers for connection rotation in the tick loop
-    pub peer_manager: Option<std::sync::Arc<PeerManager>>,
 }
 
 /// Peer connection events emitted by the overlay.
@@ -275,7 +267,6 @@ impl Default for OverlayConfig {
             is_validator: true,
             version_string: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
             peer_event_tx: None,
-            peer_manager: None,
         }
     }
 }
