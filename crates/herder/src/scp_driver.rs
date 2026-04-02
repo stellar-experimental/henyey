@@ -2228,7 +2228,18 @@ impl HerderScpCallback {
 }
 
 impl SCPDriver for HerderScpCallback {
-    fn validate_value(&self, slot_index: u64, value: &Value, _nomination: bool) -> ValidationLevel {
+    fn validate_value(&self, slot_index: u64, value: &Value, nomination: bool) -> ValidationLevel {
+        // Parity: stellar-core's HerderSCPDriver::validateValue returns
+        // kFullyValidatedValue for ballot protocol (nomination=false).
+        // During the ballot protocol (PREPARE/CONFIRM/EXTERNALIZE), the
+        // value was already validated during nomination — re-validation
+        // would fail for future slots whose close times are ahead of our
+        // local state. This is critical for post-catchup convergence:
+        // EXTERNALIZE envelopes from the current network slot must be
+        // accepted without close-time or tx-set validation.
+        if !nomination {
+            return ValidationLevel::FullyValidated;
+        }
         match self.driver.validate_value_impl(slot_index, value) {
             ValueValidation::Valid => ValidationLevel::FullyValidated,
             ValueValidation::MaybeValid => ValidationLevel::MaybeValid,
