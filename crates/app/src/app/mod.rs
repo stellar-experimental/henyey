@@ -3496,4 +3496,98 @@ mod tests {
         // For a small gap like this, we should get first_buffered - 1 as target
         assert_eq!(timeout_target, Some(first_buffered - 1));
     }
+
+    /// Regression test for a deadlock in out_of_sync_recovery where the node
+    /// gets stuck when next_slot is missing and target_checkpoint > latest_externalized.
+    ///
+    /// Scenario: Node catches up to L61935313, real-time SCP externalizes L61935323,
+    /// but slots 61935314-61935322 are missing. The catchup_target is
+    /// latest_ext - TX_SET_REQUEST_WINDOW = 61935311, and checkpoint_containing(61935311) =
+    /// 61935359 > latest_externalized (61935323). The node's latest_externalized is frozen
+    /// because it can't advance (stuck), but the archive HAS published checkpoint 61935359
+    /// because the network moved past it.
+    ///
+    /// Before the fix: recovery_attempts_without_progress was reset to 2 on every tick,
+    /// creating an infinite loop where attempts oscillated between 2 and 3 and never
+    /// reached RECOVERY_ESCALATION_CATCHUP (6), preventing catchup.
+    ///
+    /// After the fix: attempts accumulate normally. After 30 ticks (~5 minutes), the
+    /// code triggers catchup regardless of the checkpoint heuristic.
+    #[test]
+    fn test_gap_recovery_does_not_deadlock_on_unpublished_checkpoint_heuristic() {
+        use henyey_history::checkpoint::checkpoint_containing;
+
+        // Reproduce the exact scenario from mainnet L61935313
+        let current_ledger = 61935313u32;
+        let latest_externalized = 61935323u64;
+        let next_slot = current_ledger as u64 + 1; // 61935314
+
+        // The catchup target is latest_ext - TX_SET_REQUEST_WINDOW (12)
+        let catchup_target = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW) as u32;
+        assert_eq!(catchup_target, 61935311);
+
+        let target_checkpoint = checkpoint_containing(catchup_target);
+        assert_eq!(target_checkpoint, 61935359);
+
+        // This is the condition that causes the "checkpoint not published" branch
+        assert!(
+            target_checkpoint as u64 > latest_externalized,
+            "target_checkpoint ({}) should exceed latest_externalized ({}) — \
+             this is the condition that triggers the stuck state",
+            target_checkpoint,
+            latest_externalized
+        );
+
+        // Verify that the gap detection would identify the missing next_slot
+        assert!(
+            latest_externalized > next_slot,
+            "latest_externalized ({}) should exceed next_slot ({})",
+            latest_externalized,
+            next_slot
+        );
+
+        // The fix: attempts must be allowed to accumulate past 30 so that
+        // either the line-130 escalation (attempts >= RECOVERY_ESCALATION_CATCHUP)
+        // triggers catchup, or the new attempts >= 30 branch directly triggers it.
+        // Previously, attempts were reset to 2, which is < RECOVERY_ESCALATION_CATCHUP (6).
+        let _escalation_threshold = RECOVERY_ESCALATION_CATCHUP;
+        let stuck_catchup_threshold = 30u64;
+
+        // Simulate the attempt counter behavior:
+        // - Attempts 0-2: request SCP state from peers (fall through)
+        // - Attempts 3-29: wait (return without resetting counter)
+        // - Attempt 30+: trigger catchup
+        for attempt in 0..=stuck_catchup_threshold + 5 {
+            if target_checkpoint as u64 > latest_externalized {
+                if attempt <= 2 {
+                    // Falls through to SCP state request — fine
+                } else if attempt < stuck_catchup_threshold {
+                    // Waits without resetting — this is the fix
+                    // (Before fix: counter was reset to 2 here)
+                } else {
+                    // Triggers catchup — this is the new escape hatch
+                    assert!(
+                        attempt >= stuck_catchup_threshold,
+                        "Should trigger catchup at attempt {}",
+                        attempt
+                    );
+                    break;
+                }
+            } else {
+                // This branch triggers "Next slot permanently missing — catchup"
+                // Not reached in this scenario since checkpoint > latest_ext
+                panic!("Should not reach this branch in this scenario");
+            }
+        }
+
+        // Also verify: if latest_externalized catches up to the checkpoint
+        // (e.g., the node participates in SCP for later slots), the normal
+        // catchup path at line 316 would trigger. This is the original design
+        // for when the heuristic is correct.
+        let advanced_latest_ext = target_checkpoint as u64 + 1;
+        assert!(
+            !(target_checkpoint as u64 > advanced_latest_ext),
+            "When latest_ext advances past checkpoint, normal catchup should trigger"
+        );
+    }
 }

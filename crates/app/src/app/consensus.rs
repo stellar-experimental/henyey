@@ -293,7 +293,14 @@ impl App {
                                  requesting SCP state from peers"
                             );
                             // Fall through to SCP state request below.
-                        } else {
+                        } else if attempts < 30 {
+                            // Wait for the checkpoint to be published. We use
+                            // latest_externalized as a proxy for "what the network
+                            // has reached", but when the node itself is stuck,
+                            // latest_externalized is frozen and the archive may
+                            // already have the checkpoint. Allow attempts to
+                            // accumulate so the escalation at line 130 can trigger
+                            // catchup after ~30 recovery ticks (~5 minutes).
                             tracing::info!(
                                 current_ledger,
                                 next_slot,
@@ -304,13 +311,33 @@ impl App {
                                  (next slot EXTERNALIZE not available from peers)",
                                 target_checkpoint,
                             );
-                            // Don't request SCP state or trigger catchup —
-                            // just return and wait for the next consensus tick.
-                            // Reset the counter so we don't escalate to catchup
-                            // (which would also fail since the checkpoint isn't
-                            // published).
-                            self.recovery_attempts_without_progress
-                                .store(2, Ordering::SeqCst);
+                            return;
+                        } else {
+                            // We've waited long enough (~30 ticks / ~5 minutes).
+                            // The archive almost certainly has the checkpoint by
+                            // now even though our local latest_externalized hasn't
+                            // advanced (because we're stuck). Try catchup — if the
+                            // archive doesn't have it yet, catchup will fail
+                            // gracefully and we'll retry.
+                            tracing::warn!(
+                                current_ledger,
+                                next_slot,
+                                target_checkpoint,
+                                latest_externalized,
+                                attempts,
+                                "Checkpoint {} assumed published (stuck for {} attempts) \
+                                 — triggering catchup to skip gap",
+                                target_checkpoint,
+                                attempts,
+                            );
+                            {
+                                let mut buffer = self.syncing_ledgers.write().await;
+                                buffer.retain(|seq, info| {
+                                    *seq > current_ledger && info.tx_set.is_some()
+                                });
+                            }
+                            self.maybe_start_externalized_catchup(latest_externalized)
+                                .await;
                             return;
                         }
                     } else {
