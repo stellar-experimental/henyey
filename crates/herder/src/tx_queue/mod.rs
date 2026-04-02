@@ -1475,23 +1475,6 @@ impl TransactionQueue {
         }
     }
 
-    /// Remove transactions that were applied in a ledger.
-    ///
-    /// Removes each transaction from `by_hash` and fully cleans up the
-    /// corresponding `account_states` entry (transaction, fees, empty entries)
-    /// so that subsequent transactions from the same source account are not
-    /// rejected with `TryAgainLater`.
-    pub fn remove_applied_by_hash(&self, tx_hashes: &[Hash256]) {
-        let mut by_hash = self.by_hash.write();
-        let mut account_states = self.account_states.write();
-        for hash in tx_hashes {
-            if let Some(removed) = by_hash.remove(hash) {
-                Self::drop_transaction(&mut account_states, &removed);
-            }
-        }
-        // Keep in seen to prevent re-adding
-    }
-
     /// Get a transaction by hash.
     pub fn get(&self, hash: &Hash256) -> Option<QueuedTransaction> {
         self.by_hash.read().get(hash).cloned()
@@ -3796,33 +3779,33 @@ mod tests {
     fn test_remove_applied() {
         let queue = TransactionQueue::with_defaults();
 
-        let tx = make_test_envelope(200, 1);
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 44);
         queue.try_add(tx.clone());
 
         let hash = full_hash(&tx);
         assert!(queue.contains(&hash));
 
-        queue.remove_applied_by_hash(&[hash]);
+        queue.remove_applied(&[(tx, 1)]);
         assert!(!queue.contains(&hash));
         assert_eq!(queue.len(), 0);
     }
 
-    /// After remove_applied_by_hash, the account_states entry must be fully
+    /// After remove_applied, the account_states entry must be fully
     /// cleaned up (transaction cleared, fees released, empty entry removed)
     /// so the account can immediately submit a new transaction.
     #[test]
-    fn test_remove_applied_by_hash_clears_account_state() {
+    fn test_remove_applied_clears_account_state() {
         let queue = TransactionQueue::with_defaults();
 
         let mut tx = make_test_envelope(200, 1);
         set_source(&mut tx, 50);
-        let hash = full_hash(&tx);
 
         assert_eq!(queue.try_add(tx.clone()), TxQueueResult::Added);
         // Verify account_state was created
         assert!(queue.account_states.read().contains_key(&account_key(&tx)));
 
-        queue.remove_applied_by_hash(&[hash]);
+        queue.remove_applied(&[(tx.clone(), 1)]);
 
         // Account state should be fully cleaned up (empty entry removed)
         assert!(
@@ -3831,18 +3814,17 @@ mod tests {
         );
     }
 
-    /// After remove_applied_by_hash, a new transaction from the same source
+    /// After remove_applied, a new transaction from the same source
     /// must be accepted (not rejected with TryAgainLater).
     #[test]
-    fn test_remove_applied_by_hash_allows_new_tx_from_same_account() {
+    fn test_remove_applied_allows_new_tx_from_same_account() {
         let queue = TransactionQueue::with_defaults();
 
         let mut tx1 = make_test_envelope(200, 1);
         set_source(&mut tx1, 60);
-        let hash1 = full_hash(&tx1);
 
-        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
-        queue.remove_applied_by_hash(&[hash1]);
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
+        queue.remove_applied(&[(tx1, 1)]);
 
         // A new tx from the same account should be accepted
         let mut tx2 = make_test_envelope(300, 1);

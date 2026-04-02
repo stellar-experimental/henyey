@@ -1793,11 +1793,6 @@ impl Herder {
         }
     }
 
-    /// Remove applied transactions from the queue.
-    pub fn remove_applied_transactions(&self, tx_hashes: &[Hash256]) {
-        self.tx_queue.remove_applied_by_hash(tx_hashes);
-    }
-
     /// Clean up old data.
     pub fn cleanup(&self) {
         // Clean up old externalized slots
