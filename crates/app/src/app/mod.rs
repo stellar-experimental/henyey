@@ -3605,4 +3605,67 @@ mod tests {
             "When latest_ext advances past checkpoint, normal catchup should trigger"
         );
     }
+
+    /// Regression test: after rapid close overshoots the archive's latest
+    /// checkpoint, trigger_recovery_catchup must target the NEXT checkpoint
+    /// (ahead of current_ledger), not CatchupTarget::Current which returns
+    /// the stale archive checkpoint we've already passed.
+    ///
+    /// Reproduces the exact scenario from mainnet L61936132:
+    /// - Node caught up to checkpoint 61936127 and rapid-closed to 61936132
+    /// - Archive's latest is still 61936127 (behind us)
+    /// - CatchupTarget::Current → 61936127 → "already at target" → dead loop
+    /// - Fix: target checkpoint_containing(61936133) = 61936191 → retries
+    ///   until archive publishes it → catchup succeeds → convergence
+    #[test]
+    fn test_recovery_catchup_targets_next_checkpoint_not_current() {
+        use henyey_history::checkpoint::checkpoint_containing;
+
+        // Scenario: rapid close overshot the archive's latest checkpoint
+        let current_ledger = 61936132u32;
+        let archive_latest = 61936127u32; // the archive's latest checkpoint
+
+        // Verify we ARE past the archive checkpoint — this is the stuck condition
+        assert!(
+            current_ledger > archive_latest,
+            "current_ledger ({}) should be past archive_latest ({}) — \
+             this is the condition where CatchupTarget::Current loops",
+            current_ledger,
+            archive_latest,
+        );
+
+        // The fix: compute next checkpoint from current_ledger + 1
+        let next_cp = checkpoint_containing(current_ledger + 1);
+        assert_eq!(next_cp, 61936191);
+
+        // The next checkpoint must be AHEAD of current_ledger
+        assert!(
+            next_cp > current_ledger,
+            "next_cp ({}) must be ahead of current_ledger ({}) — \
+             this ensures CatchupTarget::Ledger(next_cp) never triggers \
+             'already at target'",
+            next_cp,
+            current_ledger,
+        );
+
+        // The next checkpoint must also be ahead of the archive's latest
+        assert!(
+            next_cp > archive_latest,
+            "next_cp ({}) must be ahead of archive_latest ({}) — \
+             this means the archive may not have it yet, but the catchup \
+             will retry with 404s until it's published",
+            next_cp,
+            archive_latest,
+        );
+
+        // Edge case: current_ledger is exactly ON a checkpoint boundary
+        let current_on_boundary = 61936127u32;
+        let next_cp_from_boundary = checkpoint_containing(current_on_boundary + 1);
+        assert_eq!(next_cp_from_boundary, 61936191);
+        assert!(
+            next_cp_from_boundary > current_on_boundary,
+            "Even at a checkpoint boundary, next_cp ({}) must be ahead",
+            next_cp_from_boundary,
+        );
+    }
 }

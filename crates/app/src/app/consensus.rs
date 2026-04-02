@@ -741,8 +741,22 @@ impl App {
 
             let catchup_message_handle = self.start_catchup_message_caching_from_self().await;
 
+            // Target the next checkpoint boundary after our current ledger.
+            // CatchupTarget::Current returns the archive's latest checkpoint,
+            // which we may have already passed during rapid close. This creates
+            // a dead loop: recovery → catchup → "already at target" → recovery.
+            // By targeting the next checkpoint AHEAD of us, the catchup will
+            // either succeed immediately (if the archive has it) or retry with
+            // 404s until the archive publishes it — but it will never no-op.
+            let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+            tracing::info!(
+                current_ledger,
+                next_checkpoint = next_cp,
+                "Targeting next checkpoint for recovery catchup"
+            );
+
             self.set_phase(14); // 14 = catchup_running
-            let catchup_result = self.catchup(CatchupTarget::Current).await;
+            let catchup_result = self.catchup(CatchupTarget::Ledger(next_cp)).await;
             self.set_phase(5); // 5 = back in consensus_tick
 
             if let Some(handle) = catchup_message_handle {

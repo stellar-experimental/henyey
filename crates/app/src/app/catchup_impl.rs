@@ -1895,30 +1895,32 @@ impl App {
         //   - Peers have evicted EXTERNALIZE for the slots right after our LCL
         //   - The node is stuck until the next checkpoint publishes (~5 min)
         if target_checkpoint > latest_externalized as u32 {
-            // Don't have EXTERNALIZE for the next slot, and peers likely
-            // evicted it (too old). Fall through to CatchupTarget::Current
-            // which will catch up to the latest available archive checkpoint.
             tracing::info!(
                 current_ledger,
                 target,
                 target_checkpoint,
                 latest_externalized,
-                "Target checkpoint not yet published; using CatchupTarget::Current to reach latest available"
+                "Target checkpoint not yet published; will target it directly and retry"
             );
         }
 
-        // Use CatchupTarget::Current when the target checkpoint isn't published
-        // yet. This queries the archive for the latest available checkpoint,
-        // avoiding 404 errors from trying to download unpublished data.
+        // When the target checkpoint isn't published yet, target it directly
+        // with CatchupTarget::Ledger. Previously we fell back to
+        // CatchupTarget::Current, but that returns the archive's latest
+        // checkpoint — which we may have already passed during rapid close.
+        // This created a dead loop: catchup → "already at target" → retry.
+        // By targeting the future checkpoint, the download will 404 and retry
+        // until the archive publishes it, ensuring forward progress.
         let catchup_target = if target_checkpoint > latest_externalized as u32 {
             tracing::info!(
                 current_ledger,
                 latest_externalized,
                 target,
                 target_checkpoint,
-                "Starting externalized catchup (using CatchupTarget::Current — checkpoint not yet published)"
+                "Starting externalized catchup (targeting future checkpoint {})",
+                target_checkpoint,
             );
-            CatchupTarget::Current
+            CatchupTarget::Ledger(target_checkpoint)
         } else {
             tracing::info!(
                 current_ledger,
