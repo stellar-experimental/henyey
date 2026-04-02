@@ -284,20 +284,12 @@ impl HistoryManager {
     /// Download a bucket from any available archive.
     pub async fn get_bucket(&self, hash: &henyey_common::Hash256) -> Result<Vec<u8>> {
         let hash = *hash;
-        for archive in &self.archives {
-            match archive.get_bucket(&hash).await {
-                Ok(data) => return Ok(data),
-                Err(e) => {
-                    tracing::warn!(
-                        url = %archive.base_url(),
-                        hash = %hash,
-                        error = %e,
-                        "Failed to get bucket from archive"
-                    );
-                }
-            }
-        }
-        Err(HistoryError::BucketNotFound(hash))
+        self.try_archives(
+            |a| Box::pin(a.get_bucket(&hash)),
+            "get bucket",
+            HistoryError::BucketNotFound(hash),
+        )
+        .await
     }
 
     /// Get ledger headers for a checkpoint from any available archive.
