@@ -109,6 +109,9 @@ pub mod checkpoint;
 pub mod replay;
 pub mod verify;
 
+// Comparison and validation
+pub mod compare;
+
 // Publishing and external data sources
 pub mod cdp;
 pub mod checkpoint_builder;
@@ -137,6 +140,7 @@ pub use checkpoint::{
     is_checkpoint_ledger, last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at,
     ledger_to_trigger_catchup, size_of_checkpoint_containing, CHECKPOINT_FREQUENCY,
 };
+pub use compare::{compare_checkpoint, Category, CheckpointComparison, Mismatch};
 pub use download::DownloadConfig;
 pub use error::HistoryError;
 pub use paths::{

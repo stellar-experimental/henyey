@@ -776,6 +776,29 @@ enum Commands {
         #[arg(long, default_value = "10")]
         iterations: u32,
     },
+
+    /// Compare a checkpoint between two history archives
+    ///
+    /// Downloads checkpoint data (HAS, ledger headers, transactions, results)
+    /// from both archives and performs a typed, field-by-field comparison.
+    /// SCP messages are skipped (different validators produce different envelopes).
+    /// Buckets are compared by hash only (via the HAS bucket list hashes).
+    ///
+    /// Exit code 0 = match, 1 = mismatch or error.
+    #[command(name = "compare-checkpoint")]
+    CompareCheckpoint {
+        /// URL or file:// path to the local archive (the one being tested)
+        #[arg(long)]
+        local_archive: String,
+
+        /// URL or file:// path to the reference archive (e.g. SDF testnet)
+        #[arg(long)]
+        remote_archive: String,
+
+        /// Checkpoint ledger sequence to compare (must be a checkpoint boundary)
+        #[arg(long)]
+        checkpoint: u32,
+    },
 }
 
 #[tokio::main]
@@ -981,6 +1004,12 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+
+        Commands::CompareCheckpoint {
+            local_archive,
+            remote_archive,
+            checkpoint,
+        } => cmd_compare_checkpoint(&local_archive, &remote_archive, checkpoint).await,
     }
 }
 
@@ -1831,6 +1860,44 @@ async fn cmd_apply_load(
     }
 
     Ok(())
+}
+
+/// Compare a checkpoint between two history archives.
+///
+/// Downloads checkpoint data (HAS, ledger headers, transactions, results) from
+/// both archives and reports any differences. Exit code 0 = match, 1 = mismatch.
+async fn cmd_compare_checkpoint(
+    local_url: &str,
+    remote_url: &str,
+    checkpoint: u32,
+) -> anyhow::Result<()> {
+    use henyey_history::{compare_checkpoint, HistoryArchive};
+
+    println!("Comparing checkpoint {} between archives", checkpoint);
+    println!("  Local:     {}", local_url);
+    println!("  Reference: {}", remote_url);
+    println!();
+
+    let local = HistoryArchive::new(local_url)
+        .map_err(|e| anyhow::anyhow!("Failed to create local archive client: {}", e))?;
+    let reference = HistoryArchive::new(remote_url)
+        .map_err(|e| anyhow::anyhow!("Failed to create reference archive client: {}", e))?;
+
+    let result = compare_checkpoint(&local, &reference, checkpoint)
+        .await
+        .map_err(|e| anyhow::anyhow!("Comparison failed: {}", e))?;
+
+    result.print_summary();
+
+    if result.is_match() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Checkpoint {} has {} mismatch(es)",
+            checkpoint,
+            result.mismatch_count()
+        );
+    }
 }
 
 /// Force SCP command handler.

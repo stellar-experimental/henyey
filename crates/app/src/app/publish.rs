@@ -7,22 +7,29 @@ impl App {
     /// checkpoints ready to be published. For command-based archives (e.g.,
     /// local `cp`/`mkdir` archives used in quickstart local mode), this builds
     /// the checkpoint files in a temp directory and uploads them.
+    ///
+    /// Publishing runs as a background task to avoid blocking the event loop.
+    /// The `publish_in_progress` flag prevents concurrent publishes.
     pub async fn maybe_publish_history(&self) {
         // Only validators publish
         if !self.is_validator {
             return;
         }
 
+        // Don't start a new publish if one is already running in the background
+        if self.publish_in_progress.load(Ordering::SeqCst) {
+            return;
+        }
+
         // Check for writable archives with put commands
-        let command_archives: Vec<_> = self
+        let has_writable = self
             .config
             .history
             .archives
             .iter()
-            .filter(|a| a.put_enabled && a.put.is_some())
-            .collect();
+            .any(|a| a.put_enabled && a.put.is_some());
 
-        if command_archives.is_empty() {
+        if !has_writable {
             tracing::debug!(
                 total_archives = self.config.history.archives.len(),
                 "publish: no writable command archives found"
@@ -50,22 +57,57 @@ impl App {
             return;
         }
 
-        tracing::info!(checkpoint, "Publishing checkpoint to history archive");
-
-        match self
-            .publish_single_checkpoint(checkpoint, &command_archives)
-            .await
-        {
-            Ok(()) => {
-                if let Err(e) = self.db.remove_publish(checkpoint) {
-                    tracing::warn!(checkpoint, error = %e, "Failed to dequeue published checkpoint");
-                }
-                tracing::info!(checkpoint, "Checkpoint published successfully");
-            }
-            Err(e) => {
-                tracing::warn!(checkpoint, error = %e, "Failed to publish checkpoint");
-            }
+        // Try to acquire the publish lock
+        if self.publish_in_progress.swap(true, Ordering::SeqCst) {
+            return; // Another call raced us
         }
+
+        tracing::info!(
+            checkpoint,
+            "Publishing checkpoint to history archive (background)"
+        );
+
+        // Spawn the publish as a background task via self_arc to avoid
+        // blocking the event loop. Publishing involves gzip compression
+        // of XDR files and shell command execution (cp/mkdir), which can
+        // take 30-50 seconds on large checkpoints.
+        let weak = self.self_arc.read().await;
+        let app = match weak.upgrade() {
+            Some(arc) => arc,
+            None => {
+                self.publish_in_progress.store(false, Ordering::SeqCst);
+                tracing::warn!("Cannot spawn publish task: self_arc unavailable");
+                return;
+            }
+        };
+        drop(weak);
+
+        tokio::spawn(async move {
+            let command_archives: Vec<_> = app
+                .config
+                .history
+                .archives
+                .iter()
+                .filter(|a| a.put_enabled && a.put.is_some())
+                .collect();
+
+            match app
+                .publish_single_checkpoint(checkpoint, &command_archives)
+                .await
+            {
+                Ok(()) => {
+                    if let Err(e) = app.db.remove_publish(checkpoint) {
+                        tracing::warn!(checkpoint, error = %e, "Failed to dequeue published checkpoint");
+                    }
+                    tracing::info!(checkpoint, "Checkpoint published successfully");
+                }
+                Err(e) => {
+                    tracing::warn!(checkpoint, error = %e, "Failed to publish checkpoint");
+                }
+            }
+
+            app.publish_in_progress.store(false, Ordering::SeqCst);
+        });
     }
 
     /// Publish a single checkpoint to all command-based archives.

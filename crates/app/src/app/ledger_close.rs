@@ -82,15 +82,17 @@ impl App {
             );
         }
 
+        // For generalized tx sets (protocol 20+), the legacy `txSet` field
+        // uses a zeroed-out `previous_ledger_hash` with empty txs, matching
+        // stellar-core behavior. The actual generalized tx set is stored in
+        // the `ext` field (V1). stellar-core's `writeGeneralizedTxSetToStream`
+        // leaves `hist.txSet` default-initialized (all zeros).
         let tx_set_entry = match tx_set_variant {
             TransactionSetVariant::Classic(set) => set.clone(),
-            TransactionSetVariant::Generalized(set) => {
-                let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = set;
-                TransactionSet {
-                    previous_ledger_hash: set_v1.previous_ledger_hash.clone(),
-                    txs: VecM::default(),
-                }
-            }
+            TransactionSetVariant::Generalized(_) => TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: VecM::default(),
+            },
         };
         let tx_history_entry = TransactionHistoryEntry {
             ledger_seq: header.ledger_seq,

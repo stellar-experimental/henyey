@@ -350,7 +350,7 @@ impl PublishManager {
         info!(
             checkpoint = checkpoint_ledger,
             files = state.files_written,
-            "Checkpoint published successfully"
+            "Checkpoint files prepared locally"
         );
 
         Ok(state)

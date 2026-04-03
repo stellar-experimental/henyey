@@ -285,6 +285,9 @@ pub struct App {
     /// replay-only. This is triggered when a previous catchup fails with a
     /// hash mismatch (state divergence, e.g., protocol upgrade missed).
     catchup_needs_full_reset: AtomicBool,
+    /// Prevent concurrent history publish operations.
+    /// When set, a background task is publishing a checkpoint.
+    publish_in_progress: AtomicBool,
     /// Buffered externalized ledgers waiting to apply.
     syncing_ledgers: RwLock<BTreeMap<u32, henyey_herder::LedgerCloseInfo>>,
     /// Latest externalized slot we've observed (for liveness checks).
@@ -600,6 +603,7 @@ impl App {
             catchup_in_progress: AtomicBool::new(false),
             catchup_fatal_failure: AtomicBool::new(false),
             catchup_needs_full_reset: AtomicBool::new(false),
+            publish_in_progress: AtomicBool::new(false),
             syncing_ledgers: RwLock::new(BTreeMap::new()),
             last_externalized_slot: AtomicU64::new(0),
             scp_messages_sent: AtomicU64::new(0),

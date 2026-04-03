@@ -137,7 +137,22 @@ pub async fn download_with_retries(
 }
 
 /// Download a file from a URL (single attempt).
+///
+/// Supports both HTTP(S) and `file://` URLs. For `file://` URLs, reads
+/// directly from the local filesystem.
 async fn download_once(client: &Client, url: &str) -> Result<Bytes, HistoryError> {
+    // Handle file:// URLs by reading from the local filesystem.
+    if let Some(path) = url.strip_prefix("file://") {
+        let path = std::path::PathBuf::from(path);
+        match tokio::fs::read(&path).await {
+            Ok(data) => return Ok(Bytes::from(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(HistoryError::NotFound(url.to_string()));
+            }
+            Err(e) => return Err(HistoryError::Io(e)),
+        }
+    }
+
     let response = client.get(url).send().await.map_err(HistoryError::Http)?;
 
     let status = response.status();
