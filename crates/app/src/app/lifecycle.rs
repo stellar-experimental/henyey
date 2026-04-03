@@ -407,7 +407,7 @@ impl App {
                                         "EXTERNALIZE" => self.scp_externalize_sent.fetch_add(1, Ordering::Relaxed),
                                         _ => 0,
                                     };
-                                    tracing::info!(slot, peers = count, pledge_type, "Broadcast SCP envelope");
+                                    tracing::debug!(slot, peers = count, pledge_type, "Broadcast SCP envelope");
                                 }
                                 Err(e) => {
                                     tracing::warn!(slot, error = %e, pledge_type, "Failed to broadcast SCP envelope");
@@ -1042,7 +1042,7 @@ impl App {
                         // Expected, ignore
                     }
                     henyey_herder::TxQueueResult::QueueFull => {
-                        tracing::warn!("Transaction queue full, dropping transaction");
+                        // Aggregate count emitted per ledger close in Herder::ledger_closed()
                     }
                     henyey_herder::TxQueueResult::FeeTooLow => {
                         tracing::debug!("Transaction fee too low, rejected");

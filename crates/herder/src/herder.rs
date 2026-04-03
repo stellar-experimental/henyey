@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, error, info, warn};
 
 use henyey_common::Hash256;
@@ -273,6 +274,8 @@ pub struct Herder {
     quorum_tracker: RwLock<QuorumTracker>,
     /// Runtime-mutable upgrade scheduling (set via HTTP `/upgrades?mode=set`).
     runtime_upgrades: RwLock<Upgrades>,
+    /// Count of transactions dropped due to queue full since last ledger close.
+    queue_full_count: AtomicU64,
 }
 
 impl Herder {
@@ -388,6 +391,7 @@ impl Herder {
             slot_quorum_tracker: RwLock::new(slot_quorum_tracker),
             quorum_tracker: RwLock::new(quorum_tracker),
             runtime_upgrades: RwLock::new(Upgrades::default()),
+            queue_full_count: AtomicU64::new(0),
         }
     }
 
@@ -679,7 +683,7 @@ impl Herder {
         let lcl = ledger_seq as u64;
         let slot = lcl + 1;
 
-        info!("Bootstrapping Herder at ledger {}", ledger_seq);
+        debug!("Bootstrapping Herder at ledger {}", ledger_seq);
 
         // Update tracking slot
         *self.tracking_slot.write() = slot;
@@ -718,7 +722,7 @@ impl Herder {
             }
         }
 
-        info!(
+        debug!(
             lcl,
             tracking_slot = slot,
             "Herder now tracking next consensus slot"
@@ -1217,7 +1221,7 @@ impl Herder {
                 debug!("Duplicate transaction ignored");
             }
             TxQueueResult::QueueFull => {
-                warn!("Transaction queue full");
+                self.queue_full_count.fetch_add(1, Ordering::Relaxed);
             }
             TxQueueResult::FeeTooLow => {
                 debug!("Transaction fee too low");
@@ -1281,7 +1285,7 @@ impl Herder {
             starting_seq.as_ref(),
         );
 
-        info!(
+        debug!(
             hash = %tx_set.hash,
             tx_count = tx_set.len(),
             "Proposing transaction set"
@@ -1471,6 +1475,15 @@ impl Herder {
     ) {
         debug!(slot, txs = applied_txs.len(), "Ledger closed");
 
+        // Emit aggregate queue-full count for the previous ledger interval.
+        let dropped = self.queue_full_count.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            warn!(
+                slot,
+                dropped, "Transaction queue full, dropped transactions since last ledger close"
+            );
+        }
+
         // Remove applied transactions from queue (sequence-based: removes
         // any queued tx where seq <= applied seq for the same source account,
         // matching stellar-core's removeApplied behaviour).
@@ -1583,7 +1596,7 @@ impl Herder {
             starting_seq.as_ref(),
         );
 
-        info!(
+        debug!(
             hash = %tx_set.hash,
             tx_count = tx_set.transactions.len(),
             "Proposing transaction set"
