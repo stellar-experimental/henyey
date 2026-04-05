@@ -46,6 +46,9 @@ upstream/
 rust_out
 testnet.lock
 
+# Audit reports
+reports/
+
 # Claude local files
 .claude/*.local.md
 .opencode/*
