@@ -626,7 +626,15 @@ impl LedgerDelta {
         let mut has_offers = false;
         let mut has_pool_share_trustlines = false;
         let mut offer_pool_changes = Vec::new();
-        for (_key, change) in self.changes.drain() {
+
+        // Iterate using change_order for deterministic ordering.
+        // drain() on a HashMap iterates in arbitrary order, which would
+        // produce non-deterministic bucket list updates across nodes.
+        let order = std::mem::take(&mut self.change_order);
+        for key in order {
+            let Some(change) = self.changes.remove(&key) else {
+                continue;
+            };
             let entry_ref = match &change {
                 EntryChange::Created(e) | EntryChange::Deleted { previous: e } => e,
                 EntryChange::Updated { current, .. } => current,
@@ -1688,5 +1696,39 @@ mod tests {
     fn test_current_entries_empty_delta() {
         let delta = LedgerDelta::new(1);
         assert!(delta.current_entries().is_empty());
+    }
+
+    /// AUDIT-C8: drain_categorization_for_bucket_update must iterate in
+    /// deterministic (insertion) order, not arbitrary HashMap::drain() order.
+    ///
+    /// Without this, different nodes produce different bucket list entries
+    /// for the same ledger, causing consensus divergence.
+    #[test]
+    fn test_audit_c8_drain_categorization_deterministic_order() {
+        // Insert entries in a specific order
+        let mut delta = LedgerDelta::new(1);
+        for seed in [10u8, 5, 20, 1, 15, 8, 25, 3] {
+            delta.record_create(create_test_account(seed)).unwrap();
+        }
+
+        let cat = delta.drain_categorization_for_bucket_update();
+
+        // init_entries must be in insertion order (10, 5, 20, 1, 15, 8, 25, 3)
+        let seeds: Vec<u8> = cat
+            .init_entries
+            .iter()
+            .map(|e| match &e.data {
+                LedgerEntryData::Account(acc) => match &acc.account_id.0 {
+                    PublicKey::PublicKeyTypeEd25519(key) => key.0[0],
+                },
+                _ => panic!("expected account"),
+            })
+            .collect();
+
+        assert_eq!(
+            seeds,
+            vec![10, 5, 20, 1, 15, 8, 25, 3],
+            "drain_categorization_for_bucket_update must preserve insertion order"
+        );
     }
 }
