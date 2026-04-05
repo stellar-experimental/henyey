@@ -425,6 +425,14 @@ pub fn verify_inner_signatures(
 ) -> bool {
     use crate::validation::verify_signature_with_key;
 
+    // An empty signature list must not pass verification.
+    // Without this check, the for-loop below returns true by vacuous truth.
+    // stellar-core's SignatureChecker::checkSignature returns false when no
+    // signatures match any signer, regardless of neededWeight.
+    if signatures.is_empty() {
+        return false;
+    }
+
     for sig in signatures {
         // Find matching public key by hint
         let hint = &sig.hint.0;
@@ -1172,6 +1180,25 @@ mod tests {
         assert_eq!(
             result.refundable_fee_tracker().unwrap().get_fee_refund(),
             400
+        );
+    }
+
+    /// AUDIT-C7: Empty signature list must not pass verification.
+    ///
+    /// An empty signatures vec causes the for-loop in verify_inner_signatures
+    /// to never execute, returning true (vacuous truth). stellar-core's
+    /// SignatureChecker::checkSignature returns false when no signatures
+    /// match, even with neededWeight=0. Empty sigs must be rejected.
+    #[test]
+    fn test_audit_c7_empty_signatures_returns_false() {
+        let inner_hash = Hash256([42u8; 32]);
+        let signatures: &[DecoratedSignature] = &[];
+        let pk = henyey_crypto::PublicKey::from_bytes(&[1u8; 32]).unwrap();
+        let public_keys = &[pk];
+
+        assert!(
+            !verify_inner_signatures(&inner_hash, signatures, public_keys),
+            "empty signature list must not pass verification (vacuous truth bypass)"
         );
     }
 }
