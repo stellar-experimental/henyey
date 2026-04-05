@@ -719,8 +719,19 @@ impl TransactionExecutor {
             tx_meta: Some(tx_meta),
             fee_changes: Some(fee_changes),
             post_fee_changes: Some(post_fee_changes),
-            // Convert HashSet back to Vec for the return type
-            hot_archive_restored_keys: collected_hot_archive_keys.into_iter().collect(),
+            // Convert HashSet to a deterministically-ordered Vec.
+            // HashSet iteration order is arbitrary; sorting by XDR-encoded key
+            // ensures all validators produce identical hot archive bucket list
+            // updates for the same ledger.
+            hot_archive_restored_keys: {
+                let mut keys: Vec<_> = collected_hot_archive_keys.into_iter().collect();
+                keys.sort_by(|a, b| {
+                    let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
+                    let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+                    a_bytes.cmp(&b_bytes)
+                });
+                keys
+            },
             op_type_timings,
             exec_time_us: total_us,
             validation_us,
