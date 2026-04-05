@@ -8,6 +8,7 @@
 #   ./scripts/test-history-publish.sh --no-build        # skip cargo build
 #   ./scripts/test-history-publish.sh --timeout 600     # wait up to 10 min
 #   ./scripts/test-history-publish.sh --checkpoint 63   # compare specific checkpoint
+#   ./scripts/test-history-publish.sh --data-dir /tmp/x # use specific data directory
 #
 # Exit codes:
 #   0 = checkpoint matches SDF archive
@@ -24,6 +25,7 @@ DO_BUILD=true
 TIMEOUT=600        # 10 minutes max wait for first checkpoint
 CHECKPOINT=""      # auto-detect from published HAS
 KEEP_DATA=false
+DATA_DIR_OVERRIDE=""  # if set, use this instead of auto-generated path
 
 # SDF testnet reference archive
 SDF_ARCHIVE="https://history.stellar.org/prd/core-testnet/core_testnet_001"
@@ -35,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     --timeout)      TIMEOUT="$2"; shift 2 ;;
     --checkpoint)   CHECKPOINT="$2"; shift 2 ;;
     --keep-data)    KEEP_DATA=true; shift ;;
+    --data-dir)     DATA_DIR_OVERRIDE="$2"; KEEP_DATA=true; shift 2 ;;
     -h|--help)
       sed -n '3,14p' "$0" | sed 's/^# \?//'
       exit 0 ;;
@@ -42,8 +45,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# --- Data dirs (local to project root) ---
-DATA_DIR="$PROJECT_ROOT/data/publish-test-$$"
+# --- Data dirs ---
+if [[ -n "$DATA_DIR_OVERRIDE" ]]; then
+  DATA_DIR="$DATA_DIR_OVERRIDE"
+else
+  DATA_DIR="$PROJECT_ROOT/data/publish-test-$$"
+fi
 HISTORY_DIR="$DATA_DIR/history"
 DB_PATH="$DATA_DIR/validator.db"
 BUCKET_DIR="$DATA_DIR/buckets"

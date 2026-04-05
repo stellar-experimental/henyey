@@ -1,0 +1,76 @@
+name: History Publish (Testnet)
+
+on:
+  schedule:
+    # Daily at 08:00 UTC (offset from verify-execution at 06:00)
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+    inputs:
+      timeout:
+        description: "Timeout in seconds for waiting for first checkpoint"
+        required: false
+        type: string
+        default: "900"
+
+concurrency:
+  group: history-publish
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-history-publish:
+    name: Test History Publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          key: release
+
+      - name: Build (release)
+        run: cargo build --release -p henyey
+
+      - name: Run history publish integration test
+        run: |
+          TIMEOUT="${{ inputs.timeout }}"
+          TIMEOUT="${TIMEOUT:-900}"
+
+          ./scripts/test-history-publish.sh \
+            --no-build \
+            --timeout "$TIMEOUT" \
+            --data-dir "${{ runner.temp }}/publish-test"
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-publish-logs
+          path: |
+            ${{ runner.temp }}/publish-test/validator.log
+            ${{ runner.temp }}/publish-test/history/.well-known/stellar-history.json
+          retention-days: 14
+
+      - name: Summary
+        if: always()
+        run: |
+          DATA_DIR="${{ runner.temp }}/publish-test"
+          HAS_FILE="$DATA_DIR/history/.well-known/stellar-history.json"
+
+          echo "## History Publish (Testnet)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ -f "$HAS_FILE" ]]; then
+            CHECKPOINT=$(jq -r '.currentLedger' "$HAS_FILE" 2>/dev/null || echo "unknown")
+            echo "- **Checkpoint:** $CHECKPOINT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **Checkpoint:** none published" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "- **Status:** ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
