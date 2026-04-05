@@ -89,8 +89,11 @@ where
 {
     fn is_quorum_slice_inner(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
         let threshold = quorum_set.threshold as usize;
+        // threshold==0 is unsatisfiable (return false), matching stellar-core
+        // where uint32 thresholdLeft=0 never satisfies `thresholdLeft <= 0`
+        // after decrement (unsigned underflow wraps to large value).
         if threshold == 0 {
-            return true;
+            return false;
         }
 
         let mut count = 0;
@@ -1479,5 +1482,45 @@ mod tests {
         let mut nodes = HashSet::new();
         nodes.insert(make_node_id(1));
         assert!(!is_v_blocking(&qs, &nodes));
+    }
+
+    #[test]
+    fn test_audit_c2_threshold_zero_returns_false() {
+        // Regression test for AUDIT-C2: is_quorum_slice must return false
+        // when threshold==0, matching stellar-core behavior where a zero
+        // threshold makes the quorum set unsatisfiable (not vacuously true).
+        //
+        // This is reachable via normalize_quorum_set_with_remove producing
+        // threshold-0 inner sets during EXTERNALIZE.
+        let qs = ScpQuorumSet {
+            threshold: 0,
+            validators: vec![].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let nodes = HashSet::new();
+        let get_qs = |_: &NodeId| -> Option<ScpQuorumSet> { None };
+
+        // threshold==0 must be unsatisfiable (return false), not vacuously true
+        assert!(
+            !is_quorum_slice(&qs, &nodes, &get_qs),
+            "threshold==0 must return false (unsatisfiable), not true"
+        );
+
+        // Even with nodes present, threshold==0 is still unsatisfiable
+        let node1 = make_node_id(1);
+        let mut nodes_with = HashSet::new();
+        nodes_with.insert(node1.clone());
+
+        let qs_with_validator = ScpQuorumSet {
+            threshold: 0,
+            validators: vec![node1].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        assert!(
+            !is_quorum_slice(&qs_with_validator, &nodes_with, &get_qs),
+            "threshold==0 with matching validators must still return false"
+        );
     }
 }
