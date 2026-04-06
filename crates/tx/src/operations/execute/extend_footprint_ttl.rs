@@ -108,15 +108,22 @@ pub fn execute_extend_footprint_ttl(
 
         // Track read bytes and check limit
         // stellar-core: checkReadBytesResourceLimit(entrySize)
-        let entry_size = entry
-            .and_then(|e| e.to_xdr(stellar_xdr::curr::Limits::none()).ok())
-            .map(|bytes| bytes.len() as u32)
-            .unwrap_or(0);
-        accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
-        if accumulated_read_bytes > disk_read_bytes_limit {
-            return Ok(make_result(
-                ExtendFootprintTtlResultCode::ResourceLimitExceeded,
-            ));
+        //
+        // On protocol >= 23 (PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION), stellar-core's
+        // ExtendFootprintTTLParallelApplyHelper::checkReadBytesResourceLimit() always
+        // returns true — it skips the disk_read_bytes check entirely. The resource
+        // accounting is handled at the cluster level instead.
+        if context.protocol_version < 23 {
+            let entry_size = entry
+                .and_then(|e| e.to_xdr(stellar_xdr::curr::Limits::none()).ok())
+                .map(|bytes| bytes.len() as u32)
+                .unwrap_or(0);
+            accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
+            if accumulated_read_bytes > disk_read_bytes_limit {
+                return Ok(make_result(
+                    ExtendFootprintTtlResultCode::ResourceLimitExceeded,
+                ));
+            }
         }
 
         // Extend the TTL
@@ -548,6 +555,158 @@ mod tests {
                 assert!(
                     matches!(r, ExtendFootprintTtlResult::Success),
                     "Missing entry should be skipped (success), got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Regression test for VE-17 (L61997500): On protocol >= 23
+    /// (PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION), stellar-core's
+    /// ExtendFootprintTTLParallelApplyHelper::checkReadBytesResourceLimit()
+    /// always returns true — disk_read_bytes enforcement is skipped.
+    /// Our code was incorrectly enforcing it on all protocols, causing
+    /// ResourceLimitExceeded where stellar-core returned Success.
+    #[test]
+    fn test_extend_footprint_ttl_skips_disk_read_bytes_on_protocol_23_plus() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        // Protocol 25 (mainnet current) — must skip disk_read_bytes check
+        let context = LedgerContext {
+            protocol_version: 25,
+            ..LedgerContext::testnet(1, 1000)
+        };
+        let source = create_test_account_id(0);
+
+        let contract_hash = Hash([99u8; 32]);
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: contract_hash.clone(),
+        });
+
+        // Insert a contract code entry with enough bytes to exceed disk_read_bytes=1
+        let code_entry = ContractCodeEntry {
+            ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+            hash: contract_hash.clone(),
+            code: vec![0u8; 500].try_into().unwrap(),
+        };
+        state.create_contract_code(code_entry);
+
+        // Insert a TTL entry that needs extending
+        let key_hash = crate::soroban::compute_key_hash(&contract_key);
+        let ttl_entry = stellar_xdr::curr::TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: context.sequence + 10,
+        };
+        state.create_ttl(ttl_entry);
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 1000,
+        };
+
+        // disk_read_bytes = 1 — would fail on pre-23 protocol since entry > 1 byte
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 1, // Tiny limit — would fail on pre-23
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::Success),
+                    "Protocol >= 23 should skip disk_read_bytes check and succeed, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Verify that pre-23 protocol still enforces disk_read_bytes for ExtendFootprintTtl.
+    /// This is the counterpart to the VE-17 regression test above.
+    #[test]
+    fn test_extend_footprint_ttl_enforces_disk_read_bytes_on_pre_v23() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        // Protocol 22 — must enforce disk_read_bytes check
+        let context = LedgerContext {
+            protocol_version: 22,
+            ..LedgerContext::testnet(1, 1000)
+        };
+        let source = create_test_account_id(0);
+
+        let contract_hash = Hash([98u8; 32]);
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: contract_hash.clone(),
+        });
+
+        let code_entry = ContractCodeEntry {
+            ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+            hash: contract_hash.clone(),
+            code: vec![0u8; 500].try_into().unwrap(),
+        };
+        state.create_contract_code(code_entry);
+
+        let key_hash = crate::soroban::compute_key_hash(&contract_key);
+        let ttl_entry = stellar_xdr::curr::TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: context.sequence + 10,
+        };
+        state.create_ttl(ttl_entry);
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 1000,
+        };
+
+        // disk_read_bytes = 1 — entry is ~500+ bytes, should exceed limit on pre-23
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 1,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::ResourceLimitExceeded),
+                    "Protocol < 23 should enforce disk_read_bytes and reject, got {:?}",
                     r
                 );
             }
