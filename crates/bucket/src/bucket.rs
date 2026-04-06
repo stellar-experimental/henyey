@@ -474,82 +474,55 @@ impl Bucket {
             &bytes[..std::cmp::min(16, bytes.len())]
         );
 
-        // Check if the file uses XDR record marking (high bit set in first 4 bytes)
-        let uses_record_marks = if bytes.len() >= 4 {
-            bytes[0] & 0x80 != 0
-        } else {
-            false
-        };
+        // Bucket files always use XDR Record Marking Standard (RFC 5531).
+        // Each entry is prefixed with a 4-byte record mark: high bit set
+        // (last fragment) + 31-bit length. This matches stellar-core's
+        // XDRInputFileStream::readOne() which always reads record marks.
+        while offset + 4 <= bytes.len() {
+            // Read 4-byte record mark (big-endian)
+            let record_mark = u32::from_be_bytes([
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+            ]);
+            offset += 4;
 
-        if uses_record_marks {
-            debug!("Bucket file uses XDR record marking format");
+            // High bit is "last fragment" flag, remaining 31 bits are length
+            let _last_fragment = (record_mark & 0x80000000) != 0;
+            let record_len = (record_mark & 0x7FFFFFFF) as usize;
 
-            // Parse using XDR Record Marking Standard
-            while offset + 4 <= bytes.len() {
-                // Read 4-byte record mark (big-endian)
-                let record_mark = u32::from_be_bytes([
-                    bytes[offset],
-                    bytes[offset + 1],
-                    bytes[offset + 2],
-                    bytes[offset + 3],
-                ]);
-                offset += 4;
+            if offset + record_len > bytes.len() {
+                return Err(BucketError::Serialization(format!(
+                    "Record length {} exceeds remaining data {} at offset {}",
+                    record_len,
+                    bytes.len() - offset,
+                    offset - 4
+                )));
+            }
 
-                // High bit is "last fragment" flag, remaining 31 bits are length
-                let _last_fragment = (record_mark & 0x80000000) != 0;
-                let record_len = (record_mark & 0x7FFFFFFF) as usize;
-
-                if offset + record_len > bytes.len() {
-                    return Err(BucketError::Serialization(format!(
-                        "Record length {} exceeds remaining data {} at offset {}",
+            // Parse the XDR record
+            let record_data = &bytes[offset..offset + record_len];
+            match stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none()) {
+                Ok(xdr_entry) => {
+                    entries.push(xdr_entry);
+                }
+                Err(e) => {
+                    debug!(
+                        "Parse error at offset {}, record_len {}, data: {:02x?}, error: {}",
+                        offset,
                         record_len,
-                        bytes.len() - offset,
-                        offset - 4
+                        &record_data[..std::cmp::min(16, record_data.len())],
+                        e
+                    );
+                    return Err(BucketError::Serialization(format!(
+                        "Failed to parse bucket entry: {}",
+                        e
                     )));
                 }
-
-                // Parse the XDR record
-                let record_data = &bytes[offset..offset + record_len];
-                match stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none()) {
-                    Ok(xdr_entry) => {
-                        entries.push(xdr_entry);
-                    }
-                    Err(e) => {
-                        debug!(
-                            "Parse error at offset {}, record_len {}, data: {:02x?}, error: {}",
-                            offset,
-                            record_len,
-                            &record_data[..std::cmp::min(16, record_data.len())],
-                            e
-                        );
-                        return Err(BucketError::Serialization(format!(
-                            "Failed to parse bucket entry: {}",
-                            e
-                        )));
-                    }
-                }
-
-                offset += record_len;
             }
-        } else {
-            debug!("Bucket file uses raw XDR format (no record marks)");
 
-            // Parse as raw XDR stream (legacy format)
-            use stellar_xdr::curr::Limited;
-            let cursor = std::io::Cursor::new(bytes);
-            let mut limited = Limited::new(cursor, Limits::none());
-
-            while limited.inner.position() < bytes.len() as u64 {
-                match stellar_xdr::curr::BucketEntry::read_xdr(&mut limited) {
-                    Ok(xdr_entry) => {
-                        entries.push(xdr_entry);
-                    }
-                    Err(_) => {
-                        // End of stream or error
-                        break;
-                    }
-                }
-            }
+            offset += record_len;
         }
 
         debug!("Parsed {} bucket entries", entries.len());
@@ -1745,5 +1718,59 @@ mod tests {
         let iter = bucket.iter().unwrap();
         // This line verifies the type at compile time
         let _items: Vec<crate::Result<BucketEntry>> = iter.collect();
+    }
+
+    /// [AUDIT-BH1] Raw XDR fallback silently swallows parse errors.
+    ///
+    /// Construct a raw XDR byte stream with two entries where the second is
+    /// corrupt. The current buggy code enters the raw XDR fallback (because
+    /// the first byte doesn't have high bit set) and silently `break`s on
+    /// the corrupt second entry, returning only the first entry.
+    /// After the fix (always use record marks), this should error.
+    #[test]
+    fn test_audit_bh1_parse_entries_rejects_corrupt_data() {
+        // Create two valid entries as raw XDR (no record marks)
+        let entry1 = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
+        let entry2 = BucketEntry::Liveentry(make_account_entry([2u8; 32], 200));
+        let raw1 = entry1.to_xdr(Limits::none()).unwrap();
+        let raw2 = entry2.to_xdr(Limits::none()).unwrap();
+
+        // Concatenate entry1 raw XDR + truncated entry2 (corrupt)
+        let mut corrupt_stream = raw1.clone();
+        corrupt_stream.extend_from_slice(&raw2[..raw2.len() / 2]); // truncated
+
+        // The current buggy code: detects no record marks (first byte 0x00),
+        // enters raw XDR fallback, parses entry1 successfully, then hits a
+        // parse error on the truncated entry2 and silently `break`s —
+        // returning 1 entry instead of erroring.
+        let result = Bucket::parse_entries(&corrupt_stream);
+        // After fix: should error (invalid record mark or parse failure)
+        assert!(
+            result.is_err(),
+            "parse_entries should error on corrupt data, not silently return partial results"
+        );
+    }
+
+    /// [AUDIT-BH1] All bucket data must be parsed as record-marked XDR.
+    ///
+    /// Bucket files always use XDR record marks (RFC 5531). There should be
+    /// no "raw XDR" fallback path — that path silently swallows errors.
+    #[test]
+    fn test_audit_bh1_no_raw_xdr_fallback() {
+        // Serialize an entry as raw XDR (no record marks) — this is NOT a
+        // valid bucket file format. parse_entries must reject it.
+        let entry = BucketEntry::Liveentry(make_account_entry([2u8; 32], 200));
+        let raw_xdr = entry.to_xdr(Limits::none()).unwrap();
+
+        // The raw XDR for a Liveentry starts with discriminant 0x00000001,
+        // whose first byte is 0x00 (high bit clear). The current buggy code
+        // would detect this as "no record marks" and parse it via the raw
+        // XDR fallback. The fixed code should reject it because the record
+        // mark is missing/invalid.
+        let result = Bucket::parse_entries(&raw_xdr);
+        assert!(
+            result.is_err(),
+            "parse_entries should reject raw XDR without record marks"
+        );
     }
 }

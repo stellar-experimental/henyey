@@ -645,20 +645,11 @@ impl DiskBucket {
             )));
         }
 
-        // Read record mark
+        // Read record mark (RFC 5531) — bucket files always use record marks
         let mark_buf: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
-
-        let (record_len, record_start) = if mark_buf[0] & 0x80 != 0 {
-            let mark = u32::from_be_bytes(mark_buf);
-            ((mark & 0x7FFFFFFF) as usize, offset + 4)
-        } else {
-            // No record mark — try reading as raw XDR from offset
-            let xdr_entry =
-                stellar_xdr::curr::BucketEntry::from_xdr(&data[offset..], Limits::none()).map_err(
-                    |e| BucketError::Serialization(format!("Failed to parse entry: {}", e)),
-                )?;
-            return Ok(xdr_entry);
-        };
+        let mark = u32::from_be_bytes(mark_buf);
+        let record_len = (mark & 0x7FFFFFFF) as usize;
+        let record_start = offset + 4;
 
         if record_start + record_len > data.len() {
             return Err(BucketError::Io(std::io::Error::new(
@@ -738,25 +729,13 @@ impl DiskBucket {
     pub fn iter(&self) -> Result<DiskBucketIter> {
         let file = File::open(&self.file_path)?;
         let file_len = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
+        let reader = BufReader::new(file);
 
-        // Check if file uses XDR record marks by reading the first 4 bytes
-        let uses_record_marks = if file_len >= 4 {
-            let mut mark_buf = [0u8; 4];
-            reader.read_exact(&mut mark_buf)?;
-            let has_marks = mark_buf[0] & 0x80 != 0;
-            // Seek back to the start
-            reader.seek(SeekFrom::Start(0))?;
-            has_marks
-        } else {
-            false
-        };
-
+        // Bucket files always use XDR record marks (RFC 5531).
         Ok(DiskBucketIter {
             reader,
             file_len,
             position: 0,
-            uses_record_marks,
         })
     }
 
@@ -824,8 +803,6 @@ pub struct DiskBucketIter {
     file_len: u64,
     /// Current byte position in the file.
     position: u64,
-    /// Whether the file uses XDR record marks (vs raw XDR stream).
-    uses_record_marks: bool,
 }
 
 impl Iterator for DiskBucketIter {
@@ -836,63 +813,38 @@ impl Iterator for DiskBucketIter {
             return None;
         }
 
-        if self.uses_record_marks {
-            if self.position + 4 > self.file_len {
-                return None;
-            }
+        // Bucket files always use XDR record marks (RFC 5531).
+        if self.position + 4 > self.file_len {
+            return None;
+        }
 
-            // Read 4-byte record mark
-            let mut mark_buf = [0u8; 4];
-            if let Err(e) = self.reader.read_exact(&mut mark_buf) {
-                return Some(Err(BucketError::Io(e)));
-            }
-            self.position += 4;
+        // Read 4-byte record mark
+        let mut mark_buf = [0u8; 4];
+        if let Err(e) = self.reader.read_exact(&mut mark_buf) {
+            return Some(Err(BucketError::Io(e)));
+        }
+        self.position += 4;
 
-            let record_mark = u32::from_be_bytes(mark_buf);
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+        let record_mark = u32::from_be_bytes(mark_buf);
+        let record_len = (record_mark & 0x7FFFFFFF) as usize;
 
-            if self.position + record_len as u64 > self.file_len {
-                return None;
-            }
+        if self.position + record_len as u64 > self.file_len {
+            return None;
+        }
 
-            // Read the entry data
-            let mut record_data = vec![0u8; record_len];
-            if let Err(e) = self.reader.read_exact(&mut record_data) {
-                return Some(Err(BucketError::Io(e)));
-            }
-            self.position += record_len as u64;
+        // Read the entry data
+        let mut record_data = vec![0u8; record_len];
+        if let Err(e) = self.reader.read_exact(&mut record_data) {
+            return Some(Err(BucketError::Io(e)));
+        }
+        self.position += record_len as u64;
 
-            match stellar_xdr::curr::BucketEntry::from_xdr(&record_data, Limits::none()) {
-                Ok(xdr_entry) => Some(Ok(xdr_entry)),
-                Err(e) => Some(Err(BucketError::Serialization(format!(
-                    "Failed to parse: {}",
-                    e
-                )))),
-            }
-        } else {
-            use stellar_xdr::curr::{Limited, ReadXdr};
-            // For raw XDR format, use the XDR streaming reader.
-            // Note: For raw XDR (no record marks), EOF is signaled by a read
-            // error (UnexpectedEof). We distinguish this from real errors by
-            // checking the error kind.
-            let mut limited = Limited::new(&mut self.reader, Limits::none());
-
-            match stellar_xdr::curr::BucketEntry::read_xdr(&mut limited) {
-                Ok(xdr_entry) => {
-                    // Update our position tracking
-                    self.position = self.reader.stream_position().unwrap_or(self.file_len);
-                    Some(Ok(xdr_entry))
-                }
-                Err(stellar_xdr::curr::Error::Io(ref io_err))
-                    if io_err.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    // Clean EOF — end of raw XDR stream
-                    None
-                }
-                Err(e) => Some(Err(BucketError::Serialization(format!(
-                    "Failed to parse raw XDR bucket entry: {e}"
-                )))),
-            }
+        match stellar_xdr::curr::BucketEntry::from_xdr(&record_data, Limits::none()) {
+            Ok(xdr_entry) => Some(Ok(xdr_entry)),
+            Err(e) => Some(Err(BucketError::Serialization(format!(
+                "Failed to parse: {}",
+                e
+            )))),
         }
     }
 }
