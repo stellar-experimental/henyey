@@ -239,17 +239,13 @@ fn split_signers_by_type(signers: &[Signer]) -> HashMap<SignerKeyType, Vec<Signe
 
 /// Verify a HASH_X signature.
 ///
-/// The signature should be a 32-byte preimage whose SHA-256 hash equals
-/// the signer key's hash.
+/// The signature is a variable-length preimage (up to XDR Signature<64> limit)
+/// whose SHA-256 hash must equal the signer key's hash. Matches stellar-core's
+/// verifyHashX which accepts any preimage length.
 fn verify_hash_x(sig: &DecoratedSignature, signer: &Signer) -> bool {
     let SignerKey::HashX(expected_hash) = &signer.key else {
         return false;
     };
-
-    // HashX signature must be exactly 32 bytes (the preimage)
-    if sig.signature.0.len() != 32 {
-        return false;
-    }
 
     // Check hint matches last 4 bytes of expected hash
     let expected_hint = [
@@ -719,6 +715,71 @@ mod tests {
         // No signatures means threshold can't be met
         assert!(!checker.check_signature(&signers, 10));
         assert!(checker.check_all_signatures_used()); // No signatures to use
+    }
+
+    /// Test that Hash-X accepts variable-length preimages (not just 32 bytes).
+    /// Regression test for AUDIT-723: verify_hash_x rejected valid non-32-byte
+    /// preimages with a hard 32-byte length check. Stellar-core accepts any
+    /// preimage length (up to XDR Signature<64> limit) as long as SHA-256(preimage)
+    /// matches the signer key hash.
+    #[test]
+    fn test_audit_723_hash_x_accepts_variable_length_preimage() {
+        // Use a 16-byte preimage (shorter than 32)
+        let short_preimage = vec![0xAA; 16];
+        let hash_of_short = Hash256::hash(&short_preimage);
+
+        let sig = DecoratedSignature {
+            hint: SignatureHint([
+                hash_of_short.0[28],
+                hash_of_short.0[29],
+                hash_of_short.0[30],
+                hash_of_short.0[31],
+            ]),
+            signature: XdrSignature(short_preimage.try_into().unwrap()),
+        };
+        let signatures = vec![sig];
+
+        let signer = Signer {
+            key: SignerKey::HashX(Uint256(hash_of_short.0)),
+            weight: 10,
+        };
+        let signers = vec![signer];
+
+        let tx_hash = create_test_hash();
+        let mut checker = SignatureChecker::new(tx_hash, &signatures);
+
+        // A 16-byte preimage with correct hash should be accepted
+        assert!(
+            checker.check_signature(&signers, 10),
+            "Hash-X should accept variable-length preimages"
+        );
+
+        // Also test a 64-byte preimage (maximum XDR Signature length)
+        let long_preimage = vec![0xBB; 64];
+        let hash_of_long = Hash256::hash(&long_preimage);
+
+        let sig2 = DecoratedSignature {
+            hint: SignatureHint([
+                hash_of_long.0[28],
+                hash_of_long.0[29],
+                hash_of_long.0[30],
+                hash_of_long.0[31],
+            ]),
+            signature: XdrSignature(long_preimage.try_into().unwrap()),
+        };
+        let signatures2 = vec![sig2];
+
+        let signer2 = Signer {
+            key: SignerKey::HashX(Uint256(hash_of_long.0)),
+            weight: 10,
+        };
+        let signers2 = vec![signer2];
+
+        let mut checker2 = SignatureChecker::new(tx_hash, &signatures2);
+        assert!(
+            checker2.check_signature(&signers2, 10),
+            "Hash-X should accept 64-byte preimages"
+        );
     }
 
     /// Test pre_auth_tx signer doesn't match wrong hash.
