@@ -365,14 +365,9 @@ pub fn parse_xdr_stream_auto<T: ReadXdr>(data: &[u8]) -> Result<Vec<T>, HistoryE
         return Ok(Vec::new());
     }
 
-    // Check if the file uses XDR record marking (high bit set in first 4 bytes)
-    let uses_record_marks = data.len() >= 4 && (data[0] & 0x80) != 0;
-
-    if uses_record_marks {
-        parse_record_marked_xdr_stream(data)
-    } else {
-        parse_xdr_stream(data)
-    }
+    // History/bucket files always use XDR record marks (RFC 5531).
+    // No format detection needed — always parse with record marks.
+    parse_record_marked_xdr_stream(data)
 }
 
 /// Download and decompress a gzipped file.
