@@ -293,9 +293,10 @@ impl QuorumSetConfig {
             return None;
         }
 
-        // Calculate threshold from percentage
-        let total = validators.len() + inner_sets.len();
-        let threshold = ((total as u32 * self.threshold_percent) / 100).max(1);
+        // Calculate threshold from percentage using ceiling division.
+        // Matches stellar-core: 1 + ((total * percent - 1) / 100)
+        let total = validators.len() as u32 + inner_sets.len() as u32;
+        let threshold = 1 + (total * self.threshold_percent - 1) / 100;
 
         let mut quorum_set = ScpQuorumSet {
             threshold,

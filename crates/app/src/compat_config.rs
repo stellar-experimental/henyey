@@ -787,6 +787,41 @@ mod tests {
     }
 
     #[test]
+    fn test_quorum_threshold_ceiling_division() {
+        // Verify threshold uses ceiling division matching stellar-core:
+        //   1 + ((total * percent - 1) / 100)
+        // With 3 validators and 51%: ceil(3*0.51) = 2
+        // Floor division would give: (3*51)/100 = 1 — WRONG
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let key2 = henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey();
+        let key3 = henyey_crypto::SecretKey::from_seed(&[3u8; 32])
+            .public_key()
+            .to_strkey();
+
+        let qs = crate::config::QuorumSetConfig {
+            threshold_percent: 51,
+            validators: vec![key1, key2, key3],
+            inner_sets: vec![],
+        };
+        let xdr = qs.to_xdr().unwrap();
+        assert_eq!(xdr.threshold, 2, "ceil(3 * 51 / 100) should be 2, not 1");
+
+        // Also verify 67% with 3 validators: ceil(2.01) = 3
+        // stellar-core: 1 + (3*67-1)/100 = 1 + 200/100 = 1 + 2 = 3
+        let qs67 = crate::config::QuorumSetConfig {
+            threshold_percent: 67,
+            validators: qs.validators.clone(),
+            inner_sets: vec![],
+        };
+        let xdr67 = qs67.to_xdr().unwrap();
+        assert_eq!(xdr67.threshold, 3, "ceil(3 * 67 / 100) should be 3, not 2");
+    }
+
+    #[test]
     fn test_preferred_upgrade_protocol_version() {
         let core_toml: toml::Value = toml::from_str(
             r#"
