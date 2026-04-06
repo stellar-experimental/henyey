@@ -60,6 +60,12 @@ use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace};
 
+/// Maximum number of known peer addresses kept in memory.
+///
+/// Matches the batch size used by `load_random_peers` from the database (1000).
+/// Prevents unbounded growth from PEERS messages sent by remote nodes.
+const MAX_KNOWN_PEERS: usize = 1000;
+
 /// An overlay message received from a peer, ready for dispatch to subscribers.
 #[derive(Clone)]
 pub struct OverlayMessage {
@@ -965,7 +971,7 @@ impl OverlayManager {
 
     pub(super) fn add_known_peer(&self, addr: PeerAddress) -> bool {
         let mut known = self.known_peers.write();
-        if known.contains(&addr) {
+        if known.len() >= MAX_KNOWN_PEERS || known.contains(&addr) {
             return false;
         }
         known.push(addr);
@@ -1148,5 +1154,49 @@ mod tests {
         manager.clear_ledgers_below(0, 0);
         manager.clear_ledgers_below(100, 50);
         manager.clear_ledgers_below(u32::MAX, u32::MAX);
+    }
+
+    /// Regression test for AUDIT-H13: known_peers must be capped at MAX_KNOWN_PEERS.
+    #[test]
+    fn test_known_peers_cap() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        // Add MAX_KNOWN_PEERS unique addresses — all should be accepted.
+        for i in 0..MAX_KNOWN_PEERS {
+            let port = (i % 65534 + 1) as u16;
+            let host = format!("10.{}.{}.{}", (i >> 16) & 0xFF, (i >> 8) & 0xFF, i & 0xFF);
+            let addr = PeerAddress::new(&host, port);
+            assert!(
+                manager.add_known_peer(addr),
+                "peer {i} should be accepted (under cap)"
+            );
+        }
+        assert_eq!(manager.known_peers().len(), MAX_KNOWN_PEERS);
+
+        // One more should be rejected.
+        let extra = PeerAddress::new("192.168.1.1", 9999);
+        assert!(
+            !manager.add_known_peer(extra),
+            "should reject when at MAX_KNOWN_PEERS"
+        );
+        assert_eq!(manager.known_peers().len(), MAX_KNOWN_PEERS);
+    }
+
+    /// Verify deduplication still works.
+    #[test]
+    fn test_known_peers_dedup() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let addr = PeerAddress::new("10.0.0.1", 11625);
+        assert!(manager.add_known_peer(addr.clone()));
+        assert!(!manager.add_known_peer(addr));
     }
 }

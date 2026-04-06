@@ -298,6 +298,9 @@ impl OverlayManager {
                 {
                     let mut kp = known_peers.write();
                     for addr in &result.known {
+                        if kp.len() >= super::MAX_KNOWN_PEERS {
+                            break;
+                        }
                         if !kp
                             .iter()
                             .any(|p| p.host == addr.host && p.port == addr.port)
