@@ -109,7 +109,22 @@ pub fn build_tx_result_pair(
     };
     let op_results: Vec<OperationResult> = exec.operation_results.clone();
 
-    let result = if frame.is_fee_bump() {
+    let result = if frame.is_fee_bump() && exec.fee_bump_outer_failure {
+        // Fee-bump outer-wrapper failure: emit a top-level result code without
+        // an InnerTransactionResultPair. Matches stellar-core's setError()
+        // behavior in FeeBumpTransactionFrame::commonValid/commonValidPreSeqNum.
+        let result = if let Some(failure) = &exec.failure {
+            failure_code_to_result(failure)
+        } else {
+            TransactionResultResult::TxFailed(Vec::new().try_into().unwrap())
+        };
+        TransactionResult {
+            fee_charged: exec.fee_charged,
+            result,
+            ext: TransactionResultExt::V0,
+        }
+    } else if frame.is_fee_bump() {
+        // Fee-bump inner failure or success: wrap in InnerTransactionResultPair.
         let inner_hash = fee_bump_inner_hash(frame, network_id)?;
         let inner_result = if exec.success {
             InnerTransactionResultResult::TxSuccess(

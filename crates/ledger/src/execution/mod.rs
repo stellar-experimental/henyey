@@ -385,6 +385,11 @@ pub struct TransactionExecutionResult {
     pub meta_build_phase_us: u64,
     /// Cached transaction hash (computed during validation, reused in result building).
     pub tx_hash: Option<Hash256>,
+    /// Whether this is a fee-bump outer-wrapper failure (e.g. fee source missing,
+    /// insufficient fee). When true, the failure should be serialized as a top-level
+    /// result code, not wrapped in TxFeeBumpInnerFailed. Matches stellar-core's
+    /// distinction between setError (outer) and setInnermostError (inner).
+    pub fee_bump_outer_failure: bool,
 }
 
 /// Type alias: `ExecutionFailure` is now `TransactionResultCode` from the XDR crate.
@@ -429,6 +434,7 @@ pub(super) fn failed_result(
         signer_removal_us: 0,
         seq_bump_us: 0,
         tx_hash: None,
+        fee_bump_outer_failure: false,
     }
 }
 
@@ -2184,6 +2190,9 @@ impl TransactionExecutor {
             signer_removal_us: pre.signer_removal_us,
             seq_bump_us: pre.seq_bump_us,
             tx_hash: pre.tx_hash,
+            // TxInsufficientBalance from fee deduction is an outer failure for
+            // fee-bump transactions (stellar-core's commonValid → setError).
+            fee_bump_outer_failure: pre.frame.is_fee_bump(),
         }
     }
 

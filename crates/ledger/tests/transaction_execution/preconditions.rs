@@ -588,6 +588,7 @@ fn test_fee_bump_result_encoding() {
         meta_fee_refund_us: 0,
         meta_build_phase_us: 0,
         tx_hash: None,
+        fee_bump_outer_failure: false,
     };
 
     let pair = build_tx_result_pair(
@@ -602,6 +603,102 @@ fn test_fee_bump_result_encoding() {
     match pair.result.result {
         TransactionResultResult::TxFeeBumpInnerSuccess(InnerTransactionResultPair { .. }) => {}
         other => panic!("unexpected fee bump result: {:?}", other),
+    }
+}
+
+/// Fee-bump outer-wrapper failures (e.g. fee source missing) must produce
+/// a top-level result code, not TxFeeBumpInnerFailed. Matches stellar-core's
+/// setError() behavior in FeeBumpTransactionFrame::commonValid.
+#[test]
+fn test_audit_574_fee_bump_outer_failure_is_top_level() {
+    let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    let inner_tx = Transaction {
+        source_account: source.clone(),
+        fee: 100,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let inner_env = TransactionV1Envelope {
+        tx: inner_tx,
+        signatures: VecM::default(),
+    };
+
+    let fee_bump = FeeBumpTransaction {
+        fee_source: source,
+        fee: 200,
+        inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+        ext: stellar_xdr::curr::FeeBumpTransactionExt::V0,
+    };
+
+    let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+        tx: fee_bump,
+        signatures: VecM::default(),
+    });
+
+    // Simulate a fee-bump outer failure (e.g. fee source account not found)
+    let exec = henyey_ledger::execution::TransactionExecutionResult {
+        success: false,
+        fee_charged: 0,
+        fee_refund: 0,
+        operation_results: vec![],
+        error: Some("Fee source account not found".into()),
+        failure: Some(TransactionResultCode::TxNoAccount),
+        tx_meta: None,
+        fee_changes: None,
+        post_fee_changes: None,
+        hot_archive_restored_keys: vec![],
+        op_type_timings: std::collections::HashMap::new(),
+        exec_time_us: 0,
+        validation_us: 0,
+        fee_seq_us: 0,
+        footprint_us: 0,
+        ops_us: 0,
+        meta_build_us: 0,
+        val_account_load_us: 0,
+        val_tx_hash_us: 0,
+        val_ed25519_us: 0,
+        val_other_us: 0,
+        fee_deduct_us: 0,
+        op_sig_check_us: 0,
+        signer_removal_us: 0,
+        seq_bump_us: 0,
+        meta_commit_us: 0,
+        meta_fee_refund_us: 0,
+        meta_build_phase_us: 0,
+        tx_hash: None,
+        fee_bump_outer_failure: true,
+    };
+
+    let pair = build_tx_result_pair(
+        &henyey_tx::TransactionFrame::from_owned_with_network(envelope, NetworkId::testnet()),
+        &NetworkId::testnet(),
+        &exec,
+        100,
+        24,
+    )
+    .expect("build tx result");
+
+    // Must be a top-level TxNoAccount, NOT TxFeeBumpInnerFailed
+    match pair.result.result {
+        TransactionResultResult::TxNoAccount => {}
+        TransactionResultResult::TxFeeBumpInnerFailed(_) => {
+            panic!("Fee-bump outer failure should NOT be wrapped as TxFeeBumpInnerFailed")
+        }
+        other => panic!("expected TxNoAccount, got {:?}", other),
     }
 }
 

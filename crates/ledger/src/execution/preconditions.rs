@@ -44,6 +44,18 @@ impl TransactionExecutor {
             result: failed_result(failure, error),
             past_seq_check: true,
         };
+        // Helper for fee-bump outer-wrapper failures. In stellar-core, these are
+        // emitted via setError() (not setInnermostError()), producing a top-level
+        // result code without an InnerTransactionResultPair wrapper.
+        let is_fee_bump = frame.is_fee_bump();
+        let fee_bump_outer_fail = |failure, error| {
+            let mut result = failed_result(failure, error);
+            result.fee_bump_outer_failure = true;
+            ValidationFailure {
+                result,
+                past_seq_check: false,
+            }
+        };
 
         // Phase 1: Structure validation
         if !frame.is_valid_structure() {
@@ -52,16 +64,31 @@ impl TransactionExecutor {
             } else {
                 TransactionResultCode::TxMalformed
             };
-            return Ok(Err(pre_seq_fail(failure, "Invalid transaction structure")));
+            return Ok(Err(if is_fee_bump {
+                fee_bump_outer_fail(failure, "Invalid transaction structure")
+            } else {
+                pre_seq_fail(failure, "Invalid transaction structure")
+            }));
         }
 
         // Phase 2: Account loading
+        // Fee source account not found is an outer failure for fee-bump (stellar-core's
+        // FeeBumpTransactionFrame::commonValidPreSeqNum → setError(txNO_ACCOUNT)).
+        // Inner source account not found is an inner failure (stellar-core's
+        // TransactionFrame::commonValid → setInnermostError via checkValidWithOptionallyChargedFee).
         let acct_load_start = std::time::Instant::now();
         if !self.load_account(snapshot, &fee_source_id)? {
-            return Ok(Err(pre_seq_fail(
-                TransactionResultCode::TxNoAccount,
-                "Source account not found",
-            )));
+            return Ok(Err(if is_fee_bump {
+                fee_bump_outer_fail(
+                    TransactionResultCode::TxNoAccount,
+                    "Fee source account not found",
+                )
+            } else {
+                pre_seq_fail(
+                    TransactionResultCode::TxNoAccount,
+                    "Source account not found",
+                )
+            }));
         }
         if !self.load_account(snapshot, &inner_source_id)? {
             return Ok(Err(pre_seq_fail(
@@ -73,10 +100,17 @@ impl TransactionExecutor {
         let fee_source_account = match self.state.get_account(&fee_source_id) {
             Some(acc) => acc.clone(),
             None => {
-                return Ok(Err(pre_seq_fail(
-                    TransactionResultCode::TxNoAccount,
-                    "Source account not found",
-                )))
+                return Ok(Err(if is_fee_bump {
+                    fee_bump_outer_fail(
+                        TransactionResultCode::TxNoAccount,
+                        "Fee source account not found",
+                    )
+                } else {
+                    pre_seq_fail(
+                        TransactionResultCode::TxNoAccount,
+                        "Source account not found",
+                    )
+                }))
             }
         };
         let source_account = match self.state.get_account(&inner_source_id) {
@@ -98,7 +132,7 @@ impl TransactionExecutor {
             let outer_inclusion_fee = frame.inclusion_fee();
 
             if outer_inclusion_fee < outer_min_inclusion_fee {
-                return Ok(Err(pre_seq_fail(
+                return Ok(Err(fee_bump_outer_fail(
                     TransactionResultCode::TxInsufficientFee,
                     "Insufficient fee",
                 )));
@@ -121,7 +155,7 @@ impl TransactionExecutor {
                 let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
                 let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
                 if v1 < v2 {
-                    return Ok(Err(pre_seq_fail(
+                    return Ok(Err(fee_bump_outer_fail(
                         TransactionResultCode::TxInsufficientFee,
                         "Insufficient fee",
                     )));
@@ -129,7 +163,7 @@ impl TransactionExecutor {
             } else {
                 let allow_negative_inner = inner_is_soroban;
                 if !allow_negative_inner {
-                    return Ok(Err(pre_seq_fail(
+                    return Ok(Err(fee_bump_outer_fail(
                         TransactionResultCode::TxFailed,
                         "Fee bump inner transaction invalid",
                     )));
@@ -286,10 +320,20 @@ impl TransactionExecutor {
         // Phase 6: Signature validation
         let sig_start = std::time::Instant::now();
         if validation::validate_signatures(&frame, &validation_ctx).is_err() {
-            return Ok(Err(post_seq_fail(
-                TransactionResultCode::TxBadAuth,
-                "Invalid signature",
-            )));
+            if is_fee_bump {
+                let mut result =
+                    failed_result(TransactionResultCode::TxBadAuth, "Invalid signature");
+                result.fee_bump_outer_failure = true;
+                return Ok(Err(ValidationFailure {
+                    result,
+                    past_seq_check: true,
+                }));
+            } else {
+                return Ok(Err(post_seq_fail(
+                    TransactionResultCode::TxBadAuth,
+                    "Invalid signature",
+                )));
+            }
         }
 
         let hash_start = std::time::Instant::now();
@@ -307,10 +351,22 @@ impl TransactionExecutor {
             outer_threshold,
         ) {
             tracing::debug!("Signature check failed: fee_source outer check");
-            return Ok(Err(post_seq_fail(
-                TransactionResultCode::TxBadAuth,
-                "Invalid signature",
-            )));
+            if is_fee_bump {
+                // Fee-bump outer signature failure: stellar-core's
+                // FeeBumpTransactionFrame::commonValid → setError(txBAD_AUTH).
+                let mut result =
+                    failed_result(TransactionResultCode::TxBadAuth, "Invalid signature");
+                result.fee_bump_outer_failure = true;
+                return Ok(Err(ValidationFailure {
+                    result,
+                    past_seq_check: true,
+                }));
+            } else {
+                return Ok(Err(post_seq_fail(
+                    TransactionResultCode::TxBadAuth,
+                    "Invalid signature",
+                )));
+            }
         }
 
         // NOTE: For fee-bump transactions, we deliberately do NOT check the inner

@@ -36,8 +36,8 @@ use stellar_xdr::curr::{
     SignatureHint, Signer, SignerKey, SorobanResources, SorobanTransactionData,
     SorobanTransactionDataExt, SponsorshipDescriptor, String32, StringM, Thresholds, TimeBounds,
     TimePoint, Transaction, TransactionEnvelope, TransactionEventStage, TransactionExt,
-    TransactionMeta, TransactionResultResult, TransactionV1Envelope, TrustLineAsset,
-    TrustLineEntry, TrustLineEntryExt, TrustLineFlags, TtlEntry, Uint256, VecM,
+    TransactionMeta, TransactionResultCode, TransactionResultResult, TransactionV1Envelope,
+    TrustLineAsset, TrustLineEntry, TrustLineEntryExt, TrustLineFlags, TtlEntry, Uint256, VecM,
 };
 
 fn create_account_entry_with_last_modified(

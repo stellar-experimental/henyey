@@ -751,6 +751,7 @@ impl TransactionExecutor {
             signer_removal_us,
             seq_bump_us,
             tx_hash,
+            fee_bump_outer_failure: false,
         })
     }
 
