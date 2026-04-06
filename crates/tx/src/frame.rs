@@ -183,12 +183,7 @@ impl TransactionFrame {
                 return Ok(*cached_hash);
             }
         }
-        // Compute fresh
-        let payload = self.signature_payload(network_id)?;
-        let bytes = payload
-            .to_xdr(Limits::none())
-            .map_err(|e| TxError::Internal(format!("XDR serialization failed: {}", e)))?;
-        let hash = sha256(&bytes);
+        let hash = Self::hash_envelope(&self.envelope, network_id)?;
         // Cache (best-effort; if already set by a prior call, that's fine)
         let _ = self.cached_hash.set((*network_id, hash));
         Ok(hash)
@@ -204,13 +199,33 @@ impl TransactionFrame {
         self.hash(network_id)
     }
 
-    /// Create the signature payload for signing/verification.
-    fn signature_payload(&self, network_id: &NetworkId) -> Result<TransactionSignaturePayload> {
-        let tagged_tx = match &*self.envelope {
+    /// Compute the transaction hash directly from an envelope reference.
+    ///
+    /// This avoids cloning the entire envelope when only the hash is needed
+    /// (e.g., for signing). Only the inner transaction is cloned for the
+    /// signature payload, not the signatures.
+    pub fn hash_envelope(
+        envelope: &TransactionEnvelope,
+        network_id: &NetworkId,
+    ) -> Result<Hash256> {
+        let tagged_tx = match envelope {
             TransactionEnvelope::TxV0(env) => {
-                // Convert V0 to V1 for signature payload
-                let tx = self.v0_to_v1_transaction(&env.tx)?;
-                TransactionSignaturePayloadTaggedTransaction::Tx(tx)
+                // V0 → V1 conversion for signature payload (mirrors v0_to_v1_transaction)
+                let source_account = MuxedAccount::Ed25519(env.tx.source_account_ed25519.clone());
+                let cond = match &env.tx.time_bounds {
+                    Some(tb) => Preconditions::Time(tb.clone()),
+                    None => Preconditions::None,
+                };
+                let v1_tx = Transaction {
+                    source_account,
+                    fee: env.tx.fee,
+                    seq_num: env.tx.seq_num.clone(),
+                    cond,
+                    memo: env.tx.memo.clone(),
+                    operations: env.tx.operations.clone(),
+                    ext: TransactionExt::V0,
+                };
+                TransactionSignaturePayloadTaggedTransaction::Tx(v1_tx)
             }
             TransactionEnvelope::Tx(env) => {
                 TransactionSignaturePayloadTaggedTransaction::Tx(env.tx.clone())
@@ -219,36 +234,14 @@ impl TransactionFrame {
                 TransactionSignaturePayloadTaggedTransaction::TxFeeBump(env.tx.clone())
             }
         };
-
-        Ok(TransactionSignaturePayload {
+        let payload = TransactionSignaturePayload {
             network_id: Hash(network_id.0 .0),
             tagged_transaction: tagged_tx,
-        })
-    }
-
-    /// Convert a V0 transaction to V1 (needed for signature payload).
-    fn v0_to_v1_transaction(&self, v0: &stellar_xdr::curr::TransactionV0) -> Result<Transaction> {
-        // V0 stores raw public key bytes, V1 uses MuxedAccount
-        let source_account = MuxedAccount::Ed25519(v0.source_account_ed25519.clone());
-
-        // Map V0 time_bounds to V1 Preconditions to preserve them in the
-        // signature payload.  stellar-core hashes V0 transactions directly
-        // (including time bounds); dropping them here would produce a
-        // different hash and break signature verification.
-        let cond = match &v0.time_bounds {
-            Some(tb) => Preconditions::Time(tb.clone()),
-            None => Preconditions::None,
         };
-
-        Ok(Transaction {
-            source_account,
-            fee: v0.fee,
-            seq_num: v0.seq_num.clone(),
-            cond,
-            memo: v0.memo.clone(),
-            operations: v0.operations.clone(),
-            ext: TransactionExt::V0,
-        })
+        let bytes = payload
+            .to_xdr(Limits::none())
+            .map_err(|e| TxError::Internal(format!("XDR serialization failed: {}", e)))?;
+        Ok(sha256(&bytes))
     }
 
     /// Get the source account.

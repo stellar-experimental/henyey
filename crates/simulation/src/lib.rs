@@ -258,10 +258,9 @@ impl Simulation {
         self.overlay_connection_factory = Some(Arc::clone(&overlay_connection_factory));
 
         for id in ids {
-            let mut spec = self
+            let spec = self
                 .app_specs
-                .get(&id)
-                .cloned()
+                .get_mut(&id)
                 .with_context(|| format!("missing app spec for {}", id))?;
 
             let data_dir = spec.data_dir.clone().unwrap_or_else(|| {
@@ -269,7 +268,9 @@ impl Simulation {
             });
             spec.data_dir = Some(Arc::clone(&data_dir));
             spec.peer_port = port_map.get(&id).copied();
-            self.app_specs.insert(id.clone(), spec.clone());
+
+            // Re-borrow as shared ref to satisfy build_app_from_spec(&self, ...).
+            let spec = &self.app_specs[&id];
             let app = self
                 .build_app_from_spec(
                     &spec,
