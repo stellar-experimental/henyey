@@ -398,9 +398,15 @@ async fn test_core3_restart_rejoin_over_tcp() {
     sim.restart_node("node0").await.expect("restart node0 tcp");
     wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
 
-    // Re-establish peer connections so node0 can receive SCP state.
-    let _ = sim.add_connection("node0", "node1").await;
-    let _ = sim.add_connection("node0", "node2").await;
+    // Re-establish peer connections with retry (TCP connections can fail transiently).
+    let stabilized = sim
+        .stabilize_app_tcp_connectivity(1, Duration::from_secs(10))
+        .await
+        .expect("stabilize connectivity after restart");
+    assert!(
+        stabilized,
+        "node0 failed to establish peer connectivity after restart"
+    );
 
     // Request SCP state so node0 learns about the externalized slots it missed.
     sim.app("node0")
@@ -408,30 +414,8 @@ async fn test_core3_restart_rejoin_over_tcp() {
         .request_scp_state_from_peers()
         .await;
 
-    // Wait for node0 to catch up to ledger 3 (where node1/node2 are) before
-    // triggering ledger 4 consensus. Without this, node0's manual_close would
-    // trigger the wrong slot.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while tokio::time::Instant::now() < deadline {
-        if sim.have_all_app_nodes_externalized(3, 1) {
-            break;
-        }
-        // Periodically re-request SCP state to help node0 learn about slot 3.
-        sim.app("node0")
-            .expect("node0")
-            .request_scp_state_from_peers()
-            .await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    if !sim.have_all_app_nodes_externalized(3, 1) {
-        for id in ["node0", "node1", "node2"] {
-            eprintln!("catchup {id}: {:?}", sim.app_debug_stats(id).await);
-        }
-    }
-    assert!(
-        sim.have_all_app_nodes_externalized(3, 1),
-        "node0 failed to catch up to ledger 3"
-    );
+    // Wait for node0 to catch up to ledger 3 (where node1/node2 are).
+    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
 
     // Now advance all nodes to ledger 4.
     manual_close_until(&sim, 4, Duration::from_secs(30)).await;

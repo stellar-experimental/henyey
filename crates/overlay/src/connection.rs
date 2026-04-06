@@ -385,8 +385,18 @@ impl Listener {
     ///
     /// Returns an IO error if the port is already in use or binding fails.
     pub async fn bind(port: u16) -> Result<Self> {
-        let addr = format!("0.0.0.0:{}", port);
-        let listener = TcpListener::bind(&addr).await?;
+        let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], port));
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .map_err(OverlayError::Io)?;
+        socket.set_reuse_address(true).map_err(OverlayError::Io)?;
+        socket.set_nonblocking(true).map_err(OverlayError::Io)?;
+        socket.bind(&addr.into()).map_err(OverlayError::Io)?;
+        socket.listen(128).map_err(OverlayError::Io)?;
+        let listener = TcpListener::from_std(socket.into()).map_err(OverlayError::Io)?;
         let local_addr = listener.local_addr()?;
 
         debug!("Listening on {}", local_addr);
