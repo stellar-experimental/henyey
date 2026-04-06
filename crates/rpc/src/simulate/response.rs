@@ -178,63 +178,9 @@ fn serialize_state_changes(
         let mut entry = serde_json::Map::new();
         entry.insert("type".into(), json!(change_type));
 
-        // Key
-        match format {
-            XdrFormat::Base64 => {
-                let key_bytes = diff
-                    .key
-                    .to_xdr(Limits::none())
-                    .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
-                entry.insert("key".into(), json!(BASE64.encode(&key_bytes)));
-            }
-            XdrFormat::Json => {
-                let key_json = serde_json::to_value(&diff.key)
-                    .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
-                entry.insert("keyJson".into(), key_json);
-            }
-        }
-
-        // Before
-        match (&diff.state_before, format) {
-            (Some(before), XdrFormat::Base64) => {
-                let bytes = before
-                    .to_xdr(Limits::none())
-                    .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
-                entry.insert("before".into(), json!(BASE64.encode(&bytes)));
-            }
-            (Some(before), XdrFormat::Json) => {
-                let jv = serde_json::to_value(before)
-                    .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
-                entry.insert("beforeJson".into(), jv);
-            }
-            (None, XdrFormat::Base64) => {
-                entry.insert("before".into(), serde_json::Value::Null);
-            }
-            (None, XdrFormat::Json) => {
-                entry.insert("beforeJson".into(), serde_json::Value::Null);
-            }
-        }
-
-        // After
-        match (&diff.state_after, format) {
-            (Some(after), XdrFormat::Base64) => {
-                let bytes = after
-                    .to_xdr(Limits::none())
-                    .map_err(|e| JsonRpcError::internal(format!("XDR encode error: {e}")))?;
-                entry.insert("after".into(), json!(BASE64.encode(&bytes)));
-            }
-            (Some(after), XdrFormat::Json) => {
-                let jv = serde_json::to_value(after)
-                    .map_err(|e| JsonRpcError::internal(format!("JSON serialize error: {e}")))?;
-                entry.insert("afterJson".into(), jv);
-            }
-            (None, XdrFormat::Base64) => {
-                entry.insert("after".into(), serde_json::Value::Null);
-            }
-            (None, XdrFormat::Json) => {
-                entry.insert("afterJson".into(), serde_json::Value::Null);
-            }
-        }
+        insert_sim_xdr_field(&mut entry, "key", &diff.key, format)?;
+        insert_optional_sim_xdr_field(&mut entry, "before", diff.state_before.as_ref(), format)?;
+        insert_optional_sim_xdr_field(&mut entry, "after", diff.state_after.as_ref(), format)?;
 
         entries.push(serde_json::Value::Object(entry));
     }
@@ -301,6 +247,29 @@ fn insert_sim_xdr_field<T: WriteXdr + serde::Serialize>(
     format: XdrFormat,
 ) -> Result<(), JsonRpcError> {
     util::insert_xdr_field_styled(obj, base_name, val, format, util::XdrKeyStyle::Unsuffixed)
+}
+
+/// Insert an optional XDR value: serializes `Some(val)` or inserts `Null`.
+///
+/// Base64: `"{base_name}": "<b64>"` or `"{base_name}": null`
+/// Json: `"{base_name}Json": {...}` or `"{base_name}Json": null`
+fn insert_optional_sim_xdr_field<T: WriteXdr + serde::Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base_name: &str,
+    val: Option<&T>,
+    format: XdrFormat,
+) -> Result<(), JsonRpcError> {
+    match val {
+        Some(v) => insert_sim_xdr_field(obj, base_name, v, format),
+        None => {
+            let key = match format {
+                XdrFormat::Base64 => base_name.to_string(),
+                XdrFormat::Json => format!("{base_name}Json"),
+            };
+            obj.insert(key, serde_json::Value::Null);
+            Ok(())
+        }
+    }
 }
 
 /// Insert an array of XDR values with simulate-specific naming.

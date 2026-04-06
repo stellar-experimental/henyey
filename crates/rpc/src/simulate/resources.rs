@@ -199,10 +199,6 @@ pub(super) fn compute_invoke_resource_fee(
     tx_size: u32,
     restored_entry_count: u32,
 ) -> i64 {
-    use soroban_host::fees::{
-        compute_rent_fee, compute_transaction_resource_fee, TransactionResources,
-    };
-
     // Compute disk_read_entries the same way as upstream soroban-simulation:
     // only non-Soroban entries (accounts, trustlines etc.) count, since Soroban
     // entries (ContractData/ContractCode) are cached in memory and don't require
@@ -222,33 +218,15 @@ pub(super) fn compute_invoke_resource_fee(
     }
     disk_read_entries += restored_entry_count;
 
-    let tx_resources = TransactionResources {
-        instructions: resources.instructions,
+    compute_resource_fee_core(
+        resources,
         disk_read_entries,
-        write_entries: resources.footprint.read_write.len() as u32,
-        disk_read_bytes: resources.disk_read_bytes,
-        write_bytes: resources.write_bytes,
-        contract_events_size_bytes: contract_events_and_return_value_size,
-        transaction_size_bytes: tx_size,
-    };
-
-    let fee_config = build_fee_config(soroban_info);
-    let (non_refundable, refundable) = compute_transaction_resource_fee(&tx_resources, &fee_config);
-
-    let rent_fee = compute_rent_fee(
         rent_changes,
-        &build_rent_fee_config(soroban_info),
+        soroban_info,
         current_ledger_seq,
-    );
-
-    // Apply adjustment to refundable fee + rent (matches soroban-simulation default)
-    let total_refundable = refundable.saturating_add(rent_fee);
-    let adjusted_refundable = if total_refundable > 0 {
-        ((total_refundable as f64) * REFUNDABLE_FEE_ADJUSTMENT_FACTOR).floor() as i64
-    } else {
-        0
-    };
-    non_refundable.saturating_add(adjusted_refundable)
+        contract_events_and_return_value_size,
+        tx_size,
+    )
 }
 
 /// Compute resource fee for ExtendTTL/Restore operations (rent-dominant).
@@ -263,27 +241,52 @@ pub(super) fn compute_resource_fee_with_rent(
     contract_events_size: u32,
     tx_size: u32,
 ) -> i64 {
+    let disk_read_entries =
+        resources.footprint.read_only.len() as u32 + resources.footprint.read_write.len() as u32;
+
+    compute_resource_fee_core(
+        resources,
+        disk_read_entries,
+        rent_changes,
+        soroban_info,
+        current_ledger_seq,
+        contract_events_size,
+        tx_size,
+    )
+}
+
+/// Shared fee assembly: build resources → compute tx fee → compute rent → adjust.
+fn compute_resource_fee_core(
+    resources: &SorobanResources,
+    disk_read_entries: u32,
+    rent_changes: &[soroban_host::fees::LedgerEntryRentChange],
+    soroban_info: &henyey_ledger::SorobanNetworkInfo,
+    current_ledger_seq: u32,
+    contract_events_size_bytes: u32,
+    tx_size: u32,
+) -> i64 {
     use soroban_host::fees::{
         compute_rent_fee, compute_transaction_resource_fee, TransactionResources,
     };
 
     let tx_resources = TransactionResources {
         instructions: resources.instructions,
-        disk_read_entries: resources.footprint.read_only.len() as u32
-            + resources.footprint.read_write.len() as u32,
+        disk_read_entries,
         write_entries: resources.footprint.read_write.len() as u32,
         disk_read_bytes: resources.disk_read_bytes,
         write_bytes: resources.write_bytes,
-        contract_events_size_bytes: contract_events_size,
+        contract_events_size_bytes,
         transaction_size_bytes: tx_size,
     };
 
     let fee_config = build_fee_config(soroban_info);
-    let rent_fee_config = build_rent_fee_config(soroban_info);
-
     let (non_refundable, refundable) = compute_transaction_resource_fee(&tx_resources, &fee_config);
 
-    let rent_fee = compute_rent_fee(rent_changes, &rent_fee_config, current_ledger_seq);
+    let rent_fee = compute_rent_fee(
+        rent_changes,
+        &build_rent_fee_config(soroban_info),
+        current_ledger_seq,
+    );
 
     let total_refundable = refundable.saturating_add(rent_fee);
     let adjusted_refundable = if total_refundable > 0 {
