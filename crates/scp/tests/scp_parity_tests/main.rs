@@ -428,7 +428,7 @@ impl TestSCP {
     /// Get the nomination leaders for slot 0.
     /// Matches stellar-core `scp.getNominationLeaders(0)`.
     #[allow(dead_code)]
-    fn get_nomination_leaders(&self) -> std::collections::HashSet<NodeId> {
+    fn get_nomination_leaders(&self) -> std::collections::BTreeSet<NodeId> {
         self.scp.get_nomination_leaders(0)
     }
 

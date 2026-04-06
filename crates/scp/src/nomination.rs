@@ -30,7 +30,7 @@
 //! value (via the driver's `combine_candidates` method) which is then used
 //! to start the ballot protocol.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use stellar_xdr::curr::{
@@ -108,7 +108,7 @@ pub struct NominationProtocol {
     ///
     /// Leaders are determined by a priority function based on the
     /// previous value and round number.
-    round_leaders: HashSet<NodeId>,
+    round_leaders: BTreeSet<NodeId>,
 
     /// The last envelope we constructed locally.
     last_envelope: Option<ScpEnvelope>,
@@ -134,7 +134,7 @@ impl NominationProtocol {
             previous_value: None,
             timer_exp_count: 0,
             latest_nominations: HashMap::new(),
-            round_leaders: HashSet::new(),
+            round_leaders: BTreeSet::new(),
             last_envelope: None,
             last_envelope_emit: None,
             fully_validated: true,
@@ -191,7 +191,7 @@ impl NominationProtocol {
     }
 
     /// Get the current round leaders.
-    pub fn get_round_leaders(&self) -> &HashSet<NodeId> {
+    pub fn get_round_leaders(&self) -> &BTreeSet<NodeId> {
         &self.round_leaders
     }
 
@@ -2193,5 +2193,40 @@ mod tests {
         assert!(nom.candidates().is_empty());
         // N6: In the slot, the timer should be set regardless of `updated`.
         // This test confirms the nomination state is correct for that check.
+    }
+
+    /// [AUDIT-M1] round_leaders must use deterministic iteration order.
+    ///
+    /// stellar-core uses `std::set<NodeID>` which iterates in lexicographic order.
+    /// Before fix: HashSet had non-deterministic iteration order.
+    /// After fix: BTreeSet provides deterministic (sorted) iteration.
+    #[test]
+    fn test_audit_m1_round_leaders_deterministic_iteration() {
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let node3 = make_node_id(3);
+        let quorum_set = make_quorum_set(vec![node1.clone(), node2.clone(), node3.clone()], 2);
+        let driver = Arc::new(ParityMockDriver::new(quorum_set.clone()));
+        let mut nom = NominationProtocol::new();
+
+        let value = make_value(&[10]);
+        let prev = make_value(&[0]);
+
+        // Nominate to populate round_leaders
+        nom.nominate(&ctx!(&node1, &quorum_set, &driver, 1), value, &prev, false);
+
+        let leaders = nom.get_round_leaders();
+        if leaders.len() > 1 {
+            // Verify iteration order is deterministic (sorted) by collecting
+            // multiple times and comparing
+            let order1: Vec<_> = leaders.iter().collect();
+            let order2: Vec<_> = leaders.iter().collect();
+            assert_eq!(order1, order2, "BTreeSet iteration must be deterministic");
+
+            // Verify it's actually sorted (BTreeSet guarantee)
+            for pair in order1.windows(2) {
+                assert!(pair[0] < pair[1], "Leaders must be in sorted order");
+            }
+        }
     }
 }

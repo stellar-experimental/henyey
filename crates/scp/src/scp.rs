@@ -753,7 +753,7 @@ impl<D: SCPDriver> SCP<D> {
     ///
     /// Returns the set of nodes that are leaders for the current nomination round.
     /// Matches stellar-core `getNominationLeaders(slotIndex)` on the TestSCP wrapper.
-    pub fn get_nomination_leaders(&self, slot_index: u64) -> std::collections::HashSet<NodeId> {
+    pub fn get_nomination_leaders(&self, slot_index: u64) -> std::collections::BTreeSet<NodeId> {
         let slots = self.slots.read();
         slots
             .get(&slot_index)

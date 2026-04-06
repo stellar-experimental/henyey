@@ -570,7 +570,7 @@ impl Slot {
     /// Get nomination round leaders.
     ///
     /// Returns the set of nodes that are leaders for the current nomination round.
-    pub fn get_nomination_leaders(&self) -> std::collections::HashSet<NodeId> {
+    pub fn get_nomination_leaders(&self) -> std::collections::BTreeSet<NodeId> {
         self.nomination.get_round_leaders().clone()
     }
 
