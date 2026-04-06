@@ -380,12 +380,31 @@ impl FutureBucket {
 
     /// Resolve synchronously (blocking).
     ///
-    /// This is useful when you need the result immediately and are not in an async context.
+    /// If an async merge is in progress (merge_handle is set), blocks on
+    /// that task's result rather than re-executing the merge. This matches
+    /// stellar-core's `resolve()` which always consumes the future. Only
+    /// falls back to a synchronous merge if no async task was started.
     pub fn resolve_blocking(&mut self) -> Result<Arc<Bucket>> {
         match self.state {
             FutureBucketState::LiveOutput => Ok(self.output.clone().expect("output should be set")),
             FutureBucketState::LiveInputs => {
-                // Do synchronous merge
+                // If an async merge is in progress, block on its result
+                // instead of re-executing the merge (which would race with
+                // the background task).
+                if let Some(handle) = self.merge_handle.take() {
+                    // Use block_in_place to allow blocking within a tokio
+                    // runtime context. This moves the blocking call off the
+                    // async worker thread.
+                    let bucket = tokio::task::block_in_place(|| {
+                        handle.receiver.blocking_recv()
+                    })
+                    .map_err(|_| {
+                        BucketError::Merge("merge task was cancelled".to_string())
+                    })??;
+                    return Ok(self.finalize_merge(bucket));
+                }
+
+                // No async task — do synchronous merge
                 let curr = self
                     .input_curr
                     .as_ref()
@@ -1039,5 +1058,64 @@ mod tests {
         assert_eq!(hashes.len(), 2);
         assert!(hashes.contains(&hash1));
         assert!(hashes.contains(&hash2));
+    }
+
+    /// [AUDIT-BH2] resolve_blocking must consume the in-flight async merge
+    /// rather than re-executing the merge synchronously.
+    ///
+    /// When a FutureBucket has a live merge_handle, resolve_blocking should
+    /// block on the async task result. This test creates a FutureBucket with
+    /// a merge_handle whose sender will deliver the result, and verifies that
+    /// resolve_blocking receives from the handle (after fix) rather than
+    /// re-executing the merge from inputs (before fix).
+    ///
+    /// We detect re-execution by setting input_curr and input_snap to None
+    /// while providing a valid merge_handle. Before the fix, resolve_blocking
+    /// would panic trying to access None inputs. After the fix, it blocks on
+    /// the merge_handle and succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_audit_bh2_resolve_blocking_consumes_async_merge() {
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let bucket =
+            Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
+
+        // Create a oneshot channel and send a pre-computed result
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let expected_hash = bucket.hash();
+        sender
+            .send(Ok(Bucket::from_entries(vec![BucketEntry::Liveentry(
+                make_account_entry([1u8; 32], 100),
+            )])
+            .unwrap()))
+            .ok();
+
+        // Construct a FutureBucket in LiveInputs state with a merge_handle
+        // but WITHOUT live input buckets. If resolve_blocking tries to
+        // re-execute the merge from inputs, it will fail with "missing curr
+        // input". If it properly consumes the merge_handle, it will succeed.
+        let mut fb = FutureBucket {
+            state: FutureBucketState::LiveInputs,
+            input_curr: None, // Deliberately None to detect re-execution
+            input_snap: None, // Deliberately None to detect re-execution
+            output: None,
+            merge_handle: Some(MergeHandle { receiver }),
+            input_curr_hash: Some(expected_hash),
+            input_snap_hash: Some(Hash256::ZERO),
+            output_hash: None,
+            protocol_version: 25,
+            keep_tombstones: true,
+            normalize_init: false,
+        };
+
+        // Before fix: resolve_blocking ignores merge_handle and tries to
+        // merge from inputs, which are None → error "missing curr input".
+        // After fix: resolve_blocking blocks on merge_handle → success.
+        let result = fb.resolve_blocking();
+        assert!(
+            result.is_ok(),
+            "resolve_blocking should consume the merge_handle, not re-execute from inputs: {:?}",
+            result.err()
+        );
+        assert_eq!(fb.state(), FutureBucketState::LiveOutput);
     }
 }
