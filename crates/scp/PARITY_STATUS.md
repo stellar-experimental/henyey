@@ -236,8 +236,8 @@ Corresponds to: `LocalNode.h`, `QuorumSetUtils.h`
 | `getSingletonQSet()` | `singleton_quorum_set()` | Full |
 | `forAllNodes()` | `get_all_nodes()` | Full |
 | `isQuorumSlice(QSet, nodeSet)` | `is_quorum_slice()` | Full |
-| `isVBlocking(QSet, nodeSet)` | `is_v_blocking()`, `is_blocking_set()` | Full |
-| `isVBlocking(QSet, map, filter)` | `is_blocking_set()` (adapted) | Full |
+| `isVBlocking(QSet, nodeSet)` | `is_v_blocking()` | Full |
+| `isVBlocking(QSet, map, filter)` | `is_v_blocking()` (adapted) | Full |
 | `isQuorum()` | `is_quorum()` | Full |
 | `findClosestVBlocking()` (set) | `find_closest_v_blocking()` | Full |
 | `findClosestVBlocking()` (map) | `find_closest_v_blocking()` | Full |

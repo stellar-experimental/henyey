@@ -1179,7 +1179,7 @@ fn test_ballot_timeout_bump() {
     scp.nominate(slot_index, value.clone(), &prev_value);
 
     // Simulate ballot timeout
-    let bumped = scp.ballot_protocol_timer_expired(slot_index);
+    let bumped = scp.bump_ballot(slot_index);
 
     // Should attempt to bump (may or may not succeed depending on state)
     // The important thing is it doesn't panic

@@ -181,9 +181,13 @@ where
 /// * `quorum_set` - The quorum set to check against
 /// * `nodes` - The set of nodes to check
 ///
+/// Check if a set of nodes is a v-blocking set for a given quorum set.
+///
+/// A set B is v-blocking for node v if B intersects all of v's quorum slices.
+///
 /// # Returns
-/// True if the nodes form a blocking set.
-pub fn is_blocking_set(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
+/// True if the nodes form a v-blocking set.
+pub fn is_v_blocking(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
     let total = quorum_set.validators.len() + quorum_set.inner_sets.len();
     let threshold = quorum_set.threshold as usize;
 
@@ -206,20 +210,12 @@ pub fn is_blocking_set(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bo
 
     // Count inner sets that are blocked
     for inner_set in quorum_set.inner_sets.iter() {
-        if is_blocking_set(inner_set, nodes) {
+        if is_v_blocking(inner_set, nodes) {
             count += 1;
         }
     }
 
     count >= blocking_threshold
-}
-
-/// Check if a set of nodes is a v-blocking set for a given quorum set.
-///
-/// A set B is v-blocking for node v if B intersects all of v's quorum slices.
-/// This is equivalent to is_blocking_set for the node's quorum set.
-pub fn is_v_blocking(quorum_set: &ScpQuorumSet, nodes: &HashSet<NodeId>) -> bool {
-    is_blocking_set(quorum_set, nodes)
 }
 
 /// Check if a quorum set is sane.
@@ -649,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_blocking_set() {
+    fn test_is_v_blocking() {
         let node1 = make_node_id(1);
         let node2 = make_node_id(2);
         let node3 = make_node_id(3);
@@ -661,12 +657,12 @@ mod tests {
         let mut nodes = HashSet::new();
         nodes.insert(node1.clone());
         nodes.insert(node2.clone());
-        assert!(is_blocking_set(&qs, &nodes));
+        assert!(is_v_blocking(&qs, &nodes));
 
         // 1 node should not be blocking
         let mut nodes = HashSet::new();
         nodes.insert(node1);
-        assert!(!is_blocking_set(&qs, &nodes));
+        assert!(!is_v_blocking(&qs, &nodes));
     }
 
     #[test]
@@ -1241,13 +1237,13 @@ mod tests {
         // Any single validator blocks
         let mut nodes = HashSet::new();
         nodes.insert(node0.clone());
-        assert!(is_blocking_set(&qs, &nodes));
+        assert!(is_v_blocking(&qs, &nodes));
 
         // If inner set is blocked, it blocks the outer
         let mut nodes = HashSet::new();
         nodes.insert(node2.clone());
         nodes.insert(node3.clone());
-        assert!(is_blocking_set(&qs, &nodes));
+        assert!(is_v_blocking(&qs, &nodes));
     }
 
     #[test]

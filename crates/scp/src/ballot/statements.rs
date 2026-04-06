@@ -351,7 +351,7 @@ impl BallotProtocol {
                 nodes.insert(node_id.clone());
             }
         }
-        is_blocking_set(local_quorum_set, &nodes)
+        is_v_blocking(local_quorum_set, &nodes)
             && !self
                 .statement_quorum_set_map(local_node_id, local_quorum_set, driver)
                 .is_empty()
@@ -404,7 +404,7 @@ impl BallotProtocol {
             }
         }
 
-        if is_blocking_set(local_quorum_set, &accepted_nodes) {
+        if is_v_blocking(local_quorum_set, &accepted_nodes) {
             return true;
         }
 

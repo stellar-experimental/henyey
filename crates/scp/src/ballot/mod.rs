@@ -54,7 +54,7 @@ use stellar_xdr::curr::{
 
 use crate::driver::{SCPDriver, ValidationLevel};
 use crate::quorum::{
-    hash_quorum_set, is_blocking_set, is_quorum, is_quorum_set_sane, simple_quorum_set,
+    hash_quorum_set, is_quorum, is_quorum_set_sane, is_v_blocking, simple_quorum_set,
 };
 use crate::EnvelopeState;
 use crate::SlotContext;

@@ -294,20 +294,6 @@ impl<D: SCPDriver> SCP<D> {
         }
     }
 
-    /// Handle ballot protocol timer expiration.
-    ///
-    /// This is an alias for [`bump_ballot`](Self::bump_ballot) that matches
-    /// the stellar-core `ballotProtocolTimerExpired()` naming convention.
-    ///
-    /// # Arguments
-    /// * `slot_index` - The slot whose timer expired
-    ///
-    /// # Returns
-    /// True if the ballot was bumped, false otherwise.
-    pub fn ballot_protocol_timer_expired(&self, slot_index: u64) -> bool {
-        self.bump_ballot(slot_index)
-    }
-
     /// Get the externalized value for a slot.
     ///
     /// # Returns

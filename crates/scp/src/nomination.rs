@@ -39,7 +39,7 @@ use stellar_xdr::curr::{
 };
 
 use crate::driver::{SCPDriver, ValidationLevel};
-use crate::quorum::{hash_quorum_set, is_blocking_set, is_quorum};
+use crate::quorum::{hash_quorum_set, is_quorum, is_v_blocking};
 use crate::EnvelopeState;
 use crate::SlotContext;
 
@@ -524,8 +524,7 @@ impl NominationProtocol {
                 continue;
             }
 
-            if !self.should_accept_value(value, local_node_id, local_quorum_set, driver, slot_index)
-            {
+            if !self.should_accept_value(value, local_node_id, local_quorum_set, driver) {
                 continue;
             }
             match driver.validate_value(slot_index, value, true) {
@@ -786,7 +785,6 @@ impl NominationProtocol {
         local_node_id: &NodeId,
         local_quorum_set: &ScpQuorumSet,
         driver: &Arc<D>,
-        _slot_index: u64,
     ) -> bool {
         let voters = self.get_nodes_with_value(value, |nom| &nom.votes);
         let acceptors = self.get_nodes_with_value(value, |nom| &nom.accepted);
@@ -794,7 +792,7 @@ impl NominationProtocol {
         let qsets = self.nomination_quorum_set_map(local_node_id, local_quorum_set, driver);
         let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
 
-        is_blocking_set(local_quorum_set, &acceptors)
+        is_v_blocking(local_quorum_set, &acceptors)
             || is_quorum(local_quorum_set, &supporters, get_qs)
     }
 
