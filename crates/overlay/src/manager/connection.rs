@@ -21,6 +21,16 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::PeerHandle;
+use parking_lot::RwLock;
+use tokio::task::JoinHandle;
+
+/// Prune completed JoinHandles from the vec, then push the new one.
+/// This prevents unbounded growth of the peer_handles vector.
+fn push_peer_handle(handles: &RwLock<Vec<JoinHandle<()>>>, handle: JoinHandle<()>) {
+    let mut guard = handles.write();
+    guard.retain(|h| !h.is_finished());
+    guard.push(handle);
+}
 
 impl OverlayManager {
     /// Create a PeerHandle (outbound channel + FlowControl) and atomically
@@ -224,7 +234,7 @@ impl OverlayManager {
                                     }
                                 });
 
-                                peer_handles.write().push(peer_handle);
+                                push_peer_handle(&peer_handles, peer_handle);
                             }
                             Err(e) => {
                                 tracing::error!("Accept error: {}", e);
@@ -384,7 +394,7 @@ impl OverlayManager {
             .await;
         });
 
-        peer_handles.write().push(peer_handle);
+        push_peer_handle(&peer_handles, peer_handle);
 
         Ok(true)
     }
@@ -505,7 +515,7 @@ pub(super) async fn connect_outbound_inner(
         pool_clone.release_authenticated();
     });
 
-    shared.peer_handles.write().push(handle);
+    push_peer_handle(&shared.peer_handles, handle);
 
     Ok(peer_id)
 }
