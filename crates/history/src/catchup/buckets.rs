@@ -212,9 +212,20 @@ impl CatchupManager {
             if bucket_path.exists() {
                 debug!("Loading existing bucket {} from disk", hash);
                 let bucket = Bucket::from_xdr_file_disk_backed(&bucket_path)?;
-                let mut cache = bucket_cache.lock().unwrap();
-                cache.insert(*hash, bucket.clone());
-                return Ok(bucket);
+                // Verify hash matches (protects against corrupt files on disk)
+                if bucket.hash() != *hash {
+                    warn!(
+                        "Existing bucket file has wrong hash: expected {}, got {}",
+                        hash,
+                        bucket.hash()
+                    );
+                    let _ = std::fs::remove_file(&bucket_path);
+                    // Fall through to download the bucket fresh
+                } else {
+                    let mut cache = bucket_cache.lock().unwrap();
+                    cache.insert(*hash, bucket.clone());
+                    return Ok(bucket);
+                }
             }
 
             // Use preloaded bucket data if available, otherwise download.
@@ -407,6 +418,15 @@ impl CatchupManager {
                     // Load hot archive bucket from disk eagerly — builds the index
                     // immediately so it's ready for lookups during live operation.
                     let bucket = HotArchiveBucket::from_xdr_file_disk_backed(&bucket_path)?;
+
+                    // Verify hash matches (same as live bucket verification)
+                    if bucket.hash() != *hash {
+                        let _ = std::fs::remove_file(&bucket_path);
+                        return Err(henyey_bucket::BucketError::HashMismatch {
+                            expected: hash.to_hex(),
+                            actual: bucket.hash().to_hex(),
+                        });
+                    }
 
                     // Cache for reuse (same hash can appear at multiple levels)
                     {
