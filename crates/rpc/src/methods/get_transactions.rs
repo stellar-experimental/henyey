@@ -23,11 +23,7 @@ pub async fn handle(
 ) -> Result<serde_json::Value, JsonRpcError> {
     let format = util::parse_format(&params)?;
 
-    let ledger = ctx.app.ledger_summary();
-    let oldest = util::oldest_ledger(&ctx.app);
-
-    // Look up oldest ledger close time
-    let oldest_close_time = util::ledger_close_time(&ctx.app, oldest).to_string();
+    let lctx = util::LedgerContext::from_app(&ctx.app);
 
     // Parse optional status filter
     let status_filter = match params.get("status").and_then(|v| v.as_str()) {
@@ -64,8 +60,8 @@ pub async fn handle(
         limit,
         DEFAULT_TX_LIMIT,
         MAX_TX_LIMIT,
-        oldest,
-        ledger.num,
+        lctx.oldest_ledger,
+        lctx.latest_ledger,
     )?;
 
     // Convert cursor to (start_ledger, start_tx_index) for the DB query
@@ -79,7 +75,7 @@ pub async fn handle(
     };
 
     // End ledger for query: latest + 1 (exclusive upper bound)
-    let end_ledger = ledger.num + 1;
+    let end_ledger = lctx.latest_ledger + 1;
 
     // Query transactions from database
     let records = ctx
@@ -121,12 +117,10 @@ pub async fn handle(
         transactions.push(serde_json::Value::Object(obj));
     }
 
-    Ok(json!({
+    let mut result = serde_json::json!({
         "transactions": transactions,
-        "latestLedger": ledger.num,
-        "latestLedgerCloseTime": ledger.close_time.to_string(),
-        "oldestLedger": oldest,
-        "oldestLedgerCloseTime": oldest_close_time,
         "cursor": last_cursor
-    }))
+    });
+    lctx.insert_json_fields(result.as_object_mut().unwrap());
+    Ok(result)
 }

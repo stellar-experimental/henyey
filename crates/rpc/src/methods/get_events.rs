@@ -24,7 +24,7 @@ pub async fn handle(
 ) -> Result<serde_json::Value, JsonRpcError> {
     let format = util::parse_format(&params)?;
 
-    let ledger = ctx.app.ledger_summary();
+    let lctx = util::LedgerContext::from_app(&ctx.app);
 
     let start_ledger = params
         .get("startLedger")
@@ -110,17 +110,14 @@ pub async fn handle(
 
     let last_cursor = events.last().map(|e| e.id.as_str()).unwrap_or("");
 
-    let oldest = util::oldest_ledger(&ctx.app);
-    let oldest_close_time = format_unix_timestamp_utc(util::ledger_close_time(&ctx.app, oldest));
-
-    Ok(json!({
+    let mut result = json!({
         "events": event_json,
         "cursor": last_cursor,
-        "latestLedger": ledger.num,
-        "latestLedgerCloseTime": ledger.close_time.to_string(),
-        "oldestLedger": oldest,
-        "oldestLedgerCloseTime": oldest_close_time
-    }))
+    });
+    lctx.insert_json_fields(result.as_object_mut().unwrap());
+    // get_events formats oldestLedgerCloseTime as ISO 8601 (unlike other handlers)
+    result["oldestLedgerCloseTime"] = json!(format_unix_timestamp_utc(lctx.oldest_close_time));
+    Ok(result)
 }
 
 /// Maximum number of filters allowed per request.

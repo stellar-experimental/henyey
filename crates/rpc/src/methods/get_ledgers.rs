@@ -23,11 +23,7 @@ pub async fn handle(
 ) -> Result<serde_json::Value, JsonRpcError> {
     let format = util::parse_format(&params)?;
 
-    let ledger = ctx.app.ledger_summary();
-    let oldest = util::oldest_ledger(&ctx.app);
-
-    // Look up oldest ledger close time
-    let oldest_close_time = util::ledger_close_time(&ctx.app, oldest).to_string();
+    let lctx = util::LedgerContext::from_app(&ctx.app);
 
     // Parse parameters
     let start_ledger = params
@@ -46,11 +42,16 @@ pub async fn handle(
 
     // Validate and resolve pagination.
     // getLedgers cursor is a plain ledger sequence (not a TOID).
-    let (effective_start, effective_limit) =
-        validate_ledger_pagination(start_ledger, cursor_str, limit, oldest, ledger.num)?;
+    let (effective_start, effective_limit) = validate_ledger_pagination(
+        start_ledger,
+        cursor_str,
+        limit,
+        lctx.oldest_ledger,
+        lctx.latest_ledger,
+    )?;
 
     // End ledger for query: latest + 1 (exclusive upper bound)
-    let end_ledger = ledger.num + 1;
+    let end_ledger = lctx.latest_ledger + 1;
 
     // Query ledger close metas from database
     let metas = ctx
@@ -90,14 +91,12 @@ pub async fn handle(
         ledgers.push(serde_json::Value::Object(obj));
     }
 
-    Ok(json!({
+    let mut result = json!({
         "ledgers": ledgers,
-        "latestLedger": ledger.num,
-        "latestLedgerCloseTime": ledger.close_time.to_string(),
-        "oldestLedger": oldest,
-        "oldestLedgerCloseTime": oldest_close_time,
         "cursor": last_cursor
-    }))
+    });
+    lctx.insert_json_fields(result.as_object_mut().unwrap());
+    Ok(result)
 }
 
 /// Validate getLedgers pagination. Cursor is a plain ledger sequence.

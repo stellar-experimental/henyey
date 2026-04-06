@@ -19,11 +19,7 @@ pub async fn handle(
 
     let format = util::parse_format(&params)?;
 
-    let ledger = ctx.app.ledger_summary();
-    let oldest = util::oldest_ledger(&ctx.app);
-
-    // Look up the oldest ledger close time
-    let oldest_close_time = util::ledger_close_time(&ctx.app, oldest).to_string();
+    let lctx = util::LedgerContext::from_app(&ctx.app);
 
     // Look up the transaction in the database
     let tx_record = ctx
@@ -46,22 +42,14 @@ pub async fn handle(
                 format,
                 false,
             )?;
-            obj.insert("latestLedger".into(), json!(ledger.num));
-            obj.insert(
-                "latestLedgerCloseTime".into(),
-                json!(ledger.close_time.to_string()),
-            );
-            obj.insert("oldestLedger".into(), json!(oldest));
-            obj.insert("oldestLedgerCloseTime".into(), json!(oldest_close_time));
+            lctx.insert_json_fields(&mut obj);
 
             Ok(serde_json::Value::Object(obj))
         }
-        None => Ok(json!({
-            "status": "NOT_FOUND",
-            "latestLedger": ledger.num,
-            "latestLedgerCloseTime": ledger.close_time.to_string(),
-            "oldestLedger": oldest,
-            "oldestLedgerCloseTime": oldest_close_time
-        })),
+        None => {
+            let mut result = json!({ "status": "NOT_FOUND" });
+            lctx.insert_json_fields(result.as_object_mut().unwrap());
+            Ok(result)
+        }
     }
 }

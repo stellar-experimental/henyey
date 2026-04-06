@@ -336,6 +336,47 @@ pub(crate) fn ledger_close_time(app: &henyey_app::App, ledger_seq: u32) -> u64 {
         .unwrap_or(0)
 }
 
+/// Common ledger context fields included in most RPC responses.
+///
+/// Captures the latest and oldest ledger sequence numbers and their close
+/// times in a single struct, avoiding the repeated 3-call boilerplate
+/// (`ledger_summary` + `oldest_ledger` + `ledger_close_time`).
+pub(crate) struct LedgerContext {
+    pub latest_ledger: u32,
+    pub latest_close_time: u64,
+    pub oldest_ledger: u32,
+    pub oldest_close_time: u64,
+}
+
+impl LedgerContext {
+    /// Build from the running app state.
+    pub fn from_app(app: &henyey_app::App) -> Self {
+        let summary = app.ledger_summary();
+        let oldest = oldest_ledger(app);
+        let oldest_close = ledger_close_time(app, oldest);
+        Self {
+            latest_ledger: summary.num,
+            latest_close_time: summary.close_time,
+            oldest_ledger: oldest,
+            oldest_close_time: oldest_close,
+        }
+    }
+
+    /// Insert the four standard fields into a `serde_json::Map`.
+    pub fn insert_json_fields(&self, map: &mut serde_json::Map<String, serde_json::Value>) {
+        map.insert("latestLedger".into(), serde_json::json!(self.latest_ledger));
+        map.insert(
+            "latestLedgerCloseTime".into(),
+            serde_json::json!(self.latest_close_time.to_string()),
+        );
+        map.insert("oldestLedger".into(), serde_json::json!(self.oldest_ledger));
+        map.insert(
+            "oldestLedgerCloseTime".into(),
+            serde_json::json!(self.oldest_close_time.to_string()),
+        );
+    }
+}
+
 /// Check if XDR-encoded transaction envelope bytes represent a fee bump transaction.
 // SECURITY: XDR input pre-bounded by HTTP body size limit; Limits::none() is safe
 pub(crate) fn is_fee_bump_envelope(envelope_bytes: &[u8]) -> bool {
