@@ -51,6 +51,21 @@ const DEFAULT_WASM_SIZE: usize = 35_000;
 /// Default inclusion fee for Soroban transactions.
 const DEFAULT_SOROBAN_INCLUSION_FEE: u32 = 100;
 
+/// Base CPU instruction budget for contract invocations.
+const INVOKE_BASE_INSTRUCTIONS: u32 = 2_000_000;
+
+/// Random range added on top of `INVOKE_BASE_INSTRUCTIONS`.
+const INVOKE_INSTRUCTIONS_RANGE: u64 = 1_000_000;
+
+/// Guest CPU cycles per instruction (stellar-core ratio).
+const GUEST_CYCLES_PER_INSTRUCTION: u64 = 80;
+
+/// Host CPU cycles per instruction (stellar-core ratio).
+const HOST_CYCLES_PER_INSTRUCTION: u64 = 5030;
+
+/// Base disk-read bytes for contract invocations (before adding entry sizes).
+const INVOKE_BASE_READ_BYTES: u32 = 5_000;
+
 // ---------------------------------------------------------------------------
 // ContractInstance (Soroban)
 // ---------------------------------------------------------------------------
@@ -601,16 +616,15 @@ impl TxGenerator {
 
         // Sample workload parameters deterministically
         let rand_val = deterministic_rand(account_id, ledger_num);
-        let target_instructions: u32 = 2_000_000 + (rand_val % 1_000_000) as u32;
+        let target_instructions: u32 =
+            INVOKE_BASE_INSTRUCTIONS + (rand_val % INVOKE_INSTRUCTIONS_RANGE) as u32;
 
         // Split between guest and host cycles (matching stellar-core ratios)
-        let guest_cycles_per_instruction = 80u64;
-        let host_cycles_per_instruction = 5030u64;
         let host_fraction = (rand_val >> 16) % 100;
         let host_instructions = (target_instructions as u64 * host_fraction) / 100;
         let guest_instructions = target_instructions as u64 - host_instructions;
-        let host_cycles = host_instructions / host_cycles_per_instruction;
-        let guest_cycles = guest_instructions / guest_cycles_per_instruction;
+        let host_cycles = host_instructions / HOST_CYCLES_PER_INSTRUCTION;
+        let guest_cycles = guest_instructions / GUEST_CYCLES_PER_INSTRUCTION;
 
         let n_entries = 1 + (rand_val >> 32) % 4; // 1-4 entries
         let kb_per_entry = 1 + (rand_val >> 40) % 4; // 1-4 KB
@@ -646,7 +660,7 @@ impl TxGenerator {
                 read_only_keys: instance.read_only_keys.clone(),
                 read_write_keys: rw_keys,
                 instructions: target_instructions,
-                read_bytes: 5000 + instance.contract_entries_size,
+                read_bytes: INVOKE_BASE_READ_BYTES + instance.contract_entries_size,
                 write_bytes: (n_entries as u32) * (kb_per_entry as u32) * 1024,
                 inclusion_fee: fee,
             },

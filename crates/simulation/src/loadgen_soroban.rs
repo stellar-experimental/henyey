@@ -25,6 +25,57 @@ use stellar_xdr::curr::{
 pub(crate) const LOADGEN_WASM: &[u8] = include_bytes!("../wasm/loadgen.wasm");
 
 // ---------------------------------------------------------------------------
+// Resource estimate constants for Soroban transaction building.
+// These are generous defaults matching stellar-core's `TxGenerator` estimates.
+// ---------------------------------------------------------------------------
+
+/// CPU instructions budget for uploading a WASM blob.
+const UPLOAD_WASM_INSTRUCTIONS: u32 = 2_500_000;
+
+/// Padding added to the raw WASM size for disk-read and write-byte estimates.
+const WASM_SIZE_PADDING: u32 = 500;
+
+/// Generous resource-fee estimate for WASM upload transactions (stroops).
+const UPLOAD_WASM_RESOURCE_FEE: i64 = 50_000_000;
+
+/// CPU instructions budget for contract creation.
+const CREATE_CONTRACT_INSTRUCTIONS: u32 = 1_000_000;
+
+/// Disk-read bytes estimate for contract creation.
+const CREATE_CONTRACT_READ_BYTES: u32 = 5_000;
+
+/// Write bytes estimate for contract creation.
+const CREATE_CONTRACT_WRITE_BYTES: u32 = 300;
+
+/// Generous resource-fee estimate for contract creation (stroops).
+const CREATE_CONTRACT_RESOURCE_FEE: i64 = 10_000_000;
+
+/// Generous resource-fee estimate for invoke / batch transactions (stroops).
+const INVOKE_RESOURCE_FEE: i64 = 50_000_000;
+
+/// CPU instructions budget for SAC transfer invocations.
+///
+/// stellar-core uses 250K instructions but our non-typed host API (P25)
+/// meters XDR deserialization, consuming ~263K+ for a SAC transfer.
+/// Use 2M to avoid ResourceLimitExceeded in load tests.
+const SAC_TRANSFER_INSTRUCTIONS: u32 = 2_000_000;
+
+/// Disk-read bytes estimate for SAC transfer invocations.
+const SAC_TRANSFER_READ_BYTES: u32 = 10_000;
+
+/// Write bytes estimate for SAC transfer invocations.
+const SAC_TRANSFER_WRITE_BYTES: u32 = 10_000;
+
+/// Per-transfer CPU instructions budget for batch transfers.
+const BATCH_TRANSFER_INSTRUCTIONS_PER_ITEM: u32 = 500_000;
+
+/// Per-transfer disk-read bytes for batch transfers.
+const BATCH_TRANSFER_READ_BYTES_PER_ITEM: u32 = 800;
+
+/// Per-transfer write bytes for batch transfers.
+const BATCH_TRANSFER_WRITE_BYTES_PER_ITEM: u32 = 800;
+
+// ---------------------------------------------------------------------------
 // SorobanTxBuilder
 // ---------------------------------------------------------------------------
 
@@ -105,13 +156,12 @@ impl SorobanTxBuilder {
                 read_only: VecM::default(),
                 read_write: vec![code_key].try_into().unwrap_or_default(),
             },
-            instructions: 2_500_000,
-            disk_read_bytes: (wasm.len() as u32).saturating_add(500),
-            write_bytes: (wasm.len() as u32).saturating_add(500),
+            instructions: UPLOAD_WASM_INSTRUCTIONS,
+            disk_read_bytes: (wasm.len() as u32).saturating_add(WASM_SIZE_PADDING),
+            write_bytes: (wasm.len() as u32).saturating_add(WASM_SIZE_PADDING),
         };
 
-        // Resource fee estimate: generous default for simulation
-        let resource_fee = 50_000_000i64;
+        let resource_fee = UPLOAD_WASM_RESOURCE_FEE;
 
         self.build_soroban_envelope(source, sequence, op, resources, resource_fee, inclusion_fee)
     }
@@ -177,12 +227,12 @@ impl SorobanTxBuilder {
                 read_only: vec![code_key].try_into().unwrap_or_default(),
                 read_write: vec![instance_key].try_into().unwrap_or_default(),
             },
-            instructions: 1_000_000,
-            disk_read_bytes: 5000,
-            write_bytes: 300,
+            instructions: CREATE_CONTRACT_INSTRUCTIONS,
+            disk_read_bytes: CREATE_CONTRACT_READ_BYTES,
+            write_bytes: CREATE_CONTRACT_WRITE_BYTES,
         };
 
-        let resource_fee = 10_000_000i64;
+        let resource_fee = CREATE_CONTRACT_RESOURCE_FEE;
         self.build_soroban_envelope(source, sequence, op, resources, resource_fee, inclusion_fee)
     }
 
@@ -226,7 +276,7 @@ impl SorobanTxBuilder {
             write_bytes: invocation.write_bytes,
         };
 
-        let resource_fee = 50_000_000i64;
+        let resource_fee = INVOKE_RESOURCE_FEE;
         self.build_soroban_envelope(
             source,
             sequence,
@@ -273,12 +323,12 @@ impl SorobanTxBuilder {
                 read_only: VecM::default(),
                 read_write: vec![instance_key].try_into().unwrap_or_default(),
             },
-            instructions: 1_000_000,
-            disk_read_bytes: 5000,
-            write_bytes: 300,
+            instructions: CREATE_CONTRACT_INSTRUCTIONS,
+            disk_read_bytes: CREATE_CONTRACT_READ_BYTES,
+            write_bytes: CREATE_CONTRACT_WRITE_BYTES,
         };
 
-        let resource_fee = 10_000_000i64;
+        let resource_fee = CREATE_CONTRACT_RESOURCE_FEE;
         self.build_soroban_envelope(source, sequence, op, resources, resource_fee, inclusion_fee)
     }
 
@@ -371,12 +421,12 @@ impl SorobanTxBuilder {
             // stellar-core uses 250K instructions but our non-typed host API (P25)
             // meters XDR deserialization, consuming ~263K+ for a SAC transfer.
             // Use 2M with generous I/O limits to avoid ResourceLimitExceeded in load tests.
-            instructions: 2_000_000,
-            disk_read_bytes: 10_000,
-            write_bytes: 10_000,
+            instructions: SAC_TRANSFER_INSTRUCTIONS,
+            disk_read_bytes: SAC_TRANSFER_READ_BYTES,
+            write_bytes: SAC_TRANSFER_WRITE_BYTES,
         };
 
-        let resource_fee = 10_000_000i64;
+        let resource_fee = CREATE_CONTRACT_RESOURCE_FEE;
         self.build_soroban_envelope(
             source,
             sequence,
@@ -423,12 +473,12 @@ impl SorobanTxBuilder {
                 read_only: transfer.instance_keys.try_into().unwrap_or_default(),
                 read_write: VecM::default(),
             },
-            instructions: 500_000 * batch_size,
-            disk_read_bytes: 800 * batch_size,
-            write_bytes: 800 * batch_size,
+            instructions: BATCH_TRANSFER_INSTRUCTIONS_PER_ITEM * batch_size,
+            disk_read_bytes: BATCH_TRANSFER_READ_BYTES_PER_ITEM * batch_size,
+            write_bytes: BATCH_TRANSFER_WRITE_BYTES_PER_ITEM * batch_size,
         };
 
-        let resource_fee = 50_000_000i64;
+        let resource_fee = INVOKE_RESOURCE_FEE;
         self.build_soroban_envelope(
             source,
             sequence,
