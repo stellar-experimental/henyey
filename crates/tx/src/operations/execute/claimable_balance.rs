@@ -33,6 +33,9 @@ use crate::{Result, TxError};
 ///
 /// * `op` - The CreateClaimableBalance operation data
 /// * `source` - The source account ID
+/// * `tx_source` - The transaction-level source account (for balance ID derivation)
+/// * `tx_seq` - The transaction sequence number (for balance ID derivation)
+/// * `op_index` - The operation index within the transaction (for balance ID derivation)
 /// * `state` - The ledger state manager
 /// * `context` - The ledger context
 ///

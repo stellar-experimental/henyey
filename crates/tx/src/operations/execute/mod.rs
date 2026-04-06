@@ -388,21 +388,6 @@ pub use offer_exchange::{
     ExchangeResult, RoundingType,
 };
 
-/// Execute a single operation.
-///
-/// This is the main dispatch function that routes to the appropriate
-/// operation-specific executor based on the operation type.
-///
-/// # Arguments
-///
-/// * `op` - The operation to execute
-/// * `source_account_id` - The transaction's source account (used if operation has no explicit source)
-/// * `state` - The ledger state manager
-/// * `context` - The ledger context
-///
-/// # Returns
-///
-/// Returns the operation result, which may indicate success or a specific failure code.
 pub struct SorobanOperationMeta {
     /// Contract/system events emitted by the operation.
     pub events: Vec<ContractEvent>,
@@ -565,10 +550,6 @@ fn convert_cost_params_to_p24(
     )
     .ok()
 }
-
-// P25 XDR conversion functions (convert_cost_params_to_p25, convert_ledger_entry_to_p25)
-// have been removed after XDR alignment. The workspace stellar-xdr 25.0.0 and
-// soroban-env-host P25's stellar-xdr 25.0.0 are the same crate.
 
 fn convert_ledger_entry_to_p24(
     entry: &stellar_xdr::curr::LedgerEntry,

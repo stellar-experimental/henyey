@@ -44,9 +44,7 @@ pub struct RestoreFootprintResources<'a> {
 /// * `source` - The source account ID
 /// * `state` - The ledger state manager
 /// * `context` - The ledger context
-/// * `soroban_data` - The Soroban transaction data containing the footprint
-/// * `min_persistent_entry_ttl` - Minimum persistent entry TTL from Soroban config
-/// * `hot_archive_restores` - Entries to restore from the hot archive
+/// * `resources` - Bundled restore-specific resources (soroban data, min TTL, hot archive entries, TTL cache)
 ///
 /// # Returns
 ///

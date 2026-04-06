@@ -314,10 +314,6 @@ mod tests {
         }
     }
 
-    // P25 XDR conversion functions have been removed after XDR alignment.
-    // The workspace stellar-xdr 25.0.0 and soroban-env-host P25's stellar-xdr 25.0.0
-    // are the same crate, so all types are identical.
-
     use stellar_xdr::curr::{
         ContractDataDurability, ContractDataEntry, ContractId, LedgerKeyContractData, ScAddress,
         ScVal, TtlEntry,

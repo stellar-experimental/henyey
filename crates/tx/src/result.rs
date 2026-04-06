@@ -596,14 +596,11 @@ fn code_to_result(code: stellar_xdr::curr::TransactionResultCode) -> Transaction
 /// # Usage
 ///
 /// ```ignore
-/// // Create a result for execution
-/// let mut result = MutableTransactionResult::new(fee_charged);
+/// // Create a success result pre-populated with op_count slots
+/// let mut result = MutableTransactionResult::create_success(fee_charged, op_count);
 ///
 /// // Initialize refundable fee tracking for Soroban
 /// result.initialize_refundable_fee_tracker(max_refundable_fee);
-///
-/// // Set operation results as they complete
-/// result.set_operation_result(0, op_result);
 ///
 /// // On error, set error code (resets refundable fees)
 /// result.set_error(TransactionResultCode::TxFailed);

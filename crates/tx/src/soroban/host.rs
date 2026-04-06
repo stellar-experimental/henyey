@@ -1063,7 +1063,7 @@ fn execute_host_function_p24(
     let (contract_events, contract_events_size) =
         decode_contract_events(&result.encoded_contract_events, &make_budget_error)?;
 
-    // ── Rent: use crate's extract_rent_changes() ──
+    // ── Rent: use soroban-env-host's extract_rent_changes() ──
     let rent_changes_p24 =
         soroban_env_host24::e2e_invoke::extract_rent_changes(&result.ledger_changes);
     let rent_fee_config = rent_fee_config_p25_to_p24(&soroban_config.rent_fee_config);
@@ -1308,7 +1308,7 @@ fn execute_host_function_p25(
     let (contract_events, contract_events_size) =
         decode_contract_events(&result.encoded_contract_events, &make_budget_error)?;
 
-    // ── Rent: use crate's extract_rent_changes() ──
+    // ── Rent: use soroban-env-host's extract_rent_changes() ──
     let rent_changes = e2e_invoke::extract_rent_changes(&result.ledger_changes);
     let rent_fee = compute_rent_fee(
         &rent_changes,
@@ -1376,9 +1376,6 @@ fn rent_fee_config_p25_to_p24(
         temporary_rent_rate_denominator: config.temporary_rent_rate_denominator,
     }
 }
-
-// convert_diagnostic_events_p25 has been removed after XDR alignment.
-// DiagnosticEvent is now the same type between workspace and soroban-env-host P25.
 
 #[cfg(test)]
 mod tests {
