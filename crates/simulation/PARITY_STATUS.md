@@ -52,7 +52,7 @@ Corresponds to: `Simulation.h`
 | `startAllNodes()` | `start_all_nodes()` / `try_start_all_nodes()` | Full |
 | `stopAllNodes()` | `stop_all_nodes()` | Full |
 | `removeNode()` | `remove_node()` | Full |
-| `getAppFromPeerMap()` | `app_by_port()` | Full |
+| `getAppFromPeerMap()` | — | None (removed: unused) |
 | `haveAllExternalized()` | `have_all_externalized()` / `have_all_app_nodes_externalized()` | Full |
 | `crankNode()` | `crank_node()` | Full |
 | `crankAllNodes()` | `crank_all_nodes()` | Full |

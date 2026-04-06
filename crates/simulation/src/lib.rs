@@ -171,10 +171,6 @@ impl Simulation {
         );
     }
 
-    pub fn remove_app_node_spec(&mut self, node_id: &str) -> Option<()> {
-        self.app_specs.remove(node_id).map(|_| ())
-    }
-
     pub fn populate_app_nodes_from_existing(&mut self, threshold_percent: u32) {
         self.populate_app_nodes_from_existing_with_quorum_adjuster(
             threshold_percent,
@@ -456,23 +452,6 @@ impl Simulation {
             .with_context(|| format!("missing running app node {}", initiator))?;
         let _ = initiator_app.app.disconnect_peer(&peer_id).await;
         Ok(())
-    }
-
-    /// Look up a running app by its peer port.
-    ///
-    /// Matches stellar-core `Simulation::getAppFromPeerMap(peerPort)`.
-    pub fn app_by_port(&self, port: u16) -> Option<Arc<App>> {
-        self.running_apps
-            .values()
-            .find(|n| n.peer_port == port)
-            .map(|n| Arc::clone(&n.app))
-    }
-
-    /// Check whether a loopback link is active between two nodes.
-    ///
-    /// Exposes `LoopbackNetwork::link_active` for test assertions.
-    pub fn has_loopback_link(&self, a: &str, b: &str) -> bool {
-        self.loopback.link_active(a, b)
     }
 
     /// Get the expected next ledger close time for an app node.
