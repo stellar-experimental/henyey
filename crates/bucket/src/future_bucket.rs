@@ -103,23 +103,69 @@ impl Default for FutureBucketSnapshot {
 
 /// Async handle to receive the result of a background merge.
 pub struct MergeHandle {
-    receiver: oneshot::Receiver<Result<Bucket>>,
+    receiver: Option<oneshot::Receiver<Result<Bucket>>>,
+    /// Cached result from a previous is_complete() check that found the value ready.
+    cached_result: Option<Result<Bucket>>,
 }
 
 impl MergeHandle {
+    /// Create a new MergeHandle from a oneshot receiver.
+    fn new(receiver: oneshot::Receiver<Result<Bucket>>) -> Self {
+        Self {
+            receiver: Some(receiver),
+            cached_result: None,
+        }
+    }
+
     /// Check if the merge is complete without blocking.
+    ///
+    /// If the result is ready, it is cached internally so that a subsequent
+    /// resolve() call can still retrieve it. This avoids the problem where
+    /// try_recv() consumes the value from the oneshot channel.
     pub fn is_complete(&mut self) -> bool {
-        // Try to receive without blocking
-        matches!(
-            self.receiver.try_recv(),
-            Ok(_) | Err(oneshot::error::TryRecvError::Closed)
-        )
+        if self.cached_result.is_some() {
+            return true;
+        }
+        if let Some(ref mut receiver) = self.receiver {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.cached_result = Some(result);
+                    self.receiver = None;
+                    true
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.receiver = None;
+                    true
+                }
+                Err(oneshot::error::TryRecvError::Empty) => false,
+            }
+        } else {
+            // Receiver already consumed (channel closed without result)
+            true
+        }
     }
 
     /// Wait for the merge to complete and return the result.
     pub async fn resolve(self) -> Result<Bucket> {
+        // Return cached result if is_complete() already retrieved it
+        if let Some(result) = self.cached_result {
+            return result;
+        }
         self.receiver
+            .expect("receiver should be present if no cached result")
             .await
+            .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))?
+    }
+
+    /// Block on the merge result synchronously.
+    pub fn resolve_blocking(self) -> Result<Bucket> {
+        // Return cached result if is_complete() already retrieved it
+        if let Some(result) = self.cached_result {
+            return result;
+        }
+        self.receiver
+            .expect("receiver should be present if no cached result")
+            .blocking_recv()
             .map_err(|_| BucketError::Merge("merge task was cancelled".to_string()))?
     }
 }
@@ -213,7 +259,7 @@ impl FutureBucket {
             input_curr: Some(curr),
             input_snap: Some(snap),
             output: None,
-            merge_handle: Some(MergeHandle { receiver }),
+            merge_handle: Some(MergeHandle::new(receiver)),
             input_curr_hash: Some(curr_hash),
             input_snap_hash: Some(snap_hash),
             output_hash: None,
@@ -392,15 +438,7 @@ impl FutureBucket {
                 // instead of re-executing the merge (which would race with
                 // the background task).
                 if let Some(handle) = self.merge_handle.take() {
-                    // Use block_in_place to allow blocking within a tokio
-                    // runtime context. This moves the blocking call off the
-                    // async worker thread.
-                    let bucket = tokio::task::block_in_place(|| {
-                        handle.receiver.blocking_recv()
-                    })
-                    .map_err(|_| {
-                        BucketError::Merge("merge task was cancelled".to_string())
-                    })??;
+                    let bucket = tokio::task::block_in_place(|| handle.resolve_blocking())?;
                     return Ok(self.finalize_merge(bucket));
                 }
 
@@ -550,7 +588,7 @@ impl FutureBucket {
 
                 self.input_curr = Some(curr);
                 self.input_snap = Some(snap);
-                self.merge_handle = Some(MergeHandle { receiver });
+                self.merge_handle = Some(MergeHandle::new(receiver));
                 self.protocol_version = protocol_version;
                 self.keep_tombstones = keep_tombstones;
                 self.normalize_init = normalize_init;
@@ -1060,6 +1098,38 @@ mod tests {
         assert!(hashes.contains(&hash2));
     }
 
+    /// [AUDIT-BH3] is_complete/is_ready must not consume the merge result.
+    ///
+    /// `try_recv()` on a oneshot channel takes the value out. If is_complete()
+    /// is called when the result is ready, it consumes the value, and a
+    /// subsequent resolve() will fail with "merge task was cancelled".
+    /// The fix uses poll-based checking instead of try_recv().
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_audit_bh3_is_complete_does_not_consume_result() {
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+
+        let bucket1 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
+        let bucket2 = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap());
+
+        let mut fb = FutureBucket::start_merge(bucket1, bucket2, 25, true, false);
+
+        // Wait for the merge to complete
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Call is_ready() which calls is_complete() — this should NOT consume the result
+        assert!(fb.is_ready(), "merge should be complete after waiting");
+
+        // Now resolve() should still succeed — before fix, this would fail with
+        // "merge task was cancelled" because try_recv() consumed the value
+        let result = fb.resolve().await;
+        assert!(
+            result.is_ok(),
+            "resolve() should succeed after is_ready(): {:?}",
+            result.err()
+        );
+    }
+
     /// [AUDIT-BH2] resolve_blocking must consume the in-flight async merge
     /// rather than re-executing the merge synchronously.
     ///
@@ -1076,8 +1146,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_audit_bh2_resolve_blocking_consumes_async_merge() {
         let entry1 = make_account_entry([1u8; 32], 100);
-        let bucket =
-            Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
+        let bucket = Arc::new(Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap());
 
         // Create a oneshot channel and send a pre-computed result
         let (sender, receiver) = tokio::sync::oneshot::channel();
@@ -1098,7 +1167,7 @@ mod tests {
             input_curr: None, // Deliberately None to detect re-execution
             input_snap: None, // Deliberately None to detect re-execution
             output: None,
-            merge_handle: Some(MergeHandle { receiver }),
+            merge_handle: Some(MergeHandle::new(receiver)),
             input_curr_hash: Some(expected_hash),
             input_snap_hash: Some(Hash256::ZERO),
             output_hash: None,
