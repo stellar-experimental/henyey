@@ -524,6 +524,20 @@ pub(super) struct DeltaEntries {
     pub(super) deleted: Vec<LedgerKey>,
 }
 
+/// Snapshot of delta entries from the pre-apply phases (fee, sequence, signers).
+///
+/// Bundled together because all three are captured before operation execution
+/// and used together for rollback on failure.
+pub(super) struct PreApplySnapshot {
+    pub(super) fee_entries: DeltaEntries,
+    pub(super) seq_entries: DeltaEntries,
+    pub(super) signer_entries: DeltaEntries,
+    /// Whether to deduct the fee after rollback (true for non-fee-bump inner txs).
+    pub(super) deduct_fee: bool,
+    /// The fee amount to re-add to the delta after rollback.
+    pub(super) fee: i64,
+}
+
 /// Context for executing transactions during ledger close.
 pub struct TransactionExecutor {
     /// Ledger sequence being processed.

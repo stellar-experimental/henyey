@@ -23,7 +23,7 @@ use super::meta::*;
 use super::result_mapping::*;
 use super::signatures::*;
 use super::{
-    DeltaEntries, DeltaSlice, OperationExecutionRequest, PreApplyResult, RefundableFeeTracker,
+    DeltaSlice, OperationExecutionRequest, PreApplyResult, PreApplySnapshot, RefundableFeeTracker,
     TransactionExecutionResult, TransactionExecutor,
 };
 
@@ -611,16 +611,19 @@ impl TransactionExecutor {
         }
 
         if !all_success {
+            let pre_apply = PreApplySnapshot {
+                fee_entries,
+                seq_entries,
+                signer_entries,
+                deduct_fee,
+                fee,
+            };
             self.rollback_failed_tx(
                 &frame,
                 &fee_source_id,
                 &inner_source_id,
                 &operation_results,
-                deduct_fee,
-                fee,
-                &fee_entries,
-                &seq_entries,
-                &signer_entries,
+                &pre_apply,
                 &mut refundable_fee_tracker,
             );
             op_changes.clear();
@@ -796,18 +799,13 @@ impl TransactionExecutor {
     /// 2. Restores fee, sequence, and signer entries from the pre-apply phase
     /// 3. Re-adds the fee to the delta (so failed TXs still contribute fees)
     /// 4. Resets the refundable fee tracker (full refund on failure)
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn rollback_failed_tx(
         &mut self,
         frame: &TransactionFrame,
         fee_source_id: &AccountId,
         inner_source_id: &AccountId,
         operation_results: &[OperationResult],
-        deduct_fee: bool,
-        fee: i64,
-        fee_entries: &DeltaEntries,
-        seq_entries: &DeltaEntries,
-        signer_entries: &DeltaEntries,
+        pre_apply: &PreApplySnapshot,
         refundable_fee_tracker: &mut Option<RefundableFeeTracker>,
     ) {
         let tx_hash = frame
@@ -824,28 +822,28 @@ impl TransactionExecutor {
         self.state.rollback();
         restore_delta_entries(
             &mut self.state,
-            &fee_entries.created,
-            &fee_entries.updated,
-            &fee_entries.deleted,
+            &pre_apply.fee_entries.created,
+            &pre_apply.fee_entries.updated,
+            &pre_apply.fee_entries.deleted,
         );
         // Re-add the fee to the delta after rollback.
         // rollback() restores the delta from the snapshot taken BEFORE fee deduction,
         // so we must explicitly re-add this transaction's fee to preserve it.
         // This ensures failed transactions still contribute their fees to the fee pool.
-        if deduct_fee && fee > 0 {
-            self.state.delta_mut().add_fee(fee);
+        if pre_apply.deduct_fee && pre_apply.fee > 0 {
+            self.state.delta_mut().add_fee(pre_apply.fee);
         }
         restore_delta_entries(
             &mut self.state,
-            &seq_entries.created,
-            &seq_entries.updated,
-            &seq_entries.deleted,
+            &pre_apply.seq_entries.created,
+            &pre_apply.seq_entries.updated,
+            &pre_apply.seq_entries.deleted,
         );
         restore_delta_entries(
             &mut self.state,
-            &signer_entries.created,
-            &signer_entries.updated,
-            &signer_entries.deleted,
+            &pre_apply.signer_entries.created,
+            &pre_apply.signer_entries.updated,
+            &pre_apply.signer_entries.deleted,
         );
 
         // Reset the refundable fee tracker when transaction fails.
