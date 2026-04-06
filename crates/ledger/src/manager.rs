@@ -2798,16 +2798,18 @@ impl LedgerCloseContext<'_> {
         ]
     }
 
-    /// Apply version upgrade side effects for protocol 21.
+    /// Shared helper: load, resize, update, and persist CPU and memory cost param entries.
     ///
-    /// Parity: NetworkConfig.cpp:1432-1439 `createCostTypesForV21`
-    /// Resizes CPU and memory cost params to include ParseWasm/InstantiateWasm types
-    /// and updates VmCachedInstantiation.
-    fn create_cost_types_for_v21(&mut self) -> Result<()> {
-        use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams, ExtensionPoint};
-
-        // V21 last cost type: VerifyEcdsaSecp256r1Sig = 44
-        const NEW_SIZE: usize = 45;
+    /// Each update triple `(index, const_term, linear_term)` sets the corresponding
+    /// `ContractCostParamEntry` at the given index. Indices beyond the current
+    /// length are filled with zero entries during the resize.
+    fn resize_and_update_cost_params(
+        &mut self,
+        new_size: usize,
+        cpu_updates: &[(usize, i64, i64)],
+        mem_updates: &[(usize, i64, i64)],
+    ) -> Result<()> {
+        use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams};
 
         let make_entry = |const_term: i64, linear_term: i64| ContractCostParamEntry {
             ext: ExtensionPoint::V0,
@@ -2815,127 +2817,133 @@ impl LedgerCloseContext<'_> {
             linear_term,
         };
 
-        // --- Update CPU cost params ---
-        // Parity: NetworkConfig.cpp:340-441 updateCpuCostParamsEntryForV21
-        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
-        });
-        let cpu_entry = self.load_entry(&cpu_key)?.ok_or_else(|| {
-            LedgerError::Internal("ContractCostParamsCpuInstructions entry not found".to_string())
-        })?;
-        let mut cpu_params = if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
-        ) = &cpu_entry.data
-        {
-            params.0.to_vec()
-        } else {
-            return Err(LedgerError::Internal(
-                "Unexpected entry type for CPU cost params".to_string(),
-            ));
+        // Helper closure: load, resize, update, and persist one cost param config setting.
+        let mut update_params = |setting_id: ConfigSettingId,
+                                 updates: &[(usize, i64, i64)],
+                                 wrap: fn(ContractCostParams) -> ConfigSettingEntry,
+                                 label: &str|
+         -> Result<()> {
+            let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
+                config_setting_id: setting_id,
+            });
+            let entry = self
+                .load_entry(&key)?
+                .ok_or_else(|| LedgerError::Internal(format!("{label} entry not found")))?;
+
+            let mut params = if let LedgerEntryData::ConfigSetting(ref cs) = entry.data {
+                match cs {
+                    ConfigSettingEntry::ContractCostParamsCpuInstructions(p)
+                    | ConfigSettingEntry::ContractCostParamsMemoryBytes(p) => p.0.to_vec(),
+                    _ => {
+                        return Err(LedgerError::Internal(format!(
+                            "Unexpected entry type for {label}"
+                        )));
+                    }
+                }
+            } else {
+                return Err(LedgerError::Internal(format!(
+                    "Unexpected entry type for {label}"
+                )));
+            };
+
+            params.resize(new_size, make_entry(0, 0));
+            for &(idx, c, l) in updates {
+                params[idx] = make_entry(c, l);
+            }
+
+            let new_entry = LedgerEntry {
+                last_modified_ledger_seq: self.close_data.ledger_seq,
+                data: LedgerEntryData::ConfigSetting(wrap(ContractCostParams(
+                    params
+                        .try_into()
+                        .map_err(|_| LedgerError::Internal(format!("Failed to convert {label}")))?,
+                ))),
+                ext: LedgerEntryExt::V0,
+            };
+            self.delta.record_update(entry, new_entry)?;
+            Ok(())
         };
 
-        cpu_params.resize(NEW_SIZE, make_entry(0, 0));
+        update_params(
+            ConfigSettingId::ContractCostParamsCpuInstructions,
+            cpu_updates,
+            ConfigSettingEntry::ContractCostParamsCpuInstructions,
+            "ContractCostParamsCpuInstructions",
+        )?;
 
-        // Updated existing entry:
-        cpu_params[12] = make_entry(41142, 634); // VmCachedInstantiation
-                                                 // New entries (indices 23..=44):
-        cpu_params[23] = make_entry(73077, 25410); // ParseWasmInstructions
-        cpu_params[24] = make_entry(0, 540752); // ParseWasmFunctions
-        cpu_params[25] = make_entry(0, 176363); // ParseWasmGlobals
-        cpu_params[26] = make_entry(0, 29989); // ParseWasmTableEntries
-        cpu_params[27] = make_entry(0, 1061449); // ParseWasmTypes
-        cpu_params[28] = make_entry(0, 237336); // ParseWasmDataSegments
-        cpu_params[29] = make_entry(0, 328476); // ParseWasmElemSegments
-        cpu_params[30] = make_entry(0, 701845); // ParseWasmImports
-        cpu_params[31] = make_entry(0, 429383); // ParseWasmExports
-        cpu_params[32] = make_entry(0, 28); // ParseWasmDataSegmentBytes
-        cpu_params[33] = make_entry(43030, 0); // InstantiateWasmInstructions
-        cpu_params[34] = make_entry(0, 7556); // InstantiateWasmFunctions
-        cpu_params[35] = make_entry(0, 10711); // InstantiateWasmGlobals
-        cpu_params[36] = make_entry(0, 3300); // InstantiateWasmTableEntries
-        cpu_params[37] = make_entry(0, 0); // InstantiateWasmTypes
-        cpu_params[38] = make_entry(0, 23038); // InstantiateWasmDataSegments
-        cpu_params[39] = make_entry(0, 42488); // InstantiateWasmElemSegments
-        cpu_params[40] = make_entry(0, 828974); // InstantiateWasmImports
-        cpu_params[41] = make_entry(0, 297100); // InstantiateWasmExports
-        cpu_params[42] = make_entry(0, 14); // InstantiateWasmDataSegmentBytes
-        cpu_params[43] = make_entry(1882, 0); // Sec1DecodePointUncompressed
-        cpu_params[44] = make_entry(3000906, 0); // VerifyEcdsaSecp256r1Sig
+        update_params(
+            ConfigSettingId::ContractCostParamsMemoryBytes,
+            mem_updates,
+            ConfigSettingEntry::ContractCostParamsMemoryBytes,
+            "ContractCostParamsMemoryBytes",
+        )?;
 
-        let new_cpu_entry = LedgerEntry {
-            last_modified_ledger_seq: self.close_data.ledger_seq,
-            data: LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
-                    cpu_params.try_into().map_err(|_| {
-                        LedgerError::Internal("Failed to convert V21 CPU cost params".to_string())
-                    })?,
-                )),
-            ),
-            ext: LedgerEntryExt::V0,
-        };
-        self.delta.record_update(cpu_entry, new_cpu_entry)?;
+        Ok(())
+    }
 
-        // --- Update memory cost params ---
-        // Parity: NetworkConfig.cpp:778-880 updateMemCostParamsEntryForV21
-        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
-        });
-        let mem_entry = self.load_entry(&mem_key)?.ok_or_else(|| {
-            LedgerError::Internal("ContractCostParamsMemoryBytes entry not found".to_string())
-        })?;
-        let mut mem_params = if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
-        ) = &mem_entry.data
-        {
-            params.0.to_vec()
-        } else {
-            return Err(LedgerError::Internal(
-                "Unexpected entry type for memory cost params".to_string(),
-            ));
-        };
+    /// Apply version upgrade side effects for protocol 21.
+    ///
+    /// Parity: NetworkConfig.cpp:1432-1439 `createCostTypesForV21`
+    /// Resizes CPU and memory cost params to include ParseWasm/InstantiateWasm types
+    /// and ECDSA-secp256r1 verification.
+    fn create_cost_types_for_v21(&mut self) -> Result<()> {
+        const NEW_SIZE: usize = 45; // V21 last cost type: VerifyEcdsaSecp256r1Sig = 44
 
-        mem_params.resize(NEW_SIZE, make_entry(0, 0));
+        // CPU params: Parity: NetworkConfig.cpp:340-441 updateCpuCostParamsEntryForV21
+        let cpu_updates: &[(usize, i64, i64)] = &[
+            (12, 41142, 634),   // VmCachedInstantiation (updated)
+            (23, 73077, 25410), // ParseWasmInstructions
+            (24, 0, 540752),    // ParseWasmFunctions
+            (25, 0, 176363),    // ParseWasmGlobals
+            (26, 0, 29989),     // ParseWasmTableEntries
+            (27, 0, 1061449),   // ParseWasmTypes
+            (28, 0, 237336),    // ParseWasmDataSegments
+            (29, 0, 328476),    // ParseWasmElemSegments
+            (30, 0, 701845),    // ParseWasmImports
+            (31, 0, 429383),    // ParseWasmExports
+            (32, 0, 28),        // ParseWasmDataSegmentBytes
+            (33, 43030, 0),     // InstantiateWasmInstructions
+            (34, 0, 7556),      // InstantiateWasmFunctions
+            (35, 0, 10711),     // InstantiateWasmGlobals
+            (36, 0, 3300),      // InstantiateWasmTableEntries
+            (37, 0, 0),         // InstantiateWasmTypes
+            (38, 0, 23038),     // InstantiateWasmDataSegments
+            (39, 0, 42488),     // InstantiateWasmElemSegments
+            (40, 0, 828974),    // InstantiateWasmImports
+            (41, 0, 297100),    // InstantiateWasmExports
+            (42, 0, 14),        // InstantiateWasmDataSegmentBytes
+            (43, 1882, 0),      // Sec1DecodePointUncompressed
+            (44, 3000906, 0),   // VerifyEcdsaSecp256r1Sig
+        ];
 
-        // Updated existing entry:
-        mem_params[12] = make_entry(69472, 1217); // VmCachedInstantiation
-                                                  // New entries (indices 23..=44):
-        mem_params[23] = make_entry(17564, 6457); // ParseWasmInstructions
-        mem_params[24] = make_entry(0, 47464); // ParseWasmFunctions
-        mem_params[25] = make_entry(0, 13420); // ParseWasmGlobals
-        mem_params[26] = make_entry(0, 6285); // ParseWasmTableEntries
-        mem_params[27] = make_entry(0, 64670); // ParseWasmTypes
-        mem_params[28] = make_entry(0, 29074); // ParseWasmDataSegments
-        mem_params[29] = make_entry(0, 48095); // ParseWasmElemSegments
-        mem_params[30] = make_entry(0, 103229); // ParseWasmImports
-        mem_params[31] = make_entry(0, 36394); // ParseWasmExports
-        mem_params[32] = make_entry(0, 257); // ParseWasmDataSegmentBytes
-        mem_params[33] = make_entry(70704, 0); // InstantiateWasmInstructions
-        mem_params[34] = make_entry(0, 14613); // InstantiateWasmFunctions
-        mem_params[35] = make_entry(0, 6833); // InstantiateWasmGlobals
-        mem_params[36] = make_entry(0, 1025); // InstantiateWasmTableEntries
-        mem_params[37] = make_entry(0, 0); // InstantiateWasmTypes
-        mem_params[38] = make_entry(0, 129632); // InstantiateWasmDataSegments
-        mem_params[39] = make_entry(0, 13665); // InstantiateWasmElemSegments
-        mem_params[40] = make_entry(0, 97637); // InstantiateWasmImports
-        mem_params[41] = make_entry(0, 9176); // InstantiateWasmExports
-        mem_params[42] = make_entry(0, 126); // InstantiateWasmDataSegmentBytes
-        mem_params[43] = make_entry(0, 0); // Sec1DecodePointUncompressed
-        mem_params[44] = make_entry(0, 0); // VerifyEcdsaSecp256r1Sig
+        // Memory params: Parity: NetworkConfig.cpp:778-880 updateMemCostParamsEntryForV21
+        let mem_updates: &[(usize, i64, i64)] = &[
+            (12, 69472, 1217), // VmCachedInstantiation (updated)
+            (23, 17564, 6457), // ParseWasmInstructions
+            (24, 0, 47464),    // ParseWasmFunctions
+            (25, 0, 13420),    // ParseWasmGlobals
+            (26, 0, 6285),     // ParseWasmTableEntries
+            (27, 0, 64670),    // ParseWasmTypes
+            (28, 0, 29074),    // ParseWasmDataSegments
+            (29, 0, 48095),    // ParseWasmElemSegments
+            (30, 0, 103229),   // ParseWasmImports
+            (31, 0, 36394),    // ParseWasmExports
+            (32, 0, 257),      // ParseWasmDataSegmentBytes
+            (33, 70704, 0),    // InstantiateWasmInstructions
+            (34, 0, 14613),    // InstantiateWasmFunctions
+            (35, 0, 6833),     // InstantiateWasmGlobals
+            (36, 0, 1025),     // InstantiateWasmTableEntries
+            (37, 0, 0),        // InstantiateWasmTypes
+            (38, 0, 129632),   // InstantiateWasmDataSegments
+            (39, 0, 13665),    // InstantiateWasmElemSegments
+            (40, 0, 97637),    // InstantiateWasmImports
+            (41, 0, 9176),     // InstantiateWasmExports
+            (42, 0, 126),      // InstantiateWasmDataSegmentBytes
+            (43, 0, 0),        // Sec1DecodePointUncompressed
+            (44, 0, 0),        // VerifyEcdsaSecp256r1Sig
+        ];
 
-        let new_mem_entry = LedgerEntry {
-            last_modified_ledger_seq: self.close_data.ledger_seq,
-            data: LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
-                    mem_params.try_into().map_err(|_| {
-                        LedgerError::Internal(
-                            "Failed to convert V21 memory cost params".to_string(),
-                        )
-                    })?,
-                )),
-            ),
-            ext: LedgerEntryExt::V0,
-        };
-        self.delta.record_update(mem_entry, new_mem_entry)?;
+        self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
 
         tracing::info!(
             ledger_seq = self.close_data.ledger_seq,
@@ -2951,140 +2959,67 @@ impl LedgerCloseContext<'_> {
     /// Parity: NetworkConfig.cpp:1441-1448 `createCostTypesForV22`
     /// Resizes CPU and memory cost params to include BLS12-381 curve types.
     fn create_cost_types_for_v22(&mut self) -> Result<()> {
-        use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams, ExtensionPoint};
+        const NEW_SIZE: usize = 70; // V22 last cost type: Bls12381FrInv = 69
 
-        // V22 last cost type: Bls12381FrInv = 69
-        const NEW_SIZE: usize = 70;
+        // CPU params: Parity: NetworkConfig.cpp:443-553 updateCpuCostParamsEntryForV22
+        let cpu_updates: &[(usize, i64, i64)] = &[
+            (45, 661, 0),              // Bls12381EncodeFp
+            (46, 985, 0),              // Bls12381DecodeFp
+            (47, 1934, 0),             // Bls12381G1CheckPointOnCurve
+            (48, 730510, 0),           // Bls12381G1CheckPointInSubgroup
+            (49, 5921, 0),             // Bls12381G2CheckPointOnCurve
+            (50, 1057822, 0),          // Bls12381G2CheckPointInSubgroup
+            (51, 92642, 0),            // Bls12381G1ProjectiveToAffine
+            (52, 100742, 0),           // Bls12381G2ProjectiveToAffine
+            (53, 7689, 0),             // Bls12381G1Add
+            (54, 2458985, 0),          // Bls12381G1Mul
+            (55, 2426722, 96397671),   // Bls12381G1Msm
+            (56, 1541554, 0),          // Bls12381MapFpToG1
+            (57, 3211191, 6713),       // Bls12381HashToG1
+            (58, 25207, 0),            // Bls12381G2Add
+            (59, 7873219, 0),          // Bls12381G2Mul
+            (60, 8035968, 309667335),  // Bls12381G2Msm
+            (61, 2420202, 0),          // Bls12381MapFp2ToG2
+            (62, 7050564, 6797),       // Bls12381HashToG2
+            (63, 10558948, 632860943), // Bls12381Pairing
+            (64, 1994, 0),             // Bls12381FrFromU256
+            (65, 1155, 0),             // Bls12381FrToU256
+            (66, 74, 0),               // Bls12381FrAddSub
+            (67, 332, 0),              // Bls12381FrMul
+            (68, 691, 74558),          // Bls12381FrPow
+            (69, 35421, 0),            // Bls12381FrInv
+        ];
 
-        let make_entry = |const_term: i64, linear_term: i64| ContractCostParamEntry {
-            ext: ExtensionPoint::V0,
-            const_term,
-            linear_term,
-        };
+        // Memory params: Parity: NetworkConfig.cpp:882-990 updateMemCostParamsEntryForV22
+        let mem_updates: &[(usize, i64, i64)] = &[
+            (45, 0, 0),           // Bls12381EncodeFp
+            (46, 0, 0),           // Bls12381DecodeFp
+            (47, 0, 0),           // Bls12381G1CheckPointOnCurve
+            (48, 0, 0),           // Bls12381G1CheckPointInSubgroup
+            (49, 0, 0),           // Bls12381G2CheckPointOnCurve
+            (50, 0, 0),           // Bls12381G2CheckPointInSubgroup
+            (51, 0, 0),           // Bls12381G1ProjectiveToAffine
+            (52, 0, 0),           // Bls12381G2ProjectiveToAffine
+            (53, 0, 0),           // Bls12381G1Add
+            (54, 0, 0),           // Bls12381G1Mul
+            (55, 109494, 354667), // Bls12381G1Msm
+            (56, 5552, 0),        // Bls12381MapFpToG1
+            (57, 9424, 0),        // Bls12381HashToG1
+            (58, 0, 0),           // Bls12381G2Add
+            (59, 0, 0),           // Bls12381G2Mul
+            (60, 219654, 354667), // Bls12381G2Msm
+            (61, 3344, 0),        // Bls12381MapFp2ToG2
+            (62, 6816, 0),        // Bls12381HashToG2
+            (63, 2204, 9340474),  // Bls12381Pairing
+            (64, 0, 0),           // Bls12381FrFromU256
+            (65, 248, 0),         // Bls12381FrToU256
+            (66, 0, 0),           // Bls12381FrAddSub
+            (67, 0, 0),           // Bls12381FrMul
+            (68, 0, 128),         // Bls12381FrPow
+            (69, 0, 0),           // Bls12381FrInv
+        ];
 
-        // --- Update CPU cost params ---
-        // Parity: NetworkConfig.cpp:443-553 updateCpuCostParamsEntryForV22
-        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
-        });
-        let cpu_entry = self.load_entry(&cpu_key)?.ok_or_else(|| {
-            LedgerError::Internal("ContractCostParamsCpuInstructions entry not found".to_string())
-        })?;
-        let mut cpu_params = if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
-        ) = &cpu_entry.data
-        {
-            params.0.to_vec()
-        } else {
-            return Err(LedgerError::Internal(
-                "Unexpected entry type for CPU cost params".to_string(),
-            ));
-        };
-
-        cpu_params.resize(NEW_SIZE, make_entry(0, 0));
-
-        // New BLS12-381 entries (indices 45..=69):
-        cpu_params[45] = make_entry(661, 0); // Bls12381EncodeFp
-        cpu_params[46] = make_entry(985, 0); // Bls12381DecodeFp
-        cpu_params[47] = make_entry(1934, 0); // Bls12381G1CheckPointOnCurve
-        cpu_params[48] = make_entry(730510, 0); // Bls12381G1CheckPointInSubgroup
-        cpu_params[49] = make_entry(5921, 0); // Bls12381G2CheckPointOnCurve
-        cpu_params[50] = make_entry(1057822, 0); // Bls12381G2CheckPointInSubgroup
-        cpu_params[51] = make_entry(92642, 0); // Bls12381G1ProjectiveToAffine
-        cpu_params[52] = make_entry(100742, 0); // Bls12381G2ProjectiveToAffine
-        cpu_params[53] = make_entry(7689, 0); // Bls12381G1Add
-        cpu_params[54] = make_entry(2458985, 0); // Bls12381G1Mul
-        cpu_params[55] = make_entry(2426722, 96397671); // Bls12381G1Msm
-        cpu_params[56] = make_entry(1541554, 0); // Bls12381MapFpToG1
-        cpu_params[57] = make_entry(3211191, 6713); // Bls12381HashToG1
-        cpu_params[58] = make_entry(25207, 0); // Bls12381G2Add
-        cpu_params[59] = make_entry(7873219, 0); // Bls12381G2Mul
-        cpu_params[60] = make_entry(8035968, 309667335); // Bls12381G2Msm
-        cpu_params[61] = make_entry(2420202, 0); // Bls12381MapFp2ToG2
-        cpu_params[62] = make_entry(7050564, 6797); // Bls12381HashToG2
-        cpu_params[63] = make_entry(10558948, 632860943); // Bls12381Pairing
-        cpu_params[64] = make_entry(1994, 0); // Bls12381FrFromU256
-        cpu_params[65] = make_entry(1155, 0); // Bls12381FrToU256
-        cpu_params[66] = make_entry(74, 0); // Bls12381FrAddSub
-        cpu_params[67] = make_entry(332, 0); // Bls12381FrMul
-        cpu_params[68] = make_entry(691, 74558); // Bls12381FrPow
-        cpu_params[69] = make_entry(35421, 0); // Bls12381FrInv
-
-        let new_cpu_entry = LedgerEntry {
-            last_modified_ledger_seq: self.close_data.ledger_seq,
-            data: LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
-                    cpu_params.try_into().map_err(|_| {
-                        LedgerError::Internal("Failed to convert V22 CPU cost params".to_string())
-                    })?,
-                )),
-            ),
-            ext: LedgerEntryExt::V0,
-        };
-        self.delta.record_update(cpu_entry, new_cpu_entry)?;
-
-        // --- Update memory cost params ---
-        // Parity: NetworkConfig.cpp:882-990 updateMemCostParamsEntryForV22
-        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
-        });
-        let mem_entry = self.load_entry(&mem_key)?.ok_or_else(|| {
-            LedgerError::Internal("ContractCostParamsMemoryBytes entry not found".to_string())
-        })?;
-        let mut mem_params = if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
-        ) = &mem_entry.data
-        {
-            params.0.to_vec()
-        } else {
-            return Err(LedgerError::Internal(
-                "Unexpected entry type for memory cost params".to_string(),
-            ));
-        };
-
-        mem_params.resize(NEW_SIZE, make_entry(0, 0));
-
-        // New BLS12-381 entries (indices 45..=69):
-        mem_params[45] = make_entry(0, 0); // Bls12381EncodeFp
-        mem_params[46] = make_entry(0, 0); // Bls12381DecodeFp
-        mem_params[47] = make_entry(0, 0); // Bls12381G1CheckPointOnCurve
-        mem_params[48] = make_entry(0, 0); // Bls12381G1CheckPointInSubgroup
-        mem_params[49] = make_entry(0, 0); // Bls12381G2CheckPointOnCurve
-        mem_params[50] = make_entry(0, 0); // Bls12381G2CheckPointInSubgroup
-        mem_params[51] = make_entry(0, 0); // Bls12381G1ProjectiveToAffine
-        mem_params[52] = make_entry(0, 0); // Bls12381G2ProjectiveToAffine
-        mem_params[53] = make_entry(0, 0); // Bls12381G1Add
-        mem_params[54] = make_entry(0, 0); // Bls12381G1Mul
-        mem_params[55] = make_entry(109494, 354667); // Bls12381G1Msm
-        mem_params[56] = make_entry(5552, 0); // Bls12381MapFpToG1
-        mem_params[57] = make_entry(9424, 0); // Bls12381HashToG1
-        mem_params[58] = make_entry(0, 0); // Bls12381G2Add
-        mem_params[59] = make_entry(0, 0); // Bls12381G2Mul
-        mem_params[60] = make_entry(219654, 354667); // Bls12381G2Msm
-        mem_params[61] = make_entry(3344, 0); // Bls12381MapFp2ToG2
-        mem_params[62] = make_entry(6816, 0); // Bls12381HashToG2
-        mem_params[63] = make_entry(2204, 9340474); // Bls12381Pairing
-        mem_params[64] = make_entry(0, 0); // Bls12381FrFromU256
-        mem_params[65] = make_entry(248, 0); // Bls12381FrToU256
-        mem_params[66] = make_entry(0, 0); // Bls12381FrAddSub
-        mem_params[67] = make_entry(0, 0); // Bls12381FrMul
-        mem_params[68] = make_entry(0, 128); // Bls12381FrPow
-        mem_params[69] = make_entry(0, 0); // Bls12381FrInv
-
-        let new_mem_entry = LedgerEntry {
-            last_modified_ledger_seq: self.close_data.ledger_seq,
-            data: LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
-                    mem_params.try_into().map_err(|_| {
-                        LedgerError::Internal(
-                            "Failed to convert V22 memory cost params".to_string(),
-                        )
-                    })?,
-                )),
-            ),
-            ext: LedgerEntryExt::V0,
-        };
-        self.delta.record_update(mem_entry, new_mem_entry)?;
+        self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
 
         tracing::info!(
             ledger_seq = self.close_data.ledger_seq,
@@ -3259,8 +3194,6 @@ impl LedgerCloseContext<'_> {
     /// Resizes the CPU and memory cost param entries to include BN254 curve
     /// cost types and populates their values.
     fn create_cost_types_for_v25(&mut self) -> Result<()> {
-        use stellar_xdr::curr::{ContractCostParamEntry, ContractCostParams, ExtensionPoint};
-
         // BN254 cost type indices (from ContractCostType enum)
         const BN254_ENCODE_FP: usize = 70;
         const BN254_DECODE_FP: usize = 71;
@@ -3279,114 +3212,45 @@ impl LedgerCloseContext<'_> {
         const BN254_FR_INV: usize = 84;
         const NEW_SIZE: usize = BN254_FR_INV + 1; // 85
 
-        let make_entry = |const_term: i64, linear_term: i64| ContractCostParamEntry {
-            ext: ExtensionPoint::V0,
-            const_term,
-            linear_term,
-        };
+        // CPU params: from NetworkConfig.cpp:556-629
+        let cpu_updates: &[(usize, i64, i64)] = &[
+            (BN254_ENCODE_FP, 344, 0),
+            (BN254_DECODE_FP, 476, 0),
+            (BN254_G1_CHECK_POINT_ON_CURVE, 904, 0),
+            (BN254_G2_CHECK_POINT_ON_CURVE, 2811, 0),
+            (BN254_G2_CHECK_POINT_IN_SUBGROUP, 2937755, 0),
+            (BN254_G1_PROJECTIVE_TO_AFFINE, 61, 0),
+            (BN254_G1_ADD, 3623, 0),
+            (BN254_G1_MUL, 1150435, 0),
+            (BN254_PAIRING, 5263916, 392472814),
+            (BN254_FR_FROM_U256, 2052, 0),
+            (BN254_FR_TO_U256, 1133, 0),
+            (BN254_FR_ADD_SUB, 74, 0),
+            (BN254_FR_MUL, 332, 0),
+            (BN254_FR_POW, 755, 68930),
+            (BN254_FR_INV, 33151, 0),
+        ];
 
-        // --- Update CPU cost params ---
-        let cpu_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsCpuInstructions,
-        });
-        let cpu_entry = self.load_entry(&cpu_key)?.ok_or_else(|| {
-            LedgerError::Internal("ContractCostParamsCpuInstructions entry not found".to_string())
-        })?;
-        let mut cpu_params = if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsCpuInstructions(params),
-        ) = &cpu_entry.data
-        {
-            params.0.to_vec()
-        } else {
-            return Err(LedgerError::Internal(
-                "Unexpected entry type for CPU cost params".to_string(),
-            ));
-        };
+        // Memory params: from NetworkConfig.cpp:993-1067
+        let mem_updates: &[(usize, i64, i64)] = &[
+            (BN254_ENCODE_FP, 0, 0),
+            (BN254_DECODE_FP, 0, 0),
+            (BN254_G1_CHECK_POINT_ON_CURVE, 0, 0),
+            (BN254_G2_CHECK_POINT_ON_CURVE, 0, 0),
+            (BN254_G2_CHECK_POINT_IN_SUBGROUP, 0, 0),
+            (BN254_G1_PROJECTIVE_TO_AFFINE, 0, 0),
+            (BN254_G1_ADD, 0, 0),
+            (BN254_G1_MUL, 0, 0),
+            (BN254_PAIRING, 1821, 6232546),
+            (BN254_FR_FROM_U256, 0, 0),
+            (BN254_FR_TO_U256, 312, 0),
+            (BN254_FR_ADD_SUB, 0, 0),
+            (BN254_FR_MUL, 0, 0),
+            (BN254_FR_POW, 0, 0),
+            (BN254_FR_INV, 0, 0),
+        ];
 
-        // Resize to fit BN254 types
-        cpu_params.resize(NEW_SIZE, make_entry(0, 0));
-
-        // Set BN254 CPU cost values (from NetworkConfig.cpp:556-629)
-        cpu_params[BN254_ENCODE_FP] = make_entry(344, 0);
-        cpu_params[BN254_DECODE_FP] = make_entry(476, 0);
-        cpu_params[BN254_G1_CHECK_POINT_ON_CURVE] = make_entry(904, 0);
-        cpu_params[BN254_G2_CHECK_POINT_ON_CURVE] = make_entry(2811, 0);
-        cpu_params[BN254_G2_CHECK_POINT_IN_SUBGROUP] = make_entry(2937755, 0);
-        cpu_params[BN254_G1_PROJECTIVE_TO_AFFINE] = make_entry(61, 0);
-        cpu_params[BN254_G1_ADD] = make_entry(3623, 0);
-        cpu_params[BN254_G1_MUL] = make_entry(1150435, 0);
-        cpu_params[BN254_PAIRING] = make_entry(5263916, 392472814);
-        cpu_params[BN254_FR_FROM_U256] = make_entry(2052, 0);
-        cpu_params[BN254_FR_TO_U256] = make_entry(1133, 0);
-        cpu_params[BN254_FR_ADD_SUB] = make_entry(74, 0);
-        cpu_params[BN254_FR_MUL] = make_entry(332, 0);
-        cpu_params[BN254_FR_POW] = make_entry(755, 68930);
-        cpu_params[BN254_FR_INV] = make_entry(33151, 0);
-
-        let new_cpu_entry = LedgerEntry {
-            last_modified_ledger_seq: self.close_data.ledger_seq,
-            data: LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
-                    cpu_params.try_into().map_err(|_| {
-                        LedgerError::Internal("Failed to convert CPU cost params".to_string())
-                    })?,
-                )),
-            ),
-            ext: LedgerEntryExt::V0,
-        };
-        self.delta.record_update(cpu_entry, new_cpu_entry)?;
-
-        // --- Update memory cost params ---
-        let mem_key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
-            config_setting_id: ConfigSettingId::ContractCostParamsMemoryBytes,
-        });
-        let mem_entry = self.load_entry(&mem_key)?.ok_or_else(|| {
-            LedgerError::Internal("ContractCostParamsMemoryBytes entry not found".to_string())
-        })?;
-        let mut mem_params = if let LedgerEntryData::ConfigSetting(
-            ConfigSettingEntry::ContractCostParamsMemoryBytes(params),
-        ) = &mem_entry.data
-        {
-            params.0.to_vec()
-        } else {
-            return Err(LedgerError::Internal(
-                "Unexpected entry type for memory cost params".to_string(),
-            ));
-        };
-
-        // Resize to fit BN254 types
-        mem_params.resize(NEW_SIZE, make_entry(0, 0));
-
-        // Set BN254 memory cost values (from NetworkConfig.cpp:993-1067)
-        // Most are 0,0 except Bn254Pairing and Bn254FrToU256
-        mem_params[BN254_ENCODE_FP] = make_entry(0, 0);
-        mem_params[BN254_DECODE_FP] = make_entry(0, 0);
-        mem_params[BN254_G1_CHECK_POINT_ON_CURVE] = make_entry(0, 0);
-        mem_params[BN254_G2_CHECK_POINT_ON_CURVE] = make_entry(0, 0);
-        mem_params[BN254_G2_CHECK_POINT_IN_SUBGROUP] = make_entry(0, 0);
-        mem_params[BN254_G1_PROJECTIVE_TO_AFFINE] = make_entry(0, 0);
-        mem_params[BN254_G1_ADD] = make_entry(0, 0);
-        mem_params[BN254_G1_MUL] = make_entry(0, 0);
-        mem_params[BN254_PAIRING] = make_entry(1821, 6232546);
-        mem_params[BN254_FR_FROM_U256] = make_entry(0, 0);
-        mem_params[BN254_FR_TO_U256] = make_entry(312, 0);
-        mem_params[BN254_FR_ADD_SUB] = make_entry(0, 0);
-        mem_params[BN254_FR_MUL] = make_entry(0, 0);
-        mem_params[BN254_FR_POW] = make_entry(0, 0);
-        mem_params[BN254_FR_INV] = make_entry(0, 0);
-
-        let new_mem_entry = LedgerEntry {
-            last_modified_ledger_seq: self.close_data.ledger_seq,
-            data: LedgerEntryData::ConfigSetting(
-                ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
-                    mem_params.try_into().map_err(|_| {
-                        LedgerError::Internal("Failed to convert memory cost params".to_string())
-                    })?,
-                )),
-            ),
-            ext: LedgerEntryExt::V0,
-        };
-        self.delta.record_update(mem_entry, new_mem_entry)?;
+        self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
 
         tracing::info!(
             ledger_seq = self.close_data.ledger_seq,
