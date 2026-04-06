@@ -221,15 +221,13 @@ where
         + Send
         + 'static,
 {
-    let soroban_info_clone = soroban_info.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        sim_fn(&snapshot_source, &ledger_info, &soroban_info_clone)
-    })
-    .await
-    .map_err(|e| JsonRpcError::internal(format!("simulation task failed: {e}")))?;
+    let result =
+        tokio::task::spawn_blocking(move || sim_fn(&snapshot_source, &ledger_info, &soroban_info))
+            .await
+            .map_err(|e| JsonRpcError::internal(format!("simulation task failed: {e}")))?;
 
     match result {
-        Ok(tx_data) => build_footprint_response(tx_data, &soroban_info, latest_ledger, format),
+        Ok(tx_data) => build_footprint_response(tx_data, latest_ledger, format),
         Err(e) => build_error_response(e, latest_ledger),
     }
 }

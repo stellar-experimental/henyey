@@ -248,7 +248,6 @@ fn serialize_state_changes(
 /// `transactionData` and `minResourceFee`.
 pub(super) fn build_footprint_response(
     tx_data: SorobanTransactionData,
-    _soroban_info: &henyey_ledger::SorobanNetworkInfo,
     latest_ledger: u32,
     format: XdrFormat,
 ) -> Result<serde_json::Value, JsonRpcError> {
@@ -331,55 +330,6 @@ fn insert_sim_xdr_array_field<T: WriteXdr + serde::Serialize>(
 mod tests {
     use super::*;
     use stellar_xdr::curr::*;
-
-    fn test_soroban_network_info() -> henyey_ledger::SorobanNetworkInfo {
-        henyey_ledger::SorobanNetworkInfo {
-            max_contract_size: 65536,
-            max_contract_data_key_size: 250,
-            max_contract_data_entry_size: 65536,
-            tx_max_instructions: 100_000_000,
-            ledger_max_instructions: 2_500_000_000,
-            fee_rate_per_instructions_increment: 25,
-            tx_memory_limit: 41943040,
-            ledger_max_read_ledger_entries: 200,
-            ledger_max_read_bytes: 200_000,
-            ledger_max_write_ledger_entries: 150,
-            ledger_max_write_bytes: 65536,
-            tx_max_read_ledger_entries: 40,
-            tx_max_read_bytes: 200_000,
-            tx_max_write_ledger_entries: 25,
-            tx_max_write_bytes: 65536,
-            fee_read_ledger_entry: 6250,
-            fee_write_ledger_entry: 10000,
-            fee_read_1kb: 1786,
-            fee_write_1kb: 11800,
-            fee_historical_1kb: 16235,
-            tx_max_contract_events_size_bytes: 8198,
-            fee_contract_events_size_1kb: 10000,
-            ledger_max_tx_size_bytes: 71680,
-            tx_max_size_bytes: 71680,
-            fee_transaction_size_1kb: 1624,
-            ledger_max_tx_count: 150,
-            max_entry_ttl: 6_312_000,
-            min_temporary_ttl: 17280,
-            min_persistent_ttl: 120960,
-            persistent_rent_rate_denominator: 2103840,
-            temp_rent_rate_denominator: 4096,
-            max_entries_to_archive: 100,
-            bucketlist_size_window_sample_size: 30,
-            eviction_scan_size: 100000,
-            starting_eviction_scan_level: 7,
-            average_bucket_list_size: 100_000_000,
-            state_target_size_bytes: 134217728,
-            rent_fee_1kb_state_size_low: 1000,
-            rent_fee_1kb_state_size_high: 100000000,
-            state_size_rent_fee_growth_factor: 1000,
-            nomination_timeout_initial_ms: 1000,
-            nomination_timeout_increment_ms: 500,
-            ballot_timeout_initial_ms: 1000,
-            ballot_timeout_increment_ms: 500,
-        }
-    }
 
     fn test_account_key(key_byte: u8) -> LedgerKey {
         LedgerKey::Account(LedgerKeyAccount {
@@ -608,8 +558,7 @@ mod tests {
             },
             resource_fee: 12345,
         };
-        let info = test_soroban_network_info();
-        let resp = build_footprint_response(tx_data, &info, 100, XdrFormat::Base64).unwrap();
+        let resp = build_footprint_response(tx_data, 100, XdrFormat::Base64).unwrap();
         assert!(resp.get("transactionData").is_some());
         assert!(resp["transactionData"].is_string());
         assert_eq!(resp["minResourceFee"], "12345");
@@ -632,8 +581,7 @@ mod tests {
             },
             resource_fee: 99,
         };
-        let info = test_soroban_network_info();
-        let resp = build_footprint_response(tx_data, &info, 50, XdrFormat::Json).unwrap();
+        let resp = build_footprint_response(tx_data, 50, XdrFormat::Json).unwrap();
         // JSON mode: "transactionDataJson" instead of "transactionData"
         assert!(resp.get("transactionDataJson").is_some());
         assert!(resp.get("transactionData").is_none());

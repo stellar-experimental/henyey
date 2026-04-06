@@ -7,6 +7,27 @@ use stellar_xdr::curr::{LedgerKey, OperationBody, SorobanResources};
 /// Multiplicative adjustment factor for refundable fees (soroban-simulation default).
 const REFUNDABLE_FEE_ADJUSTMENT_FACTOR: f64 = 1.15;
 
+/// Default additive leeway applied to CPU instructions (soroban-simulation default).
+const DEFAULT_INSTRUCTION_LEEWAY: u32 = 50_000;
+
+/// Multiplicative factor for CPU instruction adjustment (soroban-simulation default).
+const INSTRUCTION_ADJUSTMENT_FACTOR: f64 = 1.04;
+
+/// Multiplicative factor for transaction-size adjustment (soroban-simulation default).
+const TX_SIZE_ADJUSTMENT_FACTOR: f64 = 1.1;
+
+/// Additive factor for transaction-size adjustment (soroban-simulation default).
+const TX_SIZE_ADDITIVE_ADJUSTMENT: u32 = 500;
+
+/// Fallback transaction size when XDR encoding fails.
+const FALLBACK_TX_SIZE: u32 = 300;
+
+/// Estimated number of signatures on the transaction envelope for size estimation.
+const MAX_SIGNATURES_ESTIMATE: usize = 20;
+
+/// Length of a single Ed25519 signature in bytes.
+const SIGNATURE_LENGTH: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Resource adjustments
 // ---------------------------------------------------------------------------
@@ -23,11 +44,15 @@ pub(super) fn sim_adjust(value: u32, multiplicative: f64, additive: u32) -> u32 
 /// Apply resource adjustment factors matching soroban-simulation defaults.
 ///
 /// `instruction_leeway` comes from the `resourceConfig.instructionLeeway` request param.
-/// The effective additive factor is `max(50_000, instruction_leeway)`.
+/// The effective additive factor is `max(DEFAULT_INSTRUCTION_LEEWAY, instruction_leeway)`.
 /// `disk_read_bytes` and `write_bytes` use `(1.0, 0)` (no additive adjustment) per upstream.
 pub(super) fn adjust_resources(resources: &mut SorobanResources, instruction_leeway: u32) {
-    let additive = 50_000u32.max(instruction_leeway);
-    resources.instructions = sim_adjust(resources.instructions, 1.04, additive);
+    let additive = DEFAULT_INSTRUCTION_LEEWAY.max(instruction_leeway);
+    resources.instructions = sim_adjust(
+        resources.instructions,
+        INSTRUCTION_ADJUSTMENT_FACTOR,
+        additive,
+    );
     resources.disk_read_bytes = sim_adjust(resources.disk_read_bytes, 1.0, 0);
     resources.write_bytes = sim_adjust(resources.write_bytes, 1.0, 0);
 }
@@ -59,9 +84,9 @@ pub(super) fn estimate_tx_size_for_op(
 
     let sig = DecoratedSignature {
         hint: SignatureHint([0u8; 4]),
-        signature: Signature::try_from(vec![0u8; 64]).unwrap_or_default(),
+        signature: Signature::try_from(vec![0u8; SIGNATURE_LENGTH]).unwrap_or_default(),
     };
-    let sigs: Vec<DecoratedSignature> = (0..20).map(|_| sig.clone()).collect();
+    let sigs: Vec<DecoratedSignature> = (0..MAX_SIGNATURES_ESTIMATE).map(|_| sig.clone()).collect();
 
     let source = MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
         id: 0,
@@ -109,10 +134,13 @@ pub(super) fn estimate_tx_size_for_op(
     let raw_size = envelope
         .to_xdr(Limits::none())
         .map(|b| b.len() as u32)
-        .unwrap_or(300);
+        .unwrap_or(FALLBACK_TX_SIZE);
 
-    // Apply tx_size adjustment: max(x + 500, floor(x * 1.1))
-    sim_adjust(raw_size, 1.1, 500)
+    sim_adjust(
+        raw_size,
+        TX_SIZE_ADJUSTMENT_FACTOR,
+        TX_SIZE_ADDITIVE_ADJUSTMENT,
+    )
 }
 
 // ---------------------------------------------------------------------------
