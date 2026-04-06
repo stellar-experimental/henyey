@@ -192,8 +192,9 @@ impl ScpQueries for Connection {
                 continue;
             }
 
-            // Collect referenced quorum set hashes
-            let mut qset_hashes = std::collections::HashSet::new();
+            // Collect referenced quorum set hashes (BTreeSet for deterministic ordering,
+            // matching stellar-core's std::set<Hash> in copySCPHistoryToStream)
+            let mut qset_hashes = std::collections::BTreeSet::new();
             for env in &envelopes {
                 let hash = scp_envelope_quorum_set_hash(env);
                 qset_hashes.insert(hash);

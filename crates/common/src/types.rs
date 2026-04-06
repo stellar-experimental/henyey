@@ -29,7 +29,7 @@ use std::fmt;
 /// let zeros = Hash256::from_bytes([0u8; 32]);
 /// assert!(zeros.is_zero());
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Hash256(pub [u8; 32]);
 
 impl Hash256 {
