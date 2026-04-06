@@ -134,6 +134,9 @@ impl MergeHandle {
                     true
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
+                    self.cached_result = Some(Err(BucketError::Merge(
+                        "merge task was cancelled".to_string(),
+                    )));
                     self.receiver = None;
                     true
                 }
