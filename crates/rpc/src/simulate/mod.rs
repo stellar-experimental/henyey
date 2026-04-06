@@ -146,13 +146,17 @@ fn extract_soroban_op(
     }
 }
 
-/// Validate memo (MemoText must be <= 28 bytes).
+/// Maximum length of a memo text field in bytes (Stellar protocol limit).
+const MAX_MEMO_TEXT_BYTES: usize = 28;
+
+/// Validate memo (MemoText must be <= MAX_MEMO_TEXT_BYTES bytes).
 fn validate_memo(memo: &stellar_xdr::curr::Memo) -> Result<(), JsonRpcError> {
     if let stellar_xdr::curr::Memo::Text(text) = memo {
-        if text.len() > 28 {
+        if text.len() > MAX_MEMO_TEXT_BYTES {
             return Err(JsonRpcError::invalid_params(format!(
-                "memo text too long: {} bytes (max 28)",
-                text.len()
+                "memo text too long: {} bytes (max {})",
+                text.len(),
+                MAX_MEMO_TEXT_BYTES,
             )));
         }
     }

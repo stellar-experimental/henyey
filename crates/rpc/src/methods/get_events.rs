@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{ContractEvent, ContractEventBody, Limits, ReadXdr, ScVal, WriteXdr};
+use stellar_xdr::curr::{
+    ContractEvent, ContractEventBody, ContractEventType, Limits, ReadXdr, ScVal, WriteXdr,
+};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -74,11 +76,11 @@ pub async fn handle(
         let close_time =
             format_unix_timestamp_utc(util::ledger_close_time(&ctx.app, event.ledger_seq));
 
-        let event_type_str = match event.event_type {
-            0 => "contract",
-            1 => "system",
-            2 => "diagnostic",
-            _ => "contract",
+        let event_type_str = match ContractEventType::try_from(event.event_type) {
+            Ok(ContractEventType::Contract) => "contract",
+            Ok(ContractEventType::System) => "system",
+            Ok(ContractEventType::Diagnostic) => "diagnostic",
+            Err(_) => "contract",
         };
 
         let mut obj = serde_json::Map::new();
