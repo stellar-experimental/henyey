@@ -1393,10 +1393,6 @@ impl ApplyLoad {
     // Upgrade helpers
     // =======================================================================
 
-    /// Apply Soroban config upgrade with the configured limits.
-    ///
-    /// Matches stellar-core `ApplyLoad::upgradeSettings()`.
-    ///
     /// Apply Soroban config upgrades for LimitBased mode.
     ///
     /// Matches stellar-core `ApplyLoad::upgradeSettings()`.

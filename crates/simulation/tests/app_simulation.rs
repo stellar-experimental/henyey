@@ -101,7 +101,7 @@ async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
     };
 
     for id in node_ids.iter().take(2) {
-        let secret = sim.secret_for_test(id).expect("secret for node");
+        let secret = sim.secret_for_node(id).expect("secret for node");
         sim.add_app_node(id.clone(), secret, quorum_set.clone());
     }
     sim.start_all_nodes().await;

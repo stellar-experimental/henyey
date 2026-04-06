@@ -778,13 +778,6 @@ impl Simulation {
             })
     }
 
-    pub fn secret_for_test(&self, node_id: &str) -> Option<SecretKey> {
-        self.app_specs
-            .get(node_id)
-            .map(|spec| spec.secret_key.clone())
-            .or_else(|| self.nodes.get(node_id).map(|n| n.secret_key.clone()))
-    }
-
     pub fn all_links(&self) -> Vec<(String, String)> {
         self.loopback.links()
     }
@@ -1113,7 +1106,7 @@ impl Simulation {
         ))))
     }
 
-    fn secret_for_node(&self, node_id: &str) -> anyhow::Result<SecretKey> {
+    pub fn secret_for_node(&self, node_id: &str) -> anyhow::Result<SecretKey> {
         self.app_specs
             .get(node_id)
             .map(|spec| spec.secret_key.clone())
