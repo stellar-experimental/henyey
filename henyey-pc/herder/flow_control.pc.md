@@ -83,11 +83,13 @@ function update_for_soroban(new_tx_max_size_bytes):
   new_max = new_tx_max_size_bytes + extra_buffer
   new_max = max(max_classic_tx_size, new_max)
 
+  diff = 0
   if new_max > self.max_tx_size:
     diff = new_max - self.max_tx_size
-    MUTATE self.max_tx_size = new_max
-    → diff
-  → 0
+
+  // Always update, even on decrease (matches stellar-core)
+  MUTATE self.max_tx_size = new_max
+  → diff
 ```
 
 ### is_tx_size_valid

@@ -384,4 +384,51 @@ mod tests {
         assert!(config.is_tx_size_valid(MAX_CLASSIC_TX_SIZE_BYTES));
         assert!(!config.is_tx_size_valid(MAX_CLASSIC_TX_SIZE_BYTES + 1));
     }
+
+    #[test]
+    fn test_decrease_then_increase_reports_correct_diff() {
+        // After a decrease, a subsequent increase should report diff relative
+        // to the decreased value, not the original high value.
+        let mut config = FlowControlConfig::default();
+
+        // Increase to 500k + buffer
+        config.update_for_soroban(500_000);
+        assert_eq!(
+            config.max_tx_size,
+            500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
+        );
+
+        // Decrease to 200k + buffer
+        let diff = config.update_for_soroban(200_000);
+        assert_eq!(diff, 0);
+        assert_eq!(
+            config.max_tx_size,
+            200_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
+        );
+
+        // Re-increase to 300k + buffer: diff should be relative to 200k, not 500k
+        let diff = config.update_for_soroban(300_000);
+        assert_eq!(
+            diff,
+            (300_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER)
+                - (200_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER)
+        );
+        assert_eq!(
+            config.max_tx_size,
+            300_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
+        );
+    }
+
+    #[test]
+    fn test_decrease_to_same_value_returns_zero_diff() {
+        let mut config = FlowControlConfig::default();
+
+        config.update_for_soroban(500_000);
+        let diff = config.update_for_soroban(500_000);
+        assert_eq!(diff, 0);
+        assert_eq!(
+            config.max_tx_size,
+            500_000 + FLOW_CONTROL_BYTES_EXTRA_BUFFER
+        );
+    }
 }
