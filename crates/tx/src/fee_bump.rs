@@ -389,7 +389,7 @@ pub fn validate_fee_bump(
     if frame.operation_count() == 0 {
         return Err(FeeBumpError::TooManyOperations(0));
     }
-    if frame.operation_count() > 100 {
+    if frame.operation_count() > crate::MAX_OPS_PER_TX {
         return Err(FeeBumpError::TooManyOperations(frame.operation_count()));
     }
 
@@ -401,7 +401,7 @@ pub fn validate_fee_bump(
     // Validate inner signatures are well-formed
     for sig in frame.inner_signatures() {
         // Signatures must be 64 bytes for Ed25519
-        if sig.signature.0.len() != 64 {
+        if sig.signature.0.len() != crate::ED25519_SIGNATURE_LENGTH {
             return Err(FeeBumpError::InvalidInnerSignature);
         }
     }

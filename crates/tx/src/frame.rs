@@ -657,8 +657,8 @@ impl TransactionFrame {
             return false;
         }
 
-        // Must have at most 100 operations
-        if self.operations().len() > 100 {
+        // Must have at most MAX_OPS_PER_TX operations
+        if self.operations().len() > crate::MAX_OPS_PER_TX {
             return false;
         }
 

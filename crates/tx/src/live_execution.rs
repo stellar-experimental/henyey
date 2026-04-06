@@ -321,7 +321,7 @@ fn calculate_fee_to_charge(
     _protocol_version: u32,
     base_fee_override: Option<i64>,
 ) -> i64 {
-    let base_fee = base_fee_override.unwrap_or(100); // Default base fee
+    let base_fee = base_fee_override.unwrap_or(crate::NETWORK_MIN_BASE_FEE);
     let op_count = std::cmp::max(1, frame.operation_count() as i64);
     let adjusted_fee = base_fee * op_count;
 

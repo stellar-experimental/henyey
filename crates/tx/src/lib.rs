@@ -112,6 +112,24 @@
 //! The crate supports multiple Stellar protocol versions and uses the correct
 //! soroban-env-host version for each protocol to ensure deterministic replay.
 
+// ---------------------------------------------------------------------------
+// Protocol-level constants
+// ---------------------------------------------------------------------------
+
+/// Maximum number of operations allowed in a single transaction.
+///
+/// Parity: stellar-core `MAX_OPS_PER_TX` (Herder.h).
+pub(crate) const MAX_OPS_PER_TX: usize = 100;
+
+/// Network minimum base fee per operation (in stroops).
+///
+/// Used as the default when no base fee is explicitly provided.
+/// Parity: stellar-core `MIN_INCLUSION_FEE` / 1 operation.
+pub(crate) const NETWORK_MIN_BASE_FEE: i64 = 100;
+
+/// Length of an Ed25519 signature in bytes.
+pub(crate) const ED25519_SIGNATURE_LENGTH: usize = 64;
+
 mod apply;
 mod error;
 mod events;

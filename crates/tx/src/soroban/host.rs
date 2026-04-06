@@ -491,14 +491,17 @@ macro_rules! define_wasm_compilation_context {
 
         impl $struct_name {
             /// Create a new compilation context with very high budget limits.
-            /// We use 10 billion CPU instructions and 1GB memory to ensure compilation
+            /// We use generous CPU and memory budgets to ensure compilation
             /// never fails due to budget constraints. The actual compilation cost is
             /// typically much lower, but we want to match stellar-core behavior which doesn't
             /// meter compilation at all.
+            const WASM_COMPILATION_CPU_BUDGET: u64 = 10_000_000_000;
+            const WASM_COMPILATION_MEM_BUDGET: u64 = 1_000_000_000;
+
             fn new() -> Self {
                 let budget = $host_crate::budget::Budget::try_from_configs(
-                    10_000_000_000,     // 10 billion CPU instructions
-                    1_000_000_000,      // 1 GB memory
+                    Self::WASM_COMPILATION_CPU_BUDGET,
+                    Self::WASM_COMPILATION_MEM_BUDGET,
                     Default::default(), // Default CPU cost params
                     Default::default(), // Default memory cost params
                 )
