@@ -76,26 +76,19 @@ impl CatchupManager {
                         TransactionSetVariant::Generalized(set.clone())
                     }
                 };
-                if let Err(e) = verify::verify_tx_set(&data.header, &tx_set) {
-                    warn!(
-                        "Transaction set verification failed for ledger {}: {}",
-                        data.header.ledger_seq, e
-                    );
-                    // Continue - tx sets may be empty for some ledgers
-                }
+                verify::verify_tx_set(&data.header, &tx_set)?;
             }
             if let Some(entry) = data.tx_result_entry.as_ref() {
-                if let Ok(xdr) = entry
+                let xdr = entry
                     .tx_result_set
                     .to_xdr(stellar_xdr::curr::Limits::none())
-                {
-                    if let Err(e) = verify::verify_tx_result_set(&data.header, &xdr) {
-                        warn!(
-                            "Transaction result set verification failed for ledger {}: {}",
+                    .map_err(|e| {
+                        HistoryError::CatchupFailed(format!(
+                            "Failed to serialize tx result set for ledger {}: {}",
                             data.header.ledger_seq, e
-                        );
-                    }
-                }
+                        ))
+                    })?;
+                verify::verify_tx_result_set(&data.header, &xdr)?;
             }
         }
 
@@ -390,6 +383,62 @@ mod tests {
                 err
             );
         }
+    }
+
+    /// [AUDIT-YH2] verify_tx_set must return a fatal error for mismatched tx set hashes.
+    /// Before fix: verify_downloaded_data logged a warning and continued.
+    /// After fix: the error propagates, halting replay.
+    #[test]
+    fn test_audit_yh2_tx_set_mismatch_is_error() {
+        use stellar_xdr::curr::{Hash, LedgerHeader, StellarValue, TransactionSet};
+
+        // Create a header with a specific tx_set_hash
+        let mut header = LedgerHeader::default();
+        header.ledger_seq = 100;
+        header.scp_value = StellarValue {
+            tx_set_hash: Hash([0xAA; 32]), // Expected hash
+            ..Default::default()
+        };
+
+        // Create an empty tx set — its hash will NOT match [0xAA; 32]
+        let tx_set = henyey_ledger::TransactionSetVariant::Classic(TransactionSet {
+            previous_ledger_hash: Hash([0; 32]),
+            txs: vec![].try_into().unwrap(),
+        });
+
+        let result = crate::verify::verify_tx_set(&header, &tx_set);
+        assert!(result.is_err(), "Mismatched tx set hash must be an error");
+        let err = result.unwrap_err();
+        assert!(
+            err.is_fatal_catchup_failure(),
+            "Tx set hash mismatch must be classified as fatal: {}",
+            err
+        );
+    }
+
+    /// [AUDIT-YH2] verify_tx_result_set must return a fatal error for mismatched result hashes.
+    #[test]
+    fn test_audit_yh2_tx_result_set_mismatch_is_error() {
+        use stellar_xdr::curr::{Hash, LedgerHeader};
+
+        let mut header = LedgerHeader::default();
+        header.ledger_seq = 100;
+        header.tx_set_result_hash = Hash([0xBB; 32]); // Expected hash
+
+        // Provide a result set whose hash won't match [0xBB; 32]
+        let fake_result_xdr = b"not the real result set";
+
+        let result = crate::verify::verify_tx_result_set(&header, fake_result_xdr);
+        assert!(
+            result.is_err(),
+            "Mismatched tx result hash must be an error"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.is_fatal_catchup_failure(),
+            "Tx result hash mismatch must be classified as fatal: {}",
+            err
+        );
     }
 
     /// Verify the exponential backoff formula used in retry.
