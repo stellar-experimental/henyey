@@ -108,6 +108,8 @@ pub struct NominationProtocol {
     ///
     /// Leaders are determined by a priority function based on the
     /// previous value and round number.
+    /// Uses BTreeSet for deterministic iteration order, matching stellar-core's
+    /// std::set<NodeID> (NominationProtocol.h:32).
     round_leaders: BTreeSet<NodeId>,
 
     /// The last envelope we constructed locally.
