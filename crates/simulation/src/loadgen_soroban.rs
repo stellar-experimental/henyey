@@ -562,16 +562,6 @@ pub fn make_contract_address(contract_id: &Hash256) -> ScAddress {
     ScAddress::Contract(ContractId(Hash(contract_id.0)))
 }
 
-/// Construct an `ScVal::U32`.
-pub fn make_u32(value: u32) -> ScVal {
-    ScVal::U32(value)
-}
-
-/// Construct an `ScVal::U64`.
-pub fn make_u64(value: u64) -> ScVal {
-    ScVal::U64(value)
-}
-
 /// Build a `LedgerKey` for a contract instance.
 pub fn contract_instance_key(contract_id: &Hash256) -> LedgerKey {
     LedgerKey::ContractData(LedgerKeyContractData {

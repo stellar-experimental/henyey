@@ -29,8 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::loadgen_soroban::{
     compute_contract_id, contract_code_key, contract_instance_key, make_account_address,
-    make_contract_address, make_u32, make_u64, BatchTransfer, ContractInvocation, SacTransfer,
-    SorobanTxBuilder,
+    make_contract_address, BatchTransfer, ContractInvocation, SacTransfer, SorobanTxBuilder,
 };
 
 // ---------------------------------------------------------------------------
@@ -241,9 +240,7 @@ impl GeneratedLoadConfig {
     ///
     /// Matches stellar-core `GeneratedLoadConfig::isDone()`.
     pub fn is_done(&self) -> bool {
-        if self.mode.is_load() {
-            self.n_txs == 0
-        } else if self.mode.is_soroban_setup() {
+        if self.mode.is_soroban_setup() {
             self.n_instances == 0
         } else {
             self.n_txs == 0
@@ -619,10 +616,10 @@ impl TxGenerator {
         let kb_per_entry = 1 + (rand_val >> 40) % 4; // 1-4 KB
 
         let args = vec![
-            make_u64(guest_cycles),
-            make_u64(host_cycles),
-            make_u32(n_entries as u32),
-            make_u32(kb_per_entry as u32),
+            ScVal::U64(guest_cycles),
+            ScVal::U64(host_cycles),
+            ScVal::U32(n_entries as u32),
+            ScVal::U32(kb_per_entry as u32),
         ];
 
         // Build read-write keys for contract data entries
@@ -1305,13 +1302,6 @@ impl LoadGenerator {
                 config.max_fee_rate,
             )
         }
-    }
-
-    /// Check if load generation is complete.
-    ///
-    /// Matches stellar-core `LoadGenerator::isDone()`.
-    pub fn is_done(&self, config: &GeneratedLoadConfig) -> bool {
-        config.is_done()
     }
 
     /// Stop load generation.
