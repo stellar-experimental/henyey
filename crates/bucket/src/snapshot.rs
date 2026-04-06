@@ -435,7 +435,11 @@ impl BucketListSnapshot {
                 if remaining.is_empty() {
                     break;
                 }
+                let mut bucket_err = None;
                 remaining.retain(|(key, key_bytes)| {
+                    if bucket_err.is_some() {
+                        return true;
+                    }
                     match bucket.get_result_by_key_bytes(key, key_bytes) {
                         Ok(Some(entry)) => match entry {
                             BucketEntry::Liveentry(ref e) | BucketEntry::Initentry(ref e) => {
@@ -446,9 +450,15 @@ impl BucketListSnapshot {
                             BucketEntry::Metaentry(_) => true,
                         },
                         Ok(None) => true,
-                        Err(_) => true,
+                        Err(e) => {
+                            bucket_err = Some(e);
+                            true
+                        }
                     }
                 });
+                if let Some(e) = bucket_err {
+                    return Err(e);
+                }
             }
         }
 
