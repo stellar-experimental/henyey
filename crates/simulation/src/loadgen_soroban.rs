@@ -378,40 +378,11 @@ impl SorobanTxBuilder {
         // Build read_write footprint entries matching stellar-core:
         // 1. Source account entry (for balance deduction)
         // 2. Destination balance CONTRACT_DATA entry (for SAC balance tracking)
-        let mut read_write_keys = Vec::new();
-
-        // Source account key
-        if let ScAddress::Account(ref aid) = transfer.from_address {
-            read_write_keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                account_id: aid.clone(),
-            }));
-        }
-
-        // Destination balance key (CONTRACT_DATA with Balance + to_address)
-        match &transfer.to_address {
-            ScAddress::Contract(_) => {
-                read_write_keys.push(LedgerKey::ContractData(
-                    stellar_xdr::curr::LedgerKeyContractData {
-                        contract: make_contract_address(&transfer.contract_id),
-                        key: ScVal::Vec(Some(stellar_xdr::curr::ScVec(
-                            vec![
-                                ScVal::Symbol(ScSymbol("Balance".try_into().unwrap())),
-                                ScVal::Address(transfer.to_address),
-                            ]
-                            .try_into()
-                            .unwrap_or_default(),
-                        ))),
-                        durability: stellar_xdr::curr::ContractDataDurability::Persistent,
-                    },
-                ));
-            }
-            ScAddress::Account(ref aid) => {
-                read_write_keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
-                    account_id: aid.clone(),
-                }));
-            }
-            _ => {} // MuxedAccount, ClaimableBalance, LiquidityPool not used in load test
-        }
+        let read_write_keys = build_sac_transfer_rw_keys(
+            &transfer.from_address,
+            transfer.to_address,
+            &transfer.contract_id,
+        );
 
         let resources = SorobanResources {
             footprint: LedgerFootprint {
@@ -626,6 +597,55 @@ pub fn contract_code_key(wasm_hash: &Hash256) -> LedgerKey {
     LedgerKey::ContractCode(LedgerKeyContractCode {
         hash: Hash(wasm_hash.0),
     })
+}
+
+/// Build the read-write footprint keys for a SAC `transfer` invocation.
+///
+/// Returns keys for:
+/// 1. Source account (if the sender is an account, not a contract)
+/// 2. Destination balance entry (CONTRACT_DATA for contracts, Account for accounts)
+fn build_sac_transfer_rw_keys(
+    from_address: &ScAddress,
+    to_address: ScAddress,
+    contract_id: &Hash256,
+) -> Vec<LedgerKey> {
+    let mut keys = Vec::new();
+
+    // Source account key
+    if let ScAddress::Account(ref aid) = from_address {
+        keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: aid.clone(),
+        }));
+    }
+
+    // Destination balance key
+    match &to_address {
+        ScAddress::Contract(_) => {
+            let balance_key = ScVal::Vec(Some(stellar_xdr::curr::ScVec(
+                vec![
+                    ScVal::Symbol(ScSymbol("Balance".try_into().unwrap())),
+                    ScVal::Address(to_address),
+                ]
+                .try_into()
+                .unwrap_or_default(),
+            )));
+            keys.push(LedgerKey::ContractData(
+                stellar_xdr::curr::LedgerKeyContractData {
+                    contract: make_contract_address(contract_id),
+                    key: balance_key,
+                    durability: stellar_xdr::curr::ContractDataDurability::Persistent,
+                },
+            ));
+        }
+        ScAddress::Account(ref aid) => {
+            keys.push(LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: aid.clone(),
+            }));
+        }
+        _ => {} // MuxedAccount, ClaimableBalance, LiquidityPool not used in load test
+    }
+
+    keys
 }
 
 /// Sign a `TransactionEnvelope` and attach the signature.

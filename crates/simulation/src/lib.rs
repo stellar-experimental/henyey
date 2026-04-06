@@ -633,15 +633,7 @@ impl Simulation {
     ///
     /// Matches stellar-core `Simulation::crankForAtMost(duration, finalCrank)`.
     pub async fn crank_for_at_most(&mut self, duration: Duration, final_crank: bool) {
-        let deadline = tokio::time::Instant::now() + duration;
-        while tokio::time::Instant::now() < deadline {
-            if !self.crank_all_nodes().await {
-                break;
-            }
-        }
-        if final_crank {
-            let _ = self.crank_all_nodes().await;
-        }
+        self.crank_loop(duration, true, final_crank).await;
     }
 
     /// Crank all lightweight SimNodes repeatedly for at least `duration`
@@ -649,9 +641,20 @@ impl Simulation {
     ///
     /// Matches stellar-core `Simulation::crankForAtLeast(duration, finalCrank)`.
     pub async fn crank_for_at_least(&mut self, duration: Duration, final_crank: bool) {
+        self.crank_loop(duration, false, final_crank).await;
+    }
+
+    /// Shared crank loop.
+    ///
+    /// When `stop_when_idle` is true, the loop breaks early if no node did work
+    /// (at-most semantics). Otherwise it runs until the deadline (at-least semantics).
+    async fn crank_loop(&mut self, duration: Duration, stop_when_idle: bool, final_crank: bool) {
         let deadline = tokio::time::Instant::now() + duration;
         loop {
-            let _ = self.crank_all_nodes().await;
+            let did_work = self.crank_all_nodes().await;
+            if stop_when_idle && !did_work {
+                break;
+            }
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
@@ -878,12 +881,8 @@ impl Simulation {
         data_dir: Arc<TempDir>,
         peer_port: u16,
     ) -> anyhow::Result<RunningAppNode> {
-        let app = Arc::new(app);
-        app.set_self_arc().await;
+        let app = Self::wrap_app(app).await;
         app.bootstrap_from_db().await?;
-        // All simulation transactions are loadgen txs — skip fee balance checks
-        // to match stellar-core's `isLoadgenTx` bypass in TransactionQueue::canAdd().
-        app.set_skip_fee_balance_check(true);
         Self::spawn_app_run_loop(app, data_dir, peer_port)
     }
 
@@ -896,8 +895,7 @@ impl Simulation {
         data_dir: Arc<TempDir>,
         peer_port: u16,
     ) -> anyhow::Result<RunningAppNode> {
-        let app = Arc::new(app);
-        app.set_self_arc().await;
+        let app = Self::wrap_app(app).await;
 
         // Restore the LedgerManager from persisted DB + on-disk buckets.
         // App::run() will read the restored ledger via get_current_ledger()
@@ -919,10 +917,18 @@ impl Simulation {
             }
         }
 
+        Self::spawn_app_run_loop(app, data_dir, peer_port)
+    }
+
+    /// Wrap a raw `App` in an `Arc`, set its self-reference, and configure
+    /// it for simulation (skip fee balance checks).
+    async fn wrap_app(app: App) -> Arc<App> {
+        let app = Arc::new(app);
+        app.set_self_arc().await;
         // All simulation transactions are loadgen txs — skip fee balance checks
         // to match stellar-core's `isLoadgenTx` bypass in TransactionQueue::canAdd().
         app.set_skip_fee_balance_check(true);
-        Self::spawn_app_run_loop(app, data_dir, peer_port)
+        app
     }
 
     fn spawn_app_run_loop(
