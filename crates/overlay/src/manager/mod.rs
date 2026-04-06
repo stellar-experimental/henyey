@@ -519,31 +519,54 @@ impl OverlayManager {
             None // non-flood: send to all
         };
 
-        debug!("Broadcasting {} to {} peers", msg_type, self.peers.len());
+        // Collect target peer IDs so we can move the message into the last send.
+        let target_peers: Vec<PeerId> = self
+            .peers
+            .iter()
+            .filter_map(|entry| {
+                let peer_id = entry.key();
+                if let Some(ref forward) = forward_peers {
+                    if !forward.contains(peer_id) {
+                        return None;
+                    }
+                }
+                Some(peer_id.clone())
+            })
+            .collect();
+
+        debug!("Broadcasting {} to {} peers", msg_type, target_peers.len());
 
         let mut sent = 0usize;
-        for entry in self.peers.iter() {
-            let peer_id = entry.key();
-            // For flood messages, skip peers excluded by FloodGate
-            if let Some(ref forward) = forward_peers {
-                if !forward.contains(peer_id) {
-                    trace!("Skipping flood to {} (already has message)", peer_id);
-                    continue;
+        let num_targets = target_peers.len();
+        let mut message = Some(message);
+        for (i, peer_id) in target_peers.iter().enumerate() {
+            let is_last = i + 1 == num_targets;
+            let outbound_msg = if is_last {
+                // Move the original into the last send to avoid one clone.
+                let msg = message.take().unwrap();
+                if is_flood {
+                    OutboundMessage::Flood(msg)
+                } else {
+                    OutboundMessage::Send(msg)
                 }
-            }
-
-            let outbound_msg = if is_flood {
-                OutboundMessage::Flood(message.clone())
             } else {
-                OutboundMessage::Send(message.clone())
-            };
-            match entry.value().outbound_tx.try_send(outbound_msg) {
-                Ok(()) => sent += 1,
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    debug!("Outbound channel full for {}, dropping broadcast", peer_id);
+                // Clone for all but the last peer.
+                let msg = message.as_ref().unwrap().clone();
+                if is_flood {
+                    OutboundMessage::Flood(msg)
+                } else {
+                    OutboundMessage::Send(msg)
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    debug!("Outbound channel closed for {}", peer_id);
+            };
+            if let Some(entry) = self.peers.get(peer_id) {
+                match entry.value().outbound_tx.try_send(outbound_msg) {
+                    Ok(()) => sent += 1,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        debug!("Outbound channel full for {}, dropping broadcast", peer_id);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        debug!("Outbound channel closed for {}", peer_id);
+                    }
                 }
             }
         }

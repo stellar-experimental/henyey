@@ -339,13 +339,13 @@ pub struct FlowControl {
     /// Optional callback for intelligent SCP queue trimming.
     scp_callback: Option<Arc<dyn ScpQueueCallback>>,
     /// Metrics - messages dropped from SCP queue.
-    pub dropped_scp: AtomicU64,
+    pub(crate) dropped_scp: AtomicU64,
     /// Metrics - messages dropped from TX queue.
-    pub dropped_txs: AtomicU64,
+    pub(crate) dropped_txs: AtomicU64,
     /// Metrics - messages dropped from advert queue.
-    pub dropped_adverts: AtomicU64,
+    pub(crate) dropped_adverts: AtomicU64,
     /// Metrics - messages dropped from demand queue.
-    pub dropped_demands: AtomicU64,
+    pub(crate) dropped_demands: AtomicU64,
 }
 
 impl FlowControl {
@@ -511,7 +511,7 @@ impl FlowControl {
 
         // Add to queue
         state.outbound_queues[queue_idx].push_back(QueuedOutboundMessage {
-            message: msg.clone(),
+            message: msg,
             time_emplaced: Instant::now(),
             being_sent: false,
         });
@@ -943,7 +943,7 @@ pub fn is_flow_controlled_message(msg: &StellarMessage) -> bool {
 }
 
 /// Get message body size in bytes without heap allocation.
-pub fn msg_body_size(msg: &StellarMessage) -> u64 {
+pub(crate) fn msg_body_size(msg: &StellarMessage) -> u64 {
     henyey_common::xdr_encoded_len(msg) as u64
 }
 
@@ -957,7 +957,7 @@ pub fn msg_body_size(msg: &StellarMessage) -> u64 {
 /// For the normal path, call [`CapacityGuard::finish`] to consume the guard
 /// and retrieve the [`SendMoreCapacity`] needed to decide whether to send
 /// `SEND_MORE_EXTENDED` back to the peer.
-pub struct CapacityGuard {
+pub(crate) struct CapacityGuard {
     flow_control: Arc<FlowControl>,
     message: Option<StellarMessage>,
 }
@@ -966,7 +966,7 @@ impl CapacityGuard {
     /// Create a new guard, locking local capacity for `msg`.
     ///
     /// Returns `None` if the flow control rejected the message (no capacity).
-    pub fn new(flow_control: Arc<FlowControl>, msg: StellarMessage) -> Option<Self> {
+    pub(crate) fn new(flow_control: Arc<FlowControl>, msg: StellarMessage) -> Option<Self> {
         if flow_control.begin_message_processing(&msg) {
             Some(Self {
                 flow_control,
@@ -981,7 +981,7 @@ impl CapacityGuard {
     ///
     /// This is the normal-path exit: it releases capacity and tells the
     /// caller whether to send `SEND_MORE_EXTENDED`.
-    pub fn finish(mut self) -> SendMoreCapacity {
+    pub(crate) fn finish(mut self) -> SendMoreCapacity {
         // Take the message so Drop becomes a no-op.
         let msg = self.message.take().expect("finish called twice");
         self.flow_control.end_message_processing(&msg)
