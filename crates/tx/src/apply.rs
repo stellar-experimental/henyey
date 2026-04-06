@@ -464,16 +464,18 @@ fn apply_ledger_entry_changes(changes: &LedgerEntryChanges, delta: &mut LedgerDe
                 delta.record_create(entry.clone());
             }
             LedgerEntryChange::Updated(entry) => {
-                // Use the preceding STATE as pre_state, or the entry itself as fallback
-                let pre_state = pending_state.take().unwrap_or_else(|| entry.clone());
+                // STATE must always precede UPDATED in valid XDR meta
+                let pre_state = pending_state
+                    .take()
+                    .expect("UPDATED entry must be preceded by STATE in ledger entry changes");
                 delta.record_update(pre_state, entry.clone());
             }
             LedgerEntryChange::Removed(key) => {
-                // Use the preceding STATE as pre_state, or create a placeholder if missing
-                if let Some(pre_state) = pending_state.take() {
-                    delta.record_delete(key.clone(), pre_state);
-                }
-                // If no STATE preceded this REMOVED, skip recording (shouldn't happen in valid meta)
+                // STATE must always precede REMOVED in valid XDR meta
+                let pre_state = pending_state
+                    .take()
+                    .expect("REMOVED entry must be preceded by STATE in ledger entry changes");
+                delta.record_delete(key.clone(), pre_state);
             }
             LedgerEntryChange::State(entry) => {
                 // Store STATE for the next UPDATED/REMOVED
