@@ -539,11 +539,13 @@ impl OverlayManager {
         let Some(entry) = self.peers.get(peer_id) else {
             return false;
         };
+        // Use try_send to avoid blocking if the peer's channel is full.
+        // The peer_loop will exit on its own via the `running` flag or
+        // straggler timeout.
         let _ = entry
             .value()
             .outbound_tx
-            .send(OutboundMessage::Shutdown)
-            .await;
+            .try_send(OutboundMessage::Shutdown);
         true
     }
 
@@ -554,8 +556,7 @@ impl OverlayManager {
             let _ = entry
                 .value()
                 .outbound_tx
-                .send(OutboundMessage::Shutdown)
-                .await;
+                .try_send(OutboundMessage::Shutdown);
         }
     }
 
@@ -570,7 +571,11 @@ impl OverlayManager {
     }
 
     /// Send a message to a specific peer.
-    pub async fn send_to(&self, peer_id: &PeerId, message: StellarMessage) -> Result<()> {
+    ///
+    /// Non-blocking: drops the message if the peer's outbound channel is full,
+    /// returning `Err(ChannelSend)`. This prevents a slow/malicious peer from
+    /// stalling the caller (matching stellar-core's non-blocking sendMessage).
+    pub fn send_to(&self, peer_id: &PeerId, message: StellarMessage) -> Result<()> {
         let entry = self
             .peers
             .get(peer_id)
@@ -579,8 +584,7 @@ impl OverlayManager {
         entry
             .value()
             .outbound_tx
-            .send(OutboundMessage::Send(message))
-            .await
+            .try_send(OutboundMessage::Send(message))
             .map_err(|_| OverlayError::ChannelSend)
     }
 
@@ -953,7 +957,7 @@ impl OverlayManager {
             hash = hex::encode(&hash.0),
             "Requesting transaction set from peer"
         );
-        self.send_to(peer_id, message).await
+        self.send_to(peer_id, message)
     }
 
     /// Request a quorum set by hash from a specific peer.
@@ -966,7 +970,7 @@ impl OverlayManager {
             hash = hex::encode(&hash.0),
             "Requesting quorum set from peer"
         );
-        self.send_to(peer_id, message).await
+        self.send_to(peer_id, message)
     }
 
     pub(super) fn add_known_peer(&self, addr: PeerAddress) -> bool {
@@ -992,14 +996,16 @@ impl OverlayManager {
             let _ = tx.send(());
         }
 
-        // Send shutdown to all peer tasks via their channels
+        // Send shutdown to all peer tasks via their channels.
+        // Use try_send to avoid blocking: the `running` flag (set to false
+        // above) ensures peer_loops exit on their next iteration regardless.
         let senders: Vec<_> = self
             .peers
             .iter()
             .map(|e| e.value().outbound_tx.clone())
             .collect();
         for tx in senders {
-            let _ = tx.send(OutboundMessage::Shutdown).await;
+            let _ = tx.try_send(OutboundMessage::Shutdown);
         }
         self.peers.clear();
 
