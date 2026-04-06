@@ -17,7 +17,8 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use soroban_env_host_p25 as soroban_host;
 use stellar_xdr::curr::{
-    HostFunction, LedgerKey, Limits, OperationBody, ReadXdr, TransactionEnvelope,
+    HostFunction, LedgerKey, Limits, OperationBody, ReadXdr, SorobanTransactionData,
+    TransactionEnvelope,
 };
 
 use crate::context::RpcContext;
@@ -195,6 +196,45 @@ fn extract_footprint_keys(
 }
 
 // ---------------------------------------------------------------------------
+// Footprint simulation helper
+// ---------------------------------------------------------------------------
+
+/// Run a footprint-only simulation (ExtendFootprintTtl or RestoreFootprint) in a
+/// blocking task and build the JSON-RPC response.
+///
+/// The caller provides a closure that performs the actual simulation given
+/// references to the snapshot source, ledger info, and soroban network config.
+async fn run_footprint_simulation<F>(
+    snapshot_source: BucketListSnapshotSource,
+    ledger_info: soroban_host::LedgerInfo,
+    soroban_info: henyey_ledger::SorobanNetworkInfo,
+    latest_ledger: u32,
+    format: XdrFormat,
+    sim_fn: F,
+) -> Result<serde_json::Value, JsonRpcError>
+where
+    F: FnOnce(
+            &BucketListSnapshotSource,
+            &soroban_host::LedgerInfo,
+            &henyey_ledger::SorobanNetworkInfo,
+        ) -> Result<SorobanTransactionData, String>
+        + Send
+        + 'static,
+{
+    let soroban_info_clone = soroban_info.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        sim_fn(&snapshot_source, &ledger_info, &soroban_info_clone)
+    })
+    .await
+    .map_err(|e| JsonRpcError::internal(format!("simulation task failed: {e}")))?;
+
+    match result {
+        Ok(tx_data) => build_footprint_response(tx_data, &soroban_info, latest_ledger, format),
+        Err(e) => build_error_response(e, latest_ledger),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handler entry point
 // ---------------------------------------------------------------------------
 
@@ -298,23 +338,15 @@ pub async fn handle(
                     "authMode is only supported for InvokeHostFunction operations",
                 ));
             }
-            let soroban_info_clone = soroban_info.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                simulate_extend_ttl_op(
-                    &snapshot_source,
-                    &ledger_info,
-                    &keys,
-                    extend_to,
-                    &soroban_info_clone,
-                )
-            })
+            run_footprint_simulation(
+                snapshot_source,
+                ledger_info,
+                soroban_info,
+                ledger.num,
+                format,
+                move |snap, li, si| simulate_extend_ttl_op(snap, li, &keys, extend_to, si),
+            )
             .await
-            .map_err(|e| JsonRpcError::internal(format!("simulation task failed: {e}")))?;
-
-            match result {
-                Ok(tx_data) => build_footprint_response(tx_data, &soroban_info, ledger.num, format),
-                Err(e) => build_error_response(e, ledger.num),
-            }
         }
         SorobanOp::RestoreFootprint { keys } => {
             if !auth_mode_str.is_empty() {
@@ -322,17 +354,15 @@ pub async fn handle(
                     "authMode is only supported for InvokeHostFunction operations",
                 ));
             }
-            let soroban_info_clone = soroban_info.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                simulate_restore_op(&snapshot_source, &ledger_info, &keys, &soroban_info_clone)
-            })
+            run_footprint_simulation(
+                snapshot_source,
+                ledger_info,
+                soroban_info,
+                ledger.num,
+                format,
+                move |snap, li, si| simulate_restore_op(snap, li, &keys, si),
+            )
             .await
-            .map_err(|e| JsonRpcError::internal(format!("simulation task failed: {e}")))?;
-
-            match result {
-                Ok(tx_data) => build_footprint_response(tx_data, &soroban_info, ledger.num, format),
-                Err(e) => build_error_response(e, ledger.num),
-            }
         }
     }
 }
