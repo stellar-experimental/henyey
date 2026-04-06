@@ -235,13 +235,14 @@ Store the crate context for reference while auditing individual files.
 
 ### 1c: Initialize Tracking
 
-Use TodoWrite to create a task list tracking progress through the target files.
+Use TaskCreate to create tasks tracking progress through the target files.
 Group by crate if auditing multiple crates.
 
 Initialize counters:
 ```
 files_audited = 0
 findings = []  # (severity, crate, title, body)
+next_audit_id = 1  # auto-incrementing ID for [AUDIT-NNN] issue titles
 ```
 
 ---
@@ -276,6 +277,12 @@ Look for these vulnerability classes, ordered by severity:
 - Determinism violations: any code path where two honest nodes processing
   the same ledger could reach different states (floating point, HashMap
   iteration order, system clock usage, thread-dependent ordering)
+- Protocol-version-dependent code paths: stellar-core uses different Apply
+  helpers for pre-V23 vs parallel execution
+  (`PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION = V23`). Check that
+  ExtendFootprintTtl, RestoreFootprint, and InvokeHostFunction correctly
+  gate resource limit enforcement and metering by protocol version. Real
+  bugs VE-14 through VE-17 were all in this category.
 
 **HIGH:**
 - Integer overflow/underflow in financial calculations (balances, fees,
@@ -307,8 +314,8 @@ accepting it:
    If any rule applies, discard the finding.
 
 2. **Parity check** (for consensus-critical crates): Read the corresponding
-   stellar-core code using the crate-to-upstream mapping. Use subagents
-   (Task tool with `explore` type) to read the upstream `.h` and `.cpp` files.
+   stellar-core code using the crate-to-upstream mapping. Use the Agent tool
+   with `subagent_type: "Explore"` to read the upstream `.h` and `.cpp` files.
    If the behavior matches, discard the finding.
 
 3. **Call-site reachability check**: Search for production callers of the
@@ -331,7 +338,14 @@ accepting it:
    ```
    If a matching issue already exists, skip to avoid duplicates.
 
-Only findings that survive all 6 checks are accepted.
+7. **Parallel execution path check** (for Soroban ops in tx/ledger crates):
+   If the code handles ExtendFootprintTtl, RestoreFootprint, or
+   InvokeHostFunction, read both the `*PreV23ApplyHelper` and
+   `*ParallelApplyHelper` classes in the corresponding stellar-core `.cpp`.
+   Verify our code handles both protocol paths correctly (typically via
+   `protocol_version < 23` or `protocol_version_is_before(V23)` gating).
+
+Only findings that survive all 7 checks are accepted.
 
 ### 2d: Record Findings
 
@@ -361,8 +375,8 @@ rpc herder app
 history historywork db common work simulation clock henyey
 ```
 
-For each crate, use subagents (Task tool with `explore` type) to read files
-and gather context efficiently. Launch exploration agents to:
+For each crate, use the Agent tool with `subagent_type: "Explore"` to read
+files and gather context efficiently. Launch exploration agents to:
 - Read all `.rs` files in the crate's `src/` directory
 - Identify key data structures, public APIs, and state machines
 - Flag potential vulnerability patterns for detailed analysis
@@ -401,15 +415,15 @@ format below and stop.
 For each confirmed finding, file a GitHub issue:
 
 ```bash
-gh issue create --title "[SEVERITY] [CRATE] Short title" \
-  --label "security,audit,SEVERITY_LOWERCASE" \
+gh issue create --title "[AUDIT-NNN] Short title" \
+  --label "security,audit,SEVERITY_LOWERCASE,crate:CRATE_NAME" \
   --body "$(cat <<'EOF'
 ## Audit Finding
 
 **Source file**: `FILE_PATH`
 **Crate**: `CRATE_NAME`
 **Severity**: SEVERITY
-**Source**: Automated security audit (skill: /audit)
+**Source**: Automated security audit (skill: /audit-ctf)
 
 ---
 
@@ -427,6 +441,12 @@ FINDING_DESCRIPTION
 EOF
 )"
 ```
+
+Where `NNN` is the zero-padded `next_audit_id` (e.g., `AUDIT-001`, `AUDIT-002`).
+Increment `next_audit_id` after each issue is created. The `[AUDIT-NNN]` prefix
+is required for compatibility with `/security-fix` and `/security-fix-loop`.
+
+Create `crate:CRATE_NAME` labels on-the-fly if they don't exist yet.
 
 Severity label values: `critical`, `high`, `medium`, `low`.
 
@@ -463,8 +483,8 @@ Findings:      0 — No significant findings.
 ## Guidelines
 
 - **Use subagents for exploration.** When you need to read stellar-core files,
-  search for callers, or scan multiple files for a pattern, launch Task agents
-  with `explore` type. Do not read everything sequentially.
+  search for callers, or scan multiple files for a pattern, use the Agent tool
+  with `subagent_type: "Explore"`. Do not read everything sequentially.
 - **When in doubt, read stellar-core.** The #1 source of false positives is
   flagging behavior that matches upstream. Spend the time to check parity
   rather than filing a dubious finding.
@@ -483,3 +503,7 @@ Findings:      0 — No significant findings.
 - **Do not report issues that require physical infeasibility.** Integer
   wraparound at `u32::MAX` that would take 680 years at current rates is not
   exploitable.
+- **Cost awareness.** A full-codebase audit (~350 files) with thorough parity
+  checks is expensive due to many tool calls per file. Prefer auditing one
+  crate at a time (`--crate <name>`) rather than all at once. Use `--dry-run`
+  to preview findings before filing issues.
