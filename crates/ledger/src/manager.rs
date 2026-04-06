@@ -1374,7 +1374,10 @@ impl LedgerManager {
     /// `BucketLevel::clone()` drops unresolved async merges. After calling
     /// this, all pending merges are `PendingMerge::InMemory` and safe to clone.
     pub fn resolve_pending_bucket_merges(&self) {
-        self.bucket_list.write().resolve_all_pending_merges();
+        self.bucket_list
+            .write()
+            .resolve_all_pending_merges()
+            .expect("bucket merge failure is fatal — cannot continue with corrupt bucket list");
     }
 
     /// Get a lock on the unified offer store for direct access.

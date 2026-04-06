@@ -522,7 +522,7 @@ pub fn replay_ledger_with_execution(
 
     // Resolve all pending async merges before cloning.
     // This ensures merge results are cached and won't be lost during clone.
-    bucket_list.resolve_all_pending_merges();
+    bucket_list.resolve_all_pending_merges()?;
 
     // Create snapshot with the correct id_pool from the previous ledger.
     // This is critical for correct offer ID assignment during transaction execution.

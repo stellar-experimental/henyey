@@ -124,6 +124,39 @@ fn make_account_key(seed: u8) -> LedgerKey {
     })
 }
 
+/// Like `make_account_entry` but accepts a u32 seed to avoid key collisions
+/// when generating more than 256 unique entries.
+fn make_account_entry_wide(seed: u32, balance: i64) -> LedgerEntry {
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&seed.to_be_bytes());
+
+    LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes))),
+            balance,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: Vec::new().try_into().unwrap(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    }
+}
+
+fn make_account_key_wide(seed: u32) -> LedgerKey {
+    let mut bytes = [0u8; 32];
+    bytes[0..4].copy_from_slice(&seed.to_be_bytes());
+
+    LedgerKey::Account(LedgerKeyAccount {
+        account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes))),
+    })
+}
+
 // =============================================================================
 // Hot Archive Integration Tests
 // =============================================================================
@@ -274,15 +307,15 @@ async fn test_bucket_list_basic_operations() {
     let mut bl = BucketList::new();
 
     // Add batches and verify bucket sizes stay reasonable
-    for i in 1..=130 {
-        let entries: Vec<_> = (0..8)
-            .map(|j| make_account_entry((i * 10 + j) as u8, 100 * i as i64))
+    for i in 1..=130u32 {
+        let entries: Vec<_> = (0..8u32)
+            .map(|j| make_account_entry_wide(i * 10 + j, 100 * i as i64))
             .collect();
 
         let dead_keys: Vec<_> = if i > 5 {
             // Delete some old entries
-            (0..3)
-                .map(|j| make_account_key(((i - 5) * 10 + j) as u8))
+            (0..3u32)
+                .map(|j| make_account_key_wide((i - 5) * 10 + j))
                 .collect()
         } else {
             vec![]
@@ -341,9 +374,9 @@ async fn test_bucket_list_snap_steady_state() {
     let mut bl = BucketList::new();
 
     // Add many batches to reach steady state
-    for i in 1..=500 {
-        let entries: Vec<_> = (0..4)
-            .map(|j| make_account_entry(((i * 10 + j) % 256) as u8, 100))
+    for i in 1..=500u32 {
+        let entries: Vec<_> = (0..4u32)
+            .map(|j| make_account_entry_wide(i * 10 + j, 100))
             .collect();
 
         bl.add_batch(
@@ -377,9 +410,9 @@ async fn test_bucket_list_deepest_curr_accumulates() {
     let mut bl = BucketList::new();
 
     // Add batches to push entries to deeper levels
-    for i in 1..=1000 {
-        let entries: Vec<_> = (0..2)
-            .map(|j| make_account_entry(((i * 10 + j) % 256) as u8, 100))
+    for i in 1..=1000u32 {
+        let entries: Vec<_> = (0..2u32)
+            .map(|j| make_account_entry_wide(i * 10 + j, 100))
             .collect();
 
         bl.add_batch(

@@ -595,39 +595,28 @@ impl BucketLevel {
     /// Promote the prepared bucket into curr, if any.
     ///
     /// For async merges, this will block until the merge completes.
-    /// This matches stellar-core's BucketLevel::commit() behavior.
+    /// This matches stellar-core's BucketLevel::commit() behavior where
+    /// merge failures are fatal (propagated as exceptions / releaseAssert).
     ///
     /// Returns the merge key and output hash for async merges that completed
     /// successfully, so the caller can record them in the BucketMergeMap.
-    fn commit(&mut self) -> Option<(MergeKey, Hash256)> {
+    fn commit(&mut self) -> Result<Option<(MergeKey, Hash256)>> {
         if let Some(pending) = self.next.take() {
             match pending {
                 PendingMerge::InMemory(bucket) => {
                     self.curr = Arc::new(bucket);
-                    None
+                    Ok(None)
                 }
                 PendingMerge::Async(mut handle) => {
                     let merge_key = handle.merge_key.clone();
-                    match handle.resolve() {
-                        Ok(bucket) => {
-                            let output_hash = bucket.hash();
-                            self.curr = bucket;
-                            Some((merge_key, output_hash))
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                level = self.level,
-                                error = %e,
-                                "Failed to resolve async merge, keeping current bucket"
-                            );
-                            // Keep the current bucket on error
-                            None
-                        }
-                    }
+                    let bucket = handle.resolve()?;
+                    let output_hash = bucket.hash();
+                    self.curr = bucket;
+                    Ok(Some((merge_key, output_hash)))
                 }
             }
         } else {
-            None
+            Ok(None)
         }
     }
 
@@ -682,19 +671,17 @@ impl BucketLevel {
     /// we wait for it to complete and cache its result. This is necessary
     /// before cloning the bucket list, as unresolved async merges would be
     /// lost during cloning.
-    pub fn resolve_pending_merge(&mut self) {
+    ///
+    /// Merge failures are propagated as errors (matching stellar-core's
+    /// fatal behavior for merge failures).
+    pub fn resolve_pending_merge(&mut self) -> Result<()> {
         if let Some(PendingMerge::Async(ref mut handle)) = self.next {
             if handle.result.is_none() {
                 // Resolve the async merge, which caches the result in the handle
-                if let Err(e) = handle.resolve() {
-                    tracing::error!(
-                        level = self.level,
-                        error = %e,
-                        "Failed to resolve async merge"
-                    );
-                }
+                handle.resolve()?;
             }
         }
+        Ok(())
     }
 
     /// Get a reference to the next bucket if any (pending merge result).
@@ -1180,10 +1167,11 @@ impl BucketList {
     /// This should be called before cloning a bucket list to ensure that all
     /// async merges are resolved and their results are cached, preventing data
     /// loss during cloning.
-    pub fn resolve_all_pending_merges(&mut self) {
+    pub fn resolve_all_pending_merges(&mut self) -> Result<()> {
         for level in &mut self.levels {
-            level.resolve_pending_merge();
+            level.resolve_pending_merge()?;
         }
+        Ok(())
     }
 
     /// Get the hash of the entire BucketList.
@@ -1847,7 +1835,7 @@ impl BucketList {
                     .unwrap_or_else(|| "None".to_string());
 
                 // Record completed merges for deduplication
-                if let Some((merge_key, output_hash)) = self.levels[i].commit() {
+                if let Some((merge_key, output_hash)) = self.levels[i].commit()? {
                     self.completed_merges.push((merge_key, output_hash));
                 }
 
@@ -1914,7 +1902,7 @@ impl BucketList {
         // This avoids disk I/O for level 0 merges which happen frequently
         self.levels[0].prepare_first_level(protocol_version, new_bucket)?;
         // Level 0 commit doesn't produce merge keys (in-memory merges)
-        let _ = self.levels[0].commit();
+        self.levels[0].commit()?;
 
         // Ensure all curr/snap buckets have a permanent file on disk so that
         // restart recovery can locate them by hash.  Level 0 uses an in-memory
@@ -3357,7 +3345,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let _ = level.commit();
+        let _ = level.commit().unwrap();
 
         let mut saw_live = false;
         for entry_result in level.curr.iter().unwrap() {
@@ -4127,7 +4115,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let _ = level_probe.commit();
+        let _ = level_probe.commit().unwrap();
         let expected_hash = level_probe.curr.hash();
         assert!(
             !expected_hash.is_zero(),
@@ -4180,7 +4168,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let _ = level_fixed.commit();
+        let _ = level_fixed.commit().unwrap();
         let result_hash = level_fixed.curr.hash();
 
         // The result must be the correct hash, not SHA-256("").
@@ -4453,5 +4441,92 @@ mod tests {
 
         let reloaded = Bucket::from_xdr_file_disk_backed(&permanent_path).unwrap();
         assert_eq!(reloaded.hash(), expected_hash);
+    }
+
+    /// Regression test for AUDIT-BC2: commit() must propagate merge errors
+    /// instead of silently keeping the old bucket.
+    ///
+    /// Previously, commit() caught async merge errors, logged them, and
+    /// returned None — silently keeping the stale curr bucket. This meant
+    /// a failed merge would leave the bucket list in an incorrect state,
+    /// causing bucket list hash divergence and consensus failure.
+    ///
+    /// stellar-core behavior: FutureBucket::resolve() propagates exceptions
+    /// from the background merge thread. BucketLevel::commit() does not catch
+    /// them — they crash the node via releaseAssert or unhandled exception.
+    /// Merge failures are always fatal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_audit_bc2_commit_propagates_merge_error() {
+        use tokio::sync::oneshot;
+
+        // Create a level with a known curr bucket
+        let mut level = BucketLevel::new(1);
+
+        // Set up a PendingMerge::Async with a channel that sends an error
+        let (sender, receiver) = oneshot::channel();
+        let merge_key = MergeKey::new(true, Hash256::default(), Hash256::default());
+
+        let handle = AsyncMergeHandle {
+            receiver: Some(receiver),
+            level: 1,
+            result: None,
+            input_file_paths: vec![],
+            input_curr_hash: Hash256::default(),
+            input_snap_hash: Hash256::default(),
+            merge_key,
+        };
+
+        level.next = Some(PendingMerge::Async(handle));
+
+        // Send an error through the channel (simulates a failed background merge)
+        sender
+            .send(Err(BucketError::Merge(
+                "simulated merge failure".to_string(),
+            )))
+            .unwrap();
+
+        // commit() must return Err, NOT silently keep the old bucket
+        let result = level.commit();
+        assert!(
+            result.is_err(),
+            "commit() must propagate merge errors, not silently keep old bucket"
+        );
+    }
+
+    /// Regression test for AUDIT-BC2: resolve_pending_merge() must propagate errors.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_audit_bc2_resolve_pending_merge_propagates_error() {
+        use tokio::sync::oneshot;
+
+        let mut level = BucketLevel::new(1);
+
+        let (sender, receiver) = oneshot::channel();
+        let merge_key = MergeKey::new(true, Hash256::default(), Hash256::default());
+
+        let handle = AsyncMergeHandle {
+            receiver: Some(receiver),
+            level: 1,
+            result: None,
+            input_file_paths: vec![],
+            input_curr_hash: Hash256::default(),
+            input_snap_hash: Hash256::default(),
+            merge_key,
+        };
+
+        level.next = Some(PendingMerge::Async(handle));
+
+        // Send an error
+        sender
+            .send(Err(BucketError::Merge(
+                "simulated merge failure".to_string(),
+            )))
+            .unwrap();
+
+        // resolve_pending_merge() must return Err
+        let result = level.resolve_pending_merge();
+        assert!(
+            result.is_err(),
+            "resolve_pending_merge() must propagate merge errors"
+        );
     }
 }

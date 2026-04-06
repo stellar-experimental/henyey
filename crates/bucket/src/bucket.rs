@@ -1722,7 +1722,7 @@ mod tests {
     #[test]
     fn test_bucket_iter_yields_result_items() {
         // Verify in-memory bucket iteration yields Ok items
-        let entry = make_live_entry(make_account_entry([1u8; 32], 100));
+        let entry = BucketEntry::Liveentry(make_account_entry([1u8; 32], 100));
         let bucket = Bucket::from_entries(vec![entry.clone()]).unwrap();
         let mut iter = bucket.iter().unwrap();
 
