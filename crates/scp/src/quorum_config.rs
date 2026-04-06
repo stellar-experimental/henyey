@@ -127,8 +127,12 @@ pub fn config_to_quorum_set(config: &QuorumSetConfig) -> Result<ScpQuorumSet, Qu
 
     let qs = ScpQuorumSet {
         threshold,
-        validators: validators.try_into().unwrap_or_default(),
-        inner_sets: inner_sets.try_into().unwrap_or_default(),
+        validators: validators
+            .try_into()
+            .expect("validators exceed XDR maximum capacity"),
+        inner_sets: inner_sets
+            .try_into()
+            .expect("inner sets exceed XDR maximum capacity"),
     };
 
     // Validate the resulting quorum set
