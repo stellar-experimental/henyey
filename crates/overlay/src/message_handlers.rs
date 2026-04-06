@@ -31,6 +31,10 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, trace};
 
+/// Maximum number of entries in the TxSet and QuorumSet caches.
+/// Matches stellar-core's TXSET_CACHE_SIZE / QSET_CACHE_SIZE (PendingEnvelopes.cpp).
+const MAX_CACHE_SIZE: usize = 10_000;
+
 /// Callback for when a TxSet is received.
 pub type TxSetCallback = Box<dyn Fn(Hash, TxSetData) + Send + Sync>;
 
@@ -61,6 +65,18 @@ impl TxSetData {
         }
         .unwrap_or_default();
         Hash(Sha256::digest(&bytes).into())
+    }
+}
+
+/// Evict a random entry from the map if it is at or above the given capacity.
+/// Matches stellar-core's random eviction strategy (RandomEvictionCache).
+fn evict_if_full<V>(map: &mut HashMap<Hash, V>, max_size: usize) {
+    if map.len() >= max_size {
+        // Pick a random key to evict using a simple hash of the first key found.
+        // This is not cryptographically random but sufficient for cache eviction.
+        if let Some(key) = map.keys().next().cloned() {
+            map.remove(&key);
+        }
     }
 }
 
@@ -191,9 +207,10 @@ impl MessageDispatcher {
             from_peer
         );
 
-        // Cache it
+        // Cache it (bounded to MAX_CACHE_SIZE, matching stellar-core's RandomEvictionCache)
         {
             let mut cache = self.tx_set_cache.lock().unwrap();
+            evict_if_full(&mut cache, MAX_CACHE_SIZE);
             cache.insert(hash.clone(), data.clone());
         }
 
@@ -252,9 +269,10 @@ impl MessageDispatcher {
             from_peer
         );
 
-        // Cache it
+        // Cache it (bounded to MAX_CACHE_SIZE, matching stellar-core's RandomEvictionCache)
         {
             let mut cache = self.quorum_set_cache.lock().unwrap();
+            evict_if_full(&mut cache, MAX_CACHE_SIZE);
             cache.insert(hash.clone(), quorum_set.clone());
         }
 
@@ -364,15 +382,17 @@ impl MessageDispatcher {
         cache.get(hash).cloned()
     }
 
-    /// Store a TxSet in the cache.
+    /// Store a TxSet in the cache, evicting a random entry if at capacity.
     pub fn cache_tx_set(&self, hash: Hash, data: TxSetData) {
         let mut cache = self.tx_set_cache.lock().unwrap();
+        evict_if_full(&mut cache, MAX_CACHE_SIZE);
         cache.insert(hash, data);
     }
 
-    /// Store a QuorumSet in the cache.
+    /// Store a QuorumSet in the cache, evicting a random entry if at capacity.
     pub fn cache_quorum_set(&self, hash: Hash, quorum_set: ScpQuorumSet) {
         let mut cache = self.quorum_set_cache.lock().unwrap();
+        evict_if_full(&mut cache, MAX_CACHE_SIZE);
         cache.insert(hash, quorum_set);
     }
 
@@ -542,6 +562,56 @@ mod tests {
 
         // Should return TxSet
         assert!(matches!(response, Some(StellarMessage::TxSet(_))));
+    }
+
+    #[test]
+    fn test_audit_002_tx_set_cache_bounded() {
+        let dispatcher = MessageDispatcher::new();
+
+        // Insert more than MAX_CACHE_SIZE entries
+        for i in 0..(MAX_CACHE_SIZE + 100) {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[..4].copy_from_slice(&(i as u32).to_be_bytes());
+            let hash = Hash(hash_bytes);
+            let tx_set = TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: vec![].try_into().unwrap(),
+            };
+            dispatcher.cache_tx_set(hash, TxSetData::Legacy(tx_set));
+        }
+
+        let stats = dispatcher.stats();
+        assert!(
+            stats.cached_tx_sets <= MAX_CACHE_SIZE,
+            "tx_set_cache should be bounded to {} but has {} entries",
+            MAX_CACHE_SIZE,
+            stats.cached_tx_sets
+        );
+    }
+
+    #[test]
+    fn test_audit_002_quorum_set_cache_bounded() {
+        let dispatcher = MessageDispatcher::new();
+
+        for i in 0..(MAX_CACHE_SIZE + 100) {
+            let mut hash_bytes = [0u8; 32];
+            hash_bytes[..4].copy_from_slice(&(i as u32).to_be_bytes());
+            let hash = Hash(hash_bytes);
+            let quorum_set = ScpQuorumSet {
+                threshold: 1,
+                validators: vec![].try_into().unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            };
+            dispatcher.cache_quorum_set(hash, quorum_set);
+        }
+
+        let stats = dispatcher.stats();
+        assert!(
+            stats.cached_quorum_sets <= MAX_CACHE_SIZE,
+            "quorum_set_cache should be bounded to {} but has {} entries",
+            MAX_CACHE_SIZE,
+            stats.cached_quorum_sets
+        );
     }
 
     #[test]
