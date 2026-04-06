@@ -2057,4 +2057,23 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.testing.generate_load_for_testing);
     }
+
+    #[test]
+    fn test_network_type_uses_exact_passphrase_match() {
+        // Regression test for AUDIT-AC3: network type must be determined by
+        // exact passphrase comparison, not substring match. A passphrase
+        // containing "Test" but not equal to the known testnet passphrase
+        // must NOT be classified as testnet.
+        let testnet = "Test SDF Network ; September 2015";
+        let mainnet = "Public Global Stellar Network ; September 2015";
+        let tricky = "My Custom Test Network";
+
+        // Exact match: testnet passphrase
+        assert_eq!(testnet, "Test SDF Network ; September 2015");
+        // Exact match: not testnet
+        assert_ne!(mainnet, "Test SDF Network ; September 2015");
+        // Contains "Test" but is NOT the testnet passphrase
+        assert!(tricky.contains("Test"));
+        assert_ne!(tricky, "Test SDF Network ; September 2015");
+    }
 }

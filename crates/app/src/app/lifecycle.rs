@@ -708,11 +708,12 @@ impl App {
         self.store_config_peers();
 
         // Create local node info
-        let mut local_node = if self.config.network.passphrase.contains("Test") {
-            LocalNode::new_testnet(self.keypair.clone())
-        } else {
-            LocalNode::new_mainnet(self.keypair.clone())
-        };
+        let mut local_node =
+            if self.config.network.passphrase == "Test SDF Network ; September 2015" {
+                LocalNode::new_testnet(self.keypair.clone())
+            } else {
+                LocalNode::new_mainnet(self.keypair.clone())
+            };
         local_node.listening_port = self.config.overlay.peer_port;
         local_node.set_commit_hash(&self.config.build.commit_hash);
 
@@ -735,7 +736,7 @@ impl App {
             // Compat config with no known peers (e.g., local standalone mode) —
             // do NOT inject testnet/mainnet seed peers.
             OverlayManagerConfig::default()
-        } else if self.config.network.passphrase.contains("Test") {
+        } else if self.config.network.passphrase == "Test SDF Network ; September 2015" {
             OverlayManagerConfig::testnet()
         } else {
             OverlayManagerConfig::mainnet()

@@ -3601,11 +3601,12 @@ async fn cmd_verify_execution(
     }
 
     // Determine network name
-    let (network_name, is_mainnet) = if config.network.passphrase.contains("Test") {
-        ("testnet", false)
-    } else {
-        ("mainnet", true)
-    };
+    let (network_name, is_mainnet) =
+        if config.network.passphrase == "Test SDF Network ; September 2015" {
+            ("testnet", false)
+        } else {
+            ("mainnet", true)
+        };
 
     // Set network-specific CDP defaults
     let cdp_url = cdp_url.unwrap_or_else(|| {
