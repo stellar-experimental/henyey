@@ -586,80 +586,101 @@ impl FlowControl {
         limit: usize,
         scp_callback: &Option<Arc<dyn ScpQueueCallback>>,
     ) -> usize {
+        let Some(ref cb) = scp_callback else {
+            return Self::trim_scp_queue_naive(queue, limit);
+        };
+
+        let min_slot = cb.min_slot_to_remember();
+        let checkpoint_seq = cb.most_recent_checkpoint_seq();
+        let mut value_replaced = false;
         let mut dropped = 0;
 
-        if let Some(ref cb) = scp_callback {
-            let min_slot = cb.min_slot_to_remember();
-            let checkpoint_seq = cb.most_recent_checkpoint_seq();
-            let mut value_replaced = false;
-
-            let mut i = 0;
-            while i < queue.len() {
-                if queue[i].being_sent {
-                    i += 1;
-                    continue;
-                }
-
-                // Extract slot index from the SCP envelope
-                let slot_index = if let StellarMessage::ScpMessage(ref env) = queue[i].message {
-                    env.statement.slot_index
-                } else {
-                    i += 1;
-                    continue;
-                };
-
-                // Drop messages for slots we no longer care about
-                // (except the checkpoint sequence)
-                if slot_index < min_slot && slot_index != checkpoint_seq {
-                    queue.remove(i);
-                    dropped += 1;
-                    continue;
-                }
-
-                // Replace older nomination/ballot with newer one from the back
-                if !value_replaced
-                    && i + 1 < queue.len()
-                    && !queue.back().map(|m| m.being_sent).unwrap_or(true)
-                {
-                    let back_st = queue.back().and_then(|m| {
-                        if let StellarMessage::ScpMessage(ref env) = m.message {
-                            Some(&env.statement)
-                        } else {
-                            None
-                        }
-                    });
-                    let curr_st = if let StellarMessage::ScpMessage(ref env) = queue[i].message {
-                        Some(&env.statement)
-                    } else {
-                        None
-                    };
-                    if let (Some(old_st), Some(new_st)) = (curr_st, back_st) {
-                        if henyey_scp::is_newer_nomination_or_ballot_st(old_st, new_st) {
-                            value_replaced = true;
-                            let back = queue.pop_back().unwrap();
-                            queue[i] = back;
-                            dropped += 1;
-                            i += 1;
-                            continue;
-                        }
-                    }
-                }
-
+        let mut i = 0;
+        while i < queue.len() {
+            if queue[i].being_sent {
                 i += 1;
+                continue;
             }
-        } else {
-            // Fallback: naive FIFO trimming when no callback is set
-            while queue.len() > limit / 2 {
-                match queue.front() {
-                    Some(front) if !front.being_sent => {
-                        queue.pop_front();
-                        dropped += 1;
-                    }
-                    _ => break,
-                }
+
+            let Some(slot_index) = Self::scp_slot_index(&queue[i].message) else {
+                i += 1;
+                continue;
+            };
+
+            // Drop messages for slots we no longer care about
+            // (except the checkpoint sequence)
+            if slot_index < min_slot && slot_index != checkpoint_seq {
+                queue.remove(i);
+                dropped += 1;
+                continue;
             }
+
+            // Try to replace this message with a newer nomination/ballot from
+            // the back of the queue (one replacement per trim pass).
+            if !value_replaced && Self::try_replace_with_back(queue, i) {
+                value_replaced = true;
+                dropped += 1;
+                i += 1;
+                continue;
+            }
+
+            i += 1;
         }
 
+        dropped
+    }
+
+    /// Extract the SCP slot index from a `StellarMessage`, if it's an SCP message.
+    fn scp_slot_index(msg: &StellarMessage) -> Option<u64> {
+        if let StellarMessage::ScpMessage(ref env) = msg {
+            Some(env.statement.slot_index)
+        } else {
+            None
+        }
+    }
+
+    /// If the back of the queue holds a newer nomination/ballot than `queue[i]`,
+    /// pop the back and replace `queue[i]` with it. Returns `true` on replacement.
+    fn try_replace_with_back(queue: &mut VecDeque<QueuedOutboundMessage>, i: usize) -> bool {
+        // Need at least one element after i, and the back must not be in-flight.
+        if i + 1 >= queue.len() {
+            return false;
+        }
+        if queue.back().map_or(true, |m| m.being_sent) {
+            return false;
+        }
+
+        let back_st = queue.back().and_then(|m| match m.message {
+            StellarMessage::ScpMessage(ref env) => Some(&env.statement),
+            _ => None,
+        });
+        let curr_st = match queue[i].message {
+            StellarMessage::ScpMessage(ref env) => Some(&env.statement),
+            _ => None,
+        };
+
+        if let (Some(old_st), Some(new_st)) = (curr_st, back_st) {
+            if henyey_scp::is_newer_nomination_or_ballot_st(old_st, new_st) {
+                let back = queue.pop_back().unwrap();
+                queue[i] = back;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Naive FIFO trim: pop from front until queue is at most half the limit.
+    fn trim_scp_queue_naive(queue: &mut VecDeque<QueuedOutboundMessage>, limit: usize) -> usize {
+        let mut dropped = 0;
+        while queue.len() > limit / 2 {
+            match queue.front() {
+                Some(front) if !front.being_sent => {
+                    queue.pop_front();
+                    dropped += 1;
+                }
+                _ => break,
+            }
+        }
         dropped
     }
 
