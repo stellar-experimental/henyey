@@ -1,6 +1,6 @@
 ---
 name: security-fix-loop
-description: Process all open security audit issues in severity order — validate, test, fix, repeat
+description: Process open security audit issues — severity order, unassigned before assigned within each tier; validate, test, fix, repeat
 argument-hint: [--label <label>] [--dry-run]
 ---
 
@@ -11,23 +11,24 @@ Parse `$ARGUMENTS`:
 
 # Security Fix Loop
 
-Continuously pick the highest-severity open security audit issue, process it
-with `/security-fix`, and repeat until no open issues remain.
+Continuously pick the highest-severity open security audit issue **that has
+no assignees when possible**, process it with `/security-fix`, and repeat until
+no open issues remain.
 
 ## Step 1: Query Open Security Issues
 
 Fetch all open audit issues:
 
 ```
-gh issue list --label security,audit --state open --json number,title,labels --limit 500
+gh issue list --label security,audit --state open --json number,title,labels,assignees --limit 500
 ```
 
 If `$EXTRA_LABEL` is set, add it to the label filter:
 ```
-gh issue list --label security,audit,$EXTRA_LABEL --state open --json number,title,labels --limit 500
+gh issue list --label security,audit,$EXTRA_LABEL --state open --json number,title,labels,assignees --limit 500
 ```
 
-### Severity Ordering
+### Queue ordering
 
 Parse the `labels` array for each issue to determine severity. Sort the full
 list in this order:
@@ -37,8 +38,16 @@ list in this order:
 3. **medium** — issues with the `medium` label
 4. **low** — issues with the `low` label
 
-Within the same severity tier, sort by issue number ascending (lowest number
-first = oldest first).
+Within the **same severity tier**, sort next by **assignee status**:
+
+- **Unassigned first** — `assignees` is empty or missing (no one has claimed
+  the issue on GitHub). Prefer these so the loop does not compete with work
+  already signaled by assignees.
+- **Assigned second** — one or more assignees present. Process these only after
+  every unassigned issue in that severity tier has been handled (or skipped).
+
+Within the same severity **and** the same assignee bucket, sort by issue number
+ascending (lowest number first = oldest first).
 
 If an issue has no recognized severity label, place it after `low`.
 
@@ -52,11 +61,11 @@ Print the queue as a table:
 ═══ SECURITY FIX QUEUE ═══
 N issues to process
 
-  #  | Issue | Severity | Title
------|-------|----------|------
-  1  | #28   | CRITICAL | [AUDIT-C1] Overlay auth bypass via...
-  2  | #29   | CRITICAL | [AUDIT-C2] ...
-  3  | #40   | HIGH     | [AUDIT-H1] ...
+  #  | Issue | Severity | Assignee   | Title
+-----|-------|----------|------------|------
+  1  | #28   | CRITICAL | —          | [AUDIT-C1] Overlay auth bypass via...
+  2  | #29   | CRITICAL | @alice     | [AUDIT-C2] ...
+  3  | #40   | HIGH     | —          | [AUDIT-H1] ...
  ...
 ═══════════════════════════
 ```
@@ -89,14 +98,16 @@ Repeat until the queue is empty:
 
 ### 4a: Pick the Next Issue
 
-Take the first issue from the queue (highest severity, lowest issue number).
+Take the first issue from the queue (highest severity, **unassigned before
+assigned**, then lowest issue number within that bucket).
 
-Print a progress header:
+Print a progress header (show assignees as `—` when `assignees` is empty):
 ```
 ═══ SECURITY FIX [<total + 1> / <queue_size_at_start>] ═══
-Issue:    #<number>
-Title:    <title>
-Severity: <SEVERITY>
+Issue:     #<number>
+Title:     <title>
+Severity:  <SEVERITY>
+Assignee:  <— | @login[, @login...]>
 ═══════════════════════════════════════════════════════════
 ```
 
@@ -171,7 +182,7 @@ fix could not be completed. Do the following:
 Before picking the next issue, re-query the open issues:
 
 ```
-gh issue list --label security,audit --state open --json number,title,labels --limit 500
+gh issue list --label security,audit --state open --json number,title,labels,assignees --limit 500
 ```
 
 (Include `$EXTRA_LABEL` if set.)
@@ -182,8 +193,9 @@ This is necessary because:
 - The issue we just processed is now closed (or labeled `needs-manual-review`
   and should be excluded from the queue).
 
-Re-sort by severity and issue number. Filter out any issues labeled
-`needs-manual-review` (they were already attempted and failed).
+Re-sort by severity, then unassigned-before-assigned, then issue number. Filter
+out any issues labeled `needs-manual-review` (they were already attempted and
+failed).
 
 If the re-queried list is empty, exit the loop.
 
@@ -237,6 +249,10 @@ Issues requiring manual review:
   unlimited time retrying a single issue.
 - **Severity first.** Always process the highest-severity remaining issue next.
   Critical vulnerabilities take priority over medium-severity code smells.
+- **Unassigned first within a tier.** Before taking an assigned issue at a given
+  severity, exhaust unassigned issues at that severity (and `/security-fix`
+  will self-assign when work starts). This reduces duplicate effort when
+  multiple people or agents run the loop.
 - **Track progress.** Use the TodoWrite tool to maintain a running task list
   of issues being processed.
 - **Build once, test often.** `cargo test --all` runs at the end of each

@@ -55,6 +55,22 @@ If the issue is already closed, stop and report: "Issue $ISSUE is already closed
 If the issue has no `[AUDIT-` prefix in the title, stop and report: "Issue
 $ISSUE does not appear to be a security audit issue."
 
+### Claim the issue (self-assign)
+
+You are about to invest real time in this issue. Signal that it is in progress
+by assigning yourself **now**, before validation and code work (Step 2 onward).
+
+Run:
+```
+gh issue edit $ISSUE --add-assignee @me
+```
+
+- If you are already an assignee, this is a no-op; still run it for a uniform
+  workflow.
+- If the command fails (permissions, org policy, SSO), log the error and
+  **continue** — do not block triage or fixes on assignee updates. Mention the
+  failure when you post the final issue comment or PR description if relevant.
+
 Read the linked audit report if one is referenced (e.g.,
 `reports/audit/overlay__auth.rs.md`).
 
@@ -302,6 +318,8 @@ This handles:
 
 ## Guidelines
 
+- **Claim early.** Self-assign as soon as the issue is confirmed open and
+  audit-scoped (end of Step 1), so duplicate work is visible to the team.
 - **Be precise.** Cite `file:line` for every claim in validation comments.
 - **Do not speculate.** If you cannot determine whether a finding is real,
   read more code until you can. If you still cannot after thorough
