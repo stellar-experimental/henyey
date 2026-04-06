@@ -260,7 +260,7 @@ impl OverlayManager {
     /// Connect to a discovered peer, run its peer loop, then clean up.
     ///
     /// Used by `add_peer` for background connections discovered via Peers messages.
-    async fn run_discovered_peer_connection(
+    async fn connect_to_discovered_peer(
         addr: PeerAddress,
         local_node: LocalNode,
         connect_timeout: u64,
@@ -384,7 +384,7 @@ impl OverlayManager {
 
         let peer_handles = Arc::clone(&shared.peer_handles);
         let peer_handle = tokio::spawn(async move {
-            Self::run_discovered_peer_connection(
+            Self::connect_to_discovered_peer(
                 addr,
                 local_node,
                 connect_timeout,
@@ -435,7 +435,7 @@ impl OverlayManager {
 ///
 /// This is a module-level function (not a method) so it can be called from
 /// `tick.rs` without requiring `&self`.
-pub(super) async fn connect_outbound_inner(
+pub(super) async fn connect_to_explicit_peer(
     addr: &PeerAddress,
     local_node: LocalNode,
     timeout_secs: u64,

@@ -171,11 +171,6 @@ impl TxDemandsManager {
         }
     }
 
-    /// Create with default configuration.
-    pub fn with_defaults() -> Self {
-        Self::new(TxDemandsConfig::default())
-    }
-
     /// Set the callback for checking transaction status.
     pub fn set_tx_status_fn(&self, f: TxStatusFn) {
         let mut cb = self.tx_status_fn.write();
@@ -479,7 +474,7 @@ impl TxDemandsManager {
 
 impl Default for TxDemandsManager {
     fn default() -> Self {
-        Self::with_defaults()
+        Self::new(TxDemandsConfig::default())
     }
 }
 
@@ -531,14 +526,14 @@ mod tests {
 
     #[test]
     fn test_demand_manager_creation() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
         assert!(!manager.is_running());
         assert_eq!(manager.pending_count(), 0);
     }
 
     #[test]
     fn test_start_shutdown() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
 
         manager.start();
         assert!(manager.is_running());
@@ -549,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_demand_status_unknown_tx() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
         let hash = make_hash(1);
         let peer = make_peer_id(1);
 
@@ -560,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_demand_status_known_tx() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
         let hash = make_hash(1);
         let peer = make_peer_id(1);
 
@@ -573,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_demand_status_banned_tx() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
         let hash = make_hash(1);
         let peer = make_peer_id(1);
 
@@ -586,7 +581,7 @@ mod tests {
 
     #[test]
     fn test_demand_status_already_demanded_from_peer() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
         let hash = make_hash(1);
         let peer = make_peer_id(1);
 
@@ -647,7 +642,7 @@ mod tests {
 
     #[test]
     fn test_process_adverts() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
         let peer = make_peer_id(1);
 
         let hashes = vec![make_hash(1), make_hash(2), make_hash(3)];
@@ -660,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_process_adverts_with_limit() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
         let peer = make_peer_id(1);
 
         let hashes = vec![make_hash(1), make_hash(2), make_hash(3)];
@@ -674,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_record_tx_received() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
         let hash = make_hash(1);
         let peer = make_peer_id(1);
 
@@ -717,7 +712,7 @@ mod tests {
 
     #[test]
     fn test_recv_demand() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
 
         // Set up get_tx callback
         let call_count = Arc::new(AtomicUsize::new(0));
@@ -775,7 +770,7 @@ mod tests {
 
     #[test]
     fn test_stats() {
-        let manager = TxDemandsManager::with_defaults();
+        let manager = TxDemandsManager::default();
         let hash = make_hash(1);
         let peer = make_peer_id(1);
 

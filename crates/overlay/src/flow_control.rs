@@ -376,11 +376,6 @@ impl FlowControl {
         }
     }
 
-    /// Create with default configuration.
-    pub fn with_defaults() -> Self {
-        Self::new(FlowControlConfig::default())
-    }
-
     /// Set the peer ID for logging.
     pub fn set_peer_id(&self, peer_id: PeerId) {
         let mut state = self.state.lock().unwrap();
@@ -883,6 +878,12 @@ impl FlowControl {
     }
 }
 
+impl Default for FlowControl {
+    fn default() -> Self {
+        Self::new(FlowControlConfig::default())
+    }
+}
+
 /// Statistics about flow control state.
 #[derive(Debug, Clone)]
 pub struct FlowControlStats {
@@ -1065,7 +1066,7 @@ mod tests {
     fn test_initial_byte_capacity_equals_batch_size() {
         // OVERLAY_SPEC §5.1: initial byte capacity = flow_control_bytes_batch_size,
         // NOT flood_reading_capacity * batch_size.
-        let fc = FlowControl::with_defaults();
+        let fc = FlowControl::default();
         let stats = fc.get_stats();
         assert_eq!(
             stats.local_flood_bytes_capacity, 100_000,
@@ -1075,7 +1076,7 @@ mod tests {
 
     #[test]
     fn test_flow_control_creation() {
-        let fc = FlowControl::with_defaults();
+        let fc = FlowControl::default();
         let stats = fc.get_stats();
 
         assert_eq!(stats.local_flood_capacity, 200);
@@ -1127,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_release_capacity() {
-        let fc = FlowControl::with_defaults();
+        let fc = FlowControl::default();
 
         // Initially no outbound capacity
         let stats = fc.get_stats();
@@ -1148,7 +1149,7 @@ mod tests {
 
     #[test]
     fn test_no_outbound_capacity_timeout_clears_after_send_more_extended() {
-        let fc = FlowControl::with_defaults();
+        let fc = FlowControl::default();
 
         assert!(fc.no_outbound_capacity_timeout(0));
 
@@ -1163,7 +1164,7 @@ mod tests {
 
     #[test]
     fn test_begin_end_message_processing() {
-        let fc = FlowControl::with_defaults();
+        let fc = FlowControl::default();
         let tx = make_tx_message();
 
         // Begin processing
@@ -1178,7 +1179,7 @@ mod tests {
 
     #[test]
     fn test_send_more_validation() {
-        let fc = FlowControl::with_defaults();
+        let fc = FlowControl::default();
 
         // Valid message
         let valid = StellarMessage::SendMoreExtended(SendMoreExtended {
@@ -1201,7 +1202,7 @@ mod tests {
 
     #[test]
     fn test_queue_and_batch() {
-        let fc = FlowControl::with_defaults();
+        let fc = FlowControl::default();
 
         // Grant some capacity
         let send_more = StellarMessage::SendMoreExtended(SendMoreExtended {
@@ -1408,7 +1409,7 @@ mod tests {
 
     #[test]
     fn test_capacity_guard_finish_returns_send_more() {
-        let fc = Arc::new(FlowControl::with_defaults());
+        let fc = Arc::new(FlowControl::default());
         let tx = make_tx_message();
 
         // Process enough messages to trigger a SEND_MORE batch
@@ -1471,7 +1472,7 @@ mod tests {
 
     #[test]
     fn test_capacity_guard_finish_prevents_double_release() {
-        let fc = Arc::new(FlowControl::with_defaults());
+        let fc = Arc::new(FlowControl::default());
         let tx = make_tx_message();
 
         let initial_stats = fc.get_stats();

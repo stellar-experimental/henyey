@@ -108,11 +108,6 @@ impl TxAdverts {
         }
     }
 
-    /// Create with default configuration.
-    pub fn with_defaults() -> Self {
-        Self::new(TxAdvertsConfig::default())
-    }
-
     /// Set the callback for sending FloodAdvert messages.
     pub fn set_send_callback(&self, callback: SendAdvertFn) {
         let mut cb = self.send_callback.write();
@@ -314,7 +309,7 @@ impl TxAdverts {
 
 impl Default for TxAdverts {
     fn default() -> Self {
-        Self::with_defaults()
+        Self::new(TxAdvertsConfig::default())
     }
 }
 
@@ -343,14 +338,14 @@ mod tests {
 
     #[test]
     fn test_tx_adverts_creation() {
-        let adverts = TxAdverts::with_defaults();
+        let adverts = TxAdverts::default();
         assert_eq!(adverts.size(), 0);
         assert!(!adverts.has_adverts());
     }
 
     #[test]
     fn test_queue_incoming_advert() {
-        let adverts = TxAdverts::with_defaults();
+        let adverts = TxAdverts::default();
         let hashes = vec![make_hash(1), make_hash(2), make_hash(3)];
 
         adverts.queue_incoming_advert(&hashes, 100);
@@ -367,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_pop_incoming_advert() {
-        let adverts = TxAdverts::with_defaults();
+        let adverts = TxAdverts::default();
         let hashes = vec![make_hash(1), make_hash(2)];
 
         adverts.queue_incoming_advert(&hashes, 100);
@@ -386,7 +381,7 @@ mod tests {
 
     #[test]
     fn test_retry_has_priority() {
-        let adverts = TxAdverts::with_defaults();
+        let adverts = TxAdverts::default();
 
         // Add incoming
         adverts.queue_incoming_advert(&[make_hash(1), make_hash(2)], 100);
@@ -405,7 +400,7 @@ mod tests {
 
     #[test]
     fn test_queue_outgoing_advert() {
-        let adverts = TxAdverts::with_defaults();
+        let adverts = TxAdverts::default();
 
         adverts.queue_outgoing_advert(make_hash(1));
         adverts.queue_outgoing_advert(make_hash(2));
@@ -415,7 +410,7 @@ mod tests {
 
     #[test]
     fn test_flush_advert_with_callback() {
-        let adverts = TxAdverts::with_defaults();
+        let adverts = TxAdverts::default();
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
 
@@ -455,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_clear_below() {
-        let adverts = TxAdverts::with_defaults();
+        let adverts = TxAdverts::default();
 
         adverts.queue_incoming_advert(&[make_hash(1)], 100);
         adverts.queue_incoming_advert(&[make_hash(2)], 200);

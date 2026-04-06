@@ -94,8 +94,8 @@ impl Connection {
         // Spec: OVERLAY_SPEC §4.1 — TCP_NODELAY and SO_LINGER MUST be set.
         stream.set_nodelay(true)?;
         // SO_LINGER with timeout=0 causes immediate close (RST) without waiting.
-        #[allow(deprecated)]
-        stream.set_linger(Some(Duration::from_secs(0)))?;
+        let sock = socket2::SockRef::from(&stream);
+        sock.set_linger(Some(Duration::from_secs(0)))?;
 
         Self::from_boxed_io(Box::pin(stream), remote_addr, direction)
     }

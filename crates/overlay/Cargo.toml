@@ -31,6 +31,9 @@ serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# TCP socket options
+socket2.workspace = true
+
 # Utilities
 bytes.workspace = true
 dashmap.workspace = true

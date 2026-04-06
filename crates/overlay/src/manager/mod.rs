@@ -124,7 +124,7 @@ pub(super) struct TickConnectCtx {
 /// Shared state passed to spawned peer tasks.
 ///
 /// Bundles all `Arc`-wrapped state that background tasks need, avoiding
-/// 20+ individual parameter lists on `connect_outbound_inner` and
+/// 20+ individual parameter lists on `connect_to_explicit_peer` and
 /// `run_peer_loop`.
 #[derive(Clone)]
 pub(super) struct SharedPeerState {
@@ -468,7 +468,7 @@ impl OverlayManager {
             .config
             .connect_timeout_secs
             .max(self.config.auth_timeout_secs);
-        connection::connect_outbound_inner(
+        connection::connect_to_explicit_peer(
             addr,
             self.local_node.clone(),
             timeout,
@@ -577,21 +577,6 @@ impl OverlayManager {
     /// Non-blocking: drops the message if the peer's outbound channel is full,
     /// returning `Err(ChannelSend)`. This prevents a slow/malicious peer from
     /// stalling the caller (matching stellar-core's non-blocking sendMessage).
-    pub fn send_to(&self, peer_id: &PeerId, message: StellarMessage) -> Result<()> {
-        let entry = self
-            .peers
-            .get(peer_id)
-            .ok_or_else(|| OverlayError::PeerNotFound(peer_id.to_string()))?;
-
-        entry
-            .value()
-            .outbound_tx
-            .try_send(OutboundMessage::Send(message))
-            .map_err(|_| OverlayError::ChannelSend)
-    }
-
-    /// Non-blocking send: drops the message if the peer's outbound channel is full.
-    /// Use this for flood responses where back-pressure should not stall the caller.
     pub fn try_send_to(&self, peer_id: &PeerId, message: StellarMessage) -> Result<()> {
         let entry = self
             .peers
@@ -960,7 +945,7 @@ impl OverlayManager {
             hash = hex::encode(&hash.0),
             "Requesting transaction set from peer"
         );
-        self.send_to(peer_id, message)
+        self.try_send_to(peer_id, message)
     }
 
     /// Request a quorum set by hash from a specific peer.
@@ -973,7 +958,7 @@ impl OverlayManager {
             hash = hex::encode(&hash.0),
             "Requesting quorum set from peer"
         );
-        self.send_to(peer_id, message)
+        self.try_send_to(peer_id, message)
     }
 
     pub(super) fn add_known_peer(&self, addr: PeerAddress) -> bool {

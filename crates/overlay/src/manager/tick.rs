@@ -374,7 +374,7 @@ impl OverlayManager {
             }
 
             let timeout = ctx.connect_timeout.max(ctx.auth_timeout);
-            match super::connection::connect_outbound_inner(
+            match super::connection::connect_to_explicit_peer(
                 addr,
                 ctx.local_node.clone(),
                 timeout,
@@ -436,7 +436,7 @@ impl OverlayManager {
             }
 
             let timeout = ctx.connect_timeout.max(ctx.auth_timeout);
-            match super::connection::connect_outbound_inner(
+            match super::connection::connect_to_explicit_peer(
                 addr,
                 ctx.local_node.clone(),
                 timeout,
