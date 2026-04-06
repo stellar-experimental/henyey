@@ -667,12 +667,14 @@ impl SurveyManager {
 
     /// Add a peer to the backlog of peers to survey.
     pub fn add_peer_to_backlog(&self, peer_id: PeerId) -> bool {
-        let surveyed = self.surveyed_peers.write();
+        // Lock order: peers_to_survey (A) then surveyed_peers (B).
+        // Must match pop_peer_to_survey, reset, and stats to avoid ABBA deadlock.
+        let mut peers = self.peers_to_survey.write();
+        let surveyed = self.surveyed_peers.read();
         if surveyed.contains(&peer_id) {
             return false;
         }
 
-        let mut peers = self.peers_to_survey.write();
         peers.push_back(peer_id);
         true
     }
