@@ -168,7 +168,11 @@ impl DiagnosticEventManager {
                     val: arg,
                 });
             }
-            ScVal::Map(Some(ScMap(entries.try_into().unwrap_or_default())))
+            ScVal::Map(Some(ScMap(
+                entries
+                    .try_into()
+                    .expect("XDR bounded conversion must not fail"),
+            )))
         };
 
         let event = ContractEvent {
@@ -176,7 +180,9 @@ impl DiagnosticEventManager {
             contract_id: None,
             type_: ContractEventType::Diagnostic,
             body: ContractEventBody::V0(ContractEventV0 {
-                topics: topics.try_into().unwrap_or_default(),
+                topics: topics
+                    .try_into()
+                    .expect("XDR bounded conversion must not fail"),
                 data,
             }),
         };
@@ -258,8 +264,14 @@ impl DiagnosticEventManager {
             contract_id: None,
             type_: ContractEventType::Diagnostic,
             body: ContractEventBody::V0(ContractEventV0 {
-                topics: topics.try_into().unwrap_or_default(),
-                data: ScVal::Map(Some(ScMap(entries.try_into().unwrap_or_default()))),
+                topics: topics
+                    .try_into()
+                    .expect("XDR bounded conversion must not fail"),
+                data: ScVal::Map(Some(ScMap(
+                    entries
+                        .try_into()
+                        .expect("XDR bounded conversion must not fail"),
+                ))),
             }),
         };
 
@@ -460,7 +472,10 @@ impl OperationMetaBuilder {
     /// Finalize into OperationMeta (for V2/V3 meta).
     pub fn finalize_v2(self) -> OperationMeta {
         OperationMeta {
-            changes: self.changes.try_into().unwrap_or_default(),
+            changes: self
+                .changes
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
         }
     }
 
@@ -469,8 +484,13 @@ impl OperationMetaBuilder {
         let events = self.event_manager.finalize();
         OperationMetaV2 {
             ext: ExtensionPoint::V0,
-            changes: self.changes.try_into().unwrap_or_default(),
-            events: events.try_into().unwrap_or_default(),
+            changes: self
+                .changes
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
+            events: events
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
         }
     }
 }
@@ -735,7 +755,9 @@ impl TransactionMetaBuilder {
             // Return empty V2 meta when disabled
             return TransactionMeta::V2(TransactionMetaV2 {
                 tx_changes_before: LedgerEntryChanges::default(),
-                operations: vec![].try_into().unwrap_or_default(),
+                operations: vec![]
+                    .try_into()
+                    .expect("XDR bounded conversion must not fail"),
                 tx_changes_after: LedgerEntryChanges::default(),
             });
         }
@@ -759,9 +781,17 @@ impl TransactionMetaBuilder {
             .collect();
 
         TransactionMeta::V2(TransactionMetaV2 {
-            tx_changes_before: self.tx_changes_before.try_into().unwrap_or_default(),
-            operations: operations.try_into().unwrap_or_default(),
-            tx_changes_after: self.tx_changes_after.try_into().unwrap_or_default(),
+            tx_changes_before: self
+                .tx_changes_before
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
+            operations: operations
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
+            tx_changes_after: self
+                .tx_changes_after
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
         })
     }
 
@@ -779,9 +809,13 @@ impl TransactionMetaBuilder {
         let soroban_meta = if self.is_soroban && success {
             Some(SorobanTransactionMeta {
                 ext: SorobanTransactionMetaExt::V0,
-                events: vec![].try_into().unwrap_or_default(), // Events collected at tx level
+                events: vec![]
+                    .try_into()
+                    .expect("XDR bounded conversion must not fail"), // Events collected at tx level
                 return_value: ScVal::Void,
-                diagnostic_events: diagnostic_events.try_into().unwrap_or_default(),
+                diagnostic_events: diagnostic_events
+                    .try_into()
+                    .expect("XDR bounded conversion must not fail"),
             })
         } else {
             None
@@ -789,9 +823,17 @@ impl TransactionMetaBuilder {
 
         TransactionMeta::V3(TransactionMetaV3 {
             ext: ExtensionPoint::V0,
-            tx_changes_before: self.tx_changes_before.try_into().unwrap_or_default(),
-            operations: operations.try_into().unwrap_or_default(),
-            tx_changes_after: self.tx_changes_after.try_into().unwrap_or_default(),
+            tx_changes_before: self
+                .tx_changes_before
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
+            operations: operations
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
+            tx_changes_after: self
+                .tx_changes_after
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
             soroban_meta,
         })
     }
@@ -831,12 +873,24 @@ impl TransactionMetaBuilder {
 
         TransactionMeta::V4(TransactionMetaV4 {
             ext: ExtensionPoint::V0,
-            tx_changes_before: self.tx_changes_before.try_into().unwrap_or_default(),
-            operations: operations.try_into().unwrap_or_default(),
-            tx_changes_after: self.tx_changes_after.try_into().unwrap_or_default(),
+            tx_changes_before: self
+                .tx_changes_before
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
+            operations: operations
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
+            tx_changes_after: self
+                .tx_changes_after
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
             soroban_meta,
-            events: tx_events.try_into().unwrap_or_default(),
-            diagnostic_events: diagnostic_events.try_into().unwrap_or_default(),
+            events: tx_events
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
+            diagnostic_events: diagnostic_events
+                .try_into()
+                .expect("XDR bounded conversion must not fail"),
         })
     }
 }
