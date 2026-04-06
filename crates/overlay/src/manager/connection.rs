@@ -263,8 +263,22 @@ impl OverlayManager {
             };
 
         let peer_id = peer.id().clone();
-        info!("Connected to discovered peer: {} at {}", peer_id, addr);
 
+        // Reject banned peers (mirrors connect_outbound_inner).
+        if shared.banned_peers.read().contains(&peer_id) {
+            debug!("Rejected banned discovered peer {} at {}", peer_id, addr);
+            pool.release_pending();
+            return;
+        }
+
+        // Reject peers we're already connected to (mirrors connect_outbound_inner).
+        if shared.peers.contains_key(&peer_id) {
+            debug!("Rejected duplicate discovered peer {} at {}", peer_id, addr);
+            pool.release_pending();
+            return;
+        }
+
+        info!("Connected to discovered peer: {} at {}", peer_id, addr);
         pool.mark_authenticated();
         shared
             .send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
