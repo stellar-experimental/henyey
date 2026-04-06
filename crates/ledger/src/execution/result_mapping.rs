@@ -23,7 +23,7 @@ pub(super) fn failure_code_to_result(code: &TransactionResultCode) -> Transactio
         TransactionResultCode::TxNotSupported => TransactionResultResult::TxNotSupported,
         TransactionResultCode::TxInternalError => TransactionResultResult::TxInternalError,
         TransactionResultCode::TxBadSponsorship => TransactionResultResult::TxBadSponsorship,
-        TransactionResultCode::TxSorobanInvalid => TransactionResultResult::TxNotSupported,
+        TransactionResultCode::TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
         // TxFailed, TxSuccess, TxFeeBumpInnerSuccess, TxFeeBumpInnerFailed carry payloads
         // and are handled specially by build_tx_result_pair.
         TransactionResultCode::TxFailed
@@ -81,7 +81,7 @@ pub(super) fn failure_code_to_inner_result(
         TransactionResultCode::TxNotSupported => InnerTransactionResultResult::TxNotSupported,
         TransactionResultCode::TxInternalError => InnerTransactionResultResult::TxInternalError,
         TransactionResultCode::TxBadSponsorship => InnerTransactionResultResult::TxBadSponsorship,
-        TransactionResultCode::TxSorobanInvalid => InnerTransactionResultResult::TxNotSupported,
+        TransactionResultCode::TxSorobanInvalid => InnerTransactionResultResult::TxSorobanInvalid,
         // TxFailed and success/fee-bump codes carry payloads.
         TransactionResultCode::TxFailed
         | TransactionResultCode::TxSuccess
@@ -201,4 +201,69 @@ pub fn build_tx_result_pair(
         transaction_hash: stellar_xdr::curr::Hash(tx_hash.0),
         result,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_audit_573_soroban_invalid_maps_correctly() {
+        // TxSorobanInvalid must map to TxSorobanInvalid, not TxNotSupported.
+        // Using TxNotSupported would produce a different tx_set_result_hash
+        // and cause consensus divergence.
+        let result = failure_code_to_result(&TransactionResultCode::TxSorobanInvalid);
+        assert!(
+            matches!(result, TransactionResultResult::TxSorobanInvalid),
+            "TxSorobanInvalid should map to TxSorobanInvalid, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_audit_573_soroban_invalid_inner_maps_correctly() {
+        let result = failure_code_to_inner_result(&TransactionResultCode::TxSorobanInvalid, &[]);
+        assert!(
+            matches!(result, InnerTransactionResultResult::TxSorobanInvalid),
+            "TxSorobanInvalid inner should map to TxSorobanInvalid, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_all_failure_codes_map_to_distinct_variants() {
+        // Ensure no two distinct failure codes map to the same result variant.
+        // This catches copy-paste errors where a new code is mapped to an existing variant.
+        let codes = [
+            TransactionResultCode::TxMalformed,
+            TransactionResultCode::TxMissingOperation,
+            TransactionResultCode::TxBadAuth,
+            TransactionResultCode::TxBadAuthExtra,
+            TransactionResultCode::TxBadMinSeqAgeOrGap,
+            TransactionResultCode::TxTooEarly,
+            TransactionResultCode::TxTooLate,
+            TransactionResultCode::TxBadSeq,
+            TransactionResultCode::TxInsufficientFee,
+            TransactionResultCode::TxInsufficientBalance,
+            TransactionResultCode::TxNoAccount,
+            TransactionResultCode::TxNotSupported,
+            TransactionResultCode::TxInternalError,
+            TransactionResultCode::TxBadSponsorship,
+            TransactionResultCode::TxSorobanInvalid,
+        ];
+
+        for (i, code_a) in codes.iter().enumerate() {
+            for code_b in codes.iter().skip(i + 1) {
+                let result_a = failure_code_to_result(code_a);
+                let result_b = failure_code_to_result(code_b);
+                let disc_a = std::mem::discriminant(&result_a);
+                let disc_b = std::mem::discriminant(&result_b);
+                assert_ne!(
+                    disc_a, disc_b,
+                    "Distinct failure codes {:?} and {:?} map to the same result variant",
+                    code_a, code_b
+                );
+            }
+        }
+    }
 }
