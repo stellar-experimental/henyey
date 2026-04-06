@@ -225,7 +225,12 @@ impl Bucket {
             })?;
 
             // Write record mark + entry to hasher (XDR Record Marking format)
-            let size = entry_bytes.len() as u32;
+            let size = u32::try_from(entry_bytes.len()).map_err(|_| {
+                BucketError::Serialization(format!(
+                    "Entry too large for XDR record mark: {} bytes",
+                    entry_bytes.len()
+                ))
+            })?;
             let record_mark = size | 0x80000000; // Set high bit
             hasher.update(record_mark.to_be_bytes());
             hasher.update(&entry_bytes);
@@ -547,7 +552,12 @@ impl Bucket {
             })?;
 
             // Write 4-byte record mark: high bit set + size (big-endian)
-            let size = entry_bytes.len() as u32;
+            let size = u32::try_from(entry_bytes.len()).map_err(|_| {
+                BucketError::Serialization(format!(
+                    "Entry too large for XDR record mark: {} bytes",
+                    entry_bytes.len()
+                ))
+            })?;
             let record_mark = size | 0x80000000; // Set high bit
             bytes.extend_from_slice(&record_mark.to_be_bytes());
 
@@ -984,7 +994,12 @@ impl Bucket {
             })?;
 
             // Write record mark + entry to hasher (XDR Record Marking format)
-            let size = entry_bytes.len() as u32;
+            let size = u32::try_from(entry_bytes.len()).map_err(|_| {
+                BucketError::Serialization(format!(
+                    "Entry too large for XDR record mark: {} bytes",
+                    entry_bytes.len()
+                ))
+            })?;
             let record_mark = size | 0x80000000;
             hasher.update(record_mark.to_be_bytes());
             hasher.update(&entry_bytes);
