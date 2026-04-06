@@ -148,6 +148,11 @@ impl ParallelPartitionConfig {
         ledger_max_instructions: i64,
         ledger_max_dependent_tx_clusters: u32,
     ) -> Self {
+        assert!(
+            ledger_max_instructions >= 0,
+            "ledger_max_instructions must be non-negative, got {}",
+            ledger_max_instructions
+        );
         let instructions_per_cluster = if stage_count > 0 {
             (ledger_max_instructions as u64) / (stage_count as u64)
         } else {
