@@ -113,7 +113,7 @@ pub fn execute_extend_footprint_ttl(
             .map(|bytes| bytes.len() as u32)
             .unwrap_or(0);
         accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
-        if disk_read_bytes_limit > 0 && accumulated_read_bytes > disk_read_bytes_limit {
+        if accumulated_read_bytes > disk_read_bytes_limit {
             return Ok(make_result(
                 ExtendFootprintTtlResultCode::ResourceLimitExceeded,
             ));
@@ -548,6 +548,80 @@ mod tests {
                 assert!(
                     matches!(r, ExtendFootprintTtlResult::Success),
                     "Missing entry should be skipped (success), got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Regression test for AUDIT-M33: zero disk_read_bytes limit must reject
+    /// any non-zero accumulated read bytes, not skip enforcement entirely.
+    ///
+    /// stellar-core: ExtendFootprintTTLOpFrame.cpp line 219 —
+    /// `if (mResources.diskReadBytes < mMetrics.mLedgerReadByte)` has no > 0 guard.
+    #[test]
+    fn test_extend_footprint_ttl_zero_disk_read_bytes_rejects() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let contract_hash = Hash([42u8; 32]);
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: contract_hash.clone(),
+        });
+
+        // Insert a contract code entry into state so the lookup succeeds
+        let code_entry = ContractCodeEntry {
+            ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+            hash: contract_hash.clone(),
+            code: vec![0u8; 100].try_into().unwrap(),
+        };
+        state.create_contract_code(code_entry);
+
+        // Insert a TTL entry that needs extending (live_until < current + extend_to)
+        let key_hash = crate::soroban::compute_key_hash(&contract_key);
+        let ttl_entry = stellar_xdr::curr::TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: context.sequence + 10, // live but needs extending
+        };
+        state.create_ttl(ttl_entry);
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 1000, // target = current + 1000, well beyond current TTL
+        };
+
+        // disk_read_bytes = 0 means zero budget: any read should exceed it
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::ResourceLimitExceeded),
+                    "Zero disk_read_bytes should reject any read, got {:?}",
                     r
                 );
             }
