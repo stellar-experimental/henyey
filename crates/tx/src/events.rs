@@ -592,7 +592,7 @@ impl TxEventManager {
         amount: i64,
         stage: TransactionEventStage,
     ) {
-        self.new_fee_event(fee_source, -amount.abs(), stage);
+        self.new_fee_event(fee_source, -amount.saturating_abs(), stage);
     }
 
     /// Emit a fee refund event (positive amount).
@@ -604,7 +604,7 @@ impl TxEventManager {
         amount: i64,
         stage: TransactionEventStage,
     ) {
-        self.new_fee_event(fee_source, amount.abs(), stage);
+        self.new_fee_event(fee_source, amount.saturating_abs(), stage);
     }
 
     /// Finalize and return all accumulated events.
