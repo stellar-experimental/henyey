@@ -2309,85 +2309,74 @@ async fn cmd_verify_history(
                         }
 
                         match archive.get_transactions(checkpoint).await {
-                            Ok(tx_entries) => {
-                                match archive.get_results(checkpoint).await {
-                                    Ok(tx_results) => {
-                                        let tx_map = tx_entries
-                                            .iter()
-                                            .map(|entry| (entry.ledger_seq, entry))
-                                            .collect::<std::collections::HashMap<_, _>>();
-                                        let result_map = tx_results
-                                            .iter()
-                                            .map(|entry| (entry.ledger_seq, entry))
-                                            .collect::<std::collections::HashMap<_, _>>();
+                            Ok(tx_entries) => match archive.get_results(checkpoint).await {
+                                Ok(tx_results) => {
+                                    let tx_map = tx_entries
+                                        .iter()
+                                        .map(|entry| (entry.ledger_seq, entry))
+                                        .collect::<std::collections::HashMap<_, _>>();
+                                    let result_map = tx_results
+                                        .iter()
+                                        .map(|entry| (entry.ledger_seq, entry))
+                                        .collect::<std::collections::HashMap<_, _>>();
 
-                                        for header in &headers {
-                                            let Some(tx_entry) = tx_map.get(&header.ledger_seq)
-                                            else {
-                                                println!(
+                                    for header in &headers {
+                                        let Some(tx_entry) = tx_map.get(&header.ledger_seq) else {
+                                            println!(
                                                     "    Missing transaction history entry for ledger {}",
                                                     header.ledger_seq
                                                 );
-                                                error_count += 1;
-                                                continue;
-                                            };
-                                            let Some(result_entry) =
-                                                result_map.get(&header.ledger_seq)
-                                            else {
-                                                println!(
+                                            error_count += 1;
+                                            continue;
+                                        };
+                                        let Some(result_entry) = result_map.get(&header.ledger_seq)
+                                        else {
+                                            println!(
                                                     "    Missing transaction result entry for ledger {}",
                                                     header.ledger_seq
                                                 );
-                                                error_count += 1;
-                                                continue;
-                                            };
+                                            error_count += 1;
+                                            continue;
+                                        };
 
-                                            let tx_set = match &tx_entry.ext {
-                                                stellar_xdr::curr::TransactionHistoryEntryExt::V1(generalized) => {
-                                                    TransactionSetVariant::Generalized(generalized.clone())
-                                                }
-                                                stellar_xdr::curr::TransactionHistoryEntryExt::V0 => {
-                                                    TransactionSetVariant::Classic(tx_entry.tx_set.clone())
-                                                }
-                                            };
-                                            if let Err(e) = verify::verify_tx_set(header, &tx_set) {
-                                                println!(
+                                        let tx_set = TransactionSetVariant::from(*tx_entry);
+                                        if let Err(e) = verify::verify_tx_set(header, &tx_set) {
+                                            println!(
                                                     "    Tx set hash verification FAILED (ledger {}): {}",
                                                     header.ledger_seq, e
                                                 );
-                                                error_count += 1;
-                                            }
+                                            error_count += 1;
+                                        }
 
-                                            let result_xdr = result_entry
-                                                .tx_result_set
-                                                .to_xdr(stellar_xdr::curr::Limits::none());
-                                            match result_xdr {
-                                                Ok(bytes) => {
-                                                    if let Err(e) =
-                                                        verify::verify_tx_result_set(header, &bytes)
-                                                    {
-                                                        println!(
+                                        let result_xdr = result_entry
+                                            .tx_result_set
+                                            .to_xdr(stellar_xdr::curr::Limits::none());
+                                        match result_xdr {
+                                            Ok(bytes) => {
+                                                if let Err(e) =
+                                                    verify::verify_tx_result_set(header, &bytes)
+                                                {
+                                                    println!(
                                                             "    Tx result hash verification FAILED (ledger {}): {}",
                                                             header.ledger_seq, e
                                                         );
-                                                        error_count += 1;
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    println!(
-                                                        "    Failed to encode tx result set for ledger {}: {}",
-                                                        header.ledger_seq, e
-                                                    );
                                                     error_count += 1;
                                                 }
                                             }
+                                            Err(e) => {
+                                                println!(
+                                                        "    Failed to encode tx result set for ledger {}: {}",
+                                                        header.ledger_seq, e
+                                                    );
+                                                error_count += 1;
+                                            }
                                         }
                                     }
-                                    Err(e) => {
-                                        println!("    Warning: Could not verify tx results: {}", e);
-                                    }
                                 }
-                            }
+                                Err(e) => {
+                                    println!("    Warning: Could not verify tx results: {}", e);
+                                }
+                            },
                             Err(e) => {
                                 println!("    Warning: Could not verify transactions: {}", e);
                             }
@@ -2446,7 +2435,6 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
     use henyey_ledger::TransactionSetVariant;
     use std::fs;
     use std::path::PathBuf;
-    use stellar_xdr::curr::TransactionHistoryEntryExt;
     use url::Url;
 
     if !config.node.is_validator {
@@ -2643,14 +2631,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             let tx_entry = &tx_entries[idx];
             let tx_result_entry = &tx_results[idx];
             let header = &header_entry.header;
-            let tx_set = match &tx_entry.ext {
-                TransactionHistoryEntryExt::V1(generalized) => {
-                    TransactionSetVariant::Generalized(generalized.clone())
-                }
-                TransactionHistoryEntryExt::V0 => {
-                    TransactionSetVariant::Classic(tx_entry.tx_set.clone())
-                }
-            };
+            let tx_set = TransactionSetVariant::from(tx_entry);
             let tx_set_hash = verify::compute_tx_set_hash(&tx_set).unwrap_or(Hash256::ZERO);
             let expected_tx_set = Hash256::from(header.scp_value.tx_set_hash.0);
             if tx_set_hash != expected_tx_set {
@@ -3716,78 +3697,20 @@ async fn cmd_verify_execution(
     let init_has = archive.get_checkpoint_has(init_checkpoint).await?;
 
     // Extract bucket hashes
-    let bucket_hashes: Vec<(Hash256, Hash256)> = init_has
-        .current_buckets
-        .iter()
-        .map(|level| {
-            (
-                Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
-                Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-            )
-        })
-        .collect();
+    let bucket_hashes = init_has.bucket_hash_pairs();
 
     let live_next_states: Vec<HasNextState> = init_has
-        .current_buckets
-        .iter()
-        .map(|level| HasNextState {
-            state: level.next.state,
-            output: level
-                .next
-                .output
-                .as_ref()
-                .and_then(|h| Hash256::from_hex(h).ok()),
-            input_curr: level
-                .next
-                .curr
-                .as_ref()
-                .and_then(|h| Hash256::from_hex(h).ok()),
-            input_snap: level
-                .next
-                .snap
-                .as_ref()
-                .and_then(|h| Hash256::from_hex(h).ok()),
-        })
+        .live_next_states()
+        .into_iter()
+        .map(HasNextState::from)
         .collect();
 
     // Extract hot archive bucket hashes (protocol 23+)
-    let hot_archive_hashes: Option<Vec<(Hash256, Hash256)>> =
-        init_has.hot_archive_buckets.as_ref().map(|levels| {
-            levels
-                .iter()
-                .map(|level| {
-                    (
-                        Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
-                        Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-                    )
-                })
-                .collect()
-        });
+    let hot_archive_hashes = init_has.hot_archive_bucket_hash_pairs();
 
-    let hot_archive_next_states: Option<Vec<HasNextState>> =
-        init_has.hot_archive_buckets.as_ref().map(|levels| {
-            levels
-                .iter()
-                .map(|level| HasNextState {
-                    state: level.next.state,
-                    output: level
-                        .next
-                        .output
-                        .as_ref()
-                        .and_then(|h| Hash256::from_hex(h).ok()),
-                    input_curr: level
-                        .next
-                        .curr
-                        .as_ref()
-                        .and_then(|h| Hash256::from_hex(h).ok()),
-                    input_snap: level
-                        .next
-                        .snap
-                        .as_ref()
-                        .and_then(|h| Hash256::from_hex(h).ok()),
-                })
-                .collect()
-        });
+    let hot_archive_next_states: Option<Vec<HasNextState>> = init_has
+        .hot_archive_next_states()
+        .map(|states| states.into_iter().map(HasNextState::from).collect());
 
     // Collect all bucket hashes to download
     let mut all_hashes: Vec<Hash256> = Vec::new();
@@ -4796,14 +4719,9 @@ async fn cmd_debug_bucket_entry(
     // Get bucket list hashes at this checkpoint
     let has_entry = archive.get_checkpoint_has(checkpoint_seq).await?;
     let bucket_hashes: Vec<Hash256> = has_entry
-        .current_buckets
-        .iter()
-        .flat_map(|level| {
-            vec![
-                Hash256::from_hex(&level.curr).unwrap_or(Hash256::ZERO),
-                Hash256::from_hex(&level.snap).unwrap_or(Hash256::ZERO),
-            ]
-        })
+        .bucket_hash_pairs()
+        .into_iter()
+        .flat_map(|(curr, snap)| [curr, snap])
         .collect();
 
     println!("Loading bucket list...");

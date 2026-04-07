@@ -1312,50 +1312,41 @@ impl ScpDriver {
     /// `min(tx.fee, numOps * componentBaseFee)`. For legacy tx sets,
     /// inclusion fee == full fee (no discounting).
     fn tx_set_total_inclusion_fees(tx_set: &TransactionSet) -> i64 {
-        if let Some(ref gen) = tx_set.generalized_tx_set {
-            let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = gen;
-            let mut total = 0i64;
-            for phase in set_v1.phases.iter() {
-                match phase {
-                    stellar_xdr::curr::TransactionPhase::V0(components) => {
-                        for comp in components.iter() {
-                            let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                                c,
-                            ) = comp;
-                            for tx in c.txs.iter() {
-                                let full_fee = Self::envelope_fee(tx);
-                                let inclusion_fee = if let Some(base_fee) = c.base_fee {
-                                    let ops = Self::envelope_num_ops(tx) as i64;
-                                    full_fee.min(ops * base_fee)
-                                } else {
-                                    full_fee
-                                };
-                                total += inclusion_fee;
-                            }
-                        }
-                    }
-                    stellar_xdr::curr::TransactionPhase::V1(parallel) => {
-                        for stage in parallel.execution_stages.iter() {
-                            for cluster in stage.iter() {
-                                for tx in cluster.0.iter() {
-                                    let full_fee = Self::envelope_fee(tx);
-                                    let inclusion_fee = if let Some(base_fee) = parallel.base_fee {
-                                        let ops = Self::envelope_num_ops(tx) as i64;
-                                        full_fee.min(ops * base_fee)
-                                    } else {
-                                        full_fee
-                                    };
-                                    total += inclusion_fee;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            total
-        } else {
+        let Some(ref gen) = tx_set.generalized_tx_set else {
             // Legacy tx set: inclusion fee == full fee
-            Self::tx_set_total_fees(tx_set)
+            return Self::tx_set_total_fees(tx_set);
+        };
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = gen;
+
+        let mut total = 0i64;
+        for phase in set_v1.phases.iter() {
+            for (tx, base_fee) in Self::phase_txs_with_base_fee(phase) {
+                total += crate::tx_set_utils::inclusion_fee(tx, base_fee);
+            }
+        }
+        total
+    }
+
+    /// Iterate over all transactions in a phase, yielding each envelope
+    /// together with the component's optional base fee.
+    fn phase_txs_with_base_fee(
+        phase: &stellar_xdr::curr::TransactionPhase,
+    ) -> Vec<(&stellar_xdr::curr::TransactionEnvelope, Option<i64>)> {
+        match phase {
+            stellar_xdr::curr::TransactionPhase::V0(components) => components
+                .iter()
+                .flat_map(|comp| {
+                    let stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) = comp;
+                    c.txs.iter().map(move |tx| (tx, c.base_fee))
+                })
+                .collect(),
+            stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel
+                .execution_stages
+                .iter()
+                .flat_map(|stage| stage.iter())
+                .flat_map(|cluster| cluster.0.iter())
+                .map(|tx| (tx, parallel.base_fee))
+                .collect(),
         }
     }
 

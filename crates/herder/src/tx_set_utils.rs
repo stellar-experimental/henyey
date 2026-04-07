@@ -28,6 +28,22 @@ pub(crate) fn envelope_fee(env: &TransactionEnvelope) -> i64 {
     }
 }
 
+/// Compute the inclusion fee for a transaction given an optional component base fee.
+///
+/// If a `base_fee` is present, the inclusion fee is `min(full_fee, num_ops * base_fee)`
+/// (i.e. the tx only pays up to the component's discounted rate). Otherwise the full
+/// declared fee is used.
+pub(crate) fn inclusion_fee(env: &TransactionEnvelope, base_fee: Option<i64>) -> i64 {
+    let full_fee = envelope_fee(env);
+    match base_fee {
+        Some(bf) => {
+            let ops = envelope_num_ops(env) as i64;
+            full_fee.min(ops * bf)
+        }
+        None => full_fee,
+    }
+}
+
 /// Get the number of operations from a transaction envelope.
 ///
 /// For fee-bump transactions, returns the inner transaction's operation count.

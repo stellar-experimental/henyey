@@ -248,6 +248,23 @@ pub enum TransactionSetVariant {
     Generalized(GeneralizedTransactionSet),
 }
 
+impl From<&stellar_xdr::curr::TransactionHistoryEntry> for TransactionSetVariant {
+    /// Extract the transaction set from a history entry.
+    ///
+    /// For V1 entries, extracts the generalized transaction set from the ext field.
+    /// For V0 entries, uses the classic transaction set.
+    fn from(entry: &stellar_xdr::curr::TransactionHistoryEntry) -> Self {
+        match &entry.ext {
+            stellar_xdr::curr::TransactionHistoryEntryExt::V1(generalized) => {
+                TransactionSetVariant::Generalized(generalized.clone())
+            }
+            stellar_xdr::curr::TransactionHistoryEntryExt::V0 => {
+                TransactionSetVariant::Classic(entry.tx_set.clone())
+            }
+        }
+    }
+}
+
 impl TransactionSetVariant {
     /// Get the number of transactions in the set.
     pub fn num_transactions(&self) -> usize {
