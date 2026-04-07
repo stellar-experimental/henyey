@@ -786,8 +786,13 @@ fn apply_soroban_storage_changes(
             is_rent_related = change.is_rent_related,
             "Applying storage change"
         );
-        let was_created =
-            apply_soroban_storage_change(state, change, hot_archive_restored_keys, ttl_key_cache);
+        let was_created = apply_soroban_storage_change(
+            state,
+            change,
+            hot_archive_restored_keys,
+            ttl_key_cache,
+            &mut created_keys,
+        );
         if was_created {
             created_keys.insert(change.key.clone());
         }
@@ -912,6 +917,7 @@ fn apply_soroban_storage_change(
     change: &crate::soroban::StorageChange,
     hot_archive_restored_keys: &std::collections::HashSet<LedgerKey>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+    created_keys: &mut std::collections::HashSet<LedgerKey>,
 ) -> bool {
     // Check if this entry is being restored from the hot archive.
     // Hot archive restored entries must be recorded as INIT (created) in the bucket list delta,
@@ -1024,6 +1030,9 @@ fn apply_soroban_storage_change(
                     // First restoration from hot archive - create TTL
                     tracing::debug!(?key_hash, live_until, "TTL emit: hot archive restore");
                     state.create_ttl(ttl);
+                    created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                        key_hash: key_hash.clone(),
+                    }));
                 } else if is_hot_archive_restore && ttl_already_restored {
                     // TTL was already restored by earlier TX - update
                     tracing::debug!(
@@ -1044,11 +1053,19 @@ fn apply_soroban_storage_change(
                         exists,
                         "TTL emit: data modified, TTL extended or new"
                     );
+                    if !exists {
+                        created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                            key_hash: key_hash.clone(),
+                        }));
+                    }
                     create_or_update_ttl(state, ttl, exists);
                 } else if existing_ttl.is_none() {
                     // New entry being created - emit TTL
                     tracing::debug!(?key_hash, live_until, "TTL emit: new TTL entry");
                     state.create_ttl(ttl);
+                    created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                        key_hash: key_hash.clone(),
+                    }));
                 } else {
                     // TTL was NOT extended and entry already exists - skip emission
                     tracing::debug!(
@@ -1886,7 +1903,13 @@ mod tests {
         };
 
         let no_restored_keys = std::collections::HashSet::new();
-        apply_soroban_storage_change(&mut state, &change, &no_restored_keys, None);
+        apply_soroban_storage_change(
+            &mut state,
+            &change,
+            &no_restored_keys,
+            None,
+            &mut std::collections::HashSet::new(),
+        );
         assert!(state
             .get_contract_data(&contract_id, &contract_key, durability)
             .is_some());
@@ -1903,7 +1926,13 @@ mod tests {
             is_read_only_ttl_bump: false,
         };
 
-        apply_soroban_storage_change(&mut state, &delete_change, &no_restored_keys, None);
+        apply_soroban_storage_change(
+            &mut state,
+            &delete_change,
+            &no_restored_keys,
+            None,
+            &mut std::collections::HashSet::new(),
+        );
         assert!(state
             .get_contract_data(&contract_id, &contract_key, durability)
             .is_none());
@@ -2001,7 +2030,13 @@ mod tests {
         };
 
         let no_restored_keys = std::collections::HashSet::new();
-        apply_soroban_storage_change(&mut state2, &modify_change, &no_restored_keys, None);
+        apply_soroban_storage_change(
+            &mut state2,
+            &modify_change,
+            &no_restored_keys,
+            None,
+            &mut std::collections::HashSet::new(),
+        );
 
         // Verify data was updated
         let cd = state2
@@ -2319,7 +2354,13 @@ mod tests {
             let mut hot_archive_keys = std::collections::HashSet::new();
             hot_archive_keys.insert(key.clone());
 
-            apply_soroban_storage_change(&mut state, &change, &hot_archive_keys, None);
+            apply_soroban_storage_change(
+                &mut state,
+                &change,
+                &hot_archive_keys,
+                None,
+                &mut std::collections::HashSet::new(),
+            );
 
             // With hot_archive_keys and entry NOT in delta.created,
             // apply_soroban_storage_change should use create_contract_data.
@@ -2377,7 +2418,13 @@ mod tests {
             // Now apply WITHOUT hot_archive_keys
             let no_restored_keys: std::collections::HashSet<LedgerKey> =
                 std::collections::HashSet::new();
-            apply_soroban_storage_change(&mut state, &change, &no_restored_keys, None);
+            apply_soroban_storage_change(
+                &mut state,
+                &change,
+                &no_restored_keys,
+                None,
+                &mut std::collections::HashSet::new(),
+            );
 
             // Without hot_archive_keys, entry exists, so should call update_contract_data
             let created_count = state
@@ -2481,7 +2528,13 @@ mod tests {
             "Delta should be empty before the call"
         );
 
-        apply_soroban_storage_change(&mut state, &change, &hot_archive_restored_keys, None);
+        apply_soroban_storage_change(
+            &mut state,
+            &change,
+            &hot_archive_restored_keys,
+            None,
+            &mut std::collections::HashSet::new(),
+        );
 
         // KEY ASSERTION: no TTL INIT should have been created.
         // Before the fix, create_ttl() was called, producing a spurious TTL INIT that
