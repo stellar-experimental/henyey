@@ -106,6 +106,13 @@ const MAX_TX_SET_ALLOWANCE_BYTES: u32 = 10 * 1024 * 1024;
 const MAX_CLASSIC_BYTE_ALLOWANCE: u32 = MAX_TX_SET_ALLOWANCE_BYTES / 2;
 const MAX_SOROBAN_BYTE_ALLOWANCE: u32 = MAX_TX_SET_ALLOWANCE_BYTES / 2;
 
+/// Default maximum number of transactions in the queue.
+const DEFAULT_MAX_QUEUE_SIZE: usize = 1000;
+/// Default maximum age (seconds) before a pending transaction is evicted (5 minutes).
+const DEFAULT_MAX_AGE_SECS: u64 = 300;
+/// Default minimum fee per operation (100 stroops = 0.00001 XLM).
+const DEFAULT_MIN_FEE_PER_OP: u32 = 100;
+
 /// Trait for providing ledger account balance information.
 ///
 /// This trait is used for fee balance validation during transaction queue
@@ -173,9 +180,9 @@ pub struct TxQueueConfig {
 impl Default for TxQueueConfig {
     fn default() -> Self {
         Self {
-            max_size: 1000,
-            max_age_secs: 300, // 5 minutes
-            min_fee_per_op: 100,
+            max_size: DEFAULT_MAX_QUEUE_SIZE,
+            max_age_secs: DEFAULT_MAX_AGE_SECS,
+            min_fee_per_op: DEFAULT_MIN_FEE_PER_OP,
             validate_signatures: true,
             validate_time_bounds: true,
             network_id: NetworkId::testnet(),

@@ -138,7 +138,7 @@ pub use cdp::{
 pub use checkpoint::{
     checkpoint_containing, checkpoint_frequency, first_ledger_in_checkpoint_containing,
     is_checkpoint_ledger, last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at,
-    ledger_to_trigger_catchup, size_of_checkpoint_containing, CHECKPOINT_FREQUENCY,
+    ledger_to_trigger_catchup, size_of_checkpoint_containing,
 };
 pub use compare::{compare_checkpoint, Category, CheckpointComparison, Mismatch};
 pub use download::DownloadConfig;

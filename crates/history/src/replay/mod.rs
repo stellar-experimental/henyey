@@ -144,7 +144,7 @@ pub struct ReplayConfig {
     ///
     /// This is the primary verification that ensures correct state
     /// reconstruction. Verification only runs at checkpoint boundaries
-    /// (ledger % 64 == 63) because intermediate states may differ.
+    /// because intermediate states may differ.
     pub verify_bucket_list: bool,
 
     /// Emit classic contract events during replay.

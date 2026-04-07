@@ -33,10 +33,6 @@ pub fn checkpoint_frequency() -> u32 {
         .unwrap_or(&DEFAULT_CHECKPOINT_FREQUENCY)
 }
 
-/// Legacy constant alias for compatibility — use `checkpoint_frequency()` for
-/// runtime-configurable behavior.
-pub const CHECKPOINT_FREQUENCY: u32 = 64;
-
 /// Calculate the checkpoint ledger for a given sequence.
 ///
 /// Checkpoint ledgers are of the form `(n * 64) + 63`, i.e., 63, 127, 191, etc.

@@ -60,7 +60,7 @@ pub struct PersistedSlotState {
 
 impl PersistedSlotState {
     /// Current version of the persisted state format.
-    pub const CURRENT_VERSION: u32 = 1;
+    pub(crate) const CURRENT_VERSION: u32 = 1;
 
     /// Create a new empty persisted state.
     pub fn new() -> Self {
@@ -90,7 +90,7 @@ impl PersistedSlotState {
     }
 
     /// Get the envelopes from the persisted state.
-    pub fn get_envelopes(&self) -> Vec<Result<ScpEnvelope>> {
+    pub(crate) fn get_envelopes(&self) -> Vec<Result<ScpEnvelope>> {
         self.envelopes
             .iter()
             .map(|bytes| {
@@ -102,7 +102,7 @@ impl PersistedSlotState {
     }
 
     /// Get the quorum sets from the persisted state.
-    pub fn get_quorum_sets(&self) -> Vec<Result<ScpQuorumSet>> {
+    pub(crate) fn get_quorum_sets(&self) -> Vec<Result<ScpQuorumSet>> {
         self.quorum_sets
             .iter()
             .map(|bytes| {
@@ -114,14 +114,14 @@ impl PersistedSlotState {
     }
 
     /// Encode to JSON for storage.
-    pub fn to_json(&self) -> Result<String> {
+    pub(crate) fn to_json(&self) -> Result<String> {
         serde_json::to_string(self).map_err(|e| {
             HerderError::InvalidEnvelope(format!("failed to encode persisted state: {}", e))
         })
     }
 
     /// Decode from JSON.
-    pub fn from_json(json: &str) -> Result<Self> {
+    pub(crate) fn from_json(json: &str) -> Result<Self> {
         serde_json::from_str(json).map_err(|e| {
             HerderError::InvalidEnvelope(format!("failed to decode persisted state: {}", e))
         })

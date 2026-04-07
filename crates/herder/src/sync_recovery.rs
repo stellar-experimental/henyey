@@ -65,7 +65,7 @@ pub const OUT_OF_SYNC_RECOVERY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Maximum number of slots to keep ahead when purging during recovery.
 /// Spec: HERDER_SPEC §16 — LEDGER_VALIDITY_BRACKET = 100.
-pub const LEDGER_VALIDITY_BRACKET: u32 = 100;
+pub const LEDGER_VALIDITY_BRACKET: u64 = 100;
 
 /// Commands sent to the sync recovery manager.
 #[derive(Debug)]

@@ -139,7 +139,7 @@ fn run_eviction_scan(
 
 /// Verify the combined bucket list hash at checkpoint boundaries.
 ///
-/// Verification is only reliable at checkpoints (ledger_seq % 64 == 63) because
+/// Verification is only reliable at checkpoint boundaries because
 /// re-execution without TransactionMeta may produce slightly different entry values.
 /// For protocol 23+, eviction must also be running to get accurate results.
 fn verify_bucket_list_hash(
@@ -149,7 +149,7 @@ fn verify_bucket_list_hash(
     hot_archive_bucket_list: &henyey_bucket::HotArchiveBucketList,
     eviction_iterator: Option<EvictionIterator>,
 ) -> Result<()> {
-    let is_checkpoint = header.ledger_seq % 64 == 63;
+    let is_checkpoint = is_checkpoint_ledger(header.ledger_seq);
     let eviction_running = config.run_eviction && eviction_iterator.is_some();
     let can_verify = is_checkpoint
         && (protocol_version_is_before(header.ledger_version, ProtocolVersion::V23)
@@ -921,7 +921,7 @@ mod tests {
 
     #[test]
     fn test_replay_ledger_with_execution_bucket_hash_mismatch() {
-        // Use checkpoint ledger (seq % 64 == 63) so bucket list verification runs
+        // Use checkpoint ledger (is_checkpoint_ledger(127) == true) so bucket list verification runs
         let mut header = make_test_header(127);
         // Use protocol version 25 (P24+) for correct combined hash semantics
         header.ledger_version = 25;

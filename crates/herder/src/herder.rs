@@ -59,6 +59,7 @@ use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStat
 use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig};
 use crate::state::HerderState;
+use crate::sync_recovery::LEDGER_VALIDITY_BRACKET;
 use crate::tx_queue::{
     account_key_from_account_id, TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult,
     TxQueueStats,
@@ -90,13 +91,6 @@ const MAX_TIME_SLIP_SECONDS: u64 = 60;
 /// stellar-core computes this as `min((MAX_SLOTS_TO_REMEMBER + 2) * TARGET_CLOSE_TIME / 1000, 90)`.
 /// With default values: `min(14 * 5, 90) = 70` seconds.
 const MAXIMUM_LEDGER_CLOSETIME_DRIFT: u64 = 70;
-
-/// Maximum number of ledgers ahead of tracking that we accept SCP messages for.
-///
-/// Matches stellar-core `Herder::LEDGER_VALIDITY_BRACKET = 100`. When tracking consensus,
-/// we reject envelopes for slots more than this many ahead of our next consensus
-/// ledger index.
-const LEDGER_VALIDITY_BRACKET: u64 = 100;
 
 /// Genesis ledger sequence number.
 ///

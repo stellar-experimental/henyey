@@ -127,12 +127,12 @@ pub async fn compare_checkpoint(
     // --- Transactions ---
     let local_txs = local.get_transactions(checkpoint).await?;
     let ref_txs = reference.get_transactions(checkpoint).await?;
-    compare_transactions(&local_txs, &ref_txs, &mut mismatches);
+    compare_entries(&local_txs, &ref_txs, &mut mismatches);
 
     // --- Results ---
     let local_results = local.get_results(checkpoint).await?;
     let ref_results = reference.get_results(checkpoint).await?;
-    compare_results(&local_results, &ref_results, &mut mismatches);
+    compare_entries(&local_results, &ref_results, &mut mismatches);
 
     Ok(CheckpointComparison {
         checkpoint,
@@ -397,73 +397,52 @@ fn compare_ledger_headers(
 }
 
 // ============================================================================
-// Transaction comparison
+// Transaction & result comparison
 // ============================================================================
 
-fn compare_transactions(
-    local: &[TransactionHistoryEntry],
-    reference: &[TransactionHistoryEntry],
-    out: &mut Vec<Mismatch>,
-) {
-    if local.len() != reference.len() {
-        out.push(Mismatch {
-            category: Category::Transactions,
-            detail: format!(
-                "entry count: local={} reference={}",
-                local.len(),
-                reference.len()
-            ),
-        });
+/// Trait for history entry types that can be compared by XDR serialization.
+trait ComparableEntry {
+    fn ledger_seq(&self) -> u32;
+    fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::curr::Error>;
+    fn category() -> Category;
+    fn payload_name() -> &'static str;
+}
+
+impl ComparableEntry for TransactionHistoryEntry {
+    fn ledger_seq(&self) -> u32 {
+        self.ledger_seq
     }
-
-    let min_len = local.len().min(reference.len());
-    for i in 0..min_len {
-        let l = &local[i];
-        let r = &reference[i];
-
-        if l.ledger_seq != r.ledger_seq {
-            out.push(Mismatch {
-                category: Category::Transactions,
-                detail: format!(
-                    "entry {}: ledger_seq local={} reference={}",
-                    i, l.ledger_seq, r.ledger_seq
-                ),
-            });
-            continue;
-        }
-
-        // Compare by XDR serialization of the full transaction set.
-        let l_xdr = l.tx_set.to_xdr(stellar_xdr::curr::Limits::none());
-        let r_xdr = r.tx_set.to_xdr(stellar_xdr::curr::Limits::none());
-        match (l_xdr, r_xdr) {
-            (Ok(l_bytes), Ok(r_bytes)) if l_bytes != r_bytes => {
-                out.push(Mismatch {
-                    category: Category::Transactions,
-                    detail: format!(
-                        "ledger {}: tx_set differs (local {} bytes, reference {} bytes)",
-                        l.ledger_seq,
-                        l_bytes.len(),
-                        r_bytes.len(),
-                    ),
-                });
-            }
-            _ => {}
-        }
+    fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::curr::Error> {
+        self.tx_set.to_xdr(stellar_xdr::curr::Limits::none())
+    }
+    fn category() -> Category {
+        Category::Transactions
+    }
+    fn payload_name() -> &'static str {
+        "tx_set"
     }
 }
 
-// ============================================================================
-// Results comparison
-// ============================================================================
+impl ComparableEntry for TransactionHistoryResultEntry {
+    fn ledger_seq(&self) -> u32 {
+        self.ledger_seq
+    }
+    fn payload_xdr(&self) -> std::result::Result<Vec<u8>, stellar_xdr::curr::Error> {
+        self.tx_result_set.to_xdr(stellar_xdr::curr::Limits::none())
+    }
+    fn category() -> Category {
+        Category::Results
+    }
+    fn payload_name() -> &'static str {
+        "tx_result_set"
+    }
+}
 
-fn compare_results(
-    local: &[TransactionHistoryResultEntry],
-    reference: &[TransactionHistoryResultEntry],
-    out: &mut Vec<Mismatch>,
-) {
+fn compare_entries<T: ComparableEntry>(local: &[T], reference: &[T], out: &mut Vec<Mismatch>) {
+    let category = T::category();
     if local.len() != reference.len() {
         out.push(Mismatch {
-            category: Category::Results,
+            category,
             detail: format!(
                 "entry count: local={} reference={}",
                 local.len(),
@@ -477,27 +456,29 @@ fn compare_results(
         let l = &local[i];
         let r = &reference[i];
 
-        if l.ledger_seq != r.ledger_seq {
+        if l.ledger_seq() != r.ledger_seq() {
             out.push(Mismatch {
-                category: Category::Results,
+                category,
                 detail: format!(
                     "entry {}: ledger_seq local={} reference={}",
-                    i, l.ledger_seq, r.ledger_seq
+                    i,
+                    l.ledger_seq(),
+                    r.ledger_seq()
                 ),
             });
             continue;
         }
 
-        // Compare by XDR serialization.
-        let l_xdr = l.tx_result_set.to_xdr(stellar_xdr::curr::Limits::none());
-        let r_xdr = r.tx_result_set.to_xdr(stellar_xdr::curr::Limits::none());
+        let l_xdr = l.payload_xdr();
+        let r_xdr = r.payload_xdr();
         match (l_xdr, r_xdr) {
             (Ok(l_bytes), Ok(r_bytes)) if l_bytes != r_bytes => {
                 out.push(Mismatch {
-                    category: Category::Results,
+                    category,
                     detail: format!(
-                        "ledger {}: tx_result_set differs (local {} bytes, reference {} bytes)",
-                        l.ledger_seq,
+                        "ledger {}: {} differs (local {} bytes, reference {} bytes)",
+                        l.ledger_seq(),
+                        T::payload_name(),
                         l_bytes.len(),
                         r_bytes.len(),
                     ),

@@ -13,7 +13,6 @@
 
 pub use crate::paths::{
     bucket_path, checkpoint_frequency, checkpoint_ledger, checkpoint_path, is_checkpoint_ledger,
-    CHECKPOINT_FREQUENCY,
 };
 
 /// Alias for checkpoint_ledger to match naming convention.
@@ -192,7 +191,7 @@ pub fn checkpoint_range(checkpoint_ledger_seq: u32) -> (u32, u32) {
 /// # Panics
 ///
 /// Panics if `first_ledger_of_buffered_checkpoint` is not a checkpoint start
-/// (i.e., not a multiple of `CHECKPOINT_FREQUENCY`).
+/// (i.e., not a multiple of the checkpoint frequency).
 ///
 /// # Examples
 ///
