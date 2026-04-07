@@ -1338,10 +1338,9 @@ pub fn initialize_genesis_ledger(
     use henyey_history::build_history_archive_state;
     use henyey_ledger::{calculate_skip_values, compute_header_hash};
     use stellar_xdr::curr::{
-        AccountEntry, AccountEntryExt, AccountId, BucketListType, Hash, LedgerEntry,
-        LedgerEntryData, LedgerEntryExt, LedgerHeader, LedgerHeaderExt, Limits, PublicKey,
-        SequenceNumber, StellarValue, StellarValueExt, Thresholds, TimePoint,
-        TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
+        AccountId, BucketListType, Hash, LedgerHeader, LedgerHeaderExt, Limits, PublicKey,
+        StellarValue, StellarValueExt, TimePoint, TransactionHistoryEntry,
+        TransactionHistoryEntryExt, TransactionHistoryResultEntry,
         TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet, Uint256, VecM,
         WriteXdr,
     };
@@ -1357,71 +1356,11 @@ pub fn initialize_genesis_ledger(
     )));
 
     let total_coins: i64 = 1_000_000_000_000_000_000;
-
-    // Compute per-account balance when test accounts are requested.
-    // Matches stellar-core: split evenly, root gets the remainder.
-    let (root_balance, test_balance) = if genesis_test_account_count > 0 {
-        let total_accounts = genesis_test_account_count as i64 + 1;
-        let base = total_coins / total_accounts;
-        let remainder = total_coins % total_accounts;
-        (base + remainder, base)
-    } else {
-        (total_coins, 0i64)
-    };
-
-    let root_entry = LedgerEntry {
-        last_modified_ledger_seq: 1,
-        data: LedgerEntryData::Account(AccountEntry {
-            account_id: root_account_id,
-            balance: root_balance,
-            seq_num: SequenceNumber(0),
-            num_sub_entries: 0,
-            inflation_dest: None,
-            flags: 0,
-            home_domain: stellar_xdr::curr::String32::default(),
-            thresholds: Thresholds([1, 0, 0, 0]),
-            signers: VecM::default(),
-            ext: AccountEntryExt::V0,
-        }),
-        ext: LedgerEntryExt::V0,
-    };
-
-    // Build list of genesis entries: root + test accounts
-    let mut genesis_entries = vec![root_entry];
-
-    for i in 0..genesis_test_account_count {
-        let name = format!("TestAccount-{}", i);
-        let seed = deterministic_seed(&name);
-        let secret = SecretKey::from_seed(&seed);
-        let public = secret.public_key();
-        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
-
-        genesis_entries.push(LedgerEntry {
-            last_modified_ledger_seq: 1,
-            data: LedgerEntryData::Account(AccountEntry {
-                account_id,
-                balance: test_balance,
-                seq_num: SequenceNumber(0),
-                num_sub_entries: 0,
-                inflation_dest: None,
-                flags: 0,
-                home_domain: stellar_xdr::curr::String32::default(),
-                thresholds: Thresholds([1, 0, 0, 0]),
-                signers: VecM::default(),
-                ext: AccountEntryExt::V0,
-            }),
-            ext: LedgerEntryExt::V0,
-        });
-    }
-
-    if genesis_test_account_count > 0 {
-        tracing::info!(
-            count = genesis_test_account_count,
-            balance_per_account = test_balance,
-            root_balance = root_balance,
-            "Creating genesis test accounts"
-        );
-    }
+    let genesis_entries = build_genesis_entries(
+        root_account_id,
+        total_coins,
+        genesis_test_account_count,
+    );
 
     let mut bucket_list = BucketList::new();
     bucket_list
@@ -1491,6 +1430,67 @@ pub fn initialize_genesis_ledger(
 
     let _ = compute_header_hash(&header)?;
     Ok(())
+}
+
+/// Build genesis ledger entries: root account + optional test accounts.
+fn build_genesis_entries(
+    root_account_id: stellar_xdr::curr::AccountId,
+    total_coins: i64,
+    test_account_count: u32,
+) -> Vec<stellar_xdr::curr::LedgerEntry> {
+    use stellar_xdr::curr::{
+        AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
+        PublicKey, SequenceNumber, Thresholds, Uint256, VecM,
+    };
+
+    // Compute per-account balance: split evenly, root gets the remainder.
+    let (root_balance, test_balance) = if test_account_count > 0 {
+        let total_accounts = test_account_count as i64 + 1;
+        let base = total_coins / total_accounts;
+        let remainder = total_coins % total_accounts;
+        (base + remainder, base)
+    } else {
+        (total_coins, 0i64)
+    };
+
+    let make_account_entry = |account_id: AccountId, balance: i64| LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Account(AccountEntry {
+            account_id,
+            balance,
+            seq_num: SequenceNumber(0),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: stellar_xdr::curr::String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: VecM::default(),
+            ext: AccountEntryExt::V0,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let mut entries = vec![make_account_entry(root_account_id, root_balance)];
+
+    for i in 0..test_account_count {
+        let name = format!("TestAccount-{}", i);
+        let seed = deterministic_seed(&name);
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(*public.as_bytes())));
+        entries.push(make_account_entry(account_id, test_balance));
+    }
+
+    if test_account_count > 0 {
+        tracing::info!(
+            count = test_account_count,
+            balance_per_account = test_balance,
+            root_balance = root_balance,
+            "Creating genesis test accounts"
+        );
+    }
+
+    entries
 }
 
 fn root_secret(network_passphrase: &str) -> SecretKey {
