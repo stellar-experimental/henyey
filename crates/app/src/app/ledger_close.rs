@@ -559,7 +559,7 @@ impl App {
                         return Ok(henyey_bucket::Bucket::empty());
                     }
                     let bucket_path =
-                        bucket_dir_for_merge.join(format!("{}.bucket.xdr", hash.to_hex()));
+                        bucket_dir_for_merge.join(henyey_bucket::canonical_bucket_filename(hash));
                     if bucket_path.exists() {
                         henyey_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
                     } else {
@@ -808,7 +808,8 @@ impl App {
                     if hash.is_zero() {
                         return Ok(henyey_bucket::Bucket::empty());
                     }
-                    let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                    let bucket_path =
+                        bucket_dir.join(henyey_bucket::canonical_bucket_filename(hash));
                     if bucket_path.exists() {
                         henyey_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
                     } else {

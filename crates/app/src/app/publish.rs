@@ -237,7 +237,7 @@ impl App {
                         std::fs::create_dir_all(parent)?;
                     }
                     // Find the backing file on disk
-                    let src = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                    let src = bucket_dir.join(henyey_bucket::canonical_bucket_filename(&hash));
                     if src.exists() {
                         use flate2::write::GzEncoder;
                         use flate2::Compression;

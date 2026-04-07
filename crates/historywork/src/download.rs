@@ -10,6 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 
+use henyey_bucket::canonical_bucket_filename;
 use henyey_common::Hash256;
 use henyey_history::{archive::HistoryArchive, archive_state::HistoryArchiveState, verify};
 use henyey_ledger::TransactionSetVariant;
@@ -130,16 +131,15 @@ impl Work for DownloadBucketsWork {
             "downloading buckets",
         )
         .await;
-        let has = {
+        // Borrow the HAS from the shared state to extract bucket hashes, then
+        // drop the lock before starting the (potentially slow) downloads.
+        let hashes = {
             let guard = self.state.lock().await;
-            guard.has.clone()
+            let Some(ref has) = guard.has else {
+                return WorkOutcome::Failed("missing HAS".to_string());
+            };
+            content_bucket_hashes(has)
         };
-
-        let Some(has) = has else {
-            return WorkOutcome::Failed("missing HAS".to_string());
-        };
-
-        let hashes = content_bucket_hashes(&has);
         let total = hashes.len();
         let archive = self.archive.clone();
         let bucket_dir = self.bucket_dir.clone();
@@ -153,7 +153,7 @@ impl Work for DownloadBucketsWork {
         let to_download: Vec<_> = hashes
             .iter()
             .filter(|hash| {
-                let path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                let path = bucket_dir.join(canonical_bucket_filename(&hash));
                 !path.exists()
             })
             .cloned()
@@ -178,7 +178,7 @@ impl Work for DownloadBucketsWork {
                     let downloaded_count = &downloaded_count;
 
                     async move {
-                        let path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                        let path = bucket_dir.join(canonical_bucket_filename(&hash));
                         download_and_save_bucket(&archive, &hash, &path).await?;
 
                         let count =
@@ -254,8 +254,7 @@ impl Work for DownloadLedgerHeadersWork {
             Err(err) => return WorkOutcome::Failed(format!("failed to download headers: {err}")),
         };
 
-        let header_chain: Vec<_> = headers.iter().map(|entry| entry.header.clone()).collect();
-        if let Err(err) = verify::verify_header_chain(&header_chain) {
+        if let Err(err) = verify::verify_header_chain_from_entries(&headers) {
             return WorkOutcome::Failed(format!("header chain verification failed: {err}"));
         }
 

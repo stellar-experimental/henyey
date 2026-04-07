@@ -59,7 +59,7 @@ use crate::{
     replay::ReplayConfig,
     verify, CatchupResult, HistoryError, Result,
 };
-use henyey_bucket::{BucketList, BucketManager, HotArchiveBucketList};
+use henyey_bucket::{canonical_bucket_filename, BucketList, BucketManager, HotArchiveBucketList};
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::Database;
 use std::collections::HashMap;
@@ -769,9 +769,7 @@ impl CatchupManager {
         self.progress.buckets_total = buckets_downloaded;
         for (idx, hash) in bucket_hashes.iter().enumerate() {
             if !hash.is_zero() && hash != empty_bucket_hash {
-                let bucket_path = data
-                    .bucket_dir
-                    .join(format!("{}.bucket.xdr", hash.to_hex()));
+                let bucket_path = data.bucket_dir.join(canonical_bucket_filename(hash));
                 if !bucket_path.exists() {
                     return Err(HistoryError::BucketNotFound(*hash));
                 }
@@ -786,10 +784,8 @@ impl CatchupManager {
                 if hash.is_zero() || *hash == *empty_bucket_hash {
                     continue;
                 }
-                let src = data
-                    .bucket_dir
-                    .join(format!("{}.bucket.xdr", hash.to_hex()));
-                let dst = bucket_mgr_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                let src = data.bucket_dir.join(canonical_bucket_filename(hash));
+                let dst = bucket_mgr_dir.join(canonical_bucket_filename(hash));
                 if src.exists() && !dst.exists() {
                     std::fs::copy(&src, &dst).map_err(|e| {
                         HistoryError::CatchupFailed(format!(

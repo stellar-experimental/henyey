@@ -1,7 +1,9 @@
 //! Bucket application logic for catchup: restoring bucket lists from HAS.
 
 use crate::{archive_state::HistoryArchiveState, HistoryError, Result};
-use henyey_bucket::{Bucket, BucketList, HasNextState, HotArchiveBucketList};
+use henyey_bucket::{
+    canonical_bucket_filename, Bucket, BucketList, HasNextState, HotArchiveBucketList,
+};
 use henyey_common::Hash256;
 use std::collections::HashMap;
 
@@ -43,7 +45,7 @@ pub(super) fn load_disk_backed_bucket_closure(
         if hash.is_zero() {
             return Ok(Bucket::empty());
         }
-        let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+        let bucket_path = bucket_dir.join(canonical_bucket_filename(hash));
         if bucket_path.exists() {
             Bucket::from_xdr_file_disk_backed(&bucket_path)
         } else {
@@ -68,7 +70,7 @@ pub(super) fn load_disk_backed_hot_archive_bucket_closure(
         if hash.is_zero() {
             return Ok(HotArchiveBucket::empty());
         }
-        let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+        let bucket_path = bucket_dir.join(canonical_bucket_filename(hash));
         if bucket_path.exists() {
             HotArchiveBucket::from_xdr_file_disk_backed(&bucket_path)
         } else {
@@ -203,7 +205,7 @@ impl CatchupManager {
             }
 
             // Construct path for this bucket
-            let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+            let bucket_path = bucket_dir.join(canonical_bucket_filename(hash));
 
             // Check if bucket already exists on disk as an XDR file.
             // Build the index eagerly so it's ready for lookups during live
@@ -375,8 +377,7 @@ impl CatchupManager {
                     }
 
                     // Check if we have the XDR data in the pre-downloaded cache
-                    let bucket_path =
-                        bucket_dir_clone.join(format!("{}.bucket.xdr", hash.to_hex()));
+                    let bucket_path = bucket_dir_clone.join(canonical_bucket_filename(hash));
 
                     let xdr_data: Option<Vec<u8>> = if let Some(data) = {
                         let mut preloaded = preloaded_buckets.lock().unwrap();

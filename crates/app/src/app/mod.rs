@@ -933,7 +933,7 @@ impl App {
             for bucket in buckets_to_check {
                 if bucket.backing_file_path().is_none() && !bucket.hash().is_zero() {
                     let permanent =
-                        bucket_dir.join(format!("{}.bucket.xdr", bucket.hash().to_hex()));
+                        bucket_dir.join(henyey_bucket::canonical_bucket_filename(&bucket.hash()));
                     if !permanent.exists() {
                         if let Err(e) = bucket.save_to_xdr_file(&permanent) {
                             tracing::warn!(

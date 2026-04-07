@@ -263,24 +263,31 @@ pub async fn get_progress(state: &SharedHistoryState) -> HistoryWorkProgress {
 ///
 /// # Errors
 ///
-/// Returns an error if the HAS is not available (other fields may be empty).
+/// Returns an error if the HAS or bucket directory is not available (other
+/// fields may be empty).
+///
+/// # Ownership
+///
+/// This function *takes* data out of the shared state rather than cloning it,
+/// since checkpoint data is only consumed once at the end of a work chain.
+/// Calling it a second time will fail because the HAS has been moved.
 pub async fn build_checkpoint_data(state: &SharedHistoryState) -> Result<CheckpointData> {
-    let guard = state.lock().await;
+    let mut guard = state.lock().await;
     let has = guard
         .has
-        .clone()
+        .take()
         .ok_or_else(|| anyhow!("missing History Archive State"))?;
 
     Ok(CheckpointData {
         has,
         bucket_dir: guard
             .bucket_dir
-            .clone()
+            .take()
             .ok_or_else(|| anyhow!("bucket directory not set"))?,
-        headers: guard.headers.clone(),
-        transactions: guard.transactions.clone(),
-        tx_results: guard.tx_results.clone(),
-        scp_history: guard.scp_history.clone(),
+        headers: std::mem::take(&mut guard.headers),
+        transactions: std::mem::take(&mut guard.transactions),
+        tx_results: std::mem::take(&mut guard.tx_results),
+        scp_history: std::mem::take(&mut guard.scp_history),
     })
 }
 

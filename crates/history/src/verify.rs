@@ -40,7 +40,8 @@ use henyey_common::Hash256;
 use henyey_crypto::Sha256Hasher;
 use henyey_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
-    LedgerHeader, Limits, ScpHistoryEntry, ScpStatement, TransactionHistoryResultEntry, WriteXdr,
+    LedgerHeader, LedgerHeaderHistoryEntry, Limits, ScpHistoryEntry, ScpStatement,
+    TransactionHistoryResultEntry, WriteXdr,
 };
 
 /// Optional trust anchors for ledger chain verification (spec §9.2).
@@ -102,6 +103,37 @@ pub fn verify_header_chain(headers: &[LedgerHeader]) -> Result<()> {
         let prev_hash = compute_header_hash(prev_header)?;
 
         // Check that current header's previous_ledger_hash matches
+        let expected_prev_hash = Hash256::from(curr_header.previous_ledger_hash.clone());
+        if prev_hash != expected_prev_hash {
+            return Err(HistoryError::InvalidPreviousHash {
+                ledger: curr_header.ledger_seq,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Like [`verify_header_chain`] but accepts `LedgerHeaderHistoryEntry` slices
+/// directly, avoiding the need to clone every `LedgerHeader` into a
+/// contiguous `Vec` just for verification.
+pub fn verify_header_chain_from_entries(entries: &[LedgerHeaderHistoryEntry]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    for i in 1..entries.len() {
+        let prev_header = &entries[i - 1].header;
+        let curr_header = &entries[i].header;
+
+        if curr_header.ledger_seq != prev_header.ledger_seq + 1 {
+            return Err(HistoryError::InvalidSequence {
+                expected: prev_header.ledger_seq + 1,
+                got: curr_header.ledger_seq,
+            });
+        }
+
+        let prev_hash = compute_header_hash(prev_header)?;
         let expected_prev_hash = Hash256::from(curr_header.previous_ledger_hash.clone());
         if prev_hash != expected_prev_hash {
             return Err(HistoryError::InvalidPreviousHash {

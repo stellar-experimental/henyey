@@ -2,6 +2,21 @@
 //!
 //! This module provides [`HistoryWorkBuilder`] and [`HistoryWorkIds`] for
 //! setting up download work item DAGs with proper dependency ordering.
+//!
+//! # Dependency Graph
+//!
+//! The builder creates the following work DAG:
+//!
+//! ```text
+//!   get_has ──┬── download_buckets    (RETRY_A_LOT)
+//!             └── download_headers ──┬── download_tx        (RETRY_A_LOT)
+//!                                    ├── download_tx_results (RETRY_A_LOT, after tx)
+//!                                    └── download_scp       (RETRY_A_FEW)
+//! ```
+//!
+//! Work items are retried per CATCHUP_SPEC §9.1:
+//! - `RETRY_A_FEW` (5): lightweight metadata downloads (HAS, SCP)
+//! - `RETRY_A_LOT` (32): bulk data downloads (buckets, headers, txs, results)
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -3,6 +3,7 @@
 use crate::{
     archive::HistoryArchive, archive_state::HistoryArchiveState, checkpoint, HistoryError, Result,
 };
+use henyey_bucket::canonical_bucket_filename;
 use henyey_common::Hash256;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -178,7 +179,7 @@ impl CatchupManager {
                 if hash.is_zero() || *hash == empty_bucket_hash {
                     return false;
                 }
-                let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                let bucket_path = bucket_dir.join(canonical_bucket_filename(&hash));
                 !bucket_path.exists()
             })
             .cloned()
@@ -211,7 +212,7 @@ impl CatchupManager {
                 let downloaded = &downloaded;
 
                 async move {
-                    let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
+                let bucket_path = bucket_dir.join(canonical_bucket_filename(&hash));
 
                     // Try each archive until one succeeds
                     for archive in &archives {

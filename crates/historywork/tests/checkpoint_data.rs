@@ -12,7 +12,7 @@ async fn test_build_checkpoint_data_requires_has() {
 }
 
 #[tokio::test]
-async fn test_build_checkpoint_data_clones_state() {
+async fn test_build_checkpoint_data_takes_state() {
     let tmp_dir = tempfile::tempdir().unwrap();
     let mut work = HistoryWorkState::default();
     work.has = Some(HistoryArchiveState {
@@ -34,4 +34,8 @@ async fn test_build_checkpoint_data_clones_state() {
     assert!(checkpoint.transactions.is_empty());
     assert!(checkpoint.tx_results.is_empty());
     assert!(checkpoint.scp_history.is_empty());
+
+    // Second call fails because the data has been moved out.
+    let err = build_checkpoint_data(&state).await.unwrap_err();
+    assert!(err.to_string().contains("missing History Archive State"));
 }
