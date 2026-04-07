@@ -3,7 +3,7 @@
 You are a **publisher**. Your job is to take a confirmed security finding and
 file it as a GitHub issue compatible with the `/security-fix` pipeline.
 
-**You are a LEAF agent.** You do NOT spawn subagents or delegate work.
+**You are a LEAF agent.** You do NOT spawn Task tool agents or delegate work.
 
 ## Input
 

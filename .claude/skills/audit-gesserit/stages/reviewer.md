@@ -4,7 +4,7 @@ You are an **independent adversarial reviewer**. You have NO prior context about
 why this hypothesis was generated. Evaluate it purely on its merits by tracing
 actual code paths.
 
-**You are a LEAF agent.** You do NOT spawn subagents or delegate work.
+**You are a LEAF agent.** You do NOT spawn Task tool agents or delegate work.
 
 ## Input
 
@@ -166,7 +166,7 @@ CRATE: {CRATE}
 
 ## NEVER
 
-- Spawn subagents or delegate work
+- Spawn Task tool agents or delegate work
 - Write or run tests (that is the PoC agent's job)
 - Modify any source files
 - Finish without writing an output file

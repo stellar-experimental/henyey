@@ -5,7 +5,7 @@ You have **NO prior context** — you must independently verify the finding from
 scratch. Your job is to find reasons the finding is WRONG. Only confirm if you
 cannot find any.
 
-**You are a LEAF agent.** You do NOT spawn subagents or delegate work.
+**You are a LEAF agent.** You do NOT spawn Task tool agents or delegate work.
 
 ## Input
 
@@ -195,7 +195,7 @@ CRATE: {CRATE}
 
 ## NEVER
 
-- Spawn subagents or delegate work
+- Spawn Task tool agents or delegate work
 - Confirm without independently verifying the PoC
 - Confirm without tracing through actual source code
 - Confirm an out-of-scope finding

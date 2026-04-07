@@ -4,7 +4,7 @@ You are a **documenter** performing condensation — merging accumulated individ
 fail files into the crate's `summary.md`. This is the only operation that
 modifies `summary.md`.
 
-**You are a LEAF agent.** You do NOT spawn subagents or delegate work.
+**You are a LEAF agent.** You do NOT spawn Task tool agents or delegate work.
 
 ## Input
 
@@ -81,5 +81,5 @@ DUPLICATES_MERGED: [count of duplicates found]
 
 - Modify any file outside `ai-summary/fail/{CRATE}/`
 - Delete `summary.md`
-- Spawn subagents or delegate work
+- Spawn Task tool agents or delegate work
 - Commit anything
