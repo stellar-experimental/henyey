@@ -59,61 +59,11 @@ pub(crate) fn execute_change_trust(
 
     if op.limit == 0 {
         // Removing trustline
-        let Some(tl) = state.get_trustline_by_trustline_asset(source, &tl_asset) else {
-            return Ok(make_result(ChangeTrustResultCode::InvalidLimit));
-        };
-        if tl.balance > 0 {
-            // Can't remove trustline with balance
-            return Ok(make_result(ChangeTrustResultCode::InvalidLimit));
+        if let Some(result) = remove_trustline(
+            source, &tl_asset, is_pool_share, pool_params, multiplier, state,
+        )? {
+            return Ok(result);
         }
-        if trustline_liabilities(tl).buying > 0 {
-            return Ok(make_result(ChangeTrustResultCode::InvalidLimit));
-        }
-
-        if !is_pool_share && liquidity_pool_use_count(tl) != 0 {
-            return Ok(make_result(ChangeTrustResultCode::CannotDelete));
-        }
-
-        if is_pool_share && !manage_pool_on_deleted_trustline(state, &tl_asset) {
-            return Ok(make_result(ChangeTrustResultCode::CannotDelete));
-        }
-
-        if is_pool_share {
-            let params = pool_params.expect("pool params must exist");
-            decrement_pool_use_counts(state, source, params)?;
-        }
-
-        {
-            let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
-                account_id: source.clone(),
-                asset: tl_asset.clone(),
-            });
-            if state.entry_sponsor(&ledger_key).is_some() {
-                state.remove_entry_sponsorship_and_update_counts(
-                    &ledger_key,
-                    source,
-                    multiplier,
-                )?;
-            }
-        }
-
-        // Decrease sub-entries BEFORE deleting trustline.
-        // stellar-core records account STATE/UPDATED before trustline STATE/REMOVED.
-        if let Some(account) = state.get_account_mut(source) {
-            if account.num_sub_entries >= multiplier as u32 {
-                account.num_sub_entries -= multiplier as u32;
-            } else {
-                return Err(TxError::Internal(
-                    "negative subentry count while deleting trustline".to_string(),
-                ));
-            }
-        }
-        // Flush ALL account changes before recording trustline deletion.
-        // stellar-core records all pending account STATE/UPDATED pairs before
-        // trustline deletions, which may include accounts modified in earlier ops.
-        state.flush_all_accounts();
-
-        state.delete_trustline_by_trustline_asset(source, &tl_asset);
     } else if let Some(current_tl) = existing {
         // Updating existing trustline
         let current_balance = current_tl.balance;
@@ -137,94 +87,176 @@ pub(crate) fn execute_change_trust(
         }
     } else {
         // Creating new trustline
-
-        // Check issuer exists before subentry limit (matches stellar-core ordering)
-        if is_pool_share {
-            let params = pool_params.expect("pool params must exist");
-            if let Err(code) = validate_pool_share_trustlines(source, params, state) {
-                return Ok(make_result(code));
-            }
-            increment_pool_use_counts(state, source, params)?;
-        } else {
-            let asset = maybe_asset.as_ref().expect("asset must exist");
-            let issuer = get_asset_issuer(asset);
-            if let Some(issuer_id) = issuer {
-                if state.get_account(&issuer_id).is_none() {
-                    return Ok(make_result(ChangeTrustResultCode::NoIssuer));
-                }
-            }
-        }
-
-        // Check subentries limit before creating trustline
-        // Pool share trustlines count as 2 subentries (multiplier)
-        let source_account = require_source_account(state, source)?;
-        if source_account.num_sub_entries + multiplier as u32 > ACCOUNT_SUBENTRY_LIMIT {
-            return Ok(OperationResult::OpTooManySubentries);
-        }
-
-        // Check source can afford new sub-entry
-        // stellar-core uses getAvailableBalance which deducts selling liabilities
-        let sponsor = state.active_sponsor_for(source);
-        if let Some(sponsor) = &sponsor {
-            let sponsor_account = state
-                .get_account(sponsor)
-                .ok_or(TxError::SourceAccountNotFound)?;
-            let new_min_balance = state.minimum_balance_for_account_with_deltas(
-                sponsor_account,
-                context.protocol_version,
-                0,
-                multiplier,
-                0,
-            )?;
-            let available = account_balance_after_liabilities(sponsor_account);
-            if available < new_min_balance {
-                return Ok(make_result(ChangeTrustResultCode::LowReserve));
-            }
-        } else {
-            let source_account = require_source_account(state, source)?;
-            let new_min_balance = state.minimum_balance_for_account(
-                source_account,
-                context.protocol_version,
-                multiplier,
-            )?;
-            let available = account_balance_after_liabilities(source_account);
-            if available < new_min_balance {
-                return Ok(make_result(ChangeTrustResultCode::LowReserve));
-            }
-        }
-
-        // Create trustline
-        let trustline = TrustLineEntry {
-            account_id: source.clone(),
-            asset: tl_asset.clone(),
-            balance: 0,
-            limit: op.limit,
-            flags: build_trustline_flags(maybe_asset.as_ref(), state),
-            ext: TrustLineEntryExt::V0,
-        };
-
-        // Apply sponsorship if present
-        if sponsor.is_some() {
-            let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
-                account_id: source.clone(),
-                asset: tl_asset.clone(),
-            });
-            state.apply_entry_sponsorship(ledger_key, source, multiplier)?;
-        }
-        state.create_trustline(trustline);
-
-        if is_pool_share {
-            let params = pool_params.expect("pool params must exist");
-            manage_pool_on_new_trustline(state, &tl_asset, params);
-        }
-
-        // Increase sub-entries
-        if let Some(account) = state.get_account_mut(source) {
-            account.num_sub_entries += multiplier as u32;
+        if let Some(result) = create_trustline(
+            source,
+            &tl_asset,
+            op.limit,
+            is_pool_share,
+            pool_params,
+            maybe_asset.as_ref(),
+            multiplier,
+            state,
+            context,
+        )? {
+            return Ok(result);
         }
     }
 
     Ok(make_result(ChangeTrustResultCode::Success))
+}
+
+/// Remove a trustline. Returns `Ok(Some(result))` on early error, `Ok(None)` on success.
+fn remove_trustline(
+    source: &AccountId,
+    tl_asset: &TrustLineAsset,
+    is_pool_share: bool,
+    pool_params: Option<&LiquidityPoolParameters>,
+    multiplier: i64,
+    state: &mut LedgerStateManager,
+) -> Result<Option<OperationResult>> {
+    let Some(tl) = state.get_trustline_by_trustline_asset(source, tl_asset) else {
+        return Ok(Some(make_result(ChangeTrustResultCode::InvalidLimit)));
+    };
+    if tl.balance > 0 {
+        return Ok(Some(make_result(ChangeTrustResultCode::InvalidLimit)));
+    }
+    if trustline_liabilities(tl).buying > 0 {
+        return Ok(Some(make_result(ChangeTrustResultCode::InvalidLimit)));
+    }
+
+    if !is_pool_share && liquidity_pool_use_count(tl) != 0 {
+        return Ok(Some(make_result(ChangeTrustResultCode::CannotDelete)));
+    }
+
+    if is_pool_share && !manage_pool_on_deleted_trustline(state, tl_asset) {
+        return Ok(Some(make_result(ChangeTrustResultCode::CannotDelete)));
+    }
+
+    if is_pool_share {
+        let params = pool_params.expect("pool params must exist");
+        decrement_pool_use_counts(state, source, params)?;
+    }
+
+    {
+        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: source.clone(),
+            asset: tl_asset.clone(),
+        });
+        if state.entry_sponsor(&ledger_key).is_some() {
+            state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, multiplier)?;
+        }
+    }
+
+    // Decrease sub-entries BEFORE deleting trustline.
+    // stellar-core records account STATE/UPDATED before trustline STATE/REMOVED.
+    if let Some(account) = state.get_account_mut(source) {
+        if account.num_sub_entries >= multiplier as u32 {
+            account.num_sub_entries -= multiplier as u32;
+        } else {
+            return Err(TxError::Internal(
+                "negative subentry count while deleting trustline".to_string(),
+            ));
+        }
+    }
+    // Flush ALL account changes before recording trustline deletion.
+    state.flush_all_accounts();
+    state.delete_trustline_by_trustline_asset(source, tl_asset);
+    Ok(None)
+}
+
+/// Create a new trustline. Returns `Ok(Some(result))` on early error, `Ok(None)` on success.
+#[allow(clippy::too_many_arguments)]
+fn create_trustline(
+    source: &AccountId,
+    tl_asset: &TrustLineAsset,
+    limit: i64,
+    is_pool_share: bool,
+    pool_params: Option<&LiquidityPoolParameters>,
+    maybe_asset: Option<&Asset>,
+    multiplier: i64,
+    state: &mut LedgerStateManager,
+    context: &LedgerContext,
+) -> Result<Option<OperationResult>> {
+    // Check issuer exists before subentry limit (matches stellar-core ordering)
+    if is_pool_share {
+        let params = pool_params.expect("pool params must exist");
+        if let Err(code) = validate_pool_share_trustlines(source, params, state) {
+            return Ok(Some(make_result(code)));
+        }
+        increment_pool_use_counts(state, source, params)?;
+    } else {
+        let asset = maybe_asset.expect("asset must exist");
+        let issuer = get_asset_issuer(asset);
+        if let Some(issuer_id) = issuer {
+            if state.get_account(&issuer_id).is_none() {
+                return Ok(Some(make_result(ChangeTrustResultCode::NoIssuer)));
+            }
+        }
+    }
+
+    // Check subentries limit
+    let source_account = require_source_account(state, source)?;
+    if source_account.num_sub_entries + multiplier as u32 > ACCOUNT_SUBENTRY_LIMIT {
+        return Ok(Some(OperationResult::OpTooManySubentries));
+    }
+
+    // Check source can afford new sub-entry
+    let sponsor = state.active_sponsor_for(source);
+    if let Some(sponsor) = &sponsor {
+        let sponsor_account = state
+            .get_account(sponsor)
+            .ok_or(TxError::SourceAccountNotFound)?;
+        let new_min_balance = state.minimum_balance_for_account_with_deltas(
+            sponsor_account,
+            context.protocol_version,
+            0,
+            multiplier,
+            0,
+        )?;
+        let available = account_balance_after_liabilities(sponsor_account);
+        if available < new_min_balance {
+            return Ok(Some(make_result(ChangeTrustResultCode::LowReserve)));
+        }
+    } else {
+        let source_account = require_source_account(state, source)?;
+        let new_min_balance = state.minimum_balance_for_account(
+            source_account,
+            context.protocol_version,
+            multiplier,
+        )?;
+        let available = account_balance_after_liabilities(source_account);
+        if available < new_min_balance {
+            return Ok(Some(make_result(ChangeTrustResultCode::LowReserve)));
+        }
+    }
+
+    let trustline = TrustLineEntry {
+        account_id: source.clone(),
+        asset: tl_asset.clone(),
+        balance: 0,
+        limit,
+        flags: build_trustline_flags(maybe_asset, state),
+        ext: TrustLineEntryExt::V0,
+    };
+
+    if sponsor.is_some() {
+        let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: source.clone(),
+            asset: tl_asset.clone(),
+        });
+        state.apply_entry_sponsorship(ledger_key, source, multiplier)?;
+    }
+    state.create_trustline(trustline);
+
+    if is_pool_share {
+        let params = pool_params.expect("pool params must exist");
+        manage_pool_on_new_trustline(state, tl_asset, params);
+    }
+
+    if let Some(account) = state.get_account_mut(source) {
+        account.num_sub_entries += multiplier as u32;
+    }
+    Ok(None)
 }
 
 fn change_trust_asset_to_trust_line_asset(
