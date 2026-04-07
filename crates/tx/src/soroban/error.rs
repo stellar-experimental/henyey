@@ -1,7 +1,8 @@
-//! Error conversion utilities between P24 and P25 Soroban host error types.
+//! Error conversion utilities between P24/P26 and P25 Soroban host error types.
 
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
+use soroban_env_host_p26 as soroban_env_host26;
 
 /// Convert a P24 HostError to P25 HostError.
 ///
@@ -43,6 +44,53 @@ fn convert_sc_error_p24_to_p25(
         ScError24::Budget(code) => ScError25::Budget(convert_sc_error_code_p24_to_p25(code)),
         ScError24::Value(code) => ScError25::Value(convert_sc_error_code_p24_to_p25(code)),
         ScError24::Auth(code) => ScError25::Auth(convert_sc_error_code_p24_to_p25(code)),
+    }
+}
+
+/// Convert a P26 HostError to P25 HostError.
+///
+/// This function is used when protocol 26 code needs to report errors
+/// in protocol 25 format (our canonical error type for SorobanExecutionError).
+///
+/// P26 uses stellar-xdr 26.0.0 (same as workspace), P25 uses stellar-xdr 25.0.0.
+/// The ScError variants and codes are the same across versions, so we convert
+/// by matching the integer representation.
+pub(crate) fn convert_host_error_p26_to_p25(
+    err: soroban_env_host26::HostError,
+) -> soroban_env_host25::HostError {
+    let sc_error = soroban_env_host26::xdr::ScError::try_from(&err).unwrap_or(
+        soroban_env_host26::xdr::ScError::Context(
+            soroban_env_host26::xdr::ScErrorCode::InternalError,
+        ),
+    );
+    let sc_error = convert_sc_error_p26_to_p25(sc_error);
+    soroban_env_host25::HostError::from(sc_error)
+}
+
+fn convert_sc_error_code_p26_to_p25(
+    code: soroban_env_host26::xdr::ScErrorCode,
+) -> soroban_env_host25::xdr::ScErrorCode {
+    soroban_env_host25::xdr::ScErrorCode::try_from(code as i32)
+        .unwrap_or(soroban_env_host25::xdr::ScErrorCode::InternalError)
+}
+
+fn convert_sc_error_p26_to_p25(
+    sc_error: soroban_env_host26::xdr::ScError,
+) -> soroban_env_host25::xdr::ScError {
+    use soroban_env_host25::xdr::ScError as ScError25;
+    use soroban_env_host26::xdr::ScError as ScError26;
+
+    match sc_error {
+        ScError26::Contract(code) => ScError25::Contract(code),
+        ScError26::WasmVm(code) => ScError25::WasmVm(convert_sc_error_code_p26_to_p25(code)),
+        ScError26::Context(code) => ScError25::Context(convert_sc_error_code_p26_to_p25(code)),
+        ScError26::Storage(code) => ScError25::Storage(convert_sc_error_code_p26_to_p25(code)),
+        ScError26::Object(code) => ScError25::Object(convert_sc_error_code_p26_to_p25(code)),
+        ScError26::Crypto(code) => ScError25::Crypto(convert_sc_error_code_p26_to_p25(code)),
+        ScError26::Events(code) => ScError25::Events(convert_sc_error_code_p26_to_p25(code)),
+        ScError26::Budget(code) => ScError25::Budget(convert_sc_error_code_p26_to_p25(code)),
+        ScError26::Value(code) => ScError25::Value(convert_sc_error_code_p26_to_p25(code)),
+        ScError26::Auth(code) => ScError25::Auth(convert_sc_error_code_p26_to_p25(code)),
     }
 }
 

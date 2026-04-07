@@ -3,10 +3,11 @@
 //! This module provides the main entry point for executing Stellar operations.
 //! Each operation type has its own submodule with the specific execution logic.
 
-use henyey_common::{protocol_version_is_before, ProtocolVersion};
+use henyey_common::{protocol_version_is_before, protocol_version_starts_from, ProtocolVersion};
 use soroban_env_host24::xdr::ReadXdr as ReadXdrP24;
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
+use soroban_env_host_p26 as soroban_env_host26;
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
     Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, Liabilities, Operation,
@@ -754,6 +755,28 @@ fn compute_rent_fee_by_protocol(
             "compute_rent_fee_by_protocol: P24 config"
         );
         soroban_env_host24::fees::compute_rent_fee(&changes, &p24_config, ledger_seq)
+    } else if protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
+        // P26: code entry rent uses div_ceil(fee, 3) instead of P25's fee /= 3 (truncation).
+        // Use the P26 host's compute_rent_fee to get the correct rounding behavior.
+        let changes: Vec<soroban_env_host26::fees::LedgerEntryRentChange> = rent_changes
+            .iter()
+            .map(|change| soroban_env_host26::fees::LedgerEntryRentChange {
+                is_persistent: change.is_persistent,
+                is_code_entry: change.is_code_entry,
+                old_size_bytes: change.old_size_bytes,
+                new_size_bytes: change.new_size_bytes,
+                old_live_until_ledger: change.old_live_until_ledger,
+                new_live_until_ledger: change.new_live_until_ledger,
+            })
+            .collect();
+        let p26_config = soroban_env_host26::fees::RentFeeConfiguration {
+            fee_per_write_1kb: config.fee_per_write_1kb,
+            fee_per_rent_1kb: config.fee_per_rent_1kb,
+            fee_per_write_entry: config.fee_per_write_entry,
+            persistent_rent_rate_denominator: config.persistent_rent_rate_denominator,
+            temporary_rent_rate_denominator: config.temporary_rent_rate_denominator,
+        };
+        soroban_env_host26::fees::compute_rent_fee(&changes, &p26_config, ledger_seq)
     } else {
         let changes: Vec<soroban_env_host25::fees::LedgerEntryRentChange> = rent_changes
             .iter()

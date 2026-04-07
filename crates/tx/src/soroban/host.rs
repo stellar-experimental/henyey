@@ -20,6 +20,7 @@ use soroban_env_host24::{
 use soroban_env_host25::HostError as HostErrorP25;
 use soroban_env_host_p24 as soroban_env_host24;
 use soroban_env_host_p25 as soroban_env_host25;
+use soroban_env_host_p26 as soroban_env_host26;
 
 // P25 module cache types
 use soroban_env_host25::{
@@ -29,15 +30,28 @@ use soroban_env_host25::{
     ModuleCache as ModuleCacheP25,
 };
 
-// After XDR alignment: our workspace stellar-xdr 25.0.0 is the same crate as
-// soroban-env-host P25's transitive stellar-xdr 25.0.0, so the Rust types are
-// identical and no conversion is needed for the P25 path.
+// P26 module cache types
+// soroban-env-host-p26 uses stellar-xdr 26.0.0 — the same version as our workspace.
+// This means P26 XDR types ARE the workspace types — no XDR byte roundtrip needed.
+use soroban_env_host26::HostError as HostErrorP26;
+use soroban_env_host26::{
+    budget::AsBudget as AsBudgetP26,
+    vm::VersionedContractCodeCostInputs as VersionedContractCodeCostInputsP26,
+    CompilationContext as CompilationContextP26, ErrorHandler as ErrorHandlerP26,
+    ModuleCache as ModuleCacheP26,
+};
+
+// After XDR alignment: our workspace stellar-xdr 26.0.0 is the same crate as
+// soroban-env-host P26's transitive stellar-xdr 26.0.0, so the Rust types are
+// identical and no conversion is needed for the P26 path.
+// soroban-env-host P25 uses stellar-xdr 25.0.0, so XDR byte roundtrips are
+// needed for the P25 SnapshotSource impl.
 use stellar_xdr::curr::{
     DiagnosticEvent, LedgerEntry, LedgerKey, Limits, ReadXdr, ScVal, SorobanTransactionData,
     SorobanTransactionDataExt, WriteXdr,
 };
 
-use super::error::convert_host_error_p24_to_p25;
+use super::error::{convert_host_error_p24_to_p25, convert_host_error_p26_to_p25};
 use super::HostFunctionInvocation;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -145,8 +159,10 @@ pub struct StorageChange {
 pub enum PersistentModuleCache {
     /// Protocol 24 module cache
     P24(ModuleCache),
-    /// Protocol 25+ module cache
+    /// Protocol 25 module cache
     P25(ModuleCacheP25),
+    /// Protocol 26+ module cache
+    P26(ModuleCacheP26),
 }
 
 impl PersistentModuleCache {
@@ -164,9 +180,19 @@ impl PersistentModuleCache {
             .map(PersistentModuleCache::P25)
     }
 
+    /// Create a new empty P26 cache.
+    pub fn new_p26() -> Option<Self> {
+        let ctx = WasmCompilationContextP26::new();
+        ModuleCacheP26::new(&ctx)
+            .ok()
+            .map(PersistentModuleCache::P26)
+    }
+
     /// Create a new cache for the given protocol version.
     pub fn new_for_protocol(protocol_version: u32) -> Option<Self> {
-        if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
+        if protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
+            Self::new_p26()
+        } else if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
             Self::new_p25()
         } else {
             Self::new_p24()
@@ -199,6 +225,18 @@ impl PersistentModuleCache {
                     .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
                     .is_ok()
             }
+            PersistentModuleCache::P26(cache) => {
+                let ctx = WasmCompilationContextP26::new();
+                // P26 uses stellar-xdr 26.0.0 (same as workspace) — types are identical.
+                let contract_id =
+                    soroban_env_host26::xdr::Hash(<Sha256 as Digest>::digest(code).into());
+                let cost_inputs = VersionedContractCodeCostInputsP26::V0 {
+                    wasm_bytes: code.len(),
+                };
+                cache
+                    .parse_and_cache_module(&ctx, protocol_version, &contract_id, code, cost_inputs)
+                    .is_ok()
+            }
         }
     }
 
@@ -218,6 +256,11 @@ impl PersistentModuleCache {
                 let contract_id = soroban_env_host25::xdr::Hash(hash.0);
                 cache.remove_module(&contract_id).ok().flatten().is_some()
             }
+            PersistentModuleCache::P26(cache) => {
+                // P26 Hash is the same type as workspace Hash (both stellar-xdr 26.0.0)
+                let contract_id = soroban_env_host26::xdr::Hash(hash.0);
+                cache.remove_module(&contract_id).ok().flatten().is_some()
+            }
         }
     }
 
@@ -225,15 +268,23 @@ impl PersistentModuleCache {
     pub fn as_p24(&self) -> Option<&ModuleCache> {
         match self {
             PersistentModuleCache::P24(cache) => Some(cache),
-            PersistentModuleCache::P25(_) => None,
+            _ => None,
         }
     }
 
     /// Get the P25 cache if this is a P25 cache.
     pub fn as_p25(&self) -> Option<&ModuleCacheP25> {
         match self {
-            PersistentModuleCache::P24(_) => None,
             PersistentModuleCache::P25(cache) => Some(cache),
+            _ => None,
+        }
+    }
+
+    /// Get the P26 cache if this is a P26 cache.
+    pub fn as_p26(&self) -> Option<&ModuleCacheP26> {
+        match self {
+            PersistentModuleCache::P26(cache) => Some(cache),
+            _ => None,
         }
     }
 }
@@ -595,6 +646,16 @@ define_wasm_compilation_context!(
     HostErrorP25
 );
 
+// P26 version of the compilation context.
+define_wasm_compilation_context!(
+    WasmCompilationContextP26,
+    soroban_env_host26,
+    ErrorHandlerP26,
+    AsBudgetP26,
+    CompilationContextP26,
+    HostErrorP26
+);
+
 /// Execute a Soroban host function with an optional pre-populated module cache.
 ///
 /// This is the same as `execute_host_function` but accepts an optional persistent
@@ -607,6 +668,19 @@ pub fn execute_host_function_with_cache(
     request: HostFunctionInvocation<'_>,
 ) -> Result<SorobanExecutionResult, SorobanExecutionError> {
     let protocol_version = request.context.protocol_version;
+    if protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
+        // INVARIANT: module cache always present and correct protocol type during Soroban execution
+        let cache = request
+            .module_cache
+            .unwrap_or_else(|| panic!("Module cache must be provided for Soroban TX execution"));
+        let p26_cache = cache.as_p26().unwrap_or_else(|| {
+            panic!(
+                "Module cache is not P26 but protocol version is {}",
+                protocol_version
+            )
+        });
+        return execute_host_function_p26(request, Some(p26_cache));
+    }
     if protocol_version_starts_from(protocol_version, ProtocolVersion::V25) {
         // INVARIANT: module cache always present and correct protocol type during Soroban execution
         let cache = request
@@ -1457,6 +1531,261 @@ fn convert_cost_params_ws_to_p25(
         soroban_env_host25::xdr::Limits::none(),
     )
     .ok()
+}
+
+/// Convert workspace (v26) RentFeeConfiguration to P26 RentFeeConfiguration.
+///
+/// The SorobanConfig stores RentFeeConfiguration as P25 types. Since the P26 host
+/// has an independent struct with the same fields, we need to copy field by field.
+fn rent_fee_config_p25_to_p26(
+    config: &soroban_env_host25::fees::RentFeeConfiguration,
+) -> soroban_env_host26::fees::RentFeeConfiguration {
+    soroban_env_host26::fees::RentFeeConfiguration {
+        fee_per_write_1kb: config.fee_per_write_1kb,
+        fee_per_rent_1kb: config.fee_per_rent_1kb,
+        fee_per_write_entry: config.fee_per_write_entry,
+        persistent_rent_rate_denominator: config.persistent_rent_rate_denominator,
+        temporary_rent_rate_denominator: config.temporary_rent_rate_denominator,
+    }
+}
+
+fn execute_host_function_p26(
+    request: HostFunctionInvocation<'_>,
+    existing_cache: Option<&ModuleCacheP26>,
+) -> Result<SorobanExecutionResult, SorobanExecutionError> {
+    use soroban_env_host26::{budget::Budget, e2e_invoke, fees::compute_rent_fee};
+
+    let HostFunctionInvocation {
+        host_function,
+        auth_entries,
+        source,
+        state,
+        context,
+        soroban_data,
+        soroban_config,
+        hot_archive,
+        ttl_key_cache,
+        ..
+    } = request;
+
+    let make_setup_error = |e: HostErrorP26| SorobanExecutionError {
+        host_error: convert_host_error_p26_to_p25(e),
+        cpu_insns_consumed: 0,
+        mem_bytes_consumed: 0,
+    };
+
+    let instruction_limit = soroban_data.resources.instructions as u64;
+    let memory_limit = soroban_config.tx_max_memory_bytes;
+
+    // P26 uses stellar-xdr 26.0.0 (same as workspace). ContractCostParams types are
+    // identical, so no XDR roundtrip is needed — we can use the workspace types directly.
+    let budget = if soroban_config.has_valid_cost_params() {
+        // soroban_env_host26::xdr::ContractCostParams IS stellar_xdr::curr::ContractCostParams
+        let p26_cpu: soroban_env_host26::xdr::ContractCostParams =
+            soroban_config.cpu_cost_params.clone();
+        let p26_mem: soroban_env_host26::xdr::ContractCostParams =
+            soroban_config.mem_cost_params.clone();
+        Budget::try_from_configs(instruction_limit, memory_limit, p26_cpu, p26_mem)
+            .map_err(make_setup_error)?
+    } else {
+        tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
+        Budget::default()
+    };
+
+    let ledger_info = soroban_env_host26::LedgerInfo {
+        protocol_version: context.protocol_version,
+        sequence_number: context.sequence,
+        timestamp: context.close_time,
+        network_id: context.network_id.0 .0,
+        base_reserve: context.base_reserve,
+        min_temp_entry_ttl: soroban_config.min_temp_entry_ttl,
+        min_persistent_entry_ttl: soroban_config.min_persistent_entry_ttl,
+        max_entry_ttl: soroban_config.max_entry_ttl,
+    };
+
+    tracing::debug!(
+        protocol_version = context.protocol_version,
+        sequence_number = context.sequence,
+        timestamp = context.close_time,
+        instruction_limit,
+        memory_limit,
+        has_cost_params = soroban_config.has_valid_cost_params(),
+        "P26: Soroban host ledger info configured"
+    );
+
+    // SECURITY: PRNG seed always Some in production Soroban execution path
+    let base_prng_seed: [u8; 32] = if let Some(prng_seed) = context.soroban_prng_seed {
+        prng_seed
+    } else {
+        tracing::warn!("P26: Using fallback PRNG seed - results may differ from stellar-core");
+        derive_fallback_prng_seed(context)
+    };
+
+    let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(
+        state,
+        context.sequence,
+        hot_archive,
+        ttl_key_cache,
+    );
+
+    // ── Gather footprint entries ──
+    let footprint = prepare_footprint_entries(
+        &snapshot,
+        soroban_data,
+        context,
+        soroban_config,
+        ttl_key_cache,
+        "P26",
+    )?;
+
+    // Use existing module cache — it must always be provided.
+    let module_cache = existing_cache
+        .unwrap_or_else(|| {
+            panic!(
+                "P26: Module cache is not available — this is a bug. \
+                The persistent module cache should always be initialized before TX execution."
+            )
+        })
+        .clone();
+    let module_cache = Some(module_cache);
+
+    // ── Encode inputs and call non-typed invoke_host_function() ──
+    let inputs = encode_invocation_inputs(host_function, soroban_data, source, auth_entries)?;
+
+    let mut diagnostic_events: Vec<soroban_env_host26::xdr::DiagnosticEvent> = Vec::new();
+
+    let result = match e2e_invoke::invoke_host_function(
+        &budget,
+        true, // enable_diagnostics
+        inputs.encoded_host_fn,
+        inputs.encoded_resources,
+        &footprint.actual_restored_indices,
+        inputs.encoded_source,
+        inputs.encoded_auth.into_iter(),
+        ledger_info,
+        footprint.encoded_ledger_entries.into_iter(),
+        footprint.encoded_ttl_entries.into_iter(),
+        base_prng_seed.to_vec(),
+        &mut diagnostic_events,
+        None, // trace_hook
+        module_cache,
+    ) {
+        Ok(r) => {
+            tracing::debug!(
+                cpu_consumed = budget.get_cpu_insns_consumed().unwrap_or(0),
+                mem_consumed = budget.get_mem_bytes_consumed().unwrap_or(0),
+                "P26: e2e_invoke completed successfully"
+            );
+            r
+        }
+        Err(e) => {
+            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
+            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
+            tracing::debug!(
+                cpu_consumed = cpu_insns_consumed,
+                mem_consumed = mem_bytes_consumed,
+                error = %e,
+                "P26: e2e_invoke failed"
+            );
+            for (i, event) in diagnostic_events.iter().enumerate() {
+                use soroban_env_host26::xdr::WriteXdr as _;
+                if let Ok(encoded) = event.to_xdr(soroban_env_host26::xdr::Limits::none()) {
+                    tracing::warn!(
+                        event_idx = i,
+                        event_hex = hex::encode(&encoded),
+                        "P26: Diagnostic event"
+                    );
+                }
+            }
+            return Err(SorobanExecutionError {
+                host_error: convert_host_error_p26_to_p25(e),
+                cpu_insns_consumed,
+                mem_bytes_consumed,
+            });
+        }
+    };
+
+    // ── Decode result ──
+    let make_budget_error = |desc: &str| -> SorobanExecutionError {
+        tracing::debug!(desc, "P26: XDR decode error in result processing");
+        SorobanExecutionError {
+            host_error: HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                soroban_env_host25::xdr::ScErrorType::Context,
+                soroban_env_host25::xdr::ScErrorCode::InternalError,
+            )),
+            cpu_insns_consumed: budget.get_cpu_insns_consumed().unwrap_or(0),
+            mem_bytes_consumed: budget.get_mem_bytes_consumed().unwrap_or(0),
+        }
+    };
+
+    let (return_value, return_value_size) = match result.encoded_invoke_result {
+        Ok(ref bytes) => {
+            let val = ScVal::from_xdr(bytes, Limits::none())
+                .map_err(|_| make_budget_error("failed to decode ScVal"))?;
+            (val, bytes.len() as u32)
+        }
+        Err(ref e) => {
+            let cpu_insns_consumed = budget.get_cpu_insns_consumed().unwrap_or(0);
+            let mem_bytes_consumed = budget.get_mem_bytes_consumed().unwrap_or(0);
+            tracing::debug!(
+                cpu_consumed = cpu_insns_consumed,
+                mem_consumed = mem_bytes_consumed,
+                error = %e,
+                "P26: e2e_invoke result contained error"
+            );
+            return Err(SorobanExecutionError {
+                host_error: convert_host_error_p26_to_p25(e.clone()),
+                cpu_insns_consumed,
+                mem_bytes_consumed,
+            });
+        }
+    };
+
+    // ── Contract events ──
+    let (contract_events, contract_events_size) =
+        decode_contract_events(&result.encoded_contract_events, &make_budget_error)?;
+
+    // ── Rent: use P26 host's compute_rent_fee (ceiling division for code entries) ──
+    // This is the key behavioral difference from P25: code entry rent uses
+    // div_ceil(fee, 3) instead of fee /= 3 (truncation).
+    let rent_changes = e2e_invoke::extract_rent_changes(&result.ledger_changes);
+    let p26_rent_config = rent_fee_config_p25_to_p26(&soroban_config.rent_fee_config);
+    let rent_fee = compute_rent_fee(&rent_changes, &p26_rent_config, context.sequence);
+
+    // ── Storage changes ──
+    let normalized_changes: Vec<NormalizedLedgerChange> = result
+        .ledger_changes
+        .into_iter()
+        .map(|c| NormalizedLedgerChange {
+            encoded_key: c.encoded_key,
+            read_only: c.read_only,
+            encoded_new_value: c.encoded_new_value,
+            old_entry_size_bytes_for_rent: c.old_entry_size_bytes_for_rent,
+            ttl_new_live_until_ledger: c.ttl_change.map(|t| t.new_live_until_ledger),
+        })
+        .collect();
+    let storage_changes = map_storage_changes(normalized_changes, state, ttl_key_cache);
+
+    let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
+    let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
+    let contract_events_and_return_value_size =
+        contract_events_size.saturating_add(return_value_size);
+
+    // P26 diagnostic events use stellar-xdr 26.0.0, same as workspace — no conversion needed.
+    let diagnostic_events: Vec<DiagnosticEvent> = diagnostic_events;
+
+    Ok(SorobanExecutionResult {
+        return_value,
+        storage_changes,
+        contract_events,
+        diagnostic_events,
+        cpu_insns,
+        mem_bytes,
+        contract_events_and_return_value_size,
+        rent_fee,
+        live_bucket_list_restores: footprint.live_bl_restores,
+        actual_restored_indices: footprint.actual_restored_indices,
+    })
 }
 
 #[cfg(test)]
