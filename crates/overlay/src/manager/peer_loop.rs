@@ -364,6 +364,10 @@ impl OverlayManager {
                 "Peer {} sent SEND_MORE_EXTENDED: num_messages={}, num_bytes={}",
                 peer_id, sme.num_messages, sme.num_bytes
             );
+            if let Err(e) = flow_control.is_send_more_valid(message) {
+                debug!("Peer {} sent invalid SEND_MORE_EXTENDED: {}", peer_id, e);
+                return Err(());
+            }
             flow_control.maybe_release_capacity(message);
             match Self::send_flow_controlled_batch(peer, flow_control).await {
                 Ok(sent) => Ok(sent),
