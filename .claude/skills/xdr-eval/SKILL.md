@@ -1,4 +1,8 @@
-# Skill: xdr-eval
+---
+name: xdr-eval
+description: Audit a crate for raw byte arrays that should use rs-stellar-xdr types
+argument-hint: <crate-path> [--apply]
+---
 
 Parse `$ARGUMENTS`:
 - The first argument is the crate path. Replace `$TARGET` with it.

@@ -1,6 +1,6 @@
 ---
 name: audit-ctf
-description: Run a CTF-style security audit on a crate or file, filing GitHub issues for confirmed findings
+description: CTF-style security audit on a crate or file, filing GitHub issues
 argument-hint: [--crate <name> | <file-path>] [--dry-run]
 ---
 

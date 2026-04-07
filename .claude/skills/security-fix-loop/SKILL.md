@@ -1,6 +1,6 @@
 ---
 name: security-fix-loop
-description: Process open security audit issues — severity order, unassigned before assigned within each tier; validate, test, fix, repeat
+description: Process open security audit issues in severity order; validate, test, fix
 argument-hint: [--label <label>] [--dry-run]
 ---
 
