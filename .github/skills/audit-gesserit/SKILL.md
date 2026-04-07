@@ -119,8 +119,8 @@ current state.
 
 ### 1d: Initialize Tracking
 
-Use TaskCreate to create a top-level task for the audit run, and sub-tasks
-for tracking progress through the pipeline stages.
+Use TodoWrite to create tracking items for the audit run, with sub-items
+for each pipeline stage.
 
 Initialize counters:
 ```
@@ -277,9 +277,9 @@ For the selected work item, assemble the agent prompt:
    === END INPUT ===
    ```
 
-8. **Spawn the Agent** using the Agent tool:
+8. **Spawn the Agent** using the Task tool:
+   - `subagent_type`: `"general"` for all stages
    - `prompt`: the assembled prompt
-   - `model`: `"opus"` for hypothesis/reviewer/poc/final-review; `"sonnet"` for publish/condensation
    - `description`: e.g., "hypothesis for tx crate" or "review H-003"
 
 ### 2d: Process Agent Result
@@ -346,7 +346,7 @@ Round N/M: [stage] [crate] [verdict] — H:X/Y/Z PoC:A/B/C Published:P Cost:~$C.
 
 Where H = generated/promoted/rejected, PoC = attempted/confirmed/rejected.
 
-Update tasks via TaskUpdate.
+Update todos via TodoWrite.
 
 ### 2f: Parallelism Opportunities
 
@@ -401,7 +401,7 @@ poc, success), note that `/audit-gesserit --resume` can continue processing.
 
 - **One agent at a time per crate.** Never spawn two agents that read/write
   the same crate's pipeline directories simultaneously.
-- **Use subagents for all code analysis.** The orchestrator (this skill) only
+- **Use the Task tool for all code analysis.** The orchestrator (this skill) only
   manages pipeline state. It never reads source code or makes security judgments.
 - **Trust the pipeline.** Each stage is adversarial by design. If a finding
   survives all 4 gates (hypothesis → review → PoC → final review), it is

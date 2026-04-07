@@ -52,6 +52,6 @@ reports/
 # Claude local files
 .claude/*.local.md
 .opencode/*
-!.opencode/commands/
+!.opencode/skills/
 .serena/
 local-data
