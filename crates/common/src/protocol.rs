@@ -39,7 +39,7 @@
 
 /// Protocol version enumeration for type-safe version comparisons.
 ///
-/// This enum represents all known Stellar protocol versions from V0 to V25.
+/// This enum represents all known Stellar protocol versions from V0 to V26.
 /// It is used with the version-checking functions to enable compile-time
 /// verification of version comparisons.
 ///
@@ -76,6 +76,7 @@ pub enum ProtocolVersion {
     V23 = 23,
     V24 = 24,
     V25 = 25,
+    V26 = 26,
 }
 
 impl ProtocolVersion {
@@ -113,6 +114,9 @@ pub const AUTO_RESTORE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V23;
 /// reducing redundant compilation overhead.
 pub const REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V23;
 
+/// The protocol version when frozen ledger keys (CAP-77) were introduced.
+pub const FROZEN_LEDGER_KEYS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V26;
+
 /// The minimum supported ledger protocol version.
 ///
 /// This implementation only supports protocol versions 24 and above.
@@ -123,7 +127,7 @@ pub const MIN_LEDGER_PROTOCOL_VERSION: u32 = 24;
 ///
 /// This represents the highest protocol version that this implementation
 /// can process. Ledgers with higher versions will be rejected.
-pub const CURRENT_LEDGER_PROTOCOL_VERSION: u32 = 25;
+pub const CURRENT_LEDGER_PROTOCOL_VERSION: u32 = 26;
 
 /// The minimum supported ledger protocol version for Soroban execution.
 ///
@@ -249,5 +253,6 @@ mod tests {
         assert!(soroban_supported(20));
         assert!(soroban_supported(24));
         assert!(soroban_supported(25));
+        assert!(soroban_supported(26));
     }
 }

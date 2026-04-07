@@ -23,7 +23,7 @@ members = [
 # They are referenced as workspace dependencies with version pins below.
 
 [workspace.package]
-version = "25.0.0-alpha.1"
+version = "26.0.0-alpha.1"
 edition = "2021"
 authors = ["Stellar Contributors"]
 license = "Apache-2.0"
@@ -34,7 +34,7 @@ rust-version = "1.76"
 # Stellar official crates
 # We support multiple protocol versions by including multiple soroban-env-host versions.
 # Each host version is labeled with the MAXIMUM protocol it supports.
-stellar-xdr = { version = "=25.0.0", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
+stellar-xdr = { version = "=26.0.0", default-features = false, features = ["std", "curr", "serde", "serde_json"] }
 stellar-strkey = "0.0.11"
 
 # Soroban host for Protocol 24 (supports protocols 20-24)
@@ -42,6 +42,9 @@ soroban-env-host-p24 = { package = "soroban-env-host", version = "=24.0.0" }
 
 # Soroban host for Protocol 25 (supports protocol 25+)
 soroban-env-host-p25 = { package = "soroban-env-host", version = "=25.0.0" }
+
+# Soroban host for Protocol 26 (supports protocol 26+)
+soroban-env-host-p26 = { package = "soroban-env-host", version = "=26.1.2" }
 
 # Workspace crates
 henyey-common = { path = "crates/common" }

@@ -328,7 +328,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `InternalLedgerEntry` / `InternalLedgerKey` (generalized types) | Simplified to direct `LedgerEntry`/`LedgerKey`; sponsorship/seqnum tracked differently |
 | `ThreadInvariant` class | Not needed; Rust ownership model provides thread safety |
 | `LedgerTxn` full nested transaction model | Delta+savepoint model covers all use cases in the execution pipeline |
-| `SorobanNetworkConfig::updateCostTypesForV26()` | Protocol 26 is out of scope; project targets stellar-core v25 parity |
+| `SorobanNetworkConfig::updateCostTypesForV26()` | P26 cost type updates handled through existing infrastructure |
 
 ## Gaps
 

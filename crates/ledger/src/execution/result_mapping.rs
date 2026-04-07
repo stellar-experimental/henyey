@@ -24,6 +24,7 @@ pub(super) fn failure_code_to_result(code: &TransactionResultCode) -> Transactio
         TransactionResultCode::TxInternalError => TransactionResultResult::TxInternalError,
         TransactionResultCode::TxBadSponsorship => TransactionResultResult::TxBadSponsorship,
         TransactionResultCode::TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
+        TransactionResultCode::TxFrozenKeyAccessed => TransactionResultResult::TxFrozenKeyAccessed,
         // TxFailed, TxSuccess, TxFeeBumpInnerSuccess, TxFeeBumpInnerFailed carry payloads
         // and are handled specially by build_tx_result_pair.
         TransactionResultCode::TxFailed
@@ -82,6 +83,9 @@ pub(super) fn failure_code_to_inner_result(
         TransactionResultCode::TxInternalError => InnerTransactionResultResult::TxInternalError,
         TransactionResultCode::TxBadSponsorship => InnerTransactionResultResult::TxBadSponsorship,
         TransactionResultCode::TxSorobanInvalid => InnerTransactionResultResult::TxSorobanInvalid,
+        TransactionResultCode::TxFrozenKeyAccessed => {
+            InnerTransactionResultResult::TxFrozenKeyAccessed
+        }
         // TxFailed and success/fee-bump codes carry payloads.
         TransactionResultCode::TxFailed
         | TransactionResultCode::TxSuccess
@@ -265,6 +269,7 @@ mod tests {
             TransactionResultCode::TxInternalError,
             TransactionResultCode::TxBadSponsorship,
             TransactionResultCode::TxSorobanInvalid,
+            TransactionResultCode::TxFrozenKeyAccessed,
         ];
 
         for (i, code_a) in codes.iter().enumerate() {
@@ -302,6 +307,7 @@ mod tests {
             TransactionResultCode::TxInternalError,
             TransactionResultCode::TxBadSponsorship,
             TransactionResultCode::TxSorobanInvalid,
+            TransactionResultCode::TxFrozenKeyAccessed,
         ];
 
         for (i, code_a) in codes.iter().enumerate() {

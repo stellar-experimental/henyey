@@ -15,6 +15,7 @@ henyey-db.workspace = true
 # Soroban integration
 soroban-env-host-p24.workspace = true
 soroban-env-host-p25.workspace = true
+soroban-env-host-p26.workspace = true
 
 # Serialization
 serde.workspace = true

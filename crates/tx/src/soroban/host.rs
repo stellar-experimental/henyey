@@ -385,20 +385,32 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
 impl soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'_> {
     fn get(
         &self,
-        key: &Rc<LedgerKey>,
+        key: &Rc<soroban_env_host25::xdr::LedgerKey>,
     ) -> Result<Option<soroban_env_host25::storage::EntryWithLiveUntil>, HostErrorP25> {
-        // After XDR alignment: workspace LedgerKey === soroban-env-host P25 LedgerKey,
-        // so no conversion is needed. We can use the key directly.
-        let live_until = get_entry_ttl_with_cache(
-            self.state,
-            key.as_ref(),
-            self.current_ledger,
-            self.ttl_key_cache,
-        );
+        // Convert P25 LedgerKey to workspace LedgerKey via XDR byte roundtrip.
+        // soroban-env-host-p25 uses stellar-xdr v25, workspace uses v26.
+        use soroban_env_host25::xdr::WriteXdr as WriteXdrP25;
+        let key_bytes = key
+            .to_xdr(soroban_env_host25::xdr::Limits::none())
+            .map_err(|_| {
+                soroban_env_host25::Error::from_type_and_code(
+                    soroban_env_host25::xdr::ScErrorType::Context,
+                    soroban_env_host25::xdr::ScErrorCode::InternalError,
+                )
+            })?;
+        let ws_key: LedgerKey = LedgerKey::from_xdr(&key_bytes, Limits::none()).map_err(|_| {
+            soroban_env_host25::Error::from_type_and_code(
+                soroban_env_host25::xdr::ScErrorType::Context,
+                soroban_env_host25::xdr::ScErrorCode::InternalError,
+            )
+        })?;
+
+        let live_until =
+            get_entry_ttl_with_cache(self.state, &ws_key, self.current_ledger, self.ttl_key_cache);
 
         // Check TTL expiration for contract entries before looking up the entry.
         if matches!(
-            key.as_ref(),
+            ws_key,
             LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
         ) {
             match live_until {
@@ -409,11 +421,31 @@ impl soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'_
 
         // Use get_entry() to reconstruct the full LedgerEntry with correct
         // last_modified_ledger_seq and ext (sponsorship) metadata.
-        // No conversion needed — workspace types are identical to P25 types.
-        let entry = self.state.get_entry(key.as_ref());
+        let entry = self.state.get_entry(&ws_key);
 
         match entry {
-            Some(e) => Ok(Some((Rc::new(e), live_until))),
+            Some(e) => {
+                // Convert workspace LedgerEntry back to P25 LedgerEntry via XDR bytes.
+                let entry_bytes = e.to_xdr(Limits::none()).map_err(|_| {
+                    soroban_env_host25::Error::from_type_and_code(
+                        soroban_env_host25::xdr::ScErrorType::Context,
+                        soroban_env_host25::xdr::ScErrorCode::InternalError,
+                    )
+                })?;
+                use soroban_env_host25::xdr::ReadXdr as ReadXdrP25;
+                let p25_entry: soroban_env_host25::xdr::LedgerEntry =
+                    soroban_env_host25::xdr::LedgerEntry::from_xdr(
+                        &entry_bytes,
+                        soroban_env_host25::xdr::Limits::none(),
+                    )
+                    .map_err(|_| {
+                        soroban_env_host25::Error::from_type_and_code(
+                            soroban_env_host25::xdr::ScErrorType::Context,
+                            soroban_env_host25::xdr::ScErrorCode::InternalError,
+                        )
+                    })?;
+                Ok(Some((Rc::new(p25_entry), live_until)))
+            }
             None => Ok(None),
         }
     }
@@ -1142,13 +1174,26 @@ fn execute_host_function_p25(
     let memory_limit = soroban_config.tx_max_memory_bytes;
 
     let budget = if soroban_config.has_valid_cost_params() {
-        Budget::try_from_configs(
-            instruction_limit,
-            memory_limit,
-            soroban_config.cpu_cost_params.clone(),
-            soroban_config.mem_cost_params.clone(),
-        )
-        .map_err(make_setup_error)?
+        let p25_cpu =
+            convert_cost_params_ws_to_p25(&soroban_config.cpu_cost_params).ok_or_else(|| {
+                make_setup_error(HostErrorP25::from(
+                    soroban_env_host25::Error::from_type_and_code(
+                        soroban_env_host25::xdr::ScErrorType::Context,
+                        soroban_env_host25::xdr::ScErrorCode::InternalError,
+                    ),
+                ))
+            })?;
+        let p25_mem =
+            convert_cost_params_ws_to_p25(&soroban_config.mem_cost_params).ok_or_else(|| {
+                make_setup_error(HostErrorP25::from(
+                    soroban_env_host25::Error::from_type_and_code(
+                        soroban_env_host25::xdr::ScErrorType::Context,
+                        soroban_env_host25::xdr::ScErrorCode::InternalError,
+                    ),
+                ))
+            })?;
+        Budget::try_from_configs(instruction_limit, memory_limit, p25_cpu, p25_mem)
+            .map_err(make_setup_error)?
     } else {
         tracing::warn!("Using default Soroban budget - cost parameters not loaded from network.");
         Budget::default()
@@ -1338,6 +1383,9 @@ fn execute_host_function_p25(
     let contract_events_and_return_value_size =
         contract_events_size.saturating_add(return_value_size);
 
+    // Convert P25 diagnostic events to workspace types via XDR bytes.
+    let diagnostic_events = convert_diagnostic_events_p25(diagnostic_events);
+
     Ok(SorobanExecutionResult {
         return_value,
         storage_changes,
@@ -1350,6 +1398,19 @@ fn execute_host_function_p25(
         live_bucket_list_restores: footprint.live_bl_restores,
         actual_restored_indices: footprint.actual_restored_indices,
     })
+}
+
+fn convert_diagnostic_events_p25(
+    events: Vec<soroban_env_host25::xdr::DiagnosticEvent>,
+) -> Vec<DiagnosticEvent> {
+    events
+        .into_iter()
+        .filter_map(|event| {
+            use soroban_env_host25::xdr::WriteXdr as WriteXdrP25;
+            let bytes = event.to_xdr(soroban_env_host25::xdr::Limits::none()).ok()?;
+            DiagnosticEvent::from_xdr(&bytes, Limits::none()).ok()
+        })
+        .collect()
 }
 
 fn convert_diagnostic_events_p24(
@@ -1378,6 +1439,24 @@ fn rent_fee_config_p25_to_p24(
         persistent_rent_rate_denominator: config.persistent_rent_rate_denominator,
         temporary_rent_rate_denominator: config.temporary_rent_rate_denominator,
     }
+}
+
+/// Convert workspace (v26) ContractCostParams to P25 (v25) ContractCostParams via XDR bytes.
+///
+/// v26 may have more cost type entries than v25 knows about (e.g. 86 vs 85).
+/// The XDR encoding is a length-prefixed array, so v25 will accept any count up to
+/// its max (1024). Both versions use the same wire format for ContractCostParamEntry,
+/// so the byte-level roundtrip works correctly.
+fn convert_cost_params_ws_to_p25(
+    params: &stellar_xdr::curr::ContractCostParams,
+) -> Option<soroban_env_host25::xdr::ContractCostParams> {
+    let bytes = params.to_xdr(Limits::none()).ok()?;
+    use soroban_env_host25::xdr::ReadXdr as ReadXdrP25;
+    soroban_env_host25::xdr::ContractCostParams::from_xdr(
+        &bytes,
+        soroban_env_host25::xdr::Limits::none(),
+    )
+    .ok()
 }
 
 #[cfg(test)]

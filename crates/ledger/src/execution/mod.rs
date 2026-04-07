@@ -88,8 +88,8 @@ mod result_mapping;
 mod signatures;
 mod tx_set;
 
-pub use config::load_soroban_config;
 pub(crate) use config::{compute_soroban_resource_fee, load_soroban_network_info};
+pub use config::{load_frozen_key_config, load_soroban_config};
 pub use result_mapping::build_tx_result_pair;
 pub(crate) use tx_set::pre_deduct_all_fees_on_delta;
 pub use tx_set::{
@@ -579,6 +579,8 @@ pub struct TransactionExecutor {
     /// Reused across all Soroban validation and execution functions to avoid
     /// redundant SHA-256 computations.
     ttl_key_cache: Option<henyey_tx::soroban::TtlKeyCache>,
+    /// Frozen ledger keys configuration (CAP-77, Protocol 26+).
+    frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig,
 }
 
 impl TransactionExecutor {
@@ -607,6 +609,7 @@ impl TransactionExecutor {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
             ttl_key_cache: None,
+            frozen_key_config: context.frozen_key_config.clone(),
         }
     }
 
@@ -704,6 +707,7 @@ impl TransactionExecutor {
     /// 3. Using the header's id_pool would give us the wrong starting value for the next ledger
     ///    For the first ledger in a replay session, use TransactionExecutor::new() which takes
     ///    the PREVIOUS ledger's closing id_pool (which equals this ledger's starting id_pool).
+    #[allow(clippy::too_many_arguments)]
     pub fn advance_to_ledger(
         &mut self,
         ledger_seq: u32,
@@ -712,12 +716,14 @@ impl TransactionExecutor {
         protocol_version: u32,
         _id_pool: u64, // Intentionally unused - see note above
         soroban_config: SorobanConfig,
+        frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig,
     ) {
         self.ledger_seq = ledger_seq;
         self.close_time = close_time;
         self.base_reserve = base_reserve;
         self.protocol_version = protocol_version;
         self.soroban_config = soroban_config;
+        self.frozen_key_config = frozen_key_config;
         self.state.set_ledger_seq(ledger_seq);
         // Clear cached entries except offers and offer index
         self.state.clear_cached_entries_preserving_offers();

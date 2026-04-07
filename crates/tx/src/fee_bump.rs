@@ -754,6 +754,9 @@ pub fn wrap_inner_result_in_fee_bump(
         }
         TransactionResultResult::TxMalformed => InnerTransactionResultResult::TxMalformed,
         TransactionResultResult::TxSorobanInvalid => InnerTransactionResultResult::TxSorobanInvalid,
+        TransactionResultResult::TxFrozenKeyAccessed => {
+            InnerTransactionResultResult::TxFrozenKeyAccessed
+        }
         // Fee bump results shouldn't be nested
         TransactionResultResult::TxFeeBumpInnerSuccess(pair) => pair.result.result.clone(),
         TransactionResultResult::TxFeeBumpInnerFailed(pair) => pair.result.result.clone(),

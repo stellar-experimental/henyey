@@ -313,6 +313,21 @@ pub(crate) fn execute_claim_claimable_balance(
         ));
     }
 
+    // CAP-77: Check if the relevant key is frozen before claiming (apply-time check).
+    // For native asset: checks source account key.
+    // For non-native: checks source trustline key.
+    if context.frozen_key_config.has_frozen_keys() {
+        let key_to_check = match &entry.asset {
+            Asset::Native => crate::frozen_keys::account_key(source),
+            _ => crate::frozen_keys::trustline_key(source, &entry.asset),
+        };
+        if context.frozen_key_config.is_key_frozen(&key_to_check) {
+            return Ok(make_claim_result(
+                ClaimClaimableBalanceResultCode::TrustlineFrozen,
+            ));
+        }
+    }
+
     // Transfer the balance.
     // All balance checks use the overflow-safe pattern from stellar-core's
     // addBalance (types.cpp): instead of `balance + delta > maxBalance` (which
@@ -512,6 +527,9 @@ fn make_claim_result(code: ClaimClaimableBalanceResultCode) -> OperationResult {
         ClaimClaimableBalanceResultCode::NoTrust => ClaimClaimableBalanceResult::NoTrust,
         ClaimClaimableBalanceResultCode::NotAuthorized => {
             ClaimClaimableBalanceResult::NotAuthorized
+        }
+        ClaimClaimableBalanceResultCode::TrustlineFrozen => {
+            ClaimClaimableBalanceResult::TrustlineFrozen
         }
     };
 

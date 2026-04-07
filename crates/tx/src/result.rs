@@ -277,6 +277,7 @@ impl TransactionResultCodeExt for TransactionResultCode {
             TxBadMinSeqAgeOrGap => TransactionResultResult::TxBadMinSeqAgeOrGap,
             TxMalformed => TransactionResultResult::TxMalformed,
             TxSorobanInvalid => TransactionResultResult::TxSorobanInvalid,
+            TxFrozenKeyAccessed => TransactionResultResult::TxFrozenKeyAccessed,
         }
     }
 }

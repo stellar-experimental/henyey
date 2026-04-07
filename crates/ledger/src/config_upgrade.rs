@@ -27,8 +27,9 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use stellar_xdr::curr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
-    ContractDataDurability, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
-    LedgerKeyContractData, Limits, ReadXdr, ScAddress, ScVal, WriteXdr,
+    ContractDataDurability, EncodedLedgerKey, FreezeBypassTxs, FrozenLedgerKeys, Hash, LedgerEntry,
+    LedgerEntryData, LedgerEntryExt, LedgerKey, LedgerKeyContractData, Limits, ReadXdr, ScAddress,
+    ScVal, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -319,6 +320,19 @@ impl ConfigUpgradeSetFrame {
         for new_entry in self.config_upgrade_set.updated_entry.iter() {
             let setting_id = new_entry.discriminant();
 
+            // Delta entries modify existing base entries instead of replacing them.
+            // They must be handled before we try to load a config setting by ID,
+            // since delta IDs don't have their own stored config setting entries.
+            // Parity: Upgrades.cpp:1458-1517
+            if setting_id == ConfigSettingId::FrozenLedgerKeysDelta {
+                self.apply_frozen_keys_delta(new_entry, snapshot, delta, &mut changes)?;
+                continue;
+            }
+            if setting_id == ConfigSettingId::FreezeBypassTxsDelta {
+                self.apply_freeze_bypass_delta(new_entry, snapshot, delta, &mut changes)?;
+                continue;
+            }
+
             // Construct the ledger key for this config setting
             let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
                 config_setting_id: setting_id,
@@ -406,6 +420,183 @@ impl ConfigUpgradeSetFrame {
             memory_cost_params_changed,
             entry_changes,
         ))
+    }
+
+    /// Apply a FrozenLedgerKeysDelta to the base FrozenLedgerKeys config setting.
+    ///
+    /// Loads the current frozen keys, adds keys_to_freeze, removes keys_to_unfreeze,
+    /// and writes back the modified entry. Uses BTreeSet for deterministic ordering
+    /// matching stellar-core's std::set.
+    ///
+    /// Parity: Upgrades.cpp:1458-1486
+    fn apply_frozen_keys_delta(
+        &self,
+        delta_entry: &ConfigSettingEntry,
+        snapshot: &SnapshotHandle,
+        delta: &mut LedgerDelta,
+        changes: &mut Vec<stellar_xdr::curr::LedgerEntryChange>,
+    ) -> Result<(), LedgerError> {
+        use stellar_xdr::curr::LedgerEntryChange;
+
+        // Load the base CONFIG_SETTING_FROZEN_LEDGER_KEYS entry
+        let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::FrozenLedgerKeys,
+        });
+        let previous = snapshot
+            .get_entry(&key)
+            .map_err(|e| {
+                LedgerError::Internal(format!(
+                    "Failed to load FrozenLedgerKeys config setting: {}",
+                    e
+                ))
+            })?
+            .ok_or_else(|| {
+                LedgerError::Internal("FrozenLedgerKeys config setting not found".into())
+            })?;
+
+        // Extract the current keys
+        let current_keys = match &previous.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::FrozenLedgerKeys(fk)) => &fk.keys,
+            _ => {
+                return Err(LedgerError::Internal(
+                    "Unexpected entry type for FrozenLedgerKeys".into(),
+                ))
+            }
+        };
+
+        // Extract the delta
+        let delta_data = match delta_entry {
+            ConfigSettingEntry::FrozenLedgerKeysDelta(d) => d,
+            _ => {
+                return Err(LedgerError::Internal(
+                    "Expected FrozenLedgerKeysDelta entry".into(),
+                ))
+            }
+        };
+
+        // Apply: use BTreeSet for deterministic ordering (matching stellar-core std::set)
+        let mut existing: std::collections::BTreeSet<Vec<u8>> =
+            current_keys.iter().map(|k| k.0.to_vec()).collect();
+        for k in delta_data.keys_to_freeze.iter() {
+            existing.insert(k.0.to_vec());
+        }
+        for k in delta_data.keys_to_unfreeze.iter() {
+            existing.remove(k.0.as_slice());
+        }
+
+        // Convert back to XDR types
+        let new_keys: Vec<EncodedLedgerKey> = existing
+            .into_iter()
+            .map(|v| EncodedLedgerKey(v.try_into().expect("key bytes must fit BytesM")))
+            .collect();
+        let frozen_keys = FrozenLedgerKeys {
+            keys: new_keys
+                .try_into()
+                .expect("frozen keys must fit XDR bounds"),
+        };
+
+        let new_ledger_entry = LedgerEntry {
+            last_modified_ledger_seq: delta.ledger_seq(),
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::FrozenLedgerKeys(frozen_keys)),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Capture before/after for upgrade meta
+        changes.push(LedgerEntryChange::State(previous.clone()));
+        changes.push(LedgerEntryChange::Updated(new_ledger_entry.clone()));
+
+        delta.record_update(previous, new_ledger_entry)?;
+
+        info!("Applied frozen ledger keys delta");
+        Ok(())
+    }
+
+    /// Apply a FreezeBypassTxsDelta to the base FreezeBypassTxs config setting.
+    ///
+    /// Loads the current bypass tx hashes, adds add_txs, removes remove_txs,
+    /// and writes back the modified entry. Uses BTreeSet for deterministic ordering
+    /// matching stellar-core's std::set.
+    ///
+    /// Parity: Upgrades.cpp:1488-1517
+    fn apply_freeze_bypass_delta(
+        &self,
+        delta_entry: &ConfigSettingEntry,
+        snapshot: &SnapshotHandle,
+        delta: &mut LedgerDelta,
+        changes: &mut Vec<stellar_xdr::curr::LedgerEntryChange>,
+    ) -> Result<(), LedgerError> {
+        use stellar_xdr::curr::LedgerEntryChange;
+
+        // Load the base CONFIG_SETTING_FREEZE_BYPASS_TXS entry
+        let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
+            config_setting_id: ConfigSettingId::FreezeBypassTxs,
+        });
+        let previous = snapshot
+            .get_entry(&key)
+            .map_err(|e| {
+                LedgerError::Internal(format!(
+                    "Failed to load FreezeBypassTxs config setting: {}",
+                    e
+                ))
+            })?
+            .ok_or_else(|| {
+                LedgerError::Internal("FreezeBypassTxs config setting not found".into())
+            })?;
+
+        // Extract the current tx hashes
+        let current_hashes = match &previous.data {
+            LedgerEntryData::ConfigSetting(ConfigSettingEntry::FreezeBypassTxs(bt)) => {
+                &bt.tx_hashes
+            }
+            _ => {
+                return Err(LedgerError::Internal(
+                    "Unexpected entry type for FreezeBypassTxs".into(),
+                ))
+            }
+        };
+
+        // Extract the delta
+        let delta_data = match delta_entry {
+            ConfigSettingEntry::FreezeBypassTxsDelta(d) => d,
+            _ => {
+                return Err(LedgerError::Internal(
+                    "Expected FreezeBypassTxsDelta entry".into(),
+                ))
+            }
+        };
+
+        // Apply: use BTreeSet for deterministic ordering (matching stellar-core std::set<Hash>)
+        let mut existing: std::collections::BTreeSet<Hash> =
+            current_hashes.iter().cloned().collect();
+        for h in delta_data.add_txs.iter() {
+            existing.insert(h.clone());
+        }
+        for h in delta_data.remove_txs.iter() {
+            existing.remove(h);
+        }
+
+        // Convert back to XDR types
+        let new_hashes: Vec<Hash> = existing.into_iter().collect();
+        let bypass_txs = FreezeBypassTxs {
+            tx_hashes: new_hashes
+                .try_into()
+                .expect("bypass tx hashes must fit XDR bounds"),
+        };
+
+        let new_ledger_entry = LedgerEntry {
+            last_modified_ledger_seq: delta.ledger_seq(),
+            data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::FreezeBypassTxs(bypass_txs)),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // Capture before/after for upgrade meta
+        changes.push(LedgerEntryChange::State(previous.clone()));
+        changes.push(LedgerEntryChange::Updated(new_ledger_entry.clone()));
+
+        delta.record_update(previous, new_ledger_entry)?;
+
+        info!("Applied freeze bypass txs delta");
+        Ok(())
     }
 
     /// Resize the LiveSorobanStateSizeWindow when liveSorobanStateSizeWindowSampleSize
@@ -667,6 +858,11 @@ impl ConfigUpgradeSetFrame {
                     && ext.tx_max_footprint_entries >= min_config::TX_MAX_READ_LEDGER_ENTRIES
                     && ext.fee_write1_kb >= 0
             }
+            // CAP-77 frozen key config settings — always valid when present.
+            ConfigSettingEntry::FrozenLedgerKeys(_)
+            | ConfigSettingEntry::FrozenLedgerKeysDelta(_)
+            | ConfigSettingEntry::FreezeBypassTxs(_)
+            | ConfigSettingEntry::FreezeBypassTxsDelta(_) => true,
             ConfigSettingEntry::ScpTiming(timing) => {
                 protocol_version_starts_from(ledger_version, ProtocolVersion::V23)
                     && timing.ledger_target_close_time_milliseconds

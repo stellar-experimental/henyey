@@ -5,9 +5,9 @@ use std::rc::Rc;
 
 use soroban_env_host_p25 as soroban_host;
 use stellar_xdr::curr::{
-    ContractDataDurability, ExtendFootprintTtlOp, ExtensionPoint, LedgerEntryType, LedgerFootprint,
-    LedgerKey, Limits, OperationBody, ReadXdr, RestoreFootprintOp, SorobanResources,
-    SorobanTransactionData, SorobanTransactionDataExt, WriteXdr,
+    ExtendFootprintTtlOp, ExtensionPoint, LedgerEntryType, LedgerFootprint, LedgerKey, Limits,
+    OperationBody, ReadXdr, RestoreFootprintOp, SorobanResources, SorobanTransactionData,
+    SorobanTransactionDataExt, WriteXdr,
 };
 
 use super::resources::{compute_resource_fee_with_rent, estimate_tx_size_for_op};
@@ -16,7 +16,7 @@ use super::LedgerEntryDiff;
 
 pub(super) struct InvokeSimulationOutput {
     pub recording_result: soroban_host::e2e_invoke::InvokeHostFunctionRecordingModeResult,
-    pub diagnostic_events: Vec<stellar_xdr::curr::DiagnosticEvent>,
+    pub diagnostic_events: Vec<soroban_host::xdr::DiagnosticEvent>,
     pub state_changes: Vec<LedgerEntryDiff>,
 }
 
@@ -36,11 +36,17 @@ pub(super) fn run_invoke_simulation(
 
     let snapshot_rc = Rc::new(snapshot_source);
 
+    // Convert workspace types to P25 types for the host invocation
+    let p25_host_fn: soroban_host::xdr::HostFunction = super::convert::ws_to_p25(&host_fn)
+        .ok_or_else(|| "failed to convert HostFunction to P25 XDR".to_string())?;
+    let p25_source: soroban_host::xdr::AccountId = super::convert::ws_to_p25(&source_account)
+        .ok_or_else(|| "failed to convert AccountId to P25 XDR".to_string())?;
+
     let result = invoke_host_function_in_recording_mode(
         &budget,
         true, // enable_diagnostics
-        &host_fn,
-        &source_account,
+        &p25_host_fn,
+        &p25_source,
         auth_mode,
         ledger_info.clone(),
         snapshot_rc.clone(),
@@ -156,7 +162,11 @@ pub(super) fn simulate_extend_ttl_op(
     let mut extended_keys = Vec::with_capacity(keys.len());
 
     for key in keys {
-        let durability = get_key_durability(key).ok_or_else(|| {
+        // Convert workspace LedgerKey to P25 for get_key_durability
+        let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25(key)
+            .ok_or_else(|| "failed to convert LedgerKey to P25 XDR".to_string())?;
+
+        let durability = get_key_durability(&p25_key).ok_or_else(|| {
             format!(
                 "cannot extend TTL for key {:?}: only contract data/code entries have TTL",
                 key.discriminant()
@@ -194,11 +204,15 @@ pub(super) fn simulate_extend_ttl_op(
             .to_xdr(Limits::none())
             .map(|b| b.len() as u32)
             .unwrap_or(0);
-        let entry_size = entry_size_for_rent(&budget, &entry, entry_xdr_size)
+
+        // Convert workspace LedgerEntry to P25 for entry_size_for_rent
+        let p25_entry: soroban_host::xdr::LedgerEntry = super::convert::ws_to_p25(&entry)
+            .ok_or_else(|| "failed to convert LedgerEntry to P25 XDR".to_string())?;
+        let entry_size = entry_size_for_rent(&budget, &p25_entry, entry_xdr_size)
             .map_err(|e| format!("entry_size_for_rent failed: {e:?}"))?;
 
         rent_changes.push(LedgerEntryRentChange {
-            is_persistent: durability == ContractDataDurability::Persistent,
+            is_persistent: durability == soroban_host::xdr::ContractDataDurability::Persistent,
             is_code_entry: matches!(key.discriminant(), LedgerEntryType::ContractCode),
             old_size_bytes: entry_size,
             new_size_bytes: entry_size,
@@ -266,7 +280,7 @@ pub(super) fn simulate_restore_op(
 
     let budget = soroban_host::budget::Budget::default();
     let restored_live_until = ledger_info
-        .min_live_until_ledger_checked(ContractDataDurability::Persistent)
+        .min_live_until_ledger_checked(soroban_host::xdr::ContractDataDurability::Persistent)
         .ok_or("min persistent live_until ledger overflows")?;
 
     let mut rent_changes = Vec::with_capacity(keys.len());
@@ -274,8 +288,12 @@ pub(super) fn simulate_restore_op(
     let mut restored_bytes = 0u32;
 
     for key in keys {
-        let durability = get_key_durability(key);
-        if durability != Some(ContractDataDurability::Persistent) {
+        // Convert workspace LedgerKey to P25 for get_key_durability
+        let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25(key)
+            .ok_or_else(|| "failed to convert LedgerKey to P25 XDR".to_string())?;
+
+        let durability = get_key_durability(&p25_key);
+        if durability != Some(soroban_host::xdr::ContractDataDurability::Persistent) {
             return Err(format!(
                 "cannot restore key {:?}: only persistent entries can be restored",
                 key.discriminant()
@@ -304,7 +322,11 @@ pub(super) fn simulate_restore_op(
             .to_xdr(Limits::none())
             .map(|b| b.len() as u32)
             .unwrap_or(0);
-        let entry_rent_size = entry_size_for_rent(&budget, &entry, entry_xdr_size)
+
+        // Convert workspace LedgerEntry to P25 for entry_size_for_rent
+        let p25_entry: soroban_host::xdr::LedgerEntry = super::convert::ws_to_p25(&entry)
+            .ok_or_else(|| "failed to convert LedgerEntry to P25 XDR".to_string())?;
+        let entry_rent_size = entry_size_for_rent(&budget, &p25_entry, entry_xdr_size)
             .map_err(|e| format!("entry_size_for_rent failed: {e:?}"))?;
 
         restored_bytes = restored_bytes.saturating_add(entry_xdr_size);

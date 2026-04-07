@@ -25,17 +25,15 @@ pub(super) struct InvokeResponseContext<'a> {
 
 pub(super) fn build_invoke_response(
     sim_result: soroban_host::e2e_invoke::InvokeHostFunctionRecordingModeResult,
-    diagnostic_events: Vec<stellar_xdr::curr::DiagnosticEvent>,
+    diagnostic_events: Vec<soroban_host::xdr::DiagnosticEvent>,
     state_changes: Vec<LedgerEntryDiff>,
     ctx: InvokeResponseContext<'_>,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    // Use the host's resource estimates directly. The host computes:
-    //   - instructions: CPU insns consumed during simulation
-    //   - disk_read_bytes: non-Soroban entries + auto-restored entries from initial footprint
-    //   - write_bytes: sum of encoded_new_value sizes for RW entries
-    // This matches how upstream soroban-simulation passes recording_result.resources
-    // through to compute_adjusted_transaction_resources.
-    let resources = sim_result.resources.clone();
+    use super::convert::p25_to_ws;
+
+    // Convert P25 resources to workspace types
+    let resources: stellar_xdr::curr::SorobanResources = p25_to_ws(&sim_result.resources)
+        .ok_or_else(|| JsonRpcError::internal("failed to convert SorobanResources from P25"))?;
 
     // Apply resource adjustments (mirrors soroban-simulation default_adjustment)
     let mut adjusted_resources = resources.clone();
@@ -44,10 +42,17 @@ pub(super) fn build_invoke_response(
     // Compute rent changes for fee estimation
     let rent_changes = soroban_host::e2e_invoke::extract_rent_changes(&sim_result.ledger_changes);
 
+    // Convert P25 auth to workspace for the InvokeHostFunctionOp
+    let ws_auth: Vec<stellar_xdr::curr::SorobanAuthorizationEntry> = sim_result
+        .auth
+        .iter()
+        .filter_map(|a| p25_to_ws(a))
+        .collect();
+
     // Estimate the transaction size for fee computation
     let op = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
         host_function: ctx.host_fn.clone(),
-        auth: sim_result.auth.clone().try_into().unwrap_or_default(),
+        auth: ws_auth.clone().try_into().unwrap_or_default(),
     });
     let tx_size = estimate_tx_size_for_op(&op, &adjusted_resources);
 
@@ -97,25 +102,28 @@ pub(super) fn build_invoke_response(
     );
     obj.insert("latestLedger".into(), json!(ctx.latest_ledger));
 
-    // Diagnostic events — upstream uses unsuffixed "events" for base64
+    // Diagnostic events — convert P25 to workspace, then serialize
     if !diagnostic_events.is_empty() {
-        insert_sim_xdr_array_field(&mut obj, "events", &diagnostic_events, ctx.format)?;
+        let ws_events: Vec<stellar_xdr::curr::DiagnosticEvent> = diagnostic_events
+            .iter()
+            .filter_map(|e| p25_to_ws(e))
+            .collect();
+        insert_sim_xdr_array_field(&mut obj, "events", &ws_events, ctx.format)?;
     }
 
     // Encode auth entries and return value
-    let auth = &sim_result.auth;
-    let return_value = match &sim_result.invoke_result {
-        Ok(val) => Some(val.clone()),
+    let return_value: Option<stellar_xdr::curr::ScVal> = match &sim_result.invoke_result {
+        Ok(val) => p25_to_ws(val),
         Err(_) => None,
     };
 
-    if !auth.is_empty() || return_value.is_some() {
+    if !ws_auth.is_empty() || return_value.is_some() {
         let mut result_obj = serde_json::Map::new();
 
-        // auth array
+        // auth array (already converted to workspace types)
         match ctx.format {
             XdrFormat::Base64 => {
-                let auth_b64: Vec<serde_json::Value> = auth
+                let auth_b64: Vec<serde_json::Value> = ws_auth
                     .iter()
                     .filter_map(|a| {
                         a.to_xdr(Limits::none())
@@ -126,7 +134,7 @@ pub(super) fn build_invoke_response(
                 result_obj.insert("auth".into(), serde_json::Value::Array(auth_b64));
             }
             XdrFormat::Json => {
-                let auth_json: Vec<serde_json::Value> = auth
+                let auth_json: Vec<serde_json::Value> = ws_auth
                     .iter()
                     .filter_map(|a| serde_json::to_value(a).ok())
                     .collect();

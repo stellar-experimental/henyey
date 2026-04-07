@@ -12,10 +12,12 @@
 mod tests {
     use std::rc::Rc;
 
+    use soroban_env_host_p25::xdr::{ReadXdr as ReadXdrP25, WriteXdr as WriteXdrP25};
     use soroban_env_host_p25::{storage::SnapshotSource, HostError};
 
     use stellar_xdr::curr::{
-        AccountId, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey,
+        AccountId, Hash, LedgerEntry, LedgerEntryData, LedgerEntryExt, LedgerKey, Limits, ReadXdr,
+        WriteXdr,
     };
 
     use crate::soroban::host::EntryWithTtl;
@@ -154,94 +156,47 @@ mod tests {
     impl<'a> SnapshotSource for LedgerSnapshotAdapter<'a> {
         fn get(
             &self,
-            key: &Rc<LedgerKey>,
+            key: &Rc<soroban_env_host_p25::xdr::LedgerKey>,
         ) -> Result<Option<soroban_env_host_p25::storage::EntryWithLiveUntil>, HostError> {
-            // After XDR alignment: workspace LedgerKey === soroban-env-host P25 LedgerKey,
-            // so no conversion is needed. We can use the key directly.
-            let live_until = get_entry_ttl(self.state, key.as_ref(), self.current_ledger);
+            // Convert P25 LedgerKey to workspace LedgerKey via XDR bytes
+            let key_bytes = key
+                .to_xdr(soroban_env_host_p25::xdr::Limits::none())
+                .map_err(|_| {
+                    soroban_env_host_p25::Error::from_type_and_code(
+                        soroban_env_host_p25::xdr::ScErrorType::Context,
+                        soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                    )
+                })?;
+            let ws_key: LedgerKey =
+                LedgerKey::from_xdr(&key_bytes, Limits::none()).map_err(|_| {
+                    soroban_env_host_p25::Error::from_type_and_code(
+                        soroban_env_host_p25::xdr::ScErrorType::Context,
+                        soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                    )
+                })?;
 
-            let entry = match key.as_ref() {
-                LedgerKey::Account(account_key) => self
-                    .state
-                    .get_account(&account_key.account_id)
-                    .map(|acc| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Account(acc.clone()),
-                        ext: LedgerEntryExt::V0,
-                    }),
-                LedgerKey::Trustline(tl_key) => self
-                    .state
-                    .get_trustline_by_trustline_asset(&tl_key.account_id, &tl_key.asset)
-                    .map(|tl| LedgerEntry {
-                        last_modified_ledger_seq: self.current_ledger,
-                        data: LedgerEntryData::Trustline(tl.clone()),
-                        ext: LedgerEntryExt::V0,
-                    }),
-                LedgerKey::ContractData(cd_key) => match live_until {
-                    Some(lu) if lu >= self.current_ledger => self
-                        .state
-                        .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                        .map(|cd| LedgerEntry {
-                            last_modified_ledger_seq: self.current_ledger,
-                            data: LedgerEntryData::ContractData(cd.clone()),
-                            ext: LedgerEntryExt::V0,
-                        }),
-                    Some(lu) => {
-                        tracing::debug!(
-                            current_ledger = self.current_ledger,
-                            live_until = lu,
-                            "ContractData entry has expired TTL, treating as archived"
-                        );
-                        return Ok(None);
-                    }
-                    None => {
-                        tracing::debug!(
-                            current_ledger = self.current_ledger,
-                            "ContractData entry has no TTL, treating as not live"
-                        );
-                        return Ok(None);
-                    }
-                },
-                LedgerKey::ContractCode(cc_key) => match live_until {
-                    Some(lu) if lu >= self.current_ledger => self
-                        .state
-                        .get_contract_code(&cc_key.hash)
-                        .map(|code| LedgerEntry {
-                            last_modified_ledger_seq: self.current_ledger,
-                            data: LedgerEntryData::ContractCode(code.clone()),
-                            ext: LedgerEntryExt::V0,
-                        }),
-                    Some(lu) => {
-                        tracing::debug!(
-                            current_ledger = self.current_ledger,
-                            live_until = lu,
-                            "ContractCode entry has expired TTL, treating as archived"
-                        );
-                        return Ok(None);
-                    }
-                    None => {
-                        tracing::debug!(
-                            current_ledger = self.current_ledger,
-                            "ContractCode entry has no TTL, treating as not live"
-                        );
-                        return Ok(None);
-                    }
-                },
-                LedgerKey::Ttl(ttl_key) => {
-                    self.state
-                        .get_ttl(&ttl_key.key_hash)
-                        .map(|ttl| LedgerEntry {
-                            last_modified_ledger_seq: self.current_ledger,
-                            data: LedgerEntryData::Ttl(ttl.clone()),
-                            ext: LedgerEntryExt::V0,
-                        })
+            // Use get_local which works with workspace types
+            match self.get_local(&ws_key)? {
+                Some((entry, live_until)) => {
+                    // Convert workspace LedgerEntry to P25 LedgerEntry
+                    let entry_bytes = entry.to_xdr(Limits::none()).map_err(|_| {
+                        soroban_env_host_p25::Error::from_type_and_code(
+                            soroban_env_host_p25::xdr::ScErrorType::Context,
+                            soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                        )
+                    })?;
+                    let p25_entry = soroban_env_host_p25::xdr::LedgerEntry::from_xdr(
+                        &entry_bytes,
+                        soroban_env_host_p25::xdr::Limits::none(),
+                    )
+                    .map_err(|_| {
+                        soroban_env_host_p25::Error::from_type_and_code(
+                            soroban_env_host_p25::xdr::ScErrorType::Context,
+                            soroban_env_host_p25::xdr::ScErrorCode::InternalError,
+                        )
+                    })?;
+                    Ok(Some((Rc::new(p25_entry), live_until)))
                 }
-                _ => None,
-            };
-
-            // No conversion needed — types are identical after XDR alignment.
-            match entry {
-                Some(e) => Ok(Some((Rc::new(e), live_until))),
                 None => Ok(None),
             }
         }

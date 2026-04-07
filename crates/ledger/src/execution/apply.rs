@@ -278,6 +278,9 @@ impl TransactionExecutor {
                 self.network_id,
             )
         };
+        // CAP-77: Propagate frozen key config so DEX crossing can skip/delete frozen offers.
+        let mut ledger_context = ledger_context;
+        ledger_context.frozen_key_config = self.frozen_key_config.clone();
 
         let soroban_data = frame.soroban_data();
 

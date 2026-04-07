@@ -5,6 +5,7 @@
 //! - `ExtendFootprintTtl`: TTL extension resource/fee estimation
 //! - `RestoreFootprint`: Archived entry restore resource/fee estimation
 
+mod convert;
 mod preflight;
 mod resources;
 mod response;
@@ -397,7 +398,13 @@ fn resolve_auth_mode(
     use soroban_host::e2e_invoke::RecordingInvocationAuthMode;
 
     match auth_mode_str {
-        "enforce" => Ok(RecordingInvocationAuthMode::Enforcing(tx_auth.to_vec())),
+        "enforce" => {
+            let p25_auth: Vec<soroban_host::xdr::SorobanAuthorizationEntry> = tx_auth
+                .iter()
+                .map(|a| convert::ws_to_p25(a).expect("SorobanAuthorizationEntry XDR conversion"))
+                .collect();
+            Ok(RecordingInvocationAuthMode::Enforcing(p25_auth))
+        }
         "record" => {
             if !tx_auth.is_empty() {
                 return Err(JsonRpcError::invalid_params(
@@ -419,7 +426,13 @@ fn resolve_auth_mode(
             if tx_auth.is_empty() {
                 Ok(RecordingInvocationAuthMode::Recording(true))
             } else {
-                Ok(RecordingInvocationAuthMode::Enforcing(tx_auth.to_vec()))
+                let p25_auth: Vec<soroban_host::xdr::SorobanAuthorizationEntry> = tx_auth
+                    .iter()
+                    .map(|a| {
+                        convert::ws_to_p25(a).expect("SorobanAuthorizationEntry XDR conversion")
+                    })
+                    .collect();
+                Ok(RecordingInvocationAuthMode::Enforcing(p25_auth))
             }
         }
     }

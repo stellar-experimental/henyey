@@ -467,6 +467,41 @@ pub(crate) fn compute_soroban_resource_fee(
     ))
 }
 
+/// Load frozen key configuration from ledger state (Protocol 26+, CAP-77).
+///
+/// Returns a `FrozenKeyConfig` loaded from CONFIG_SETTING_FROZEN_LEDGER_KEYS and
+/// CONFIG_SETTING_FREEZE_BYPASS_TXS. Returns empty config if settings don't exist
+/// (pre-P26 or not yet initialized).
+pub fn load_frozen_key_config(
+    snapshot: &SnapshotHandle,
+    protocol_version: u32,
+) -> Result<henyey_tx::frozen_keys::FrozenKeyConfig> {
+    use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+
+    if !protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
+        return Ok(henyey_tx::frozen_keys::FrozenKeyConfig::empty());
+    }
+
+    // Load frozen ledger keys
+    let frozen_key_bytes = match load_config_setting(snapshot, ConfigSettingId::FrozenLedgerKeys)? {
+        Some(ConfigSettingEntry::FrozenLedgerKeys(fk)) => {
+            fk.keys.iter().map(|k| k.0.to_vec()).collect()
+        }
+        _ => Vec::new(),
+    };
+
+    // Load freeze bypass tx hashes
+    let bypass_tx_hashes = match load_config_setting(snapshot, ConfigSettingId::FreezeBypassTxs)? {
+        Some(ConfigSettingEntry::FreezeBypassTxs(bt)) => bt.tx_hashes.to_vec(),
+        _ => Vec::new(),
+    };
+
+    Ok(henyey_tx::frozen_keys::FrozenKeyConfig::new(
+        frozen_key_bytes,
+        bypass_tx_hashes,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

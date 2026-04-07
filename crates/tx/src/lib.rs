@@ -135,6 +135,7 @@ mod error;
 mod events;
 pub(crate) mod fee_bump;
 mod frame;
+pub mod frozen_keys;
 pub(crate) mod live_execution;
 pub(crate) mod lumen_reconciler;
 pub(crate) mod meta_builder;

@@ -3261,6 +3261,46 @@ impl LedgerCloseContext<'_> {
         Ok(())
     }
 
+    /// Create initial CONFIG_SETTING entries for Protocol 26 (CAP-77 frozen ledger keys).
+    ///
+    /// Parity: NetworkConfig.cpp createLedgerEntriesForV26
+    /// Creates 2 CONFIG_SETTING entries with empty frozen key and bypass tx sets.
+    fn create_ledger_entries_for_v26(&mut self) -> Result<()> {
+        use stellar_xdr::curr::{FreezeBypassTxs, FrozenLedgerKeys, VecM};
+
+        let ledger_seq = self.close_data.ledger_seq;
+        let make_entry = |config: ConfigSettingEntry| -> LedgerEntry {
+            LedgerEntry {
+                last_modified_ledger_seq: ledger_seq,
+                data: LedgerEntryData::ConfigSetting(config),
+                ext: LedgerEntryExt::V0,
+            }
+        };
+
+        // CONFIG_SETTING_FROZEN_LEDGER_KEYS (empty)
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::FrozenLedgerKeys(
+                FrozenLedgerKeys {
+                    keys: VecM::default(),
+                },
+            )))?;
+
+        // CONFIG_SETTING_FREEZE_BYPASS_TXS (empty)
+        self.delta
+            .record_create(make_entry(ConfigSettingEntry::FreezeBypassTxs(
+                FreezeBypassTxs {
+                    tx_hashes: VecM::default(),
+                },
+            )))?;
+
+        tracing::info!(
+            ledger_seq,
+            "Applied createLedgerEntriesForV26: created 2 CONFIG_SETTING entries for frozen keys"
+        );
+
+        Ok(())
+    }
+
     /// Load Soroban rent config from the delta (for upgraded values) falling back to snapshot.
     ///
     /// This is used during config upgrades where the new cost params are in the delta
@@ -3376,6 +3416,11 @@ impl LedgerCloseContext<'_> {
         // Cache fee_write_1kb for LedgerCloseMetaExtV1 (set during commit phase).
         // This is stellar-core's feeRent1KB() / sorobanFeeWrite1KB.
         self.soroban_fee_write_1kb = soroban_config.rent_fee_config.fee_per_write_1kb;
+        // Load frozen key configuration (CAP-77, Protocol 26+).
+        let frozen_key_config = crate::execution::load_frozen_key_config(
+            &self.snapshot,
+            self.prev_header.ledger_version,
+        )?;
         // Use transaction set hash as base PRNG seed for Soroban execution
         let soroban_base_prng_seed = prepared.hash;
         let classic_events = ClassicEventConfig {
@@ -3413,7 +3458,7 @@ impl LedgerCloseContext<'_> {
         let id_pool = self.snapshot.header().id_pool;
 
         let executor_ref = executor.get_or_insert_with(|| {
-            let ctx = LedgerContext::new(
+            let mut ctx = LedgerContext::new(
                 self.close_data.ledger_seq,
                 self.close_data.close_time,
                 self.prev_header.base_fee,
@@ -3421,6 +3466,7 @@ impl LedgerCloseContext<'_> {
                 self.prev_header.ledger_version,
                 self.manager.network_id,
             );
+            ctx.frozen_key_config = frozen_key_config.clone();
             TransactionExecutor::new(&ctx, id_pool, soroban_config.clone(), classic_events)
         });
 
@@ -3442,6 +3488,7 @@ impl LedgerCloseContext<'_> {
                 self.prev_header.ledger_version,
                 id_pool,
                 soroban_config.clone(),
+                frozen_key_config.clone(),
             );
             // Update module cache and hot archive references (they may have changed)
             if let Some(cache) = module_cache {
@@ -3522,7 +3569,7 @@ impl LedgerCloseContext<'_> {
 
             // Execute Soroban parallel phase (fees already deducted on delta).
             let soroban_start = std::time::Instant::now();
-            let ledger_context = LedgerContext::new(
+            let mut ledger_context = LedgerContext::new(
                 self.close_data.ledger_seq,
                 self.close_data.close_time,
                 self.prev_header.base_fee,
@@ -3530,6 +3577,7 @@ impl LedgerCloseContext<'_> {
                 self.prev_header.ledger_version,
                 self.manager.network_id,
             );
+            ledger_context.frozen_key_config = frozen_key_config.clone();
             let soroban_result = execute_soroban_parallel_phase(
                 &self.snapshot,
                 phase,
@@ -3796,6 +3844,12 @@ impl LedgerCloseContext<'_> {
             if needs_upgrade_to_version(ProtocolVersion::V25, prev_version, protocol_version) {
                 self.create_cost_types_for_v25()?;
                 version_upgrade_memory_cost_changed = true;
+            }
+
+            // Parity: NetworkConfig.cpp createLedgerEntriesForV26
+            // needUpgradeToVersion(V_26, prev, new) → create empty frozen key config entries
+            if needs_upgrade_to_version(ProtocolVersion::V26, prev_version, protocol_version) {
+                self.create_ledger_entries_for_v26()?;
             }
 
             // Parity: Upgrades.cpp:1189-1193

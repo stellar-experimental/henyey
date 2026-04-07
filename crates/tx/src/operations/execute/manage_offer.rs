@@ -24,6 +24,7 @@ use super::{
     apply_liabilities_delta, can_buy_at_most, is_trustline_authorized, issuer_for_asset,
     map_exchange_error, require_source_account, trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT,
 };
+use crate::frozen_keys::offer_accesses_frozen_key;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -336,6 +337,7 @@ fn execute_manage_offer(
             offer_trail: &mut offer_trail,
             state,
             context,
+            frozen_key_config: &context.frozen_key_config,
         },
         &mut sheep_sent,
         &mut wheat_received,
@@ -789,6 +791,30 @@ fn convert_with_offers(
         let Some(offer) = offer else {
             break;
         };
+
+        // CAP-77: Skip and delete offers that access frozen keys.
+        // This must be checked before the price/self filter since frozen offers
+        // are unconditionally removed regardless of price compatibility.
+        if offer_accesses_frozen_key(&offer, params.frozen_key_config) {
+            // Load seller's account and trustlines so liabilities can be released.
+            params.state.ensure_offer_entries_loaded(
+                &offer.seller_id,
+                &offer.selling,
+                &offer.buying,
+            )?;
+            // Release liabilities before deleting.
+            let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
+            apply_liabilities_delta(
+                &offer.seller_id,
+                &offer.selling,
+                &offer.buying,
+                -selling_liab,
+                -buying_liab,
+                params.state,
+            )?;
+            delete_offer_with_sponsorship(&offer.seller_id, offer.offer_id, params.state)?;
+            continue;
+        }
 
         match offer_filter(params.source, &offer, passive, max_wheat_price) {
             OfferFilterResult::Keep => {}

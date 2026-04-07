@@ -14,11 +14,13 @@ use stellar_xdr::curr::{
 };
 
 use super::offer_exchange::{ConversionParams, RoundingType};
+use super::offer_utils::{delete_offer_with_sponsorship, offer_liabilities_sell};
 use super::{
-    account_liabilities, add_account_balance, add_trustline_balance, is_trustline_authorized,
-    issuer_for_asset, trustline_liabilities,
+    account_liabilities, add_account_balance, add_trustline_balance, apply_liabilities_delta,
+    is_trustline_authorized, issuer_for_asset, trustline_liabilities,
 };
 use crate::frame::muxed_to_account_id;
+use crate::frozen_keys::offer_accesses_frozen_key;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -113,6 +115,7 @@ pub(crate) fn execute_path_payment_strict_receive(
                 offer_trail: &mut offer_trail,
                 state,
                 context,
+                frozen_key_config: &context.frozen_key_config,
             },
             &mut amount_send,
             &mut amount_recv,
@@ -250,6 +253,7 @@ pub(crate) fn execute_path_payment_strict_send(
                 offer_trail: &mut offer_trail,
                 state,
                 context,
+                frozen_key_config: &context.frozen_key_config,
             },
             &mut amount_send,
             &mut amount_recv,
@@ -529,6 +533,7 @@ fn convert_with_offers_and_pools(
             offer_trail: &mut book_offer_trail,
             state: params.state,
             context: params.context,
+            frozen_key_config: params.frozen_key_config,
         },
         &mut book_amount_send,
         &mut book_amount_recv,
@@ -626,6 +631,28 @@ fn convert_with_offers(
         let Some(offer) = offer else {
             break;
         };
+
+        // CAP-77: Skip and delete offers that access frozen keys.
+        // Frozen offers are unconditionally removed and don't count against
+        // the max offers to cross limit.
+        if offer_accesses_frozen_key(&offer, params.frozen_key_config) {
+            params.state.ensure_offer_entries_loaded(
+                &offer.seller_id,
+                &offer.selling,
+                &offer.buying,
+            )?;
+            let (selling_liab, buying_liab) = offer_liabilities_sell(offer.amount, &offer.price)?;
+            apply_liabilities_delta(
+                &offer.seller_id,
+                &offer.selling,
+                &offer.buying,
+                -selling_liab,
+                -buying_liab,
+                params.state,
+            )?;
+            delete_offer_with_sponsorship(&offer.seller_id, offer.offer_id, params.state)?;
+            continue;
+        }
 
         if offer.seller_id == *params.source {
             return Ok(ConvertResult::FilterStopCrossSelf);
@@ -1971,6 +1998,7 @@ mod tests {
                 offer_trail: &mut offer_trail,
                 state: &mut state,
                 context: &context,
+                frozen_key_config: &context.frozen_key_config,
             },
             &mut amount_send,
             &mut amount_recv,

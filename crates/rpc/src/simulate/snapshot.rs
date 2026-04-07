@@ -58,13 +58,22 @@ impl BucketListSnapshotSource {
 }
 
 impl SnapshotSource for BucketListSnapshotSource {
-    fn get(&self, key: &Rc<LedgerKey>) -> Result<Option<EntryWithLiveUntil>, HostError> {
+    fn get(
+        &self,
+        key: &Rc<soroban_host::xdr::LedgerKey>,
+    ) -> Result<Option<EntryWithLiveUntil>, HostError> {
+        // Convert P25 LedgerKey to workspace LedgerKey for bucket list lookup
+        let ws_key: LedgerKey = match super::convert::p25_to_ws(key.as_ref()) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
         // For contract data/code entries, we need to check TTL
-        let live_until = get_entry_ttl(&self.snapshot, key.as_ref());
+        let live_until = get_entry_ttl(&self.snapshot, &ws_key);
 
         // Check TTL expiration for contract entries
         if matches!(
-            key.as_ref(),
+            ws_key,
             LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
         ) {
             match live_until {
@@ -74,10 +83,18 @@ impl SnapshotSource for BucketListSnapshotSource {
         }
 
         // Look up the entry in the bucket list
-        match self.snapshot.load(key.as_ref()) {
+        match self.snapshot.load(&ws_key) {
             Some(mut entry) => {
                 normalize_entry(&mut entry);
-                Ok(Some((Rc::new(entry), live_until)))
+                // Convert workspace LedgerEntry to P25 LedgerEntry
+                let p25_entry: soroban_host::xdr::LedgerEntry = super::convert::ws_to_p25(&entry)
+                    .ok_or_else(|| {
+                    HostError::from(soroban_host::Error::from_type_and_code(
+                        soroban_host::xdr::ScErrorType::Value,
+                        soroban_host::xdr::ScErrorCode::InternalError,
+                    ))
+                })?;
+                Ok(Some((Rc::new(p25_entry), live_until)))
             }
             None => Ok(None),
         }

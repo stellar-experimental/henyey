@@ -84,6 +84,8 @@ pub struct LedgerContext {
     /// specification. If `None`, a fallback seed is used which may produce different
     /// results from stellar-core.
     pub soroban_prng_seed: Option<[u8; 32]>,
+    /// Frozen ledger keys configuration (CAP-77, Protocol 26+).
+    pub frozen_key_config: crate::frozen_keys::FrozenKeyConfig,
 }
 
 impl LedgerContext {
@@ -104,6 +106,7 @@ impl LedgerContext {
             protocol_version,
             network_id,
             soroban_prng_seed: None,
+            frozen_key_config: crate::frozen_keys::FrozenKeyConfig::empty(),
         }
     }
 
@@ -125,6 +128,7 @@ impl LedgerContext {
             protocol_version,
             network_id,
             soroban_prng_seed: Some(soroban_prng_seed),
+            frozen_key_config: crate::frozen_keys::FrozenKeyConfig::empty(),
         }
     }
 
@@ -138,6 +142,7 @@ impl LedgerContext {
             protocol_version: 21,
             network_id: NetworkId::testnet(),
             soroban_prng_seed: None,
+            frozen_key_config: crate::frozen_keys::FrozenKeyConfig::empty(),
         }
     }
 
@@ -151,6 +156,7 @@ impl LedgerContext {
             protocol_version: 21,
             network_id: NetworkId::mainnet(),
             soroban_prng_seed: None,
+            frozen_key_config: crate::frozen_keys::FrozenKeyConfig::empty(),
         }
     }
 }

@@ -94,6 +94,29 @@ pub(crate) fn execute_liquidity_pool_deposit(
         Ok(v) => v,
         Err(code) => return Ok(make_deposit_result(code)),
     };
+
+    // CAP-77: Check if any relevant trustlines are frozen (apply-time check).
+    if context.frozen_key_config.has_frozen_keys() {
+        if !matches!(asset_a, Asset::Native)
+            && context
+                .frozen_key_config
+                .is_key_frozen(&crate::frozen_keys::trustline_key(source, &asset_a))
+        {
+            return Ok(make_deposit_result(
+                LiquidityPoolDepositResultCode::TrustlineFrozen,
+            ));
+        }
+        if !matches!(asset_b, Asset::Native)
+            && context
+                .frozen_key_config
+                .is_key_frozen(&crate::frozen_keys::trustline_key(source, &asset_b))
+        {
+            return Ok(make_deposit_result(
+                LiquidityPoolDepositResultCode::TrustlineFrozen,
+            ));
+        }
+    }
+
     let available_pool_share_limit = pool_share_trustline
         .limit
         .saturating_sub(pool_share_trustline.balance);
@@ -216,7 +239,7 @@ pub(crate) fn execute_liquidity_pool_withdraw(
     op: &LiquidityPoolWithdrawOp,
     source: &AccountId,
     state: &mut LedgerStateManager,
-    _context: &LedgerContext,
+    context: &LedgerContext,
 ) -> Result<OperationResult> {
     // Validate amounts
     if op.amount <= 0 {
@@ -275,6 +298,28 @@ pub(crate) fn execute_liquidity_pool_withdraw(
         return Ok(make_withdraw_result(
             LiquidityPoolWithdrawResultCode::Underfunded,
         ));
+    }
+
+    // CAP-77: Check if any relevant trustlines are frozen (apply-time check).
+    if context.frozen_key_config.has_frozen_keys() {
+        if !matches!(asset_a, Asset::Native)
+            && context
+                .frozen_key_config
+                .is_key_frozen(&crate::frozen_keys::trustline_key(source, &asset_a))
+        {
+            return Ok(make_withdraw_result(
+                LiquidityPoolWithdrawResultCode::TrustlineFrozen,
+            ));
+        }
+        if !matches!(asset_b, Asset::Native)
+            && context
+                .frozen_key_config
+                .is_key_frozen(&crate::frozen_keys::trustline_key(source, &asset_b))
+        {
+            return Ok(make_withdraw_result(
+                LiquidityPoolWithdrawResultCode::TrustlineFrozen,
+            ));
+        }
     }
 
     let withdraw_a = get_pool_withdrawal_amount(op.amount, total_shares, reserve_a);
@@ -708,6 +753,9 @@ fn make_deposit_result(code: LiquidityPoolDepositResultCode) -> OperationResult 
         LiquidityPoolDepositResultCode::LineFull => LiquidityPoolDepositResult::LineFull,
         LiquidityPoolDepositResultCode::BadPrice => LiquidityPoolDepositResult::BadPrice,
         LiquidityPoolDepositResultCode::PoolFull => LiquidityPoolDepositResult::PoolFull,
+        LiquidityPoolDepositResultCode::TrustlineFrozen => {
+            LiquidityPoolDepositResult::TrustlineFrozen
+        }
     };
 
     OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(result))
@@ -722,6 +770,9 @@ fn make_withdraw_result(code: LiquidityPoolWithdrawResultCode) -> OperationResul
         LiquidityPoolWithdrawResultCode::Underfunded => LiquidityPoolWithdrawResult::Underfunded,
         LiquidityPoolWithdrawResultCode::LineFull => LiquidityPoolWithdrawResult::LineFull,
         LiquidityPoolWithdrawResultCode::UnderMinimum => LiquidityPoolWithdrawResult::UnderMinimum,
+        LiquidityPoolWithdrawResultCode::TrustlineFrozen => {
+            LiquidityPoolWithdrawResult::TrustlineFrozen
+        }
     };
 
     OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(result))

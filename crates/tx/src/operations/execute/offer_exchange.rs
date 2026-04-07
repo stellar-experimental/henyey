@@ -2,6 +2,7 @@
 
 use stellar_xdr::curr::{AccountId, Asset, ClaimAtom, Price};
 
+use crate::frozen_keys::FrozenKeyConfig;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 
@@ -20,6 +21,9 @@ pub struct ConversionParams<'a> {
     pub offer_trail: &'a mut Vec<ClaimAtom>,
     pub state: &'a mut LedgerStateManager,
     pub context: &'a LedgerContext,
+    /// Frozen key configuration for CAP-77 (Protocol 26+).
+    /// Offers accessing frozen keys are deleted during DEX crossing.
+    pub frozen_key_config: &'a FrozenKeyConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
