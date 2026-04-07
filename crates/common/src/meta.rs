@@ -99,6 +99,20 @@ fn normalize_ops<T>(
     }
 }
 
+/// Normalizes the before/after changes and per-operation changes shared by V2, V3, and V4
+/// transaction metadata formats.
+fn normalize_v2_style<T>(
+    tx_changes_before: &mut LedgerEntryChanges,
+    tx_changes_after: &mut LedgerEntryChanges,
+    operations: &mut stellar_xdr::curr::VecM<T>,
+    changes: impl FnMut(&mut T) -> &mut LedgerEntryChanges,
+) -> Result<(), stellar_xdr::curr::Error> {
+    sort_changes(tx_changes_before)?;
+    sort_changes(tx_changes_after)?;
+    normalize_ops(operations, changes);
+    Ok(())
+}
+
 /// Normalizes transaction metadata for deterministic hashing.
 ///
 /// This sorts all ledger entry changes within the transaction metadata
@@ -119,21 +133,24 @@ pub fn normalize_transaction_meta(
             sort_changes(&mut v1.tx_changes)?;
             normalize_ops(&mut v1.operations, |op| &mut op.changes);
         }
-        TransactionMeta::V2(v2) => {
-            sort_changes(&mut v2.tx_changes_before)?;
-            sort_changes(&mut v2.tx_changes_after)?;
-            normalize_ops(&mut v2.operations, |op| &mut op.changes);
-        }
-        TransactionMeta::V3(v3) => {
-            sort_changes(&mut v3.tx_changes_before)?;
-            sort_changes(&mut v3.tx_changes_after)?;
-            normalize_ops(&mut v3.operations, |op| &mut op.changes);
-        }
-        TransactionMeta::V4(v4) => {
-            sort_changes(&mut v4.tx_changes_before)?;
-            sort_changes(&mut v4.tx_changes_after)?;
-            normalize_ops(&mut v4.operations, |op| &mut op.changes);
-        }
+        TransactionMeta::V2(v2) => normalize_v2_style(
+            &mut v2.tx_changes_before,
+            &mut v2.tx_changes_after,
+            &mut v2.operations,
+            |op| &mut op.changes,
+        )?,
+        TransactionMeta::V3(v3) => normalize_v2_style(
+            &mut v3.tx_changes_before,
+            &mut v3.tx_changes_after,
+            &mut v3.operations,
+            |op| &mut op.changes,
+        )?,
+        TransactionMeta::V4(v4) => normalize_v2_style(
+            &mut v4.tx_changes_before,
+            &mut v4.tx_changes_after,
+            &mut v4.operations,
+            |op| &mut op.changes,
+        )?,
     }
     Ok(())
 }
