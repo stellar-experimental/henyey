@@ -474,149 +474,130 @@ pub(super) fn check_operation_signatures(
 /// OperationResult defaults to opINNER with a default inner result for the
 /// operation type (typically the "Success" variant).
 pub(super) fn default_success_op_result(op: &Operation) -> OperationResult {
-    match &op.body {
-        OperationBody::CreateAccount(_) => OperationResult::OpInner(
-            OperationResultTr::CreateAccount(stellar_xdr::curr::CreateAccountResult::Success),
-        ),
-        OperationBody::Payment(_) => OperationResult::OpInner(OperationResultTr::Payment(
-            stellar_xdr::curr::PaymentResult::Success,
-        )),
-        OperationBody::PathPaymentStrictReceive(_) => OperationResult::OpInner(
-            OperationResultTr::PathPaymentStrictReceive(PathPaymentStrictReceiveResult::Success(
-                stellar_xdr::curr::PathPaymentStrictReceiveResultSuccess {
-                    offers: Vec::new().try_into().unwrap_or_default(),
-                    last: stellar_xdr::curr::SimplePaymentResult {
-                        destination: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                            stellar_xdr::curr::Uint256([0; 32]),
-                        )),
-                        asset: Asset::Native,
-                        amount: 0,
+    use stellar_xdr::curr::*;
+
+    let inner = match &op.body {
+        OperationBody::CreateAccount(_) => {
+            OperationResultTr::CreateAccount(CreateAccountResult::Success)
+        }
+        OperationBody::Payment(_) => OperationResultTr::Payment(PaymentResult::Success),
+        OperationBody::PathPaymentStrictReceive(_) => {
+            OperationResultTr::PathPaymentStrictReceive(
+                PathPaymentStrictReceiveResult::Success(
+                    PathPaymentStrictReceiveResultSuccess {
+                        offers: VecM::default(),
+                        last: zero_simple_payment_result(),
                     },
-                },
-            )),
-        ),
+                ),
+            )
+        }
         OperationBody::ManageSellOffer(_) => {
-            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
-                ManageSellOfferResult::Success(stellar_xdr::curr::ManageOfferSuccessResult {
-                    offers_claimed: Vec::new().try_into().unwrap_or_default(),
-                    offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Deleted,
-                }),
+            OperationResultTr::ManageSellOffer(ManageSellOfferResult::Success(
+                empty_offer_success_result(),
             ))
         }
         OperationBody::CreatePassiveSellOffer(_) => {
-            OperationResult::OpInner(OperationResultTr::CreatePassiveSellOffer(
-                ManageSellOfferResult::Success(stellar_xdr::curr::ManageOfferSuccessResult {
-                    offers_claimed: Vec::new().try_into().unwrap_or_default(),
-                    offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Deleted,
-                }),
+            OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Success(
+                empty_offer_success_result(),
             ))
         }
-        OperationBody::SetOptions(_) => OperationResult::OpInner(OperationResultTr::SetOptions(
-            stellar_xdr::curr::SetOptionsResult::Success,
-        )),
-        OperationBody::ChangeTrust(_) => OperationResult::OpInner(OperationResultTr::ChangeTrust(
-            stellar_xdr::curr::ChangeTrustResult::Success,
-        )),
-        OperationBody::AllowTrust(_) => OperationResult::OpInner(OperationResultTr::AllowTrust(
-            stellar_xdr::curr::AllowTrustResult::Success,
-        )),
-        OperationBody::AccountMerge(_) => OperationResult::OpInner(
-            OperationResultTr::AccountMerge(AccountMergeResult::Success(0)),
-        ),
-        OperationBody::Inflation => OperationResult::OpInner(OperationResultTr::Inflation(
-            InflationResult::Success(Vec::new().try_into().unwrap_or_default()),
-        )),
-        OperationBody::ManageData(_) => OperationResult::OpInner(OperationResultTr::ManageData(
-            stellar_xdr::curr::ManageDataResult::Success,
-        )),
-        OperationBody::BumpSequence(_) => OperationResult::OpInner(
-            OperationResultTr::BumpSequence(stellar_xdr::curr::BumpSequenceResult::Success),
-        ),
+        OperationBody::SetOptions(_) => OperationResultTr::SetOptions(SetOptionsResult::Success),
+        OperationBody::ChangeTrust(_) => {
+            OperationResultTr::ChangeTrust(ChangeTrustResult::Success)
+        }
+        OperationBody::AllowTrust(_) => {
+            OperationResultTr::AllowTrust(AllowTrustResult::Success)
+        }
+        OperationBody::AccountMerge(_) => {
+            OperationResultTr::AccountMerge(AccountMergeResult::Success(0))
+        }
+        OperationBody::Inflation => {
+            OperationResultTr::Inflation(InflationResult::Success(VecM::default()))
+        }
+        OperationBody::ManageData(_) => {
+            OperationResultTr::ManageData(ManageDataResult::Success)
+        }
+        OperationBody::BumpSequence(_) => {
+            OperationResultTr::BumpSequence(BumpSequenceResult::Success)
+        }
         OperationBody::ManageBuyOffer(_) => {
-            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(
-                ManageBuyOfferResult::Success(stellar_xdr::curr::ManageOfferSuccessResult {
-                    offers_claimed: Vec::new().try_into().unwrap_or_default(),
-                    offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Deleted,
-                }),
+            OperationResultTr::ManageBuyOffer(ManageBuyOfferResult::Success(
+                empty_offer_success_result(),
             ))
         }
-        OperationBody::PathPaymentStrictSend(_) => OperationResult::OpInner(
+        OperationBody::PathPaymentStrictSend(_) => {
             OperationResultTr::PathPaymentStrictSend(PathPaymentStrictSendResult::Success(
-                stellar_xdr::curr::PathPaymentStrictSendResultSuccess {
-                    offers: Vec::new().try_into().unwrap_or_default(),
-                    last: stellar_xdr::curr::SimplePaymentResult {
-                        destination: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
-                            stellar_xdr::curr::Uint256([0; 32]),
-                        )),
-                        asset: Asset::Native,
-                        amount: 0,
-                    },
+                PathPaymentStrictSendResultSuccess {
+                    offers: VecM::default(),
+                    last: zero_simple_payment_result(),
                 },
-            )),
-        ),
-        OperationBody::CreateClaimableBalance(_) => OperationResult::OpInner(
-            OperationResultTr::CreateClaimableBalance(CreateClaimableBalanceResult::Success(
-                ClaimableBalanceId::ClaimableBalanceIdTypeV0(stellar_xdr::curr::Hash([0; 32])),
-            )),
-        ),
-        OperationBody::ClaimClaimableBalance(_) => {
-            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(
-                stellar_xdr::curr::ClaimClaimableBalanceResult::Success,
             ))
+        }
+        OperationBody::CreateClaimableBalance(_) => {
+            OperationResultTr::CreateClaimableBalance(CreateClaimableBalanceResult::Success(
+                ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([0; 32])),
+            ))
+        }
+        OperationBody::ClaimClaimableBalance(_) => {
+            OperationResultTr::ClaimClaimableBalance(ClaimClaimableBalanceResult::Success)
         }
         OperationBody::BeginSponsoringFutureReserves(_) => {
-            OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(
-                stellar_xdr::curr::BeginSponsoringFutureReservesResult::Success,
-            ))
+            OperationResultTr::BeginSponsoringFutureReserves(
+                BeginSponsoringFutureReservesResult::Success,
+            )
         }
         OperationBody::EndSponsoringFutureReserves => {
-            OperationResult::OpInner(OperationResultTr::EndSponsoringFutureReserves(
-                stellar_xdr::curr::EndSponsoringFutureReservesResult::Success,
-            ))
+            OperationResultTr::EndSponsoringFutureReserves(
+                EndSponsoringFutureReservesResult::Success,
+            )
         }
         OperationBody::RevokeSponsorship(_) => {
-            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(
-                stellar_xdr::curr::RevokeSponsorshipResult::Success,
-            ))
+            OperationResultTr::RevokeSponsorship(RevokeSponsorshipResult::Success)
         }
-        OperationBody::Clawback(_) => OperationResult::OpInner(OperationResultTr::Clawback(
-            stellar_xdr::curr::ClawbackResult::Success,
-        )),
+        OperationBody::Clawback(_) => OperationResultTr::Clawback(ClawbackResult::Success),
         OperationBody::ClawbackClaimableBalance(_) => {
-            OperationResult::OpInner(OperationResultTr::ClawbackClaimableBalance(
-                stellar_xdr::curr::ClawbackClaimableBalanceResult::Success,
-            ))
+            OperationResultTr::ClawbackClaimableBalance(ClawbackClaimableBalanceResult::Success)
         }
         OperationBody::SetTrustLineFlags(_) => {
-            OperationResult::OpInner(OperationResultTr::SetTrustLineFlags(
-                stellar_xdr::curr::SetTrustLineFlagsResult::Success,
-            ))
+            OperationResultTr::SetTrustLineFlags(SetTrustLineFlagsResult::Success)
         }
         OperationBody::LiquidityPoolDeposit(_) => {
-            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(
-                stellar_xdr::curr::LiquidityPoolDepositResult::Success,
-            ))
+            OperationResultTr::LiquidityPoolDeposit(LiquidityPoolDepositResult::Success)
         }
         OperationBody::LiquidityPoolWithdraw(_) => {
-            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(
-                stellar_xdr::curr::LiquidityPoolWithdrawResult::Success,
-            ))
+            OperationResultTr::LiquidityPoolWithdraw(LiquidityPoolWithdrawResult::Success)
         }
         OperationBody::InvokeHostFunction(_) => {
-            OperationResult::OpInner(OperationResultTr::InvokeHostFunction(
-                stellar_xdr::curr::InvokeHostFunctionResult::Success(stellar_xdr::curr::Hash(
-                    [0; 32],
-                )),
-            ))
+            OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Success(Hash(
+                [0; 32],
+            )))
         }
         OperationBody::ExtendFootprintTtl(_) => {
-            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(
-                stellar_xdr::curr::ExtendFootprintTtlResult::Success,
-            ))
+            OperationResultTr::ExtendFootprintTtl(ExtendFootprintTtlResult::Success)
         }
-        OperationBody::RestoreFootprint(_) => OperationResult::OpInner(
-            OperationResultTr::RestoreFootprint(stellar_xdr::curr::RestoreFootprintResult::Success),
-        ),
+        OperationBody::RestoreFootprint(_) => {
+            OperationResultTr::RestoreFootprint(RestoreFootprintResult::Success)
+        }
+    };
+    OperationResult::OpInner(inner)
+}
+
+/// Default empty offer success result used for manage offer operations.
+fn empty_offer_success_result() -> stellar_xdr::curr::ManageOfferSuccessResult {
+    stellar_xdr::curr::ManageOfferSuccessResult {
+        offers_claimed: VecM::default(),
+        offer: stellar_xdr::curr::ManageOfferSuccessResultOffer::Deleted,
+    }
+}
+
+/// Default zero-value simple payment result used for path payment operations.
+fn zero_simple_payment_result() -> stellar_xdr::curr::SimplePaymentResult {
+    stellar_xdr::curr::SimplePaymentResult {
+        destination: AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([0; 32]),
+        )),
+        asset: Asset::Native,
+        amount: 0,
     }
 }
 
