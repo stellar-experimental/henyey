@@ -883,14 +883,36 @@ async fn main() -> anyhow::Result<()> {
             start_at_ledger: _,
             start_at_hash: _,
             disable_bucket_gc: _,
-        } => cmd_run(config, validator, watcher, force_catchup, local).await,
+        } => {
+            if validator && watcher {
+                anyhow::bail!("Cannot run as both validator and watcher");
+            }
+            let mode = if local || validator {
+                RunMode::Validator
+            } else if watcher {
+                RunMode::Watcher
+            } else {
+                RunMode::Full
+            };
+            cmd_run(config, mode, force_catchup, local).await
+        }
 
         Commands::Catchup {
             target,
             mode,
             no_verify,
             parallelism,
-        } => cmd_catchup(config, target, mode, !no_verify, parallelism).await,
+        } => {
+            let mode: CatchupModeInternal = mode.parse()?;
+            let options = CatchupOptions {
+                target,
+                mode,
+                verify: !no_verify,
+                parallelism,
+                keep_temp: false,
+            };
+            cmd_catchup(config, options).await
+        }
 
         Commands::NewDb {
             path,
@@ -955,14 +977,12 @@ async fn main() -> anyhow::Result<()> {
             limit,
             last_modified_ledger_count,
         } => {
-            cmd_dump_ledger(
-                config,
-                output,
+            let filter = DumpLedgerFilter {
                 entry_type,
                 limit,
                 last_modified_ledger_count,
-            )
-            .await
+            };
+            cmd_dump_ledger(config, output, filter).await
         }
 
         Commands::SelfCheck => cmd_self_check(config).await,
@@ -1270,25 +1290,11 @@ fn load_config_file(path: &std::path::Path) -> anyhow::Result<AppConfig> {
 /// Run command handler.
 async fn cmd_run(
     config: AppConfig,
-    validator: bool,
-    watcher: bool,
+    mode: RunMode,
     force_catchup: bool,
     local: bool,
 ) -> anyhow::Result<()> {
-    if validator && watcher {
-        anyhow::bail!("Cannot run as both validator and watcher");
-    }
-
-    // In local mode, always run as validator (it's a single-node standalone network).
-    let mode = if local || validator {
-        RunMode::Validator
-    } else if watcher {
-        RunMode::Watcher
-    } else {
-        RunMode::Full
-    };
-
-    // Local mode: auto-initialize database and history if needed.
+    // In local mode, auto-initialize database and history if needed.
     let config = if local {
         let db_path = &config.database.path;
 
@@ -1376,24 +1382,7 @@ async fn cmd_run(
 }
 
 /// Catchup command handler.
-async fn cmd_catchup(
-    config: AppConfig,
-    target: String,
-    mode: String,
-    verify: bool,
-    parallelism: usize,
-) -> anyhow::Result<()> {
-    // Parse mode string into CatchupMode (supports "minimal", "complete", "recent:N")
-    let mode: CatchupModeInternal = mode.parse()?;
-
-    let options = CatchupOptions {
-        target,
-        mode,
-        verify,
-        parallelism,
-        keep_temp: false,
-    };
-
+async fn cmd_catchup(config: AppConfig, options: CatchupOptions) -> anyhow::Result<()> {
     let result = run_catchup(config, options).await?;
     println!("{}", result);
     Ok(())
@@ -4851,6 +4840,13 @@ fn cmd_check_quorum_intersection(path: &std::path::Path) -> anyhow::Result<()> {
     }
 }
 
+/// Filtering options for the dump-ledger command.
+struct DumpLedgerFilter {
+    entry_type: Option<String>,
+    limit: Option<u64>,
+    last_modified_ledger_count: Option<u32>,
+}
+
 /// Dump ledger entries from the bucket list to a JSON file.
 ///
 /// This is equivalent to stellar-core dump-ledger command.
@@ -4858,16 +4854,14 @@ fn cmd_check_quorum_intersection(path: &std::path::Path) -> anyhow::Result<()> {
 async fn cmd_dump_ledger(
     config: AppConfig,
     output: PathBuf,
-    entry_type: Option<String>,
-    limit: Option<u64>,
-    last_modified_ledger_count: Option<u32>,
+    filter: DumpLedgerFilter,
 ) -> anyhow::Result<()> {
     use henyey_bucket::BucketManager;
     use std::io::Write;
     use stellar_xdr::curr::LedgerEntryType;
 
     // Parse entry type filter if provided
-    let type_filter: Option<LedgerEntryType> = if let Some(ref type_str) = entry_type {
+    let type_filter: Option<LedgerEntryType> = if let Some(ref type_str) = filter.entry_type {
         Some(match type_str.to_lowercase().as_str() {
             "account" => LedgerEntryType::Account,
             "trustline" => LedgerEntryType::Trustline,
@@ -4905,8 +4899,9 @@ async fn cmd_dump_ledger(
     println!("Current ledger: {}", current_ledger);
 
     // Calculate minimum last modified ledger if filter is set
-    let min_last_modified: Option<u32> =
-        last_modified_ledger_count.map(|count| current_ledger.saturating_sub(count));
+    let min_last_modified: Option<u32> = filter
+        .last_modified_ledger_count
+        .map(|count| current_ledger.saturating_sub(count));
 
     // Load bucket list snapshot for the current checkpoint
     let checkpoint = henyey_history::checkpoint::latest_checkpoint_before_or_at(current_ledger)
@@ -4922,7 +4917,7 @@ async fn cmd_dump_ledger(
     let mut file = std::fs::File::create(&output)?;
 
     let mut entry_count: u64 = 0;
-    let limit_val = limit.unwrap_or(u64::MAX);
+    let limit_val = filter.limit.unwrap_or(u64::MAX);
 
     println!("Dumping entries to {}...", output.display());
 
