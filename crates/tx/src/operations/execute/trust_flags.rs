@@ -61,20 +61,7 @@ pub(crate) fn execute_allow_trust(
     }
 
     // Convert the asset code to a full Asset
-    let asset = match &op.asset {
-        stellar_xdr::curr::AssetCode::CreditAlphanum4(code) => {
-            Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
-                asset_code: code.clone(),
-                issuer: source.clone(),
-            })
-        }
-        stellar_xdr::curr::AssetCode::CreditAlphanum12(code) => {
-            Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
-                asset_code: code.clone(),
-                issuer: source.clone(),
-            })
-        }
-    };
+    let asset = asset_from_code(&op.asset, source);
 
     // Get the trustline
     let trustline = match state.get_trustline(&op.trustor, &asset) {
@@ -97,25 +84,11 @@ pub(crate) fn execute_allow_trust(
         return Ok(make_allow_trust_result(AllowTrustResultCode::CantRevoke));
     }
 
-    // Check if we need to remove offers (when revoking liabilities authorization)
-    // This matches stellar-core behavior: when going from authorized-to-maintain-liabilities
-    // to not-authorized-to-maintain-liabilities, remove all offers by this account for this asset.
-    let was_authorized_to_maintain = is_authorized_to_maintain_liabilities(trustline.flags);
-    let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
-
-    if was_authorized_to_maintain && !will_be_authorized_to_maintain {
-        // Remove all offers owned by the trustor that are buying or selling this asset
-        // This also handles liability release, subentry updates, and sponsorship
-        remove_offers_with_cleanup(state, &op.trustor, &asset);
-
-        // Also redeem pool share trustlines (protocol >= 18)
-        let result = redeem_pool_share_trustlines(state, _context, &op.trustor, &asset, tx_id)?;
-        match result {
-            RemoveResult::Success => {}
-            RemoveResult::LowReserve => {
-                return Ok(make_allow_trust_result(AllowTrustResultCode::LowReserve));
-            }
-        }
+    // Handle deauthorization: remove offers and redeem pool shares if revoking liabilities
+    if let Some(RemoveResult::LowReserve) =
+        handle_deauthorization(trustline.flags, new_flags, &op.trustor, &asset, tx_id, state, _context)?
+    {
+        return Ok(make_allow_trust_result(AllowTrustResultCode::LowReserve));
     }
 
     // Update the trustline
@@ -225,27 +198,13 @@ pub(crate) fn execute_set_trust_line_flags(
         ));
     }
 
-    // Check if we need to remove offers (when revoking liabilities authorization)
-    // This matches stellar-core behavior: when going from authorized-to-maintain-liabilities
-    // to not-authorized-to-maintain-liabilities, remove all offers by this account for this asset.
-    let was_authorized_to_maintain = is_authorized_to_maintain_liabilities(trustline.flags);
-    let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
-
-    if was_authorized_to_maintain && !will_be_authorized_to_maintain {
-        // Remove all offers owned by the trustor that are buying or selling this asset
-        // This also handles liability release, subentry updates, and sponsorship
-        remove_offers_with_cleanup(state, &op.trustor, &op.asset);
-
-        // Also redeem pool share trustlines (protocol >= 18)
-        let result = redeem_pool_share_trustlines(state, _context, &op.trustor, &op.asset, tx_id)?;
-        match result {
-            RemoveResult::Success => {}
-            RemoveResult::LowReserve => {
-                return Ok(make_set_flags_result(
-                    SetTrustLineFlagsResultCode::LowReserve,
-                ));
-            }
-        }
+    // Handle deauthorization: remove offers and redeem pool shares if revoking liabilities
+    if let Some(RemoveResult::LowReserve) =
+        handle_deauthorization(trustline.flags, new_flags, &op.trustor, &op.asset, tx_id, state, _context)?
+    {
+        return Ok(make_set_flags_result(
+            SetTrustLineFlagsResultCode::LowReserve,
+        ));
     }
 
     // Update the trustline
@@ -254,6 +213,50 @@ pub(crate) fn execute_set_trust_line_flags(
     }
 
     Ok(make_set_flags_result(SetTrustLineFlagsResultCode::Success))
+}
+
+/// Convert an AllowTrust asset code + issuer into a full Asset.
+fn asset_from_code(code: &stellar_xdr::curr::AssetCode, issuer: &AccountId) -> Asset {
+    match code {
+        stellar_xdr::curr::AssetCode::CreditAlphanum4(c) => {
+            Asset::CreditAlphanum4(stellar_xdr::curr::AlphaNum4 {
+                asset_code: c.clone(),
+                issuer: issuer.clone(),
+            })
+        }
+        stellar_xdr::curr::AssetCode::CreditAlphanum12(c) => {
+            Asset::CreditAlphanum12(stellar_xdr::curr::AlphaNum12 {
+                asset_code: c.clone(),
+                issuer: issuer.clone(),
+            })
+        }
+    }
+}
+
+/// Handle deauthorization cleanup: remove offers and redeem pool share trustlines
+/// when revoking liabilities authorization. Returns `Some(RemoveResult::LowReserve)`
+/// if pool share redemption fails due to low reserve, `None` if no deauthorization
+/// occurred or it succeeded.
+fn handle_deauthorization(
+    old_flags: u32,
+    new_flags: u32,
+    trustor: &AccountId,
+    asset: &Asset,
+    tx_id: &TxIdentity<'_>,
+    state: &mut LedgerStateManager,
+    context: &LedgerContext,
+) -> Result<Option<RemoveResult>> {
+    let was_authorized_to_maintain = is_authorized_to_maintain_liabilities(old_flags);
+    let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
+
+    if was_authorized_to_maintain && !will_be_authorized_to_maintain {
+        remove_offers_with_cleanup(state, trustor, asset);
+        let result = redeem_pool_share_trustlines(state, context, trustor, asset, tx_id)?;
+        if result == RemoveResult::LowReserve {
+            return Ok(Some(RemoveResult::LowReserve));
+        }
+    }
+    Ok(None)
 }
 
 /// Create an AllowTrust result.
