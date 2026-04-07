@@ -114,6 +114,40 @@ impl TransactionQueue {
             }
         }
 
+        // Parity: stellar-core `makeTxSetFromTransactions` calls `trimInvalid` per-phase
+        // with a shared `accountFeeMap` before surge pricing. For V26+, the fee map is
+        // shared across Classic and Soroban phases so that a fee source appearing in both
+        // phases has its total fees summed correctly.
+        // (TxSetFrame.cpp:836-860)
+        //
+        // We only run this when a fee balance provider is available. Txs are already
+        // individually validated at queue admission; the cross-phase trim catches the case
+        // where cumulative fees across both phases exceed a source's balance.
+        let fee_provider = self.get_fee_balance_provider();
+        let (classic_txs, mut soroban_txs) = if fee_provider.is_some() {
+            let ctx = {
+                let vc = self.validation_context.read();
+                crate::tx_set_utils::TxSetValidationContext {
+                    next_ledger_seq: vc.ledger_seq + 1,
+                    close_time: vc.close_time,
+                    base_fee: vc.base_fee,
+                    base_reserve: vc.base_reserve,
+                    protocol_version: vc.protocol_version,
+                    network_id: self.config.network_id,
+                }
+            };
+            let close_time_bounds = crate::tx_set_utils::CloseTimeBounds::exact();
+            crate::tx_set_utils::trim_invalid_two_phase(
+                &classic_txs,
+                &soroban_txs,
+                &ctx,
+                &close_time_bounds,
+                fee_provider.as_deref(),
+            )
+        } else {
+            (classic_txs, soroban_txs)
+        };
+
         sort_txs_by_hash(&mut soroban_txs);
 
         let classic_phase = build_classic_phase(

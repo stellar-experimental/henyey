@@ -1659,6 +1659,7 @@ impl App {
             result.header.scp_value.close_time.0,
             result.header.ledger_version,
             result.header.base_fee,
+            result.header.base_reserve,
         );
 
         // Update dynamic Soroban resource limits for queue admission.

@@ -380,6 +380,70 @@ fn remove_txs(
         .collect()
 }
 
+/// Trim invalid transactions from two phases (Classic + Soroban), sharing the
+/// fee-source map across phases for Protocol 26+.
+///
+/// For V26+, the `account_fee_map` is accumulated across both phases so that
+/// a fee source appearing in both Classic and Soroban phases has its total fees
+/// summed correctly. For pre-V26, the map is cleared between phases.
+///
+/// # Parity
+///
+/// Mirrors `makeTxSetFromTransactions` in stellar-core `TxSetFrame.cpp:836-860`
+/// where `trimInvalid` is called per-phase with a shared `accountFeeMap`.
+///
+/// Also mirrors `checkValidInternalWithResult` at `TxSetFrame.cpp:2168-2183`
+/// where `accountFeeMap` is conditionally cleared between phases based on V26.
+pub fn trim_invalid_two_phase(
+    classic_txs: &[TransactionEnvelope],
+    soroban_txs: &[TransactionEnvelope],
+    ctx: &TxSetValidationContext,
+    close_time_bounds: &CloseTimeBounds,
+    fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+) -> (Vec<TransactionEnvelope>, Vec<TransactionEnvelope>) {
+    use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+
+    let use_cross_phase_fee_map =
+        protocol_version_starts_from(ctx.protocol_version, ProtocolVersion::V26);
+
+    let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
+
+    // Phase 0: Classic
+    let classic_invalid = get_invalid_tx_list_with_fee_map(
+        classic_txs,
+        ctx,
+        close_time_bounds,
+        fee_balance_provider,
+        &mut account_fee_map,
+    );
+    let valid_classic = if classic_invalid.is_empty() {
+        classic_txs.to_vec()
+    } else {
+        remove_txs(classic_txs, &classic_invalid)
+    };
+
+    // For pre-V26, clear the fee map between phases (each phase is independent).
+    if !use_cross_phase_fee_map {
+        account_fee_map.clear();
+    }
+
+    // Phase 1: Soroban
+    let soroban_invalid = get_invalid_tx_list_with_fee_map(
+        soroban_txs,
+        ctx,
+        close_time_bounds,
+        fee_balance_provider,
+        &mut account_fee_map,
+    );
+    let valid_soroban = if soroban_invalid.is_empty() {
+        soroban_txs.to_vec()
+    } else {
+        remove_txs(soroban_txs, &soroban_invalid)
+    };
+
+    (valid_classic, valid_soroban)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

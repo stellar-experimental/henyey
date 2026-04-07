@@ -215,6 +215,8 @@ pub struct ValidationContext {
     pub protocol_version: u32,
     /// Current ledger base fee (stroops per op).
     pub base_fee: u32,
+    /// Base reserve per ledger entry (stroops).
+    pub base_reserve: u32,
     /// Soroban per-transaction resource limits (if available).
     pub soroban_limits: Option<SorobanTxLimits>,
 }
@@ -248,6 +250,7 @@ impl Default for ValidationContext {
                 .as_secs(),
             protocol_version: 21,
             base_fee: 100,
+            base_reserve: 5_000_000, // 0.5 XLM default
             soroban_limits: None,
         }
     }
@@ -713,12 +716,14 @@ impl TransactionQueue {
         close_time: u64,
         protocol_version: u32,
         base_fee: u32,
+        base_reserve: u32,
     ) {
         let mut ctx = self.validation_context.write();
         ctx.ledger_seq = ledger_seq;
         ctx.close_time = close_time;
         ctx.protocol_version = protocol_version;
         ctx.base_fee = base_fee;
+        ctx.base_reserve = base_reserve;
     }
 
     /// Validate a transaction before queueing.
@@ -2796,7 +2801,7 @@ mod tests {
     fn test_queue_rejects_below_current_base_fee() {
         let queue = TransactionQueue::with_defaults();
 
-        queue.update_validation_context(1, 0, 25, 500);
+        queue.update_validation_context(1, 0, 25, 500, 5_000_000);
 
         let low_fee = make_test_envelope(200, 1);
         let high_fee = make_test_envelope(600, 1);
