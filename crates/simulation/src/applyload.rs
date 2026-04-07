@@ -1018,28 +1018,13 @@ impl ApplyLoad {
                     self.config.bl_batch_size
                 };
 
-                for _j in 0..entry_count {
-                    let mut le = base_live_entry.clone();
-                    le.last_modified_ledger_seq = header.ledger_seq;
-                    if let LedgerEntryData::ContractData(ref mut cd) = le.data {
-                        cd.key = ScVal::U64(current_live_key);
-                    }
-                    current_live_key += 1;
-
-                    // Create TTL entry (hash before moving `le`).
-                    let ttl_key_hash =
-                        Hash256::hash(&le.to_xdr(Limits::none()).unwrap_or_default());
-                    let ttl_entry = LedgerEntry {
-                        last_modified_ledger_seq: header.ledger_seq,
-                        data: LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
-                            key_hash: Hash(ttl_key_hash.0),
-                            live_until_ledger_seq: 1_000_000_000,
-                        }),
-                        ext: LedgerEntryExt::V0,
-                    };
-                    live_entries.push(le);
-                    live_entries.push(ttl_entry);
-                }
+                generate_live_entries(
+                    &base_live_entry,
+                    header.ledger_seq,
+                    entry_count,
+                    &mut current_live_key,
+                    &mut live_entries,
+                );
 
                 let archived_entry_count = if is_last_batch {
                     hot_archive_last_batch_size
@@ -1047,28 +1032,12 @@ impl ApplyLoad {
                     hot_archive_batch_size
                 };
 
-                for _j in 0..archived_entry_count {
-                    let lk = Self::key_for_archived_entry(current_hot_archive_key);
-                    let le = LedgerEntry {
-                        last_modified_ledger_seq: header.ledger_seq,
-                        data: LedgerEntryData::ContractData(stellar_xdr::curr::ContractDataEntry {
-                            ext: ExtensionPoint::V0,
-                            contract: match &lk {
-                                LedgerKey::ContractData(cd) => cd.contract.clone(),
-                                _ => unreachable!(),
-                            },
-                            key: match &lk {
-                                LedgerKey::ContractData(cd) => cd.key.clone(),
-                                _ => unreachable!(),
-                            },
-                            durability: ContractDataDurability::Persistent,
-                            val: ScVal::Bytes(stellar_xdr::curr::ScBytes::default()),
-                        }),
-                        ext: LedgerEntryExt::V0,
-                    };
-                    archived_entries.push(le);
-                    current_hot_archive_key += 1;
-                }
+                generate_archived_entries(
+                    header.ledger_seq,
+                    archived_entry_count,
+                    &mut current_hot_archive_key,
+                    &mut archived_entries,
+                );
             }
 
             // Add to live bucket list.
@@ -1661,6 +1630,67 @@ impl ApplyLoad {
     /// Mutable accessor for the transaction generator.
     pub fn tx_generator_mut(&mut self) -> &mut TxGenerator {
         &mut self.tx_gen
+    }
+}
+
+/// Generate live entries and their TTL entries for a bucket list batch.
+fn generate_live_entries(
+    base_entry: &LedgerEntry,
+    ledger_seq: u32,
+    count: u32,
+    current_key: &mut u64,
+    entries: &mut Vec<LedgerEntry>,
+) {
+    for _ in 0..count {
+        let mut le = base_entry.clone();
+        le.last_modified_ledger_seq = ledger_seq;
+        if let LedgerEntryData::ContractData(ref mut cd) = le.data {
+            cd.key = ScVal::U64(*current_key);
+        }
+        *current_key += 1;
+
+        let ttl_key_hash = Hash256::hash(&le.to_xdr(Limits::none()).unwrap_or_default());
+        let ttl_entry = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
+                key_hash: Hash(ttl_key_hash.0),
+                live_until_ledger_seq: 1_000_000_000,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        entries.push(le);
+        entries.push(ttl_entry);
+    }
+}
+
+/// Generate archived entries for a hot archive bucket list batch.
+fn generate_archived_entries(
+    ledger_seq: u32,
+    count: u32,
+    current_key: &mut u64,
+    entries: &mut Vec<LedgerEntry>,
+) {
+    for _ in 0..count {
+        let lk = ApplyLoad::key_for_archived_entry(*current_key);
+        let le = LedgerEntry {
+            last_modified_ledger_seq: ledger_seq,
+            data: LedgerEntryData::ContractData(stellar_xdr::curr::ContractDataEntry {
+                ext: ExtensionPoint::V0,
+                contract: match &lk {
+                    LedgerKey::ContractData(cd) => cd.contract.clone(),
+                    _ => unreachable!(),
+                },
+                key: match &lk {
+                    LedgerKey::ContractData(cd) => cd.key.clone(),
+                    _ => unreachable!(),
+                },
+                durability: ContractDataDurability::Persistent,
+                val: ScVal::Bytes(stellar_xdr::curr::ScBytes::default()),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+        entries.push(le);
+        *current_key += 1;
     }
 }
 
