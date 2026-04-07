@@ -1,15 +1,12 @@
 ---
 name: audit-gesserit
 description: Multi-stage adversarial security audit with hypothesis, review, PoC, publish
-argument-hint: "[--crate <name>] [--max-rounds N] [--max-cost N] [--no-hypothesis] [--no-poc] [--no-publish] [--dry-run] [--resume] [--promote <path>]"
+argument-hint: "[--crate <name>] [--max-rounds N] [--no-hypothesis] [--no-poc] [--no-publish] [--dry-run] [--resume] [--promote <path>]"
 ---
 
 Parse `$ARGUMENTS`:
 - `--crate <name>`: Restrict to a single crate. Default: all crates by priority.
 - `--max-rounds N`: Maximum orchestrator iterations (default: 30).
-- `--max-cost N`: Maximum estimated cost in dollars (default: unlimited). The
-  orchestrator tracks cumulative agent spawns and stops when the budget is
-  exceeded. Cost estimates: opus agent ≈ $0.50–2.00, sonnet agent ≈ $0.10–0.30.
 - `--no-hypothesis`: Skip hypothesis generation; only process existing pipeline state.
 - `--no-poc`: Skip PoC stage; promote reviewed hypotheses directly to final review.
 - `--no-publish`: Skip publishing to GitHub issues.
@@ -132,15 +129,13 @@ pocs_attempted = 0
 pocs_confirmed = 0
 pocs_rejected = 0
 findings_published = 0
-estimated_cost = 0.0  # cumulative estimated cost in dollars
 ```
 
 ---
 
 ## Step 2: Main Orchestrator Loop
 
-Repeat until no more work is available, `round >= max_rounds`, or
-`estimated_cost >= max_cost` (if set):
+Repeat until no more work is available or `round >= max_rounds`:
 
 ### 2a: Scan Pipeline State
 
@@ -337,11 +332,10 @@ After the agent completes, detect the verdict by checking the filesystem:
 
 ### 2e: Update Progress
 
-Increment `round`. Update `estimated_cost` based on the agent type spawned
-(opus ≈ $1.00, sonnet ≈ $0.20). Print a one-line progress update:
+Increment `round`. Print a one-line progress update:
 
 ```
-Round N/M: [stage] [crate] [verdict] — H:X/Y/Z PoC:A/B/C Published:P Cost:~$C.CC
+Round N/M: [stage] [crate] [verdict] — H:X/Y/Z PoC:A/B/C Published:P
 ```
 
 Where H = generated/promoted/rejected, PoC = attempted/confirmed/rejected.
@@ -375,7 +369,6 @@ After the loop exits, print:
 ═══ Gesserit Audit Complete ═══
 Rounds:           N / M
 Target:           <crate name or "all crates">
-Estimated cost:   ~$C.CC
 
 Hypotheses:       X generated, Y promoted, Z rejected
 PoC attempts:     A total, B confirmed, C rejected
@@ -408,9 +401,6 @@ poc, success), note that `/audit-gesserit --resume` can continue processing.
   high-confidence.
 - **Quality over speed.** A single confirmed finding is worth more than 50
   hypotheses. Don't rush through the pipeline — let each agent do thorough work.
-- **Cost awareness.** Each agent spawn is expensive (opus for analysis stages).
-  Use `--crate` and `--max-rounds` to control scope. Start with a single crate
-  before running all-crate audits.
 - **Resume is your friend.** The filesystem state machine means you can stop
   and resume at any time. Use `--resume` to continue where you left off.
 - **Fail files are valuable.** They prevent future agents from repeating the
