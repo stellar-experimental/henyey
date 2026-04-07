@@ -47,7 +47,14 @@ impl Database {
         }
 
         let manager = r2d2_sqlite::SqliteConnectionManager::file(path).with_init(|conn| {
-            conn.execute_batch(&format!("PRAGMA busy_timeout = {};", BUSY_TIMEOUT_MS))?;
+            conn.execute_batch(&format!(
+                "PRAGMA busy_timeout = {};\
+                 PRAGMA synchronous = FULL;\
+                 PRAGMA foreign_keys = ON;\
+                 PRAGMA cache_size = {};\
+                 PRAGMA temp_store = MEMORY;",
+                BUSY_TIMEOUT_MS, CACHE_SIZE_KIB
+            ))?;
             Ok(())
         });
         let pool = r2d2::Pool::builder()
@@ -82,17 +89,11 @@ impl Database {
     fn initialize(&self) -> Result<()> {
         let conn = self.connection()?;
 
-        conn.execute_batch(&format!(
-            r#"
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = FULL;
-            PRAGMA cache_size = {};
-            PRAGMA foreign_keys = ON;
-            PRAGMA temp_store = MEMORY;
-            PRAGMA busy_timeout = {};
-        "#,
-            CACHE_SIZE_KIB, BUSY_TIMEOUT_MS
-        ))?;
+        // journal_mode is database-level (persistent), so it only needs to be set once.
+        // Per-connection PRAGMAs (synchronous, foreign_keys, cache_size, temp_store,
+        // busy_timeout) are applied via the pool's with_init callback to ensure every
+        // pooled connection gets them.
+        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
 
         let tables_exist: bool = conn
             .query_row(
