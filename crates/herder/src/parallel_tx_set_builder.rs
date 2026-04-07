@@ -460,11 +460,7 @@ fn tx_inclusion_fee(tx: &TransactionEnvelope) -> i64 {
     // stage count selection we just need relative ordering, so we use
     // the total fee as a proxy (matching stellar-core behaviour where the
     // SurgePricingPriorityQueue handles the real fee computation).
-    match tx {
-        TransactionEnvelope::TxV0(env) => env.tx.fee as i64,
-        TransactionEnvelope::Tx(env) => env.tx.fee as i64,
-        TransactionEnvelope::TxFeeBump(env) => env.tx.fee,
-    }
+    crate::tx_set_utils::envelope_fee(tx)
 }
 
 /// Build parallel Soroban phase for a fixed stage count.

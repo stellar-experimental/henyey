@@ -46,6 +46,7 @@
 use crate::{
     archive_state::{HASBucketLevel, HASBucketNext, HistoryArchiveState},
     checkpoint::is_checkpoint_ledger,
+    checkpoint_builder::write_record_marked_xdr,
     paths, verify, HistoryError, Result,
 };
 use henyey_bucket::{BucketList, PendingMergeState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
@@ -405,19 +406,12 @@ impl PublishManager {
     fn write_xdr_gz<T: WriteXdr>(&self, path: &Path, items: &[T], label: &str) -> Result<()> {
         use flate2::write::GzEncoder;
         use flate2::Compression;
-        use std::io::Write;
 
         let file = std::fs::File::create(path.with_extension("xdr.gz"))?;
         let mut encoder = GzEncoder::new(file, Compression::default());
 
         for item in items {
-            let xdr = item
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-            // Write record mark: length with high bit set (last fragment)
-            let marked_len = (xdr.len() as u32) | 0x8000_0000;
-            encoder.write_all(&marked_len.to_be_bytes())?;
-            encoder.write_all(&xdr)?;
+            write_record_marked_xdr(&mut encoder, item)?;
         }
 
         encoder.finish()?;
@@ -472,12 +466,7 @@ impl PublishManager {
             {
                 let entry =
                     entry_result.map_err(|e| HistoryError::VerificationFailed(e.to_string()))?;
-                let xdr = entry.to_xdr(stellar_xdr::curr::Limits::none()).map_err(
-                    |e: stellar_xdr::curr::Error| HistoryError::VerificationFailed(e.to_string()),
-                )?;
-                let marked_len = (xdr.len() as u32) | 0x8000_0000;
-                encoder.write_all(&marked_len.to_be_bytes())?;
-                encoder.write_all(&xdr)?;
+                write_record_marked_xdr(&mut encoder, &entry)?;
             }
         }
 

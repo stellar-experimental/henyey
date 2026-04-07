@@ -96,11 +96,14 @@ fn read_one_from_gz<T: ReadXdr>(reader: &mut impl Read) -> io::Result<Option<T>>
     Ok(Some(value))
 }
 
-/// Write one XDR entry to a gzip-compressed stream using record marking format.
+/// Write a single XDR entry using RFC 5531 record marking format.
 ///
-/// Mirrors `XdrStreamWriter::write_xdr()`: writes a 4-byte length prefix with the
-/// "last fragment" bit set, followed by the XDR payload padded to 4-byte boundary.
-fn write_one_to_gz<T: WriteXdr>(writer: &mut impl Write, entry: &T) -> io::Result<()> {
+/// Writes a 4-byte big-endian length prefix with bit 31 set ("last fragment"),
+/// followed by the XDR-serialized payload, padded to a 4-byte boundary.
+///
+/// This is the write counterpart to `download::read_record_marked_xdr` and
+/// matches stellar-core's `XDROutputFileStream::writeOne`.
+pub fn write_record_marked_xdr<T: WriteXdr>(writer: &mut impl Write, entry: &T) -> io::Result<()> {
     let xdr_bytes = entry
         .to_xdr(Limits::none())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -175,7 +178,7 @@ where
                     break;
                 }
                 last_read_ledger_seq = seq;
-                write_one_to_gz(&mut writer, &entry)?;
+                write_record_marked_xdr(&mut writer, &entry)?;
             }
             Ok(None) => {
                 // EOF — check LCL enforcement
@@ -267,21 +270,7 @@ impl XdrStreamWriter {
 
     /// Write an XDR entry with record marking.
     fn write_xdr<T: WriteXdr>(&mut self, entry: &T, ledger_seq: u32) -> Result<()> {
-        let xdr_bytes = entry.to_xdr(Limits::none())?;
-
-        // RFC 5531 record marking: 4-byte length prefix (big-endian, high bit set for last fragment)
-        // We treat each entry as a complete record (last fragment = 1)
-        let len = xdr_bytes.len() as u32;
-        let marked_len = len | 0x80000000; // Set high bit for "last fragment"
-        self.encoder.write_all(&marked_len.to_be_bytes())?;
-        self.encoder.write_all(&xdr_bytes)?;
-
-        // Pad to 4-byte boundary
-        let padding = (4 - (len % 4)) % 4;
-        if padding > 0 {
-            self.encoder.write_all(&vec![0u8; padding as usize])?;
-        }
-
+        write_record_marked_xdr(&mut self.encoder, entry)?;
         self.entry_count += 1;
         self.last_ledger = ledger_seq;
         Ok(())
@@ -459,25 +448,14 @@ impl CheckpointBuilder {
             )));
         }
 
-        // Take ownership of writers
-        let headers = self.headers_writer.take();
-        let transactions = self.transactions_writer.take();
-        let results = self.results_writer.take();
-
-        // Finish all writers and collect file info
+        // Finish all active writers and collect file info
+        let writers = [
+            self.headers_writer.take(),
+            self.transactions_writer.take(),
+            self.results_writer.take(),
+        ];
         let mut files_to_rename = Vec::new();
-
-        if let Some(writer) = headers {
-            let (dirty, final_path, _last) = writer.finish()?;
-            files_to_rename.push((dirty, final_path));
-        }
-
-        if let Some(writer) = transactions {
-            let (dirty, final_path, _last) = writer.finish()?;
-            files_to_rename.push((dirty, final_path));
-        }
-
-        if let Some(writer) = results {
+        for writer in writers.into_iter().flatten() {
             let (dirty, final_path, _last) = writer.finish()?;
             files_to_rename.push((dirty, final_path));
         }
@@ -885,7 +863,7 @@ mod tests {
         let buf = BufWriter::new(file);
         let mut encoder = GzEncoder::new(buf, Compression::default());
         for entry in entries {
-            write_one_to_gz(&mut encoder, entry).unwrap();
+            write_record_marked_xdr(&mut encoder, entry).unwrap();
         }
         let buf = encoder.finish().unwrap();
         let file = buf.into_inner().unwrap();

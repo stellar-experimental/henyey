@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Instant};
+use tokio::time::Instant;
 use tracing::{debug, info, trace};
 
 use stellar_xdr::curr::{Hash, TransactionEnvelope};
@@ -246,7 +246,7 @@ impl<C: TxBroadcastCallback> TxBroadcastManager<C> {
                 }
 
                 // Handle broadcast timer
-                _ = Self::sleep_until_or_forever(timeout) => {
+                _ = crate::herder_utils::sleep_until_or_forever(timeout) => {
                     if self.state == BroadcastState::Waiting {
                         self.broadcast_some();
                     }
@@ -364,21 +364,6 @@ impl<C: TxBroadcastCallback> TxBroadcastManager<C> {
     fn remove_transaction(&mut self, tx_hash: &Hash) {
         self.pending.remove(tx_hash);
         self.broadcast_set.remove(tx_hash);
-    }
-
-    /// Sleep until the given instant, or forever if None.
-    async fn sleep_until_or_forever(instant: Option<Instant>) {
-        match instant {
-            Some(when) => {
-                let now = Instant::now();
-                if when > now {
-                    sleep(when - now).await;
-                }
-            }
-            None => {
-                std::future::pending::<()>().await;
-            }
-        }
     }
 }
 

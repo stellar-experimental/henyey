@@ -1370,24 +1370,12 @@ impl ScpDriver {
 
     /// Get fee from a transaction envelope.
     fn envelope_fee(env: &stellar_xdr::curr::TransactionEnvelope) -> i64 {
-        match env {
-            stellar_xdr::curr::TransactionEnvelope::TxV0(e) => e.tx.fee as i64,
-            stellar_xdr::curr::TransactionEnvelope::Tx(e) => e.tx.fee as i64,
-            stellar_xdr::curr::TransactionEnvelope::TxFeeBump(e) => e.tx.fee,
-        }
+        crate::tx_set_utils::envelope_fee(env)
     }
 
     /// Get number of operations from a transaction envelope.
     fn envelope_num_ops(env: &stellar_xdr::curr::TransactionEnvelope) -> usize {
-        match env {
-            stellar_xdr::curr::TransactionEnvelope::TxV0(e) => e.tx.operations.len(),
-            stellar_xdr::curr::TransactionEnvelope::Tx(e) => e.tx.operations.len(),
-            stellar_xdr::curr::TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                    inner.tx.operations.len()
-                }
-            },
-        }
+        crate::tx_set_utils::envelope_num_ops(env)
     }
 
     /// Compute XDR-encoded size of a transaction set.

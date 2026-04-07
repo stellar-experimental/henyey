@@ -44,7 +44,7 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Instant};
+use tokio::time::Instant;
 use tracing::{debug, info, trace};
 
 use henyey_scp::SlotIndex;
@@ -250,7 +250,7 @@ impl<C: TimerCallback> TimerManager<C> {
                 }
 
                 // Handle timer expiration
-                _ = Self::sleep_until_or_forever(next_timeout) => {
+                _ = crate::herder_utils::sleep_until_or_forever(next_timeout) => {
                     self.fire_expired_timers();
                 }
             }
@@ -310,22 +310,6 @@ impl<C: TimerCallback> TimerManager<C> {
     /// Get the next timeout instant, if any.
     fn next_timeout(&self) -> Option<Instant> {
         self.timers.values().map(|t| t.expires_at).min()
-    }
-
-    /// Sleep until the given instant, or forever if None.
-    async fn sleep_until_or_forever(instant: Option<Instant>) {
-        match instant {
-            Some(when) => {
-                let now = Instant::now();
-                if when > now {
-                    sleep(when - now).await;
-                }
-            }
-            None => {
-                // Sleep forever (until cancelled by select)
-                std::future::pending::<()>().await;
-            }
-        }
     }
 
     /// Fire all expired timers and remove them.
@@ -427,7 +411,7 @@ impl<C: TimerCallback> TimerManagerWithStats<C> {
                     }
                 }
 
-                _ = TimerManager::<C>::sleep_until_or_forever(next_timeout) => {
+                _ = crate::herder_utils::sleep_until_or_forever(next_timeout) => {
                     self.inner.fire_expired_timers();
                 }
             }

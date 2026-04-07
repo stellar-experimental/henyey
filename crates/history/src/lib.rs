@@ -140,6 +140,7 @@ pub use checkpoint::{
     is_checkpoint_ledger, last_ledger_before_checkpoint_containing, latest_checkpoint_before_or_at,
     ledger_to_trigger_catchup, size_of_checkpoint_containing,
 };
+pub use checkpoint_builder::write_record_marked_xdr;
 pub use compare::{compare_checkpoint, Category, CheckpointComparison, Mismatch};
 pub use download::DownloadConfig;
 pub use error::HistoryError;

@@ -47,8 +47,8 @@ use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
 use henyey_scp::{BallotPhase, SlotIndex, SCP};
 use stellar_xdr::curr::{
-    EnvelopeType, LedgerCloseValueSignature, LedgerUpgrade, Limits, NodeId, ReadXdr, ScpEnvelope,
-    ScpQuorumSet, Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint,
+    EnvelopeType, LedgerCloseValueSignature, LedgerHeader, LedgerUpgrade, Limits, NodeId, ReadXdr,
+    ScpEnvelope, ScpQuorumSet, Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint,
     TransactionEnvelope, Uint256, UpgradeType, Value, WriteXdr,
 };
 
@@ -1252,128 +1252,9 @@ impl Herder {
         let slot = ledger_seq as u64;
         tracing::debug!("Triggering consensus for ledger {}", ledger_seq);
 
-        // Get the previous ledger hash
-        let previous_hash = if let Some(manager) = self.ledger_manager.read().as_ref() {
-            manager.current_header_hash()
-        } else {
-            Hash256::ZERO
-        };
-        let starting_seq = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .and_then(|manager| self.build_starting_seq_map(manager));
-
-        // Create transaction set from queue using the current ledger limit when available.
-        // Must use generalized format (protocol >= 20) so the hash matches what peers
-        // expect when they request the TxSet by hash from SCP StellarValue.
-        let max_txs = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|manager| manager.current_header().max_tx_set_size as usize)
-            .unwrap_or(self.config.max_tx_set_size);
-        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set_with_starting_seq(
-            previous_hash,
-            max_txs,
-            starting_seq.as_ref(),
-        );
-
-        debug!(
-            hash = %tx_set.hash,
-            tx_count = tx_set.len(),
-            "Proposing transaction set"
-        );
-
-        // Cache the transaction set
-        self.scp_driver.cache_tx_set(tx_set.clone());
-
-        // Create StellarValue for nomination
-        // Parity: HerderImpl.cpp triggerNextLedger — clamp to ensure monotonic increase
-        let lcl_close_time = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|lm| lm.current_header().scp_value.close_time.0)
-            .unwrap_or(0);
-        let mut close_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
-        if close_time <= lcl_close_time {
-            close_time = lcl_close_time + 1;
-        }
-
-        // Combine static (config) and runtime (HTTP /upgrades?mode=set) upgrades.
-        // Parity: stellar-core uses only `Upgrades::createUpgradesFor` which checks
-        // against current ledger state. We must similarly filter static proposed
-        // upgrades to avoid proposing already-applied upgrades (e.g., a protocol
-        // version upgrade that has already taken effect).
-        let header = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|lm| lm.current_header())
-            .unwrap_or_default();
-        let state = CurrentLedgerState {
-            close_time,
-            protocol_version: header.ledger_version,
-            base_fee: header.base_fee,
-            max_tx_set_size: header.max_tx_set_size,
-            base_reserve: header.base_reserve,
-            flags: match &header.ext {
-                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
-            },
-            max_soroban_tx_set_size: None, // TODO: read from config settings
-        };
-
-        // Filter static upgrades against current state to avoid proposing
-        // upgrades that have already been applied.
-        let mut upgrade_list: Vec<LedgerUpgrade> = self
-            .config
-            .proposed_upgrades
-            .iter()
-            .filter(|upgrade| match upgrade {
-                LedgerUpgrade::Version(v) => *v != state.protocol_version,
-                LedgerUpgrade::BaseFee(f) => *f != state.base_fee,
-                LedgerUpgrade::MaxTxSetSize(s) => *s != state.max_tx_set_size,
-                LedgerUpgrade::BaseReserve(r) => *r != state.base_reserve,
-                LedgerUpgrade::Flags(f) => *f != state.flags,
-                _ => true, // Config/Soroban upgrades always pass through
-            })
-            .cloned()
-            .collect();
-
-        // Add runtime upgrades from the Upgrades scheduling system
-        let runtime_upgrades = self.runtime_upgrades.read().create_upgrades_for(&state);
-        for upgrade in runtime_upgrades {
-            // Don't duplicate upgrades of the same type
-            let dominated = upgrade_list.iter().any(|existing| {
-                std::mem::discriminant(existing) == std::mem::discriminant(&upgrade)
-            });
-            if !dominated {
-                upgrade_list.push(upgrade);
-            }
-        }
-
-        let upgrades: Vec<UpgradeType> = upgrade_list
-            .iter()
-            .filter_map(|upgrade| upgrade.to_xdr(Limits::none()).ok())
-            .filter_map(|bytes| bytes.try_into().ok().map(UpgradeType))
-            .collect();
-
-        let stellar_value = self.make_stellar_value(tx_set.hash, close_time, upgrades)?;
-
-        // Encode to Value
-        let value_bytes = stellar_value
-            .to_xdr(Limits::none())
-            .map_err(|e| HerderError::Internal(format!("Failed to encode value: {}", e)))?;
-        let value = Value(
-            value_bytes
-                .try_into()
-                .map_err(|_| HerderError::Internal("Value too large".to_string()))?,
-        );
+        let value = self
+            .build_nomination_value()
+            .ok_or_else(|| HerderError::Internal("Failed to build nomination value".into()))?;
 
         // Get previous value for priority calculation
         let prev_value = self.prev_value.read().clone();
@@ -1570,57 +1451,114 @@ impl Herder {
         None
     }
 
-    /// Create a nomination value for a slot.
-    fn create_nomination_value(&self, _slot: SlotIndex) -> Option<Value> {
-        // Get the previous ledger hash from our current ledger state
-        let (previous_hash, max_txs, starting_seq) =
-            if let Some(manager) = self.ledger_manager.read().as_ref() {
-                let header = manager.current_header();
-                let max = header.max_tx_set_size as usize;
-                let starting_seq = self.build_starting_seq_map(manager);
-                (manager.current_header_hash(), max, starting_seq)
+    /// Build a nomination-ready SCP `Value`: transaction set + signed StellarValue.
+    ///
+    /// Shared by `trigger_next_ledger` and `create_nomination_value`. Steps:
+    ///   1. Read ledger state (previous_hash, max_txs, starting_seq)
+    ///   2. Build generalized transaction set and cache it
+    ///   3. Compute close_time with monotonic clamp (parity: stellar-core)
+    ///   4. Merge config + runtime upgrades, filter already-applied
+    ///   5. Sign via `make_stellar_value` and XDR-encode to `Value`
+    fn build_nomination_value(&self) -> Option<Value> {
+        // 1. Ledger state
+        let (previous_hash, max_txs, starting_seq, header, lcl_close_time) = {
+            let guard = self.ledger_manager.read();
+            if let Some(manager) = guard.as_ref() {
+                let hdr = manager.current_header();
+                let lcl_ct = hdr.scp_value.close_time.0;
+                let max = hdr.max_tx_set_size as usize;
+                let seq = self.build_starting_seq_map(manager);
+                (manager.current_header_hash(), max, seq, hdr, lcl_ct)
             } else {
-                (Hash256::ZERO, self.config.max_tx_set_size, None)
-            };
+                (
+                    Hash256::ZERO,
+                    self.config.max_tx_set_size,
+                    None,
+                    LedgerHeader::default(),
+                    0,
+                )
+            }
+        };
 
-        // Build GeneralizedTransactionSet with proper hash computation
+        // 2. Build & cache tx set
         let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set_with_starting_seq(
             previous_hash,
             max_txs,
             starting_seq.as_ref(),
         );
-
         debug!(
             hash = %tx_set.hash,
-            tx_count = tx_set.transactions.len(),
+            tx_count = tx_set.len(),
             "Proposing transaction set"
         );
-
-        // Cache the tx set so we can respond to GetTxSet requests
         self.scp_driver.cache_tx_set(tx_set.clone());
 
-        // Create StellarValue with the GeneralizedTransactionSet hash
-        let close_time = std::time::SystemTime::now()
+        // 3. Close time with monotonic clamp (parity: HerderImpl.cpp triggerNextLedger)
+        let mut close_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock before UNIX epoch")
             .as_secs();
+        if close_time <= lcl_close_time {
+            close_time = lcl_close_time + 1;
+        }
 
-        let upgrades: Vec<UpgradeType> = self
+        // 4. Upgrades: config + runtime, filtered against current state
+        let state = CurrentLedgerState {
+            close_time,
+            protocol_version: header.ledger_version,
+            base_fee: header.base_fee,
+            max_tx_set_size: header.max_tx_set_size,
+            base_reserve: header.base_reserve,
+            flags: match &header.ext {
+                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+            },
+            max_soroban_tx_set_size: None, // TODO: read from config settings
+        };
+
+        let mut upgrade_list: Vec<LedgerUpgrade> = self
             .config
             .proposed_upgrades
+            .iter()
+            .filter(|upgrade| match upgrade {
+                LedgerUpgrade::Version(v) => *v != state.protocol_version,
+                LedgerUpgrade::BaseFee(f) => *f != state.base_fee,
+                LedgerUpgrade::MaxTxSetSize(s) => *s != state.max_tx_set_size,
+                LedgerUpgrade::BaseReserve(r) => *r != state.base_reserve,
+                LedgerUpgrade::Flags(f) => *f != state.flags,
+                _ => true,
+            })
+            .cloned()
+            .collect();
+
+        let runtime_upgrades = self.runtime_upgrades.read().create_upgrades_for(&state);
+        for upgrade in runtime_upgrades {
+            let dominated = upgrade_list.iter().any(|existing| {
+                std::mem::discriminant(existing) == std::mem::discriminant(&upgrade)
+            });
+            if !dominated {
+                upgrade_list.push(upgrade);
+            }
+        }
+
+        let upgrades: Vec<UpgradeType> = upgrade_list
             .iter()
             .filter_map(|upgrade| upgrade.to_xdr(Limits::none()).ok())
             .filter_map(|bytes| bytes.try_into().ok().map(UpgradeType))
             .collect();
 
+        // 5. Sign & encode
         let stellar_value = self
             .make_stellar_value(tx_set.hash, close_time, upgrades)
             .ok()?;
-
-        // Encode to Value
         let value_bytes = stellar_value.to_xdr(Limits::none()).ok()?;
         let value = Value(value_bytes.try_into().ok()?);
         Some(value)
+    }
+
+    /// Create a nomination value for a slot.
+    fn create_nomination_value(&self, _slot: SlotIndex) -> Option<Value> {
+        self.build_nomination_value()
     }
 
     /// Create a signed StellarValue.

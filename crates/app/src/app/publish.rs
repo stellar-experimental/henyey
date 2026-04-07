@@ -370,8 +370,6 @@ fn write_scp_history_file(
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use henyey_history::paths::checkpoint_path;
-    use std::io::Write;
-    use stellar_xdr::curr::Limits;
 
     let path = base_dir.join(checkpoint_path("scp", checkpoint, "xdr.gz"));
     if let Some(parent) = path.parent() {
@@ -381,11 +379,7 @@ fn write_scp_history_file(
     let mut encoder = GzEncoder::new(file, Compression::default());
 
     for entry in entries {
-        let xdr = entry.to_xdr(Limits::none())?;
-        // Write record mark: length with high bit set (RFC 5531 last fragment)
-        let marked_len = (xdr.len() as u32) | 0x8000_0000;
-        encoder.write_all(&marked_len.to_be_bytes())?;
-        encoder.write_all(&xdr)?;
+        henyey_history::write_record_marked_xdr(&mut encoder, entry)?;
     }
     encoder.finish()?;
     Ok(())

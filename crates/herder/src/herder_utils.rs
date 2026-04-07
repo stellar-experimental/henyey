@@ -130,6 +130,26 @@ pub fn to_short_strkey(node_id: &NodeId) -> String {
     }
 }
 
+/// Sleep until the given instant, or forever if `None`.
+///
+/// When `instant` is `Some(when)`, sleeps until `when` (returning immediately
+/// if `when` is already past). When `instant` is `None`, awaits
+/// `std::future::pending()` — effectively sleeping forever until cancelled
+/// via `tokio::select!`.
+pub(crate) async fn sleep_until_or_forever(instant: Option<tokio::time::Instant>) {
+    match instant {
+        Some(when) => {
+            let now = tokio::time::Instant::now();
+            if when > now {
+                tokio::time::sleep(when - now).await;
+            }
+        }
+        None => {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

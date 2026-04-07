@@ -295,19 +295,9 @@ impl QueuedTransaction {
 
     /// Extract fee and operation count from the envelope.
     fn extract_fee_and_ops(envelope: &TransactionEnvelope) -> Result<(u64, u32)> {
-        match envelope {
-            TransactionEnvelope::TxV0(tx) => Ok((tx.tx.fee as u64, tx.tx.operations.len() as u32)),
-            TransactionEnvelope::Tx(tx) => Ok((tx.tx.fee as u64, tx.tx.operations.len() as u32)),
-            TransactionEnvelope::TxFeeBump(tx) => {
-                // For fee bump, use the outer fee
-                let inner_ops = match &tx.tx.inner_tx {
-                    stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                        inner.tx.operations.len() as u32
-                    }
-                };
-                Ok((tx.tx.fee as u64, inner_ops))
-            }
-        }
+        let fee = crate::tx_set_utils::envelope_fee(envelope) as u64;
+        let ops = crate::tx_set_utils::envelope_num_ops(envelope) as u32;
+        Ok((fee, ops))
     }
 
     fn sequence_number(&self) -> i64 {
@@ -2221,11 +2211,7 @@ mod tests {
     }
 
     fn envelope_fee(envelope: &TransactionEnvelope) -> u64 {
-        match envelope {
-            TransactionEnvelope::TxV0(tx) => tx.tx.fee as u64,
-            TransactionEnvelope::Tx(tx) => tx.tx.fee as u64,
-            TransactionEnvelope::TxFeeBump(tx) => tx.tx.fee as u64,
-        }
+        crate::tx_set_utils::envelope_fee(envelope) as u64
     }
 
     fn envelope_seq(envelope: &TransactionEnvelope) -> i64 {

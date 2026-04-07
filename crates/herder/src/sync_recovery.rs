@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
-use tokio::time::{sleep, Instant};
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use henyey_scp::SlotIndex;
@@ -256,7 +256,7 @@ impl<C: SyncRecoveryCallback> SyncRecoveryManager<C> {
                 }
 
                 // Handle timer expiration
-                _ = Self::sleep_until_or_forever(next_deadline) => {
+                _ = crate::herder_utils::sleep_until_or_forever(next_deadline) => {
                     self.handle_timer_expired();
                 }
             }
@@ -381,21 +381,6 @@ impl<C: SyncRecoveryCallback> SyncRecoveryManager<C> {
             SyncState::Tracking => self.tracking_deadline,
             SyncState::OutOfSync => self.recovery_deadline,
             SyncState::NotTracking => None,
-        }
-    }
-
-    /// Sleep until the given instant, or forever if None.
-    async fn sleep_until_or_forever(instant: Option<Instant>) {
-        match instant {
-            Some(when) => {
-                let now = Instant::now();
-                if when > now {
-                    sleep(when - now).await;
-                }
-            }
-            None => {
-                std::future::pending::<()>().await;
-            }
         }
     }
 }

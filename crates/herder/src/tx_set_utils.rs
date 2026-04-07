@@ -1,9 +1,8 @@
 //! Transaction set utility functions.
 //!
 //! This module provides utility functions for filtering invalid transactions
-//! from candidate transaction sets. These are used during nomination (to build
-//! valid transaction sets) and post-ledger-close (to ban transactions that
-//! became invalid).
+//! from candidate transaction sets, plus common envelope accessors used
+//! throughout the herder crate.
 //!
 //! # Parity
 //!
@@ -17,6 +16,30 @@ use henyey_tx::{validate_basic, LedgerContext, TransactionFrame};
 use stellar_xdr::curr::{AccountId, TransactionEnvelope};
 
 use crate::tx_queue::FeeBalanceProvider;
+
+/// Get the declared fee from a transaction envelope.
+///
+/// For fee-bump transactions, returns the outer (bumped) fee.
+pub(crate) fn envelope_fee(env: &TransactionEnvelope) -> i64 {
+    match env {
+        TransactionEnvelope::TxV0(e) => e.tx.fee as i64,
+        TransactionEnvelope::Tx(e) => e.tx.fee as i64,
+        TransactionEnvelope::TxFeeBump(e) => e.tx.fee,
+    }
+}
+
+/// Get the number of operations from a transaction envelope.
+///
+/// For fee-bump transactions, returns the inner transaction's operation count.
+pub(crate) fn envelope_num_ops(env: &TransactionEnvelope) -> usize {
+    match env {
+        TransactionEnvelope::TxV0(e) => e.tx.operations.len(),
+        TransactionEnvelope::Tx(e) => e.tx.operations.len(),
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.operations.len(),
+        },
+    }
+}
 
 /// Parameters for close-time bounds validation.
 ///
