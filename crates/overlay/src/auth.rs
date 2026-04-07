@@ -619,12 +619,14 @@ impl AuthContext {
                     msg_type
                 );
 
-                // Gate MAC verification on the receiver's own auth state,
-                // NOT on a wire flag. This matches stellar-core's
-                // `getState(guard) >= GOT_HELLO` check in Peer.cpp.
+                // Gate MAC verification on whether MAC keys are available,
+                // matching stellar-core's `getState(guard) >= GOT_HELLO`
+                // check in Peer.cpp:1032. MAC keys are derived during the
+                // Hello exchange (process_hello), so verification covers
+                // both the Auth message and all post-Auth messages.
                 // Error messages are exempt (they can use sequence 0 and skip MAC).
                 let is_error = matches!(v0.message, StellarMessage::ErrorMsg(_));
-                if self.is_authenticated() && !is_error {
+                if self.recv_mac_key.is_some() && !is_error {
                     // Verify sequence number
                     if v0.sequence != self.recv_sequence {
                         return Err(OverlayError::AuthenticationFailed(format!(
@@ -1234,6 +1236,75 @@ mod tests {
         assert!(
             result.is_ok(),
             "compatible peer should be accepted: {:?}",
+            result
+        );
+    }
+
+    /// Helper: Complete Hello exchange only (MAC keys derived, state = HelloReceived).
+    /// Does NOT complete Auth — both contexts are pre-authenticated.
+    fn complete_hello_exchange() -> (AuthContext, AuthContext) {
+        let secret_a = SecretKey::generate();
+        let secret_b = SecretKey::generate();
+        let node_a = LocalNode::new_testnet(secret_a);
+        let node_b = LocalNode::new_testnet(secret_b);
+
+        let mut ctx_a = AuthContext::new(node_a, true); // initiator
+        let mut ctx_b = AuthContext::new(node_b, false); // acceptor
+
+        let hello_a = ctx_a.create_hello();
+        let hello_b = ctx_b.create_hello();
+
+        ctx_a.hello_sent();
+        ctx_b.hello_sent();
+
+        ctx_b.process_hello(&hello_a).expect("B accepts A's hello");
+        ctx_a.process_hello(&hello_b).expect("A accepts B's hello");
+
+        assert_eq!(ctx_a.state(), AuthState::HelloReceived);
+        assert_eq!(ctx_b.state(), AuthState::HelloReceived);
+        assert!(ctx_a.recv_mac_key.is_some(), "MAC keys should be derived");
+        assert!(ctx_b.recv_mac_key.is_some(), "MAC keys should be derived");
+
+        (ctx_a, ctx_b)
+    }
+
+    #[test]
+    fn test_audit_004_auth_msg_mac_must_be_verified() {
+        // Regression test for AUDIT-004: After the Hello exchange, MAC keys
+        // are derived and available, so the Auth message's MAC MUST be
+        // verified. stellar-core gates MAC verification on `>= GOT_HELLO`
+        // (Peer.cpp:1032), which includes the Auth receive phase.
+        //
+        // The bug: unwrap_message gates on is_authenticated() (state ==
+        // Authenticated), but Auth arrives when state is HelloReceived.
+        // This means a corrupted MAC on the Auth message is silently accepted.
+        let (ctx_a, mut ctx_b) = complete_hello_exchange();
+
+        // Wrap an Auth message with a valid MAC
+        let auth_msg = StellarMessage::Auth(xdr::Auth { flags: 200 });
+        let wrapped = ctx_a.wrap_auth_message(auth_msg).expect("wrap should succeed");
+
+        // Corrupt every MAC byte
+        let corrupted = match wrapped {
+            AuthenticatedMessage::V0(mut v0) => {
+                for byte in v0.mac.mac.iter_mut() {
+                    *byte ^= 0xFF;
+                }
+                AuthenticatedMessage::V0(v0)
+            }
+        };
+
+        // The corrupted Auth message MUST be rejected.
+        // Before the fix: this passes (MAC not checked) — test FAILS.
+        // After the fix: this returns MacVerificationFailed — test PASSES.
+        let result = ctx_b.unwrap_message(corrupted);
+        assert!(
+            result.is_err(),
+            "Auth message with corrupted MAC must be rejected when MAC keys are available"
+        );
+        assert!(
+            matches!(result, Err(OverlayError::MacVerificationFailed)),
+            "expected MacVerificationFailed, got: {:?}",
             result
         );
     }
