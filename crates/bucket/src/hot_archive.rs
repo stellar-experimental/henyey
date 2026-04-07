@@ -108,7 +108,7 @@ impl HotArchiveBucket {
                 break;
             }
             let record_mark = u32::from_be_bytes(mark_bytes);
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
 
             if position + 4 + record_len as u64 > file_len {
                 break;
@@ -395,7 +395,7 @@ impl HotArchiveBucket {
         let mut mark_bytes = [0u8; 4];
         file.read_exact(&mut mark_bytes)?;
         let record_mark = u32::from_be_bytes(mark_bytes);
-        let record_len = (record_mark & 0x7FFFFFFF) as usize;
+        let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
 
         // Read entry data
         let mut data = vec![0u8; record_len];
@@ -453,7 +453,7 @@ impl HotArchiveBucket {
             offset += 4;
 
             // High bit is "last fragment" flag, remaining 31 bits are length
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
 
             if offset + record_len > bytes.len() {
                 return Err(BucketError::Serialization(format!(
@@ -516,7 +516,7 @@ impl HotArchiveBucket {
                         BucketError::Serialization(format!("failed to serialize entry: {}", e))
                     })?;
                     let sz = entry_bytes.len() as u32;
-                    let record_mark = sz | 0x80000000;
+                    let record_mark = sz | crate::XDR_RECORD_MARK;
                     bytes.extend_from_slice(&record_mark.to_be_bytes());
                     bytes.extend_from_slice(&entry_bytes);
                 }
@@ -579,7 +579,7 @@ impl HotArchiveBucket {
             let mut mark_bytes = [0u8; 4];
             reader.read_exact(&mut mark_bytes)?;
             let record_mark = u32::from_be_bytes(mark_bytes);
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
 
             if position + 4 + record_len as u64 > file_len {
                 return Err(BucketError::Serialization(format!(
@@ -712,7 +712,7 @@ impl Iterator for HotArchiveIter<'_> {
                     return None;
                 }
                 let record_mark = u32::from_be_bytes(mark_bytes);
-                let record_len = (record_mark & 0x7FFFFFFF) as usize;
+                let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
 
                 if *position + 4 + record_len as u64 > *file_len {
                     return None;

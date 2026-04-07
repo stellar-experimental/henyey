@@ -112,6 +112,16 @@ mod metrics;
 pub mod snapshot;
 
 // ============================================================================
+// XDR record mark constants
+// ============================================================================
+
+/// High bit set in XDR record marks to indicate the last (or only) fragment.
+const XDR_RECORD_MARK: u32 = 0x8000_0000;
+
+/// Mask to extract the record length from an XDR record mark.
+const XDR_RECORD_LEN_MASK: u32 = 0x7FFF_FFFF;
+
+// ============================================================================
 // Core bucket types
 // ============================================================================
 

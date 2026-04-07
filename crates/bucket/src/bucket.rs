@@ -231,7 +231,7 @@ impl Bucket {
                     entry_bytes.len()
                 ))
             })?;
-            let record_mark = size | 0x80000000; // Set high bit
+            let record_mark = size | crate::XDR_RECORD_MARK;
             hasher.update(record_mark.to_be_bytes());
             hasher.update(&entry_bytes);
 
@@ -494,8 +494,8 @@ impl Bucket {
             offset += 4;
 
             // High bit is "last fragment" flag, remaining 31 bits are length
-            let _last_fragment = (record_mark & 0x80000000) != 0;
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+            let _last_fragment = (record_mark & crate::XDR_RECORD_MARK) != 0;
+            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
 
             if offset + record_len > bytes.len() {
                 return Err(BucketError::Serialization(format!(
@@ -558,7 +558,7 @@ impl Bucket {
                     entry_bytes.len()
                 ))
             })?;
-            let record_mark = size | 0x80000000; // Set high bit
+            let record_mark = size | crate::XDR_RECORD_MARK;
             bytes.extend_from_slice(&record_mark.to_be_bytes());
 
             // Write the entry data
@@ -1000,7 +1000,7 @@ impl Bucket {
                     entry_bytes.len()
                 ))
             })?;
-            let record_mark = size | 0x80000000;
+            let record_mark = size | crate::XDR_RECORD_MARK;
             hasher.update(record_mark.to_be_bytes());
             hasher.update(&entry_bytes);
 

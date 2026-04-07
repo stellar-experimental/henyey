@@ -193,7 +193,7 @@ impl Iterator for StreamingXdrEntryIterator {
             self.position += 4;
 
             let record_mark = u32::from_be_bytes(mark_buf);
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
 
             if self.position + record_len as u64 > self.file_len {
                 return None;
@@ -648,7 +648,7 @@ impl DiskBucket {
         // Read record mark (RFC 5531) — bucket files always use record marks
         let mark_buf: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
         let mark = u32::from_be_bytes(mark_buf);
-        let record_len = (mark & 0x7FFFFFFF) as usize;
+        let record_len = (mark & crate::XDR_RECORD_LEN_MASK) as usize;
         let record_start = offset + 4;
 
         if record_start + record_len > data.len() {
@@ -692,7 +692,7 @@ impl DiskBucket {
             position += 4;
 
             let record_mark = u32::from_be_bytes(mark_buf);
-            let record_len = (record_mark & 0x7FFFFFFF) as usize;
+            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
 
             if position + record_len > data.len() {
                 break;
@@ -826,7 +826,7 @@ impl Iterator for DiskBucketIter {
         self.position += 4;
 
         let record_mark = u32::from_be_bytes(mark_buf);
-        let record_len = (record_mark & 0x7FFFFFFF) as usize;
+        let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
 
         if self.position + record_len as u64 > self.file_len {
             return None;
@@ -882,7 +882,7 @@ impl Iterator for DiskBucketOffsetIter {
         self.position += 4;
 
         let record_mark = u32::from_be_bytes(mark_buf);
-        let record_len = (record_mark & 0x7FFFFFFF) as usize;
+        let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
         let total_record_size = record_len as u64 + 4;
 
         if self.position + record_len as u64 > self.file_len {
@@ -941,7 +941,7 @@ mod tests {
         let entry_bytes = bucket_entry.to_xdr(Limits::none()).unwrap();
 
         // Write with record mark
-        let record_mark = (entry_bytes.len() as u32) | 0x80000000;
+        let record_mark = (entry_bytes.len() as u32) | crate::XDR_RECORD_MARK;
         bytes.extend_from_slice(&record_mark.to_be_bytes());
         bytes.extend_from_slice(&entry_bytes);
 
@@ -1009,7 +1009,7 @@ mod tests {
             let entry_bytes = bucket_entry.to_xdr(Limits::none()).unwrap();
 
             // Write with record mark
-            let record_mark = (entry_bytes.len() as u32) | 0x80000000;
+            let record_mark = (entry_bytes.len() as u32) | crate::XDR_RECORD_MARK;
             bytes.extend_from_slice(&record_mark.to_be_bytes());
             bytes.extend_from_slice(&entry_bytes);
         }

@@ -489,7 +489,7 @@ pub fn merge_buckets_to_file_with_counters(
             .map_err(|e| BucketError::Serialization(format!("Failed to serialize entry: {}", e)))?;
 
         // Write XDR record mark + data
-        let record_mark = (data.len() as u32) | 0x80000000;
+        let record_mark = (data.len() as u32) | crate::XDR_RECORD_MARK;
         writer.write_all(&record_mark.to_be_bytes())?;
         writer.write_all(&data)?;
 
@@ -661,7 +661,7 @@ pub fn merge_in_memory(
 
         // Update hash with XDR Record Marking format
         let size = entry_buf.len() as u32;
-        let record_mark = size | 0x80000000;
+        let record_mark = size | crate::XDR_RECORD_MARK;
         hasher.update(record_mark.to_be_bytes());
         hasher.update(entry_buf.as_slice());
 
