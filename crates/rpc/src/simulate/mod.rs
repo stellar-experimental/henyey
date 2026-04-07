@@ -195,6 +195,51 @@ fn extract_footprint_keys(
     Ok(keys)
 }
 
+/// Common simulation context: snapshot, ledger info, and Soroban network config.
+struct SimulationContext {
+    snapshot_source: BucketListSnapshotSource,
+    ledger_info: soroban_host::LedgerInfo,
+    soroban_info: henyey_ledger::SorobanNetworkInfo,
+    latest_ledger: u32,
+}
+
+impl SimulationContext {
+    /// Build from the running app state.
+    fn from_app(app: &henyey_app::App) -> Result<Self, JsonRpcError> {
+        let bl_snapshot = app
+            .bucket_snapshot_manager()
+            .copy_searchable_live_snapshot()
+            .ok_or_else(|| JsonRpcError::internal("bucket list snapshot not available"))?;
+
+        let ledger = app.ledger_summary();
+        let soroban_info = app
+            .soroban_network_info()
+            .ok_or_else(|| JsonRpcError::internal("soroban network config not available"))?;
+
+        let network_id = henyey_common::NetworkId::from_passphrase(&app.info().network_passphrase);
+
+        let ledger_info = soroban_host::LedgerInfo {
+            protocol_version: ledger.version,
+            sequence_number: ledger.num,
+            timestamp: ledger.close_time,
+            network_id: network_id.0 .0,
+            base_reserve: ledger.base_reserve,
+            min_temp_entry_ttl: soroban_info.min_temporary_ttl,
+            min_persistent_entry_ttl: soroban_info.min_persistent_ttl,
+            max_entry_ttl: soroban_info.max_entry_ttl,
+        };
+
+        let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger.num);
+
+        Ok(Self {
+            snapshot_source,
+            ledger_info,
+            soroban_info,
+            latest_ledger: ledger.num,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Footprint simulation helper
 // ---------------------------------------------------------------------------
@@ -279,34 +324,7 @@ pub async fn handle(
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
 
-    // Get bucket list snapshot
-    let bl_snapshot = ctx
-        .app
-        .bucket_snapshot_manager()
-        .copy_searchable_live_snapshot()
-        .ok_or_else(|| JsonRpcError::internal("bucket list snapshot not available"))?;
-
-    // Get ledger info
-    let ledger = ctx.app.ledger_summary();
-    let soroban_info = ctx
-        .app
-        .soroban_network_info()
-        .ok_or_else(|| JsonRpcError::internal("soroban network config not available"))?;
-
-    let network_id = henyey_common::NetworkId::from_passphrase(&ctx.app.info().network_passphrase);
-
-    let ledger_info = soroban_host::LedgerInfo {
-        protocol_version: ledger.version,
-        sequence_number: ledger.num,
-        timestamp: ledger.close_time,
-        network_id: network_id.0 .0,
-        base_reserve: ledger.base_reserve,
-        min_temp_entry_ttl: soroban_info.min_temporary_ttl,
-        min_persistent_entry_ttl: soroban_info.min_persistent_ttl,
-        max_entry_ttl: soroban_info.max_entry_ttl,
-    };
-
-    let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger.num);
+    let sim = SimulationContext::from_app(&ctx.app)?;
 
     match soroban_op {
         SorobanOp::InvokeHostFunction { host_fn, auth } => {
@@ -326,10 +344,10 @@ pub async fn handle(
             handle_invoke(InvokeRequest {
                 host_fn,
                 source_account,
-                ledger_info,
-                snapshot_source,
-                soroban_info: soroban_info.clone(),
-                latest_ledger: ledger.num,
+                ledger_info: sim.ledger_info,
+                snapshot_source: sim.snapshot_source,
+                soroban_info: sim.soroban_info.clone(),
+                latest_ledger: sim.latest_ledger,
                 format,
                 auth_mode: resolved_auth_mode,
                 instruction_leeway,
@@ -343,10 +361,10 @@ pub async fn handle(
                 ));
             }
             run_footprint_simulation(
-                snapshot_source,
-                ledger_info,
-                soroban_info,
-                ledger.num,
+                sim.snapshot_source,
+                sim.ledger_info,
+                sim.soroban_info,
+                sim.latest_ledger,
                 format,
                 move |snap, li, si| simulate_extend_ttl_op(snap, li, &keys, extend_to, si),
             )
@@ -359,10 +377,10 @@ pub async fn handle(
                 ));
             }
             run_footprint_simulation(
-                snapshot_source,
-                ledger_info,
-                soroban_info,
-                ledger.num,
+                sim.snapshot_source,
+                sim.ledger_info,
+                sim.soroban_info,
+                sim.latest_ledger,
                 format,
                 move |snap, li, si| simulate_restore_op(snap, li, &keys, si),
             )
