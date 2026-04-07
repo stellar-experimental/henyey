@@ -725,9 +725,16 @@ impl ConfigUpgradeSetFrame {
 
     /// Check if a config setting ID is non-upgradeable.
     pub fn is_non_upgradeable(id: ConfigSettingId) -> bool {
+        // While the BucketList size window and eviction iterator are stored in a
+        // ConfigSetting entry, the BucketList defines these values, they should
+        // never be changed via upgrade. Frozen ledger keys and freeze bypass txs
+        // are also non-upgradeable (they use delta-based upgrades instead).
         matches!(
             id,
-            ConfigSettingId::LiveSorobanStateSizeWindow | ConfigSettingId::EvictionIterator
+            ConfigSettingId::LiveSorobanStateSizeWindow
+                | ConfigSettingId::EvictionIterator
+                | ConfigSettingId::FrozenLedgerKeys
+                | ConfigSettingId::FreezeBypassTxs
         )
     }
 
@@ -931,12 +938,29 @@ mod tests {
 
     #[test]
     fn test_is_non_upgradeable() {
+        // These 4 settings should be non-upgradeable
         assert!(ConfigUpgradeSetFrame::is_non_upgradeable(
             ConfigSettingId::LiveSorobanStateSizeWindow
         ));
         assert!(ConfigUpgradeSetFrame::is_non_upgradeable(
             ConfigSettingId::EvictionIterator
         ));
+        assert!(ConfigUpgradeSetFrame::is_non_upgradeable(
+            ConfigSettingId::FrozenLedgerKeys
+        ));
+        assert!(ConfigUpgradeSetFrame::is_non_upgradeable(
+            ConfigSettingId::FreezeBypassTxs
+        ));
+
+        // Delta settings for frozen keys ARE upgradeable
+        assert!(!ConfigUpgradeSetFrame::is_non_upgradeable(
+            ConfigSettingId::FrozenLedgerKeysDelta
+        ));
+        assert!(!ConfigUpgradeSetFrame::is_non_upgradeable(
+            ConfigSettingId::FreezeBypassTxsDelta
+        ));
+
+        // Other settings are upgradeable
         assert!(!ConfigUpgradeSetFrame::is_non_upgradeable(
             ConfigSettingId::ContractMaxSizeBytes
         ));

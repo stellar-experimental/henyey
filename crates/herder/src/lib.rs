@@ -161,8 +161,8 @@ pub use ledger_close_data::{stellar_value_to_string, LedgerCloseData, LedgerClos
 
 // TxSetUtils
 pub use tx_set_utils::{
-    get_invalid_tx_list, get_invalid_tx_list_with_fee_map, trim_invalid,
-    trim_invalid_two_phase, CloseTimeBounds, TxSetValidationContext,
+    get_invalid_tx_list, get_invalid_tx_list_with_fee_map, trim_invalid, trim_invalid_two_phase,
+    CloseTimeBounds, TxSetValidationContext,
 };
 
 // Fee balance provider trait (used by tx_set_utils for affordability checks)

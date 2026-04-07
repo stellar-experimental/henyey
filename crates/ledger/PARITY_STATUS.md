@@ -206,7 +206,8 @@ Corresponds to: `LedgerManagerImpl.h` (transaction execution), `NetworkConfig.h`
 | `SorobanNetworkConfig::createCostTypesForV22()` | `create_cost_types_for_v22()` in `manager.rs` | Full |
 | `SorobanNetworkConfig::createCostTypesForV25()` | `create_cost_types_for_v25()` in `manager.rs` | Full |
 | `SorobanNetworkConfig::createAndUpdateLedgerEntriesForV23()` | `create_and_update_ledger_entries_for_v23()` in `manager.rs` | Full |
-| `SorobanNetworkConfig::updateCostTypesForV26()` | Not implemented | None |
+| `SorobanNetworkConfig::updateCostTypesForV26()` | `update_cost_types_for_v26()` in `manager.rs` | Full |
+| `SorobanNetworkConfig::createLedgerEntriesForV26()` | `create_ledger_entries_for_v26()` in `manager.rs` | Full |
 
 ### config_upgrade.rs (`config_upgrade.rs`)
 
