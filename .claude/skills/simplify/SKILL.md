@@ -15,75 +15,82 @@ Review the Rust crate at `$TARGET` and identify concrete simplifications.
 ## Mode
 
 - **`$MODE = review`** (default): Produce a ranked list of findings with
-  file:line references. Do NOT make any changes.
+  file:line references. Do NOT make any changes. Cap at **15 findings** per
+  crate — if you find more, keep only the highest-impact ones.
 - **`$MODE = apply`**: Perform the simplifications directly. For each change,
   briefly state what you changed and why. Run `cargo clippy -p <crate>` and
   `cargo test -p <crate>` after each logical group of changes to verify
-  correctness.
+  correctness. Stop after **10 changes** or when remaining findings are
+  low-impact.
+
+## Parity Filter
+
+This codebase mirrors stellar-core for determinism. Before reporting any
+finding, check whether the code structurally mirrors a stellar-core counterpart
+by looking in `stellar-core/src/`. **Suppress the finding** if refactoring
+would make it harder to verify parity. Signs of parity-driven structure:
+
+- The file/function name matches a stellar-core `.cpp`/`.h` file or function.
+- The control flow (match arms, if-else chains) follows stellar-core's ordering.
+- Constants, parameter lists, or duplicated logic mirrors stellar-core's own
+  structure (including stellar-core's own duplication).
+
+This filter applies most often to: LARGE MODULE, GOD FUNCTION, DEEP NESTING,
+LONG PARAMETER LIST, DUPLICATION, and MAGIC NUMBERS.
 
 ## Categories
 
 For each finding, classify it into exactly one category:
 
 ### Structure
- 1. **LARGE MODULE** — any single .rs file over 500 lines (excluding tests).
-    Suggest how to reduce size via extraction of helpers, deduplication, or
-    dead-code removal. Only recommend converting to a directory module
-    (`foo/mod.rs`) when the *implementation* has 3+ clearly separable concerns
-    that each exceed ~200 lines. Never split a file solely to extract tests.
- 2. **GOD FUNCTION** — any function over 80 lines or with cyclomatic complexity
-    that makes it hard to follow. Suggest extraction points and names for the
-    extracted functions.
+ 1. **LARGE MODULE** — any single .rs file over 1000 non-test lines.
+    Suggest reduction via extraction, deduplication, or dead-code removal.
+    Only recommend a directory module (`foo/mod.rs`) when 3+ separable concerns
+    each exceed ~200 lines. Never split solely to extract tests.
+ 2. **GOD FUNCTION** — any function over 150 lines or with cyclomatic complexity
+    that makes it hard to follow. Suggest extraction points and names.
  3. **DEEP NESTING** — blocks indented 4+ levels. Suggest early returns, guard
-    clauses, or extraction to flatten them.
- 4. **LONG PARAMETER LIST** — functions taking 5+ parameters. Suggest grouping
+    clauses, or extraction to flatten.
+ 4. **LONG PARAMETER LIST** — functions taking 7+ parameters. Suggest grouping
     into a context/config struct.
 
 ### Redundancy
  5. **DEAD CODE** — functions, fields, methods, or branches that are never used
     or always return a fixed value. Include evidence (e.g., "no callers found").
- 6. **DUPLICATION** — identical or near-identical logic repeated in multiple places.
-    Show the locations and what a single shared implementation would look like.
- 7. **DUPLICATE STATE** — the same truth tracked in two or more places that must
-    be kept in sync manually. Suggest which copy to remove.
- 8. **SCATTERED CONCERN** — a single logical operation (e.g., resetting tracking
-    state) performed in multiple call sites instead of one function.
+ 6. **DUPLICATION** — identical or near-identical logic repeated in 2+ places.
+    Show the locations and what a shared implementation would look like.
+ 7. **DUPLICATE STATE** — the same truth tracked in 2+ places that must be kept
+    in sync manually. Suggest which copy to remove.
+ 8. **SCATTERED CONCERN** — a single logical operation performed in multiple call
+    sites instead of one function.
  9. **UNNECESSARY CLONING** — values cloned where a borrow or move would suffice.
- 9b. **TRIVIAL WRAPPER** — one-liner functions that only delegate to another
-    function with no added logic (e.g., `fn foo(x: T) { bar(x) }`). Inline the
-    call at the call site and remove the wrapper, unless it provides meaningful
-    abstraction (e.g., a public API shielding an internal signature).
+10. **TRIVIAL WRAPPER** — one-liner functions that only delegate with no added
+    logic. Inline and remove, unless the wrapper provides meaningful abstraction
+    (e.g., a public API shielding an internal signature).
 
 ### Naming & Constants
-10. **MISLEADING NAMES** — identifiers whose name does not match their actual
+11. **MISLEADING NAMES** — identifiers whose name does not match their actual
     semantics. Suggest a better name.
-11. **MAGIC NUMBERS** — hardcoded numeric or string literals that should be
-    named constants.
+12. **MAGIC NUMBERS** — hardcoded numeric or string literals that should be
+    named constants. Skip constants that mirror stellar-core values or are
+    defined by the XDR specification.
 
 ### Visibility
-12. **OVERLY BROAD VISIBILITY** — functions, methods, or types marked `pub` that
-    are only used within the current module or crate. Suggest narrowing to
-    `pub(crate)`, `pub(super)`, or private. Every `pub` item should be
-    justifiably public — if no external crate uses it, restrict its scope.
+13. **OVERLY BROAD VISIBILITY** — `pub` items only used within the current
+    module or crate. Suggest narrowing to `pub(crate)`, `pub(super)`, or
+    private.
 
-### Clippy & Types
-13. **CLIPPY SUPPRESSIONS** — any `#[allow(clippy::...)]` or `#[allow(dead_code)]`.
-    For each, determine whether the underlying issue can be fixed so the
-    suppression can be removed. If the suppression is genuinely necessary
-    (e.g., false positive, upstream requirement), note why.
-14. **TYPE COMPLEXITY** — types that are hard to read at a glance, especially
-    those marked `#[allow(clippy::type_complexity)]`. Suggest type aliases,
-    wrapper structs, or simplified signatures.
+### Clippy
+14. **CLIPPY SUPPRESSIONS** — `#[allow(clippy::...)]` or `#[allow(dead_code)]`
+    where the underlying issue can be fixed. Do not report suppressions that
+    are genuinely necessary (false positive, upstream requirement, or parity
+    with stellar-core). In particular, `#[allow(clippy::too_many_arguments)]`
+    on parity functions is expected — skip these.
 
 ### Documentation
-15. **STALE COMMENTS** — comments that no longer match the code they describe,
-    or that reference removed/renamed items. Fix or remove.
-16. **COMMENTED-OUT CODE** — dead code left as comments instead of being deleted.
-    Remove it (git preserves history).
-17. **TODO/FIXME/HACK** — unresolved markers. For each: still relevant? If yes,
-    describe the fix. If no, remove the marker.
-18. **MISSING MODULE DOC** — .rs files over 100 lines with no top-level `//!` doc
-    comment explaining the module's purpose. Suggest a one-line summary.
+15. **STALE COMMENTS** — comments that no longer match the code. Fix or remove.
+16. **COMMENTED-OUT CODE** — dead code left as comments. Remove (git preserves
+    history).
 
 ## Ranking
 
@@ -93,12 +100,13 @@ readability, or prevent bugs. High-impact first.
 ## Conventions
 
 - **Inline tests**: Unit tests belong in `#[cfg(test)] mod tests { }` at the
-  bottom of the source file. Do not extract tests into separate files or
-  directory modules.
+  bottom of the source file. Do not extract tests into separate files.
 
 ## Scope
 
-Ignore test code and `stellar-core/`.
+- Do not flag issues **within** test code (`#[cfg(test)]`) or in `stellar-core/`.
+- Test code **may** be referenced as evidence (e.g., to show a function is only
+  called from tests when evaluating dead code or visibility).
 
 ## Output Format (review mode only)
 
