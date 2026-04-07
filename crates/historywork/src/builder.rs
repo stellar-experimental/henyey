@@ -102,7 +102,7 @@ impl HistoryWorkBuilder {
     /// Creates and registers all download work items (HAS, buckets, headers,
     /// transactions, results, SCP) with proper dependency ordering. Each work
     /// item is configured with appropriate retry counts per CATCHUP_SPEC §9.1:
-    /// HAS downloads use `RETRY_A_FEW` (10), bulk downloads use `RETRY_A_LOT` (32).
+    /// HAS downloads use `RETRY_A_FEW` (5), bulk downloads use `RETRY_A_LOT` (32).
     ///
     /// # Returns
     ///

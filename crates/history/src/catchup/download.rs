@@ -22,6 +22,9 @@ use super::{CatchupManager, LedgerData};
 /// `MAX_CONCURRENT_SUBPROCESSES`.
 pub(super) const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 
+/// Log download progress every N items (and always on the last item).
+const PROGRESS_REPORT_INTERVAL: u32 = 5;
+
 /// Run a future to completion from a synchronous context.
 ///
 /// Handles three cases:
@@ -166,13 +169,13 @@ impl CatchupManager {
         use futures::stream::{self, StreamExt};
 
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
-        let empty_bucket_hash = Hash256::hash(&[]);
+        let empty_bucket_hash = Hash256::empty_hash();
 
         // Filter out zero/empty hashes and already-downloaded buckets
         let to_download: Vec<_> = hashes
             .iter()
             .filter(|hash| {
-                if hash.is_zero() || **hash == empty_bucket_hash {
+                if hash.is_zero() || *hash == empty_bucket_hash {
                     return false;
                 }
                 let bucket_path = bucket_dir.join(format!("{}.bucket.xdr", hash.to_hex()));
@@ -234,7 +237,7 @@ impl CatchupManager {
                                 let count = downloaded
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                     + 1;
-                                if count % 5 == 0 || count == total_to_download as u32 {
+                                if count % PROGRESS_REPORT_INTERVAL == 0 || count == total_to_download as u32 {
                                     info!("Downloaded {}/{} buckets", count, total_to_download);
                                 }
                                 debug!("Pre-downloaded bucket {} ({} bytes)", hash, data.len());

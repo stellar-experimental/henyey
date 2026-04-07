@@ -611,9 +611,9 @@ mod tests {
         let result = verify_tx_result_set(&header, &[]);
         // This will fail unless the hash happens to match (it won't for zero header)
         // The hash of empty bytes won't match the zero tx_set_result_hash
-        let empty_hash = Hash256::hash(&[]);
+        let empty_hash = Hash256::empty_hash();
         let expected_hash = Hash256::from(header.tx_set_result_hash.clone());
-        if empty_hash != expected_hash {
+        if *empty_hash != expected_hash {
             assert!(result.is_err());
         }
     }

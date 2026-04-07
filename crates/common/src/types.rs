@@ -38,6 +38,16 @@ impl Hash256 {
     /// This is commonly used as a sentinel value or placeholder.
     pub const ZERO: Self = Self([0u8; 32]);
 
+    /// SHA-256 hash of the empty byte slice (`&[]`).
+    ///
+    /// Used as the sentinel value for empty buckets in the bucket list.
+    /// Computed once on first access.
+    pub fn empty_hash() -> &'static Self {
+        use std::sync::OnceLock;
+        static EMPTY: OnceLock<Hash256> = OnceLock::new();
+        EMPTY.get_or_init(|| Hash256::hash(&[]))
+    }
+
     /// Compute the SHA-256 hash of arbitrary data.
     ///
     /// # Examples

@@ -22,6 +22,9 @@ use crate::{set_progress, HistoryWorkStage, SharedHistoryState};
 /// `MAX_CONCURRENT_SUBPROCESSES` limit.
 pub(crate) const MAX_CONCURRENT_DOWNLOADS: usize = 16;
 
+/// Log download progress every N items (and always on the last item).
+const PROGRESS_REPORT_INTERVAL: u32 = 5;
+
 // ============================================================================
 // Work Items
 // ============================================================================
@@ -180,7 +183,9 @@ impl Work for DownloadBucketsWork {
 
                         let count =
                             downloaded_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        if count % 5 == 0 || count == total_to_download as u32 {
+                        if count % PROGRESS_REPORT_INTERVAL == 0
+                            || count == total_to_download as u32
+                        {
                             tracing::info!("Downloaded {}/{} buckets", count, total_to_download);
                         }
                         Ok(())
@@ -468,10 +473,10 @@ impl Work for DownloadScpHistoryWork {
 /// Filters out the zero hash and the hash of the empty bucket, which are
 /// sentinel values that should not be downloaded.
 pub(crate) fn content_bucket_hashes(has: &HistoryArchiveState) -> Vec<Hash256> {
-    let empty_bucket_hash = Hash256::hash(&[]);
+    let empty_bucket_hash = Hash256::empty_hash();
     has.unique_bucket_hashes()
         .into_iter()
-        .filter(|h| !h.is_zero() && *h != empty_bucket_hash)
+        .filter(|h| !h.is_zero() && h != empty_bucket_hash)
         .collect()
 }
 

@@ -182,7 +182,7 @@ impl CatchupManager {
         let archives = self.archives.clone();
         let bucket_dir = bucket_dir.to_path_buf();
 
-        let empty_bucket_hash = Hash256::hash(&[]);
+        let empty_bucket_hash = Hash256::empty_hash();
 
         // Helper to load a bucket - downloads on-demand, saves to disk, and caches
         let load_bucket = |hash: &Hash256| -> henyey_bucket::Result<Bucket> {
@@ -190,7 +190,7 @@ impl CatchupManager {
             if hash.is_zero() {
                 return Ok(Bucket::empty());
             }
-            if *hash == empty_bucket_hash {
+            if hash == empty_bucket_hash {
                 return Ok(Bucket::empty());
             }
 

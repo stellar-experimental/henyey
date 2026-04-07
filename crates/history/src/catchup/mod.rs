@@ -764,11 +764,11 @@ impl CatchupManager {
             "Verifying bucket files on disk",
         );
         let bucket_hashes = data.has.unique_bucket_hashes();
-        let empty_bucket_hash = Hash256::hash(&[]);
+        let empty_bucket_hash = Hash256::empty_hash();
         let buckets_downloaded = bucket_hashes.len() as u32;
         self.progress.buckets_total = buckets_downloaded;
         for (idx, hash) in bucket_hashes.iter().enumerate() {
-            if !hash.is_zero() && *hash != empty_bucket_hash {
+            if !hash.is_zero() && hash != empty_bucket_hash {
                 let bucket_path = data
                     .bucket_dir
                     .join(format!("{}.bucket.xdr", hash.to_hex()));
@@ -783,7 +783,7 @@ impl CatchupManager {
         let bucket_mgr_dir = self.bucket_manager.bucket_dir().to_path_buf();
         if data.bucket_dir != bucket_mgr_dir {
             for hash in &bucket_hashes {
-                if hash.is_zero() || *hash == empty_bucket_hash {
+                if hash.is_zero() || *hash == *empty_bucket_hash {
                     continue;
                 }
                 let src = data
