@@ -794,20 +794,22 @@ fn apply_soroban_storage_changes(
     }
 
     // CAP-73 validation: verify that newly created keys are of expected types.
-    // stellar-core: InvokeHostFunctionOpFrame::recordStorageChanges()
+    // Parity: InvokeHostFunctionOpFrame::recordStorageChanges():664-683
+    // stellar-core uses releaseAssertOrThrow (fires in all builds), so we use
+    // assert! (not debug_assert!) to match — never fail silently.
     for key in &created_keys {
         if is_soroban_key(key) {
             // Soroban entries must have a corresponding TTL entry also created
             let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
             let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash });
-            debug_assert!(
+            assert!(
                 created_keys.contains(&ttl_key),
                 "Created Soroban entry {:?} missing TTL key",
                 key
             );
         } else if protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
             // V26+: SAC can create Account and Trustline entries (CAP-73)
-            debug_assert!(
+            assert!(
                 matches!(
                     key,
                     LedgerKey::Ttl(_) | LedgerKey::Account(_) | LedgerKey::Trustline(_)
@@ -817,7 +819,7 @@ fn apply_soroban_storage_changes(
             );
         } else {
             // Pre-V26: only TTL keys should be created as non-Soroban entries
-            debug_assert!(
+            assert!(
                 matches!(key, LedgerKey::Ttl(_)),
                 "Non-Soroban created key must be TTL in pre-V26, got {:?}",
                 std::mem::discriminant(key)
