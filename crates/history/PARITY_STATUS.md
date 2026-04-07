@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-history`
 **Upstream**: `stellar-core/src/history/`
-**Overall Parity**: 83%
-**Last Updated**: 2026-03-26
+**Overall Parity**: 79%
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -11,7 +11,7 @@
 |------|--------|-------|
 | Checkpoint math | Full | Matches 64-ledger checkpoint rules |
 | Archive path generation | Full | Standard shard and dirty paths covered |
-| HAS parsing and diffing | Partial | Missing direct bucket-list hash helper |
+| HAS parsing and diffing | Full | Bucket-list hash, parsing, futures, and diffing all covered |
 | Archive HTTP and shell access | Full | Native HTTP reads plus shell-command writes |
 | Archive manager | Partial | No random selection or work wrappers |
 | Checkpoint builder | Full | Crash-safe dirty-file recovery implemented |
@@ -71,7 +71,7 @@ Corresponds to: `HistoryArchive.h` (`HistoryArchiveState`)
 | `wellKnownRemoteDir()` / `wellKnownRemoteName()` | `.well-known/stellar-history.json` helpers | Full |
 | `remoteDir()` / `remoteName()` | `has_path()` / `checkpoint_path("history", ...)` | Full |
 | `localName()` | -- | Omission |
-| `getBucketListHash()` | -- | None |
+| `getBucketListHash()` | `compute_bucket_list_hash()` | Full |
 | `differingBuckets()` | `differing_bucket_hashes()` / `all_differing_bucket_hashes()` | Full |
 | `allBuckets()` | `all_bucket_hashes()` / `unique_bucket_hashes()` | Full |
 | `serialize()` / `deserialize()` | `to_json()` / `from_json()` | Full |
@@ -200,7 +200,6 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `getBucketListHash()` | Medium | No direct HAS helper returning the combined live/hot hash |
 | `resolveAnyReadyFutures()` | Low | Incremental FutureBucket resolution is still missing |
 | `prepareForPublish()` parity | Low | Publish preparation exists, but not as a full HAS instance method |
 | `selectRandomReadableHistoryArchive()` | Low | Readable archives are returned, not randomly selected |
@@ -257,7 +256,7 @@ Features not yet implemented. These ARE counted against parity %.
 | Checkpoint builder and queue | 2 `TEST_CASE` / 6 `SECTION` | 25 `#[test]` | Rust covers recovery paths well |
 | Publish workflows | 6 `TEST_CASE` / 18 `SECTION` | 15 `#[test]` | Missing restart, multi-archive, and throttling scenarios |
 | Catchup and replay | 17 `TEST_CASE` / 9 `SECTION` | 44 `#[test]` | Rust has broad unit coverage but lighter end-to-end catchup scenarios |
-| **Total** | **35 `TEST_CASE` / 71 `SECTION`** | **204 `#[test]`** | Upstream still has more scenario-heavy acceptance coverage |
+| **Total** | **35 `TEST_CASE` / 71 `SECTION`** | **212 `#[test]`** | Upstream still has more scenario-heavy acceptance coverage |
 
 ### Test Gaps
 
@@ -271,7 +270,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 78 |
-| Gaps (None + Partial) | 16 |
+| Implemented (Full) | 65 |
+| Gaps (None + Partial) | 17 |
 | Intentional Omissions | 7 |
-| **Parity** | **78 / (78 + 16) = 83%** |
+| **Parity** | **65 / (65 + 17) = 79%** |

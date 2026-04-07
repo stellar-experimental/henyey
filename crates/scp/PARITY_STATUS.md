@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-scp`
 **Upstream**: `stellar-core/src/scp/`
-**Overall Parity**: 93%
-**Last Updated**: 2026-03-25
+**Overall Parity**: 95%
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -386,24 +386,24 @@ Features excluded by design. These are NOT counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Quorum set validation | 1 TEST_CASE / 14 SECTION (`QuorumSetTests.cpp`) | 37 #[test] in `quorum.rs` | Comprehensive coverage |
-| Nomination weight/stats | 3 TEST_CASE / 10 SECTION (`SCPUnitTests.cpp`) | 24 #[test] in `nomination.rs` | Priority and hash tests |
+| Quorum set validation | 1 TEST_CASE / 14 SECTION (`QuorumSetTests.cpp`) | 38 #[test] in `quorum.rs` | Comprehensive coverage |
+| Nomination weight/stats | 3 TEST_CASE / 10 SECTION (`SCPUnitTests.cpp`) | 25 #[test] in `nomination.rs` | Priority and hash tests |
 | Ballot protocol | 2 TEST_CASE / ~130 SECTION (`SCPTests.cpp`) | 55 #[test] in `ballot/` | All state transitions |
-| Nomination protocol | 1 TEST_CASE / ~35 SECTION (`SCPTests.cpp`) | 24 #[test] in `nomination.rs` | Nomination flow |
-| V-blocking/quorum | 2 TEST_CASE / ~35 SECTION (`SCPTests.cpp`) | 37 #[test] in `quorum.rs` | Quorum operations |
+| Nomination protocol | 1 TEST_CASE / ~35 SECTION (`SCPTests.cpp`) | 25 #[test] in `nomination.rs` | Nomination flow |
+| V-blocking/quorum | 2 TEST_CASE / ~35 SECTION (`SCPTests.cpp`) | 38 #[test] in `quorum.rs` | Quorum operations |
 | Multi-node simulation | Covered within SCPTests.cpp | 50 #[test] in `tests/multi_node_simulation.rs` | End-to-end scenarios |
-| SCP parity tests | N/A | 124 #[test] in `tests/scp_parity_tests.rs` | Parity-focused scenarios |
+| SCP parity tests | N/A | 124 #[test] in `tests/scp_parity_tests/` | Parity-focused scenarios |
 | Quorum intersection | N/A | 6 #[test] in `tests/quorum_intersection_json.rs` | JSON-based quorum tests |
-| Statement ordering | Covered within SCPTests.cpp | 1 #[test] in `compare.rs` | Statement comparison |
+| Statement ordering | Covered within SCPTests.cpp | 3 #[test] in `compare.rs` | Statement comparison |
 | Display formatting | N/A | 4 #[test] in `format.rs` | String formatting |
 | Info/JSON types | N/A | 4 #[test] in `info.rs` | Serialization tests |
 | Slot management | Covered within SCPTests.cpp | 26 #[test] in `slot.rs` | Per-slot operations |
 | SCP coordinator | Covered within SCPTests.cpp | 15 #[test] in `scp.rs` | Top-level API tests |
 | Driver | N/A | 11 #[test] in `driver.rs` | Weight computation, timeout |
-| Quorum config | N/A | 5 #[test] in `quorum_config.rs` | Config parsing |
+| Quorum config | N/A | 6 #[test] in `quorum_config.rs` | Config parsing |
 | Lib-level helpers | N/A | 2 #[test] in `lib.rs` | EnvelopeState, QuorumInfoNodeState |
 
-**Totals**: Upstream: 9 TEST_CASE / 189 SECTION. Rust: 184 unit #[test] + 180 integration #[test] = 364 total.
+**Totals**: Upstream: 9 TEST_CASE / 189 SECTION. Rust: 189 unit #[test] + 180 integration #[test] = 369 total.
 
 ### Test Gaps
 
@@ -413,7 +413,7 @@ No major consensus-algorithm test gaps are apparent. Remaining parity gaps are c
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 153 |
+| Implemented (Full) | 206 |
 | Gaps (None + Partial) | 11 |
 | Intentional Omissions | 12 |
-| **Parity** | **153 / (153 + 11) = 93%** |
+| **Parity** | **206 / (206 + 11) = 95%** |

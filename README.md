@@ -424,8 +424,8 @@ henyey/
 | Crate | Purpose | Parity |
 |-------|---------|--------|
 | [`henyey`](crates/henyey/README.md) | CLI entrypoint, argument parsing, command dispatch | [56%](crates/henyey/PARITY_STATUS.md) |
-| [`henyey-app`](crates/app/README.md) | Application wiring, lifecycle, HTTP APIs, meta streaming, history publishing | [69%](crates/app/PARITY_STATUS.md) |
-| [`henyey-common`](crates/henyey-common/README.md) | Shared types, config helpers, time utilities | [90%](crates/henyey-common/PARITY_STATUS.md) |
+| [`henyey-app`](crates/app/README.md) | Application wiring, lifecycle, HTTP APIs, meta streaming, history publishing | [70%](crates/app/PARITY_STATUS.md) |
+| [`henyey-common`](crates/henyey-common/README.md) | Shared types, config helpers, time utilities | [91%](crates/henyey-common/PARITY_STATUS.md) |
 | [`henyey-clock`](crates/clock/README.md) | Injectable clock abstractions for deterministic simulation and runtime timing | [100%](crates/clock/PARITY_STATUS.md) |
 | [`henyey-crypto`](crates/henyey-crypto/README.md) | Ed25519 signing, SHA-256 hashing, strkey encoding | [69%](crates/henyey-crypto/PARITY_STATUS.md) |
 | [`henyey-db`](crates/henyey-db/README.md) | SQLite schema, migrations, query layer | [94%](crates/henyey-db/PARITY_STATUS.md) |
@@ -434,8 +434,8 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-scp`](crates/henyey-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [93%](crates/henyey-scp/PARITY_STATUS.md) |
-| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [77%](crates/henyey-herder/PARITY_STATUS.md) |
+| [`henyey-scp`](crates/henyey-scp/README.md) | Stellar Consensus Protocol: nomination, balloting, quorum logic | [95%](crates/henyey-scp/PARITY_STATUS.md) |
+| [`henyey-herder`](crates/henyey-herder/README.md) | Consensus coordination, transaction queue, ledger close triggers | [79%](crates/henyey-herder/PARITY_STATUS.md) |
 | [`henyey-overlay`](crates/henyey-overlay/README.md) | P2P overlay network, peer management, message flooding | [92%](crates/henyey-overlay/PARITY_STATUS.md) |
 
 ### Execution Layer
@@ -444,13 +444,13 @@ henyey/
 |-------|---------|--------|
 | [`henyey-ledger`](crates/henyey-ledger/README.md) | Ledger close pipeline, per-operation savepoints, state snapshots, delta tracking | [94%](crates/henyey-ledger/PARITY_STATUS.md) |
 | [`henyey-tx`](crates/henyey-tx/README.md) | Transaction validation and execution (classic + Soroban), savepoint-based rollback | [97%](crates/henyey-tx/PARITY_STATUS.md) |
-| [`henyey-bucket`](crates/henyey-bucket/README.md) | BucketList implementation, merges, on-disk state | [93%](crates/henyey-bucket/PARITY_STATUS.md) |
+| [`henyey-bucket`](crates/henyey-bucket/README.md) | BucketList implementation, merges, on-disk state | [84%](crates/henyey-bucket/PARITY_STATUS.md) |
 
 ### History & Sync
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-history`](crates/henyey-history/README.md) | History archive I/O, catchup, replay, verification, publishing | [83%](crates/henyey-history/PARITY_STATUS.md) |
+| [`henyey-history`](crates/henyey-history/README.md) | History archive I/O, catchup, replay, verification, publishing | [79%](crates/henyey-history/PARITY_STATUS.md) |
 | [`henyey-historywork`](crates/henyey-historywork/README.md) | History work scheduling, publish/catchup task management | [38%](crates/henyey-historywork/PARITY_STATUS.md) |
 
 ### RPC
@@ -463,8 +463,8 @@ henyey/
 
 | Crate | Purpose | Parity |
 |-------|---------|--------|
-| [`henyey-work`](crates/henyey-work/README.md) | Generic DAG-based work scheduler | [39%](crates/henyey-work/PARITY_STATUS.md) |
-| [`henyey-simulation`](crates/simulation/README.md) | Deterministic multi-node simulation harness and topology/fault scenarios | [86%](crates/simulation/PARITY_STATUS.md) |
+| [`henyey-work`](crates/henyey-work/README.md) | Generic DAG-based work scheduler | [25%](crates/henyey-work/PARITY_STATUS.md) |
+| [`henyey-simulation`](crates/simulation/README.md) | Deterministic multi-node simulation harness and topology/fault scenarios | [85%](crates/simulation/PARITY_STATUS.md) |
 
 ## Design Constraints
 

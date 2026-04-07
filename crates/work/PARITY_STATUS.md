@@ -2,33 +2,33 @@
 
 **Crate**: `henyey-work`
 **Upstream**: `stellar-core/src/work/`
-**Overall Parity**: 39%
-**Last Updated**: 2026-03-25
+**Overall Parity**: 25%
+**Last Updated**: 2026-04-07
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
-| Basic work lifecycle | Partial | Core run/retry/cancel flow exists |
+| Basic work lifecycle | Partial | Core run/retry/cancel flow exists; lifecycle hooks missing |
 | Scheduler execution loop | Full | Async ready-queue scheduler implemented |
 | Dependency ordering | Full | Explicit DAG edges enforce ordering |
-| Retry management | Partial | Retry delays exist; hooks/constants differ |
+| Retry management | Partial | Retry delays exist; named constants and hooks differ |
 | Cancellation handling | Partial | Cooperative cancel, no `ABORTING` phase |
-| WorkSequence helper | Full | Sequential chains via dependency edges |
-| WorkWithCallback wrapper | Full | Post-run callback wrapper exists |
-| Hierarchical work tree | None | Parent-child supervision is absent |
-| Batch coordination | None | `BatchWork` equivalent missing |
-| Conditional gating | None | `ConditionalWork` equivalent missing |
+| Hierarchical work tree | None | `Work` parent-child supervision is absent |
+| WorkSequence helper | None | Not implemented (no `sequence.rs`) |
+| BatchWork coordinator | None | `BatchWork` equivalent missing |
+| ConditionalWork gating | None | `ConditionalWork` equivalent missing |
+| WorkWithCallback wrapper | None | Not implemented (no `callback.rs`) |
 
 ## File Mapping
 
 | stellar-core File | Rust Module | Notes |
 |--------------------|-------------|-------|
-| `BasicWork.h` / `BasicWork.cpp` | `types.rs`, `scheduler.rs` | States/outcomes live in `types.rs`; execution, retries, and cancellation live in `scheduler.rs` |
+| `BasicWork.h` / `BasicWork.cpp` | `types.rs`, `scheduler.rs` | States/outcomes in `types.rs`; execution, retries, and cancellation in `scheduler.rs` |
 | `Work.h` / `Work.cpp` | (not mapped) | Flat DAG scheduler replaces hierarchical parent-child work |
 | `WorkScheduler.h` / `WorkScheduler.cpp` | `scheduler.rs` | Scheduler loop, concurrency control, retries, metrics, and events |
-| `WorkSequence.h` / `WorkSequence.cpp` | `sequence.rs` | Helper builds a linear dependency chain |
-| `WorkWithCallback.h` / `WorkWithCallback.cpp` | `callback.rs` | Wrapper runs callback after each attempt |
+| `WorkSequence.h` / `WorkSequence.cpp` | (not mapped) | Sequential execution helper not implemented |
+| `WorkWithCallback.h` / `WorkWithCallback.cpp` | (not mapped) | Callback wrapper not implemented |
 | `BatchWork.h` / `BatchWork.cpp` | (not mapped) | Parallel batch coordinator not implemented |
 | `ConditionalWork.h` / `ConditionalWork.cpp` | (not mapped) | Condition-gated work wrapper not implemented |
 
@@ -36,7 +36,7 @@
 
 ### Basic work model (`types.rs`, `scheduler.rs`)
 
-Corresponds to: `BasicWork.h`
+Corresponds to: `BasicWork.h` / `BasicWork.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
@@ -45,16 +45,16 @@ Corresponds to: `BasicWork.h`
 | `BasicWork()` constructor | `Work` trait + scheduler entry construction | Full |
 | `getName()` | `Work::name()` | Full |
 | `getState()` | `WorkScheduler::state()` | Full |
+| `getStatus()` formatted string | Not implemented | None |
 | `isDone()` | `WorkState::is_terminal()` | Full |
-| `onRun()` pure virtual | `Work::run()` async method | Full |
-| `startWork()` | Scheduler starts work when runnable | Full |
 | `crankWork()` | Tokio task execution inside scheduler loop | Full |
-| `RETRY_NEVER` / `RETRY_ONCE` / `RETRY_A_FEW` / `RETRY_A_LOT` | Caller passes `retries: u32` | Partial |
-| `getStatus()` | `WorkSnapshot` / `WorkEvent` introspection | Partial |
+| `startWork()` | Scheduler starts work when runnable | Full |
+| `onRun()` pure virtual | `Work::run()` async method | Full |
 | `onAbort()` pure virtual | Cooperative cancellation via `WorkContext` | Full |
 | `shutdown()` | `WorkScheduler::cancel()` / `cancel_all()` | Full |
 | `isAborting()` | `CancellationToken::is_cancelled()` | Full |
-| `onSuccess()` callback | Not implemented; use `WorkWithCallback` | None |
+| `RETRY_NEVER` / `RETRY_ONCE` / `RETRY_A_FEW` / `RETRY_A_LOT` | Caller passes `retries: u32` | Partial |
+| `onSuccess()` callback | Not implemented | None |
 | `onFailureRetry()` callback | Not implemented | None |
 | `onFailureRaise()` callback | Not implemented | None |
 | `getRetryDelay()` exponential backoff | Work decides delay via `WorkOutcome::Retry { delay }` | Partial |
@@ -62,7 +62,7 @@ Corresponds to: `BasicWork.h`
 
 ### Hierarchical work tree (not implemented)
 
-Corresponds to: `Work.h`
+Corresponds to: `Work.h` / `Work.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
@@ -91,7 +91,7 @@ Corresponds to: `Work.h`
 
 ### Scheduler (`scheduler.rs`)
 
-Corresponds to: `WorkScheduler.h`
+Corresponds to: `WorkScheduler.h` / `WorkScheduler.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
@@ -103,23 +103,23 @@ Corresponds to: `WorkScheduler.h`
 | `scheduleOne()` IO-posted crank | Tokio task spawning / ready queue | Full |
 | `doWork()` scheduler loop | `run_until_done_with_cancel()` | Full |
 
-### Sequence helper (`sequence.rs`)
+### Sequence helper (not implemented)
 
-Corresponds to: `WorkSequence.h`
+Corresponds to: `WorkSequence.h` / `WorkSequence.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `WorkSequence()` constructor | `WorkSequence::new()` | Full |
-| `onRun()` sequential dispatch | `push()` creates a dependency chain | Full |
-| `onAbort()` abort current work | Scheduler cancellation blocks downstream work | Full |
-| `onReset()` | Not needed; scheduler retries original work items | Full |
-| `getStatus()` | Not implemented; inspect scheduler snapshots instead | Partial |
-| `shutdown()` | Scheduler cancellation APIs | Full |
-| `stopAtFirstFailure` flag | Failed dependency blocks later sequence entries | Full |
+| `WorkSequence()` constructor | (not implemented) | None |
+| `getStatus()` | (not implemented) | None |
+| `shutdown()` | (not implemented) | None |
+| `onRun()` sequential dispatch | (not implemented) | None |
+| `onAbort()` | (not implemented) | None |
+| `onReset()` | (not implemented) | None |
+| `stopAtFirstFailure` flag | (not implemented) | None |
 
 ### Batch coordinator (not implemented)
 
-Corresponds to: `BatchWork.h`
+Corresponds to: `BatchWork.h` / `BatchWork.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
@@ -134,7 +134,7 @@ Corresponds to: `BatchWork.h`
 
 ### Conditional wrapper (not implemented)
 
-Corresponds to: `ConditionalWork.h`
+Corresponds to: `ConditionalWork.h` / `ConditionalWork.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
@@ -145,15 +145,15 @@ Corresponds to: `ConditionalWork.h`
 | `onAbort()` | (not implemented) | None |
 | `onReset()` | (not implemented) | None |
 
-### Callback wrapper (`callback.rs`)
+### Callback wrapper (not implemented)
 
-Corresponds to: `WorkWithCallback.h`
+Corresponds to: `WorkWithCallback.h` / `WorkWithCallback.cpp`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `WorkWithCallback()` constructor | `WorkWithCallback::new()` | Full |
-| `onRun()` callback execution | Wrapped `Work::run()` plus callback invocation | Full |
-| `onAbort()` | Cancellation token propagation | Full |
+| `WorkWithCallback()` constructor | (not implemented) | None |
+| `onRun()` callback execution | (not implemented) | None |
+| `onAbort()` | (not implemented) | None |
 
 ## Intentional Omissions
 
@@ -181,14 +181,16 @@ Features not yet implemented. These ARE counted against parity %.
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
 | `Work` class hierarchy | High | Missing parent-child supervision blocks parity for composite work trees |
+| `WorkSequence` | High | Sequential execution helper is absent |
 | `BatchWork` | Medium | Parallel batch throttling helper is absent |
 | `ConditionalWork` | Medium | Condition-gated sequential dependencies are unsupported |
-| `onSuccess()` lifecycle hook | Low | Callers must wrap work explicitly with `WorkWithCallback` |
+| `WorkWithCallback` | Medium | Simple callback wrapper is absent |
+| `onSuccess()` lifecycle hook | Low | No post-success hook |
 | `onFailureRetry()` lifecycle hook | Low | Retry-side callbacks do not exist |
 | `onFailureRaise()` lifecycle hook | Low | Permanent-failure callback hook does not exist |
 | `getRetryETA()` | Low | No ETA reporting for delayed retries |
-| `getStatus()` formatted strings | Low | Introspection exists, but no formatted status API |
-| `RETRY_*` retry constants | Low | Callers use numeric retry budgets directly |
+| `getStatus()` formatted strings | Low | No formatted status API |
+| `RETRY_*` named constants | Low | Callers use numeric retry budgets directly |
 
 ## Architectural Differences
 
@@ -199,7 +201,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 2. **Hierarchy vs. flat DAG**
    - **stellar-core**: `Work` builds trees of parent and child work items, and the scheduler walks those trees in round-robin order.
-   - **Rust**: `WorkScheduler` owns a flat graph of work items with explicit dependency edges; `WorkSequence` only builds those edges.
+   - **Rust**: `WorkScheduler` owns a flat graph of work items with explicit dependency edges.
    - **Rationale**: Current henyey workflows are easier to express as dependency graphs than nested supervision trees.
 
 3. **Cancellation semantics**
@@ -219,24 +221,24 @@ Features not yet implemented. These ARE counted against parity %.
 | `BasicWork` state machine | 1 TEST_CASE / 8 SECTION | 0 `#[test]` | No direct coverage for waiting, retry hooks, or shutdown transitions |
 | Hierarchical `Work` trees | 1 TEST_CASE / 4 SECTION | 0 `#[test]` | Not implemented in Rust |
 | Scheduler ordering and retries | 2 TEST_CASE / 4 SECTION | 2 `#[tokio::test]` | Covers dependency order and retry-then-success |
-| `WorkSequence` | 1 TEST_CASE / 5 SECTION | 1 `#[tokio::test]` | Only basic sequential ordering is covered |
-| `WorkWithCallback` | Tested inline in `WorkTests.cpp` | 1 `#[tokio::test]` | Basic callback invocation covered |
-| `BatchWork` | 1 TEST_CASE / 2 SECTION | 0 `#[test]` | Feature absent |
-| `ConditionalWork` | 1 TEST_CASE / 5 SECTION | 0 `#[test]` | Feature absent |
-| Cancellation and introspection | Shutdown scenarios spread across multiple sections | 2 `#[tokio::test]` | Covers external cancellation plus metrics/snapshot reporting |
+| `WorkSequence` | 1 TEST_CASE / 5 SECTION | 0 `#[test]` | Not implemented in Rust |
+| `BatchWork` | 1 TEST_CASE / 2 SECTION | 0 `#[test]` | Not implemented in Rust |
+| `ConditionalWork` | 1 TEST_CASE / 5 SECTION | 0 `#[test]` | Not implemented in Rust |
+| `RunCommandWork` | 1 TEST_CASE / 4 SECTION | 0 `#[test]` | Not part of work crate |
+| Cancellation and metrics | Shutdown scenarios across multiple sections | 2 `#[tokio::test]` | Covers cancel + metrics/snapshot |
 
 ### Test Gaps
 
-- No Rust test exercises the richer `BasicWork` state machine behaviors that stellar-core covers, especially waiting callbacks, abort transitions, and retry callback hooks.
-- Rust tests do not cover fairness or multi-level scheduling behavior comparable to stellar-core's hierarchical scheduling tests.
-- `WorkSequence` has only a happy-path ordering test; upstream also checks empty sequences, mid-sequence failure, and shutdown behavior.
-- No Rust equivalents exist for upstream `BatchWork` and `ConditionalWork` tests because those abstractions are missing.
+- No Rust tests exercise the `BasicWork` state machine behaviors (waiting, abort transitions, retry hooks).
+- Rust tests do not cover fairness or multi-level scheduling comparable to stellar-core's hierarchical tests.
+- No Rust equivalents exist for upstream `WorkSequence`, `BatchWork`, `ConditionalWork`, or `WorkWithCallback` tests because those abstractions are missing.
+- Only 4 `#[tokio::test]` tests exist vs. 8 TEST_CASE / 32 SECTION upstream.
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 28 |
-| Gaps (None + Partial) | 44 |
+| Implemented (Full) | 18 |
+| Gaps (None + Partial) | 53 |
 | Intentional Omissions | 12 |
-| **Parity** | **28 / (28 + 44) = 39%** |
+| **Parity** | **18 / (18 + 53) = 25%** |

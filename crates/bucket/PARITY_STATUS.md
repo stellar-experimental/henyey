@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-bucket`
 **Upstream**: `stellar-core/src/bucket/`
-**Overall Parity**: 93%
-**Last Updated**: 2026-03-25
+**Overall Parity**: 84%
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -14,7 +14,7 @@
 | Bucket and merge semantics | Full | CAP-0020 merge behavior implemented |
 | BucketManager lifecycle and GC | Partial | Merge-future reattachment and metrics still incomplete |
 | FutureBucket restart state | Full | HAS-compatible input/output hash snapshots supported |
-| Snapshot and query APIs | Partial | Hot-archive refresh helper is still missing |
+| Snapshot and query APIs | Partial | Hot-archive refresh and scan helpers still missing |
 | Live bucket indexing | Full | In-memory and page indexes, bloom filter, persistence |
 | Hot archive indexing | Partial | Lookup exists, but no dedicated `HotArchiveBucketIndex` API |
 | Bucket input/output iterators | Partial | Legacy gzip wrappers differ from upstream uncompressed iterators |
@@ -48,6 +48,7 @@
 | `LedgerCmp.h` | `entry.rs` | Key and bucket-entry ordering |
 | `BucketUtils.h` | `entry.rs`, `metrics.rs`, `eviction.rs` | Entry counters, eviction structs, merge counters |
 | `BucketUtils.cpp` | `metrics.rs`, `eviction.rs`, `snapshot.rs` | Counter math and eviction-resolution helpers |
+| `BucketMergeAdapter.h` | `iterator.rs` | Merge input adapters for file and memory sources |
 
 ## Component Mapping
 
@@ -110,6 +111,7 @@ Corresponds to: `HotArchiveBucket.h`, `HotArchiveBucketList.h`, `HotArchiveBucke
 | `isTombstoneEntry()` / `maybePut()` | `is_hot_archive_tombstone()` / merge helpers | Full |
 | `mergeCasesWithEqualKeys()` | `merge_hot_archive_buckets()` | Full |
 | `bucketEntryToLoadResult()` / `convertToBucketEntry()` | `get()` / `HotArchiveBucket::fresh()` conversion | Full |
+| `countOldEntryType()` / `countNewEntryType()` / `checkProtocolLegality()` | No-ops consistent with upstream | Full |
 | `HotArchiveBucketList::addBatch()` | `HotArchiveBucketList::add_batch()` | Full |
 | `HotArchiveBucketIndex(...)` | Lazy `ensure_index()` BTreeMap | Partial |
 | `HotArchiveBucketIndex::lookup()` | `HotArchiveBucket::get()` | Full |
@@ -128,14 +130,16 @@ Corresponds to: `BucketManager.h`
 | `create()` / `initialize()` | `BucketManager::new()` constructor path | Full |
 | `bucketIndexFilename()` / `getBucketDir()` | `index_path_for_bucket()` / `bucket_dir()` | Full |
 | `getBucketIfExists()` / `getBucketByHash()` | `bucket_exists()` / `load_bucket()` | Full |
-| `adoptFileAsBucket()` / `noteEmptyMergeOutput()` | temp promotion and empty-bucket handling in `merge()` | Full |
+| `adoptFileAsBucket()` / `noteEmptyMergeOutput()` | Temp promotion and empty-bucket handling in `merge()` | Full |
 | `forgetUnreferencedBuckets()` | `retain_buckets()` | Full |
 | `addLiveBatch()` / `addHotArchiveBatch()` | `BucketList::add_batch()` / `HotArchiveBucketList::add_batch()` | Full |
 | `snapshotLedger()` / `assumeState()` | `snapshot_ledger()` / `assume_state()` | Full |
-| `loadCompleteLedgerState()` / `loadCompleteHotArchiveState()` | same-named Rust methods | Full |
+| `loadCompleteLedgerState()` / `loadCompleteHotArchiveState()` | Same-named Rust methods | Full |
 | `mergeBuckets()` | `merge_all_buckets()` | Full |
 | `visitLedgerEntries()` | `visit_ledger_entries()` / `_of_type()` | Full |
 | `scheduleVerifyReferencedBucketsWork()` | `verify_referenced_bucket_hashes()` | Full |
+| `startBackgroundEvictionScan()` / `resolveBackgroundEvictionScan()` | Snapshot-based eviction scan in `snapshot.rs` and `eviction.rs` | Full |
+| `checkForMissingBucketsFiles()` / `getBucketListReferencedBuckets()` | `verify_buckets_exist()` / `all_referenced_hashes()` | Full |
 | `getMergeFuture()` / `putMergeFuture()` | Completed-merge cache only; no manager-level future reattach | None |
 | `getBloomMissMeter()` / `getBloomLookupMeter()` | No dedicated meter API | None |
 | `getCacheHitMeter()` / `getCacheMissMeter()` | Cache stats exist, no meter API | Partial |
@@ -150,7 +154,7 @@ Corresponds to: `FutureBucket.h`, `MergeKey.h`
 |--------------|------|--------|
 | `FutureBucket()` / `clear()` | `FutureBucket::clear()` | Full |
 | Live merge constructor | `FutureBucket::start_merge()` | Full |
-| `isLive()` / `isMerging()` / `isClear()` | same-named Rust methods | Full |
+| `isLive()` / `isMerging()` / `isClear()` | Same-named Rust methods | Full |
 | `hasHashes()` / `hasOutputHash()` / `getOutputHash()` | `has_hashes()` / `output_hash()` | Full |
 | `mergeComplete()` / `resolve()` | `merge_complete()` / `resolve()` / `resolve_blocking()` | Full |
 | `makeLive()` | `make_live()` | Full |
@@ -171,8 +175,7 @@ Corresponds to: `BucketInputIterator.h`, `BucketOutputIterator.h`, `BucketMergeA
 | `BucketOutputIterator(...)` | `BucketOutputIterator::new()` | Partial |
 | `put()` | `put()` | Full |
 | `getBucket()` | `finish()` returns path/hash/entries, not adopted bucket | Partial |
-| `MergeInput` / `FileMergeInput` / `MemoryMergeInput` | same-named Rust trait and structs | Full |
-| `BucketMergeAdapter.h` | Rust traits and generics | Full |
+| `MergeInput` / `FileMergeInput` / `MemoryMergeInput` | Same-named Rust trait and structs | Full |
 
 ### snapshots (`snapshot.rs`)
 
@@ -180,20 +183,27 @@ Corresponds to: `BucketListSnapshot.h`, `BucketSnapshotManager.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `BucketSnapshotBase(bucket)` | `BucketSnapshot::new()` | Full |
-| `isEmpty()` / `getRawBucket()` | `is_empty()` / `raw_bucket()` | Full |
-| `getBucketEntry()` / `loadKeys()` | `get()` / `load_keys()` | Full |
-| `BucketListSnapshot(bl, header)` | `BucketListSnapshot::new()` | Full |
-| `getLevels()` / `getLedgerSeq()` / `getLedgerHeader()` | `levels()` / `ledger_seq()` / `ledger_header()` | Full |
-| `SearchableBucketListSnapshotBase::load()` | `SearchableBucketListSnapshot::load()` | Full |
-| `loadKeysFromLedger()` | same-named Rust methods | Full |
-| `loadPoolShareTrustLinesByAccountAndAsset()` | same-named Rust method | Full |
-| `loadInflationWinners()` | same-named Rust method | Full |
-| `scanForEviction()` / `scanForEntriesOfType()` | same-named Rust methods | Full |
-| `updateCurrentSnapshot()` / `copySearchableLiveBucketListSnapshot()` | same-named Rust methods | Full |
-| `copySearchableHotArchiveBucketListSnapshot()` / `copySearchableBucketListSnapshots()` | `copy_searchable_hot_archive_snapshot()` / `copy_live_and_hot_archive_snapshots()` | Full |
+| `BucketListSnapshotData(bl, header)` | `BucketListSnapshot::new()` | Full |
+| `BucketListSnapshotData::getLedgerSeq()` | `ledger_seq()` | Full |
+| `SearchableBucketListSnapshot::load()` | `SearchableBucketListSnapshot::load()` | Full |
+| `loadKeysFromLedger()` | Same-named Rust method | Full |
+| `getLedgerSeq()` / `getLedgerHeader()` | `ledger_seq()` / `ledger_header()` | Full |
+| `getSnapshotData()` / `getHistoricalSnapshots()` | Accessible via snapshot struct fields | Full |
+| `SearchableLiveBucketListSnapshot::loadKeys()` | `load_keys()` | Full |
+| `loadPoolShareTrustLinesByAccountAndAsset()` | Same-named Rust method | Full |
+| `loadInflationWinners()` | Same-named Rust method | Full |
+| `scanForEviction()` / `scanForEvictionInBucket()` | Same-named Rust methods | Full |
+| `scanForEntriesOfType()` | Same-named Rust method | Full |
+| `SearchableHotArchiveBucketListSnapshot::loadKeys()` | `load_keys()` | Full |
+| `SearchableHotArchiveBucketListSnapshot::scanAllEntries()` | *(none)* | None |
+| `BucketSnapshotManager(ctor)` | `BucketSnapshotManager::new()` | Full |
+| `updateCurrentSnapshot()` | Same-named Rust method | Full |
+| `copySearchableLiveBucketListSnapshot()` | `copy_searchable_live_snapshot()` | Full |
+| `copySearchableHotArchiveBucketListSnapshot()` | `copy_searchable_hot_archive_snapshot()` | Full |
+| `copySearchableBucketListSnapshots()` | `copy_live_and_hot_archive_snapshots()` | Full |
 | `maybeCopySearchableBucketListSnapshot()` | `maybe_update_live_snapshot()` | Full |
 | `maybeCopySearchableHotArchiveBucketListSnapshot()` | *(none)* | None |
+| `maybeCopyLiveAndHotArchiveSnapshots()` | `copy_live_and_hot_archive_snapshots()` re-query pattern | Full |
 
 ### indexing and application (`index.rs`, `index_persistence.rs`, `applicator.rs`, `entry.rs`, `metrics.rs`, `merge_map.rs`, `bloom_filter.rs`, `cache.rs`)
 
@@ -209,9 +219,12 @@ Corresponds to: `LiveBucketIndex.h`, `DiskIndex.h`, `InMemoryIndex.h`, `BucketIn
 | `BucketApplicator` and `Counters` | `BucketApplicator` and `ApplicatorCounters` | Full |
 | `BucketMergeMap` public API | `record_merge()` / `forget_all_merges_producing()` / `get_output()` / `get_outputs_for_input()` | Full |
 | `LedgerEntryIdCmp` / `BucketEntryIdCmp` | `compare_keys()` / `compare_entries()` | Full |
-| `MergeCounters` / `BucketEntryCounters` | same-named Rust structs | Full |
+| `MergeCounters` / `BucketEntryCounters` | Same-named Rust structs | Full |
+| `EvictionResultEntry` / `EvictionResultCandidates` / `EvictedStateVectors` | `EvictionCandidate` / `EvictionResult` / `ResolvedEviction` | Full |
+| `EvictionMetrics` / `EvictionStatistics::recordEvictedEntry()` | `EvictionCounters` / eviction stats | Full |
 | `EvictionStatistics::submitMetricsAndRestartCycle()` | Simplified eviction statistics only | Partial |
 | Binary fuse filter and random-eviction cache | `BucketBloomFilter` / `RandomEvictionCache` | Full |
+| `updateTypeBoundaries()` / `buildTypeRangesMap()` | Type range tracking in index construction | Full |
 
 ## Intentional Omissions
 
@@ -236,6 +249,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `BucketManager::getMergeFuture()` / `putMergeFuture()` | High | No manager-level reattachment to in-flight merges |
 | `HotArchiveBucketIndex` scan, counters, page-size, iterator, bloom API | Medium | Only lazy point lookup exists today |
 | `BucketSnapshotManager::maybeCopySearchableHotArchiveBucketListSnapshot()` | Medium | Live snapshot refresher exists; hot archive equivalent does not |
+| `SearchableHotArchiveBucketListSnapshot::scanAllEntries()` | Medium | Hot archive full-scan iteration not implemented |
 | `BucketInputIterator` / `BucketOutputIterator` production parity | Medium | Legacy gzip wrappers differ from upstream uncompressed iterators |
 | `BucketManager` meter accessors and merge timer parity | Low | Counter snapshots exist but not the public meter API |
 | `BucketManager::reportBucketEntryCountMetrics()` | Low | Entry counters are collected but not fully published |
@@ -272,25 +286,27 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| `BucketTests.cpp` | 8 TEST_CASE / 13 SECTION | ~87 `#[test]` | Merge rules, bucket encoding, hot archive behavior |
-| `BucketListTests.cpp` | 17 TEST_CASE / 23 SECTION | ~70 `#[test]` | Spill scheduling, eviction scans, snapshots |
-| `BucketManagerTests.cpp` | 11 TEST_CASE / 0 SECTION | ~42 `#[test]` | Lifecycle, cleanup, persistence, HAS restart |
+| `BucketTests.cpp` | 8 TEST_CASE / 13 SECTION | ~79 `#[test]` | Merge rules, bucket encoding, hot archive behavior |
+| `BucketListTests.cpp` | 17 TEST_CASE / 23 SECTION | ~29 `#[test]` | Spill scheduling, eviction scans, snapshots |
+| `BucketManagerTests.cpp` | 11 TEST_CASE / 0 SECTION | ~30 `#[test]` | Lifecycle, cleanup, persistence, HAS restart |
 | `BucketIndexTests.cpp` | 13 TEST_CASE / 10 SECTION | ~56 `#[test]` | In-memory index, disk index, cache, persistence |
-| `BucketMergeMapTests.cpp` | 1 TEST_CASE / 0 SECTION | 6 `#[test]` | Completed-merge bookkeeping |
-| **Total** | **50 TEST_CASE / 46 SECTION** | **280 `#[test]`** | Rust coverage is broader but still misses a few upstream scenarios |
+| `BucketMergeMapTests.cpp` | 1 TEST_CASE / 0 SECTION | 13 `#[test]` | Completed-merge bookkeeping |
+| Other (applicator, entry, future, metrics, iterator) | — | ~41 `#[test]` | Applicator, entry comparison, iterator tests |
+| **Total** | **50 TEST_CASE / 46 SECTION** | **~248 `#[test]`** | Rust coverage is broader but still misses a few upstream scenarios |
 
 ### Test Gaps
 
 - In-progress merge reattachment after restart is still thinner than upstream's `bucketmanager reattach to running merge` coverage.
 - `maxEntriesToArchive` and eviction-cycle metric behavior from `BucketListTests.cpp` are only partially mirrored.
 - No dedicated tests exercise a full `HotArchiveBucketIndex`-style scan or counter API because the Rust API does not exist yet.
+- No tests exercise `scanAllEntries` on hot archive snapshots because the method does not exist yet.
 - Legacy `iterator.rs` tests cover gzip wrappers, not parity with the uncompressed production bucket format used elsewhere in the crate.
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 87 |
-| Gaps (None + Partial) | 7 |
+| Implemented (Full) | 95 |
+| Gaps (None + Partial) | 18 |
 | Intentional Omissions | 7 |
-| **Parity** | **87 / (87 + 7) = 93%** |
+| **Parity** | **95 / (95 + 18) = 84%** |

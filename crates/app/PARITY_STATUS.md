@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-app`
 **Upstream**: `stellar-core/src/main/`
-**Overall Parity**: 69%
-**Last Updated**: 2026-03-25
+**Overall Parity**: 70%
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -11,7 +11,7 @@
 |------|--------|-------|
 | Application lifecycle and runtime wiring | Full | Init, run, catchup, shutdown, recovery loops |
 | Configuration loading and compat translation | Partial | Core TOML and captive-core translation work; many stellar-core helpers omitted |
-| HTTP admin and query surfaces | Partial | Core endpoints exist; several stellar-core-compatible admin routes are stubbed or absent |
+| HTTP admin and query surfaces | Partial | Core endpoints exist including generateLoad; several compat admin routes are stubbed or absent |
 | Catchup and restart recovery | Full | Archive catchup, replay, restart restore, publish flow wired |
 | Persistent state integration | Partial | Critical state persisted through `henyey-db`; some SCP helper APIs absent |
 | Background maintenance | Full | Periodic pruning and RPC-retention cleanup implemented |
@@ -111,6 +111,8 @@ Corresponds to: `CommandHandler.h`
 |--------------|------|--------|
 | `info()` / `metrics()` / `peers()` / `quorum()` / `scpInfo()` / `tx()` / `upgrades()` / `dumpProposedSettings()` / `sorobanInfo()` | native and compat handlers | Full |
 | `maintenance()` / `clearMetrics()` / `selfCheck()` | native and compat handlers | Full |
+| `generateLoad()` | native and compat handlers (feature-gated via `loadgen`) | Full |
+| `testAcc()` | compat handler with deterministic key derivation | Full |
 | `manualClose()` | works, but explicit seq/time params are rejected in compat/native handlers | Partial |
 | `connect()` / `dropPeer()` / `unban()` / `bans()` | native handlers work; compat handlers are placeholders or incomplete | Partial |
 | `ll()` | native dynamic log control works; compat handler is minimal | Partial |
@@ -176,7 +178,8 @@ Features excluded by design. These are NOT counted against parity %.
 | Protocol-23 corruption verifier/reconciler | Repository targets protocol 24+ only |
 | `CommandLine.h`, `SettingsUpgradeUtils.h`, and `dumpxdr.h` utilities | Owned by the `henyey` binary crate, not `henyey-app` |
 | `minimalDBForInMemoryMode()` / `canRebuildInMemoryLedgerFromBuckets()` | Test-only upstream helpers not mirrored in this crate |
-| `BUILD_TESTS`-only overlay/loadgen toggles | Rust test strategy uses different hooks and feature gates |
+| `BUILD_TESTS`-only overlay toggle (`getRunInOverlayOnlyMode` / `setRunInOverlayOnlyMode`) | Rust test strategy uses different hooks and feature gates |
+| `testTx()` | Test-only wire-format endpoint; no production use |
 
 ## Gaps
 
@@ -220,33 +223,38 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Config and compat translation | 9 TEST_CASE / 22 SECTION | 57 `#[test]` | Strong coverage for loading, validation, and captive-core translation |
-| Command handler / compat HTTP | 6 TEST_CASE / 27 SECTION | 44 `#[test]` | Rust covers many handler helpers, but several compat behaviors are still stubs |
-| Query server | 1 TEST_CASE / 9 SECTION | 9 `#[test]` | Good coverage of lookup ordering and validation |
+| Config and compat translation | 9 TEST_CASE / 21 SECTION | 64 `#[test]` | Strong coverage for loading, validation, and captive-core translation |
+| Command handler / compat HTTP | 5 TEST_CASE / 27 SECTION | 46 `#[test]` | Includes handler helpers, generateLoad, testacc; some compat behaviors are still stubs |
+| Query server | 1 TEST_CASE / 9 SECTION | 7 `#[test]` | Good coverage of lookup ordering and validation |
 | Run/catchup utilities | 4 TEST_CASE / 5 SECTION | 19 `#[test]` | Target parsing and run-mode helpers are well covered |
 | Self-check scheduling | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No dedicated periodic self-check scheduling tests |
 | Maintenance | 0 TEST_CASE / 0 SECTION | 12 `#[test]` | Strong regression coverage for retention thresholds |
-| App core types/runtime | — | 29 `#[test]` | App state, recovery bookkeeping, and runtime helpers |
+| Banned accounts | 4 TEST_CASE / 21 SECTION | 0 `#[test]` | Subsystem not implemented; upstream has comprehensive tests |
+| App core types/runtime | — | 35 `#[test]` | App state, recovery bookkeeping, and runtime helpers |
 | Metadata and logging | — | 10 `#[test]` | Basic coverage for stream rotation and log-level handling |
 
 ### Test Gaps
 
 - Compat admin endpoints lack parity-style integration tests for real side effects (`connect`, `droppeer`, `unban`, survey control).
 - There is no Rust equivalent of upstream's scheduled online self-check test in `SelfCheckTests.cpp`.
-- Account-ban persistence has no Rust tests because the subsystem is not implemented.
+- Account-ban persistence has no Rust tests because the subsystem is not implemented. Upstream has 4 TEST_CASE / 21 SECTION.
+- HTTP threaded server behavior (3 TEST_CASE upstream in `HttpThreadedTests.cpp`) has no direct equivalent.
 
 ## Verification Results
 
 - **Testnet verification**: Node successfully syncs and tracks consensus on testnet, closing ledgers in parity with stellar-core validators.
 - **Catchup gap recovery**: Successfully bridges 20-30 slot gaps between catchup checkpoint and live consensus (verified January 2026).
 - **Event loop stability**: Multiple event loop freeze bugs identified and fixed (February 2026): blocking flood demand sends, unbounded buffered ledger close loops, blocking bucket GC during catchup, and SCP drain starvation.
+- **Post-catchup convergence**: Fixed several convergence failures including dead loops targeting stale checkpoints, deadlocks from frozen `latest_externalized`, and SCP EXTERNALIZE envelope emission for validator nodes (March–April 2026).
+- **TX queue parity**: Implemented stellar-core `updateQueue` semantics with correct invalidation and revalidation ordering (March 2026).
+- **Audit fixes**: Resolved audit findings including config passphrase matching, quorum threshold rounding, unsolicited quorum set rejection, and compat config validator entry validation (March–April 2026).
 - **Survey protocol**: Time-sliced surveys successfully collect and report topology data from testnet peers.
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 88 |
+| Implemented (Full) | 90 |
 | Gaps (None + Partial) | 39 |
-| Intentional Omissions | 26 |
-| **Parity** | **88 / (88 + 39) = 69%** |
+| Intentional Omissions | 24 |
+| **Parity** | **90 / (90 + 39) = 70%** |

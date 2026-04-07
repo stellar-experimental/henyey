@@ -3,7 +3,7 @@
 **Crate**: `henyey-tx`
 **Upstream**: `stellar-core/src/transactions/`
 **Overall Parity**: 97%
-**Last Updated**: 2026-03-26
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -21,6 +21,7 @@
 | Offer Exchange | Full | exchangeV10, pool exchange, price bounds |
 | Sponsorship Utils | Full | Inline in state.rs |
 | Per-Operation Rollback | Full | Savepoint matches nested LedgerTxn |
+| Frozen Ledger Keys (P26) | Full | CAP-77: FrozenKeyConfig, per-op checking |
 | Soroban Fee Computation | Partial | Static surge pricing fee computation not implemented |
 | Flooding Validation | None | Overlay admission checks omitted |
 | Parallel Execution | None | Not implemented by design |
@@ -40,8 +41,8 @@
 | `OfferExchange.h` / `.cpp` | `operations/execute/offer_exchange.rs` | Full |
 | `OperationFrame.h` / `.cpp` | `operations/mod.rs`, `operations/execute/mod.rs` | Full |
 | `SignatureUtils.h` / `.cpp` | `signature_checker.rs`, `validation.rs` | Verify functions inline |
-| `SponsorshipUtils.h` / `.cpp` | `state.rs` | Inline in state manager |
-| `TransactionUtils.h` / `.cpp` | `state.rs`, `frame.rs`, various ops | Distributed across crate |
+| `SponsorshipUtils.h` / `.cpp` | `state/sponsorship.rs` | Inline in state manager |
+| `TransactionUtils.h` / `.cpp` | `state/mod.rs`, `frame.rs`, various ops | Distributed across crate |
 | `ManageOfferOpFrameBase.h` / `.cpp` | `operations/execute/manage_offer.rs` | Full |
 | `PathPaymentOpFrameBase.h` / `.cpp` | `operations/execute/path_payment.rs` | Full |
 | `TrustFlagsOpFrameBase.h` / `.cpp` | `operations/execute/trust_flags.rs` | Full |
@@ -287,7 +288,7 @@ Corresponds to: `OperationFrame.h`
 | `isSoroban()` | `is_soroban()` | Full |
 | `isOpSupported()` | Protocol version checks inline | Full |
 
-### SponsorshipUtils (`state.rs`)
+### SponsorshipUtils (`state/sponsorship.rs`)
 
 Corresponds to: `SponsorshipUtils.h`
 
@@ -334,6 +335,7 @@ Corresponds to: `TransactionUtils.h`
 | `getLumenContractInfo()` / `getAssetContractID()` | `contract_id_from_asset()` | Full |
 | `validateContractLedgerEntry()` | Inline in soroban host | Full |
 | `createEntryRentChangeWithoutModification()` | Inline in `execute/mod.rs` rent computation | Full |
+| `offerAccessesFrozenKey()` | `offer_accesses_frozen_key()` in `frozen_keys.rs` | Full |
 
 ### SignatureUtils (distributed)
 
@@ -348,6 +350,18 @@ Corresponds to: `SignatureUtils.h`
 | `getHint()` | Inline hint extraction | Full |
 | `sign()` | Not needed (no signing in Rust) | Full |
 | `signHashX()` | Not needed (no signing in Rust) | Full |
+
+### Frozen Ledger Keys (`frozen_keys.rs`)
+
+Corresponds to: CAP-77 frozen key checking (distributed across `OperationFrame.h`, `TransactionFrame.h`)
+
+| stellar-core | Rust | Status |
+|--------------|------|--------|
+| `TransactionFrame::accessesFrozenKey()` | `accesses_frozen_key()` | Full |
+| `OperationFrame::doesAccessFrozenKey()` (per-op) | `operation_accesses_frozen_key()` | Full |
+| `FrozenKeyConfig` loading | `FrozenKeyConfig::new()` | Full |
+| Bypass TX hash checking | `is_freeze_bypass_tx()` | Full |
+| Per-asset frozen key checking | `offer_accesses_frozen_key()` | Full |
 
 ### Classic Operations (`operations/execute/`)
 
@@ -393,6 +407,7 @@ All 24 classic operations are fully implemented:
 | stellar-core Component | Rust Module | Status |
 |------------------------|-------------|--------|
 | Protocol-versioned hosts | `soroban/protocol/p24.rs`, `p25.rs` | Full |
+| Protocol 26 host | `soroban/host.rs` (p26 dispatch) | Full |
 | `e2e_invoke` API | `soroban/host.rs` | Full |
 | Storage snapshot | `soroban/storage.rs` | Full |
 | Budget tracking | `soroban/budget.rs` | Full |
@@ -400,11 +415,11 @@ All 24 classic operations are fully implemented:
 | Rent fee calculation | `soroban/host.rs` | Full |
 | Archived entry restoration | `operations/execute/restore_footprint.rs` | Full |
 | PRNG seed | `soroban/host.rs` | Full |
-| Error mapping | `soroban/error.rs` | Full |
+| Error mapping (incl. p26) | `soroban/error.rs` | Full |
 | Write bytes checking | `soroban/host.rs` | Full |
 | Event size checking | `soroban/host.rs` | Full |
 
-### Order Book Index (`state.rs`)
+### Order Book Index (`state/mod.rs`)
 
 | stellar-core Component | Rust Implementation | Status |
 |------------------------|---------------------|--------|
@@ -416,7 +431,7 @@ All 24 classic operations are fully implemented:
 | Index maintenance | `create_offer`, `update_offer`, `delete_offer` | Full |
 | Rollback support | Index rebuilt from restored offers | Full |
 
-### Per-Operation Savepoint Rollback (`state.rs`)
+### Per-Operation Savepoint Rollback (`state/mod.rs`)
 
 Corresponds to: `LedgerTxn.h` (nested commit/rollback)
 
@@ -466,6 +481,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `sign()` / `signHashX()` (SignatureUtils) | No signing required; verification only |
 | `setReplayTransactionResult()` / `adoptFailedReplayResult()` | Test replay infrastructure |
 | `exchangeV2()` / `exchangeV3()` | Pre-protocol-10 exchange; protocol 24+ only |
+| `TransactionMetaFrame` (test-only view) | Test infrastructure; not needed in production |
 
 ## Gaps
 
@@ -494,7 +510,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 3. **Protocol Versioning for Soroban**
    - **stellar-core**: Version-aware code paths within single codebase
-   - **Rust**: Separate `soroban-env-host-p24` and `soroban-env-host-p25` crates
+   - **Rust**: Separate `soroban-env-host-p24`, `soroban-env-host-p25`, and `soroban-env-host-p26` crates
    - **Rationale**: Compile-time protocol selection avoids runtime branching in host
 
 4. **Error Handling**
@@ -512,40 +528,46 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: Sponsorship tracking integrated into `LedgerStateManager` with explicit stack and entry sponsor maps
    - **Rationale**: Unified state management; same observable behavior
 
+7. **Frozen Key Checking**
+   - **stellar-core**: Per-operation `doesAccessFrozenKey()` virtual method on each `OperationFrame`
+   - **Rust**: Centralized `FrozenKeyConfig` with `accesses_frozen_key()` dispatch per operation type
+   - **Rationale**: Data-driven dispatch avoids virtual method overhead; same observable behavior
+
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
 | InvokeHostFunction | 70 TEST_CASE / 301 SECTION | 25 #[test] | Testnet integration covers gaps |
-| Offer management | 2 TEST_CASE / 178 SECTION | 34 #[test] | Good unit coverage |
-| TxEnvelope/Signatures | 5 TEST_CASE / 154 SECTION | 15 #[test] | Testnet integration covers gaps |
+| Offer management | 2 TEST_CASE / 178 SECTION | 35 #[test] | Good unit coverage |
+| TxEnvelope/Signatures | 5 TEST_CASE / 154 SECTION | 16 #[test] | Testnet integration covers gaps |
 | PathPaymentStrictReceive | 2 TEST_CASE / 123 SECTION | 21 #[test] | Testnet integration covers gaps |
 | Exchange mechanics | 6 TEST_CASE / 85 SECTION | 16 #[test] | Good exchange math coverage |
 | LiquidityPool trading | 2 TEST_CASE / 86 SECTION | 17 #[test] | Testnet integration covers gaps |
 | Payment | 2 TEST_CASE / 76 SECTION | 26 #[test] | Good coverage |
 | ClaimableBalance | 1 TEST_CASE / 72 SECTION | 28 #[test] | Good coverage |
-| SetTrustLineFlags | 2 TEST_CASE / 70 SECTION | 16 #[test] | Testnet integration covers gaps |
+| SetTrustLineFlags | 4 TEST_CASE / 70 SECTION | 17 #[test] | Testnet integration covers gaps |
 | ManageBuyOffer | 8 TEST_CASE / 69 SECTION | 35 #[test] (shared) | Shared with sell offer tests |
 | RevokeSponsorship | 1 TEST_CASE / 65 SECTION | 15 #[test] | Testnet integration covers gaps |
 | PathPaymentStrictSend | 2 TEST_CASE / 58 SECTION | 21 #[test] (shared) | Shared with strict receive tests |
-| AllowTrust | 2 TEST_CASE / 54 SECTION | 16 #[test] (shared) | Shared with trust flags tests |
+| FrozenLedgerKeys | 14 TEST_CASE / 54 SECTION | 33 #[test] | Good coverage |
+| AllowTrust | 2 TEST_CASE / 54 SECTION | 17 #[test] (shared) | Shared with trust flags tests |
 | AccountMerge | 2 TEST_CASE / 46 SECTION | 17 #[test] | Good coverage |
 | TxResults | 1 TEST_CASE / 38 SECTION | 31 #[test] | Good coverage |
 | ChangeTrust | 2 TEST_CASE / 37 SECTION | 21 #[test] | Good coverage |
-| FeeBumpTransaction | 1 TEST_CASE / 23 SECTION | 19 #[test] | Good coverage |
-| SetOptions | 1 TEST_CASE / 21 SECTION | 24 #[test] | Exceeds upstream |
+| FeeBumpTransaction | 1 TEST_CASE / 23 SECTION | 20 #[test] | Good coverage |
+| SetOptions | 1 TEST_CASE / 21 SECTION | 25 #[test] | Exceeds upstream |
 | ClawbackOps | 1 TEST_CASE / 18 SECTION | 16 #[test] | Good coverage |
 | Inflation | 2 TEST_CASE / 16 SECTION | 7 #[test] | Deprecated operation |
 | ClawbackClaimableBalance | 1 TEST_CASE / 14 SECTION | 16 #[test] (shared) | Shared with clawback tests |
 | LiquidityPoolDeposit | 1 TEST_CASE / 12 SECTION | 17 #[test] (shared) | Shared pool tests |
 | LiquidityPoolWithdraw | 1 TEST_CASE / 12 SECTION | 17 #[test] (shared) | Shared pool tests |
 | BumpSequence | 1 TEST_CASE / 11 SECTION | 6 #[test] | Adequate coverage |
-| CreateAccount | 1 TEST_CASE / 10 SECTION | 13 #[test] | Exceeds upstream |
+| CreateAccount | 1 TEST_CASE / 10 SECTION | 14 #[test] | Exceeds upstream |
 | BeginSponsoring | 1 TEST_CASE / 9 SECTION | 15 #[test] (shared) | Shared sponsorship tests |
 | Events | 1 TEST_CASE / 8 SECTION | 60 #[test] | Exceeds upstream |
 | ManageData | 1 TEST_CASE / 4 SECTION | 14 #[test] | Exceeds upstream |
 | EndSponsoring | 1 TEST_CASE / 2 SECTION | 15 #[test] (shared) | Shared sponsorship tests |
-| SignatureUtils | 2 TEST_CASE / 0 SECTION | 15 #[test] | Good coverage |
+| SignatureUtils | 2 TEST_CASE / 0 SECTION | 16 #[test] | Good coverage |
 | ParallelApply | 4 TEST_CASE / 0 SECTION | 0 #[test] | N/A (not implemented) |
 | State management | - | 61 #[test] | Rust-only: savepoint, rollback, offer index |
 | Entry store | - | 45 #[test] | Rust-only: generic entry store |
@@ -553,21 +575,23 @@ Features not yet implemented. These ARE counted against parity %.
 | Lumen reconciler | - | 17 #[test] | Rust-only: SAC event reconciliation |
 | Result tracking | - | 31 #[test] | Rust-only: MutableTransactionResult |
 | Live execution | - | 28 #[test] | Rust-only: fee/seq/refund flow |
-| History apply | - | 20 #[test] | Rust-only: catchup mode |
-| Frame properties | - | 52 #[test] | Rust-only: envelope accessors, Soroban validation helpers |
+| History apply | - | 22 #[test] | Rust-only: catchup mode |
+| Frame properties | - | 54 #[test] | Rust-only: envelope accessors, Soroban validation |
 | Validation | - | 28 #[test] | Rust-only: precondition checks |
 | Soroban types | - | 2 #[test] | Rust-only: protocol type mapping |
 | Soroban errors | - | 15 #[test] | Rust-only: error code mapping |
 | Soroban storage | - | 12 #[test] | Rust-only: storage snapshot |
-| Soroban events | - | 5 #[test] | Rust-only: contract events |
+| Soroban host | - | 9 #[test] | Rust-only: host configuration |
 | Soroban budget | - | 9 #[test] | Rust-only: budget tracking |
-| Soroban host | - | 14 #[test] | Rust-only: host configuration |
+| Soroban P25 | - | 6 #[test] | Rust-only: protocol 25 host tests |
 | Prefetch | - | 11 #[test] | Rust-only: footprint prefetch |
 | Test utilities | - | 14 #[test] | Rust-only: test infrastructure |
 | Error types | - | 12 #[test] | Rust-only: error mapping |
-| Operation dispatch | - | 61 #[test] | Rust-only: operation routing and helpers |
+| Operation dispatch | - | 35 #[test] | Rust-only: operation routing and helpers |
+| Operation validation | - | 26 #[test] | Rust-only: operation validation |
+| Lib integration | - | 11 #[test] | Rust-only: public API integration |
 
-**Total: 130 TEST_CASE / 1,672 SECTION upstream vs. 899 #[test] in Rust**
+**Total: 144 TEST_CASE / 1,726 SECTION upstream vs. 944 #[test] in Rust**
 
 ### Test Gaps
 
@@ -575,10 +599,10 @@ The following upstream test areas have limited Rust unit test equivalents, thoug
 
 1. **InvokeHostFunction edge cases** (301 SECTIONs vs 25 tests) -- Soroban contract invocation, storage, archival edge cases
 2. **Offer exchange mechanics** (178 SECTIONs vs 35 tests) -- DEX crossing, rounding, self-trade
-3. **TxEnvelope multisig scenarios** (154 SECTIONs vs 15 tests) -- Complex multisig, extra signers, batching
+3. **TxEnvelope multisig scenarios** (154 SECTIONs vs 16 tests) -- Complex multisig, extra signers, batching
 4. **PathPayment complex paths** (123 SECTIONs vs 21 tests) -- Multi-hop paths, pool+book interaction
 5. **LiquidityPool trading** (86 SECTIONs vs 17 tests) -- Cross-pool operations
-6. **SetTrustLineFlags** (70 SECTIONs vs 16 tests) -- Authorization state transitions
+6. **SetTrustLineFlags** (70 SECTIONs vs 17 tests) -- Authorization state transitions
 
 ## Verification Results
 
@@ -654,6 +678,14 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 5. **Clawback Trustline Flag Check (Fixed January 2026)**: Clawback operations were checking `AUTH_CLAWBACK_ENABLED_FLAG` on the issuer account instead of `TRUSTLINE_CLAWBACK_ENABLED_FLAG` on the trustline. Fixed to check the trustline flag per stellar-core behavior.
 
+6. **Ed25519SignedPayload Signer Comparison (Fixed March 2026)**: Ed25519SignedPayload signer key comparison was not including the payload bytes when matching against transaction signatures. Fixed to include full payload in comparison per stellar-core behavior.
+
+7. **Hash-X Preimage Length (Fixed March 2026)**: Hash-X preimage validation was incorrectly requiring a 32-byte length. Fixed to accept variable-length preimages per XDR specification.
+
+8. **Soroban Resource Fee Validation (Fixed March 2026)**: Missing validation that `resource_fee <= total_fee` for Soroban transactions, allowing transactions with resource fees exceeding total fees.
+
+9. **Balance Refund Overflow (Fixed March 2026)**: Fee refund arithmetic could overflow on i64 boundaries. Fixed with saturating arithmetic.
+
 #### Remaining Work
 
 1. **Bucket list parity**: The primary blocker for higher match rates at high ledger numbers is bucket list state divergence, being addressed in `henyey-bucket`.
@@ -666,31 +698,32 @@ Both approaches ensure WASM compilation costs are NOT charged against transactio
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 196 |
+| Implemented (Full) | 201 |
 | Gaps (None + Partial) | 6 |
-| Intentional Omissions | 30 |
-| **Parity** | **196 / (196 + 6) = 97%** |
+| Intentional Omissions | 31 |
+| **Parity** | **201 / (201 + 6) = 97%** |
 
-Breakdown of the 196 implemented items:
+Breakdown of the 201 implemented items:
 - TransactionFrame accessors/methods: 29
 - Validation functions: 13
 - SignatureChecker functions: 10
 - MutableTransactionResult functions: 16
 - FeeBumpTransactionFrame functions: 11
-- Live execution functions: 14 (+2: commonPreApply, processSignatures)
+- Live execution functions: 11
 - TransactionMetaBuilder functions: 9
 - Event emission functions: 18
-- Offer exchange functions: 12
+- Offer exchange functions: 13
 - OperationFrame/ThresholdLevel: 11
 - SponsorshipUtils functions: 14
-- TransactionUtils functions: 21 (+1: createEntryRentChangeWithoutModification)
+- TransactionUtils functions: 22
 - Classic operations (24 ops, doApply + doCheckValid each): 27
 - Soroban operations (3 ops): 3
-- Soroban integration components: 11
+- Soroban integration components: 12
 - Order book index: 7
 - Savepoint/rollback: 7
 - LumenEventReconciler: 1
-- SignatureUtils (verify functions): 4
+- SignatureUtils (verify functions): 7
+- Frozen ledger keys (CAP-77): 5
 
 Breakdown of the 6 gaps:
 - `computeSorobanResourceFee()` (static fee computation)

@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-herder`
 **Upstream**: `stellar-core/src/herder/`
-**Overall Parity**: 77%
-**Last Updated**: 2026-03-25
+**Overall Parity**: 79%
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -16,7 +16,7 @@
 | LedgerCloseData | Full | All accessors and XDR round-trip |
 | PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache |
 | QuorumTracker | Full | expand, rebuild, closest validators |
-| TransactionQueue | Partial | Missing arb damping (Low priority, flooding optimization only) |
+| TransactionQueue | Partial | Missing arb damping; fee release and drop now implemented |
 | TxQueueLimiter | Partial | Missing visitTopTxs with custom limits |
 | TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
 | SurgePricingUtils | Full | All lane configs and priority queue |
@@ -94,7 +94,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `getJsonTransitiveQuorumInfo()` | `json_api.rs` structures | Partial |
 | `getCurrentlyTrackedQuorum()` | `quorum_tracker.quorum_map()` | Full |
 | `getMaxQueueSizeOps()` | `max_queue_size_ops()` | Full |
-| `getMaxQueueSizeSorobanOps()` | _(not implemented)_ | None |
+| `getMaxQueueSizeSorobanOps()` | `update_soroban_resource_limits()` / `effective_queue_soroban_resources()` | Full |
 | `maybeHandleUpgrade()` | Post-close upgrade check in `henyey-app` | Full |
 | `isBannedTx()` | `tx_queue.is_banned()` | Full |
 | `getTx()` | `tx_queue.get_tx()` | Full |
@@ -282,9 +282,9 @@ Corresponds to: `TransactionQueue.h`
 | `getMaxQueueSizeOps()` | via config | Full |
 | `findAllAssetPairsInvolvedInPaymentLoops()` | _(not implemented)_ | None |
 | `canAdd()` | logic in `try_add()` | Full |
-| `releaseFeeMaybeEraseAccountState()` | _(not implemented)_ | None |
-| `prepareDropTransaction()` | _(not implemented)_ | None |
-| `dropTransaction()` | handled in eviction | Partial |
+| `releaseFeeMaybeEraseAccountState()` | `drop_transaction()` | Full |
+| `prepareDropTransaction()` | _(not needed — Rust ownership)_ | _(omitted)_ |
+| `dropTransaction()` | `drop_transaction()` | Full |
 | `isFiltered()` | `is_filtered()` | Full |
 | `broadcastTx()` | `TxBroadcastManager` | Full |
 | `broadcastSome()` | `TxBroadcastManager` | Full |
@@ -431,6 +431,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `Herder::create()` (factory) | Rust uses direct construction |
 | `Herder::shutdown()` | Rust uses RAII; drop handles cleanup |
 | medida metrics (`SCPMetrics`, `QueueMetrics`) | Metrics infrastructure uses different Rust libraries |
+| `prepareDropTransaction()` | Rust ownership model doesn't need a separate "prepare" step; `drop_transaction()` handles both |
 
 ## Gaps
 
@@ -460,7 +461,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `checkAndMaybeReanalyzeQuorumMap()` | Low | Background quorum analysis |
 | `getMoreSCPState()` | Low | Peer SCP state request |
 | `recomputeKeysToFilter()` | Low | Soroban footprint filtering |
-| `getMaxQueueSizeSorobanOps()` | Low | Soroban queue sizing |
 | `ctValidityOffset()` | Low | Close time offset computation |
 | PendingEnvelopes cost tracking (4 methods) | Low | Per-validator cost analysis |
 | `HerderPersistence::getNodeQuorumSet()` | Low | Node-level quorum set lookup |
@@ -518,18 +518,18 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| HerderTests | 38 TEST_CASE / 277 SECTION | 61 `#[test]` | Broad unit coverage, limited end-to-end flow tests |
-| PendingEnvelopesTests | 1 TEST_CASE / 20 SECTION | 22 `#[test]` | Good unit coverage; missing cost-tracking parity |
+| HerderTests | 38 TEST_CASE / 277 SECTION | 26 `#[test]` + 54 scp_driver | Broad unit coverage; driver tests significantly expanded |
+| PendingEnvelopesTests | 1 TEST_CASE / 20 SECTION | 24 `#[test]` | Good unit coverage; missing cost-tracking parity |
 | QuorumIntersectionTests | 28 TEST_CASE / 0 SECTION | 0 tests | Not implemented |
 | QuorumTrackerTests | 2 TEST_CASE / 10 SECTION | 10 unit tests | Good coverage |
-| TransactionQueueTests | 18 TEST_CASE / 157 SECTION | 112 `#[test]` | Strong unit coverage; missing arb-damping scenarios |
-| TxSetTests | 10 TEST_CASE / 66 SECTION | 83 `#[test]` | Strong unit coverage; missing ApplicableTxSetFrame parity |
+| TransactionQueueTests | 18 TEST_CASE / 157 SECTION | 118 `#[test]` + 7 integration | Strong coverage; fee release and drop now tested |
+| TxSetTests | 10 TEST_CASE / 66 SECTION | 30 tx_set + 27 tx_set_utils + 22 parallel | Strong coverage across modules |
 | UpgradesTests | 29 TEST_CASE / 109 SECTION | 20 `#[test]` | Major gap; missing ledger-integrated config-upgrade tests |
 
 ### Test Gaps
 
-- **HerderTests**: Missing integration tests for full envelope processing flow, ledger close lifecycle, out-of-sync recovery, quorum map reanalysis, and upgrade scheduling
-- **TransactionQueue**: Missing tests for arbitrage damping, filtered-account overrides, and full rebroadcast behavior. Note: `rebroadcast()` exists in `TxBroadcastManager` but is not called after ledger close (`updateTransactionQueue` in stellar-core calls `queue.rebroadcast()` after `ban()`)
+- **HerderTests**: Missing integration tests for full envelope processing flow, ledger close lifecycle, out-of-sync recovery, quorum map reanalysis, and upgrade scheduling. SCP driver tests (54) cover significant validation and signing paths.
+- **TransactionQueue**: Missing tests for arbitrage damping and filtered-account overrides. Fee release, drop, and rebroadcast testing improved. Note: `rebroadcast()` exists in `TxBroadcastManager` but is not wired into post-ledger-close path.
 - **TxSet**: Missing `ApplicableTxSetFrame` validation tests, phase ordering tests, and history-tx-set construction tests
 - **Upgrades**: Missing ledger-integrated upgrade application tests, config upgrade set tests, and nomination-timeout stripping behavior
 - **QuorumIntersection**: Entirely missing (not implemented)
@@ -538,7 +538,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 135 |
-| Gaps (None + Partial) | 41 |
-| Intentional Omissions | 12 |
-| **Parity** | **135 / (135 + 41) = 77%** |
+| Implemented (Full) | 138 |
+| Gaps (None + Partial) | 37 |
+| Intentional Omissions | 13 |
+| **Parity** | **138 / (138 + 37) = 79%** |

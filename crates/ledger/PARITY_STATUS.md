@@ -3,7 +3,7 @@
 **Crate**: `henyey-ledger`
 **Upstream**: `stellar-core/src/ledger/`
 **Overall Parity**: 94%
-**Last Updated**: 2026-03-26
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -19,7 +19,7 @@
 | Fee / Reserve Calculations | Full | Liabilities, sponsorship |
 | Offer Sorting / Comparison | Full | OfferDescriptor, AssetPair |
 | In-Memory Soroban State | Full | Contract data/code with TTL |
-| Config Upgrade Handling | Full | Validation, apply, and protocol upgrade synthesis |
+| Config Upgrade Handling | Full | Validation, apply, protocol upgrade synthesis |
 | LedgerTxn Nested Transactions | Partial | Savepoints cover operation rollback |
 | Parallel Apply / Threading | Partial | Parallel cluster execution via tokio; no ApplyState phase machine |
 | Soroban Metrics | None | No metrics collection |
@@ -46,6 +46,7 @@
 | `TrustLineWrapper.h` / `TrustLineWrapper.cpp` | `lib.rs` (trustlines module) | Balance constraint subset |
 | `SorobanMetrics.h` / `SorobanMetrics.cpp` | -- | Not implemented |
 | `SharedModuleCacheCompiler.h` / `SharedModuleCacheCompiler.cpp` | `manager.rs` | Single-threaded `rebuild_module_cache()` |
+| `LedgerEntryScope.h` / `LedgerEntryScope.cpp` | -- | Not needed; Rust ownership model |
 | `LedgerTxnOfferSQL.cpp` | -- | SQL backend not implemented |
 
 ## Component Mapping
@@ -256,7 +257,7 @@ Corresponds to: `InMemorySorobanState.h`
 | `InternalContractDataMapEntry` | HashMap-based storage | Full |
 | `SharedSorobanState` (thread-safe wrapper) | `SharedSorobanState` | Full |
 
-### manager.rs — module cache (`manager.rs`)
+### manager.rs -- module cache (`manager.rs`)
 
 Corresponds to: `SharedModuleCacheCompiler.h`
 
@@ -329,7 +330,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `InternalLedgerEntry` / `InternalLedgerKey` (generalized types) | Simplified to direct `LedgerEntry`/`LedgerKey`; sponsorship/seqnum tracked differently |
 | `ThreadInvariant` class | Not needed; Rust ownership model provides thread safety |
 | `LedgerTxn` full nested transaction model | Delta+savepoint model covers all use cases in the execution pipeline |
-| `SorobanNetworkConfig::updateCostTypesForV26()` | P26 cost type updates handled through existing infrastructure |
+| `LedgerEntryScope.h` / `LedgerEntryScope.cpp` (scoped entry tracking) | Rust ownership/borrowing system provides compile-time scope safety without runtime checks |
 
 ## Gaps
 
@@ -355,9 +356,9 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: The delta+savepoint model is simpler while covering the primary use case (per-operation rollback during transaction execution). General nesting is not needed by the current execution pipeline. The `InternalLedgerEntry` generalization is unnecessary because sponsorship tracking is handled inline during operation execution.
 
 2. **Threading Model**
-   - **stellar-core**: Multi-threaded with dedicated apply thread and parallel Soroban execution threads. Uses an `ApplyState` phase machine (SETTING_UP_STATE -> READY_TO_APPLY -> APPLYING -> COMMITTING) to coordinate thread access. `LedgerTxn` enforces same-thread invariant. Transaction execution split into `preParallelApply` (sequential on primary thread) and `parallelApply` (on worker threads).
-   - **Rust**: Parallel Soroban cluster execution via `tokio::spawn_blocking` in `execute_stage_clusters()`. Each cluster gets its own `TransactionExecutor` and `LedgerDelta`, merged back into the parent delta after completion. Transaction execution split into `pre_apply()` (validation, fee, seq bump) and `apply_body()` (operations) matching the upstream architecture. No `ApplyState` phase machine — ledger close orchestration is sequential at the stage level.
-   - **Rationale**: The `pre_apply`/`apply_body` split mirrors stellar-core's `preParallelApply`/`parallelApply` architecture, enabling correct parallel execution without an explicit phase machine. Tokio's blocking thread pool replaces `std::async` for cluster parallelism.
+   - **stellar-core**: Multi-threaded with dedicated apply thread and parallel Soroban execution threads. Uses an `ApplyState` phase machine (SETTING_UP_STATE -> READY_TO_APPLY -> APPLYING -> COMMITTING) to coordinate thread access. `LedgerTxn` enforces same-thread invariant. `LedgerEntryScope` provides compile-time and runtime scope checking for entry access across threads. Transaction execution split into `preParallelApply` (sequential on primary thread) and `parallelApply` (on worker threads).
+   - **Rust**: Parallel Soroban cluster execution via `tokio::spawn_blocking` in `execute_stage_clusters()`. Each cluster gets its own `TransactionExecutor` and `LedgerDelta`, merged back into the parent delta after completion. Transaction execution split into `pre_apply()` (validation, fee, seq bump) and `apply_body()` (operations) matching the upstream architecture. No `ApplyState` phase machine — ledger close orchestration is sequential at the stage level. Rust's ownership model provides compile-time thread safety without the need for `LedgerEntryScope`.
+   - **Rationale**: The `pre_apply`/`apply_body` split mirrors stellar-core's `preParallelApply`/`parallelApply` architecture, enabling correct parallel execution without an explicit phase machine. Tokio's blocking thread pool replaces `std::async` for cluster parallelism. Rust's borrow checker replaces `LedgerEntryScope`'s runtime scope tracking.
 
 3. **Persistence Layer**
    - **stellar-core**: Dual SQL + Bucket List with SQL being phased out. Maintains offer tables in SQL with complex bulk upsert/delete operations. Supports read-only and read-write SQL transaction modes. Uses `RandomEvictionCache` for entry caching, `BulkLedgerEntryChangeAccumulator` for batch SQL operations.
@@ -383,21 +384,22 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| LedgerTxn | 32 TEST_CASE / 251 SECTION | 35 #[test] in `delta.rs` | Rust tests focus on coalescing; nested txn tests not needed |
+| LedgerTxn | 32 TEST_CASE / 254 SECTION | 39 #[test] in `delta.rs` | Rust tests focus on coalescing; nested txn tests not needed |
 | Liabilities | 3 TEST_CASE / 37 SECTION | 42 #[test] in `lib.rs` | Good parity on reserve/liability tests |
 | Ledger Header | 3 TEST_CASE / 1 SECTION | 3 #[test] in `header.rs` | Covers hash, skip list, chain verify |
 | Ledger Close Meta | 3 TEST_CASE / 6 SECTION | 7 #[test] in `close.rs` | Covers tx set handling, ordering |
-| Ledger Close | 1 TEST_CASE / 0 SECTION | 30 #[test] in `manager.rs` | Rust has extensive close pipeline tests |
+| Ledger Close | 1 TEST_CASE / 0 SECTION | 41 #[test] in `manager.rs` | Rust has extensive close pipeline tests |
 | Snapshots | -- | 9 #[test] in `snapshot.rs` | No upstream snapshot-specific tests |
 | Offers | -- | 9 #[test] in `offer.rs` | Offer comparison tests |
 | Config Upgrades | -- | 12 #[test] in `config_upgrade.rs` | Config validation tests |
 | Soroban State | -- | 16 #[test] in `soroban_state.rs` | In-memory state tests |
-| Execution | -- | 17 #[test] in `execution/mod.rs`, 2 in `execution/tx_set.rs` | Transaction execution tests |
+| Execution | -- | 18 #[test] in `execution/mod.rs`, 2 in `execution/tx_set.rs`, 4 in `execution/result_mapping.rs`, 3 in `execution/config.rs` | Transaction execution tests |
 | Memory Report | -- | 4 #[test] in `memory_report.rs` | Memory instrumentation tests |
+| Integration | -- | 21 #[test] in `tests/transaction_execution/regression.rs`, 17 in `tests/transaction_execution/classic_events.rs`, 12 in `tests/transaction_execution/preconditions.rs`, 5 in `tests/ledger_close_integration.rs`, 2 in `tests/ledger_close_meta_vectors.rs`, 2 in `tests/tx_meta_hash_vectors.rs` | Extensive integration tests |
 
 ### Test Gaps
 
-- **LedgerTxn nested transaction tests** (32 upstream TEST_CASE / 251 SECTION): The Rust crate does not replicate the full LedgerTxn test suite since it uses a different state model (delta vs nested transactions). The coalescing tests in `delta.rs` cover the equivalent behavior.
+- **LedgerTxn nested transaction tests** (32 upstream TEST_CASE / 254 SECTION): The Rust crate does not replicate the full LedgerTxn test suite since it uses a different state model (delta vs nested transactions). The coalescing tests in `delta.rs` cover the equivalent behavior.
 - **Ledger close meta stream tests**: No equivalent for `LedgerCloseMetaStreamTests.cpp` (3 TEST_CASE / 6 SECTION) which tests meta file rotation and streaming.
 - **Entry activation/deactivation tests**: Not applicable since Rust does not use the activation tracking pattern.
 
@@ -409,13 +411,13 @@ The ledger crate has been verified against testnet for ledger close correctness.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 136 |
+| Implemented (Full) | 138 |
 | Gaps (None + Partial) | 9 |
 | Intentional Omissions | 31 |
-| **Parity** | **136 / (136 + 9) = 94%** |
+| **Parity** | **138 / (138 + 9) = 94%** |
 
-The 136 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (21, including `commonPreApply`→`pre_apply`, `preParallelApply`→`pre_apply`, `parallelApply`→`apply_body`), config upgrade (11, including the v20/v21/v22/v23/v25 network-config synthesis paths), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7).
+The 138 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (28, including `commonPreApply`/`preParallelApply`/`parallelApply` and all v20-v26 network-config synthesis paths), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7), module cache rebuild (1 — partial, not counted here).
 
 The 9 gap items include: timing utilities (2), metrics methods (2), ApplyState phase machine (1), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), and meta streaming (1).
 
-The 31 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant), features handled by other crates (catchup, checkpoint ranges, app state machine), protocol-26-only upgrade helpers, and architectural choices (LedgerTxn nested model replaced by delta+savepoint).
+The 31 intentional omissions are primarily SQL backend features (LedgerTxnRoot, offer SQL, header SQL operations), debug tooling (P23HotArchiveBug, FlushAndRotateMetaDebugWork), deprecated functionality (inflation), C++ implementation artifacts (InternalLedgerEntry, EntryPtrState, ThreadInvariant, LedgerEntryScope), features handled by other crates (catchup, checkpoint ranges, app state machine), and architectural choices (LedgerTxn nested model replaced by delta+savepoint).

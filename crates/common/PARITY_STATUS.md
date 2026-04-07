@@ -2,36 +2,42 @@
 
 **Crate**: `henyey-common`
 **Upstream**: `stellar-core/src/util/`
-**Overall Parity**: 90%
-**Last Updated**: 2026-03-25
+**Overall Parity**: 91%
+**Last Updated**: 2026-04-07
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
-| Protocol version helpers | Partial | Missing `protocolVersionEquals()` and `V_26` |
+| Protocol version helpers | Full | All helpers, constants, and V0–V26 enum variants implemented |
 | Hash and ledger key utilities | Full | Hash xor, zero-check, key extraction implemented |
-| Asset and balance helpers | Partial | `getIssuer`/`isIssuer` not fully generic |
+| Asset and balance helpers | Partial | `getIssuer`/`isIssuer` not fully generic across all XDR asset variants |
 | Numeric helpers | Full | 64-bit and 128-bit helpers match mapped APIs |
 | Resource accounting | Partial | `anyLessThan()` and `limitTo()` missing |
-| Metadata normalization | Partial | `TransactionMeta` only |
+| Metadata normalization | Partial | `TransactionMeta` only; `LedgerCloseMeta` normalization missing |
 | XDR frame streams | Partial | `readPage()` missing |
 | Durable filesystem rename | Full | Crash-safe rename implemented |
-| Rust-only support modules | Full | Config, network, time, memory have no direct util peer |
+| Rust-only support modules | Full | Config, network, time, memory, version have no direct util peer |
 
 ## File Mapping
 
 | stellar-core File | Rust Module | Notes |
 |--------------------|-------------|-------|
-| `ProtocolVersion.h` / `ProtocolVersion.cpp` | `protocol.rs` | Mostly complete; missing equality helper and `V_26` |
+| `ProtocolVersion.h` / `ProtocolVersion.cpp` | `protocol.rs` | Complete: enum, comparisons, constants |
 | `types.h` / `types.cpp` | `types.rs` | Hash helpers and `LedgerEntryKey()` |
 | `types.h` / `types.cpp` | `asset.rs` | Asset validation, issuer helpers, bucket key helpers, balance math |
 | `numeric.h` / `numeric.cpp` | `math.rs` | Full mapped arithmetic parity |
-| `numeric128.h` / `numeric128.cpp` | `math.rs` | Full mapped 128-bit helpers; `hugeDivide()` omitted |
+| `numeric128.h` / `numeric128.cpp` | `math.rs` | Full mapped 128-bit helpers; `hugeDivide()` omitted (intentional) |
 | `TxResource.h` / `TxResource.cpp` | `resource.rs` | Core arithmetic implemented; two comparison helpers missing |
 | `MetaUtils.h` / `MetaUtils.cpp` | `meta.rs` | `TransactionMeta` normalization only |
 | `XDRStream.h` | `xdr_stream.rs` | Frame I/O implemented; page scanning missing |
 | `Fs.h` / `Fs.cpp` | `fs_utils.rs` | Only `durableRename()` is ported here |
+| — | `config.rs` | Rust-native configuration types (no upstream peer) |
+| — | `network.rs` | Rust-native network identity (no upstream peer) |
+| — | `time.rs` | Rust-native timestamp helpers (no upstream peer) |
+| — | `memory.rs` | Rust-native memory estimation (no upstream peer) |
+| — | `version.rs` | Rust-native version string construction (no upstream peer) |
+| — | `error.rs` | Rust-native error types (no upstream peer) |
 
 ## Component Mapping
 
@@ -41,7 +47,7 @@ Corresponds to: `ProtocolVersion.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `ProtocolVersion` enum | `ProtocolVersion` enum | Partial |
+| `ProtocolVersion` enum (V_0–V_26) | `ProtocolVersion` enum (V0–V26) | Full |
 | `protocolVersionIsBefore()` | `protocol_version_is_before()` | Full |
 | `protocolVersionStartsFrom()` | `protocol_version_starts_from()` | Full |
 | `protocolVersionEquals()` | — | None |
@@ -56,7 +62,7 @@ Corresponds to: `types.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `Hash` | `Hash256` | Full |
+| `Hash` / `uint256` | `Hash256` | Full |
 | `isZero(uint256 const&)` | `Hash256::is_zero()` | Full |
 | `operator^=(Hash&, Hash const&)` | `BitXorAssign for Hash256` | Full |
 | `LedgerEntryKey()` | `entry_to_key()` | Full |
@@ -178,7 +184,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `compareAsset()`, `unsignedToSigned()`, `formatSize()`, `iequals()`, `isAsciiAlphaNumeric()`, `toAsciiLower()`, `roundDown()` (`types.h`) | Replaced by stdlib helpers or local call-site code |
 | `operator>=(Price)`, `operator>(Price)`, `operator==(Price)` (`types.h`) | Implemented in `henyey-tx` where price ordering is needed |
 | `bigDivideOrThrow()` (`numeric.h`) | Rust returns `Result` instead of throwing |
-| `saturatingAdd<T>()` (`numeric.h`) | Rust integer types provide built-in saturation |
+| `saturatingAdd<T>()` (`numeric.h`) | Rust integer types provide built-in `saturating_add()` |
 | `bigDivideOrThrow128()` (`numeric128.h`) | Rust returns `Result` instead of throwing |
 | `hugeDivide()` (`numeric128.h`) | Logic is inlined in `henyey-tx` pool exchange code |
 | `VirtualClock`, `VirtualTimer`, `Scheduler`, `SimpleTimer` (`Timer.h`, `Scheduler.h`, `SimpleTimer.h`) | Runtime timing uses tokio and `henyey-clock` instead |
@@ -189,6 +195,11 @@ Features excluded by design. These are NOT counted against parity %.
 | `RandomEvictionCache`, `BitSet`, `TarjanSCCCalculator`, `BinaryFuseFilter` | Deferred until dependent crates need concrete ports |
 | `Math.h` random, clustering, and backoff helpers | Use `rand`/crate-local helpers; not protocol-critical here |
 | `xdrquery/*` headers and `DebugMetaUtils.h` | Debug and inspection tooling, not required by the shared common crate |
+| `SecretValue` | Rust does not need a wrapper type to prevent accidental logging |
+| `Algorithm.h` (`split()` helper) | Replaced by iterator combinators and `itertools` |
+| `GlobalChecks.h` assertions and lock guards | Rust uses `assert!`/`debug_assert!` and `std::sync::Mutex` |
+| `JitterInjection` | Testing-only jitter injection not applicable to Rust runtime |
+| `TcmallocConfig` | Allocator configuration not applicable to Rust |
 
 ## Gaps
 
@@ -196,10 +207,9 @@ Features not yet implemented. These ARE counted against parity %.
 
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
-| `ProtocolVersion::V_26` | Low | Enum stops at `V25` even though upstream header now includes `V_26` |
-| `protocolVersionEquals()` | Low | Callers currently use direct comparisons |
-| `getIssuer<T>()` | Medium | Rust only exposes Asset and TrustLineAsset helpers |
-| `isIssuer<T>()` | Medium | Same generic coverage gap as `getIssuer<T>()` |
+| `protocolVersionEquals()` | Low | Callers currently use direct `==` comparisons on the `u32` version |
+| `getIssuer<T>()` generic coverage | Medium | Rust has Asset and TrustLineAsset variants but not ChangeTrustAsset |
+| `isIssuer<T>()` generic coverage | Medium | Same coverage gap as `getIssuer<T>()` |
 | `anyLessThan()` (`TxResource.h`) | Medium | Used by resource-limit comparisons in upstream pricing code |
 | `limitTo()` (`TxResource.h`) | Medium | Missing clamping helper for per-dimension caps |
 | `normalizeMeta(LedgerCloseMeta&)` | Medium | Needed for full ledger-close meta canonicalization |
@@ -208,13 +218,13 @@ Features not yet implemented. These ARE counted against parity %.
 ## Architectural Differences
 
 1. **Error handling**
-   - **stellar-core**: Throws exceptions and uses `releaseAssert` helpers.
-   - **Rust**: Returns `Result` for recoverable failures and uses panics for invariants.
+   - **stellar-core**: Throws exceptions and uses `releaseAssert` / `releaseAssertOrThrow` macros.
+   - **Rust**: Returns `Result` for recoverable failures and uses `assert!` / `panic!` for invariants.
    - **Rationale**: Rust surfaces failure paths in types instead of exception control flow.
 
 2. **Stream I/O surface**
-   - **stellar-core**: Exposes one hierarchy with explicit open/close, file handles, and seek helpers.
-   - **Rust**: Uses narrower wrappers around `BufReader` and `BufWriter` plus RAII cleanup.
+   - **stellar-core**: Exposes one class hierarchy with explicit open/close, file handles, seek, and page-based scanning.
+   - **Rust**: Uses narrower wrappers around `BufReader` and `BufWriter` plus RAII cleanup via `Drop`.
    - **Rationale**: The crate implements only the stream operations current Rust callers need.
 
 3. **Resource arithmetic**
@@ -223,13 +233,13 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: Trait-based arithmetic is the idiomatic Rust equivalent.
 
 4. **Filesystem utilities**
-   - **stellar-core**: Centralizes many helpers in `fs`.
+   - **stellar-core**: Centralizes many helpers in the `fs` namespace (lock, mkpath, findfiles, hexStr, etc.).
    - **Rust**: Keeps only crash-sensitive rename logic in `fs_utils.rs` and relies on `std::fs` otherwise.
    - **Rationale**: Most non-durable filesystem helpers do not need a dedicated wrapper in Rust.
 
 5. **Shared support modules**
    - **stellar-core**: Many utility concerns live under `src/util/`.
-   - **Rust**: `config.rs`, `network.rs`, `time.rs`, `memory.rs`, and `error.rs` are Rust-native additions without direct upstream peers.
+   - **Rust**: `config.rs`, `network.rs`, `time.rs`, `memory.rs`, `version.rs`, and `error.rs` are Rust-native additions without direct upstream peers.
    - **Rationale**: The workspace factors cross-cutting concerns into this crate even when upstream keeps them elsewhere or relies on C++ infrastructure.
 
 ## Test Coverage
@@ -238,11 +248,17 @@ Features not yet implemented. These ARE counted against parity %.
 |------|-------------------|------------|-------|
 | Balance helpers | 1 TEST_CASE | 1 `#[test]` | `add_balance()` behavior is covered |
 | Big divide and roots | 4 TEST_CASE / 9 SECTION | 15 `#[test]` | Good coverage for 64-bit and 128-bit math |
-| Uint128 helpers | 3 TEST_CASE / 6 SECTION | 15 `#[test]` | Rust covers the ported numeric128 helpers, not upstream `uint128_t` internals |
-| XDR stream I/O | 2 TEST_CASE / 3 SECTION | 13 `#[test]` | Roundtrip and durable-write coverage is stronger than upstream mapped tests |
-| Timer utilities | 8 TEST_CASE (+1 conditional) | 2 `#[test]` | Rust only tests epoch conversion helpers |
+| Uint128 helpers | 3 TEST_CASE / 6 SECTION | 15 `#[test]` | Rust covers the ported numeric128 helpers |
+| XDR stream I/O | 2 TEST_CASE / 3 SECTION | 13 `#[test]` | Roundtrip and durable-write coverage is stronger than upstream |
+| Timer/Time utilities | 9 TEST_CASE | 2 `#[test]` | Rust only tests epoch conversion helpers |
 | Filesystem rename | 4 TEST_CASE | 3 `#[test]` | Durable rename happy-path and error cases covered |
-| Math clustering/random helpers | 1 TEST_CASE / 5 SECTION | 0 `#[test]` | Intentionally omitted from this crate |
+| Protocol version | — | 4 `#[test]` | Rust has dedicated version comparison tests |
+| Asset validation | — | 11 `#[test]` | Comprehensive asset/issuer/balance/code tests |
+| Resource accounting | — | 13 `#[test]` | Arithmetic, scaling, and display tests |
+| Types/Hash | — | 8 `#[test]` | Hash creation, hex conversion, XOR, entry_to_key |
+| Version string | — | 5 `#[test]` | Version format and protocol invariant |
+| Memory estimation | — | 5 `#[test]` | Heap estimation helpers |
+| Math clustering/random | 1 TEST_CASE / 5 SECTION | 0 | Intentionally omitted from this crate |
 
 ### Test Gaps
 
@@ -255,7 +271,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 69 |
-| Gaps (None + Partial) | 8 |
-| Intentional Omissions | 15 |
-| **Parity** | **69 / (69 + 8) = 90%** |
+| Implemented (Full) | 70 |
+| Gaps (None + Partial) | 7 |
+| Intentional Omissions | 20 |
+| **Parity** | **70 / (70 + 7) = 91%** |

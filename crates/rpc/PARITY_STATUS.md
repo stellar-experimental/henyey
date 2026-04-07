@@ -3,7 +3,7 @@
 **Crate**: `henyey-rpc`
 **Upstream**: `stellar-rpc/cmd/soroban-rpc/internal/` (standalone Go service; no direct `stellar-core/src/*` subsystem)
 **Overall Parity**: 100%
-**Last Updated**: 2026-03-25
+**Last Updated**: 2026-04-07
 
 ## Summary
 

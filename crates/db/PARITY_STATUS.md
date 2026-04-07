@@ -3,7 +3,7 @@
 **Crate**: `henyey-db`
 **Upstream**: `stellar-core/src/database/`, plus SQL/persistence helpers from `src/main/PersistentState.*`, `src/ledger/LedgerHeaderUtils.*`, `src/transactions/TransactionSQL.*`, `src/herder/HerderPersistence*.*`, `src/overlay/PeerManager.*`, `src/overlay/BanManager*.*`, and the publish-queue subset of `src/history/HistoryManager*.*`
 **Overall Parity**: 94%
-**Last Updated**: 2026-03-26
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -28,10 +28,12 @@
 |--------------------|-------------|-------|
 | `Database.h` / `Database.cpp` | `src/pool.rs`, `src/database/mod.rs`, `src/migrations.rs` | Connection management, initialization, schema upgrade flow |
 | `DatabaseUtils.h` / `DatabaseUtils.cpp` | `src/queries/ledger.rs`, `src/queries/scp.rs`, `src/queries/history.rs`, `src/queries/ledger_close_meta.rs`, `src/queries/events.rs` | Old-entry deletion logic inlined per query module |
+| `DatabaseTypeSpecificOperation.h` | — | Intentional omission: SQLite-only design needs no backend dispatch |
+| `DatabaseConnectionString.h` / `DatabaseConnectionString.cpp` | — | Intentional omission: SQLite paths have no passwords |
 | `PersistentState.h` / `PersistentState.cpp` | `src/queries/state.rs`, `src/queries/scp.rs`, `src/scp_persistence.rs` | Storestate access plus SCP slot and tx-set persistence |
 | `LedgerHeaderUtils.h` / `LedgerHeaderUtils.cpp` | `src/queries/ledger.rs` | Ledger header storage, lookup, streaming, retention |
 | `TransactionSQL.h` / `TransactionSQL.cpp` | `src/queries/history.rs` | Transaction-set and tx-result checkpoint streaming |
-| `HerderPersistence.h` / `HerderPersistenceImpl.cpp` | `src/queries/scp.rs`, `src/scp_persistence.rs` | SCP envelopes, quorum sets, crash-recovery state |
+| `HerderPersistence.h` / `HerderPersistenceImpl.h` / `HerderPersistenceImpl.cpp` | `src/queries/scp.rs`, `src/scp_persistence.rs` | SCP envelopes, quorum sets, crash-recovery state |
 | `PeerManager.h` / `PeerManager.cpp` | `src/queries/peers.rs`, `src/database/network.rs` | SQL-backed peer record persistence subset |
 | `BanManager.h` / `BanManagerImpl.cpp` | `src/queries/ban.rs`, `src/database/network.rs` | SQL-backed ban-list persistence subset |
 | `HistoryManagerImpl.cpp` (publish queue SQL subset) | `src/queries/publish_queue.rs`, `src/database/network.rs` | Persistent publish queue state |
@@ -51,13 +53,13 @@ Corresponds to: `Database.h`, `DatabaseUtils.h`
 | `Database::Database()` | `Database::open()`, `Database::open_in_memory()` | Full |
 | `Database::getSession()` | `Database::with_connection()` / `Database::connection()` | Full |
 | `Database::getRawSession()` | `Database::connection()` | Full |
-| `Database::getPool()` | `Database.pool` | Full |
+| `Database::getPool()` | `Database.pool` (r2d2 pool) | Full |
 | `Database::canUsePool()` | Pool always available on file-backed DBs | Full |
 | `Database::initialize()` | `Database::initialize()` | Full |
 | `Database::getMainDBSchemaVersion()` | `migrations::get_schema_version()` | Full |
 | `Database::upgradeToCurrentSchema()` | `migrations::run_migrations()` | Full |
 | `decodeOpaqueXDR()` | `stellar_xdr::ReadXdr` | Full |
-| `DatabaseUtils::deleteOldEntriesHelper()` | Inlined bounded-delete SQL helpers | Full |
+| `DatabaseUtils::deleteOldEntriesHelper()` | Inlined bounded-delete SQL helpers per query module | Full |
 
 ### schema and persistent state (`src/schema.rs`, `src/queries/state.rs`)
 
@@ -92,7 +94,11 @@ Corresponds to: `TransactionSQL.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `populateCheckpointFilesFromDB()` | `HistoryQueries::copy_tx_history_to_streams()` | Full |
+| `populateCheckpointFilesFromDB()` (tx sets) | `HistoryQueries::copy_tx_history_to_streams()` | Full |
+| `populateCheckpointFilesFromDB()` (tx results) | `HistoryQueries::copy_tx_history_to_streams()` | Full |
+| `storeTransaction()` | `HistoryQueries::store_transaction()` | Full |
+| `loadTransaction()` | `HistoryQueries::load_transaction()` | Full |
+| `deleteOldEntries()` (txhistory, txsets, txresults) | `HistoryQueries::delete_old_tx_history()` | Full |
 
 ### SCP history (`src/queries/scp.rs`)
 
@@ -125,14 +131,14 @@ Corresponds to: `PeerManager.h` SQL subset
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `ensureExists()` | `PeerQueries::store_peer()` | Full |
-| `load()` | `PeerQueries::load_peer()` | Full |
-| `store()` | `PeerQueries::store_peer()` | Full |
-| `loadRandomPeers()` | `load_random_peers()` and specialized variants | Full |
-| `removePeersWithManyFailures()` | `remove_peers_with_failures()` | Full |
-| `getPeersToSend()` | Random-peer query helpers | Full |
-| `loadAllPeers()` | `load_peers(None)` | Full |
-| `storePeers()` | Repeated `store_peer()` calls | Full |
+| `PeerManager::ensureExists()` | `PeerQueries::store_peer()` | Full |
+| `PeerManager::load()` | `PeerQueries::load_peer()` | Full |
+| `PeerManager::store()` | `PeerQueries::store_peer()` | Full |
+| `PeerManager::loadRandomPeers()` | `load_random_peers()` and specialized variants | Full |
+| `PeerManager::removePeersWithManyFailures()` | `remove_peers_with_failures()` | Full |
+| `PeerManager::getPeersToSend()` | Random-peer query helpers | Full |
+| `PeerManager::loadAllPeers()` | `load_peers(None)` | Full |
+| `PeerManager::storePeers()` | Repeated `store_peer()` calls | Full |
 
 ### ban list (`src/queries/ban.rs`, `src/database/network.rs`)
 
@@ -172,6 +178,8 @@ Features excluded by design. These are NOT counted against parity %.
 | `shouldRebuildForOfferTable()`, `clearRebuildForOfferTable()`, `setRebuildForOfferTable()` | Offer-table rebuild flow is not modeled in Rust DB state |
 | `dropTxMetaIfExists()` | No separate legacy txmeta table exists in the Rust schema |
 | `LedgerHeaderUtils::getFlags()`, `LedgerHeaderUtils::isValid()` | Validation belongs in ledger logic, not the DB crate |
+| `PeerManager::update()` (type/backoff logic) | Higher-level peer heuristics live in the overlay crate, not in DB |
+| `PeerManager::countPeers()` | Not needed; peer loading handles limits directly |
 
 ## Gaps
 
@@ -191,7 +199,7 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: The repository standardizes on SQLite, so the DB crate drops cross-backend abstraction.
 
 2. **Database layout**
-   - **stellar-core**: Modern SQLite deployments can split data across main and misc databases.
+   - **stellar-core**: Modern SQLite deployments split data across main and misc databases for concurrency.
    - **Rust**: All tables live in one SQLite database.
    - **Rationale**: Simpler initialization and schema management; concurrency tradeoffs are accepted for now.
 
@@ -201,7 +209,7 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rationale**: BLOB storage avoids encoding overhead and matches rusqlite ergonomics.
 
 4. **Schema versioning**
-   - **stellar-core**: Main schema version 27 plus misc schema version 2.
+   - **stellar-core**: Main schema version 28 plus misc schema version 2.
    - **Rust**: Independent schema version 8 with fresh-schema assumptions.
    - **Rationale**: The Rust node does not preserve legacy upgrade history from older stellar-core releases.
 
@@ -219,13 +227,13 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Database core | 9 `TEST_CASE` / 11 `SECTION` in `DatabaseTests.cpp` | 5 `#[test]` in `migrations.rs` | Rust covers schema/version flow but not misc-DB split or MVCC |
+| Database core | 10 `TEST_CASE` / 13 `SECTION` in `DatabaseTests.cpp` | 5 `#[test]` in `migrations.rs` | Rust covers schema/version flow but not misc-DB split or MVCC |
 | Connection string helpers | 1 `TEST_CASE` / 20 `SECTION` in `DatabaseConnectionStringTest.cpp` | 0 | Intentional omission in SQLite-only design |
 | State queries | Indirect upstream coverage via `PersistentState` tests | 3 `#[test]` in `state.rs` | Basic key-value coverage present |
 | Ledger headers | Indirect upstream coverage via ledger/history tests | 8 `#[test]` in `ledger.rs` | Good CRUD, hash, and stream coverage |
 | Transaction history | Indirect upstream coverage via history/transaction tests | 10 `#[test]` in `history.rs` | Strong coverage for txsets and txresults |
 | SCP persistence | Indirect upstream coverage via herder tests | 8 `#[test]` in `scp.rs` + 2 in `scp_persistence.rs` | Missing direct coverage for remaining parity gaps |
-| Peer management | Indirect upstream coverage via overlay tests | 6 `#[test]` in `peers.rs` | SQL subset covered; higher-level peer heuristics live elsewhere |
+| Peer management | 8 `TEST_CASE` / 38 `SECTION` in `PeerManagerTests.cpp` | 6 `#[test]` in `peers.rs` | SQL subset covered; higher-level peer heuristics live elsewhere |
 | Ban list | Indirect upstream coverage via overlay tests | 0 | No dedicated `ban.rs` unit tests |
 | Publish queue | Indirect upstream coverage via history tests | 2 `#[test]` in `publish_queue.rs` | Focused on overwrite/idempotency behavior |
 | Rust-only retention tables | N/A | 4 `#[test]` in `events.rs`, 5 in `ledger_close_meta.rs`, 2 in `bucket_list.rs` | Good coverage for Rust-only tables |
@@ -234,14 +242,14 @@ Features not yet implemented. These ARE counted against parity %.
 
 - No Rust test covers the upstream SQLite MVCC scenario from `DatabaseTests.cpp`.
 - No direct unit test covers the missing `getNodeQuorumSet()` parity gap.
-- `ban.rs` has no dedicated unit tests.
+- `ban.rs` has no dedicated unit tests (functionality exercised through integration tests).
 - `delete_old_tx_set_data()` remains effectively untested because it is currently a no-op.
 
 ## Parity Calculation
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 49 |
+| Implemented (Full) | 51 |
 | Gaps (None + Partial) | 3 |
-| Intentional Omissions | 24 |
-| **Parity** | **49 / (49 + 3) = 94%** |
+| Intentional Omissions | 26 |
+| **Parity** | **51 / (51 + 3) = 94%** |

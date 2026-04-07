@@ -2,8 +2,8 @@
 
 **Crate**: `henyey-simulation`
 **Upstream**: `stellar-core/src/simulation/`
-**Overall Parity**: 86%
-**Last Updated**: 2026-03-25
+**Overall Parity**: 85%
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -52,7 +52,7 @@ Corresponds to: `Simulation.h`
 | `startAllNodes()` | `start_all_nodes()` / `try_start_all_nodes()` | Full |
 | `stopAllNodes()` | `stop_all_nodes()` | Full |
 | `removeNode()` | `remove_node()` | Full |
-| `getAppFromPeerMap()` | — | None (removed: unused) |
+| `getAppFromPeerMap()` | — | Intentional Omission |
 | `haveAllExternalized()` | `have_all_externalized()` / `have_all_app_nodes_externalized()` | Full |
 | `crankNode()` | `crank_node()` | Full |
 | `crankAllNodes()` | `crank_all_nodes()` | Full |
@@ -250,6 +250,7 @@ Features excluded by design. These are NOT counted against parity %.
 | `metricsSummary()` and medida-backed counters | henyey uses lightweight internal reporting, not medida |
 | `stopOverlayTick()` | Overlay retry behavior is owned by runtime tasks, not manual tick control |
 | `LoopbackOverlayManager` / `ApplicationLoopbackOverlay` | Loopback transport lives in `henyey-overlay` rather than simulation-local subclasses |
+| `getAppFromPeerMap()` | Removed: unused even in upstream stellar-core |
 | `SOROBAN_UPGRADE_SETUP` / `SOROBAN_CREATE_UPGRADE` modes | henyey applies config changes directly instead of via upgrade contract |
 | `PAY_PREGENERATED` and `pregeneratedTxLoad()` | File-driven replay mode is not used by this crate |
 | `SOROBAN_INVOKE_APPLY_LOAD` mode | Apply-load benchmarking is wired directly through `ApplyLoad` |
@@ -329,7 +330,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 117 |
-| Gaps (None + Partial) | 19 |
-| Intentional Omissions | 31 |
-| **Parity** | **117 / (117 + 19) = 86%** |
+| Implemented (Full) | 114 |
+| Gaps (None + Partial) | 20 |
+| Intentional Omissions | 24 |
+| **Parity** | **114 / (114 + 20) = 85%** |

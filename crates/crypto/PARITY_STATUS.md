@@ -3,7 +3,7 @@
 **Crate**: `henyey-crypto`
 **Upstream**: `stellar-core/src/crypto/`
 **Overall Parity**: 69%
-**Last Updated**: 2026-03-25
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -11,16 +11,17 @@
 |------|--------|-------|
 | SHA-256 Hashing | Partial | Single-shot, streaming (no reset), HMAC, HKDF, XDR hashing |
 | BLAKE2 Hashing | Partial | Single-shot only; no streaming hasher or XDR hashing |
-| Hex Encoding | Full | All four upstream functions implemented |
+| Hex Encoding | Full | All four upstream functions implemented (test-only gated) |
 | Random Generation | Full | CSPRNG via OsRng |
 | Curve25519 ECDH | Full | Key exchange, shared key derivation |
 | Sealed Box Encryption | Full | Encrypt/decrypt via crypto_box |
 | Ed25519 Keys & Signatures | Partial | Generate, sign, verify, StrKey; missing isZero, ==, < |
 | StrKey Encoding | Partial | Core encode/decode via `stellar_strkey`; missing size/convert utils |
 | Short Hash (SipHash) | Full | initialize, computeHash, xdrComputeHash, seed |
-| SignerKey Utilities | Full | preAuthTx, hashX, ed25519Payload, getEd25519 |
+| SignerKey Utilities | Full | preAuthTx, hashX, ed25519Payload, getEd25519 (test-only gated) |
 | Signature Verification Cache | Partial | BLAKE2-keyed FIFO cache; missing clear/seed/flush APIs |
 | Key/Logging Utilities | None | toShortString, logKey, random helpers |
+| Error Types | Full | `CryptoError` enum covers all upstream failure modes |
 
 ## File Mapping
 
@@ -28,14 +29,14 @@
 |--------------------|-------------|-------|
 | `SHA.h` / `SHA.cpp` | `hash.rs` | SHA-256, HMAC-SHA256, HKDF |
 | `BLAKE2.h` / `BLAKE2.cpp` | `hash.rs` | BLAKE2b-256 single-shot only |
-| `Hex.h` / `Hex.cpp` | `hex.rs` | Hex encoding/decoding |
+| `Hex.h` / `Hex.cpp` | `hex.rs` | Hex encoding/decoding (all functions `#[cfg(test)]`) |
 | `Random.h` / `Random.cpp` | `random.rs` | CSPRNG |
 | `Curve25519.h` / `Curve25519.cpp` | `curve25519.rs`, `sealed_box.rs` | ECDH and sealed box split across two modules |
 | `SecretKey.h` / `SecretKey.cpp` | `keys.rs`, `signature.rs` | Key types, signing, verification with cache |
 | `StrKey.h` / `StrKey.cpp` | *(re-export)* `stellar_strkey` | StrKey encoding/decoding delegated to external crate |
 | `ShortHash.h` / `ShortHash.cpp` | `short_hash.rs` | SipHash-2-4 |
-| `SignerKey.h` / `SignerKey.cpp` | `signer_key.rs` | KeyFunctions<SignerKey> specialization |
-| `SignerKeyUtils.h` / `SignerKeyUtils.cpp` | `signer_key.rs` | SignerKey construction utilities |
+| `SignerKey.h` / `SignerKey.cpp` | `signer_key.rs` | KeyFunctions<SignerKey> specialization (all `#[cfg(test)]`) |
+| `SignerKeyUtils.h` / `SignerKeyUtils.cpp` | `signer_key.rs` | SignerKey construction utilities (all `#[cfg(test)]`) |
 | `KeyUtils.h` / `KeyUtils.cpp` | `keys.rs` | Generic key encode/decode via methods on key types |
 | `CryptoError.h` | `error.rs` | Error types |
 | `XDRHasher.h` | `hash.rs` | XDR hashing (different approach) |
@@ -54,11 +55,11 @@ Corresponds to: `SHA.h`, `BLAKE2.h`
 | `SHA256::reset()` | -- | None |
 | `SHA256::add(ByteSlice)` | `Sha256Hasher::update(&[u8])` | Full |
 | `SHA256::finish()` | `Sha256Hasher::finalize()` | Full |
-| `xdrSha256<T>(T)` | `xdr_sha256<T: WriteXdr>(T)` | Full |
-| `hmacSha256(key, bin)` | `hmac_sha256(&[u8; 32], &[u8])` | Full |
-| `hmacSha256Verify(hmac, key, bin)` | `hmac_sha256_verify(&[u8; 32], &[u8; 32], &[u8])` | Full |
-| `hkdfExtract(bin)` | `hkdf_extract(&[u8])` | Full |
-| `hkdfExpand(key, bin)` | `hkdf_expand(&[u8; 32], &[u8])` | Full |
+| `xdrSha256<T>(T)` | `xdr_sha256<T: WriteXdr>(T)` (`#[cfg(test)]`) | Full |
+| `hmacSha256(key, bin)` | `hmac_sha256(&[u8; 32], &[u8])` (`pub(crate)`) | Full |
+| `hmacSha256Verify(hmac, key, bin)` | `hmac_sha256_verify(&[u8; 32], &[u8; 32], &[u8])` (`#[cfg(test)]`) | Full |
+| `hkdfExtract(bin)` | `hkdf_extract(&[u8])` (`pub(crate)`) | Full |
+| `hkdfExpand(key, bin)` | `hkdf_expand(&[u8; 32], &[u8])` (`#[cfg(test)]`) | Full |
 | `blake2(ByteSlice)` | `blake2(&[u8])` | Full |
 | `BLAKE2::BLAKE2()` | -- | None |
 | `BLAKE2::reset()` | -- | None |
@@ -69,6 +70,8 @@ Corresponds to: `SHA.h`, `BLAKE2.h`
 ### hex.rs (`hex.rs`)
 
 Corresponds to: `Hex.h`
+
+All functions are `#[cfg(test)]` — implementations exist but are not compiled into production builds.
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
@@ -102,8 +105,8 @@ Corresponds to: `Curve25519.h` (encrypt/decrypt portion)
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `curve25519Encrypt<N>(pub, bin)` | `seal_to_public_key(pub, &[u8])` | Full |
-| `curve25519Decrypt(sec, pub, enc)` | `open_from_secret_key(sec, &[u8])` | Full |
+| `curve25519Encrypt<N>(pub, bin)` | `seal_to_public_key(pub, &[u8])` / `seal_to_curve25519_public_key(&[u8;32], &[u8])` | Full |
+| `curve25519Decrypt(sec, pub, enc)` | `open_from_secret_key(sec, &[u8])` / `open_from_curve25519_secret_key(&[u8;32], &[u8])` | Full |
 
 ### keys.rs (`keys.rs`)
 
@@ -161,15 +164,17 @@ Corresponds to: `ShortHash.h`
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `shortHash::initialize()` | `initialize()` | Full |
+| `shortHash::initialize()` | `initialize()` (`#[cfg(test)]`) | Full |
 | `shortHash::getShortHashInitKey()` | -- | None |
 | `shortHash::seed(unsigned int)` | `seed(u32)` | Full |
-| `shortHash::computeHash(ByteSlice)` | `compute_hash(&[u8])` | Full |
+| `shortHash::computeHash(ByteSlice)` | `compute_hash(&[u8])` (`pub(crate)`) | Full |
 | `shortHash::xdrComputeHash<T>(T)` | `xdr_compute_hash<T: WriteXdr>(T)` | Full |
 
 ### signer_key.rs (`signer_key.rs`)
 
 Corresponds to: `SignerKeyUtils.h`, `SignerKey.h`
+
+All functions are `#[cfg(test)]` — implementations exist but are not compiled into production builds.
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
@@ -268,12 +273,17 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: `Sha256Hasher::finalize()` consumes the hasher; create a new instance to hash again
    - **Rationale**: Rust's ownership model makes consuming-finalize more natural; no `BLAKE2` streaming hasher exists yet
 
+7. **`#[cfg(test)]` gating**
+   - **stellar-core**: All crypto functions are available in both production and test builds
+   - **Rust**: Several modules (`hex.rs`, `signer_key.rs`) and many individual functions (`hmac_sha256_verify`, `hkdf_expand`, `xdr_sha256`, `seal_to_public_key`, `open_from_secret_key`, `initialize`) are compiled only in test builds. Production builds use higher-level wrappers or the `pub(crate)` internal API directly
+   - **Rationale**: Minimizes public API surface; functions only used internally or in tests are not exposed. The implementations exist and pass tests but are not available to downstream crates
+
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
 | SHA-256 Hashing | 5 TEST_CASE (incl. 2 bench) | 15 #[test] | Rust has more granular tests |
-| BLAKE2 Hashing | 5 TEST_CASE (incl. 2 bench) | (included in hash.rs) | 3 BLAKE2-specific tests in hash.rs |
+| BLAKE2 Hashing | 5 TEST_CASE (incl. 2 bench) | 3 #[test] | BLAKE2-specific tests in hash.rs |
 | HMAC / HKDF | 2 TEST_CASE | 7 #[test] | Good coverage on both sides |
 | Signing / Verification | 5 TEST_CASE (incl. 2 bench, 2 vector suites) | 5 #[test] (keys + signature) | Upstream has much deeper vector coverage |
 | StrKey | 2 TEST_CASE, 5 SECTION | Covered by `stellar_strkey` | Rust relies on external crate's tests |

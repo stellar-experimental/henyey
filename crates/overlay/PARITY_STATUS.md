@@ -3,7 +3,7 @@
 **Crate**: `henyey-overlay`
 **Upstream**: `stellar-core/src/overlay/`
 **Overall Parity**: 92%
-**Last Updated**: 2026-03-25
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -549,22 +549,22 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| Overlay/Peer | 40 TEST_CASE / 87 SECTION | 34 #[test] (manager.rs) + 2 (peer.rs) + 4 (connection.rs) | Better coverage now, but upstream handshake matrix is still broader |
+| Overlay/Peer | 40 TEST_CASE / 87 SECTION | 36 #[test] (manager/) + 2 (peer.rs) + 5 (connection.rs) | Better coverage now, but upstream handshake matrix is still broader |
 | Flood | 1 TEST_CASE / 17 SECTION | 8 #[test] | Good single-module coverage |
-| FlowControl | Embedded in `OverlayTests.cpp` | 21 #[test] | Strong direct unit coverage |
+| FlowControl | Embedded in `OverlayTests.cpp` | 23 #[test] | Strong direct unit coverage |
 | ItemFetcher | 2 TEST_CASE / 16 SECTION | 12 #[test] + 8 integration | Good parity coverage |
 | Tracker | 1 TEST_CASE / 13 SECTION | Covered in `item_fetcher.rs` and integration tests | Adequate |
 | PeerManager | 8 TEST_CASE / 38 SECTION | 9 #[test] | Moderate gap remains in persistence edge cases |
 | BanManager | No dedicated upstream test file | 15 #[test] | Rust coverage is stronger than upstream organization suggests |
-| TCPPeer / framing | 4 TEST_CASE / 5 SECTION | 18 #[test] (codec.rs) + 4 (connection.rs) | Good framing coverage; fewer end-to-end socket scenarios |
+| TCPPeer / framing | 4 TEST_CASE / 5 SECTION | 18 #[test] (codec.rs) + 5 (connection.rs) | Good framing coverage; fewer end-to-end socket scenarios |
 | SurveyManager | 5 TEST_CASE / 7 SECTION | 20 #[test] | Good unit coverage |
 | SurveyMessageLimiter | 1 TEST_CASE / 10 SECTION | Included in 20 `survey.rs` tests | Core limiter paths covered |
 | TxAdverts | 1 TEST_CASE / 5 SECTION | 9 #[test] | Good coverage |
-| OverlayManager | 4 TEST_CASE / 0 SECTION | 34 #[test] | Strong unit coverage for startup, peer rotation, and bookkeeping |
+| OverlayManager | 4 TEST_CASE / 0 SECTION | 36 #[test] | Strong unit coverage for startup, peer rotation, and bookkeeping |
 | OverlayTopology | 2 TEST_CASE / 7 SECTION | 0 | Not covered |
-| MessageDispatcher | N/A | 8 #[test] | Rust-specific |
+| MessageDispatcher | N/A | 10 #[test] | Rust-specific; includes audit-002 cache bound tests |
 | Metrics | N/A | 12 #[test] | Rust-specific |
-| Auth | Covered indirectly in `OverlayTests.cpp` | 23 #[test] | Strong direct unit coverage |
+| Auth | Covered indirectly in `OverlayTests.cpp` | 24 #[test] | Strong direct unit coverage |
 | Codec | Covered by `TCPPeerTests.cpp` and `OverlayTests.cpp` | 18 #[test] | Good coverage |
 | TxDemands | Covered indirectly by pull-mode overlay tests | 19 #[test] | Good direct unit coverage |
 
@@ -579,7 +579,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 282 |
-| Gaps (None + Partial) | 24 |
+| Implemented (Full) | 283 |
+| Gaps (None + Partial) | 25 |
 | Intentional Omissions | 11 |
-| **Parity** | **282 / (282 + 24) = 92%** |
+| **Parity** | **283 / (283 + 25) = 92%** |

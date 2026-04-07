@@ -3,7 +3,7 @@
 **Crate**: `henyey`
 **Upstream**: `stellar-core/src/main/`
 **Overall Parity**: 56%
-**Last Updated**: 2026-03-26
+**Last Updated**: 2026-04-07
 
 ## Summary
 
@@ -30,6 +30,8 @@
 | `ApplicationUtils.h` / `ApplicationUtils.cpp` | `main.rs` | CLI command wrappers delegate into `henyey-app` and sibling crates |
 | `SettingsUpgradeUtils.h` / `SettingsUpgradeUtils.cpp` | `settings_upgrade.rs` | Soroban settings-upgrade transaction builder |
 | `dumpxdr.h` / `dumpxdr.cpp` | `main.rs`, `settings_upgrade.rs` | Generic XDR tools are missing; only settings-upgrade signing pieces were ported |
+| `CommandHandler.h` / `CommandHandler.cpp` | (in `henyey-app` crate) | HTTP command handler lives in the app crate, not the CLI binary |
+| `Config.h` / `Config.cpp` | (in `henyey-app::config`) | Config parsing and validation is in the app crate |
 
 ## Component Mapping
 
@@ -148,7 +150,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 3. **Startup validation**
    - **stellar-core**: Performs explicit XDR identity and release/protocol checks during process startup.
-   - **Rust**: Relies on a single Rust XDR implementation and compile-time workspace versioning.
+   - **Rust**: Relies on a single Rust XDR implementation and compile-time workspace versioning (`check_version_protocol_invariant`).
    - **Rationale**: The Rust binary has no mixed-language bridge that needs runtime identity validation.
 
 4. **Runtime model**
@@ -161,14 +163,18 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: Bundles the same upgrade WASM and fee structure, but uses a fixed salt and skips upstream validation checks.
    - **Rationale**: The command was ported for practical compatibility first; exact helper parity is still incomplete.
 
+6. **Henyey-only commands**
+   - **Rust adds**: `verify-execution`, `debug-bucket-entry`, `bucket-info`, `sample-config`, `verify-history`, `info`, `compare-checkpoint`, `--local` mode.
+   - These are development, debugging, and operational tools not present in stellar-core. They do not affect parity %.
+
 ## Test Coverage
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
 | CLI parsing and dispatch | 0 TEST_CASE / 0 SECTION | 5 `#[test]` | Basic `clap` command parsing is covered |
-| Load-generation mode parsing | 0 TEST_CASE / 0 SECTION | 5 `#[test]` | Covers compatibility spellings and deprecated `create` mode |
+| Load-generation mode parsing | 0 TEST_CASE / 0 SECTION | 13 `#[test]` | Covers compatibility spellings, deprecated `create` mode, and case-insensitive parsing |
 | Application-utils style helpers | 4 TEST_CASE / 5 SECTION | 6 `#[test]` | Rust focuses on genesis/database helper behavior |
-| Config and command-handler compatibility | 14 TEST_CASE / 48 SECTION | 0 `#[test]` | Most equivalent coverage lives in `henyey-app`, not this crate |
+| Config and command-handler compat | 14 TEST_CASE / 48 SECTION | 0 `#[test]` | Most equivalent coverage lives in `henyey-app`, not this crate |
 | Self-check | 1 TEST_CASE / 0 SECTION | 0 `#[test]` | No direct regression tests for the CLI command |
 | Quorum intersection | 0 TEST_CASE / 0 SECTION | 5 `#[test]` | Only the V1 JSON path is exercised |
 | Settings upgrade transactions | 0 TEST_CASE / 0 SECTION | 0 `#[test]` | No direct coverage for `get-settings-upgrade-txs` yet |
