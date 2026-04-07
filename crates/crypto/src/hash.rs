@@ -138,7 +138,7 @@ impl Default for Sha256Hasher {
 }
 
 /// Type alias for BLAKE2b with 32-byte output (256 bits).
-type Blake2b256 = Blake2b<blake2::digest::consts::U32>;
+pub(crate) type Blake2b256 = Blake2b<blake2::digest::consts::U32>;
 
 /// Computes the BLAKE2b-256 hash of the given data.
 ///

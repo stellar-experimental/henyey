@@ -7,6 +7,13 @@ use rusqlite::{params, Connection};
 
 use crate::error::DbError;
 
+/// Event type code for contract events.
+const EVENT_TYPE_CONTRACT: i32 = 0;
+/// Event type code for system events.
+const EVENT_TYPE_SYSTEM: i32 = 1;
+/// Event type code for diagnostic events.
+const EVENT_TYPE_DIAGNOSTIC: i32 = 2;
+
 /// A stored contract event record.
 #[derive(Debug, Clone)]
 pub struct EventRecord {
@@ -107,10 +114,10 @@ impl EventQueries for Connection {
         // Event type filter
         if let Some(et) = params.event_type {
             let type_code = match et {
-                "contract" => 0,
-                "system" => 1,
-                "diagnostic" => 2,
-                _ => 0,
+                "contract" => EVENT_TYPE_CONTRACT,
+                "system" => EVENT_TYPE_SYSTEM,
+                "diagnostic" => EVENT_TYPE_DIAGNOSTIC,
+                _ => EVENT_TYPE_CONTRACT,
             };
             sql.push_str(" AND event_type = ?");
             param_values.push(Box::new(type_code));
@@ -264,7 +271,7 @@ mod tests {
             op_index: index,
             tx_hash: "aabb".to_string(),
             contract_id: Some("CABC".to_string()),
-            event_type: 0,
+            event_type: EVENT_TYPE_CONTRACT,
             topics: vec!["t1".to_string()],
             event_xdr: "deadbeef".to_string(),
             in_successful_contract_call: true,

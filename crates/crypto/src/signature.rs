@@ -62,9 +62,8 @@ impl SigVerifyCache {
 }
 
 fn compute_cache_key(pubkey: &[u8; 32], sig: &[u8; 64], hash: &[u8; 32]) -> [u8; 32] {
-    use blake2::{Blake2b, Digest as _};
-    type Blake2b256 = Blake2b<blake2::digest::consts::U32>;
-    let mut hasher = Blake2b256::new();
+    use blake2::Digest as _;
+    let mut hasher = crate::hash::Blake2b256::new();
     hasher.update(pubkey);
     hasher.update(sig);
     hasher.update(hash);

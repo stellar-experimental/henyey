@@ -244,19 +244,10 @@ struct WorkEntry {
     /// Incremented before each execution attempt, including retries.
     attempts: u32,
 
-    /// Error message from the most recent failure, if any.
-    last_error: Option<String>,
-
     /// Timestamp when the current or most recent execution started.
     ///
     /// Used to calculate execution duration.
     started_at: Option<Instant>,
-
-    /// Duration of the most recent execution attempt.
-    last_duration: Option<Duration>,
-
-    /// Cumulative execution time across all attempts.
-    total_duration: Duration,
 
     /// Token for cooperative cancellation.
     ///
@@ -321,10 +312,7 @@ impl WorkScheduler {
             deps,
             retries_left: retries,
             attempts: 0,
-            last_error: None,
             started_at: None,
-            last_duration: None,
-            total_duration: Duration::ZERO,
             cancel_token: CancellationToken::new(),
             work,
         };
@@ -645,11 +633,7 @@ impl WorkScheduler {
     fn finalize_entry(&mut self, id: WorkId, work: Box<dyn Work + Send>) {
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.work = work;
-            if let Some(started_at) = entry.started_at.take() {
-                let elapsed = started_at.elapsed();
-                entry.last_duration = Some(elapsed);
-                entry.total_duration += elapsed;
-            }
+            entry.started_at.take();
         }
     }
 
@@ -689,9 +673,6 @@ impl WorkScheduler {
             }
             WorkOutcome::Failed(err) => {
                 warn!(work_id = id, error = %err, "work failed");
-                if let Some(entry) = self.entries.get_mut(&id) {
-                    entry.last_error = Some(err);
-                }
                 self.finish_terminal_state(id, WorkState::Failed, attempt);
                 CompletionAction::None
             }
