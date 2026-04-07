@@ -1675,7 +1675,7 @@ mod tests {
             pledges: ScpStatementPledges::Prepare(prep),
         };
 
-        assert!(!ballot.is_statement_sane(&statement, &node, &quorum_set, &driver));
+        assert!(!ballot.is_statement_sane(&statement, &ctx!(&node, &quorum_set, &driver, 7)));
 
         let prep_bad_h = ScpStatementPrepare {
             quorum_set_hash: hash_quorum_set(&quorum_set).into(),
@@ -1696,7 +1696,7 @@ mod tests {
             slot_index: 8,
             pledges: ScpStatementPledges::Prepare(prep_bad_h),
         };
-        assert!(!ballot.is_statement_sane(&statement_bad_h, &node, &quorum_set, &driver));
+        assert!(!ballot.is_statement_sane(&statement_bad_h, &ctx!(&node, &quorum_set, &driver, 8)));
 
         let prep_bad_c = ScpStatementPrepare {
             quorum_set_hash: hash_quorum_set(&quorum_set).into(),
@@ -1717,7 +1717,7 @@ mod tests {
             slot_index: 9,
             pledges: ScpStatementPledges::Prepare(prep_bad_c),
         };
-        assert!(!ballot.is_statement_sane(&statement_bad_c, &node, &quorum_set, &driver));
+        assert!(!ballot.is_statement_sane(&statement_bad_c, &ctx!(&node, &quorum_set, &driver, 9)));
     }
 
     #[test]
@@ -1743,7 +1743,7 @@ mod tests {
             pledges: ScpStatementPledges::Confirm(conf),
         };
 
-        assert!(!ballot.is_statement_sane(&statement, &node, &quorum_set, &driver));
+        assert!(!ballot.is_statement_sane(&statement, &ctx!(&node, &quorum_set, &driver, 10)));
     }
 
     #[test]
@@ -1764,7 +1764,7 @@ mod tests {
             1,
         );
 
-        assert!(!ballot.is_statement_sane(&env.statement, &node, &quorum_set, &driver));
+        assert!(!ballot.is_statement_sane(&env.statement, &ctx!(&node, &quorum_set, &driver, 11)));
     }
 
     struct ValidationDriver {
@@ -1899,7 +1899,7 @@ mod tests {
             pledges: ScpStatementPledges::Prepare(prep),
         };
 
-        assert!(!ballot.is_statement_sane(&statement, &node, &quorum_set, &driver));
+        assert!(!ballot.is_statement_sane(&statement, &ctx!(&node, &quorum_set, &driver, 13)));
     }
 
     // ==================== Tests for new parity features ====================

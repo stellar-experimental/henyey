@@ -68,15 +68,12 @@ impl BallotProtocol {
     pub(crate) fn is_statement_sane<D: SCPDriver>(
         &self,
         statement: &ScpStatement,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
-        let quorum_set =
-            match self.statement_quorum_set(statement, local_node_id, local_quorum_set, driver) {
-                Some(qset) => qset,
-                None => return false,
-            };
+        let quorum_set = match self.statement_quorum_set(statement, ctx) {
+            Some(qset) => qset,
+            None => return false,
+        };
 
         if is_quorum_set_sane(&quorum_set, false).is_err() {
             return false;
@@ -84,7 +81,7 @@ impl BallotProtocol {
 
         match &statement.pledges {
             ScpStatementPledges::Prepare(prep) => {
-                let is_self = statement.node_id == *local_node_id;
+                let is_self = statement.node_id == *ctx.local_node_id;
                 if !is_self && prep.ballot.counter == 0 {
                     return false;
                 }
@@ -168,9 +165,7 @@ impl BallotProtocol {
     fn statement_quorum_set<D: SCPDriver>(
         &self,
         statement: &ScpStatement,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
+        ctx: &SlotContext<'_, D>,
     ) -> Option<ScpQuorumSet> {
         match &statement.pledges {
             ScpStatementPledges::Externalize(_) => {
@@ -178,23 +173,11 @@ impl BallotProtocol {
             }
             ScpStatementPledges::Prepare(prep) => {
                 let provided = henyey_common::Hash256::from(prep.quorum_set_hash.clone());
-                self.resolve_quorum_set(
-                    &provided,
-                    &statement.node_id,
-                    local_node_id,
-                    local_quorum_set,
-                    driver,
-                )
+                self.resolve_quorum_set(&provided, &statement.node_id, ctx)
             }
             ScpStatementPledges::Confirm(conf) => {
                 let provided = henyey_common::Hash256::from(conf.quorum_set_hash.clone());
-                self.resolve_quorum_set(
-                    &provided,
-                    &statement.node_id,
-                    local_node_id,
-                    local_quorum_set,
-                    driver,
-                )
+                self.resolve_quorum_set(&provided, &statement.node_id, ctx)
             }
             _ => None,
         }
@@ -205,20 +188,18 @@ impl BallotProtocol {
         &self,
         provided: &henyey_common::Hash256,
         node_id: &NodeId,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
+        ctx: &SlotContext<'_, D>,
     ) -> Option<ScpQuorumSet> {
-        if node_id == local_node_id {
-            let expected = hash_quorum_set(local_quorum_set);
+        if node_id == ctx.local_node_id {
+            let expected = hash_quorum_set(ctx.local_quorum_set);
             if expected == *provided {
-                return Some(local_quorum_set.clone());
+                return Some(ctx.local_quorum_set.clone());
             }
         }
-        if let Some(qset) = driver.get_quorum_set_by_hash(provided) {
+        if let Some(qset) = ctx.driver.get_quorum_set_by_hash(provided) {
             return Some(qset);
         }
-        driver.get_quorum_set(node_id).and_then(|qset| {
+        ctx.driver.get_quorum_set(node_id).and_then(|qset| {
             let expected = hash_quorum_set(&qset);
             if expected == *provided {
                 Some(qset)
@@ -341,9 +322,7 @@ impl BallotProtocol {
     pub(super) fn has_vblocking_subset_strictly_ahead_of<D: SCPDriver>(
         &self,
         counter: u32,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool {
         let mut nodes = HashSet::new();
         for (node_id, envelope) in &self.latest_envelopes {
@@ -351,31 +330,22 @@ impl BallotProtocol {
                 nodes.insert(node_id.clone());
             }
         }
-        is_v_blocking(local_quorum_set, &nodes)
-            && !self
-                .statement_quorum_set_map(local_node_id, local_quorum_set, driver)
-                .is_empty()
+        is_v_blocking(ctx.local_quorum_set, &nodes)
+            && !self.statement_quorum_set_map(ctx).is_empty()
     }
 
     fn statement_quorum_set_map<D: SCPDriver>(
         &self,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
+        ctx: &SlotContext<'_, D>,
     ) -> HashMap<NodeId, ScpQuorumSet> {
         let mut map = HashMap::new();
         for (node_id, envelope) in &self.latest_envelopes {
-            if let Some(qset) = self.statement_quorum_set(
-                &envelope.statement,
-                local_node_id,
-                local_quorum_set,
-                driver,
-            ) {
+            if let Some(qset) = self.statement_quorum_set(&envelope.statement, ctx) {
                 map.insert(node_id.clone(), qset);
             }
         }
-        if !map.contains_key(local_node_id) {
-            map.insert(local_node_id.clone(), local_quorum_set.clone());
+        if !map.contains_key(ctx.local_node_id) {
+            map.insert(ctx.local_node_id.clone(), ctx.local_quorum_set.clone());
         }
         map
     }
@@ -384,9 +354,7 @@ impl BallotProtocol {
         &self,
         voted: V,
         accepted: A,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool
     where
         V: Fn(&ScpStatement) -> bool,
@@ -404,21 +372,19 @@ impl BallotProtocol {
             }
         }
 
-        if is_v_blocking(local_quorum_set, &accepted_nodes) {
+        if is_v_blocking(ctx.local_quorum_set, &accepted_nodes) {
             return true;
         }
 
-        let qsets = self.statement_quorum_set_map(local_node_id, local_quorum_set, driver);
+        let qsets = self.statement_quorum_set_map(ctx);
         let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
-        is_quorum(local_quorum_set, &supporters, get_qs)
+        is_quorum(ctx.local_quorum_set, &supporters, get_qs)
     }
 
     pub(super) fn federated_ratify<D: SCPDriver, V>(
         &self,
         voted: V,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
+        ctx: &SlotContext<'_, D>,
     ) -> bool
     where
         V: Fn(&ScpStatement) -> bool,
@@ -430,9 +396,9 @@ impl BallotProtocol {
             }
         }
 
-        let qsets = self.statement_quorum_set_map(local_node_id, local_quorum_set, driver);
+        let qsets = self.statement_quorum_set_map(ctx);
         let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
-        is_quorum(local_quorum_set, &supporters, get_qs)
+        is_quorum(ctx.local_quorum_set, &supporters, get_qs)
     }
 
     pub(super) fn statement_votes_for_ballot(
@@ -519,12 +485,7 @@ impl BallotProtocol {
             }
 
             nodes.insert(node_id.clone());
-            if let Some(qs) = self.statement_quorum_set(
-                &envelope.statement,
-                ctx.local_node_id,
-                ctx.local_quorum_set,
-                ctx.driver,
-            ) {
+            if let Some(qs) = self.statement_quorum_set(&envelope.statement, ctx) {
                 quorum_sets.insert(node_id.clone(), qs);
             }
         }

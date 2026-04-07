@@ -441,12 +441,8 @@ impl Slot {
         envelope: &ScpEnvelope,
         driver: &Arc<D>,
     ) -> EnvelopeState {
-        if !self.ballot.is_statement_sane(
-            &envelope.statement,
-            &self.local_node_id,
-            &self.local_quorum_set,
-            driver,
-        ) {
+        let ctx = slot_ctx!(self, driver);
+        if !self.ballot.is_statement_sane(&envelope.statement, &ctx) {
             return EnvelopeState::Invalid;
         }
 

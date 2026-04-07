@@ -57,13 +57,7 @@ impl BallotProtocol {
 
         // Only update last_envelope (for network emission) when we have a
         // real ballot. Matches stellar-core `canEmit = mCurrentBallot != nullptr`.
-        self.record_envelope(
-            ScpStatementPledges::Prepare(prep),
-            can_emit,
-            ctx.local_node_id,
-            ctx.driver,
-            ctx.slot_index,
-        )
+        self.record_envelope(ScpStatementPledges::Prepare(prep), can_emit, ctx)
     }
 
     /// Sign, record, and optionally publish an envelope built from the given pledges.
@@ -74,13 +68,11 @@ impl BallotProtocol {
         &mut self,
         pledges: ScpStatementPledges,
         set_last: bool,
-        local_node_id: &NodeId,
-        driver: &Arc<D>,
-        slot_index: u64,
+        ctx: &SlotContext<'_, D>,
     ) -> Option<ScpStatement> {
         let statement = ScpStatement {
-            node_id: local_node_id.clone(),
-            slot_index,
+            node_id: ctx.local_node_id.clone(),
+            slot_index: ctx.slot_index,
             pledges,
         };
 
@@ -89,8 +81,8 @@ impl BallotProtocol {
             signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
         };
 
-        driver.sign_envelope(&mut envelope);
-        if self.record_local_envelope(local_node_id, envelope.clone()) {
+        ctx.driver.sign_envelope(&mut envelope);
+        if self.record_local_envelope(ctx.local_node_id, envelope.clone()) {
             if set_last {
                 self.last_envelope = Some(envelope);
             }
@@ -111,13 +103,7 @@ impl BallotProtocol {
                 quorum_set_hash: hash_quorum_set(ctx.local_quorum_set).into(),
             };
 
-            self.record_envelope(
-                ScpStatementPledges::Confirm(conf),
-                true,
-                ctx.local_node_id,
-                ctx.driver,
-                ctx.slot_index,
-            )
+            self.record_envelope(ScpStatementPledges::Confirm(conf), true, ctx)
         } else {
             None
         }
@@ -133,13 +119,7 @@ impl BallotProtocol {
                 commit_quorum_set_hash: hash_quorum_set(ctx.local_quorum_set).into(),
             };
 
-            self.record_envelope(
-                ScpStatementPledges::Externalize(ext),
-                true,
-                ctx.local_node_id,
-                ctx.driver,
-                ctx.slot_index,
-            )
+            self.record_envelope(ScpStatementPledges::Externalize(ext), true, ctx)
         } else {
             None
         }

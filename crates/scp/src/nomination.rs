@@ -316,9 +316,7 @@ impl NominationProtocol {
             let ScpStatementPledges::Nominate(nom) = &env.statement.pledges else {
                 continue;
             };
-            let Some(new_vote) =
-                self.get_new_value_from_nomination(nom, ctx.driver, ctx.slot_index)
-            else {
+            let Some(new_vote) = self.get_new_value_from_nomination(nom, ctx) else {
                 continue;
             };
             if Self::insert_unique(&mut self.votes, new_vote.clone()) {
@@ -408,20 +406,12 @@ impl NominationProtocol {
             // Collect the votes from the envelope for acceptance checks.
             let votes_to_check: Vec<Value> = nomination.votes.iter().cloned().collect();
 
-            let (mut modified, new_candidates) = self.attempt_promote(
-                &votes_to_check,
-                ctx.local_node_id,
-                ctx.local_quorum_set,
-                ctx.driver,
-                ctx.slot_index,
-            );
+            let (mut modified, new_candidates) = self.attempt_promote(&votes_to_check, ctx);
 
             // N13: Only take round leader votes if we're still looking for
             // candidates (stellar-core processEnvelope lines 476-489).
             if self.candidates.is_empty() && self.round_leaders.contains(node_id) {
-                if let Some(new_vote) =
-                    self.get_new_value_from_nomination(nomination, ctx.driver, ctx.slot_index)
-                {
+                if let Some(new_vote) = self.get_new_value_from_nomination(nomination, ctx) {
                     if Self::insert_unique(&mut self.votes, new_vote.clone()) {
                         modified = true;
                         ctx.driver.nominating_value(ctx.slot_index, &new_vote);
@@ -436,7 +426,7 @@ impl NominationProtocol {
             }
 
             if new_candidates {
-                self.update_composite(ctx.driver, ctx.slot_index);
+                self.update_composite(ctx);
                 state_changed = true;
             }
         }
@@ -478,16 +468,20 @@ impl NominationProtocol {
     }
 
     /// Update the composite value from accepted values.
-    fn update_composite<D: SCPDriver>(&mut self, driver: &Arc<D>, slot_index: u64) {
+    fn update_composite<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) {
         if self.candidates.is_empty() {
             return;
         }
 
         // Combine all candidates
-        if let Some(composite) = driver.combine_candidates(slot_index, &self.candidates) {
+        if let Some(composite) = ctx
+            .driver
+            .combine_candidates(ctx.slot_index, &self.candidates)
+        {
             if self.latest_composite.as_ref() != Some(&composite) {
                 // Notify driver of the updated candidate value
-                driver.updated_candidate_value(slot_index, &composite);
+                ctx.driver
+                    .updated_candidate_value(ctx.slot_index, &composite);
                 self.latest_composite = Some(composite);
             }
         }
@@ -510,10 +504,7 @@ impl NominationProtocol {
     fn attempt_promote<D: SCPDriver>(
         &mut self,
         votes_to_check: &[Value],
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
-        slot_index: u64,
+        ctx: &SlotContext<'_, D>,
     ) -> (bool, bool) {
         let mut modified = false;
         let mut new_candidates = false;
@@ -524,10 +515,10 @@ impl NominationProtocol {
                 continue;
             }
 
-            if !self.should_accept_value(value, local_node_id, local_quorum_set, driver) {
+            if !self.should_accept_value(value, ctx) {
                 continue;
             }
-            match driver.validate_value(slot_index, value, true) {
+            match ctx.driver.validate_value(ctx.slot_index, value, true) {
                 ValidationLevel::FullyValidated => {
                     if Self::insert_unique(&mut self.accepted, value.clone()) {
                         Self::insert_unique(&mut self.votes, value.clone());
@@ -535,7 +526,7 @@ impl NominationProtocol {
                     }
                 }
                 ValidationLevel::MaybeValid => {
-                    if let Some(extracted) = driver.extract_valid_value(slot_index, value) {
+                    if let Some(extracted) = ctx.driver.extract_valid_value(ctx.slot_index, value) {
                         if Self::insert_unique(&mut self.votes, extracted) {
                             modified = true;
                         }
@@ -551,12 +542,13 @@ impl NominationProtocol {
                 continue;
             }
 
-            if self.should_ratify_value(&value, local_node_id, local_quorum_set, driver)
+            if self.should_ratify_value(&value, ctx)
                 && Self::insert_unique(&mut self.candidates, value.clone())
             {
                 new_candidates = true;
                 // N12: Stop the nomination timer when candidates are confirmed.
-                driver.stop_timer(slot_index, crate::driver::SCPTimerType::Nomination);
+                ctx.driver
+                    .stop_timer(ctx.slot_index, crate::driver::SCPTimerType::Nomination);
             }
         }
 
@@ -608,13 +600,7 @@ impl NominationProtocol {
         // Step 2: Run self-processing (stellar-core processEnvelope body).
         // This may recursively call emit_nomination, updating last_envelope.
         if self.started {
-            let (modified, new_candidates) = self.attempt_promote(
-                &votes,
-                ctx.local_node_id,
-                ctx.local_quorum_set,
-                ctx.driver,
-                ctx.slot_index,
-            );
+            let (modified, new_candidates) = self.attempt_promote(&votes, ctx);
 
             if modified {
                 // Cascade: stellar-core emitNomination -> processEnvelope -> emitNomination
@@ -622,7 +608,7 @@ impl NominationProtocol {
             }
 
             if new_candidates {
-                self.update_composite(ctx.driver, ctx.slot_index);
+                self.update_composite(ctx);
             }
         }
 
@@ -757,63 +743,48 @@ impl NominationProtocol {
     /// map (matching the ballot protocol's `statement_quorum_set_map` fallback).
     fn nomination_quorum_set_map<D: SCPDriver>(
         &self,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
+        ctx: &SlotContext<'_, D>,
     ) -> HashMap<NodeId, ScpQuorumSet> {
         let mut map = HashMap::new();
         for (node_id, envelope) in &self.latest_nominations {
             if let ScpStatementPledges::Nominate(nom) = &envelope.statement.pledges {
                 let qset_hash = henyey_common::Hash256::from(nom.quorum_set_hash.clone());
-                if let Some(qs) = driver.get_quorum_set_by_hash(&qset_hash) {
+                if let Some(qs) = ctx.driver.get_quorum_set_by_hash(&qset_hash) {
                     map.insert(node_id.clone(), qs);
-                } else if let Some(qs) = driver.get_quorum_set(node_id) {
+                } else if let Some(qs) = ctx.driver.get_quorum_set(node_id) {
                     map.insert(node_id.clone(), qs);
                 }
             }
         }
         // Ensure local node is always present (matches ballot protocol fallback).
-        if !map.contains_key(local_node_id) {
-            map.insert(local_node_id.clone(), local_quorum_set.clone());
+        if !map.contains_key(ctx.local_node_id) {
+            map.insert(ctx.local_node_id.clone(), ctx.local_quorum_set.clone());
         }
         map
     }
 
-    fn should_accept_value<D: SCPDriver>(
-        &self,
-        value: &Value,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
-    ) -> bool {
+    fn should_accept_value<D: SCPDriver>(&self, value: &Value, ctx: &SlotContext<'_, D>) -> bool {
         let voters = self.get_nodes_with_value(value, |nom| &nom.votes);
         let acceptors = self.get_nodes_with_value(value, |nom| &nom.accepted);
         let supporters: HashSet<_> = voters.union(&acceptors).cloned().collect();
-        let qsets = self.nomination_quorum_set_map(local_node_id, local_quorum_set, driver);
+        let qsets = self.nomination_quorum_set_map(ctx);
         let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
 
-        is_v_blocking(local_quorum_set, &acceptors)
-            || is_quorum(local_quorum_set, &supporters, get_qs)
+        is_v_blocking(ctx.local_quorum_set, &acceptors)
+            || is_quorum(ctx.local_quorum_set, &supporters, get_qs)
     }
 
-    fn should_ratify_value<D: SCPDriver>(
-        &self,
-        value: &Value,
-        local_node_id: &NodeId,
-        local_quorum_set: &ScpQuorumSet,
-        driver: &Arc<D>,
-    ) -> bool {
+    fn should_ratify_value<D: SCPDriver>(&self, value: &Value, ctx: &SlotContext<'_, D>) -> bool {
         let acceptors = self.get_nodes_with_value(value, |nom| &nom.accepted);
-        let qsets = self.nomination_quorum_set_map(local_node_id, local_quorum_set, driver);
+        let qsets = self.nomination_quorum_set_map(ctx);
         let get_qs = |node_id: &NodeId| -> Option<ScpQuorumSet> { qsets.get(node_id).cloned() };
-        is_quorum(local_quorum_set, &acceptors, get_qs)
+        is_quorum(ctx.local_quorum_set, &acceptors, get_qs)
     }
 
     fn get_new_value_from_nomination<D: SCPDriver>(
         &self,
         nomination: &ScpNomination,
-        driver: &Arc<D>,
-        slot_index: u64,
+        ctx: &SlotContext<'_, D>,
     ) -> Option<Value> {
         let mut best: Option<(u64, Value)> = None;
         let mut found_valid = false;
@@ -821,9 +792,11 @@ impl NominationProtocol {
         let consider_value = |value: &Value,
                               found_valid: &mut bool,
                               best: &mut Option<(u64, Value)>| {
-            let candidate = match driver.validate_value(slot_index, value, true) {
+            let candidate = match ctx.driver.validate_value(ctx.slot_index, value, true) {
                 ValidationLevel::FullyValidated => Some(value.clone()),
-                ValidationLevel::MaybeValid => driver.extract_valid_value(slot_index, value),
+                ValidationLevel::MaybeValid => {
+                    ctx.driver.extract_valid_value(ctx.slot_index, value)
+                }
                 ValidationLevel::Invalid => None,
             };
 
@@ -835,7 +808,7 @@ impl NominationProtocol {
                 if self.votes.contains(&candidate) {
                     return;
                 }
-                let hash = self.hash_value(driver, slot_index, &candidate);
+                let hash = self.hash_value(ctx, &candidate);
                 match best {
                     None => *best = Some((hash, candidate)),
                     Some((best_hash, _)) if hash >= *best_hash => *best = Some((hash, candidate)),
@@ -857,9 +830,10 @@ impl NominationProtocol {
         best.map(|(_, value)| value)
     }
 
-    fn hash_value<D: SCPDriver>(&self, driver: &Arc<D>, slot_index: u64, value: &Value) -> u64 {
+    fn hash_value<D: SCPDriver>(&self, ctx: &SlotContext<'_, D>, value: &Value) -> u64 {
         let prev = self.previous_value.as_ref().unwrap_or(value);
-        driver.compute_value_hash(slot_index, prev, self.round, value)
+        ctx.driver
+            .compute_value_hash(ctx.slot_index, prev, self.round, value)
     }
 
     fn update_round_leaders<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>, prev_value: &Value) {

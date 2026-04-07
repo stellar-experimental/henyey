@@ -85,9 +85,7 @@ impl BallotProtocol {
             let accepted = self.federated_accept(
                 |st| self.statement_votes_for_ballot(ballot, st),
                 |st| Self::has_prepared_ballot(ballot, st),
-                ctx.local_node_id,
-                ctx.local_quorum_set,
-                ctx.driver,
+                ctx,
             );
 
             if accepted && self.set_accept_prepared(ballot.clone(), ctx) {
@@ -169,12 +167,7 @@ impl BallotProtocol {
                 }
             }
 
-            if self.federated_ratify(
-                |st| Self::has_prepared_ballot(ballot, st),
-                ctx.local_node_id,
-                ctx.local_quorum_set,
-                ctx.driver,
-            ) {
+            if self.federated_ratify(|st| Self::has_prepared_ballot(ballot, st), ctx) {
                 return Some((ballot.clone(), idx));
             }
         }
@@ -219,12 +212,7 @@ impl BallotProtocol {
                 if !are_ballots_less_and_compatible(ballot, new_h_ballot) {
                     continue;
                 }
-                if self.federated_ratify(
-                    |st| Self::has_prepared_ballot(ballot, st),
-                    ctx.local_node_id,
-                    ctx.local_quorum_set,
-                    ctx.driver,
-                ) {
+                if self.federated_ratify(|st| Self::has_prepared_ballot(ballot, st), ctx) {
                     new_c = ballot.clone();
                 } else {
                     break;
@@ -304,9 +292,7 @@ impl BallotProtocol {
             self.federated_accept(
                 |st| self.statement_votes_commit(&ballot, interval, st),
                 |st| self.commit_predicate(&ballot, interval, st),
-                ctx.local_node_id,
-                ctx.local_quorum_set,
-                ctx.driver,
+                ctx,
             )
         });
 
@@ -397,12 +383,7 @@ impl BallotProtocol {
         let boundaries = self.get_commit_boundaries_from_statements(&ballot);
         let mut candidate = (0u32, 0u32);
         self.find_extended_interval(&mut candidate, &boundaries, |interval| {
-            self.federated_ratify(
-                |st| self.commit_predicate(&ballot, interval, st),
-                ctx.local_node_id,
-                ctx.local_quorum_set,
-                ctx.driver,
-            )
+            self.federated_ratify(|st| self.commit_predicate(&ballot, interval, st), ctx)
         });
 
         if candidate.0 == 0 {
@@ -447,12 +428,7 @@ impl BallotProtocol {
         }
 
         let local_counter = self.current_ballot.as_ref().map(|b| b.counter).unwrap_or(0);
-        if !self.has_vblocking_subset_strictly_ahead_of(
-            local_counter,
-            ctx.local_node_id,
-            ctx.local_quorum_set,
-            ctx.driver,
-        ) {
+        if !self.has_vblocking_subset_strictly_ahead_of(local_counter, ctx) {
             return false;
         }
 
@@ -465,12 +441,7 @@ impl BallotProtocol {
         }
 
         for counter in counters {
-            if !self.has_vblocking_subset_strictly_ahead_of(
-                counter,
-                ctx.local_node_id,
-                ctx.local_quorum_set,
-                ctx.driver,
-            ) {
+            if !self.has_vblocking_subset_strictly_ahead_of(counter, ctx) {
                 return self.abandon_ballot(counter, ctx);
             }
         }
