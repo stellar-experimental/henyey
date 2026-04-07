@@ -49,40 +49,9 @@ pub(crate) fn execute_create_claimable_balance(
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<OperationResult> {
-    // Validate the operation
-    if op.claimants.is_empty() {
-        return Ok(make_create_result(
-            CreateClaimableBalanceResultCode::Malformed,
-            None,
-        ));
-    }
-
-    if op.amount <= 0 {
-        return Ok(make_create_result(
-            CreateClaimableBalanceResultCode::Malformed,
-            None,
-        ));
-    }
-
-    // Check for duplicate claimants and validate predicates.
-    let mut destinations = HashSet::new();
-    for claimant in op.claimants.iter() {
-        match claimant {
-            Claimant::ClaimantTypeV0(cv0) => {
-                if !destinations.insert(cv0.destination.clone()) {
-                    return Ok(make_create_result(
-                        CreateClaimableBalanceResultCode::Malformed,
-                        None,
-                    ));
-                }
-                if !validate_claim_predicate(&cv0.predicate, 1) {
-                    return Ok(make_create_result(
-                        CreateClaimableBalanceResultCode::Malformed,
-                        None,
-                    ));
-                }
-            }
-        }
+    // Validate claimants, amount, and predicates
+    if let Some(result) = validate_create_claimable_balance_op(op) {
+        return Ok(result);
     }
 
     // Check source account exists (stellar-core calls loadSourceAccount which records access)
@@ -489,6 +458,41 @@ fn update_predicate_for_apply(predicate: &mut ClaimPredicate, close_time: u64) {
         }
         ClaimPredicate::BeforeAbsoluteTime(_) | ClaimPredicate::Unconditional => {}
     }
+}
+
+/// Validate CreateClaimableBalance operation parameters: non-empty claimants,
+/// positive amount, no duplicate destinations, and valid predicates.
+/// Returns `Some(result)` on validation failure, `None` if valid.
+fn validate_create_claimable_balance_op(
+    op: &CreateClaimableBalanceOp,
+) -> Option<OperationResult> {
+    if op.claimants.is_empty() || op.amount <= 0 {
+        return Some(make_create_result(
+            CreateClaimableBalanceResultCode::Malformed,
+            None,
+        ));
+    }
+
+    let mut destinations = HashSet::new();
+    for claimant in op.claimants.iter() {
+        match claimant {
+            Claimant::ClaimantTypeV0(cv0) => {
+                if !destinations.insert(cv0.destination.clone()) {
+                    return Some(make_create_result(
+                        CreateClaimableBalanceResultCode::Malformed,
+                        None,
+                    ));
+                }
+                if !validate_claim_predicate(&cv0.predicate, 1) {
+                    return Some(make_create_result(
+                        CreateClaimableBalanceResultCode::Malformed,
+                        None,
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn make_create_result(
