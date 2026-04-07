@@ -22,6 +22,29 @@ use crate::{Result, TxError};
 
 // Shared helpers used by multiple operation submodules.
 
+/// Load the source account entry, returning [`TxError::SourceAccountNotFound`]
+/// if missing. The dispatcher already verifies existence (returning `opNO_ACCOUNT`),
+/// so this should not fail in practice; the error path is a safety net.
+pub(super) fn require_source_account<'a>(
+    state: &'a LedgerStateManager,
+    source: &AccountId,
+) -> Result<&'a AccountEntry> {
+    state
+        .get_account(source)
+        .ok_or(TxError::SourceAccountNotFound)
+}
+
+/// Like [`require_source_account`] but returns a clone.
+pub(super) fn require_source_account_cloned(
+    state: &LedgerStateManager,
+    source: &AccountId,
+) -> Result<AccountEntry> {
+    state
+        .get_account(source)
+        .cloned()
+        .ok_or(TxError::SourceAccountNotFound)
+}
+
 /// Transaction identity used to generate deterministic IDs for claimable balances
 /// and trust-flag revocations. Bundles the three fields that always travel together.
 pub struct TxIdentity<'a> {

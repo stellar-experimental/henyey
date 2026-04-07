@@ -5,9 +5,10 @@ use stellar_xdr::curr::{
     OperationResultTr,
 };
 
+use super::require_source_account_cloned;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
-use crate::{Result, TxError};
+use crate::Result;
 
 /// Execute a BumpSequence operation.
 pub(crate) fn execute_bump_sequence(
@@ -21,10 +22,7 @@ pub(crate) fn execute_bump_sequence(
     }
 
     // Get source account
-    let mut source_account = state
-        .get_account(source)
-        .cloned()
-        .ok_or(TxError::SourceAccountNotFound)?;
+    let mut source_account = require_source_account_cloned(state, source)?;
 
     let current = source_account.seq_num.0;
 

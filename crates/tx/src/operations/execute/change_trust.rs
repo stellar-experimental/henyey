@@ -10,7 +10,7 @@ use stellar_xdr::curr::{
 
 use super::{
     account_balance_after_liabilities, is_authorized_to_maintain_liabilities,
-    trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG,
+    require_source_account, trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG,
     TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
@@ -52,9 +52,7 @@ pub(crate) fn execute_change_trust(
     }
 
     // Check source account exists
-    if state.get_account(source).is_none() {
-        return Err(TxError::SourceAccountNotFound);
-    }
+    require_source_account(state, source)?;
 
     // Get existing trustline if any
     let existing = state.get_trustline_by_trustline_asset(source, &tl_asset);
@@ -159,9 +157,7 @@ pub(crate) fn execute_change_trust(
 
         // Check subentries limit before creating trustline
         // Pool share trustlines count as 2 subentries (multiplier)
-        let source_account = state
-            .get_account(source)
-            .ok_or(TxError::SourceAccountNotFound)?;
+        let source_account = require_source_account(state, source)?;
         if source_account.num_sub_entries + multiplier as u32 > ACCOUNT_SUBENTRY_LIMIT {
             return Ok(OperationResult::OpTooManySubentries);
         }
@@ -185,9 +181,7 @@ pub(crate) fn execute_change_trust(
                 return Ok(make_result(ChangeTrustResultCode::LowReserve));
             }
         } else {
-            let source_account = state
-                .get_account(source)
-                .ok_or(TxError::SourceAccountNotFound)?;
+            let source_account = require_source_account(state, source)?;
             let new_min_balance = state.minimum_balance_for_account(
                 source_account,
                 context.protocol_version,

@@ -6,7 +6,7 @@ use stellar_xdr::curr::{
     SequenceNumber, String32, Thresholds,
 };
 
-use super::{account_balance_after_liabilities, account_liabilities};
+use super::{account_balance_after_liabilities, account_liabilities, require_source_account};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -62,10 +62,7 @@ pub(crate) fn execute_create_account(
     }
 
     // Get source account and check balance
-    let source_account = match state.get_account(source) {
-        Some(account) => account,
-        None => return Err(TxError::SourceAccountNotFound),
-    };
+    let source_account = require_source_account(state, source)?;
 
     // Check source has sufficient available balance.
     // If source is the sponsor, its numSponsoring has already been incremented

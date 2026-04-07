@@ -10,7 +10,7 @@ use stellar_xdr::curr::{
     SignerKeyEd25519SignedPayload, SignerKeyType, SponsorshipDescriptor, MASK_ACCOUNT_FLAGS_V17,
 };
 
-use super::{account_balance_after_liabilities, ACCOUNT_SUBENTRY_LIMIT};
+use super::{account_balance_after_liabilities, require_source_account, ACCOUNT_SUBENTRY_LIMIT};
 use crate::state::{ensure_account_ext_v2, LedgerStateManager};
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -88,10 +88,7 @@ pub(crate) fn execute_set_options(
     }
 
     // Get source account
-    let source_account = match state.get_account(source) {
-        Some(account) => account,
-        None => return Err(TxError::SourceAccountNotFound),
-    };
+    let source_account = require_source_account(state, source)?;
 
     // Check flag consistency
     let auth_flags_mask = AccountFlags::RequiredFlag as u32

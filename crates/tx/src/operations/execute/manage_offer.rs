@@ -22,7 +22,7 @@ use super::offer_utils::{
 use super::{
     account_balance_after_liabilities, account_liabilities, apply_balance_delta,
     apply_liabilities_delta, can_buy_at_most, is_trustline_authorized, issuer_for_asset,
-    map_exchange_error, trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT,
+    map_exchange_error, require_source_account, trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -179,9 +179,7 @@ fn execute_manage_offer(
     // For new offers, check subentry limit FIRST (before any balance/reserve checks).
     // This matches stellar-core's check ordering.
     if old_offer.is_none() {
-        let source_account = state
-            .get_account(source)
-            .ok_or(TxError::SourceAccountNotFound)?;
+        let source_account = require_source_account(state, source)?;
         if source_account.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT {
             return Ok(OperationResult::OpTooManySubentries);
         }

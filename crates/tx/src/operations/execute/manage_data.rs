@@ -8,7 +8,7 @@ use stellar_xdr::curr::{
     ManageDataResultCode, OperationResult, OperationResultTr,
 };
 
-use super::{account_balance_after_liabilities, ACCOUNT_SUBENTRY_LIMIT};
+use super::{account_balance_after_liabilities, require_source_account, ACCOUNT_SUBENTRY_LIMIT};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -48,9 +48,7 @@ pub(crate) fn execute_manage_data(
     }
 
     // Check source account exists
-    if state.get_account(source).is_none() {
-        return Err(TxError::SourceAccountNotFound);
-    }
+    require_source_account(state, source)?;
 
     // Check if data entry exists
     let existing_entry = state.get_data(source, &data_name);
@@ -87,9 +85,7 @@ pub(crate) fn execute_manage_data(
                     entry.data_value = value.clone();
                 }
             } else {
-                let source_account = state
-                    .get_account(source)
-                    .ok_or(TxError::SourceAccountNotFound)?;
+                let source_account = require_source_account(state, source)?;
 
                 // Enforce subentry limits before adding the new entry.
                 let (num_sponsoring, _num_sponsored) = state

@@ -6,7 +6,7 @@ use stellar_xdr::curr::{
     OperationResult, OperationResultTr, SponsorshipDescriptor,
 };
 
-use super::add_account_balance;
+use super::{add_account_balance, require_source_account_cloned};
 use crate::frame::muxed_to_account_id;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -30,10 +30,7 @@ pub(crate) fn execute_account_merge(
     }
 
     // Get source account
-    let source_account = match state.get_account(source) {
-        Some(account) => account.clone(),
-        None => return Err(TxError::SourceAccountNotFound),
-    };
+    let source_account = require_source_account_cloned(state, source)?;
 
     // Check source is not immutable (checked first per stellar-core doApplyFromV16)
     if source_account.flags & (AccountFlags::ImmutableFlag as u32) != 0 {
