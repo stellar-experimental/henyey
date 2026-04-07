@@ -223,7 +223,8 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     // Start the stellar-core compatibility HTTP server if enabled
     let compat_handle = if compat_http_enabled {
         #[cfg_attr(not(feature = "loadgen"), allow(unused_mut))]
-        let mut compat_server = CompatServer::new(compat_http_port, compat_http_address.clone(), app.clone());
+        let mut compat_server =
+            CompatServer::new(compat_http_port, compat_http_address.clone(), app.clone());
         #[cfg(feature = "loadgen")]
         if let Some(ref factory) = options.loadgen_runner_factory {
             compat_server.set_loadgen_runner(factory(app.clone()));
