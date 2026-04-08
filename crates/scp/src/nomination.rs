@@ -752,7 +752,12 @@ impl NominationProtocol {
                 if let Some(qs) = ctx.driver.get_quorum_set_by_hash(&qset_hash) {
                     map.insert(node_id.clone(), qs);
                 } else if let Some(qs) = ctx.driver.get_quorum_set(node_id) {
-                    map.insert(node_id.clone(), qs);
+                    // Verify the hash matches before using the fallback, matching
+                    // the ballot protocol's approach (ballot/statements.rs) and
+                    // stellar-core's hash-only lookup (Slot.cpp:316-348).
+                    if crate::quorum::hash_quorum_set(&qs) == qset_hash {
+                        map.insert(node_id.clone(), qs);
+                    }
                 }
             }
         }
@@ -1007,7 +1012,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
-    use stellar_xdr::curr::{PublicKey, ScpBallot, Uint256};
+    use stellar_xdr::curr::{Hash, PublicKey, ScpBallot, Uint256};
 
     /// Helper to construct a `SlotContext` from the old four-parameter pattern.
     macro_rules! ctx {
@@ -2202,5 +2207,65 @@ mod tests {
                 assert!(pair[0] < pair[1], "Leaders must be in sorted order");
             }
         }
+    }
+
+    /// Regression test for AUDIT-005 (SCP): nomination quorum set hash verification bypass.
+    ///
+    /// The nomination protocol's `nomination_quorum_set_map` was falling back to
+    /// `get_quorum_set(node_id)` without verifying the hash, allowing stale quorum
+    /// sets to be used in quorum calculations. stellar-core uses hash-only lookup
+    /// and excludes nodes whose quorum set hash is unknown.
+    #[test]
+    fn test_audit_005_nomination_quorum_set_hash_verified_in_fallback() {
+        use crate::quorum::hash_quorum_set;
+
+        // Create two different quorum sets.
+        let qs_current = make_quorum_set(vec![make_node_id(0), make_node_id(1)], 2);
+        let qs_stale = make_quorum_set(vec![make_node_id(0)], 1);
+        let current_hash = hash_quorum_set(&qs_current);
+        let stale_hash = hash_quorum_set(&qs_stale);
+        assert_ne!(current_hash, stale_hash, "hashes must differ");
+
+        let local_node = make_node_id(0);
+        let remote_node = make_node_id(1);
+
+        // Build a nomination state with an envelope from remote_node declaring
+        // qs_current's hash, but where the driver only has qs_stale cached by node.
+        let mut nom = NominationProtocol::new();
+        let nomination_pledge = ScpNomination {
+            quorum_set_hash: Hash(current_hash.0),
+            votes: vec![make_value(b"val")].try_into().unwrap(),
+            accepted: vec![].try_into().unwrap(),
+        };
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: remote_node.clone(),
+                slot_index: 0,
+                pledges: ScpStatementPledges::Nominate(nomination_pledge),
+            },
+            signature: stellar_xdr::curr::Signature(vec![].try_into().unwrap()),
+        };
+        nom.latest_nominations
+            .insert(remote_node.clone(), envelope);
+
+        // A driver where get_quorum_set_by_hash returns None (default)
+        // and get_quorum_set returns the STALE quorum set.
+        let driver = Arc::new(MockDriver::with_quorum_set(qs_stale.clone()));
+        let slot_ctx = ctx!(&local_node, &qs_current, &driver, 0);
+
+        let map = nom.nomination_quorum_set_map(&slot_ctx);
+
+        // The remote node's quorum set should NOT be in the map because
+        // its declared hash (current_hash) doesn't match what get_quorum_set
+        // returned (stale_hash). Before the fix, the stale set was used.
+        assert!(
+            !map.contains_key(&remote_node),
+            "Remote node with stale quorum set should be excluded from quorum map, \
+             but found: {:?}",
+            map.get(&remote_node)
+        );
+
+        // The local node should always be present (self-insert fallback).
+        assert!(map.contains_key(&local_node));
     }
 }
