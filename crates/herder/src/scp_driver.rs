@@ -1428,23 +1428,15 @@ impl ScpDriver {
 
     /// Compute total inclusion fees for a transaction set.
     ///
-    /// For generalized tx sets, the inclusion fee per tx is
-    /// `min(tx.fee, numOps * componentBaseFee)`. For legacy tx sets,
-    /// inclusion fee == full fee (no discounting).
+    /// stellar-core's `getTotalInclusionFees()` sums `getInclusionFee()` per tx:
+    /// - Classic: fullFee
+    /// - Soroban: fullFee - declaredSorobanResourceFee
     fn tx_set_total_inclusion_fees(tx_set: &TransactionSet) -> i64 {
-        let Some(ref gen) = tx_set.generalized_tx_set else {
-            // Legacy tx set: inclusion fee == full fee
-            return Self::tx_set_total_fees(tx_set);
-        };
-        let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = gen;
-
-        let mut total = 0i64;
-        for phase in set_v1.phases.iter() {
-            for (tx, base_fee) in Self::phase_txs_with_base_fee(phase) {
-                total += crate::tx_set_utils::inclusion_fee(tx, base_fee);
-            }
-        }
-        total
+        tx_set
+            .transactions
+            .iter()
+            .map(|env| crate::tx_set_utils::envelope_inclusion_fee(env))
+            .sum()
     }
 
     /// Iterate over all transactions in a phase, yielding each envelope
@@ -1470,18 +1462,45 @@ impl ScpDriver {
         }
     }
 
-    /// Compute total fees for a transaction set.
+    /// Compute total applying-time fees for a transaction set.
+    ///
+    /// stellar-core's `getTotalFees(lh)` computes `getFee(lh, baseFee, applying=true)` per tx:
+    /// - Classic with baseFee: min(inclusionFee, baseFee * numOps)
+    /// - Soroban with baseFee: resourceFee + min(inclusionFee, baseFee * numOps)
+    /// - No baseFee: fullFee
     fn tx_set_total_fees(tx_set: &TransactionSet) -> i64 {
-        tx_set
-            .transactions
-            .iter()
-            .map(|env| Self::envelope_fee(env))
-            .sum()
+        let Some(ref gen) = tx_set.generalized_tx_set else {
+            // Legacy tx set: applying fee == full fee
+            return tx_set
+                .transactions
+                .iter()
+                .map(|env| crate::tx_set_utils::envelope_fee(env))
+                .sum();
+        };
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = gen;
+
+        let mut total = 0i64;
+        for phase in set_v1.phases.iter() {
+            for (tx, base_fee) in Self::phase_txs_with_base_fee(phase) {
+                total += Self::tx_applying_fee(tx, base_fee);
+            }
+        }
+        total
     }
 
-    /// Get fee from a transaction envelope.
-    fn envelope_fee(env: &stellar_xdr::curr::TransactionEnvelope) -> i64 {
-        crate::tx_set_utils::envelope_fee(env)
+    /// Compute applying-time fee for a single transaction.
+    ///
+    /// Matches stellar-core `TransactionFrame::getFee(lh, baseFee, applying=true)`.
+    fn tx_applying_fee(env: &stellar_xdr::curr::TransactionEnvelope, base_fee: Option<i64>) -> i64 {
+        let full_fee = crate::tx_set_utils::envelope_fee(env);
+        let Some(bf) = base_fee else {
+            return full_fee;
+        };
+        let inclusion_fee = crate::tx_set_utils::envelope_inclusion_fee(env);
+        let resource_fee = full_fee.saturating_sub(inclusion_fee);
+        let num_ops = std::cmp::max(1, crate::tx_set_utils::envelope_num_ops(env) as i64);
+        let adjusted_fee = bf.saturating_mul(num_ops);
+        resource_fee.saturating_add(std::cmp::min(inclusion_fee, adjusted_fee))
     }
 
     /// Get number of operations from a transaction envelope.
@@ -3909,6 +3928,67 @@ mod compare_tx_sets_tests {
         hash
     }
 
+    /// Create a Soroban-like transaction with a given fee and resource fee.
+    /// inclusion_fee = fee - resource_fee.
+    fn make_soroban_tx(
+        seed: u8,
+        fee: u32,
+        resource_fee: i64,
+    ) -> stellar_xdr::curr::TransactionEnvelope {
+        use stellar_xdr::curr::{
+            AccountId, DecoratedSignature, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
+            LedgerFootprint, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+            PublicKey, ScAddress, ScVal, SequenceNumber, SignatureHint, SorobanResources,
+            SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        };
+        let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+        let function_name = stellar_xdr::curr::ScSymbol("test".try_into().unwrap());
+        let operations = vec![Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Account(AccountId(
+                        PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])),
+                    )),
+                    function_name,
+                    args: VecM::<ScVal>::default(),
+                }),
+                auth: vec![].try_into().unwrap(),
+            }),
+        }];
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(seed as i64),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: vec![].try_into().unwrap(),
+                        read_write: vec![].try_into().unwrap(),
+                    },
+                    instructions: 0,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee,
+            }),
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
     fn make_generalized_tx_set(
         tx: stellar_xdr::curr::TransactionEnvelope,
         base_fee: i64,
@@ -3999,15 +4079,21 @@ mod compare_tx_sets_tests {
         let driver = make_driver();
         let candidates_hash = [0u8; 32];
 
-        // Both sets have equal ops (1), but different inclusion/full-fee order:
-        // - A: full fee 1000, base_fee 100 -> inclusion fee 100
-        // - B: full fee 400,  base_fee 400 -> inclusion fee 400
-        // Criterion 2 (inclusion fee) must win over criterion 3 (full fee), so B > A.
-        let tx_a = make_tx(20, 1_000, 1);
-        let tx_b = make_tx(21, 400, 1);
+        // Use Soroban txs where inclusion_fee = full_fee - resource_fee.
+        // - A: full fee 1000, resource fee 800 -> inclusion fee 200
+        // - B: full fee 500,  resource fee 100 -> inclusion fee 400
+        //
+        // Criterion 2 (total inclusion fee): A=200, B=400 -> B wins
+        // Criterion 3 (total applying fee with base_fee=500):
+        //   A: resource(800) + min(inclusion(200), base_fee(500)*ops(1)) = 800+200 = 1000
+        //   B: resource(100) + min(inclusion(400), base_fee(500)*ops(1)) = 100+400 = 500
+        //   -> A wins criterion 3
+        // So criterion 2 should take priority, making B > A (result = Less).
+        let tx_a = make_soroban_tx(20, 1_000, 800);
+        let tx_b = make_soroban_tx(21, 500, 100);
 
-        let tx_set_a = make_generalized_tx_set(tx_a, 100);
-        let tx_set_b = make_generalized_tx_set(tx_b, 400);
+        let tx_set_a = make_generalized_tx_set(tx_a, 500);
+        let tx_set_b = make_generalized_tx_set(tx_b, 500);
 
         let hash_a = cache_tx_set(&driver, tx_set_a);
         let hash_b = cache_tx_set(&driver, tx_set_b);
