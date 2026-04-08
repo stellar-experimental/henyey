@@ -4338,3 +4338,168 @@ fn test_audit_005_fee_bump_inner_hash_for_signer_removal() {
         "num_sub_entries should be decremented after signer removal"
     );
 }
+
+/// Regression test for AUDIT-007: Sequential Soroban fee_charged missing refund subtraction.
+///
+/// The sequential execution path (`run_transactions_on_executor` with pre-charged fees)
+/// was setting `result.fee_charged = pre_charged_fee` without subtracting the Soroban
+/// refund. This caused `feeCharged` in the serialized TransactionResult to be inflated,
+/// diverging from stellar-core's `finalizeFeeRefund()` which always subtracts the refund.
+///
+/// The parallel path correctly had `pre.charged_fee.saturating_sub(result.fee_refund)`.
+#[test]
+fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
+    use henyey_ledger::execution::{run_transactions_on_executor, PreChargedFee};
+    use henyey_ledger::LedgerDelta;
+
+    let secret = SecretKey::from_seed(&[55u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 100_000_000);
+
+    let code_hash = Hash([9u8; 32]);
+    let contract_code = ContractCodeEntry {
+        ext: ContractCodeEntryExt::V0,
+        hash: code_hash.clone(),
+        code: BytesM::try_from(vec![1u8, 2u8, 3u8]).unwrap(),
+    };
+    let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+        hash: code_hash.clone(),
+    });
+    let contract_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::ContractCode(contract_code),
+        ext: LedgerEntryExt::V0,
+    };
+
+    let key_hash = {
+        use sha2::{Digest, Sha256};
+        use stellar_xdr::curr::WriteXdr;
+
+        let mut hasher = Sha256::new();
+        let bytes = contract_key
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .unwrap_or_default();
+        hasher.update(&bytes);
+        Hash(hasher.finalize().into())
+    };
+    let ttl_entry = LedgerEntry {
+        last_modified_ledger_seq: 1,
+        data: LedgerEntryData::Ttl(TtlEntry {
+            key_hash: key_hash.clone(),
+            live_until_ledger_seq: 10,
+        }),
+        ext: LedgerEntryExt::V0,
+    };
+    let ttl_key = LedgerKey::Ttl(LedgerKeyTtl { key_hash });
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .add_entry(contract_key.clone(), contract_entry)
+        .add_entry(ttl_key, ttl_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let base_fee: u32 = 100;
+
+    // Soroban TX with resource_fee that will generate a refund.
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::ExtendFootprintTtl(ExtendFootprintTtlOp {
+            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            extend_to: 100,
+        }),
+    };
+
+    let soroban_data = SorobanTransactionData {
+        ext: SorobanTransactionDataExt::V0,
+        resources: SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: vec![contract_key].try_into().unwrap(),
+                read_write: VecM::default(),
+            },
+            instructions: 0,
+            disk_read_bytes: 10000,
+            write_bytes: 0,
+        },
+        resource_fee: 900,
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 1000, // 100 inclusion + 900 resource
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V1(soroban_data),
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let sig = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(2, 1_000, base_fee, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load offers");
+
+    // Pre-charge the full declared fee (1000).
+    let pre_charged_fee: i64 = 1000;
+    let pre_charged = vec![PreChargedFee {
+        charged_fee: pre_charged_fee,
+        should_apply: true,
+        fee_changes: LedgerEntryChanges(vec![].try_into().unwrap()),
+    }];
+
+    let transactions = vec![(std::sync::Arc::new(envelope), None)];
+    let mut delta = LedgerDelta::new(2);
+
+    let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
+        executor: &mut executor,
+        snapshot: &snapshot,
+        transactions: &transactions,
+        base_fee,
+        soroban_base_prng_seed: [0u8; 32],
+        deduct_fee: false,
+        delta: &mut delta,
+        external_pre_charged: Some(&pre_charged),
+    })
+    .expect("run_transactions_on_executor");
+
+    assert!(result.results[0].success, "Soroban TX should succeed");
+
+    // The refund should be non-zero (resource fee was over-estimated).
+    let fee_refund = result.results[0].fee_refund;
+    assert!(
+        fee_refund > 0,
+        "Soroban TX should have a non-zero fee refund, got {}",
+        fee_refund
+    );
+
+    // AUDIT-007: fee_charged must be pre_charged minus the refund, not the full pre_charged.
+    let expected_fee_charged = pre_charged_fee - fee_refund;
+    assert_eq!(
+        result.results[0].fee_charged, expected_fee_charged,
+        "fee_charged ({}) should be pre_charged_fee ({}) - fee_refund ({}), not the full pre_charged",
+        result.results[0].fee_charged, pre_charged_fee, fee_refund
+    );
+
+    // Also verify the XDR TransactionResult has the correct feeCharged.
+    assert_eq!(
+        result.tx_results[0].result.fee_charged, expected_fee_charged,
+        "XDR feeCharged must match: expected {} (pre_charged {} - refund {})",
+        expected_fee_charged, pre_charged_fee, fee_refund
+    );
+}

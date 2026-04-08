@@ -240,7 +240,8 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
         // report fee_charged=0. Override with the actual pre-charged amount
         // so the result matches the fee already deducted on the delta.
         if has_pre_charged {
-            result.fee_charged = pre_fee_results[tx_index].charged_fee;
+            result.fee_charged =
+                pre_fee_results[tx_index].charged_fee.saturating_sub(result.fee_refund);
         }
 
         let frame = TransactionFrame::with_network(Arc::clone(tx), executor.network_id);
