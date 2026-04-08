@@ -401,8 +401,7 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
     let ttl_key = ttl_key_for(&data_key);
 
     // Set live_until = 99 = N-1 = snapshot.ledger_seq()
-    // stellar-core would consider this EXPIRED (99 < 100)
-    // henyey considers this LIVE (99 >= 99)
+    // Both stellar-core and henyey now consider this EXPIRED (99 < 100).
     let ttl_entry = make_ttl_entry(&data_key, snapshot_ledger);
 
     let snapshot = SnapshotBuilder::new(snapshot_ledger)
@@ -413,27 +412,17 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
         .expect("build snapshot");
     let handle = SnapshotHandle::new(snapshot);
 
-    // make_from_key uses closing_ledger (100) for TTL check
+    // make_from_key now uses closing_ledger (100) for TTL check.
+    // Entry with live_until=99 is expired because 99 < 100.
     let frame = ConfigUpgradeSetFrame::make_from_key(&handle, &upgrade_key, closing_ledger, 25);
 
-    // In stellar-core, this entry would be EXPIRED because the check uses
-    // the closing ledger (100), not the snapshot ledger (99).
-    // The entry's live_until (99) < closing ledger (100) → expired.
-    //
-    // In henyey, the check uses snapshot.ledger_seq() = 99, so
-    // live_until (99) >= 99 → LIVE.
-    //
-    // If frame is Some, the bug is present (henyey considers it live).
-    // If frame is None, the fix has been applied.
-    if frame.is_some() {
-        panic!(
-            "AUDIT-050 (#1125): ConfigUpgradeSet with live_until={} was considered LIVE \n\
-             when closing ledger {}. The TTL check uses snapshot.ledger_seq()={} \n\
-             instead of the closing ledger seq={}. stellar-core would consider this \n\
-             EXPIRED (live_until < closing_ledger).",
-            snapshot_ledger, closing_ledger, snapshot_ledger, closing_ledger
-        );
-    }
+    assert!(
+        frame.is_none(),
+        "ConfigUpgradeSet with live_until={} should be EXPIRED when closing ledger is {}. \
+         The TTL check must use the closing ledger (N), not snapshot.ledger_seq() (N-1).",
+        snapshot_ledger,
+        closing_ledger
+    );
 }
 
 // ===========================================================================
