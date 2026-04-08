@@ -1536,7 +1536,11 @@ impl App {
             &result.tx_results,
             tx_metas.as_deref(),
         ) {
-            tracing::warn!(error = %err, "Failed to persist ledger close data");
+            // Fatal: stellar-core crashes on DB failure during ledger close
+            // (uncaught SOCI exception). We must abort to prevent split-brain
+            // between in-memory state and the database.
+            tracing::error!(error = %err, "Fatal: failed to persist ledger close data");
+            std::process::abort();
         }
 
         // Persist full LedgerCloseMeta for RPC serving (getTransactions, getLedgers).
