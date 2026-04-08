@@ -1208,6 +1208,8 @@ impl UpgradeContext {
         &self,
         snapshot: &SnapshotHandle,
         delta: &mut LedgerDelta,
+        closing_ledger_seq: u32,
+        protocol_version: u32,
     ) -> Result<ConfigUpgradeResult, LedgerError> {
         use stellar_xdr::curr::{Limits, WriteXdr};
 
@@ -1217,7 +1219,12 @@ impl UpgradeContext {
 
         for key in self.config_upgrade_keys() {
             // Load the upgrade set from the ledger
-            let frame = match ConfigUpgradeSetFrame::make_from_key(snapshot, &key) {
+            let frame = match ConfigUpgradeSetFrame::make_from_key(
+                snapshot,
+                &key,
+                closing_ledger_seq,
+                protocol_version,
+            ) {
                 Some(f) => f,
                 None => {
                     tracing::warn!(

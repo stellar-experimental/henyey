@@ -732,28 +732,32 @@ pub fn replay_ledger_with_execution(
     // Update LiveSorobanStateSizeWindow if needed.
     // stellar-core calls snapshotSorobanStateSizeWindow() at the end of ledger close.
     // This samples the current Soroban state size at periodic intervals.
-    // Check if already present in live_entries (from transaction delta)
-    let has_window_entry = all_live_entries.iter().any(|e| {
-        matches!(
-            &e.data,
-            LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(_))
-        )
-    });
-    if !has_window_entry {
-        if let Some(state_size) = soroban_state_size {
-            if let Some(window_entry) = compute_soroban_state_size_window_entry(
-                header.ledger_seq,
-                bucket_list,
-                state_size,
-                None,
-            ) {
-                tracing::debug!(
-                    ledger_seq = header.ledger_seq,
-                    soroban_state_size = state_size,
-                    "Added LiveSorobanStateSizeWindow entry to live entries"
-                );
-                all_live_entries.push(window_entry);
-            }
+    // Always compute the window entry on sample ledgers, even if a config upgrade
+    // already placed a resized window in live_entries. The compute function handles
+    // both resize and shift+push; if a config upgrade resized the window, we replace
+    // the resize-only entry with the resize+shift+push result.
+    if let Some(state_size) = soroban_state_size {
+        if let Some(window_entry) = compute_soroban_state_size_window_entry(
+            header.ledger_seq,
+            bucket_list,
+            state_size,
+            None,
+        ) {
+            // Remove any existing window entry (e.g. from a config upgrade resize)
+            all_live_entries.retain(|e| {
+                !matches!(
+                    &e.data,
+                    LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                        _
+                    ))
+                )
+            });
+            tracing::debug!(
+                ledger_seq = header.ledger_seq,
+                soroban_state_size = state_size,
+                "Added LiveSorobanStateSizeWindow entry to live entries"
+            );
+            all_live_entries.push(window_entry);
         }
     }
 

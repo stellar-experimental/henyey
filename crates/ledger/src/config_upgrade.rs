@@ -137,6 +137,11 @@ pub struct ConfigUpgradeSetFrame {
 }
 
 impl ConfigUpgradeSetFrame {
+    /// Returns the protocol version this frame was constructed with.
+    pub fn ledger_version(&self) -> u32 {
+        self.ledger_version
+    }
+
     /// Load a ConfigUpgradeSet from the ledger.
     ///
     /// Returns None if:
@@ -148,6 +153,8 @@ impl ConfigUpgradeSetFrame {
     pub fn make_from_key(
         snapshot: &SnapshotHandle,
         key: &ConfigUpgradeSetKey,
+        closing_ledger_seq: u32,
+        protocol_version: u32,
     ) -> Option<Arc<Self>> {
         let lk = Self::get_ledger_key(key);
 
@@ -157,7 +164,7 @@ impl ConfigUpgradeSetFrame {
         // Check TTL (entry must be live)
         let ttl_key = Self::get_ttl_key(&lk);
         let ttl_entry = snapshot.get_entry(&ttl_key).ok()??;
-        if !Self::is_live(&ttl_entry, snapshot.ledger_seq()) {
+        if !Self::is_live(&ttl_entry, closing_ledger_seq) {
             debug!(
                 hash = format!("{:02x?}", &key.content_hash.0[..8]),
                 "ConfigUpgradeSet TTL expired"
@@ -199,11 +206,13 @@ impl ConfigUpgradeSetFrame {
             }
         };
 
-        let ledger_version = snapshot.header().ledger_version;
+        // Use the post-upgrade protocol version passed by the caller,
+        // not snapshot.header().ledger_version which may be stale when
+        // Version(N) and Config upgrades occur in the same ledger (#1088).
         let frame = Self {
             valid_xdr: Self::is_valid_xdr_static(&upgrade_set, key),
             config_upgrade_set: upgrade_set,
-            ledger_version,
+            ledger_version: protocol_version,
         };
 
         Some(Arc::new(frame))

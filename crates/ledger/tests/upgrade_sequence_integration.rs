@@ -306,32 +306,27 @@ async fn test_header_ext_persists_through_multiple_ledgers() {
 /// the config upgrade's `is_valid_for_apply()` must see protocol version N
 /// (post-upgrade), not N-1 (pre-upgrade from snapshot).
 ///
-/// Bug: `ConfigUpgradeSetFrame::make_from_key()` reads
-/// `snapshot.header().ledger_version` which is the pre-upgrade version.
-/// This causes config upgrades to be validated against the wrong version,
-/// potentially rejecting valid upgrades or accepting invalid ones.
+/// Fix: `ConfigUpgradeSetFrame::make_from_key()` now takes an explicit
+/// `protocol_version` parameter instead of reading it from the snapshot
+/// header. The caller passes the post-upgrade version.
 #[test]
 fn test_config_upgrade_sees_stale_protocol_version() {
-    // Build a snapshot with header version 24
+    let snapshot_ledger = 99u32;
     let mut header = make_genesis_header(24);
-    header.ledger_seq = 99;
+    header.ledger_seq = snapshot_ledger;
     let header_hash = compute_header_hash(&header).expect("hash");
 
-    // Create a minimal valid ConfigUpgradeSet that should be valid for V25
-    // but we don't need actual validity — we're testing what version
-    // the frame captures.
     let upgrade_key = test_config_upgrade_key();
     let upgrade_set = ConfigUpgradeSet {
-        updated_entry: VecM::default(), // Empty is simplest
+        updated_entry: VecM::default(),
     };
 
     let data_key = config_upgrade_data_key(&upgrade_key);
     let data_entry = make_config_upgrade_entry(&upgrade_key, &upgrade_set, 1);
     let ttl_key = ttl_key_for(&data_key);
-    let ttl_entry = make_ttl_entry(&data_key, 1000); // Live well past ledger 99
+    let ttl_entry = make_ttl_entry(&data_key, 1000);
 
-    // Build snapshot with version 24 header and the config upgrade entries
-    let snapshot = SnapshotBuilder::new(99)
+    let snapshot = SnapshotBuilder::new(snapshot_ledger)
         .with_header(header.clone(), header_hash)
         .add_entry(data_key.clone(), data_entry)
         .add_entry(ttl_key, ttl_entry)
@@ -339,38 +334,34 @@ fn test_config_upgrade_sees_stale_protocol_version() {
         .expect("build snapshot");
     let handle = SnapshotHandle::new(snapshot);
 
-    // Load the config upgrade — this is what happens inside apply_config_upgrades()
-    let _frame = ConfigUpgradeSetFrame::make_from_key(&handle, &upgrade_key)
-        .expect("should find config upgrade entry");
-
-    // The frame captures ledger_version from the snapshot header.
-    // After a Version(25) upgrade, this should be 25, but the snapshot still
-    // has 24 because the snapshot is immutable.
-    //
-    // We can verify this by checking is_valid_for_apply() behavior, but more
-    // directly, we can check that the snapshot header is still at version 24.
-    assert_eq!(
-        handle.header().ledger_version,
-        24,
-        "Snapshot header should be the pre-upgrade version"
-    );
-
-    // If a Version(25) + Config upgrade occur in the same ledger:
-    // - apply_to_header() on a copy: gets version 25
-    // - apply_config_upgrades() still reads snapshot: gets version 24
-    // This demonstrates the stale read.
+    // Simulate Version(25) + Config upgrades in the same ledger.
     let mut upgraded = header.clone();
     let mut ctx = UpgradeContext::new(24);
     ctx.add_upgrade(LedgerUpgrade::Version(25));
     ctx.apply_to_header(&mut upgraded);
-    assert_eq!(upgraded.ledger_version, 25, "Upgraded header should be V25");
+    let post_upgrade_version = upgraded.ledger_version;
+    assert_eq!(post_upgrade_version, 25, "Upgraded header should be V25");
     assert_eq!(
         handle.header().ledger_version,
         24,
-        "AUDIT-017 (#1088): Config upgrade reads stale version 24 from snapshot \n\
-         while the actual post-upgrade version is 25. This causes version-dependent \n\
-         validation gates (e.g., V23+ checks for ContractParallelComputeV0) to use \n\
-         the wrong protocol version."
+        "Snapshot header should still be pre-upgrade version 24"
+    );
+
+    // Pass the post-upgrade version (25) explicitly to make_from_key.
+    let closing_ledger_seq = snapshot_ledger + 1;
+    let frame = ConfigUpgradeSetFrame::make_from_key(
+        &handle,
+        &upgrade_key,
+        closing_ledger_seq,
+        post_upgrade_version,
+    )
+    .expect("should find config upgrade entry");
+
+    // The frame must use the post-upgrade version, not the stale snapshot version.
+    assert_eq!(
+        frame.ledger_version(),
+        25,
+        "Frame should use post-upgrade version 25, not stale snapshot version 24"
     );
 }
 
@@ -386,11 +377,12 @@ fn test_config_upgrade_sees_stale_protocol_version() {
 /// stellar-core increments ledgerSeq to N before processing upgrades, so
 /// its TTL check uses N as the cutoff.
 ///
-/// Divergence: When `live_until = N-1`:
-/// - stellar-core: N-1 >= N → false → EXPIRED → skip upgrade
-/// - henyey: N-1 >= N-1 → true → LIVE → apply upgrade
+/// Fix: `make_from_key` now receives the closing ledger (N) explicitly
+/// and uses it for the TTL check, matching stellar-core.
+///
+/// When `live_until = N-1`:
+/// - Both stellar-core and henyey: N-1 >= N -> false -> EXPIRED -> skip
 #[test]
-#[should_panic(expected = "AUDIT-050")]
 fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
     let closing_ledger = 100u32;
     let snapshot_ledger = closing_ledger - 1; // 99
@@ -421,8 +413,8 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
         .expect("build snapshot");
     let handle = SnapshotHandle::new(snapshot);
 
-    // make_from_key uses snapshot.ledger_seq() = 99 for TTL check
-    let frame = ConfigUpgradeSetFrame::make_from_key(&handle, &upgrade_key);
+    // make_from_key uses closing_ledger (100) for TTL check
+    let frame = ConfigUpgradeSetFrame::make_from_key(&handle, &upgrade_key, closing_ledger, 25);
 
     // In stellar-core, this entry would be EXPIRED because the check uses
     // the closing ledger (100), not the snapshot ledger (99).
@@ -653,7 +645,7 @@ fn test_config_upgrade_nonexistent_key_silently_skipped() {
     };
 
     // make_from_key returns None — key doesn't exist in ledger
-    let frame = ConfigUpgradeSetFrame::make_from_key(&handle, &bogus_key);
+    let frame = ConfigUpgradeSetFrame::make_from_key(&handle, &bogus_key, 1, 25);
     assert!(
         frame.is_none(),
         "Nonexistent config upgrade key should not be loadable"
@@ -671,7 +663,7 @@ fn test_config_upgrade_nonexistent_key_silently_skipped() {
     ctx.add_upgrade(LedgerUpgrade::Config(bogus_key));
 
     let mut delta = LedgerDelta::new(1);
-    let result = ctx.apply_config_upgrades(&handle, &mut delta);
+    let result = ctx.apply_config_upgrades(&handle, &mut delta, 1, 25);
 
     // apply_config_upgrades succeeds (silently skips the bogus key)
     assert!(
