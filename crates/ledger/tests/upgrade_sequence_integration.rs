@@ -217,7 +217,6 @@ fn make_config_setting_entry(
 /// of inheriting `prev_header.ext`. After a Flags upgrade, the next ledger's
 /// header reverts to V0.
 #[tokio::test(flavor = "multi_thread")]
-#[should_panic(expected = "AUDIT-016")]
 async fn test_header_ext_inherited_across_ledger_closes() {
     let ledger = init_ledger_manager(25);
 
@@ -262,7 +261,6 @@ async fn test_header_ext_inherited_across_ledger_closes() {
 /// Additional test: verify that multiple Flags upgrades across ledgers all
 /// persist correctly.
 #[tokio::test(flavor = "multi_thread")]
-#[should_panic(expected = "AUDIT-016")]
 async fn test_header_ext_persists_through_multiple_ledgers() {
     let ledger = init_ledger_manager(25);
 

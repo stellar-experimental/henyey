@@ -293,7 +293,7 @@ pub fn create_next_header(
         base_reserve: prev_header.base_reserve,
         max_tx_set_size: prev_header.max_tx_set_size,
         skip_list: prev_header.skip_list.clone(),
-        ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+        ext: prev_header.ext.clone(),
     };
 
     calculate_skip_values(&mut header);
