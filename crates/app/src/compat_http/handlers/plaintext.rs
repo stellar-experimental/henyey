@@ -213,6 +213,21 @@ pub(crate) async fn compat_upgrades_handler(
         if let Some(v) = params.get("flags").and_then(|s| s.parse().ok()) {
             upgrade_params.flags = Some(v);
         }
+        if let Some(v) = params
+            .get("maxsorobantxsetsize")
+            .and_then(|s| s.parse().ok())
+        {
+            upgrade_params.max_soroban_tx_set_size = Some(v);
+        }
+        if let Some(v) = params
+            .get("nominationtimeoutlimit")
+            .and_then(|s| s.parse().ok())
+        {
+            upgrade_params.nomination_timeout_limit = Some(v);
+        }
+        if let Some(v) = params.get("expirationminutes").and_then(|s| s.parse().ok()) {
+            upgrade_params.expiration_minutes = Some(v);
+        }
         if let Some(key_str) = params.get("configupgradesetkey") {
             // configupgradesetkey is a base64-encoded ConfigUpgradeSetKey XDR
             use base64::{engine::general_purpose::STANDARD, Engine};
