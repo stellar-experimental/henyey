@@ -10,10 +10,7 @@ message handler entry points, cross-referenced with Henyey's implementation stat
 
 | Status | Count |
 |--------|-------|
-| PRESENT | 16 |
-| MISSING | 3 |
-| PARTIAL | 1 |
-| N/A | 0 |
+| PRESENT | 20 |
 | **Total** | **20** |
 
 ## Frame Layer (pre-dispatch)
@@ -34,10 +31,10 @@ message handler entry points, cross-referenced with Henyey's implementation stat
 
 | Guard | stellar-core Location | Henyey Location | Status | Issue |
 |-------|----------------------|-----------------|--------|-------|
-| `shouldAbort` (peer/overlay shutting down) | `Peer.cpp:1157-1160` | `running` atomic in peer loop | PARTIAL | |
+| `shouldAbort` (peer/overlay shutting down) | `Peer.cpp:1157-1160` | `peer_loop.rs` (`running` atomic + early check in `route_received_message`) | PRESENT | |
 | `ignoreIfOutOfSync` — Transaction | `Peer.cpp:1164-1172` | Herder state gate (`can_receive_transactions`) | PRESENT | |
-| `ignoreIfOutOfSync` — FloodAdvert | `Peer.cpp:1164-1172` | — | MISSING | [#1103](https://github.com/stellar-experimental/henyey/issues/1103) |
-| `ignoreIfOutOfSync` — FloodDemand | `Peer.cpp:1164-1172` | — | MISSING | [#1103](https://github.com/stellar-experimental/henyey/issues/1103) |
+| `ignoreIfOutOfSync` — FloodAdvert | `Peer.cpp:1164-1172` | `lifecycle.rs` (`is_tracking()` guard) | PRESENT | |
+| `ignoreIfOutOfSync` — FloodDemand | `Peer.cpp:1164-1172` | `lifecycle.rs` (`is_tracking()` guard) | PRESENT | |
 
 ## PEERS Message
 
@@ -68,7 +65,7 @@ message handler entry points, cross-referenced with Henyey's implementation stat
 
 | Guard | stellar-core Location | Henyey Location | Status | Issue |
 |-------|----------------------|-----------------|--------|-------|
-| Sliding-window query rate limit | `Peer.cpp:1423-1438` (`process()`) | — | MISSING | |
+| Sliding-window query rate limit | `Peer.cpp:1423-1438` (`process()`) | `peer_loop.rs` (`QueryRateLimiter`) | PRESENT | |
 
 ## Timeouts
 
