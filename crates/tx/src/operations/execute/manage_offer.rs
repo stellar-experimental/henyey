@@ -3568,4 +3568,519 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
     }
+
+    // ── Remaining ManageBuyOffer result code parity tests ──
+
+    #[test]
+    fn test_manage_buy_offer_buy_no_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+
+        // No trustline for buying asset (USD)
+        let op = ManageBuyOfferOp {
+            selling: Asset::Native,
+            buying: usd,
+            buy_amount: 1000,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(
+                    matches!(r, ManageBuyOfferResult::BuyNoTrust),
+                    "Expected BuyNoTrust, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_buy_offer_sell_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+
+        let usd = create_asset(&issuer_id);
+        // Trustline with flags=0 (not authorized)
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            0,
+        ));
+
+        let op = ManageBuyOfferOp {
+            selling: usd,
+            buying: Asset::Native,
+            buy_amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(
+                    matches!(r, ManageBuyOfferResult::SellNotAuthorized),
+                    "Expected SellNotAuthorized, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_buy_offer_buy_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+
+        let usd = create_asset(&issuer_id);
+        // Trustline for buying side with flags=0 (not authorized)
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            0,
+        ));
+
+        let op = ManageBuyOfferOp {
+            selling: Asset::Native,
+            buying: usd,
+            buy_amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(
+                    matches!(r, ManageBuyOfferResult::BuyNotAuthorized),
+                    "Expected BuyNotAuthorized, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_buy_offer_line_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let buying_asset = create_asset(&issuer_id);
+        // Buying trustline is full (balance == limit)
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000,
+            1_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = ManageBuyOfferOp {
+            selling: Asset::Native,
+            buying: buying_asset,
+            buy_amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(
+                    matches!(r, ManageBuyOfferResult::LineFull),
+                    "Expected LineFull, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_manage_buy_offer_low_reserve() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
+        state.create_account(create_test_account(source_id.clone(), min_balance));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = ManageBuyOfferOp {
+            selling: usd,
+            buying: Asset::Native,
+            buy_amount: 10,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_buy_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(r)) => {
+                assert!(
+                    matches!(r, ManageBuyOfferResult::LowReserve),
+                    "Expected LowReserve, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    // ── Remaining CreatePassiveSellOffer result code parity tests ──
+
+    #[test]
+    fn test_create_passive_sell_offer_buy_no_trust() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+
+        // No trustline for the buying asset (USD)
+        let op = CreatePassiveSellOfferOp {
+            selling: Asset::Native,
+            buying: usd,
+            amount: 1000,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result =
+            execute_create_passive_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::BuyNoTrust),
+                    "Expected BuyNoTrust, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_passive_sell_offer_sell_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+
+        let usd = create_asset(&issuer_id);
+        // Trustline with flags=0 (not authorized)
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            0,
+        ));
+
+        let op = CreatePassiveSellOfferOp {
+            selling: usd,
+            buying: Asset::Native,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result =
+            execute_create_passive_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::SellNotAuthorized),
+                    "Expected SellNotAuthorized, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_passive_sell_offer_buy_not_authorized() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+        state.get_account_mut(&issuer_id).unwrap().flags = AccountFlags::RequiredFlag as u32;
+
+        let usd = create_asset(&issuer_id);
+        // Trustline for buying side with flags=0 (not authorized)
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            1_000_000,
+            0,
+        ));
+
+        let op = CreatePassiveSellOfferOp {
+            selling: Asset::Native,
+            buying: usd,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result =
+            execute_create_passive_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::BuyNotAuthorized),
+                    "Expected BuyNotAuthorized, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_passive_sell_offer_line_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let buying_asset = create_asset(&issuer_id);
+        // Buying trustline is full (balance == limit)
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000,
+            1_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = CreatePassiveSellOfferOp {
+            selling: Asset::Native,
+            buying: buying_asset,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result =
+            execute_create_passive_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::LineFull),
+                    "Expected LineFull, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// Test CreatePassiveSellOffer CrossSelf.
+    ///
+    /// The passive flag only changes the price threshold (strict less-than instead
+    /// of less-than-or-equal for crossing). If the source's own opposite offer
+    /// has a strictly better price, CrossSelf is returned.
+    #[test]
+    fn test_create_passive_sell_offer_cross_self() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'X']),
+            issuer: issuer_id.clone(),
+        });
+        let idr = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'I', b'D', b'R', b'X']),
+            issuer: issuer_id.clone(),
+        });
+
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'I', b'D', b'R', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Existing offer: selling IDR, buying USD at price 1/2
+        // (willing to sell 2 IDR per 1 USD)
+        state.create_offer(OfferEntry {
+            seller_id: source_id.clone(),
+            offer_id: 1,
+            selling: idr.clone(),
+            buying: usd.clone(),
+            amount: 100,
+            price: Price { n: 1, d: 2 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        // Passive offer: selling USD, buying IDR at price 1/1.
+        // The existing offer's effective ask for USD→IDR is 2/1 = 2 IDR per USD.
+        // This passive offer offers 1/1, meaning the existing offer has a strictly
+        // better price, so CrossSelf triggers.
+        let op = CreatePassiveSellOfferOp {
+            selling: usd,
+            buying: idr,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result =
+            execute_create_passive_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::CrossSelf),
+                    "Expected CrossSelf, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_create_passive_sell_offer_low_reserve() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        let min_balance = state
+            .minimum_balance_with_counts(context.protocol_version, 0, 0, 0)
+            .unwrap();
+        state.create_account(create_test_account(source_id.clone(), min_balance));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = create_asset(&issuer_id);
+        state.create_trustline(create_test_trustline(
+            source_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            }),
+            100,
+            1_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        let op = CreatePassiveSellOfferOp {
+            selling: usd,
+            buying: Asset::Native,
+            amount: 10,
+            price: Price { n: 1, d: 1 },
+        };
+
+        let result =
+            execute_create_passive_sell_offer(&op, &source_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::LowReserve),
+                    "Expected LowReserve, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
 }

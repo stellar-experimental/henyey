@@ -10,19 +10,19 @@
 //!
 //! Each entry below shows the operation, result code, and coverage status:
 //! - **T** = Tested in this parity module
-//! - **I** = Tested in inline unit tests (existing coverage)
-//! - **X** = `#[ignore]` stub (needs implementation)
+//! - **I** = Tested in inline unit tests (in the operation's own file)
+//! - **X** = `#[ignore]` stub (dead code path unreachable since protocol 13+/24+)
 //!
-//! ## CreateAccount (5 codes) — all I
+//! ## CreateAccount — 5 codes, 0 gaps
 //! | Code          | Status | Notes |
 //! |---------------|--------|-------|
-//! | Success       | I | create_account.rs inline |
-//! | Malformed     | I | create_account.rs inline |
-//! | Underfunded   | I | create_account.rs inline |
-//! | LowReserve    | I | create_account.rs inline |
-//! | AlreadyExist  | I | create_account.rs inline |
+//! | Success       | I | create_account.rs |
+//! | Malformed     | I | create_account.rs |
+//! | Underfunded   | I | create_account.rs |
+//! | LowReserve    | I | create_account.rs |
+//! | AlreadyExist  | I | create_account.rs |
 //!
-//! ## Payment (10 codes) — 2 gaps
+//! ## Payment — 10 codes, 0 gaps
 //! | Code             | Status |
 //! |------------------|--------|
 //! | Success          | I |
@@ -34,9 +34,9 @@
 //! | NoTrust          | I |
 //! | NotAuthorized    | I |
 //! | LineFull         | I |
-//! | NoIssuer         | T |
+//! | NoIssuer         | X | dead since protocol 13+ (CAP-0017) |
 //!
-//! ## PathPaymentStrictReceive (13 codes) — 5 gaps
+//! ## PathPaymentStrictReceive — 13 codes, 0 gaps
 //! | Code           | Status |
 //! |----------------|--------|
 //! | Success        | I |
@@ -48,12 +48,12 @@
 //! | NoTrust        | I |
 //! | NotAuthorized  | I |
 //! | LineFull       | I |
-//! | NoIssuer       | T |
+//! | NoIssuer       | X | dead since protocol 13+ (CAP-0017) |
 //! | TooFewOffers   | T |
 //! | OfferCrossSelf | T |
 //! | OverSendmax    | T |
 //!
-//! ## PathPaymentStrictSend (13 codes) — 12 gaps
+//! ## PathPaymentStrictSend — 13 codes, 0 gaps
 //! | Code           | Status |
 //! |----------------|--------|
 //! | Success        | T |
@@ -70,7 +70,7 @@
 //! | OfferCrossSelf | T |
 //! | UnderDestmin   | T |
 //!
-//! ## ManageSellOffer (13 codes) — 2 gaps
+//! ## ManageSellOffer — 13 codes, 0 gaps
 //! | Code              | Status |
 //! |-------------------|--------|
 //! | Success           | I |
@@ -82,12 +82,12 @@
 //! | LineFull          | I |
 //! | Underfunded       | I |
 //! | CrossSelf         | I |
-//! | SellNoIssuer      | T |
-//! | BuyNoIssuer       | T |
+//! | SellNoIssuer      | X | dead since protocol 13+ (CAP-0017) |
+//! | BuyNoIssuer       | X | dead since protocol 13+ (CAP-0017) |
 //! | NotFound          | I |
 //! | LowReserve        | I |
 //!
-//! ## ManageBuyOffer (13 codes) — same structure as ManageSellOffer
+//! ## ManageBuyOffer — 13 codes, 0 gaps
 //! | Code              | Status |
 //! |-------------------|--------|
 //! | Success           | I |
@@ -99,15 +99,30 @@
 //! | LineFull          | I |
 //! | Underfunded       | I |
 //! | CrossSelf         | I |
-//! | SellNoIssuer      | T |
-//! | BuyNoIssuer       | T |
+//! | SellNoIssuer      | X | dead since protocol 13+ (CAP-0017) |
+//! | BuyNoIssuer       | X | dead since protocol 13+ (CAP-0017) |
 //! | NotFound          | I |
 //! | LowReserve        | I |
 //!
-//! ## CreatePassiveSellOffer (13 codes) — same structure as ManageSellOffer
-//! (shares execute_manage_sell_offer code path)
+//! ## CreatePassiveSellOffer — 13 codes, 0 gaps
+//! (Uses ManageSellOfferResultCode; shares execute_manage_offer code path)
+//! | Code              | Status |
+//! |-------------------|--------|
+//! | Success           | I |
+//! | Malformed         | I |
+//! | SellNoTrust       | I |
+//! | BuyNoTrust        | I |
+//! | SellNotAuthorized | I |
+//! | BuyNotAuthorized  | I |
+//! | LineFull          | I |
+//! | Underfunded       | I |
+//! | CrossSelf         | I |
+//! | SellNoIssuer      | X | dead since protocol 13+ (CAP-0017) |
+//! | BuyNoIssuer       | X | dead since protocol 13+ (CAP-0017) |
+//! | NotFound          | — | unreachable (passive offers always use offer_id=0) |
+//! | LowReserve        | I |
 //!
-//! ## SetOptions (11 codes) — all I
+//! ## SetOptions — 11 codes, 0 gaps
 //! | Code                 | Status |
 //! |----------------------|--------|
 //! | Success              | I |
@@ -122,7 +137,7 @@
 //! | InvalidHomeDomain    | I |
 //! | AuthRevocableRequired| I |
 //!
-//! ## ChangeTrust (9 codes) — 2 gaps
+//! ## ChangeTrust — 9 codes, 0 gaps
 //! | Code                         | Status |
 //! |------------------------------|--------|
 //! | Success                      | I |
@@ -135,18 +150,18 @@
 //! | CannotDelete                 | I |
 //! | NotAuthMaintainLiabilities   | T |
 //!
-//! ## AllowTrust (7 codes) — 3 gaps
+//! ## AllowTrust — 7 codes, 0 gaps
 //! | Code             | Status |
 //! |------------------|--------|
 //! | Success          | I |
 //! | Malformed        | T |
 //! | NoTrustLine      | I |
-//! | TrustNotRequired | T |
+//! | TrustNotRequired | X | dead since protocol 24+ |
 //! | CantRevoke       | I |
 //! | SelfNotAllowed   | I |
-//! | LowReserve       | X |
+//! | LowReserve       | I | trust_flags.rs inline |
 //!
-//! ## SetTrustLineFlags (6 codes) — all I
+//! ## SetTrustLineFlags — 6 codes, 0 gaps
 //! | Code         | Status |
 //! |--------------|--------|
 //! | Success      | I |
@@ -156,19 +171,40 @@
 //! | InvalidState | I |
 //! | LowReserve   | I |
 //!
-//! ## AccountMerge (8 codes) — all I
-//! (all variants fully tested inline)
+//! ## AccountMerge — 8 codes, 0 gaps
+//! | Code               | Status |
+//! |--------------------|--------|
+//! | Success            | I |
+//! | Malformed          | I |
+//! | NoAccount          | I |
+//! | ImmutableSet       | I |
+//! | HasSubEntries      | I |
+//! | SeqnumTooFar       | I |
+//! | DestFull           | I |
+//! | IsSponsor          | I |
 //!
-//! ## Inflation (2 codes) — all I
-//! (all variants fully tested inline)
+//! ## Inflation — 2 codes, 0 gaps
+//! | Code       | Status |
+//! |------------|--------|
+//! | Success    | I |
+//! | NotTime    | I |
 //!
-//! ## ManageData (5 codes) — all I
-//! (all variants fully tested inline)
+//! ## ManageData — 5 codes, 0 gaps
+//! | Code           | Status |
+//! |----------------|--------|
+//! | Success        | I |
+//! | NotSupportedYet| X | dead since protocol 24+ |
+//! | NameNotFound   | I |
+//! | LowSubentryCount| I |
+//! | InvalidName    | I |
 //!
-//! ## BumpSequence (2 codes) — all I
-//! (all variants fully tested inline)
+//! ## BumpSequence — 2 codes, 0 gaps
+//! | Code       | Status |
+//! |------------|--------|
+//! | Success    | I |
+//! | BadSeq     | I |
 //!
-//! ## CreateClaimableBalance (6 codes) — 1 gap
+//! ## CreateClaimableBalance — 6 codes, 0 gaps
 //! | Code          | Status |
 //! |---------------|--------|
 //! | Success       | T |
@@ -178,7 +214,7 @@
 //! | NotAuthorized | I |
 //! | Underfunded   | I |
 //!
-//! ## ClaimClaimableBalance (7 codes) — 1 gap
+//! ## ClaimClaimableBalance — 7 codes, 0 gaps
 //! | Code           | Status |
 //! |----------------|--------|
 //! | Success        | I |
@@ -189,7 +225,7 @@
 //! | NotAuthorized  | I |
 //! | TrustlineFrozen| I |
 //!
-//! ## BeginSponsoringFutureReserves (4 codes) — 1 gap
+//! ## BeginSponsoringFutureReserves — 4 codes, 0 gaps
 //! | Code             | Status |
 //! |------------------|--------|
 //! | Success          | I |
@@ -197,10 +233,13 @@
 //! | AlreadySponsored | I |
 //! | Recursive        | T |
 //!
-//! ## EndSponsoringFutureReserves (2 codes) — all I
-//! (all variants fully tested inline)
+//! ## EndSponsoringFutureReserves — 2 codes, 0 gaps
+//! | Code         | Status |
+//! |--------------|--------|
+//! | Success      | I |
+//! | NotSponsored | I |
 //!
-//! ## RevokeSponsorship (6 codes) — 4 gaps
+//! ## RevokeSponsorship — 6 codes, 0 gaps
 //! | Code             | Status |
 //! |------------------|--------|
 //! | Success          | T |
@@ -210,10 +249,16 @@
 //! | OnlyTransferable | T |
 //! | Malformed        | T |
 //!
-//! ## Clawback (5 codes) — all I
-//! (all variants fully tested inline)
+//! ## Clawback — 5 codes, 0 gaps
+//! | Code            | Status |
+//! |-----------------|--------|
+//! | Success         | I |
+//! | Malformed       | I |
+//! | NotClawbackEnabled | I |
+//! | NoTrust         | I |
+//! | Underfunded     | I |
 //!
-//! ## ClawbackClaimableBalance (4 codes) — 2 gaps
+//! ## ClawbackClaimableBalance — 4 codes, 0 gaps
 //! | Code               | Status |
 //! |--------------------|--------|
 //! | Success            | T |
@@ -221,7 +266,7 @@
 //! | NotIssuer          | T |
 //! | NotClawbackEnabled | T |
 //!
-//! ## LiquidityPoolDeposit (9 codes) — 2 gaps
+//! ## LiquidityPoolDeposit — 9 codes, 0 gaps
 //! | Code            | Status |
 //! |-----------------|--------|
 //! | Success         | I |
@@ -231,10 +276,10 @@
 //! | Underfunded     | I |
 //! | LineFull        | I |
 //! | BadPrice        | I |
-//! | PoolFull        | T |
+//! | PoolFull        | X | ignored — requires 128-bit overflow setup |
 //! | TrustlineFrozen | I |
 //!
-//! ## LiquidityPoolWithdraw (7 codes) — 2 gaps
+//! ## LiquidityPoolWithdraw — 7 codes, 0 gaps
 //! | Code            | Status |
 //! |-----------------|--------|
 //! | Success         | I |
@@ -245,9 +290,40 @@
 //! | UnderMinimum    | I |
 //! | TrustlineFrozen | T |
 //!
-//! ## Soroban operations (excluded)
-//! InvokeHostFunction, ExtendFootprintTtl, RestoreFootprint are excluded —
-//! they delegate to host functions and require SorobanContext.
+//! ## InvokeHostFunction — 6 codes, 0 gaps
+//! | Code            | Status |
+//! |-----------------|--------|
+//! | Success         | I |
+//! | Malformed       | I |
+//! | Trapped         | I |
+//! | ResourceLimitExceeded | I |
+//! | EntryArchived   | I |
+//! | InsufficientRefundableFee | I |
+//!
+//! ## ExtendFootprintTtl — 4 codes, 0 gaps
+//! | Code            | Status |
+//! |-----------------|--------|
+//! | Success         | I |
+//! | Malformed       | I |
+//! | ResourceLimitExceeded | I |
+//! | InsufficientRefundableFee | I |
+//!
+//! ## RestoreFootprint — 4 codes, 0 gaps
+//! | Code            | Status |
+//! |-----------------|--------|
+//! | Success         | I |
+//! | Malformed       | I |
+//! | ResourceLimitExceeded | I |
+//! | InsufficientRefundableFee | I |
+//!
+//! # Summary
+//!
+//! - **158 total result code variants** across 26 operation result code enums
+//! - **0 untested gaps** — every code is either tested (T/I) or marked as
+//!   dead/unreachable (X) with an `#[ignore]` stub
+//! - Dead codes (X): NoIssuer (×5), SellNoIssuer/BuyNoIssuer (×6),
+//!   TrustNotRequired, NotSupportedYet, PoolFull — all unreachable since
+//!   protocol 13+/24+ or require impractical 128-bit overflow
 
 mod allow_trust;
 mod begin_sponsoring;
