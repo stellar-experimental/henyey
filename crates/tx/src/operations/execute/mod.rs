@@ -3,6 +3,7 @@
 //! This module provides the main entry point for executing Stellar operations.
 //! Each operation type has its own submodule with the specific execution logic.
 
+use henyey_common::checked_types::{BalanceError, CheckedAmount};
 use henyey_common::{protocol_version_is_before, protocol_version_starts_from, ProtocolVersion};
 use soroban_env_host24::xdr::ReadXdr as ReadXdrP24;
 use soroban_env_host_p24 as soroban_env_host24;
@@ -146,36 +147,52 @@ fn ensure_trustline_liabilities(trustline: &mut TrustLineEntry) -> &mut Liabilit
     }
 }
 
-/// Credit `delta` to an account's native balance. Returns false if overflow
-/// or buying liability constraint is violated.
-fn add_account_balance(account: &mut AccountEntry, delta: i64) -> bool {
-    // Overflow-safe: i64::MAX - balance < delta
-    if i64::MAX - account.balance < delta {
-        return false;
+/// Credit `delta` to an account's native balance.
+///
+/// Returns `BalanceError::Overflow` if the addition overflows, or
+/// `BalanceError::LiabilityViolation` if the new balance would violate
+/// the buying liability constraint.
+fn add_account_balance(account: &mut AccountEntry, delta: i64) -> std::result::Result<(), BalanceError> {
+    let new_balance = CheckedAmount::new(account.balance)
+        .checked_add(delta)
+        .ok_or(BalanceError::Overflow)?;
+    // Buying liabilities: new_balance must not exceed i64::MAX - buying
+    let buying = account_liabilities(account).buying;
+    let ceiling = CheckedAmount::new(i64::MAX)
+        .checked_sub(buying)
+        .ok_or(BalanceError::Overflow)?;
+    if new_balance > ceiling {
+        return Err(BalanceError::LiabilityViolation);
     }
-    let new_balance = account.balance + delta;
-    // Buying liabilities: new_balance > i64::MAX - buying
-    if new_balance > i64::MAX - account_liabilities(account).buying {
-        return false;
-    }
-    account.balance = new_balance;
-    true
+    account.balance = new_balance.value();
+    Ok(())
 }
 
-/// Credit `delta` to a trustline balance. Returns false if it exceeds the
-/// limit or buying liability constraint.
-fn add_trustline_balance(tl: &mut TrustLineEntry, delta: i64) -> bool {
-    // Overflow-safe: limit - balance < delta
-    if tl.limit - tl.balance < delta {
-        return false;
+/// Credit `delta` to a trustline balance.
+///
+/// Returns `BalanceError::ExceedsLimit` if the new balance would exceed the
+/// trustline limit, or `BalanceError::LiabilityViolation` if it would violate
+/// the buying liability constraint.
+fn add_trustline_balance(tl: &mut TrustLineEntry, delta: i64) -> std::result::Result<(), BalanceError> {
+    let headroom = CheckedAmount::new(tl.limit)
+        .checked_sub(tl.balance)
+        .ok_or(BalanceError::Overflow)?;
+    if delta > headroom.value() {
+        return Err(BalanceError::ExceedsLimit);
     }
-    let new_balance = tl.balance + delta;
-    // Buying liabilities: new_balance > limit - buying
-    if new_balance > tl.limit - trustline_liabilities(tl).buying {
-        return false;
+    let new_balance = CheckedAmount::new(tl.balance)
+        .checked_add(delta)
+        .ok_or(BalanceError::Overflow)?;
+    // Buying liabilities: new_balance must not exceed limit - buying
+    let buying = trustline_liabilities(tl).buying;
+    let ceiling = CheckedAmount::new(tl.limit)
+        .checked_sub(buying)
+        .ok_or(BalanceError::Overflow)?;
+    if new_balance > ceiling {
+        return Err(BalanceError::LiabilityViolation);
     }
-    tl.balance = new_balance;
-    true
+    tl.balance = new_balance.value();
+    Ok(())
 }
 
 /// Apply a balance delta (positive or negative) to an account or trustline.
@@ -193,14 +210,13 @@ fn apply_balance_delta(
                 "missing account for balance update".into(),
             ));
         };
-        let new_balance = account
-            .balance
+        let new_balance = CheckedAmount::new(account.balance)
             .checked_add(amount)
             .ok_or_else(|| TxError::Internal("balance overflow".into()))?;
-        if new_balance < 0 {
+        if new_balance.is_negative() {
             return Err(TxError::Internal("balance underflow".into()));
         }
-        account.balance = new_balance;
+        account.balance = new_balance.value();
         return Ok(());
     }
 
@@ -213,14 +229,13 @@ fn apply_balance_delta(
             "missing trustline for balance update".into(),
         ));
     };
-    let new_balance = tl
-        .balance
+    let new_balance = CheckedAmount::new(tl.balance)
         .checked_add(amount)
         .ok_or_else(|| TxError::Internal("trustline balance overflow".into()))?;
-    if new_balance < 0 || new_balance > tl.limit {
+    if new_balance.is_negative() || new_balance.value() > tl.limit {
         return Err(TxError::Internal("trustline balance out of bounds".into()));
     }
-    tl.balance = new_balance;
+    tl.balance = new_balance.value();
     Ok(())
 }
 

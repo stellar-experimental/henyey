@@ -62,7 +62,7 @@ pub(crate) fn execute_account_merge(
     let dest_acc = state
         .get_account_mut(&dest_account_id)
         .ok_or_else(|| TxError::Internal("destination account disappeared".into()))?;
-    if !add_account_balance(dest_acc, source_balance) {
+    if add_account_balance(dest_acc, source_balance).is_err() {
         return Ok(make_result(AccountMergeResultCode::DestFull));
     }
 

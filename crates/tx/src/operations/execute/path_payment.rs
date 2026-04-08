@@ -432,7 +432,7 @@ fn update_dest_balance(
             code: PathPaymentStrictReceiveResultCode::NoDestination,
             no_issuer_asset: None,
         })?;
-        if !add_account_balance(dest_account_mut, amount) {
+        if add_account_balance(dest_account_mut, amount).is_err() {
             return Err(TransferError {
                 code: PathPaymentStrictReceiveResultCode::LineFull,
                 no_issuer_asset: None,
@@ -464,7 +464,7 @@ fn update_dest_balance(
         code: PathPaymentStrictReceiveResultCode::NoTrust,
         no_issuer_asset: None,
     })?;
-    if !add_trustline_balance(dest_trustline_mut, amount) {
+    if add_trustline_balance(dest_trustline_mut, amount).is_err() {
         return Err(TransferError {
             code: PathPaymentStrictReceiveResultCode::LineFull,
             no_issuer_asset: None,

@@ -303,7 +303,7 @@ pub(crate) fn execute_claim_claimable_balance(
     match &entry.asset {
         Asset::Native => {
             if let Some(account) = state.get_account_mut(source) {
-                if !add_account_balance(account, entry.amount) {
+                if add_account_balance(account, entry.amount).is_err() {
                     return Ok(make_claim_result(ClaimClaimableBalanceResultCode::LineFull));
                 }
             }
@@ -330,7 +330,7 @@ pub(crate) fn execute_claim_claimable_balance(
                                 ClaimClaimableBalanceResultCode::NotAuthorized,
                             ));
                         }
-                        if !add_trustline_balance(tl, entry.amount) {
+                        if add_trustline_balance(tl, entry.amount).is_err() {
                             return Ok(make_claim_result(
                                 ClaimClaimableBalanceResultCode::LineFull,
                             ));

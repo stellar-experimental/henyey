@@ -636,7 +636,8 @@ fn can_credit_asset(
 fn credit_asset(state: &mut LedgerStateManager, source: &AccountId, asset: &Asset, amount: i64) {
     if matches!(asset, Asset::Native) {
         if let Some(account) = state.get_account_mut(source) {
-            add_account_balance(account, amount);
+            // stellar-core: LiquidityPoolWithdrawOpFrame.cpp — ignores addBalance return
+            let _ = add_account_balance(account, amount);
         }
         return;
     }
@@ -647,7 +648,8 @@ fn credit_asset(state: &mut LedgerStateManager, source: &AccountId, asset: &Asse
     }
 
     if let Some(tl) = state.get_trustline_mut(source, asset) {
-        add_trustline_balance(tl, amount);
+        // stellar-core: LiquidityPoolWithdrawOpFrame.cpp — ignores addBalance return
+        let _ = add_trustline_balance(tl, amount);
     }
 }
 
