@@ -349,7 +349,7 @@ Update todos via TodoWrite.
 ### 2f: Parallelism Opportunities
 
 When multiple independent work items are available at different priority levels,
-you MAY spawn up to 3 agents in parallel in a single message. Independent work:
+you MAY spawn up to 5 agents in parallel in a single message. Independent work:
 - Publish + any other stage (publishing doesn't affect code analysis)
 - Condensation + any other stage (condensation only touches fail/)
 - Hypothesis agents for different crates (no shared state)
@@ -373,6 +373,8 @@ After the loop exits, print:
 ═══ Gesserit Audit Complete ═══
 Rounds:           N / M
 Target:           <crate name or "all crates">
+Duration:         Xh Ym (wall clock from session start to completion)
+Premium requests: N (count of all background agents spawned)
 
 Hypotheses:       X generated, Y promoted, Z rejected
 PoC attempts:     A total, B confirmed, C rejected
