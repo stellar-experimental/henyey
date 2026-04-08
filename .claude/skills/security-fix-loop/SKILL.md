@@ -8,24 +8,30 @@ Parse `$ARGUMENTS`:
 - If `--label <label>` is present, set `$EXTRA_LABEL` to the value. Otherwise
   `$EXTRA_LABEL` is empty.
 - If `--dry-run` is present, set `$DRY_RUN = true`. Otherwise `$DRY_RUN = false`.
+- Determine the currently authenticated GitHub user and set
+  `$CURRENT_USER` from:
+  ```
+  gh api user --jq '.login'
+  ```
 
 # Security Fix Loop
 
-Continuously pick the highest-severity open security audit issue **that has
-no assignees when possible**, process it with `/security-fix`, and repeat until
-no open issues remain.
+Continuously pick the highest-severity open security audit issue **authored by
+the currently authenticated GitHub user** and **that has no assignees when
+possible**, process it with `/security-fix`, and repeat until no matching open
+issues remain.
 
 ## Step 1: Query Open Security Issues
 
-Fetch all open audit issues:
+Fetch all open audit issues authored by `$CURRENT_USER`:
 
 ```
-gh issue list --label security,audit --state open --json number,title,labels,assignees --limit 500
+gh issue list --label security,audit --state open --search "author:@me" --json number,title,labels,assignees --limit 500
 ```
 
 If `$EXTRA_LABEL` is set, add it to the label filter:
 ```
-gh issue list --label security,audit,$EXTRA_LABEL --state open --json number,title,labels,assignees --limit 500
+gh issue list --label security,audit,$EXTRA_LABEL --state open --search "author:@me" --json number,title,labels,assignees --limit 500
 ```
 
 ### Queue ordering
@@ -182,7 +188,7 @@ fix could not be completed. Do the following:
 Before picking the next issue, re-query the open issues:
 
 ```
-gh issue list --label security,audit --state open --json number,title,labels,assignees --limit 500
+gh issue list --label security,audit --state open --search "author:@me" --json number,title,labels,assignees --limit 500
 ```
 
 (Include `$EXTRA_LABEL` if set.)
@@ -225,7 +231,7 @@ Remaining open:     <remaining>
 
 Where `<remaining>` is the count from a final query:
 ```
-gh issue list --label security,audit --state open --json number --limit 500 | jq length
+gh issue list --label security,audit --state open --search "author:@me" --json number --limit 500 | jq length
 ```
 
 If `<remaining> > 0` and `<skipped> > 0`, also print:
