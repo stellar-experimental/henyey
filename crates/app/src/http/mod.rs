@@ -142,7 +142,12 @@ impl QueryServer {
 
         let router = Self::build_router(state);
 
-        let addr: SocketAddr = format!("{}:{}", self.address, self.port).parse()?;
+        let addr: SocketAddr = if self.address.contains(':') {
+            format!("[{}]:{}", self.address, self.port)
+        } else {
+            format!("{}:{}", self.address, self.port)
+        }
+        .parse()?;
         tracing::info!(%addr, "Starting HTTP query server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -224,7 +229,12 @@ impl StatusServer {
 
         let router = build_router(state);
 
-        let addr: SocketAddr = format!("{}:{}", self.address, self.port).parse()?;
+        let addr: SocketAddr = if self.address.contains(':') {
+            format!("[{}]:{}", self.address, self.port)
+        } else {
+            format!("{}:{}", self.address, self.port)
+        }
+        .parse()?;
         tracing::info!(%addr, "Starting HTTP status server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;

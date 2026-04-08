@@ -182,7 +182,13 @@ impl CompatServer {
         let mut shutdown_rx = self.app.subscribe_shutdown();
         let router = build_compat_router(state);
 
-        let addr: SocketAddr = format!("{}:{}", self.address, self.port).parse()?;
+        let addr: SocketAddr = if self.address.contains(':') {
+            // IPv6 addresses need brackets in socket address syntax
+            format!("[{}]:{}", self.address, self.port)
+        } else {
+            format!("{}:{}", self.address, self.port)
+        }
+        .parse()?;
         tracing::info!(
             %addr,
             "Starting stellar-core compatibility HTTP server"
