@@ -89,14 +89,14 @@ pub(crate) fn execute_create_account(
         return Ok(make_result(CreateAccountResultCode::Underfunded));
     }
 
-    // Deduct from source. Use in-place mutation to avoid duplicate updates when
-    // sponsorship counters also modify the same account.
-    if op.starting_balance != 0 {
-        let source_account = state
-            .get_account_mut(source)
-            .ok_or(TxError::SourceAccountNotFound)?;
-        sub_account_balance(source_account, op.starting_balance)?;
-    }
+    // Deduct starting_balance from source. Always call get_account_mut even
+    // when starting_balance==0 so the source is tracked as modified, matching
+    // stellar-core's unconditional loadAccount in doApplyFromV14
+    // (CreateAccountOpFrame.cpp:120). See #1093 / AUDIT-020.
+    let source_account = state
+        .get_account_mut(source)
+        .ok_or(TxError::SourceAccountNotFound)?;
+    sub_account_balance(source_account, op.starting_balance)?;
 
     let starting_seq = state.starting_sequence_number()?;
 
@@ -660,5 +660,70 @@ mod tests {
             }
             other => panic!("Unexpected result: {:?}", other),
         }
+    }
+
+    /// Regression test for AUDIT-020 / #1093: CreateAccount with starting_balance=0
+    /// (sponsored path) must track the source account as modified.
+    ///
+    /// stellar-core unconditionally calls `loadAccount(ltx, getSourceID())` in
+    /// doApplyFromV14, which marks the source as mutably loaded. On commit,
+    /// maybeUpdateLastModified bumps lastModifiedLedgerSeq. Henyey was skipping
+    /// get_account_mut when starting_balance==0, so the source was never tracked
+    /// as modified — causing a lastModifiedLedgerSeq divergence (consensus-critical
+    /// when op source != tx source).
+    #[test]
+    fn test_audit_020_zero_balance_sponsored_tracks_source_modified() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        let sponsor_id = create_test_account_id(2);
+
+        // Source account (will be the operation source, distinct from sponsor)
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        // Sponsor pays reserve for the new account
+        state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
+
+        // Set up sponsorship
+        state.push_sponsorship(sponsor_id.clone(), dest_id.clone());
+
+        // Enable per-op snapshot tracking (mirrors what the executor does)
+        state.begin_op_snapshot();
+
+        let op = CreateAccountOp {
+            destination: dest_id.clone(),
+            starting_balance: 0,
+        };
+
+        let result = execute_create_account(&op, &source_id, &mut state, &context);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
+                assert!(matches!(r, CreateAccountResult::Success), "got {:?}", r);
+            }
+            other => panic!("Unexpected result: {:?}", other),
+        }
+
+        // Flush modified entries to the delta — this is where the bug manifests.
+        // Without the fix, the source account is not in modified_accounts,
+        // so no update is recorded and lastModifiedLedgerSeq is never bumped.
+        state.flush_modified_entries();
+
+        // The source account MUST appear in updated_entries, matching stellar-core's
+        // unconditional loadAccount which causes maybeUpdateLastModified on commit.
+        let has_source_update = state.delta().updated_entries().iter().any(|entry| {
+            if let LedgerEntryData::Account(acc) = &entry.data {
+                acc.account_id == source_id
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_source_update,
+            "Source account must be tracked as modified even when starting_balance=0 \
+             (sponsored path). stellar-core unconditionally loads source mutably in \
+             doApplyFromV14 (CreateAccountOpFrame.cpp:120)."
+        );
     }
 }
