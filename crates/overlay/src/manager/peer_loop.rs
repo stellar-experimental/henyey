@@ -24,6 +24,57 @@ use tracing::{debug, info, trace, warn};
 /// `string msg<100>` constraint in the `Error` struct.
 const MAX_ERROR_MESSAGE_LEN: usize = 100;
 
+/// Multiplier for computing queries-per-window from window duration in seconds.
+/// Matches stellar-core's `QUERY_RESPONSE_MULTIPLIER` (Peer.cpp:136).
+const QUERY_RESPONSE_MULTIPLIER: u32 = 5;
+
+/// Per-query-type sliding-window rate limiter.
+///
+/// Parity: stellar-core (Peer.cpp:1423-1438) limits GetTxSet and
+/// GetScpQuorumSet queries per peer with a time-windowed counter.
+struct QueryInfo {
+    last_reset: Instant,
+    count: u32,
+}
+
+impl QueryInfo {
+    fn new() -> Self {
+        Self {
+            last_reset: Instant::now(),
+            count: 0,
+        }
+    }
+
+    /// Returns true if the query is allowed under the rate limit.
+    fn check_and_increment(&mut self, window: Duration) -> bool {
+        let max_queries = window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER;
+        if self.last_reset.elapsed() >= window {
+            self.last_reset = Instant::now();
+            self.count = 0;
+        }
+        if self.count >= max_queries {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
+
+/// Per-peer query rate limiters for GetTxSet and GetScpQuorumSet.
+struct QueryRateLimiter {
+    tx_set: QueryInfo,
+    quorum_set: QueryInfo,
+}
+
+impl QueryRateLimiter {
+    fn new() -> Self {
+        Self {
+            tx_set: QueryInfo::new(),
+            quorum_set: QueryInfo::new(),
+        }
+    }
+}
+
 /// Number of 1-second ticks between ping attempts.
 ///
 /// Matches stellar-core `RECURRENT_TIMER_PERIOD` (5 seconds).
@@ -386,6 +437,7 @@ impl OverlayManager {
     /// Applies all filtering rules (handshake, flow-control, watcher, rate
     /// limit, flood-gate dedup) and forwards surviving messages. Returns
     /// `true` if the message was SCP (so the caller can bump the SCP counter).
+    #[allow(clippy::too_many_arguments)]
     fn route_received_message(
         message: &StellarMessage,
         peer_id: &PeerId,
@@ -394,7 +446,14 @@ impl OverlayManager {
         is_validator: bool,
         received_peers: &mut bool,
         ping: &mut PingTracker,
+        query_limiter: &mut QueryRateLimiter,
     ) -> Option<bool> {
+        // Parity: shouldAbort (Peer.cpp:1157-1160) — skip message processing
+        // if the overlay is shutting down.
+        if !state.running.load(Ordering::Relaxed) {
+            return Some(false);
+        }
+
         let msg_type = helpers::message_type_name(message);
 
         // OVERLAY_SPEC §7.2: PEERS message validation.
@@ -435,6 +494,29 @@ impl OverlayManager {
         if !is_validator && helpers::is_watcher_droppable(message) {
             trace!("Watcher: dropping {} from {}", msg_type, peer_id);
             return Some(false);
+        }
+
+        // Per-peer query rate limit (parity: Peer.cpp:1423-1438).
+        // stellar-core's window = expectedLedgerCloseTime * MAX_SLOTS_TO_REMEMBER.
+        // We use a fixed 60s window (5s close time * 12 slots).
+        {
+            const QUERY_WINDOW: Duration = Duration::from_secs(60);
+            let allowed = match message {
+                StellarMessage::GetTxSet(_) => {
+                    query_limiter.tx_set.check_and_increment(QUERY_WINDOW)
+                }
+                StellarMessage::GetScpQuorumset(_) => {
+                    query_limiter.quorum_set.check_and_increment(QUERY_WINDOW)
+                }
+                _ => true,
+            };
+            if !allowed {
+                debug!(
+                    "Dropping {} from {}: query rate limit exceeded",
+                    msg_type, peer_id
+                );
+                return Some(false);
+            }
         }
 
         // Global rate limiter (henyey-specific, SCP bypasses).
@@ -518,6 +600,7 @@ impl OverlayManager {
         // OVERLAY_SPEC §7.2: Track whether we've received a PEERS message
         // from this peer. At most one is allowed; duplicates cause a drop.
         let mut received_peers = false;
+        let mut query_limiter = QueryRateLimiter::new();
 
         // Ping/RTT tracking (G4/G17): store the hash and send time of the
         // outstanding ping so we can compute round-trip time when the peer
@@ -652,6 +735,7 @@ impl OverlayManager {
                                 is_validator,
                                 &mut received_peers,
                                 &mut ping,
+                                &mut query_limiter,
                             ) {
                                 None => break,
                                 Some(is_scp) => { if is_scp { scp_messages += 1; } }
@@ -1152,4 +1236,28 @@ mod tests {
     // the handshake within `auth_timeout_secs`) occurs inside `run_peer_loop`
     // which requires real TCP streams. This is an **integration test candidate**.
     // The config default (2s for unauth, 30s for auth) is tested in lib.rs tests.
+
+    /// Regression test: QueryInfo sliding-window rate limiter.
+    /// Parity: stellar-core Peer.cpp:1423-1438 (QUERY_RESPONSE_MULTIPLIER=5).
+    #[test]
+    fn test_query_rate_limiter() {
+        let window = Duration::from_secs(10);
+        let max_queries = window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER; // 50
+
+        let mut info = QueryInfo::new();
+
+        // All queries within limit should be allowed
+        for _ in 0..max_queries {
+            assert!(
+                info.check_and_increment(window),
+                "query within limit should be allowed"
+            );
+        }
+
+        // Next query should be rejected
+        assert!(
+            !info.check_and_increment(window),
+            "query exceeding limit should be rejected"
+        );
+    }
 }
