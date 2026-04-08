@@ -359,12 +359,10 @@ impl FlowControl {
         config: FlowControlConfig,
         scp_callback: Option<Arc<dyn ScpQueueCallback>>,
     ) -> Self {
-        // Spec: OVERLAY_SPEC §5.2 — initial byte capacity is
-        // FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES (the byte batch size itself),
-        // NOT peer_flood_reading_capacity * byte_batch_size.
-        // stellar-core: FlowControlCapacity.cpp initializes mCapacity.mTotalCapacity
-        // as getConfig().FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES.
-        let initial_bytes_capacity = config.flow_control_bytes_batch_size;
+        // stellar-core: FlowControl initializes byte capacity from
+        // getFlowControlBytesTotal() which returns INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES
+        // (300,000) by default. This must match the SEND_MORE_EXTENDED grant sent to peers.
+        let initial_bytes_capacity = crate::peer::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES as u64;
 
         Self {
             state: Mutex::new(FlowControlState {
@@ -394,6 +392,33 @@ impl FlowControl {
     pub fn set_peer_id(&self, peer_id: PeerId) {
         let mut state = self.state.lock().unwrap();
         state.peer_id = Some(peer_id);
+    }
+
+    /// Create a FlowControl with a custom initial byte capacity (test only).
+    #[cfg(test)]
+    fn with_byte_capacity(config: FlowControlConfig, byte_capacity: u64) -> Self {
+        Self {
+            state: Mutex::new(FlowControlState {
+                message_capacity: FlowControlCapacity::new_message(&config),
+                byte_capacity: FlowControlCapacity::new_bytes(byte_capacity),
+                outbound_queues: Default::default(),
+                advert_queue_tx_hash_count: 0,
+                demand_queue_tx_hash_count: 0,
+                tx_queue_byte_count: 0,
+                flood_data_processed: 0,
+                flood_data_processed_bytes: 0,
+                total_msgs_processed: 0,
+                no_outbound_capacity: Some(Instant::now()),
+                last_throttle: None,
+                peer_id: None,
+            }),
+            config,
+            scp_callback: None,
+            dropped_scp: AtomicU64::new(0),
+            dropped_txs: AtomicU64::new(0),
+            dropped_adverts: AtomicU64::new(0),
+            dropped_demands: AtomicU64::new(0),
+        }
     }
 
     /// Check if we have capacity to send a message to this peer.
@@ -1098,14 +1123,15 @@ mod tests {
     }
 
     #[test]
-    fn test_initial_byte_capacity_equals_batch_size() {
-        // OVERLAY_SPEC §5.1: initial byte capacity = flow_control_bytes_batch_size,
-        // NOT flood_reading_capacity * batch_size.
+    fn test_initial_byte_capacity_matches_send_more_grant() {
+        // stellar-core: FlowControl initializes byte capacity from
+        // getFlowControlBytesTotal() = INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES (300,000),
+        // matching the SEND_MORE_EXTENDED grant sent to peers.
         let fc = FlowControl::default();
         let stats = fc.get_stats();
         assert_eq!(
-            stats.local_flood_bytes_capacity, 100_000,
-            "initial byte capacity must equal flow_control_bytes_batch_size"
+            stats.local_flood_bytes_capacity, 300_000,
+            "initial byte capacity must match SEND_MORE_EXTENDED grant (300,000)"
         );
     }
 
@@ -1535,11 +1561,8 @@ mod tests {
     fn test_begin_message_processing_no_capacity_leak_on_byte_failure() {
         // Set byte capacity to 1 byte — any real tx message is larger than
         // 1 byte, so byte capacity will always reject.
-        let config = FlowControlConfig {
-            flow_control_bytes_batch_size: 1,
-            ..FlowControlConfig::default()
-        };
-        let fc = FlowControl::new(config);
+        let config = FlowControlConfig::default();
+        let fc = FlowControl::with_byte_capacity(config, 1);
         let tx = make_tx_message();
 
         let before = fc.get_stats();

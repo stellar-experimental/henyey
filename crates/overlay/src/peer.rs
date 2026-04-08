@@ -46,7 +46,7 @@ const AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED: i32 = 200;
 /// `SendMoreExtended` message after authentication.
 ///
 /// Matches stellar-core `INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES` (300 000).
-const INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES: u32 = 300_000;
+pub(crate) const INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES: u32 = 300_000;
 
 /// Current state of a peer connection.
 ///
