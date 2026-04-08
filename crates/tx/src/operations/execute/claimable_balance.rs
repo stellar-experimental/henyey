@@ -17,8 +17,8 @@ use stellar_xdr::curr::{
 
 use super::{
     account_balance_after_liabilities, account_liabilities, add_account_balance,
-    add_trustline_balance, is_trustline_authorized, trustline_balance_after_liabilities,
-    TxIdentity, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+    add_trustline_balance, is_trustline_authorized, sub_account_balance, sub_trustline_balance,
+    trustline_balance_after_liabilities, TxIdentity, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -140,13 +140,13 @@ pub(crate) fn execute_create_claimable_balance(
     match &op.asset {
         Asset::Native => {
             if let Some(account) = state.get_account_mut(source) {
-                account.balance -= op.amount;
+                sub_account_balance(account, op.amount)?;
             }
         }
         _ => {
             if issuer.as_ref() != Some(source) {
                 if let Some(tl) = state.get_trustline_mut(source, &op.asset) {
-                    tl.balance -= op.amount;
+                    sub_trustline_balance(tl, op.amount)?;
                 }
             }
         }

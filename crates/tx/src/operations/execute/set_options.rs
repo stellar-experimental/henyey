@@ -10,7 +10,10 @@ use stellar_xdr::curr::{
     SignerKeyEd25519SignedPayload, SignerKeyType, SponsorshipDescriptor, MASK_ACCOUNT_FLAGS_V17,
 };
 
-use super::{account_balance_after_liabilities, require_source_account, ACCOUNT_SUBENTRY_LIMIT};
+use super::{
+    account_balance_after_liabilities, dec_sub_entries, inc_sub_entries, require_source_account,
+    ACCOUNT_SUBENTRY_LIMIT,
+};
 use crate::state::{ensure_account_ext_v2, LedgerStateManager};
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -367,12 +370,7 @@ fn apply_signer_update(
             signers_vec.remove(pos);
             signers_changed = true;
 
-            // stellar-core: panics on underflow (invalid account state)
-            assert!(
-                source_account.num_sub_entries > 0,
-                "num_sub_entries underflow: cannot remove sub-entry from account with 0 sub-entries"
-            );
-            source_account.num_sub_entries -= 1;
+            dec_sub_entries(source_account, 1);
         }
     } else if let Some(pos) = existing_pos {
         signers_vec[pos].weight = weight;
@@ -445,7 +443,7 @@ fn apply_signer_update(
             sponsor_delta = Some((sponsor, 1));
         }
 
-        source_account.num_sub_entries += 1;
+        inc_sub_entries(source_account, 1);
     }
 
     if signers_changed {

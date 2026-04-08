@@ -245,6 +245,89 @@ fn apply_balance_delta(
     Ok(())
 }
 
+/// Subtract `amount` from an account's native balance.
+///
+/// Used for debits (withdrawals, clawbacks, fee deductions) where the caller
+/// has already validated that the operation is permitted. No liability checks.
+pub(super) fn sub_account_balance(account: &mut AccountEntry, amount: i64) -> Result<()> {
+    let new_balance = CheckedAmount::new(account.balance)
+        .checked_sub(amount)
+        .ok_or_else(|| TxError::Internal("account balance underflow".into()))?;
+    if new_balance.is_negative() {
+        return Err(TxError::Internal("account balance would go negative".into()));
+    }
+    account.balance = new_balance.value();
+    Ok(())
+}
+
+/// Subtract `amount` from a trustline balance.
+///
+/// Used for debits where the caller has already validated authorization.
+/// No liability or limit checks.
+pub(super) fn sub_trustline_balance(tl: &mut TrustLineEntry, amount: i64) -> Result<()> {
+    let new_balance = CheckedAmount::new(tl.balance)
+        .checked_sub(amount)
+        .ok_or_else(|| TxError::Internal("trustline balance underflow".into()))?;
+    if new_balance.is_negative() {
+        return Err(TxError::Internal("trustline balance would go negative".into()));
+    }
+    tl.balance = new_balance.value();
+    Ok(())
+}
+
+/// Apply a checked delta to a pool reserve field.
+///
+/// Positive delta = deposit, negative delta = withdrawal. Returns error on
+/// overflow or if the result would be negative.
+pub(super) fn add_pool_reserve(reserve: &mut i64, delta: i64) -> Result<()> {
+    let new_val = CheckedAmount::new(*reserve)
+        .checked_add(delta)
+        .ok_or_else(|| TxError::Internal("pool reserve overflow".into()))?;
+    if new_val.is_negative() {
+        return Err(TxError::Internal("pool reserve would go negative".into()));
+    }
+    *reserve = new_val.value();
+    Ok(())
+}
+
+/// Apply a checked delta to total pool shares.
+///
+/// Positive delta = mint, negative delta = burn. Returns error on overflow
+/// or if the result would be negative.
+pub(super) fn add_pool_shares(shares: &mut i64, delta: i64) -> Result<()> {
+    let new_val = CheckedAmount::new(*shares)
+        .checked_add(delta)
+        .ok_or_else(|| TxError::Internal("pool shares overflow".into()))?;
+    if new_val.is_negative() {
+        return Err(TxError::Internal("pool shares would go negative".into()));
+    }
+    *shares = new_val.value();
+    Ok(())
+}
+
+/// Increment num_sub_entries by `n`.
+///
+/// Panics on overflow (matches stellar-core which asserts valid account state).
+pub(super) fn inc_sub_entries(account: &mut AccountEntry, n: u32) {
+    account.num_sub_entries = account
+        .num_sub_entries
+        .checked_add(n)
+        .expect("num_sub_entries overflow: too many sub-entries");
+}
+
+/// Decrement num_sub_entries by `n`.
+///
+/// Panics if the result would underflow (matches stellar-core which asserts
+/// valid account state). See #1121.
+pub(super) fn dec_sub_entries(account: &mut AccountEntry, n: u32) {
+    assert!(
+        account.num_sub_entries >= n,
+        "num_sub_entries underflow: cannot remove {n} sub-entries from account with {}",
+        account.num_sub_entries
+    );
+    account.num_sub_entries -= n;
+}
+
 /// Classify a ledger key for rent purposes: (is_persistent, is_code_entry).
 fn rent_classification(key: &stellar_xdr::curr::LedgerKey) -> (bool, bool) {
     match key {

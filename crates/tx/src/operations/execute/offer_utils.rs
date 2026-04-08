@@ -15,7 +15,7 @@ use super::offer_exchange::{
 };
 use super::{
     account_liabilities, apply_balance_delta, apply_liabilities_delta, can_buy_at_most,
-    is_authorized_to_maintain_liabilities, issuer_for_asset, map_exchange_error,
+    dec_sub_entries, is_authorized_to_maintain_liabilities, issuer_for_asset, map_exchange_error,
     trustline_liabilities,
 };
 use crate::state::LedgerStateManager;
@@ -103,13 +103,8 @@ pub(super) fn delete_offer_with_sponsorship(
         state.update_num_sponsoring(&sponsor, -1)?;
         state.update_num_sponsored(seller, -1)?;
     }
-    // stellar-core: panics on underflow (invalid account state)
     if let Some(account) = state.get_account_mut(seller) {
-        assert!(
-            account.num_sub_entries > 0,
-            "num_sub_entries underflow: cannot remove sub-entry from account with 0 sub-entries"
-        );
-        account.num_sub_entries -= 1;
+        dec_sub_entries(account, 1);
     }
     Ok(())
 }

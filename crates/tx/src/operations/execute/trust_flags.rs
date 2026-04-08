@@ -14,9 +14,10 @@ use stellar_xdr::curr::{
 };
 
 use super::{
-    ensure_account_liabilities, ensure_trustline_liabilities,
-    is_authorized_to_maintain_liabilities, issuer_for_asset, TxIdentity, AUTHORIZED_FLAG,
-    AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+    add_pool_reserve, add_pool_shares, dec_sub_entries, ensure_account_liabilities,
+    ensure_trustline_liabilities, is_authorized_to_maintain_liabilities, issuer_for_asset,
+    TxIdentity, AUTHORIZED_FLAG, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG,
+    TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -338,13 +339,8 @@ fn remove_offers_with_cleanup(
             let _ = state.update_num_sponsored(&offer.seller_id, -1);
         }
 
-        // stellar-core: panics on underflow (invalid account state)
         if let Some(account) = state.get_account_mut(&offer.seller_id) {
-            assert!(
-                account.num_sub_entries > 0,
-                "num_sub_entries underflow: cannot remove sub-entry from account with 0 sub-entries"
-            );
-            account.num_sub_entries -= 1;
+            dec_sub_entries(account, 1);
         }
     }
 }
@@ -497,9 +493,7 @@ fn redeem_pool_share_trustlines(
 
         // Decrease sub-entries BEFORE deleting trustline
         if let Some(account) = state.get_account_mut(account_id) {
-            if account.num_sub_entries >= multiplier as u32 {
-                account.num_sub_entries -= multiplier as u32;
-            }
+            dec_sub_entries(account, multiplier as u32);
         }
 
         state.delete_trustline_by_trustline_asset(account_id, &tl_asset);
@@ -549,9 +543,9 @@ fn redeem_pool_share_trustlines(
             // Update pool reserves and shares
             if let Some(pool) = state.get_liquidity_pool_mut(&pool_id) {
                 let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &mut pool.body;
-                cp.total_pool_shares -= balance;
-                cp.reserve_a -= amount_a;
-                cp.reserve_b -= amount_b;
+                add_pool_shares(&mut cp.total_pool_shares, -balance)?;
+                add_pool_reserve(&mut cp.reserve_a, -amount_a)?;
+                add_pool_reserve(&mut cp.reserve_b, -amount_b)?;
             }
         }
 

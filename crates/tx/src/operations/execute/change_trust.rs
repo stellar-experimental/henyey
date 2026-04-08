@@ -9,9 +9,9 @@ use stellar_xdr::curr::{
 };
 
 use super::{
-    account_balance_after_liabilities, is_authorized_to_maintain_liabilities,
-    require_source_account, trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG,
-    TRUSTLINE_CLAWBACK_ENABLED_FLAG,
+    account_balance_after_liabilities, dec_sub_entries, inc_sub_entries,
+    is_authorized_to_maintain_liabilities, require_source_account, trustline_liabilities,
+    ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
@@ -155,13 +155,8 @@ fn remove_trustline(
     // Decrease sub-entries BEFORE deleting trustline.
     // stellar-core records account STATE/UPDATED before trustline STATE/REMOVED.
     if let Some(account) = state.get_account_mut(source) {
-        if account.num_sub_entries >= multiplier as u32 {
-            account.num_sub_entries -= multiplier as u32;
-        } else {
-            return Err(TxError::Internal(
-                "negative subentry count while deleting trustline".to_string(),
-            ));
-        }
+        // stellar-core: panics on underflow (invalid account state)
+        dec_sub_entries(account, multiplier as u32);
     }
     // Flush ALL account changes before recording trustline deletion.
     state.flush_all_accounts();
@@ -259,7 +254,7 @@ fn create_trustline(
     }
 
     if let Some(account) = state.get_account_mut(source) {
-        account.num_sub_entries += multiplier as u32;
+        inc_sub_entries(account, multiplier as u32);
     }
     Ok(None)
 }

@@ -21,8 +21,9 @@ use super::offer_utils::{
 };
 use super::{
     account_balance_after_liabilities, account_liabilities, apply_balance_delta,
-    apply_liabilities_delta, can_buy_at_most, is_trustline_authorized, issuer_for_asset,
-    map_exchange_error, require_source_account, trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT,
+    apply_liabilities_delta, can_buy_at_most, dec_sub_entries, inc_sub_entries,
+    is_trustline_authorized, issuer_for_asset, map_exchange_error, require_source_account,
+    trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT,
 };
 use crate::frozen_keys::offer_accesses_frozen_key;
 use crate::state::LedgerStateManager;
@@ -409,7 +410,7 @@ fn execute_manage_offer(
             }
             state.create_offer(offer);
             if let Some(account) = state.get_account_mut(source) {
-                account.num_sub_entries += 1;
+                inc_sub_entries(account, 1);
             }
             ManageOfferSuccessResultOffer::Created(create_offer_entry(
                 source,
@@ -444,11 +445,7 @@ fn execute_manage_offer(
             state.delete_offer(source, offer_id);
             // stellar-core: panics on underflow (invalid account state)
             if let Some(account) = state.get_account_mut(source) {
-                assert!(
-                    account.num_sub_entries > 0,
-                    "num_sub_entries underflow: cannot remove sub-entry from account with 0 sub-entries"
-                );
-                account.num_sub_entries -= 1;
+                dec_sub_entries(account, 1);
             }
         } else {
             // New offer that was fully consumed during matching.

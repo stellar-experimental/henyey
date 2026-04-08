@@ -8,7 +8,10 @@ use stellar_xdr::curr::{
     ManageDataResultCode, OperationResult, OperationResultTr,
 };
 
-use super::{account_balance_after_liabilities, require_source_account, ACCOUNT_SUBENTRY_LIMIT};
+use super::{
+    account_balance_after_liabilities, dec_sub_entries, inc_sub_entries, require_source_account,
+    ACCOUNT_SUBENTRY_LIMIT,
+};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -67,13 +70,8 @@ pub(crate) fn execute_manage_data(
                 }
 
                 // Decrease sub-entry count before deleting.
-                // stellar-core: panics on underflow (invalid account state).
                 if let Some(account) = state.get_account_mut(source) {
-                    assert!(
-                        account.num_sub_entries > 0,
-                        "num_sub_entries underflow: cannot remove sub-entry from account with 0 sub-entries"
-                    );
-                    account.num_sub_entries -= 1;
+                    dec_sub_entries(account, 1);
                 }
 
                 state.delete_data(source, &data_name);
@@ -161,7 +159,7 @@ pub(crate) fn execute_manage_data(
 
                 // Increase sub-entry count
                 if let Some(account) = state.get_account_mut(source) {
-                    account.num_sub_entries += 1;
+                    inc_sub_entries(account, 1);
                 }
             }
         }

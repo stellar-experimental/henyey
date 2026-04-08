@@ -17,7 +17,8 @@ use super::offer_exchange::{ConversionParams, RoundingType};
 use super::offer_utils::{delete_offer_with_sponsorship, offer_liabilities_sell};
 use super::{
     account_liabilities, add_account_balance, add_trustline_balance, apply_liabilities_delta,
-    is_trustline_authorized, issuer_for_asset, trustline_liabilities,
+    is_trustline_authorized, issuer_for_asset, sub_account_balance, sub_trustline_balance,
+    trustline_liabilities,
 };
 use crate::frame::muxed_to_account_id;
 use crate::frozen_keys::offer_accesses_frozen_key;
@@ -376,7 +377,10 @@ fn update_source_balance(
             code: PathPaymentStrictReceiveResultCode::Underfunded,
             no_issuer_asset: None,
         })?;
-        source_account_mut.balance -= amount;
+        sub_account_balance(source_account_mut, amount).map_err(|_| TransferError {
+            code: PathPaymentStrictReceiveResultCode::Underfunded,
+            no_issuer_asset: None,
+        })?;
         return Ok(());
     }
 
@@ -415,7 +419,10 @@ fn update_source_balance(
             code: PathPaymentStrictReceiveResultCode::SrcNoTrust,
             no_issuer_asset: None,
         })?;
-    source_trustline_mut.balance -= amount;
+    sub_trustline_balance(source_trustline_mut, amount).map_err(|_| TransferError {
+        code: PathPaymentStrictReceiveResultCode::Underfunded,
+        no_issuer_asset: None,
+    })?;
     Ok(())
 }
 

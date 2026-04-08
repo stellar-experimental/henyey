@@ -11,6 +11,7 @@ use stellar_xdr::curr::{
 };
 
 use super::is_asset_valid;
+use super::sub_trustline_balance;
 use super::trustline_liabilities;
 use super::TRUSTLINE_CLAWBACK_ENABLED_FLAG;
 use crate::frame::muxed_to_account_id;
@@ -87,7 +88,7 @@ pub(crate) fn execute_clawback(
 
     // Perform the clawback - deduct from trustline
     if let Some(tl) = state.get_trustline_mut(&from_account_id, &op.asset) {
-        tl.balance -= op.amount;
+        sub_trustline_balance(tl, op.amount)?;
     }
 
     Ok(make_clawback_result(ClawbackResultCode::Success))

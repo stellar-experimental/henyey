@@ -6,7 +6,10 @@ use stellar_xdr::curr::{
     SequenceNumber, String32, Thresholds,
 };
 
-use super::{account_balance_after_liabilities, account_liabilities, require_source_account};
+use super::{
+    account_balance_after_liabilities, account_liabilities, require_source_account,
+    sub_account_balance,
+};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -92,7 +95,7 @@ pub(crate) fn execute_create_account(
         let source_account = state
             .get_account_mut(source)
             .ok_or(TxError::SourceAccountNotFound)?;
-        source_account.balance -= op.starting_balance;
+        sub_account_balance(source_account, op.starting_balance)?;
     }
 
     let starting_seq = state.starting_sequence_number()?;

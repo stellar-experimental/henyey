@@ -11,13 +11,14 @@ use stellar_xdr::curr::{
 };
 
 use super::{
-    account_liabilities, add_account_balance, add_trustline_balance,
-    is_authorized_to_maintain_liabilities, is_trustline_authorized,
-    trustline_balance_after_liabilities, trustline_liabilities,
+    account_liabilities, add_account_balance, add_pool_reserve, add_pool_shares,
+    add_trustline_balance, is_authorized_to_maintain_liabilities, is_trustline_authorized,
+    sub_account_balance, sub_trustline_balance, trustline_balance_after_liabilities,
+    trustline_liabilities,
 };
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
-use crate::Result;
+use crate::{Result, TxError};
 
 /// Execute a LiquidityPoolDeposit operation.
 ///
@@ -214,16 +215,18 @@ pub(crate) fn execute_liquidity_pool_deposit(
 
     // Credit pool shares to source
     if let Some(tl) = state.get_trustline_by_trustline_asset_mut(source, &pool_share_asset) {
-        tl.balance += shares_received;
+        add_trustline_balance(tl, shares_received).map_err(|_| {
+            TxError::Internal("pool share credit overflow".into())
+        })?;
     }
 
     // Update pool reserves
     if let Some(pool_mut) = state.get_liquidity_pool_mut(&op.liquidity_pool_id) {
         match &mut pool_mut.body {
             stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
-                cp.reserve_a += deposit_a;
-                cp.reserve_b += deposit_b;
-                cp.total_pool_shares += shares_received;
+                add_pool_reserve(&mut cp.reserve_a, deposit_a)?;
+                add_pool_reserve(&mut cp.reserve_b, deposit_b)?;
+                add_pool_shares(&mut cp.total_pool_shares, shares_received)?;
             }
         }
     }
@@ -352,16 +355,16 @@ pub(crate) fn execute_liquidity_pool_withdraw(
 
     // Deduct pool shares from source
     if let Some(tl) = state.get_trustline_by_trustline_asset_mut(source, &pool_share_asset) {
-        tl.balance -= op.amount;
+        sub_trustline_balance(tl, op.amount)?;
     }
 
     // Update pool reserves
     if let Some(pool_mut) = state.get_liquidity_pool_mut(&op.liquidity_pool_id) {
         match &mut pool_mut.body {
             stellar_xdr::curr::LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) => {
-                cp.reserve_a -= withdraw_a;
-                cp.reserve_b -= withdraw_b;
-                cp.total_pool_shares -= op.amount;
+                add_pool_reserve(&mut cp.reserve_a, -withdraw_a)?;
+                add_pool_reserve(&mut cp.reserve_b, -withdraw_b)?;
+                add_pool_shares(&mut cp.total_pool_shares, -op.amount)?;
             }
         }
     }
@@ -430,7 +433,8 @@ fn debit_asset(
             if account.balance < amount {
                 return Err(LiquidityPoolDepositResultCode::Underfunded);
             }
-            account.balance -= amount;
+            sub_account_balance(account, amount)
+                .map_err(|_| LiquidityPoolDepositResultCode::Underfunded)?;
         }
     } else if is_issuer(source, asset) {
         // Issuer "creates" assets out of nothing, no balance to deduct
@@ -438,7 +442,8 @@ fn debit_asset(
         if tl.balance < amount {
             return Err(LiquidityPoolDepositResultCode::Underfunded);
         }
-        tl.balance -= amount;
+        sub_trustline_balance(tl, amount)
+            .map_err(|_| LiquidityPoolDepositResultCode::Underfunded)?;
     }
     Ok(())
 }
