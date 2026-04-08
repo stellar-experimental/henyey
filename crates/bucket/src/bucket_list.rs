@@ -2968,11 +2968,9 @@ impl BucketList {
             'process: {
                 let live_entry = match &entry {
                     BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
-                    BucketEntry::Deadentry(key) => {
-                        // Mark dead keys as seen
-                        if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                            seen_keys.insert(key_bytes);
-                        }
+                    BucketEntry::Deadentry(_key) => {
+                        // Parity: stellar-core ignores DEAD entries entirely
+                        // in scanForEvictionInBucket — no key is recorded.
                         break 'process;
                     }
                     BucketEntry::Metaentry(_) => {
@@ -4536,6 +4534,117 @@ mod tests {
         assert!(
             result.is_err(),
             "resolve_pending_merge() must propagate merge errors"
+        );
+    }
+
+    /// Regression test for AUDIT-013 (bucket): DEAD-entry keys must NOT be added
+    /// to seen_keys during eviction scan. stellar-core ignores DEAD entries entirely
+    /// in scanForEvictionInBucket, so stale LIVE entries in deeper buckets can still
+    /// be evaluated for eviction.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_audit_013_dead_key_dedup_does_not_block_eviction() {
+        use crate::entry::get_ttl_key;
+
+        let seed: u8 = 42;
+        let contract_hash = Hash([seed; 32]);
+
+        // Soroban contract code entry (qualifies for eviction)
+        let data_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: contract_hash.clone(),
+        });
+        let stale_live_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: contract_hash.clone(),
+                code: vec![0u8; 100].try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        // TTL entry for this contract code — expired at current_ledger=100
+        let ttl_key = get_ttl_key(&data_key).expect("contract code should have TTL key");
+        let ttl_key_hash = match &ttl_key {
+            LedgerKey::Ttl(t) => t.key_hash.clone(),
+            _ => panic!("expected TTL key"),
+        };
+        let expired_ttl_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Ttl(TtlEntry {
+                key_hash: ttl_key_hash,
+                live_until_ledger_seq: 50, // expired: 50 < 100
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let current_ledger: u32 = 100;
+
+        let mut bl = BucketList::new();
+
+        // Level 0 curr: expired TTL (found by self.get() during scan)
+        let ttl_bucket = Bucket::from_entries(vec![
+            BucketListEntry::Metaentry(BucketMetadata {
+                ledger_version: TEST_PROTOCOL,
+                ext: BucketMetadataExt::V0,
+            }),
+            BucketListEntry::Liveentry(expired_ttl_entry),
+        ])
+        .unwrap();
+        bl.level_mut(0).unwrap().curr = Arc::new(ttl_bucket);
+
+        // Level 1 curr: DEAD entry for the contract code key
+        let dead_bucket = Bucket::from_entries(vec![
+            BucketListEntry::Metaentry(BucketMetadata {
+                ledger_version: TEST_PROTOCOL,
+                ext: BucketMetadataExt::V0,
+            }),
+            BucketListEntry::Deadentry(data_key.clone()),
+        ])
+        .unwrap();
+        bl.level_mut(1).unwrap().curr = Arc::new(dead_bucket);
+
+        // Level 2 curr: stale LIVE entry for the same key (deep copy)
+        let stale_bucket = Bucket::from_entries(vec![
+            BucketListEntry::Metaentry(BucketMetadata {
+                ledger_version: TEST_PROTOCOL,
+                ext: BucketMetadataExt::V0,
+            }),
+            BucketListEntry::Liveentry(stale_live_entry),
+        ])
+        .unwrap();
+        bl.level_mut(2).unwrap().curr = Arc::new(stale_bucket);
+
+        let settings = StateArchivalSettings {
+            max_entry_ttl: 1_000_000,
+            min_temporary_ttl: 1,
+            min_persistent_ttl: 1,
+            persistent_rent_rate_denominator: 1,
+            temp_rent_rate_denominator: 1,
+            max_entries_to_archive: 100,
+            live_soroban_state_size_window_sample_size: 0,
+            live_soroban_state_size_window_sample_period: 0,
+            eviction_scan_size: 1_000_000,
+            starting_eviction_scan_level: 1,
+        };
+
+        let iter = crate::EvictionIterator {
+            bucket_list_level: 1,
+            is_curr_bucket: true,
+            bucket_file_offset: 0,
+        };
+
+        let result = bl
+            .scan_for_eviction_incremental(iter, current_ledger, &settings)
+            .unwrap();
+
+        // Before fix: 0 candidates (DEAD key blocked the stale LIVE at level 2)
+        // After fix: DEAD entry is ignored, stale LIVE at level 2 is evaluated
+        // and found expired → 1 candidate
+        assert!(
+            !result.candidates.is_empty(),
+            "AUDIT-013: DEAD entry must not block eviction of stale LIVE in deeper bucket. \
+             Got {} candidates, expected >= 1",
+            result.candidates.len(),
         );
     }
 }

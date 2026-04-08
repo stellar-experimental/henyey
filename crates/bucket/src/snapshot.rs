@@ -588,8 +588,8 @@ impl BucketListSnapshot {
             'process: {
                 let live_entry = match &entry {
                     BucketEntry::Liveentry(e) | BucketEntry::Initentry(e) => e,
-                    BucketEntry::Deadentry(key) => {
-                        seen_keys.insert(key.clone());
+                    BucketEntry::Deadentry(_key) => {
+                        // Parity: stellar-core ignores DEAD entries in scan
                         break 'process;
                     }
                     BucketEntry::Metaentry(_) => {
