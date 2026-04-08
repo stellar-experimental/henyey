@@ -632,9 +632,13 @@ fn convert_with_offers(
             break;
         };
 
+        if offer.seller_id == *params.source {
+            return Ok(ConvertResult::FilterStopCrossSelf);
+        }
+
         // CAP-77: Skip and delete offers that access frozen keys.
-        // Frozen offers are unconditionally removed and don't count against
-        // the max offers to cross limit.
+        // Parity: stellar-core checks frozen AFTER cross-self filter.
+        // When an offer is both frozen and cross-self, cross-self takes priority.
         if offer_accesses_frozen_key(&offer, params.frozen_key_config) {
             params.state.ensure_offer_entries_loaded(
                 &offer.seller_id,
@@ -652,10 +656,6 @@ fn convert_with_offers(
             )?;
             delete_offer_with_sponsorship(&offer.seller_id, offer.offer_id, params.state)?;
             continue;
-        }
-
-        if offer.seller_id == *params.source {
-            return Ok(ConvertResult::FilterStopCrossSelf);
         }
 
         // Enforce max offers to cross limit (matches stellar-core)

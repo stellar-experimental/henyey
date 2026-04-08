@@ -792,9 +792,16 @@ fn convert_with_offers(
             break;
         };
 
+        match offer_filter(params.source, &offer, passive, max_wheat_price) {
+            OfferFilterResult::Keep => {}
+            OfferFilterResult::StopBadPrice => return Ok(ConvertResult::FilterStopBadPrice),
+            OfferFilterResult::StopCrossSelf => return Ok(ConvertResult::FilterStopCrossSelf),
+        }
+
         // CAP-77: Skip and delete offers that access frozen keys.
-        // This must be checked before the price/self filter since frozen offers
-        // are unconditionally removed regardless of price compatibility.
+        // Parity: stellar-core checks frozen AFTER price/cross-self filters.
+        // When an offer is both frozen and would trigger a stop condition,
+        // the stop condition takes priority and the offer survives.
         if offer_accesses_frozen_key(&offer, params.frozen_key_config) {
             // Load seller's account and trustlines so liabilities can be released.
             params.state.ensure_offer_entries_loaded(
@@ -814,12 +821,6 @@ fn convert_with_offers(
             )?;
             delete_offer_with_sponsorship(&offer.seller_id, offer.offer_id, params.state)?;
             continue;
-        }
-
-        match offer_filter(params.source, &offer, passive, max_wheat_price) {
-            OfferFilterResult::Keep => {}
-            OfferFilterResult::StopBadPrice => return Ok(ConvertResult::FilterStopBadPrice),
-            OfferFilterResult::StopCrossSelf => return Ok(ConvertResult::FilterStopCrossSelf),
         }
 
         let (num_wheat_received, num_sheep_send, wheat_stays) = cross_offer_v10(
@@ -3086,5 +3087,141 @@ mod tests {
             }
             other => panic!("Unexpected result type: {:?}", other),
         }
+    }
+
+    /// Regression test for AUDIT-011: CAP-77 frozen offer filter must run AFTER
+    /// price/cross-self filters, matching stellar-core ordering.
+    ///
+    /// Scenario: seller has an offer selling IDR for USD at price 2:1. The seller's
+    /// IDR trustline is frozen. Buyer places a sell offer USD→IDR at price 1:1
+    /// (max_wheat_price = 1:1). The seller's offer has price 2:1 which exceeds the
+    /// buyer's max_wheat_price — this should trigger StopBadPrice.
+    ///
+    /// Before the fix: frozen check ran first, deleting the offer and continuing.
+    /// After the fix: price check runs first, returning CrossSelf or BadPrice.
+    #[test]
+    fn test_audit_011_frozen_offer_filter_order_vs_bad_price() {
+        use crate::frozen_keys::{trustline_key, FrozenKeyConfig};
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let buyer_id = create_test_account_id(0);
+        let seller_id = create_test_account_id(1);
+        let issuer_id = create_test_account_id(2);
+        state.create_account(create_test_account(buyer_id.clone(), 100_000_000));
+        state.create_account(create_test_account(seller_id.clone(), 100_000_000));
+        state.create_account(create_test_account(issuer_id.clone(), 100_000_000));
+
+        let usd = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', b'X']),
+            issuer: issuer_id.clone(),
+        });
+        let idr = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'I', b'D', b'R', b'X']),
+            issuer: issuer_id.clone(),
+        });
+
+        // Buyer trustlines
+        state.create_trustline(create_test_trustline(
+            buyer_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000_000,
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            buyer_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'I', b'D', b'R', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Seller trustlines
+        state.create_trustline(create_test_trustline(
+            seller_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            0,
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+        state.create_trustline(create_test_trustline(
+            seller_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'I', b'D', b'R', b'X']),
+                issuer: issuer_id.clone(),
+            }),
+            1_000_000,
+            10_000_000,
+            AUTHORIZED_FLAG,
+        ));
+
+        // Seller's existing offer: selling IDR for USD at price 2/1
+        // (2 IDR per 1 USD — expensive from buyer's perspective)
+        state.create_offer(OfferEntry {
+            seller_id: seller_id.clone(),
+            offer_id: 1,
+            selling: idr.clone(),
+            buying: usd.clone(),
+            amount: 1000,
+            price: Price { n: 2, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        // Freeze the seller's IDR trustline via FrozenKeyConfig
+        let frozen_key = trustline_key(&seller_id, &idr);
+        let frozen_bytes = frozen_key.to_xdr(Limits::none()).unwrap();
+        let frozen_config = FrozenKeyConfig::new(vec![frozen_bytes], vec![]);
+
+        // Create context with frozen keys
+        let mut context = create_test_context();
+        context.frozen_key_config = frozen_config;
+
+        // Buyer places offer: selling USD, buying IDR at price 1/1
+        // The seller's offer at price 2/1 > buyer's max price 1/1 → StopBadPrice
+        // The seller's offer is ALSO frozen → would be deleted if checked first
+        //
+        // stellar-core: price check first → StopBadPrice → offer survives
+        // Bug (old code): frozen check first → offer deleted → no match → offer placed
+        let op = ManageSellOfferOp {
+            selling: usd.clone(),
+            buying: idr.clone(),
+            amount: 100,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+
+        let result = execute_manage_sell_offer(&op, &buyer_id, &mut state, &context).unwrap();
+
+        // Verify the buyer's offer was created (no crossing happened due to bad price)
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(
+                ManageSellOfferResult::Success(detail),
+            )) => {
+                // The offer should have been created since no crossing happened
+                assert!(
+                    detail.offers_claimed.is_empty(),
+                    "No offers should have been crossed"
+                );
+            }
+            other => panic!("Expected Success, got: {:?}", other),
+        }
+
+        // The seller's frozen offer must STILL exist (price filter stopped before frozen check)
+        let offer = state.get_offer(&seller_id, 1);
+        assert!(
+            offer.is_some(),
+            "AUDIT-011: Frozen offer must survive when price filter would stop first"
+        );
     }
 }
