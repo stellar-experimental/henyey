@@ -40,7 +40,7 @@ use std::time::Instant;
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use henyey_common::Hash256;
 use henyey_crypto::{PublicKey, SecretKey};
@@ -943,6 +943,31 @@ impl Herder {
         if let Err(e) = self.scp_driver.verify_envelope(&envelope) {
             debug!(slot, error = %e, "Invalid SCP envelope signature");
             return EnvelopeState::InvalidSignature;
+        }
+
+        // Parity: skip self-messages (HerderImpl.cpp:885-891)
+        let local_node_id = node_id_from_public_key(&self.config.node_public_key);
+        if envelope.statement.node_id == local_node_id {
+            trace!(slot, "Skipping self-message");
+            return EnvelopeState::Invalid;
+        }
+
+        // Parity: reject envelopes from nodes not in our transitive quorum
+        // (PendingEnvelopes.cpp:293-298 isNodeDefinitelyInQuorum)
+        // Only enforce when a quorum set is configured (validators and watchers
+        // with a quorum set). Observers without a quorum set accept all envelopes.
+        if self.config.local_quorum_set.is_some()
+            && !self
+                .quorum_tracker
+                .read()
+                .is_node_definitely_in_quorum(&envelope.statement.node_id)
+        {
+            debug!(
+                slot,
+                node = ?envelope.statement.node_id,
+                "Rejecting envelope from non-quorum node"
+            );
+            return EnvelopeState::Invalid;
         }
 
         self.slot_quorum_tracker
@@ -2271,13 +2296,12 @@ mod tests {
     // MAX_EXTERNALIZE_SLOT_DISTANCE was removed — stellar-core has no such limit.
     // When not tracking, stellar-core accepts EXTERNALIZE for any slot (maxLedgerSeq = uint32::max).
 
-    /// Creates a signed EXTERNALIZE envelope for testing.
+    /// Regression test: EXTERNALIZE from non-quorum node is rejected at the
+    /// herder level by the quorum membership check (PendingEnvelopes.cpp:293-298).
+    /// Before #1098 fix, non-quorum envelopes reached SCP and could trigger
+    /// fast-track catchup.
     #[test]
     fn test_externalize_rejected_when_node_not_in_quorum() {
-        // An EXTERNALIZE from a node not in quorum is processed by SCP but
-        // won't cause externalization. SCP accepts the individual envelope
-        // (EXTERNALIZE uses a singleton quorum for the sender) but the local
-        // node's quorum set is not satisfied, so no externalization occurs.
         let local_secret = SecretKey::from_seed(&[7u8; 32]);
         let local_public = local_secret.public_key();
         let local_node_id = node_id_from_public_key(&local_public);
@@ -2314,22 +2338,56 @@ mod tests {
         let envelope = make_signed_externalize_from(tracking, &herder, &unknown_secret);
         let result = herder.receive_scp_envelope(envelope);
 
-        // SCP accepts the envelope (EXTERNALIZE uses singleton quorum for the
-        // sender) but it should NOT cause externalization because the unknown
-        // node is not in our quorum set.
-        assert!(
-            result != EnvelopeState::Invalid,
-            "SCP should accept the EXTERNALIZE envelope itself"
+        // With the quorum membership guard, the envelope should be rejected
+        // before reaching SCP (parity with stellar-core PendingEnvelopes.cpp:293)
+        assert_eq!(
+            result,
+            EnvelopeState::Invalid,
+            "Non-quorum node envelope should be rejected by quorum membership check"
         );
         assert_eq!(
             herder.tracking_slot(),
             tracking,
             "tracking slot should NOT advance — unknown node not in quorum"
         );
-        assert!(
-            herder.latest_externalized_slot().is_none()
-                || herder.latest_externalized_slot() != Some(tracking),
-            "slot should NOT be externalized from a non-quorum node"
+    }
+
+    /// Regression test: self-message filtering (HerderImpl.cpp:885-891).
+    /// Envelopes from the local node should be skipped.
+    #[test]
+    fn test_self_message_rejected() {
+        let (herder, secret) = make_validator_herder();
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        let tracking = herder.tracking_slot(); // 101
+
+        // Create a signed envelope FROM the local node
+        let value = make_valid_value_with_cached_tx_set(&herder, &secret);
+        let node_id = node_id_from_public_key(&herder.config.node_public_key);
+        let statement = ScpStatement {
+            node_id: node_id.clone(),
+            slot_index: tracking,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: hash_quorum_set(herder.config.local_quorum_set.as_ref().unwrap())
+                    .into(),
+                ballot: ScpBallot {
+                    counter: 1,
+                    value: value.clone(),
+                },
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+        let envelope = sign_statement(&statement, &herder, &secret);
+
+        let result = herder.receive_scp_envelope(envelope);
+        assert_eq!(
+            result,
+            EnvelopeState::Invalid,
+            "Self-message should be rejected (HerderImpl.cpp:885-891)"
         );
     }
 
