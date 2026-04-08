@@ -2245,8 +2245,7 @@ mod tests {
             },
             signature: stellar_xdr::curr::Signature(vec![].try_into().unwrap()),
         };
-        nom.latest_nominations
-            .insert(remote_node.clone(), envelope);
+        nom.latest_nominations.insert(remote_node.clone(), envelope);
 
         // A driver where get_quorum_set_by_hash returns None (default)
         // and get_quorum_set returns the STALE quorum set.
