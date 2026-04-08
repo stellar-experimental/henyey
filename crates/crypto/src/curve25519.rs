@@ -30,14 +30,14 @@
 //!
 //! // Derive shared key from each side - both should match
 //! let alice_shared = Curve25519Secret::derive_shared_key(
-//!     &alice_secret, &alice_public, &bob_public, true);
+//!     &alice_secret, &alice_public, &bob_public, true).unwrap();
 //! let bob_shared = Curve25519Secret::derive_shared_key(
-//!     &bob_secret, &bob_public, &alice_public, false);
+//!     &bob_secret, &bob_public, &alice_public, false).unwrap();
 //!
 //! assert_eq!(alice_shared, bob_shared);
 //! ```
 
-use crate::{hkdf_extract, random_bytes};
+use crate::{hkdf_extract, random_bytes, CryptoError};
 use std::hash::{Hash, Hasher};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::ZeroizeOnDrop;
@@ -99,8 +99,17 @@ impl Curve25519Secret {
     /// Performs ECDH to derive a shared secret.
     ///
     /// Computes `localSecret * remotePublic` (scalar multiplication).
-    pub fn diffie_hellman(&self, remote_public: &Curve25519Public) -> [u8; 32] {
-        self.inner.diffie_hellman(&remote_public.inner).to_bytes()
+    /// Returns an error if the result is all zeros (small-order public key),
+    /// matching stellar-core's crypto_scalarmult() return-code check.
+    pub fn diffie_hellman(
+        &self,
+        remote_public: &Curve25519Public,
+    ) -> Result<[u8; 32], CryptoError> {
+        let shared = self.inner.diffie_hellman(&remote_public.inner).to_bytes();
+        if shared == [0u8; 32] {
+            return Err(CryptoError::SmallOrderPublicKey);
+        }
+        Ok(shared)
     }
 
     /// Derives a shared HMAC-SHA256 key for authenticated encryption.
@@ -130,9 +139,9 @@ impl Curve25519Secret {
         local_public: &Curve25519Public,
         remote_public: &Curve25519Public,
         local_first: bool,
-    ) -> [u8; 32] {
-        // Perform ECDH
-        let shared_secret = local_secret.diffie_hellman(remote_public);
+    ) -> Result<[u8; 32], CryptoError> {
+        // Perform ECDH (returns Err for small-order public keys)
+        let shared_secret = local_secret.diffie_hellman(remote_public)?;
 
         // Determine key ordering based on local_first
         let (public_a, public_b) = if local_first {
@@ -148,7 +157,7 @@ impl Curve25519Secret {
         buf[64..96].copy_from_slice(&public_b.to_bytes());
 
         // Apply HKDF-extract
-        hkdf_extract(&buf)
+        Ok(hkdf_extract(&buf))
     }
 }
 
@@ -248,8 +257,8 @@ mod tests {
         let bob_public = bob_secret.derive_public();
 
         // Both sides compute the same shared secret
-        let alice_shared = alice_secret.diffie_hellman(&bob_public);
-        let bob_shared = bob_secret.diffie_hellman(&alice_public);
+        let alice_shared = alice_secret.diffie_hellman(&bob_public).unwrap();
+        let bob_shared = bob_secret.diffie_hellman(&alice_public).unwrap();
 
         assert_eq!(alice_shared, bob_shared);
     }
@@ -268,14 +277,16 @@ mod tests {
             &alice_public,
             &bob_public,
             true, // Alice first
-        );
+        )
+        .unwrap();
 
         let bob_key = Curve25519Secret::derive_shared_key(
             &bob_secret,
             &bob_public,
             &alice_public,
             false, // Alice first (so Bob is not first)
-        );
+        )
+        .unwrap();
 
         // Both should derive the same key
         assert_eq!(alice_key, bob_key);
@@ -291,10 +302,12 @@ mod tests {
 
         // Same local_first value should produce different keys for different parties
         let alice_key_first =
-            Curve25519Secret::derive_shared_key(&alice_secret, &alice_public, &bob_public, true);
+            Curve25519Secret::derive_shared_key(&alice_secret, &alice_public, &bob_public, true)
+                .unwrap();
 
         let alice_key_second =
-            Curve25519Secret::derive_shared_key(&alice_secret, &alice_public, &bob_public, false);
+            Curve25519Secret::derive_shared_key(&alice_secret, &alice_public, &bob_public, false)
+                .unwrap();
 
         // Different ordering should produce different keys
         assert_ne!(alice_key_first, alice_key_second);
@@ -345,5 +358,18 @@ mod tests {
 
         // Should not contain the actual key bytes
         assert!(debug_str.contains("REDACTED"));
+    }
+
+    /// Regression test for AUDIT-018 (#1091): small-order Curve25519 public keys
+    /// must be rejected. stellar-core checks crypto_scalarmult() return code.
+    #[test]
+    fn test_audit_018_diffie_hellman_rejects_small_order_keys() {
+        let secret = Curve25519Secret::random();
+
+        // The identity point (all zeros) is a small-order point
+        let zero_key = Curve25519Public::from_bytes([0u8; 32]);
+        let result = secret.diffie_hellman(&zero_key);
+        assert!(result.is_err(), "DH with all-zeros public key should fail");
+        assert!(matches!(result, Err(CryptoError::SmallOrderPublicKey)));
     }
 }

@@ -419,6 +419,15 @@ impl AuthContext {
         let peer_ephemeral_public = X25519PublicKey::from(peer_auth_cert.pubkey.key);
         let shared_secret = our_secret.diffie_hellman(&peer_ephemeral_public);
 
+        // Reject small-order public keys that produce an all-zeros shared secret.
+        // stellar-core: Curve25519.cpp:60-63 checks crypto_scalarmult() return code,
+        // which libsodium uses to reject these points.
+        if shared_secret.as_bytes() == &[0u8; 32] {
+            return Err(OverlayError::AuthenticationFailed(
+                "small-order public key produced all-zeros shared secret".to_string(),
+            ));
+        }
+
         // Derive MAC keys using nonces from Hello messages
         let (send_key, recv_key) = self.derive_mac_keys(&shared_secret, &peer_auth_cert)?;
 

@@ -78,4 +78,10 @@ pub enum CryptoError {
         /// The new seed value that was rejected.
         requested: u32,
     },
+
+    /// ECDH produced an all-zeros shared secret, indicating the remote public
+    /// key is a small-order point. stellar-core rejects these via libsodium's
+    /// `crypto_scalarmult()` return-code check.
+    #[error("small-order public key produced all-zeros shared secret")]
+    SmallOrderPublicKey,
 }
