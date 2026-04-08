@@ -545,9 +545,17 @@ impl fmt::Display for Upgrades {
     }
 }
 
-/// Validate an upgrade for application.
+/// Validate an upgrade for application (without ledger state).
 ///
-/// Checks if the upgrade XDR is valid and the upgrade can be safely applied.
+/// Checks if the upgrade XDR is valid and the upgrade can be safely applied
+/// based on protocol version constraints alone.
+///
+/// **Note**: For `LedgerUpgrade::Config`, this function only checks that the
+/// protocol version is >= 20. It does NOT validate the ConfigUpgradeSet
+/// against ledger state (existence, XDR validity, non-upgradeable entries).
+/// For full Config upgrade validation matching stellar-core's
+/// `isValidForApply`, use `ScpDriver::is_valid_upgrade_for_apply` which
+/// performs ledger state lookups via `LedgerManager::get_config_upgrade_set`.
 ///
 /// # Arguments
 ///

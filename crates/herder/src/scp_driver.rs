@@ -3808,6 +3808,38 @@ mod tests {
             "Config upgrade with nonexistent key must be rejected when LedgerManager is available"
         );
     }
+
+    /// Test is_valid_upgrade_for_apply directly: Config upgrade without
+    /// ledger manager is rejected, and non-Config upgrades are unaffected.
+    #[test]
+    fn test_audit_023_is_valid_upgrade_for_apply_config_without_lm() {
+        use stellar_xdr::curr::{ConfigUpgradeSetKey, ContractId, Hash};
+
+        let bogus_key = ConfigUpgradeSetKey {
+            contract_id: ContractId(Hash([0xDE; 32])),
+            content_hash: Hash([0xAD; 32]),
+        };
+
+        // Config upgrade without ledger manager: rejected
+        assert!(
+            !ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::Config(bogus_key), 25, None,),
+            "Config upgrade must be rejected when no ledger manager is available"
+        );
+
+        // Non-Config upgrades are unaffected by the ledger_manager parameter
+        assert!(
+            ScpDriver::is_valid_upgrade_for_apply(&LedgerUpgrade::BaseFee(200), 25, None),
+            "BaseFee upgrade should not need ledger manager"
+        );
+        assert!(
+            ScpDriver::is_valid_upgrade_for_apply(
+                &LedgerUpgrade::MaxSorobanTxSetSize(100),
+                25,
+                None,
+            ),
+            "MaxSorobanTxSetSize upgrade should not need ledger manager"
+        );
+    }
 }
 
 #[cfg(test)]
