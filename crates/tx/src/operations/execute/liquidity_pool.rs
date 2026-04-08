@@ -2106,6 +2106,218 @@ mod tests {
         }
     }
 
+    /// Test deposit with max_amount_a <= 0 returns Malformed.
+    #[test]
+    fn test_liquidity_pool_deposit_malformed_negative_max_amount() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: PoolId(Hash([1u8; 32])),
+            max_amount_a: -1,
+            max_amount_b: 100,
+            min_price: Price { n: 1, d: 1 },
+            max_price: Price { n: 1, d: 1 },
+        };
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(
+                LiquidityPoolDepositResult::Malformed
+            ))
+        ));
+    }
+
+    /// Test deposit with price numerator <= 0 returns Malformed.
+    #[test]
+    fn test_liquidity_pool_deposit_malformed_invalid_price() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: PoolId(Hash([1u8; 32])),
+            max_amount_a: 100,
+            max_amount_b: 100,
+            min_price: Price { n: 0, d: 1 },
+            max_price: Price { n: 1, d: 1 },
+        };
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(
+                LiquidityPoolDepositResult::Malformed
+            ))
+        ));
+    }
+
+    /// Test deposit with min_price > max_price returns Malformed.
+    #[test]
+    fn test_liquidity_pool_deposit_malformed_min_price_exceeds_max() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: PoolId(Hash([1u8; 32])),
+            max_amount_a: 100,
+            max_amount_b: 100,
+            min_price: Price { n: 3, d: 1 }, // min = 3.0
+            max_price: Price { n: 1, d: 1 }, // max = 1.0
+        };
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(
+                LiquidityPoolDepositResult::Malformed
+            ))
+        ));
+    }
+
+    /// Test deposit when pool reserve would overflow returns PoolFull.
+    #[test]
+    fn test_liquidity_pool_deposit_pool_full() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_a = create_test_account_id(1);
+        let issuer_b = create_test_account_id(2);
+        state.create_account(create_test_account(source_id.clone(), i64::MAX, 0));
+        state.create_account(create_test_account(issuer_a.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(issuer_b.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"EUR\0"),
+            issuer: issuer_a.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_b.clone(),
+        });
+
+        let pool_id = PoolId(Hash([1u8; 32]));
+        // Pool with reserves near i64::MAX
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            i64::MAX - 1,
+            i64::MAX - 1,
+            i64::MAX - 1,
+        ));
+
+        // Create trustlines with huge balances
+        let tl_a = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_a {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: i64::MAX / 2,
+            limit: i64::MAX,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let tl_b = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(match &asset_b {
+                Asset::CreditAlphanum4(a) => a.clone(),
+                _ => unreachable!(),
+            }),
+            balance: i64::MAX / 2,
+            limit: i64::MAX,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        let pool_share_tl = TrustLineEntry {
+            account_id: source_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 0,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(tl_a);
+        state.create_trustline(tl_b);
+        state.create_trustline(pool_share_tl);
+        state.get_account_mut(&source_id).unwrap().num_sub_entries += 3;
+
+        let op = LiquidityPoolDepositOp {
+            liquidity_pool_id: pool_id,
+            max_amount_a: 100,
+            max_amount_b: 100,
+            min_price: Price { n: 1, d: 2 },
+            max_price: Price { n: 2, d: 1 },
+        };
+        let result = execute_liquidity_pool_deposit(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolDeposit(r)) => {
+                assert!(
+                    matches!(r, LiquidityPoolDepositResult::PoolFull),
+                    "Expected PoolFull, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
+
+    /// Test withdraw with amount <= 0 returns Malformed.
+    #[test]
+    fn test_liquidity_pool_withdraw_malformed_zero_amount() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: PoolId(Hash([1u8; 32])),
+            amount: 0,
+            min_amount_a: 0,
+            min_amount_b: 0,
+        };
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(
+                LiquidityPoolWithdrawResult::Malformed
+            ))
+        ));
+    }
+
+    /// Test withdraw with negative min_amount returns Malformed.
+    #[test]
+    fn test_liquidity_pool_withdraw_malformed_negative_min_amount() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000, 0));
+
+        let op = LiquidityPoolWithdrawOp {
+            liquidity_pool_id: PoolId(Hash([1u8; 32])),
+            amount: 100,
+            min_amount_a: -1,
+            min_amount_b: 0,
+        };
+        let result = execute_liquidity_pool_withdraw(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::LiquidityPoolWithdraw(
+                LiquidityPoolWithdrawResult::Malformed
+            ))
+        ));
+    }
+
     /// Regression test for AUDIT-010: Deposit auth check bypassed when issuer lacks AUTH_REQUIRED.
     ///
     /// stellar-core checks trustline authorization unconditionally via tlA.isAuthorized().

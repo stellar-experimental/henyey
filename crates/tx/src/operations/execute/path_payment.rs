@@ -17,8 +17,8 @@ use super::offer_exchange::{ConversionParams, RoundingType};
 use super::offer_utils::{delete_offer_with_sponsorship, offer_liabilities_sell};
 use super::{
     account_liabilities, add_account_balance, add_trustline_balance, apply_liabilities_delta,
-    is_trustline_authorized, issuer_for_asset, sub_account_balance, sub_trustline_balance,
-    trustline_liabilities,
+    is_asset_valid, is_trustline_authorized, issuer_for_asset, sub_account_balance,
+    sub_trustline_balance, trustline_liabilities,
 };
 use crate::frame::muxed_to_account_id;
 use crate::frozen_keys::offer_accesses_frozen_key;
@@ -40,6 +40,17 @@ pub(crate) fn execute_path_payment_strict_receive(
 
     // Validate amounts
     if op.send_max <= 0 || op.dest_amount <= 0 {
+        return Ok(make_strict_receive_result(
+            PathPaymentStrictReceiveResultCode::Malformed,
+            None,
+        ));
+    }
+
+    // Validate asset codes (stellar-core: isAssetValid check in doCheckValid)
+    if !is_asset_valid(&op.send_asset)
+        || !is_asset_valid(&op.dest_asset)
+        || op.path.iter().any(|a| !is_asset_valid(a))
+    {
         return Ok(make_strict_receive_result(
             PathPaymentStrictReceiveResultCode::Malformed,
             None,
@@ -188,6 +199,17 @@ pub(crate) fn execute_path_payment_strict_send(
 
     // Validate amounts
     if op.send_amount <= 0 || op.dest_min <= 0 {
+        return Ok(make_strict_send_result(
+            PathPaymentStrictSendResultCode::Malformed,
+            None,
+        ));
+    }
+
+    // Validate asset codes (stellar-core: isAssetValid check in doCheckValid)
+    if !is_asset_valid(&op.send_asset)
+        || !is_asset_valid(&op.dest_asset)
+        || op.path.iter().any(|a| !is_asset_valid(a))
+    {
         return Ok(make_strict_send_result(
             PathPaymentStrictSendResultCode::Malformed,
             None,
@@ -2384,4 +2406,109 @@ mod tests {
     #[test]
     #[ignore = "NoIssuer is unreachable since protocol 13+ (CAP-0017)"]
     fn test_path_payment_strict_send_no_issuer() {}
+
+    /// Regression test for #1115: Invalid asset code in send_asset should be rejected
+    /// as Malformed (embedded NUL byte in asset code).
+    #[test]
+    fn test_path_payment_strict_receive_malformed_invalid_send_asset() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Invalid asset: embedded NUL between non-NUL chars
+        let bad_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', 0, b'D', b'C']),
+            issuer: dest_id.clone(),
+        });
+
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: bad_asset,
+            send_max: 100,
+            destination: create_test_muxed_account(1),
+            dest_asset: Asset::Native,
+            dest_amount: 50,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        assert!(matches!(
+            result,
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(
+                PathPaymentStrictReceiveResult::Malformed
+            ))
+        ));
+    }
+
+    /// Regression test for #1115: Invalid asset code in path element should be rejected.
+    #[test]
+    fn test_path_payment_strict_receive_malformed_invalid_path_asset() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let dest_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Valid send and dest assets, but invalid asset in path
+        let bad_path_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'A', 0, b'B', b'C']),
+            issuer: dest_id.clone(),
+        });
+
+        let op = PathPaymentStrictReceiveOp {
+            send_asset: Asset::Native,
+            send_max: 100,
+            destination: create_test_muxed_account(1),
+            dest_asset: Asset::Native,
+            dest_amount: 50,
+            path: vec![bad_path_asset].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_receive(&op, &source_id, &mut state, &context).unwrap();
+        assert!(matches!(
+            result,
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictReceive(
+                PathPaymentStrictReceiveResult::Malformed
+            ))
+        ));
+    }
+
+    /// Regression test for #1115: Invalid asset in strict send dest_asset.
+    #[test]
+    fn test_path_payment_strict_send_malformed_invalid_dest_asset() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        let issuer_id = create_test_account_id(1);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let bad_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'X', 0, b'Y', b'Z']),
+            issuer: issuer_id.clone(),
+        });
+
+        let op = PathPaymentStrictSendOp {
+            send_asset: Asset::Native,
+            send_amount: 100,
+            destination: create_test_muxed_account(1),
+            dest_asset: bad_asset,
+            dest_min: 50,
+            path: vec![].try_into().unwrap(),
+        };
+
+        let result =
+            execute_path_payment_strict_send(&op, &source_id, &mut state, &context).unwrap();
+        assert!(matches!(
+            result,
+            OperationResult::OpInner(OperationResultTr::PathPaymentStrictSend(
+                PathPaymentStrictSendResult::Malformed
+            ))
+        ));
+    }
 }

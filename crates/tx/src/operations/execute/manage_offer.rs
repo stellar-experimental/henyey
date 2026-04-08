@@ -21,7 +21,7 @@ use super::offer_utils::{
 };
 use super::{
     account_balance_after_liabilities, account_liabilities, apply_balance_delta,
-    apply_liabilities_delta, can_buy_at_most, dec_sub_entries, inc_sub_entries,
+    apply_liabilities_delta, can_buy_at_most, dec_sub_entries, inc_sub_entries, is_asset_valid,
     is_trustline_authorized, issuer_for_asset, map_exchange_error, require_source_account,
     trustline_liabilities, ACCOUNT_SUBENTRY_LIMIT,
 };
@@ -29,6 +29,10 @@ use crate::frozen_keys::offer_accesses_frozen_key;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
+
+/// Maximum number of offers that can be crossed in a single manage offer operation.
+/// Matches stellar-core's MAX_OFFERS_TO_CROSS (protocol 11+).
+const MAX_OFFERS_TO_CROSS: i64 = 1000;
 
 /// Execute a ManageSellOffer operation.
 ///
@@ -345,6 +349,7 @@ fn execute_manage_offer(
         offer_id,
         passive,
         &max_wheat_price,
+        MAX_OFFERS_TO_CROSS,
     )?;
 
     let sheep_stays = match convert_res {
@@ -356,6 +361,9 @@ fn execute_manage_offer(
                 ManageSellOfferResultCode::CrossSelf,
                 None,
             ));
+        }
+        ConvertResult::CrossedTooMany => {
+            return Ok(OperationResult::OpExceededWorkLimit);
         }
     };
 
@@ -590,6 +598,11 @@ fn validate_offer(
     amount: i64,
     price: &Price,
 ) -> std::result::Result<(), ManageSellOfferResultCode> {
+    // Validate asset codes (stellar-core: isAssetValid in doCheckValid)
+    if !is_asset_valid(selling) || !is_asset_valid(buying) {
+        return Err(ManageSellOfferResultCode::Malformed);
+    }
+
     // Cannot trade an asset for itself
     if selling == buying {
         return Err(ManageSellOfferResultCode::Malformed);
@@ -756,6 +769,7 @@ enum ConvertResult {
     Partial,
     FilterStopBadPrice,
     FilterStopCrossSelf,
+    CrossedTooMany,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -772,6 +786,7 @@ fn convert_with_offers(
     updating_offer_id: i64,
     passive: bool,
     max_wheat_price: &Price,
+    max_offers_to_cross: i64,
 ) -> Result<ConvertResult> {
     params.offer_trail.clear();
     *sheep_sent = 0;
@@ -780,6 +795,11 @@ fn convert_with_offers(
     let mut max_sheep_send = params.max_send;
     let mut max_wheat_receive = params.max_receive;
     let mut need_more = max_sheep_send > 0 && max_wheat_receive > 0;
+
+    // Fast-fail if no crosses allowed
+    if need_more && max_offers_to_cross == 0 {
+        return Ok(ConvertResult::CrossedTooMany);
+    }
 
     while need_more {
         let offer = params
@@ -836,6 +856,11 @@ fn convert_with_offers(
         *wheat_received += num_wheat_received;
         max_sheep_send -= num_sheep_send;
         max_wheat_receive -= num_wheat_received;
+
+        // Check maxOffersToCross limit (stellar-core: eCrossedTooMany)
+        if params.offer_trail.len() as i64 >= max_offers_to_cross {
+            return Ok(ConvertResult::CrossedTooMany);
+        }
 
         need_more = !wheat_stays && max_wheat_receive > 0 && max_sheep_send > 0;
         if !need_more {
@@ -3234,4 +3259,40 @@ mod tests {
     #[test]
     #[ignore = "BuyNoIssuer is unreachable since protocol 13+ (CAP-0017)"]
     fn test_manage_sell_offer_buy_no_issuer() {}
+
+    /// Regression test for #1115: Invalid asset code in selling asset should be
+    /// rejected as Malformed.
+    #[test]
+    fn test_manage_sell_offer_malformed_invalid_asset_code() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(0);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Invalid asset: embedded NUL between non-NUL chars
+        let bad_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', 0, b'D', b'C']),
+            issuer: source_id.clone(),
+        });
+
+        let op = ManageSellOfferOp {
+            selling: bad_asset,
+            buying: Asset::Native,
+            amount: 100,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        };
+        let result = execute_manage_sell_offer(&op, &source_id, &mut state, &context);
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ManageSellOffer(r)) => {
+                assert!(
+                    matches!(r, ManageSellOfferResult::Malformed),
+                    "Expected Malformed for invalid asset code, got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+    }
 }

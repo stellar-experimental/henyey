@@ -1099,6 +1099,177 @@ mod tests {
         }
     }
 
+    /// Test begin sponsoring fails when recursive sponsorship is detected.
+    ///
+    /// Case 1: Source account is already being sponsored by someone else.
+    /// C++ Reference: BeginSponsoringFutureReservesTests.cpp - "recursive"
+    #[test]
+    fn test_begin_sponsoring_recursive_source_is_sponsored() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_a = create_test_account_id(50);
+        let sponsor_b = create_test_account_id(51);
+        let sponsored_id = create_test_account_id(52);
+
+        state.create_account(create_test_account(sponsor_a.clone(), 100_000_000));
+        state.create_account(create_test_account(sponsor_b.clone(), 100_000_000));
+        state.create_account(create_test_account(sponsored_id.clone(), 50_000_000));
+
+        // A begins sponsoring B
+        let begin_ab = BeginSponsoringFutureReservesOp {
+            sponsored_id: sponsor_b.clone(),
+        };
+        let r =
+            execute_begin_sponsoring_future_reserves(&begin_ab, &sponsor_a, &mut state, &context);
+        assert!(matches!(
+            r.unwrap(),
+            OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(
+                BeginSponsoringFutureReservesResult::Success
+            ))
+        ));
+
+        // B (who is already being sponsored) tries to sponsor C → Recursive
+        let begin_bc = BeginSponsoringFutureReservesOp {
+            sponsored_id: sponsored_id.clone(),
+        };
+        let r2 =
+            execute_begin_sponsoring_future_reserves(&begin_bc, &sponsor_b, &mut state, &context);
+        assert!(matches!(
+            r2.unwrap(),
+            OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(
+                BeginSponsoringFutureReservesResult::Recursive
+            ))
+        ));
+    }
+
+    /// Test begin sponsoring fails when sponsored account is already sponsoring someone.
+    ///
+    /// Case 2: The target sponsored_id is already a sponsor in the current tx.
+    #[test]
+    fn test_begin_sponsoring_recursive_sponsored_is_sponsoring() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let a = create_test_account_id(53);
+        let b = create_test_account_id(54);
+        let c = create_test_account_id(55);
+
+        state.create_account(create_test_account(a.clone(), 100_000_000));
+        state.create_account(create_test_account(b.clone(), 100_000_000));
+        state.create_account(create_test_account(c.clone(), 100_000_000));
+
+        // B begins sponsoring C (B is now a sponsor / "sponsoring" someone)
+        let begin_bc = BeginSponsoringFutureReservesOp {
+            sponsored_id: c.clone(),
+        };
+        let r = execute_begin_sponsoring_future_reserves(&begin_bc, &b, &mut state, &context);
+        assert!(matches!(
+            r.unwrap(),
+            OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(
+                BeginSponsoringFutureReservesResult::Success
+            ))
+        ));
+
+        // A tries to sponsor B, but B is already sponsoring C → Recursive
+        // (is_sponsoring(&B) returns true)
+        let begin_ab = BeginSponsoringFutureReservesOp {
+            sponsored_id: b.clone(),
+        };
+        let r2 = execute_begin_sponsoring_future_reserves(&begin_ab, &a, &mut state, &context);
+        assert!(matches!(
+            r2.unwrap(),
+            OperationResult::OpInner(OperationResultTr::BeginSponsoringFutureReserves(
+                BeginSponsoringFutureReservesResult::Recursive
+            ))
+        ));
+    }
+
+    /// Test revoke sponsorship returns Malformed when revoking a ClaimableBalance
+    /// that has no sponsor set.
+    #[test]
+    fn test_revoke_sponsorship_malformed_claimable_balance_no_sponsor() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(60);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        // Create a claimable balance with NO sponsor
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([2u8; 32]));
+        let entry = create_claimable_balance_entry(&source_id, balance_id.clone());
+        state.create_claimable_balance(entry);
+        // Note: no apply_entry_sponsorship — the entry has no sponsor
+
+        let ledger_key = LedgerKey::ClaimableBalance(LedgerKeyClaimableBalance { balance_id });
+        let op = RevokeSponsorshipOp::LedgerEntry(ledger_key);
+        let result = execute_revoke_sponsorship(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(
+                RevokeSponsorshipResult::Malformed
+            ))
+        ));
+    }
+
+    /// Test revoke sponsorship for signer variant returns DoesNotExist when
+    /// the account doesn't exist.
+    #[test]
+    fn test_revoke_sponsorship_signer_account_does_not_exist() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(61);
+        let nonexistent_id = create_test_account_id(99);
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+
+        let signer_key = SignerKey::Ed25519(Uint256([9u8; 32]));
+        let op = RevokeSponsorshipOp::Signer(RevokeSponsorshipOpSigner {
+            account_id: nonexistent_id,
+            signer_key,
+        });
+        let result = execute_revoke_sponsorship(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(
+                RevokeSponsorshipResult::DoesNotExist
+            ))
+        ));
+    }
+
+    /// Test revoke sponsorship for signer variant returns DoesNotExist when
+    /// the signer is not found on the account.
+    #[test]
+    fn test_revoke_sponsorship_signer_not_found() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(62);
+        let owner_id = create_test_account_id(63);
+        let wrong_signer = SignerKey::Ed25519(Uint256([99u8; 32]));
+
+        state.create_account(create_test_account(source_id.clone(), 100_000_000));
+        // Create account with a different signer
+        let real_signer = SignerKey::Ed25519(Uint256([10u8; 32]));
+        state.create_account(create_account_with_signer(
+            owner_id.clone(),
+            real_signer,
+            None,
+        ));
+
+        let op = RevokeSponsorshipOp::Signer(RevokeSponsorshipOpSigner {
+            account_id: owner_id,
+            signer_key: wrong_signer,
+        });
+        let result = execute_revoke_sponsorship(&op, &source_id, &mut state, &context);
+        assert!(matches!(
+            result.unwrap(),
+            OperationResult::OpInner(OperationResultTr::RevokeSponsorship(
+                RevokeSponsorshipResult::DoesNotExist
+            ))
+        ));
+    }
+
     /// Test revoke sponsorship fails when sponsored account can't afford reserve (LowReserve).
     ///
     /// C++ Reference: RevokeSponsorshipTests.cpp - "low reserve"

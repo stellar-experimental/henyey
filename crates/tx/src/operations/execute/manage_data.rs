@@ -654,4 +654,13 @@ mod tests {
         let entry = state.get_data(&source_id, "existing_key").unwrap();
         assert_eq!(entry.data_value.as_slice(), &[4, 5, 6, 7, 8]);
     }
+
+    /// NotSupportedYet is unreachable — ManageData has been supported since protocol 10,
+    /// and this codebase only supports protocol 24+.
+    #[test]
+    #[ignore = "NotSupportedYet is unreachable: ManageData supported since protocol 10, codebase requires 24+"]
+    fn test_manage_data_not_supported_yet() {
+        // No code path in execute_manage_data returns NotSupportedYet.
+        // This test documents the dead result code.
+    }
 }

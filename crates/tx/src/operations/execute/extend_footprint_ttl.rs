@@ -34,11 +34,8 @@ pub(crate) fn execute_extend_footprint_ttl(
     soroban_data: Option<&SorobanTransactionData>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> Result<OperationResult> {
-    // Validate extend_to is positive
-    if op.extend_to == 0 {
-        return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
-    }
-
+    // stellar-core only rejects extend_to > MAX_ENTRY_TTL - 1;
+    // extend_to=0 is valid and results in a no-op (target TTL <= any live entry's TTL).
     if op.extend_to > MAX_ENTRY_TTL.saturating_sub(1) {
         return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
     }
@@ -163,23 +160,50 @@ mod tests {
         LedgerContext::testnet(1, 1000)
     }
 
+    /// Regression test for #1118: extend_to=0 must be accepted as a no-op,
+    /// not rejected as Malformed. stellar-core does not check extend_to==0.
     #[test]
-    fn test_extend_footprint_ttl_malformed() {
+    fn test_extend_footprint_ttl_extend_to_zero_is_noop() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
-        let op = ExtendFootprintTtlOp {
-            ext: ExtensionPoint::V0,
-            extend_to: 0, // Invalid - must be positive
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
         };
 
-        let result = execute_extend_footprint_ttl(&op, &source, &mut state, &context, None, None);
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 0,
+        };
+
+        let result = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+        );
         assert!(result.is_ok());
 
         match result.unwrap() {
             OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
-                assert!(matches!(r, ExtendFootprintTtlResult::Malformed));
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::Success),
+                    "extend_to=0 should succeed as a no-op, got {:?}",
+                    r
+                );
             }
             _ => panic!("Unexpected result type"),
         }

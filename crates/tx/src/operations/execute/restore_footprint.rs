@@ -4,9 +4,9 @@
 //! which restores archived Soroban contract data entries.
 
 use stellar_xdr::curr::{
-    AccountId, LedgerEntry, LedgerEntryData, LedgerKey, OperationResult, OperationResultTr,
+    AccountId, LedgerEntry, LedgerEntryData, LedgerKey, Limits, OperationResult, OperationResultTr,
     RestoreFootprintOp, RestoreFootprintResult, RestoreFootprintResultCode, SorobanTransactionData,
-    TtlEntry,
+    TtlEntry, WriteXdr,
 };
 
 use crate::state::LedgerStateManager;
@@ -82,6 +82,13 @@ pub(crate) fn execute_restore_footprint(
         .saturating_add(resources.min_persistent_entry_ttl)
         .saturating_sub(1);
 
+    // Resource limit tracking (stellar-core: RestoreFootprintApplyHelper::apply)
+    let soroban_data = resources.soroban_data.unwrap(); // safe: checked above
+    let disk_read_bytes_limit = soroban_data.resources.disk_read_bytes;
+    let write_bytes_limit = soroban_data.resources.write_bytes;
+    let mut accumulated_read_bytes: u32 = 0;
+    let mut accumulated_write_bytes: u32 = 0;
+
     // First, restore hot archive entries to state.
     // These entries don't exist in the live bucket list, so we need to add them.
     // SECURITY: hot_archive_restores populated by ledger execution layer from local hot archive, not external tx input
@@ -91,6 +98,27 @@ pub(crate) fn execute_restore_footprint(
             new_ttl,
             "RestoreFootprint: restoring entry from hot archive to state"
         );
+
+        // Track resource limits for hot archive entries
+        let entry_size = restore
+            .entry
+            .to_xdr(Limits::none())
+            .ok()
+            .map(|bytes| bytes.len() as u32)
+            .unwrap_or(0);
+        accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
+        if accumulated_read_bytes > disk_read_bytes_limit {
+            return Ok(make_result(
+                RestoreFootprintResultCode::ResourceLimitExceeded,
+            ));
+        }
+        accumulated_write_bytes = accumulated_write_bytes.saturating_add(entry_size);
+        if accumulated_write_bytes > write_bytes_limit {
+            return Ok(make_result(
+                RestoreFootprintResultCode::ResourceLimitExceeded,
+            ));
+        }
+
         // Add the entry to state based on type
         match &restore.entry.data {
             LedgerEntryData::ContractCode(code) => {
@@ -126,7 +154,17 @@ pub(crate) fn execute_restore_footprint(
             continue;
         }
 
-        if restore_entry(key, new_ttl, state, current_ledger, resources.ttl_key_cache).is_err() {
+        if let Err(()) = restore_entry(
+            key,
+            new_ttl,
+            state,
+            current_ledger,
+            resources.ttl_key_cache,
+            &mut accumulated_read_bytes,
+            &mut accumulated_write_bytes,
+            disk_read_bytes_limit,
+            write_bytes_limit,
+        ) {
             return Ok(make_result(
                 RestoreFootprintResultCode::ResourceLimitExceeded,
             ));
@@ -148,13 +186,20 @@ fn is_persistent_entry(key: &LedgerKey) -> bool {
 }
 
 /// Restore a single ledger entry.
+///
+/// Returns `Err(())` if the resource limits would be exceeded.
+#[allow(clippy::too_many_arguments)]
 fn restore_entry(
     key: &LedgerKey,
     new_ttl: u32,
     state: &mut LedgerStateManager,
     current_ledger: u32,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-) -> std::result::Result<(), &'static str> {
+    accumulated_read_bytes: &mut u32,
+    accumulated_write_bytes: &mut u32,
+    disk_read_bytes_limit: u32,
+    write_bytes_limit: u32,
+) -> std::result::Result<(), ()> {
     // Only contract data and contract code can be restored
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {}
@@ -175,9 +220,24 @@ fn restore_entry(
         Some(_) | None => {
             // Entry is archived or has no TTL entry
             // We need to check if the entry itself exists in state
-            if state.get_entry(key).is_none() {
+            let entry = state.get_entry(key);
+            if entry.is_none() {
                 // Neither live nor archived entry exists; skip per stellar-core behavior.
                 return Ok(());
+            }
+
+            // Track resource limits (stellar-core: checkResourceLimits)
+            let entry_size = entry
+                .and_then(|e| e.to_xdr(Limits::none()).ok())
+                .map(|bytes| bytes.len() as u32)
+                .unwrap_or(0);
+            *accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
+            if *accumulated_read_bytes > disk_read_bytes_limit {
+                return Err(());
+            }
+            *accumulated_write_bytes = accumulated_write_bytes.saturating_add(entry_size);
+            if *accumulated_write_bytes > write_bytes_limit {
+                return Err(());
             }
 
             // Create or update the TTL entry to restore the entry
@@ -637,6 +697,84 @@ mod tests {
                 assert!(
                     matches!(r, RestoreFootprintResult::Malformed),
                     "TrustLine key should be rejected, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Regression test for #1116: RestoreFootprint must check disk_read_bytes
+    /// and write_bytes resource limits. With a limit of 0 and an actual entry
+    /// that needs restoring, ResourceLimitExceeded should be returned.
+    #[test]
+    fn test_restore_footprint_resource_limit_exceeded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        // Create a contract data entry with an expired TTL
+        let contract_id = ScAddress::Contract(ContractId(Hash([30u8; 32])));
+        let data_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: ScVal::U32(42),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id,
+            key: ScVal::U32(42),
+            durability: ContractDataDurability::Persistent,
+            val: ScVal::I32(7),
+        };
+        state.create_contract_data(cd_entry);
+
+        // Create expired TTL entry
+        let key_hash = crate::soroban::compute_key_hash(&data_key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence - 1, // expired
+        });
+
+        // Set resource limits to 0 — any actual restore should fail
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![data_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+            },
+        );
+        assert!(result.is_ok());
+
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
+                assert!(
+                    matches!(r, RestoreFootprintResult::ResourceLimitExceeded),
+                    "Expected ResourceLimitExceeded with 0 disk_read_bytes, got {:?}",
                     r
                 );
             }

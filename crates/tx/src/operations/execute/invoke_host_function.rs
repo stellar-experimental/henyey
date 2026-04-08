@@ -1236,7 +1236,7 @@ fn is_archived_contract_entry(
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
         return Ok(match state.get_ttl(&key_hash) {
             Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
-            None => true, // No TTL → treat as archived
+            None => false, // No TTL → not archived (matches stellar-core fallthrough)
         });
     }
 
@@ -1501,6 +1501,86 @@ mod tests {
         match result.result {
             OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
                 assert!(matches!(r, InvokeHostFunctionResult::EntryArchived));
+            }
+            _ => panic!("Unexpected result type"),
+        }
+    }
+
+    /// Regression test for #1120: A Soroban entry in live state without a TTL entry
+    /// should NOT be treated as archived. stellar-core falls through to normal processing
+    /// when the TTL key is missing.
+    #[test]
+    fn test_invoke_host_function_missing_ttl_not_archived() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let config = create_test_soroban_config();
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([50u8; 32])));
+        let contract_key = ScVal::U32(99);
+        let durability = ContractDataDurability::Persistent;
+
+        // Create the contract data entry BUT no TTL entry
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+            val: ScVal::I32(42),
+        };
+        state.create_contract_data(cd_entry);
+        // Intentionally NOT creating a TTL entry
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+
+        let host_function = HostFunction::InvokeContract(InvokeContractArgs {
+            contract_address: contract_id,
+            function_name: ScSymbol(StringM::try_from("noop".to_string()).unwrap()),
+            args: VecM::default(),
+        });
+
+        let op = InvokeHostFunctionOp {
+            host_function,
+            auth: VecM::default(),
+        };
+
+        let footprint = LedgerFootprint {
+            read_only: vec![key].try_into().unwrap(),
+            read_write: VecM::default(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint,
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        let soroban = SorobanContext {
+            soroban_data: Some(&soroban_data),
+            config: Some(&config),
+            module_cache: None,
+            hot_archive: None,
+            ttl_key_cache: None,
+        };
+        let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
+            .expect("invoke host function");
+
+        // Must NOT be EntryArchived — missing TTL means not archived
+        match &result.result {
+            OperationResult::OpInner(OperationResultTr::InvokeHostFunction(r)) => {
+                assert!(
+                    !matches!(r, InvokeHostFunctionResult::EntryArchived),
+                    "Missing TTL should not result in EntryArchived, got {:?}",
+                    r
+                );
             }
             _ => panic!("Unexpected result type"),
         }

@@ -2230,4 +2230,50 @@ mod tests {
             other => panic!("unexpected result: {:?}", other),
         }
     }
+
+    /// Test claim fails with CannotClaim when the predicate evaluates to false.
+    ///
+    /// The claimant is in the list but the BeforeAbsoluteTime predicate has expired
+    /// (time is in the past relative to the ledger close time).
+    #[test]
+    fn test_claim_claimable_balance_cannot_claim_predicate_expired() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        // close_time = 1000
+        let context = create_test_context();
+
+        let claimant_id = create_test_account_id(1);
+        state.create_account(create_test_account(claimant_id.clone(), 100_000_000));
+
+        // Predicate: BeforeAbsoluteTime(500)
+        // check_predicate returns (close_time < time) = (1000 < 500) = false
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([20u8; 32]));
+        let claimants = vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+            destination: claimant_id.clone(),
+            predicate: ClaimPredicate::BeforeAbsoluteTime(500),
+        })];
+        let entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: claimants.try_into().unwrap(),
+            asset: Asset::Native,
+            amount: 10_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(entry);
+
+        let op = ClaimClaimableBalanceOp {
+            balance_id: balance_id.clone(),
+        };
+        let result =
+            execute_claim_claimable_balance(&op, &claimant_id, &mut state, &context).unwrap();
+        match result {
+            OperationResult::OpInner(OperationResultTr::ClaimClaimableBalance(r)) => {
+                assert!(
+                    matches!(r, ClaimClaimableBalanceResult::CannotClaim),
+                    "Expected CannotClaim (expired predicate), got {:?}",
+                    r
+                );
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
 }
