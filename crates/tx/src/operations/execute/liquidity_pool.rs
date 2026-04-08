@@ -215,9 +215,8 @@ pub(crate) fn execute_liquidity_pool_deposit(
 
     // Credit pool shares to source
     if let Some(tl) = state.get_trustline_by_trustline_asset_mut(source, &pool_share_asset) {
-        add_trustline_balance(tl, shares_received).map_err(|_| {
-            TxError::Internal("pool share credit overflow".into())
-        })?;
+        add_trustline_balance(tl, shares_received)
+            .map_err(|_| TxError::Internal("pool share credit overflow".into()))?;
     }
 
     // Update pool reserves

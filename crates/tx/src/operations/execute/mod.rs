@@ -254,7 +254,9 @@ pub(super) fn sub_account_balance(account: &mut AccountEntry, amount: i64) -> Re
         .checked_sub(amount)
         .ok_or_else(|| TxError::Internal("account balance underflow".into()))?;
     if new_balance.is_negative() {
-        return Err(TxError::Internal("account balance would go negative".into()));
+        return Err(TxError::Internal(
+            "account balance would go negative".into(),
+        ));
     }
     account.balance = new_balance.value();
     Ok(())
@@ -269,7 +271,9 @@ pub(super) fn sub_trustline_balance(tl: &mut TrustLineEntry, amount: i64) -> Res
         .checked_sub(amount)
         .ok_or_else(|| TxError::Internal("trustline balance underflow".into()))?;
     if new_balance.is_negative() {
-        return Err(TxError::Internal("trustline balance would go negative".into()));
+        return Err(TxError::Internal(
+            "trustline balance would go negative".into(),
+        ));
     }
     tl.balance = new_balance.value();
     Ok(())
