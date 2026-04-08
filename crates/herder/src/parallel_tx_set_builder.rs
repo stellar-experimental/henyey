@@ -455,12 +455,7 @@ fn detect_conflicts(txs: &[TransactionEnvelope], network_id: NetworkId) -> Vec<B
 
 /// Inclusion fee for a transaction (fee - minimum resource fee).
 fn tx_inclusion_fee(tx: &TransactionEnvelope) -> i64 {
-    // For parallel builder fee tracking, we use the declared fee.
-    // The actual inclusion fee = declared fee - resource fee, but for
-    // stage count selection we just need relative ordering, so we use
-    // the total fee as a proxy (matching stellar-core behaviour where the
-    // SurgePricingPriorityQueue handles the real fee computation).
-    crate::tx_set_utils::envelope_fee(tx)
+    crate::tx_set_utils::envelope_inclusion_fee(tx)
 }
 
 /// Build parallel Soroban phase for a fixed stage count.
@@ -826,6 +821,25 @@ mod tests {
         })
     }
 
+    fn make_soroban_tx_with_fees(
+        seed: u8,
+        seq: i64,
+        read_only_keys: Vec<LedgerKey>,
+        read_write_keys: Vec<LedgerKey>,
+        instructions: u32,
+        fee: u32,
+        resource_fee: i64,
+    ) -> TransactionEnvelope {
+        let mut tx = make_soroban_tx(seed, seq, read_only_keys, read_write_keys, instructions);
+        if let TransactionEnvelope::Tx(env) = &mut tx {
+            env.tx.fee = fee;
+            if let TransactionExt::V1(data) = &mut env.tx.ext {
+                data.resource_fee = resource_fee;
+            }
+        }
+        tx
+    }
+
     /// Create a contract data ledger key with a unique identifier.
     fn contract_key(id: u8) -> LedgerKey {
         LedgerKey::ContractData(LedgerKeyContractData {
@@ -1001,6 +1015,27 @@ mod tests {
 
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 2);
+    }
+
+    #[test]
+    fn test_audit_018_parallel_builder_uses_inclusion_fee_ordering() {
+        let tx_low_inclusion =
+            make_soroban_tx_with_fees(1, 1, vec![], vec![contract_key(1)], 60_000, 1_000, 900);
+        let tx_high_inclusion =
+            make_soroban_tx_with_fees(2, 1, vec![], vec![contract_key(2)], 60_000, 800, 0);
+
+        let (stages, total_inclusion_fee) = build_with_stage_count(
+            &[tx_low_inclusion.clone(), tx_high_inclusion.clone()],
+            test_network_id(),
+            100_000,
+            1,
+            1,
+        );
+
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].len(), 1);
+        assert_eq!(stages[0][0], vec![tx_high_inclusion]);
+        assert_eq!(total_inclusion_fee, 800);
     }
 
     #[test]

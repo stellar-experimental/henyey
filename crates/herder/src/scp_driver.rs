@@ -2666,7 +2666,7 @@ mod tests {
         let driver = make_test_driver();
 
         let value = Value(vec![1, 2, 3].try_into().unwrap());
-        let result = driver.combine_candidates_impl(1, &[value.clone()]);
+        let result = driver.combine_candidates_impl(1, std::slice::from_ref(&value));
         assert_eq!(result, value);
     }
 

@@ -265,12 +265,14 @@ pub struct QueuedTransaction {
     pub hash: Hash256,
     /// When this transaction was received.
     pub received_at: Instant,
-    /// Fee per operation for ordering.
+    /// Declared fee per operation used for queue-admission minimum fee checks.
     pub fee_per_op: u64,
     /// Number of operations in the transaction.
     pub op_count: u32,
-    /// Total fee.
+    /// Declared full fee.
     pub total_fee: u64,
+    /// Inclusion fee used for surge pricing and replacement decisions.
+    pub inclusion_fee: u64,
 }
 
 impl QueuedTransaction {
@@ -279,9 +281,9 @@ impl QueuedTransaction {
         let hash = Hash256::hash_xdr(&envelope)
             .map_err(|e| HerderError::Internal(format!("Failed to hash transaction: {}", e)))?;
 
-        let (fee, op_count) = Self::extract_fee_and_ops(&envelope)?;
+        let (total_fee, inclusion_fee, op_count) = Self::extract_fees_and_ops(&envelope)?;
         let fee_per_op = if op_count > 0 {
-            fee / op_count as u64
+            total_fee / op_count as u64
         } else {
             0
         };
@@ -292,15 +294,29 @@ impl QueuedTransaction {
             received_at: Instant::now(),
             fee_per_op,
             op_count,
-            total_fee: fee,
+            total_fee,
+            inclusion_fee,
         })
     }
 
-    /// Extract fee and operation count from the envelope.
-    fn extract_fee_and_ops(envelope: &TransactionEnvelope) -> Result<(u64, u32)> {
-        let fee = crate::tx_set_utils::envelope_fee(envelope) as u64;
+    /// Extract full fee, inclusion fee, and operation count from the envelope.
+    fn extract_fees_and_ops(envelope: &TransactionEnvelope) -> Result<(u64, u64, u32)> {
+        let fee = crate::tx_set_utils::envelope_fee(envelope);
+        if fee < 0 {
+            return Err(HerderError::Internal(format!(
+                "Negative declared fee for transaction: {}",
+                fee
+            )));
+        }
+        let inclusion_fee = crate::tx_set_utils::envelope_inclusion_fee(envelope);
+        if inclusion_fee < 0 {
+            return Err(HerderError::Internal(format!(
+                "Negative inclusion fee for transaction: {}",
+                inclusion_fee
+            )));
+        }
         let ops = crate::tx_set_utils::envelope_num_ops(envelope) as u32;
-        Ok((fee, ops))
+        Ok((fee as u64, inclusion_fee as u64, ops))
     }
 
     fn sequence_number(&self) -> i64 {
@@ -361,15 +377,15 @@ const FEE_MULTIPLIER: u64 = 10;
 const DEFAULT_PENDING_DEPTH: u32 = 4;
 
 pub(super) fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64, u64, u32)> {
-    QueuedTransaction::extract_fee_and_ops(envelope)
+    QueuedTransaction::extract_fees_and_ops(envelope)
         .ok()
-        .map(|(fee, op_count)| {
+        .map(|(_, inclusion_fee, op_count)| {
             let per_op = if op_count > 0 {
-                fee / op_count as u64
+                inclusion_fee / op_count as u64
             } else {
                 0
             };
-            (per_op, fee, op_count)
+            (per_op, inclusion_fee, op_count)
         })
 }
 
@@ -381,9 +397,9 @@ pub(crate) fn fee_rate_cmp(a_fee: u64, a_ops: u32, b_fee: u64, b_ops: u32) -> Or
 
 fn better_fee_ratio(new_tx: &QueuedTransaction, old_tx: &QueuedTransaction) -> bool {
     match fee_rate_cmp(
-        new_tx.total_fee,
+        new_tx.inclusion_fee,
         new_tx.op_count,
-        old_tx.total_fee,
+        old_tx.inclusion_fee,
         old_tx.op_count,
     ) {
         Ordering::Greater => true,
@@ -407,7 +423,7 @@ fn min_inclusion_fee_to_beat(evicted: (u64, u32), tx: &QueuedTransaction) -> u64
     if evicted.1 == 0 {
         return 0;
     }
-    if fee_rate_cmp(evicted.0, evicted.1, tx.total_fee, tx.op_count) != Ordering::Less {
+    if fee_rate_cmp(evicted.0, evicted.1, tx.inclusion_fee, tx.op_count) != Ordering::Less {
         compute_better_fee(evicted.0, evicted.1, tx.op_count)
     } else {
         0
@@ -952,9 +968,9 @@ impl TransactionQueue {
                 }
 
                 if let Err(_min_fee) = can_replace_by_fee(
-                    queued.total_fee,
+                    queued.inclusion_fee,
                     queued.op_count,
-                    current_tx.total_fee,
+                    current_tx.inclusion_fee,
                     current_tx.op_count,
                 ) {
                     return Err(TxQueueResult::FeeTooLow);
@@ -1017,9 +1033,9 @@ impl TransactionQueue {
                 lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
             }
             if evicted_due_to_lane_limit {
-                lane_fees[lane] = (evicted.total_fee, evicted.op_count);
+                lane_fees[lane] = (evicted.inclusion_fee, evicted.op_count);
             } else {
-                lane_fees[GENERIC_LANE] = (evicted.total_fee, evicted.op_count);
+                lane_fees[GENERIC_LANE] = (evicted.inclusion_fee, evicted.op_count);
             }
             drop(lane_fees);
             pending_eviction_list.push(evicted);
@@ -1177,7 +1193,7 @@ impl TransactionQueue {
                     continue;
                 }
                 let mut global_fee = self.global_evicted_inclusion_fee.write();
-                *global_fee = (evicted.total_fee, evicted.op_count);
+                *global_fee = (evicted.inclusion_fee, evicted.op_count);
                 pending_eviction_list.push(evicted);
             }
         }
@@ -1300,8 +1316,13 @@ impl TransactionQueue {
                     .min_by(|a, b| {
                         let a_tx = a.1;
                         let b_tx = b.1;
-                        fee_rate_cmp(a_tx.total_fee, a_tx.op_count, b_tx.total_fee, b_tx.op_count)
-                            .then_with(|| b_tx.hash.0.cmp(&a_tx.hash.0))
+                        fee_rate_cmp(
+                            a_tx.inclusion_fee,
+                            a_tx.op_count,
+                            b_tx.inclusion_fee,
+                            b_tx.op_count,
+                        )
+                        .then_with(|| b_tx.hash.0.cmp(&a_tx.hash.0))
                     })
                     .map(|(h, tx)| (*h, tx.clone()))
                 {
@@ -2146,6 +2167,20 @@ mod tests {
                 resources,
                 resource_fee: 0,
             });
+        }
+        envelope
+    }
+
+    fn make_soroban_envelope_with_resource_fee(
+        fee: u32,
+        resource_fee: i64,
+        instructions: u32,
+    ) -> TransactionEnvelope {
+        let mut envelope = make_soroban_envelope_with_resources(fee, instructions);
+        if let TransactionEnvelope::Tx(env) = &mut envelope {
+            if let TransactionExt::V1(data) = &mut env.tx.ext {
+                data.resource_fee = resource_fee;
+            }
         }
         envelope
     }
@@ -3649,6 +3684,48 @@ mod tests {
             _ => None,
         };
         assert_eq!(base_fee, Some(8000));
+    }
+
+    #[test]
+    fn test_audit_018_soroban_selection_uses_inclusion_fee() {
+        let mut limit = Resource::new(vec![i64::MAX; NUM_SOROBAN_TX_RESOURCES]);
+        limit.set_val(ResourceType::Instructions, 100);
+        let config = TxQueueConfig {
+            max_soroban_resources: Some(limit),
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut low_inclusion = make_soroban_envelope_with_resource_fee(1000, 900, 50);
+        let mut highest_inclusion = make_soroban_envelope_with_resource_fee(900, 0, 50);
+        let mut next_highest_inclusion = make_soroban_envelope_with_resource_fee(800, 0, 50);
+        set_source(&mut low_inclusion, 51);
+        set_source(&mut highest_inclusion, 52);
+        set_source(&mut next_highest_inclusion, 53);
+
+        queue.try_add(low_inclusion.clone());
+        queue.try_add(highest_inclusion.clone());
+        queue.try_add(next_highest_inclusion.clone());
+
+        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
+        let parallel = match &v1.phases[1] {
+            stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel,
+            _ => panic!("expected Soroban V1 phase"),
+        };
+
+        let selected: Vec<_> = parallel
+            .execution_stages
+            .iter()
+            .flat_map(|stage| stage.iter())
+            .flat_map(|cluster| cluster.iter().cloned())
+            .collect();
+
+        assert_eq!(selected.len(), 2);
+        assert!(selected.contains(&highest_inclusion));
+        assert!(selected.contains(&next_highest_inclusion));
+        assert!(!selected.contains(&low_inclusion));
+        assert_eq!(parallel.base_fee, Some(800));
     }
 
     #[test]

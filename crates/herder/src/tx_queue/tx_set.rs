@@ -621,7 +621,7 @@ fn tx_operation_count(envelope: &TransactionEnvelope) -> i64 {
 }
 
 fn tx_inclusion_fee(envelope: &TransactionEnvelope) -> i64 {
-    crate::tx_set_utils::envelope_fee(envelope)
+    crate::tx_set_utils::envelope_inclusion_fee(envelope)
 }
 
 fn summary_generalized_tx_set(gen: &GeneralizedTransactionSet) -> String {

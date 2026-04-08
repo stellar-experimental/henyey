@@ -254,7 +254,9 @@ impl TransactionQueue {
             txs.sort_by(|a, b| {
                 a.sequence_number()
                     .cmp(&b.sequence_number())
-                    .then_with(|| fee_rate_cmp(b.total_fee, b.op_count, a.total_fee, a.op_count))
+                    .then_with(|| {
+                        fee_rate_cmp(b.inclusion_fee, b.op_count, a.inclusion_fee, a.op_count)
+                    })
                     .then_with(|| a.hash.0.cmp(&b.hash.0))
             });
 

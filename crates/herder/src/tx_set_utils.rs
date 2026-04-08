@@ -28,6 +28,27 @@ pub(crate) fn envelope_fee(env: &TransactionEnvelope) -> i64 {
     }
 }
 
+/// Get the fee bid used for transaction ordering and surge pricing.
+///
+/// For Soroban transactions this is the inclusion fee (full fee minus resource fee),
+/// matching stellar-core `TransactionFrameBase::getInclusionFee()`.
+pub(crate) fn envelope_inclusion_fee(env: &TransactionEnvelope) -> i64 {
+    let resource_fee = match env {
+        TransactionEnvelope::TxV0(_) => 0,
+        TransactionEnvelope::Tx(env) => match &env.tx.ext {
+            stellar_xdr::curr::TransactionExt::V0 => 0,
+            stellar_xdr::curr::TransactionExt::V1(data) => data.resource_fee,
+        },
+        TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => match &inner.tx.ext {
+                stellar_xdr::curr::TransactionExt::V0 => 0,
+                stellar_xdr::curr::TransactionExt::V1(data) => data.resource_fee,
+            },
+        },
+    };
+    envelope_fee(env).saturating_sub(resource_fee)
+}
+
 /// Compute the inclusion fee for a transaction given an optional component base fee.
 ///
 /// If a `base_fee` is present, the inclusion fee is `min(full_fee, num_ops * base_fee)`
@@ -956,7 +977,8 @@ mod tests {
 
         // With no offset, should be valid
         let bounds_exact = CloseTimeBounds::exact();
-        let invalid = get_invalid_tx_list(&[envelope.clone()], &ctx, &bounds_exact, None);
+        let invalid =
+            get_invalid_tx_list(std::slice::from_ref(&envelope), &ctx, &bounds_exact, None);
         assert!(
             invalid.is_empty(),
             "tx should be valid with exact close time"
@@ -964,7 +986,8 @@ mod tests {
 
         // With upper offset of 10 (close_time + 10 = 1010 > max_time 1005), should be invalid
         let bounds_offset = CloseTimeBounds::with_offsets(0, 10);
-        let invalid = get_invalid_tx_list(&[envelope.clone()], &ctx, &bounds_offset, None);
+        let invalid =
+            get_invalid_tx_list(std::slice::from_ref(&envelope), &ctx, &bounds_offset, None);
         assert_eq!(
             invalid.len(),
             1,

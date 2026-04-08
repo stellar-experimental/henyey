@@ -623,7 +623,7 @@ mod tests {
         manager
             .persist_scp_state(
                 100,
-                &[envelope.clone()],
+                std::slice::from_ref(&envelope),
                 &[(tx_hash.clone(), tx_set.clone())],
                 &[(qs_hash.clone(), quorum_set.clone())],
             )
