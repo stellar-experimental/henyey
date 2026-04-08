@@ -518,16 +518,20 @@ impl App {
                     self.log_stats().await;
                 }
 
-                // Batched tx advert flush
+                // Batched tx advert flush (parity: ignoreIfOutOfSync)
                 _ = tx_advert_interval.tick() => {
-                    self.set_phase(21); // 21 = tx_advert_flush
-                    self.flush_tx_adverts().await;
+                    if self.herder.is_tracking() {
+                        self.set_phase(21); // 21 = tx_advert_flush
+                        self.flush_tx_adverts().await;
+                    }
                 }
 
-                // Demand missing transactions from peers
+                // Demand missing transactions from peers (parity: ignoreIfOutOfSync)
                 _ = tx_demand_interval.tick() => {
-                    self.set_phase(22); // 22 = tx_demand
-                    self.run_tx_demands().await;
+                    if self.herder.is_tracking() {
+                        self.set_phase(22); // 22 = tx_demand
+                        self.run_tx_demands().await;
+                    }
                 }
 
                 // Survey scheduler
@@ -1067,11 +1071,21 @@ impl App {
             }
 
             StellarMessage::FloodAdvert(advert) => {
-                self.handle_flood_advert(&msg.from_peer, advert).await;
+                // Parity: ignoreIfOutOfSync (Peer.cpp:1164-1172)
+                if !self.herder.is_tracking() {
+                    tracing::trace!("Ignoring FloodAdvert: not tracking");
+                } else {
+                    self.handle_flood_advert(&msg.from_peer, advert).await;
+                }
             }
 
             StellarMessage::FloodDemand(demand) => {
-                self.handle_flood_demand(&msg.from_peer, demand).await;
+                // Parity: ignoreIfOutOfSync (Peer.cpp:1164-1172)
+                if !self.herder.is_tracking() {
+                    tracing::trace!("Ignoring FloodDemand: not tracking");
+                } else {
+                    self.handle_flood_demand(&msg.from_peer, demand).await;
+                }
             }
 
             StellarMessage::DontHave(dont_have) => {
