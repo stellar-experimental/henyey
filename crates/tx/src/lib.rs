@@ -127,9 +127,6 @@ pub(crate) const MAX_OPS_PER_TX: usize = 100;
 /// Parity: stellar-core `MIN_INCLUSION_FEE` / 1 operation.
 pub(crate) const NETWORK_MIN_BASE_FEE: i64 = 100;
 
-/// Length of an Ed25519 signature in bytes.
-pub(crate) const ED25519_SIGNATURE_LENGTH: usize = 64;
-
 mod apply;
 mod error;
 mod events;

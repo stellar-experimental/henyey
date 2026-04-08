@@ -66,8 +66,6 @@ pub enum FeeBumpError {
     TooManyOperations(usize),
     /// Inner transaction is not V1.
     InvalidInnerTxType,
-    /// Invalid inner signature.
-    InvalidInnerSignature,
     /// Failed to compute hash.
     HashError(String),
 }
@@ -88,7 +86,6 @@ impl std::fmt::Display for FeeBumpError {
                 write!(f, "inner transaction has too many operations: {}", count)
             }
             Self::InvalidInnerTxType => write!(f, "inner transaction must be V1"),
-            Self::InvalidInnerSignature => write!(f, "invalid inner transaction signature"),
             Self::HashError(msg) => write!(f, "hash computation error: {}", msg),
         }
     }
@@ -398,16 +395,11 @@ pub fn validate_fee_bump(
         .inner_transaction_hash()
         .map_err(|e| FeeBumpError::HashError(e.to_string()))?;
 
-    // Validate inner signatures are well-formed
-    for sig in frame.inner_signatures() {
-        // Signatures must be 64 bytes for Ed25519
-        if sig.signature.0.len() != crate::ED25519_SIGNATURE_LENGTH {
-            return Err(FeeBumpError::InvalidInnerSignature);
-        }
-    }
-
-    // Note: Full inner signature verification (checking against account signers)
-    // requires account data and is done during transaction application
+    // Note: Do NOT validate inner signature lengths here. Signatures can be
+    // variable-length (Hash-X preimages are 1-64 bytes, pre-auth TX sigs are
+    // 0 bytes). stellar-core's commonValidPreSeqNum has no inner signature
+    // length check — format validation is handled in signature_checker.rs
+    // during application. See #1122 / AUDIT-047.
 
     let _ = inner_hash; // Used for caching
     Ok(())
@@ -803,7 +795,7 @@ mod tests {
     use henyey_common::NetworkId;
     use stellar_xdr::curr::{
         Asset, FeeBumpTransactionExt, Memo, Operation, OperationBody, PaymentOp, Preconditions,
-        SequenceNumber, Transaction, TransactionExt, Uint256, VecM,
+        SequenceNumber, Signature, SignatureHint, Transaction, TransactionExt, Uint256, VecM,
     };
 
     fn create_inner_v1_envelope(fee: u32, op_count: usize) -> TransactionV1Envelope {
@@ -1203,6 +1195,81 @@ mod tests {
         assert!(
             !verify_inner_signatures(&inner_hash, signatures, public_keys),
             "empty signature list must not pass verification (vacuous truth bypass)"
+        );
+    }
+
+    /// #1122 / AUDIT-047: Fee bump must accept inner signatures of any length.
+    ///
+    /// stellar-core's commonValidPreSeqNum has no inner signature length check.
+    /// Hash-X signatures can be any length (the preimage), pre-auth TX sigs are
+    /// 0 bytes, and Ed25519 sigs are exactly 64 bytes. All must be accepted
+    /// during fee bump validation; format checking happens in signature_checker.
+    #[test]
+    fn test_validate_fee_bump_accepts_variable_length_inner_signatures() {
+        let network_id = NetworkId::testnet();
+        let context = LedgerContext::testnet(1, 1000);
+
+        // Helper: create fee bump envelope with given inner signatures
+        let make_envelope = |sig_lengths: &[usize]| {
+            let inner = create_inner_v1_envelope(100, 1);
+            let sigs: Vec<DecoratedSignature> = sig_lengths
+                .iter()
+                .map(|&len| DecoratedSignature {
+                    hint: SignatureHint([0u8; 4]),
+                    signature: Signature(vec![0xAB; len].try_into().unwrap()),
+                })
+                .collect();
+            let mut inner_env = inner;
+            inner_env.signatures = sigs.try_into().unwrap();
+
+            let fee_source = MuxedAccount::Ed25519(Uint256([3u8; 32]));
+            let fee_bump = FeeBumpTransaction {
+                fee_source,
+                fee: 200,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+                ext: FeeBumpTransactionExt::V0,
+            };
+            TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+                tx: fee_bump,
+                signatures: VecM::default(),
+            })
+        };
+
+        // Ed25519 signature (64 bytes) — should pass
+        let envelope = make_envelope(&[64]);
+        let mut frame = FeeBumpFrame::from_envelope(envelope, &network_id).unwrap();
+        assert!(validate_fee_bump(&mut frame, &context).is_ok());
+
+        // Hash-X preimage (32 bytes) — should pass
+        let envelope = make_envelope(&[32]);
+        let mut frame = FeeBumpFrame::from_envelope(envelope, &network_id).unwrap();
+        assert!(
+            validate_fee_bump(&mut frame, &context).is_ok(),
+            "32-byte Hash-X preimage inner sig must be accepted"
+        );
+
+        // Pre-auth TX signature (0 bytes) — should pass
+        let envelope = make_envelope(&[0]);
+        let mut frame = FeeBumpFrame::from_envelope(envelope, &network_id).unwrap();
+        assert!(
+            validate_fee_bump(&mut frame, &context).is_ok(),
+            "0-byte pre-auth TX inner sig must be accepted"
+        );
+
+        // Short Hash-X preimage (1 byte) — should pass
+        let envelope = make_envelope(&[1]);
+        let mut frame = FeeBumpFrame::from_envelope(envelope, &network_id).unwrap();
+        assert!(
+            validate_fee_bump(&mut frame, &context).is_ok(),
+            "1-byte Hash-X preimage inner sig must be accepted"
+        );
+
+        // Mixed lengths (Ed25519 + Hash-X) — should pass
+        let envelope = make_envelope(&[64, 32]);
+        let mut frame = FeeBumpFrame::from_envelope(envelope, &network_id).unwrap();
+        assert!(
+            validate_fee_bump(&mut frame, &context).is_ok(),
+            "mixed-length inner sigs must be accepted"
         );
     }
 }

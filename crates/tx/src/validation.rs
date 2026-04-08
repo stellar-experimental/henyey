@@ -580,7 +580,6 @@ fn validate_fee_bump_rules(
         FeeBumpError::InvalidInnerTxType => {
             ValidationError::FeeBumpInvalidInner("inner transaction must be V1".to_string())
         }
-        FeeBumpError::InvalidInnerSignature => ValidationError::InvalidSignature,
         FeeBumpError::NotFeeBump => {
             ValidationError::FeeBumpInvalidInner("not a fee bump transaction".to_string())
         }
