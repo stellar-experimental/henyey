@@ -602,16 +602,22 @@ pub fn build_parallel_soroban_phase(
     let max_fee = results.iter().map(|(_, fee)| *fee).max().unwrap_or(0);
     let fee_threshold = (max_fee as f64 * MAX_INCLUSION_FEE_TOLERANCE) as i64;
 
-    // Pick the result with the fewest stages that meets the fee threshold.
-    // Results are ordered by stage count (ascending), so first match wins.
+    // Pick the result with the fewest actual (non-empty) stages that meets
+    // the fee threshold. stellar-core (ParallelTxSetBuilder.cpp:779-800) iterates
+    // all results and tracks bestResultIndex by minimum mStages.size().
+    // Note: configured stage count doesn't always equal actual stage count — a
+    // higher configured count may drop transactions, producing fewer non-empty stages.
+    let mut best: Option<Vec<Vec<Vec<TransactionEnvelope>>>> = None;
     for (stages, fee) in results {
         if fee >= fee_threshold {
-            return stages;
+            let actual_stage_count = stages.len();
+            if best.is_none() || actual_stage_count < best.as_ref().unwrap().len() {
+                best = Some(stages);
+            }
         }
     }
 
-    // Fallback: return the last result (highest stage count = most capacity).
-    Vec::new()
+    best.unwrap_or_default()
 }
 
 /// Convert parallel phase stages into a TransactionPhase::V1 XDR structure.
