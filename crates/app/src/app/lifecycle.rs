@@ -1169,8 +1169,30 @@ impl App {
             }
 
             StellarMessage::GetScpQuorumset(hash) => {
-                tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested quorum set");
-                self.send_quorum_set(&msg.from_peer, hash).await;
+                // Rate-limit GET_SCP_QUORUMSET requests per peer.
+                // Matches stellar-core's Peer::process(mQSetQueryInfo).
+                let close_time_secs = self.herder.ledger_close_time() as u64;
+                let max_slots: u64 = 12;
+                let window = Duration::from_secs(close_time_secs * max_slots);
+                let max_rate = (window.as_secs() as u32) * QUERY_RESPONSE_MULTIPLIER;
+                let allowed = {
+                    let mut map = self.qset_query_info.write().await;
+                    let info = map
+                        .entry(msg.from_peer.clone())
+                        .or_insert_with(QueryInfo::new);
+                    if info.allow(window, max_rate) {
+                        info.num_queries += 1;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if allowed {
+                    tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested quorum set");
+                    self.send_quorum_set(&msg.from_peer, hash).await;
+                } else {
+                    tracing::debug!(peer = %msg.from_peer, "Dropping GET_SCP_QUORUMSET request (rate limited)");
+                }
             }
 
             StellarMessage::ScpQuorumset(quorum_set) => {
@@ -1236,8 +1258,30 @@ impl App {
             }
 
             StellarMessage::GetTxSet(hash) => {
-                tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested TxSet");
-                self.send_tx_set(&msg.from_peer, &hash.0).await;
+                // Rate-limit GET_TX_SET requests per peer.
+                // Matches stellar-core's Peer::process(mTxSetQueryInfo).
+                let close_time_secs = self.herder.ledger_close_time() as u64;
+                let max_slots: u64 = 12;
+                let window = Duration::from_secs(close_time_secs * max_slots);
+                let max_rate = (window.as_secs() as u32) * QUERY_RESPONSE_MULTIPLIER;
+                let allowed = {
+                    let mut map = self.tx_set_query_info.write().await;
+                    let info = map
+                        .entry(msg.from_peer.clone())
+                        .or_insert_with(QueryInfo::new);
+                    if info.allow(window, max_rate) {
+                        info.num_queries += 1;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if allowed {
+                    tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested TxSet");
+                    self.send_tx_set(&msg.from_peer, &hash.0).await;
+                } else {
+                    tracing::debug!(peer = %msg.from_peer, "Dropping GET_TX_SET request (rate limited)");
+                }
             }
 
             _ => {

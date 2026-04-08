@@ -412,6 +412,14 @@ pub struct App {
     /// Matches stellar-core's `Peer::mSCPStateQueryInfo`.
     scp_state_query_info: RwLock<HashMap<henyey_overlay::PeerId, QueryInfo>>,
 
+    /// Per-peer `GET_TX_SET` rate limiter.
+    /// Matches stellar-core's `Peer::mTxSetQueryInfo`.
+    tx_set_query_info: RwLock<HashMap<henyey_overlay::PeerId, QueryInfo>>,
+
+    /// Per-peer `GET_SCP_QUORUMSET` rate limiter.
+    /// Matches stellar-core's `Peer::mQSetQueryInfo`.
+    qset_query_info: RwLock<HashMap<henyey_overlay::PeerId, QueryInfo>>,
+
     /// Weak reference to self for spawning background tasks from &self methods.
     /// Set via `set_self_arc` after wrapping in Arc.
     self_arc: RwLock<std::sync::Weak<Self>>,
@@ -658,6 +666,8 @@ impl App {
             ping_inflight: RwLock::new(HashMap::new()),
             peer_ping_inflight: RwLock::new(HashMap::new()),
             scp_state_query_info: RwLock::new(HashMap::new()),
+            tx_set_query_info: RwLock::new(HashMap::new()),
+            qset_query_info: RwLock::new(HashMap::new()),
             self_arc: RwLock::new(std::sync::Weak::new()),
             last_event_loop_tick_ms: Arc::new(AtomicU64::new(0)),
             event_loop_phase: Arc::new(AtomicU64::new(0)),

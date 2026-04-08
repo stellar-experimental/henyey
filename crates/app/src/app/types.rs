@@ -820,6 +820,11 @@ pub(super) fn current_epoch_seconds() -> i64 {
 /// Matches stellar-core's `GET_SCP_STATE_MAX_RATE` (Peer.cpp).
 pub(super) const GET_SCP_STATE_MAX_RATE: u32 = 10;
 
+/// Multiplier applied to the query window duration to compute the default
+/// max queries per window for `GET_TX_SET` and `GET_SCP_QUORUMSET`.
+/// Matches stellar-core's `QUERY_RESPONSE_MULTIPLIER` (Peer.cpp:136).
+pub(super) const QUERY_RESPONSE_MULTIPLIER: u32 = 5;
+
 /// Per-peer, per-message-type query rate limiter.
 ///
 /// Tracks the number of queries received from a peer within a rolling window.
