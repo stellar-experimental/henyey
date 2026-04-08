@@ -215,9 +215,11 @@ impl FetchingEnvelopes {
 
         // Start fetching missing dependencies
         if need_tx_set {
-            if let Some(tx_set_hash) = Self::extract_tx_set_hash(&envelope) {
-                let hash = Hash(tx_set_hash.0);
-                self.tx_set_fetcher.fetch(hash, &envelope);
+            for tx_set_hash in Self::extract_tx_set_hashes(&envelope) {
+                if !self.tx_set_cache.contains_key(&tx_set_hash) {
+                    let hash = Hash(tx_set_hash.0);
+                    self.tx_set_fetcher.fetch(hash, &envelope);
+                }
             }
         }
 
@@ -593,10 +595,9 @@ impl FetchingEnvelopes {
             // Collect envelopes that reference this tx set
             if let Some(slot_state) = self.slots.get(&slot) {
                 for (env_hash, (envelope, _)) in slot_state.fetching.iter() {
-                    if let Some(hash) = Self::extract_tx_set_hash(envelope) {
-                        if &hash == tx_set_hash {
-                            fetching_to_check.push((*env_hash, envelope.clone()));
-                        }
+                    let hashes = Self::extract_tx_set_hashes(envelope);
+                    if hashes.iter().any(|h| h == tx_set_hash) {
+                        fetching_to_check.push((*env_hash, envelope.clone()));
                     }
                 }
             }
@@ -668,11 +669,10 @@ impl FetchingEnvelopes {
     /// Parity: checks both tx set and quorum set dependencies.
     /// An envelope is ready only when all referenced data is cached.
     fn check_dependencies(&self, envelope: &ScpEnvelope) -> (bool, bool) {
-        let need_tx_set = if let Some(hash) = Self::extract_tx_set_hash(envelope) {
-            !self.tx_set_cache.contains_key(&hash)
-        } else {
-            false
-        };
+        let tx_set_hashes = Self::extract_tx_set_hashes(envelope);
+        let need_tx_set = tx_set_hashes
+            .iter()
+            .any(|hash| !self.tx_set_cache.contains_key(hash));
 
         let need_quorum_set = if let Some(hash) = Self::extract_quorum_set_hash(envelope) {
             !self.quorum_set_cache.contains_key(&hash)
@@ -757,24 +757,19 @@ impl FetchingEnvelopes {
         true
     }
 
-    /// Extract TxSet hash from an envelope (if applicable).
-    fn extract_tx_set_hash(envelope: &ScpEnvelope) -> Option<Hash256> {
-        use stellar_xdr::curr::{ScpStatementPledges, StellarValue};
+    /// Extract all TxSet hashes from an envelope.
+    ///
+    /// Parity: stellar-core's `getValidatedTxSetHashes` extracts tx_set hashes
+    /// from ALL statement types including NOMINATE (votes + accepted). Previously
+    /// NOMINATE returned None, bypassing tx_set fetch gating (#1117).
+    fn extract_tx_set_hashes(envelope: &ScpEnvelope) -> Vec<Hash256> {
+        use stellar_xdr::curr::StellarValue;
 
-        let value = match &envelope.statement.pledges {
-            ScpStatementPledges::Externalize(ext) => Some(&ext.commit.value),
-            ScpStatementPledges::Confirm(confirm) => Some(&confirm.ballot.value),
-            ScpStatementPledges::Prepare(prepare) => Some(&prepare.ballot.value),
-            ScpStatementPledges::Nominate(_) => None,
-        };
-
-        if let Some(value) = value {
-            if let Ok(sv) = StellarValue::from_xdr(&value.0, Limits::none()) {
-                return Some(Hash256::from_bytes(sv.tx_set_hash.0));
-            }
-        }
-
-        None
+        henyey_scp::Slot::get_statement_values(&envelope.statement)
+            .into_iter()
+            .filter_map(|v| StellarValue::from_xdr(&v.0, Limits::none()).ok())
+            .map(|sv| Hash256::from_bytes(sv.tx_set_hash.0))
+            .collect()
     }
 
     /// Extract QuorumSet hash from an envelope.
@@ -802,7 +797,7 @@ mod tests {
     use super::*;
     use stellar_xdr::curr::{
         NodeId as XdrNodeId, PublicKey, ScpNomination, ScpStatement, ScpStatementPledges,
-        Signature, Uint256, WriteXdr,
+        Signature, Uint256, Value, WriteXdr,
     };
 
     fn make_test_envelope(slot: SlotIndex, node_seed: u8) -> ScpEnvelope {
@@ -1121,6 +1116,9 @@ mod tests {
         let fetching = FetchingEnvelopes::with_defaults();
         cache_test_quorum_set(&fetching);
 
+        // Pre-cache the tx_set referenced by the signed value (hash [0u8; 32])
+        fetching.cache_tx_set(Hash256::from_bytes([0u8; 32]), 100, vec![]);
+
         // Envelope with a nomination containing a Signed StellarValue
         let envelope =
             make_envelope_with_nomination_values(100, vec![make_signed_stellar_value_bytes()]);
@@ -1337,6 +1335,95 @@ mod tests {
         assert!(
             !FetchingEnvelopes::check_stellar_value_signed(&envelope),
             "Prepare with unsigned 'prepared' ballot should be rejected"
+        );
+    }
+
+    /// Helper to create a signed StellarValue for test envelopes.
+    fn make_test_stellar_value(tx_set_hash: [u8; 32]) -> Value {
+        use stellar_xdr::curr::{
+            LedgerCloseValueSignature, StellarValue, StellarValueExt, TimePoint, WriteXdr,
+        };
+
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let sv = StellarValue {
+            tx_set_hash: Hash(tx_set_hash),
+            close_time: TimePoint(100),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id,
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }),
+        };
+        Value(sv.to_xdr(Limits::none()).unwrap().try_into().unwrap())
+    }
+
+    /// Regression test for #1117: NOMINATE envelopes must wait for their
+    /// referenced tx_sets before being marked Ready.
+    ///
+    /// Before this fix, extract_tx_set_hash returned None for NOMINATE,
+    /// so NOMINATE envelopes bypassed tx_set fetch gating entirely.
+    #[test]
+    fn test_nominate_waits_for_tx_sets() {
+        let fetching = FetchingEnvelopes::with_defaults();
+        cache_test_quorum_set(&fetching);
+
+        // Create a NOMINATE envelope with two tx_set hashes in votes + accepted
+        let value_a = make_test_stellar_value([0xAA; 32]);
+        let value_b = make_test_stellar_value([0xBB; 32]);
+
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: 100,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: Hash([1u8; 32]),
+                    votes: vec![value_a].try_into().unwrap(),
+                    accepted: vec![value_b].try_into().unwrap(),
+                }),
+            },
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        // Without the tx_sets cached, NOMINATE should require fetching
+        let result = fetching.recv_envelope(envelope);
+        assert_eq!(
+            result,
+            RecvResult::Fetching,
+            "NOMINATE with uncached tx_sets should return Fetching, not Ready"
+        );
+    }
+
+    /// Regression test for #1117: NOMINATE is Ready when all tx_sets are cached.
+    #[test]
+    fn test_nominate_ready_when_tx_sets_cached() {
+        let fetching = FetchingEnvelopes::with_defaults();
+        cache_test_quorum_set(&fetching);
+
+        let value_a = make_test_stellar_value([0xAA; 32]);
+
+        // Pre-cache the tx_set
+        fetching.cache_tx_set(Hash256::from_bytes([0xAA; 32]), 100, vec![1, 2, 3]);
+
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: 100,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: Hash([1u8; 32]),
+                    votes: vec![value_a].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        let result = fetching.recv_envelope(envelope);
+        assert_eq!(
+            result,
+            RecvResult::Ready,
+            "NOMINATE with all tx_sets cached should be Ready"
         );
     }
 }
