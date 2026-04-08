@@ -52,6 +52,14 @@ pub(crate) fn execute_account_merge(
         return Ok(make_result(AccountMergeResultCode::SeqnumTooFar));
     }
 
+    // Check 1: in-flight sponsorship (active BeginSponsoringFutureReserves context)
+    // stellar-core: loadSponsorshipCounter(ltx, getSourceID()) at MergeOpFrame.cpp:232
+    if state.is_sponsoring(source) {
+        return Ok(make_result(AccountMergeResultCode::IsSponsor));
+    }
+
+    // Check 2: persistent sponsoring count
+    // stellar-core: getNumSponsoring(sourceAccountEntry) at MergeOpFrame.cpp:238
     if num_sponsoring(&source_account) > 0 {
         return Ok(make_result(AccountMergeResultCode::IsSponsor));
     }
@@ -866,5 +874,48 @@ mod tests {
                 other
             ),
         }
+    }
+
+    /// Regression test for AUDIT-032 (#1107): AccountMerge must check in-flight
+    /// sponsorship (active BeginSponsoringFutureReserves context), not just
+    /// the persistent num_sponsoring counter.
+    #[test]
+    fn test_audit_032_account_merge_rejects_inflight_sponsor() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let sponsor_id = create_test_account_id(0); // A — will be the sponsor
+        let sponsored_id = create_test_account_id(1); // B — being sponsored
+        let dest_id = create_test_account_id(2); // C — merge destination
+
+        // All accounts have num_sponsoring == 0
+        state.create_account(create_test_account(sponsor_id.clone(), 100_000_000));
+        state.create_account(create_test_account(sponsored_id.clone(), 100_000_000));
+        state.create_account(create_test_account(dest_id.clone(), 100_000_000));
+
+        // Simulate active BeginSponsoringFutureReserves: A sponsors B
+        state.push_sponsorship(sponsor_id.clone(), sponsored_id.clone());
+
+        // Attempt to merge A (the sponsor) into C — should be rejected
+        let result = execute_account_merge(
+            &create_test_muxed_account(2),
+            &sponsor_id,
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        match result {
+            OperationResult::OpInner(OperationResultTr::AccountMerge(
+                AccountMergeResult::IsSponsor,
+            )) => {} // correct — stellar-core returns ACCOUNT_MERGE_IS_SPONSOR
+            other => panic!(
+                "BUG: Expected IsSponsor for in-flight sponsor, got {:?}",
+                other
+            ),
+        }
+
+        // Sponsor account should still exist (merge was rejected)
+        assert!(state.get_account(&sponsor_id).is_some());
     }
 }
