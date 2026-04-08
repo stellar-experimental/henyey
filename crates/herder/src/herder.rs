@@ -636,22 +636,23 @@ impl Herder {
             return None;
         }
 
-        let v_blocking_slots = self.get_v_blocking_slots();
-        if v_blocking_slots.is_empty() {
-            return None;
-        }
-
-        // Find the slot to purge below: 100 slots behind the highest v-blocking slot
+        // Parity: stellar-core's outOfSyncRecovery iterates SCP's unbounded
+        // mKnownSlots map (via processSlotsDescendingFrom) and counts slots
+        // with v-blocking support. We must use scp.process_slots_descending_from
+        // + scp.got_v_blocking to mirror this — NOT the capped SlotQuorumTracker,
+        // which is limited to 12 slots and can never reach the 100-slot threshold.
         let mut max_slots_ahead = LEDGER_VALIDITY_BRACKET;
         let mut purge_slot = None;
 
-        for slot in v_blocking_slots {
-            max_slots_ahead = max_slots_ahead.saturating_sub(1);
-            if max_slots_ahead == 0 {
-                purge_slot = Some(slot);
-                break;
+        self.scp.process_slots_descending_from(u64::MAX, |seq| {
+            if self.scp.got_v_blocking(seq) {
+                max_slots_ahead = max_slots_ahead.saturating_sub(1);
+                if max_slots_ahead == 0 {
+                    purge_slot = Some(seq);
+                }
             }
-        }
+            max_slots_ahead != 0
+        });
 
         if let Some(purge_slot) = purge_slot {
             info!(purge_slot, "Out-of-sync recovery: purging slots below");
