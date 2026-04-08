@@ -577,8 +577,12 @@ fn test_deleted_offer_not_reloaded_from_snapshot() {
     let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
 
     // Offer owner account with selling liabilities for the XLM they're selling
+    // num_sub_entries = 2: one trustline + one offer
     let (offer_owner_key, mut offer_owner_entry) =
         create_account_entry(offer_owner_id.clone(), 1, 500_000_000);
+    if let LedgerEntryData::Account(ref mut acc) = offer_owner_entry.data {
+        acc.num_sub_entries = 2;
+    }
     // Set selling liabilities equal to offer amount (50 XLM)
     set_account_liabilities(&mut offer_owner_entry, 50_000_000, 0);
 
@@ -1640,11 +1644,19 @@ fn test_advance_to_ledger() {
     let (issuer_key, issuer_entry) = create_account_entry(issuer_id.clone(), 1, 100_000_000);
 
     // Offer owner A: sells 50 XLM for USD
+    // num_sub_entries = 2: one trustline + one offer
     let (owner_a_key, mut owner_a_entry) = create_account_entry(owner_a_id.clone(), 1, 500_000_000);
+    if let LedgerEntryData::Account(ref mut acc) = owner_a_entry.data {
+        acc.num_sub_entries = 2;
+    }
     set_account_liabilities(&mut owner_a_entry, 50_000_000, 0);
 
     // Offer owner B: sells 30 XLM for USD
+    // num_sub_entries = 2: one trustline + one offer
     let (owner_b_key, mut owner_b_entry) = create_account_entry(owner_b_id.clone(), 1, 500_000_000);
+    if let LedgerEntryData::Account(ref mut acc) = owner_b_entry.data {
+        acc.num_sub_entries = 2;
+    }
     set_account_liabilities(&mut owner_b_entry, 30_000_000, 0);
 
     // Source needs USD trustline
