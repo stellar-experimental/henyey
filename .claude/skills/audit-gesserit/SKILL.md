@@ -104,12 +104,15 @@ Otherwise, targets = all crates from the priority tiers above.
 If `--resume` is NOT set, create the `ai-summary/` directory tree:
 
 ```bash
+TARGETS=(tx scp overlay herder ledger bucket crypto rpc app history historywork db common work simulation clock henyey)
 for stage in hypothesis reviewed poc fail success published; do
-  for crate in $TARGETS; do
-    mkdir -p ai-summary/$stage/$crate
+  for crate in "${TARGETS[@]}"; do
+    mkdir -p "ai-summary/$stage/$crate"
   done
 done
 ```
+
+When `--crate` is specified, set `TARGETS=(<crate>)` instead of the full list.
 
 If `--resume` IS set, verify that `ai-summary/` already exists. Read its
 current state.
