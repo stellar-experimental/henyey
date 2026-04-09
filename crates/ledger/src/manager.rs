@@ -30,13 +30,14 @@ use crate::{
     close::{
         LedgerCloseData, LedgerCloseResult, LedgerCloseStats, TransactionSetVariant, UpgradeContext,
     },
-    delta::{EntryChange, LedgerDelta},
+    delta::EntryChange,
     execution::{
         execute_soroban_parallel_phase, load_soroban_network_info, pre_deduct_all_fees_on_delta,
         run_transactions_on_executor, SorobanContext, SorobanNetworkInfo,
         TransactionExecutionResult, TransactionExecutor, TxSetResult,
     },
     header::{compute_header_hash, create_next_header, NextHeaderFields},
+    ltx::LedgerTxn,
     snapshot::{LedgerSnapshot, SnapshotHandle},
     LedgerError, Result,
 };
@@ -84,6 +85,41 @@ fn get_rss_bytes() -> u64 {
     {
         0
     }
+}
+
+/// Extract `LedgerEntryChanges` from a delta, starting from `skip` changes.
+///
+/// Used during upgrade meta capture: record the number of changes before an upgrade
+/// sub-phase, run the sub-phase, then extract only the new changes.
+fn extract_entry_changes(
+    delta: &crate::delta::LedgerDelta,
+    skip: usize,
+) -> stellar_xdr::curr::LedgerEntryChanges {
+    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges, VecM};
+
+    let delta_after = delta.num_changes();
+    if delta_after <= skip {
+        return LedgerEntryChanges(VecM::default());
+    }
+
+    let mut changes: Vec<LedgerEntryChange> = Vec::new();
+    for change in delta.changes().skip(skip) {
+        match change {
+            crate::delta::EntryChange::Created(entry) => {
+                changes.push(LedgerEntryChange::Created(entry.clone()));
+            }
+            crate::delta::EntryChange::Updated { previous, current } => {
+                changes.push(LedgerEntryChange::State(previous.clone()));
+                changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
+            }
+            crate::delta::EntryChange::Deleted { previous } => {
+                let key = henyey_common::entry_to_key(previous);
+                changes.push(LedgerEntryChange::State(previous.clone()));
+                changes.push(LedgerEntryChange::Removed(key));
+            }
+        }
+    }
+    LedgerEntryChanges(changes.try_into().unwrap_or_default())
 }
 
 /// Secondary index type: account → set of pool_ids for pool share trustlines.
@@ -1888,13 +1924,20 @@ impl LedgerManager {
             upgrade_ctx.add_upgrade(upgrade.clone());
         }
 
+        // Create the root LedgerTxn for this close cycle.
+        let ltx = LedgerTxn::begin(
+            snapshot,
+            state.header.clone(),
+            state.header_hash,
+            expected_seq,
+        );
+
         Ok(LedgerCloseContext {
             manager: self,
             close_data,
             prev_header: state.header.clone(),
             prev_header_hash: state.header_hash,
-            delta: LedgerDelta::new(expected_seq),
-            snapshot,
+            ltx,
             stats: LedgerCloseStats::new(),
             upgrade_ctx,
             id_pool: state.header.id_pool,
@@ -2452,8 +2495,15 @@ impl LedgerManager {
         let snapshot = self.create_snapshot().ok()?;
         let closing_ledger_seq = snapshot.ledger_seq() + 1;
         let protocol_version = snapshot.header().ledger_version;
+        // Create a read-only LedgerTxn so make_from_key can use the unified read path.
+        let ltx = LedgerTxn::begin(
+            snapshot.clone(),
+            snapshot.header().clone(),
+            *snapshot.snapshot().header_hash(),
+            closing_ledger_seq,
+        );
         crate::config_upgrade::ConfigUpgradeSetFrame::make_from_key(
-            &snapshot,
+            &ltx,
             key,
             closing_ledger_seq,
             protocol_version,
@@ -2470,8 +2520,7 @@ struct LedgerCloseContext<'a> {
     close_data: LedgerCloseData,
     prev_header: LedgerHeader,
     prev_header_hash: Hash256,
-    delta: LedgerDelta,
-    snapshot: SnapshotHandle,
+    ltx: LedgerTxn,
     stats: LedgerCloseStats,
     upgrade_ctx: UpgradeContext,
     id_pool: u64,
@@ -2503,28 +2552,21 @@ struct LedgerCloseContext<'a> {
 }
 
 impl LedgerCloseContext<'_> {
-    /// Load an entry from the snapshot.
+    /// Load an entry through the LedgerTxn read path (current → committed → snapshot).
     fn load_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
-        // First check if we have a pending change
-        if let Some(change) = self.delta.get_change(key) {
-            return Ok(change.current_entry().cloned());
-        }
-
-        // Otherwise read from snapshot
-        self.snapshot.get_entry(key)
+        self.ltx.get_entry(key)
     }
 
-    /// Load StateArchivalSettings from the delta (for upgraded values) falling back to snapshot.
+    /// Load StateArchivalSettings through the LedgerTxn read path.
     ///
     /// Parity: In stellar-core, the eviction scan runs after config upgrades are applied to the
-    /// LedgerTxn, so it sees the upgraded StateArchival settings. We must do the same
-    /// by checking the delta first (which contains the upgrade), then falling back to
-    /// the snapshot.
+    /// LedgerTxn, so it sees the upgraded StateArchival settings. LedgerTxn's read path
+    /// (current → committed → snapshot) provides this automatically.
     fn load_state_archival_settings(&self) -> Option<StateArchivalSettings> {
         let key = LedgerKey::ConfigSetting(LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::StateArchival,
         });
-        let entry = self.load_entry(&key).ok()??;
+        let entry = self.ltx.get_entry(&key).ok()??;
         if let LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(settings)) =
             entry.data
         {
@@ -2559,13 +2601,13 @@ impl LedgerCloseContext<'_> {
         // 1. CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES
         // Parity: NetworkConfig.cpp:44-58 initialMaxContractSizeEntry
         // MinimumSorobanNetworkConfig::MAX_CONTRACT_SIZE = 2000
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::ContractMaxSizeBytes(2_000)))?;
 
         // 2. CONFIG_SETTING_CONTRACT_DATA_KEY_SIZE_BYTES
         // Parity: NetworkConfig.cpp:60-74 initialMaxContractDataKeySizeEntry
         // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_KEY_SIZE_BYTES = 200
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::ContractDataKeySizeBytes(
                 200,
             )))?;
@@ -2573,14 +2615,14 @@ impl LedgerCloseContext<'_> {
         // 3. CONFIG_SETTING_CONTRACT_DATA_ENTRY_SIZE_BYTES
         // Parity: NetworkConfig.cpp:76-90 initialMaxContractDataEntrySizeEntry
         // MinimumSorobanNetworkConfig::MAX_CONTRACT_DATA_ENTRY_SIZE_BYTES = 2000
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::ContractDataEntrySizeBytes(
                 2_000,
             )))?;
 
         // 4. CONFIG_SETTING_CONTRACT_COMPUTE_V0
         // Parity: NetworkConfig.cpp:92-116 initialContractComputeSettingsEntry
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::ContractComputeV0(
                 ConfigSettingContractComputeV0 {
                     // TX_MAX_INSTRUCTIONS = MinimumSorobanNetworkConfig::TX_MAX_INSTRUCTIONS = 2_500_000
@@ -2593,7 +2635,7 @@ impl LedgerCloseContext<'_> {
 
         // 5. CONFIG_SETTING_CONTRACT_LEDGER_COST_V0
         // Parity: NetworkConfig.cpp:118-175 initialContractLedgerAccessSettingsEntry
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::ContractLedgerCostV0(
                 ConfigSettingContractLedgerCostV0 {
                     ledger_max_disk_read_entries: 3, // LEDGER_MAX_READ_LEDGER_ENTRIES = TX_MAX
@@ -2616,7 +2658,7 @@ impl LedgerCloseContext<'_> {
 
         // 6. CONFIG_SETTING_CONTRACT_HISTORICAL_DATA_V0
         // Parity: NetworkConfig.cpp:177-186 initialContractHistoricalDataSettingsEntry
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::ContractHistoricalDataV0(
                 ConfigSettingContractHistoricalDataV0 {
                     fee_historical1_kb: 100,
@@ -2625,7 +2667,7 @@ impl LedgerCloseContext<'_> {
 
         // 7. CONFIG_SETTING_CONTRACT_EVENTS_V0
         // Parity: NetworkConfig.cpp:188-205 initialContractEventsSettingsEntry
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::ContractEventsV0(
                 ConfigSettingContractEventsV0 {
                     tx_max_contract_events_size_bytes: 200, // MinimumSorobanNetworkConfig
@@ -2635,7 +2677,7 @@ impl LedgerCloseContext<'_> {
 
         // 8. CONFIG_SETTING_CONTRACT_BANDWIDTH_V0
         // Parity: NetworkConfig.cpp:207-227 initialContractBandwidthSettingsEntry
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::ContractBandwidthV0(
                 ConfigSettingContractBandwidthV0 {
                     ledger_max_txs_size_bytes: 10_000, // TX_MAX_SIZE_BYTES = LEDGER_MAX
@@ -2646,7 +2688,7 @@ impl LedgerCloseContext<'_> {
 
         // 9. CONFIG_SETTING_CONTRACT_EXECUTION_LANES
         // Parity: NetworkConfig.cpp:229-243 initialContractExecutionLanesSettingsEntry
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::ContractExecutionLanes(
                 ConfigSettingContractExecutionLanesV0 {
                     ledger_max_tx_count: 1,
@@ -2656,7 +2698,7 @@ impl LedgerCloseContext<'_> {
         // 10. CONFIG_SETTING_CONTRACT_COST_PARAMS_CPU_INSTRUCTIONS
         // Parity: NetworkConfig.cpp:246-338 initialCpuCostParamsEntryForV20
         let cpu_params = Self::initial_cpu_cost_params_for_v20();
-        self.delta.record_create(make_entry(
+        self.ltx.record_create(make_entry(
             ConfigSettingEntry::ContractCostParamsCpuInstructions(ContractCostParams(
                 cpu_params.try_into().map_err(|_| {
                     LedgerError::Internal("Failed to create V20 CPU cost params".to_string())
@@ -2667,7 +2709,7 @@ impl LedgerCloseContext<'_> {
         // 11. CONFIG_SETTING_CONTRACT_COST_PARAMS_MEMORY_BYTES
         // Parity: NetworkConfig.cpp:688-776 initialMemCostParamsEntryForV20
         let mem_params = Self::initial_mem_cost_params_for_v20();
-        self.delta.record_create(make_entry(
+        self.ltx.record_create(make_entry(
             ConfigSettingEntry::ContractCostParamsMemoryBytes(ContractCostParams(
                 mem_params.try_into().map_err(|_| {
                     LedgerError::Internal("Failed to create V20 memory cost params".to_string())
@@ -2677,7 +2719,7 @@ impl LedgerCloseContext<'_> {
 
         // 12. CONFIG_SETTING_STATE_ARCHIVAL
         // Parity: NetworkConfig.cpp:632-685 initialStateArchivalSettings
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::StateArchival(
                 StateArchivalSettings {
                     max_entry_ttl: 1_054_080,  // MAXIMUM_ENTRY_LIFETIME (61 days)
@@ -2703,7 +2745,7 @@ impl LedgerCloseContext<'_> {
             .sum_bucket_entry_counters()
             .total_size();
         let window: Vec<u64> = vec![bl_size; 30]; // BUCKET_LIST_SIZE_WINDOW_SAMPLE_SIZE = 30
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::LiveSorobanStateSizeWindow(
                 window.try_into().map_err(|_| {
                     LedgerError::Internal("Failed to create state size window".to_string())
@@ -2712,7 +2754,7 @@ impl LedgerCloseContext<'_> {
 
         // 14. CONFIG_SETTING_EVICTION_ITERATOR
         // Parity: NetworkConfig.cpp:1128-1139 initialEvictionIterator
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::EvictionIterator(
                 EvictionIterator {
                     bucket_list_level: 6, // STARTING_EVICTION_SCAN_LEVEL
@@ -2867,7 +2909,7 @@ impl LedgerCloseContext<'_> {
                 ))),
                 ext: LedgerEntryExt::V0,
             };
-            self.delta.record_update(entry, new_entry)?;
+            self.ltx.record_update(entry, new_entry)?;
             Ok(())
         };
 
@@ -3052,7 +3094,7 @@ impl LedgerCloseContext<'_> {
 
         // 1. CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0
         // Parity: NetworkConfig.cpp:1069-1076 initialParallelComputeEntry
-        self.delta.record_create(LedgerEntry {
+        self.ltx.record_create(LedgerEntry {
             last_modified_ledger_seq: ledger_seq,
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractParallelComputeV0(
                 ConfigSettingContractParallelComputeV0 {
@@ -3064,7 +3106,7 @@ impl LedgerCloseContext<'_> {
 
         // 2. CONFIG_SETTING_SCP_TIMING
         // Parity: NetworkConfig.cpp:1092-1108 initialScpTimingEntry
-        self.delta.record_create(LedgerEntry {
+        self.ltx.record_create(LedgerEntry {
             last_modified_ledger_seq: ledger_seq,
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ScpTiming(
                 ConfigSettingScpTiming {
@@ -3101,7 +3143,7 @@ impl LedgerCloseContext<'_> {
             ));
         };
 
-        self.delta.record_create(LedgerEntry {
+        self.ltx.record_create(LedgerEntry {
             last_modified_ledger_seq: ledger_seq,
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostExtV0(
                 ConfigSettingContractLedgerCostExtV0 {
@@ -3156,7 +3198,7 @@ impl LedgerCloseContext<'_> {
                 )),
                 ext: LedgerEntryExt::V0,
             };
-            self.delta.record_update(cost_entry, new_entry)?;
+            self.ltx.record_update(cost_entry, new_entry)?;
         } else {
             return Err(LedgerError::Internal(
                 "Unexpected entry type for ContractLedgerCostV0".to_string(),
@@ -3185,7 +3227,7 @@ impl LedgerCloseContext<'_> {
                 )),
                 ext: LedgerEntryExt::V0,
             };
-            self.delta.record_update(archival_entry, new_entry)?;
+            self.ltx.record_update(archival_entry, new_entry)?;
         } else {
             return Err(LedgerError::Internal(
                 "Unexpected entry type for StateArchival".to_string(),
@@ -3336,7 +3378,7 @@ impl LedgerCloseContext<'_> {
         };
 
         // CONFIG_SETTING_FROZEN_LEDGER_KEYS (empty)
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::FrozenLedgerKeys(
                 FrozenLedgerKeys {
                     keys: VecM::default(),
@@ -3344,7 +3386,7 @@ impl LedgerCloseContext<'_> {
             )))?;
 
         // CONFIG_SETTING_FREEZE_BYPASS_TXS (empty)
-        self.delta
+        self.ltx
             .record_create(make_entry(ConfigSettingEntry::FreezeBypassTxs(
                 FreezeBypassTxs {
                     tx_hashes: VecM::default(),
@@ -3467,7 +3509,10 @@ impl LedgerCloseContext<'_> {
             self.prev_header.ledger_version,
             ProtocolVersion::V20,
         ) {
-            crate::execution::load_soroban_config(&self.snapshot, self.prev_header.ledger_version)?
+            crate::execution::load_soroban_config(
+                self.ltx.snapshot(),
+                self.prev_header.ledger_version,
+            )?
         } else {
             henyey_tx::soroban::SorobanConfig::default()
         };
@@ -3476,7 +3521,7 @@ impl LedgerCloseContext<'_> {
         self.soroban_fee_write_1kb = soroban_config.rent_fee_config.fee_per_write_1kb;
         // Load frozen key configuration (CAP-77, Protocol 26+).
         let frozen_key_config = crate::execution::load_frozen_key_config(
-            &self.snapshot,
+            self.ltx.snapshot(),
             self.prev_header.ledger_version,
         )?;
         // Use transaction set hash as base PRNG seed for Soroban execution
@@ -3513,7 +3558,7 @@ impl LedgerCloseContext<'_> {
         let executor_setup_start = std::time::Instant::now();
         let mut executor = self.manager.executor.lock().take();
         let is_new_executor = executor.is_none();
-        let id_pool = self.snapshot.header().id_pool;
+        let id_pool = self.ltx.snapshot().header().id_pool;
 
         let executor_ref = executor.get_or_insert_with(|| {
             let mut ctx = LedgerContext::new(
@@ -3564,6 +3609,10 @@ impl LedgerCloseContext<'_> {
         );
         let executor_setup_us = executor_setup_start.elapsed().as_micros() as u64;
 
+        // Clone snapshot for passing alongside mutable delta to execution functions.
+        // SnapshotHandle is Arc-based so this is a cheap reference count increment.
+        let snapshot_clone = self.ltx.snapshot().clone();
+
         let mut fee_pre_deduct_us: u64 = 0;
         let mut tx_set_result = if has_parallel
             && protocol_version_starts_from(
@@ -3585,15 +3634,15 @@ impl LedgerCloseContext<'_> {
                     self.prev_header.base_fee,
                     self.manager.network_id,
                     self.close_data.ledger_seq,
-                    &mut self.delta,
-                    &self.snapshot,
+                    self.ltx.current_delta_mut(),
+                    &snapshot_clone,
                 )?;
-            self.delta.record_fee_pool_delta(total_fee_pool);
+            self.ltx.record_fee_pool_delta(total_fee_pool);
 
             // Pre-load fee-deducted account entries from the delta into the
             // classic executor so classic TXs see ALL fee deductions (including
             // Soroban fees on shared accounts).
-            for entry in self.delta.current_entries() {
+            for entry in self.ltx.current_delta().current_entries() {
                 if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Account(_)) {
                     executor_ref.state_mut().load_entry(entry);
                 }
@@ -3608,18 +3657,18 @@ impl LedgerCloseContext<'_> {
                     results: Vec::new(),
                     tx_results: Vec::new(),
                     tx_result_metas: Vec::new(),
-                    id_pool: self.snapshot.header().id_pool,
+                    id_pool: snapshot_clone.header().id_pool,
                     hot_archive_restored_keys: Vec::new(),
                 }
             } else {
                 run_transactions_on_executor(crate::execution::RunTransactionsParams {
                     executor: executor_ref,
-                    snapshot: &self.snapshot,
+                    snapshot: &snapshot_clone,
                     transactions: classic_txs,
                     base_fee: self.prev_header.base_fee,
                     soroban_base_prng_seed: soroban_base_prng_seed.0,
                     deduct_fee: false,
-                    delta: &mut self.delta,
+                    delta: self.ltx.current_delta_mut(),
                     external_pre_charged: Some(&classic_pre_charged),
                 })?
             };
@@ -3637,11 +3686,11 @@ impl LedgerCloseContext<'_> {
             );
             ledger_context.frozen_key_config = frozen_key_config.clone();
             let soroban_result = execute_soroban_parallel_phase(
-                &self.snapshot,
+                &snapshot_clone,
                 phase,
                 classic_txs.len(),
                 &ledger_context,
-                &mut self.delta,
+                self.ltx.current_delta_mut(),
                 SorobanContext {
                     config: soroban_config,
                     base_prng_seed: soroban_base_prng_seed.0,
@@ -3685,12 +3734,12 @@ impl LedgerCloseContext<'_> {
             // Sequential path: run all transactions on the persistent executor.
             run_transactions_on_executor(crate::execution::RunTransactionsParams {
                 executor: executor_ref,
-                snapshot: &self.snapshot,
+                snapshot: &snapshot_clone,
                 transactions: &prepared.all_txs,
                 base_fee: self.prev_header.base_fee,
                 soroban_base_prng_seed: soroban_base_prng_seed.0,
                 deduct_fee: true,
-                delta: &mut self.delta,
+                delta: self.ltx.current_delta_mut(),
                 external_pre_charged: None,
             })?
         };
@@ -3855,9 +3904,7 @@ impl LedgerCloseContext<'_> {
         prev_version: u32,
         protocol_version: u32,
     ) -> Result<(bool, bool, Vec<UpgradeEntryMeta>)> {
-        use stellar_xdr::curr::{
-            LedgerEntryChange, LedgerEntryChanges, LedgerUpgrade, Limits, WriteXdr,
-        };
+        use stellar_xdr::curr::{LedgerEntryChanges, LedgerUpgrade, Limits, WriteXdr};
 
         // Parity: Upgrades.cpp:1229-1242 applyVersionUpgrade
         // Version upgrades may create/modify config setting entries in the
@@ -3868,7 +3915,7 @@ impl LedgerCloseContext<'_> {
         // Capture changes from version upgrade side effects (cost types for V25).
         // We record the delta state before and after to extract changes.
         let version_changes = if prev_version != protocol_version {
-            let delta_before = self.delta.num_changes();
+            let delta_before = self.ltx.current_delta().num_changes();
             // Parity: Upgrades.cpp:1189-1212
             // needUpgradeToVersion(V_20, prev, new) → createLedgerEntriesForV20
             if needs_upgrade_to_version(ProtocolVersion::V20, prev_version, protocol_version) {
@@ -3923,9 +3970,10 @@ impl LedgerCloseContext<'_> {
             // should never be true in production. This is included for
             // completeness.
             if needs_upgrade_to_version(ProtocolVersion::V10, prev_version, protocol_version) {
+                let snap = self.ltx.snapshot().clone();
                 crate::prepare_liabilities::prepare_liabilities(
-                    &self.snapshot,
-                    &mut self.delta,
+                    &snap,
+                    self.ltx.current_delta_mut(),
                     protocol_version,
                     self.prev_header.base_reserve,
                     self.close_data.ledger_seq,
@@ -3939,31 +3987,11 @@ impl LedgerCloseContext<'_> {
                 && protocol_version == 24
                 && self.manager.network_id().is_mainnet()
             {
-                self.delta.record_fee_pool_delta(31_879_035);
+                self.ltx.record_fee_pool_delta(31_879_035);
                 tracing::info!("Applied V24 mainnet fee pool correction: +31879035 stroops");
             }
             // Extract changes made during version upgrade side effects
-            let mut changes: Vec<LedgerEntryChange> = Vec::new();
-            let delta_after = self.delta.num_changes();
-            if delta_after > delta_before {
-                for change in self.delta.changes().skip(delta_before) {
-                    match change {
-                        crate::delta::EntryChange::Created(entry) => {
-                            changes.push(LedgerEntryChange::Created(entry.clone()));
-                        }
-                        crate::delta::EntryChange::Updated { previous, current } => {
-                            changes.push(LedgerEntryChange::State(previous.clone()));
-                            changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
-                        }
-                        crate::delta::EntryChange::Deleted { previous } => {
-                            let key = henyey_common::entry_to_key(previous);
-                            changes.push(LedgerEntryChange::State(previous.clone()));
-                            changes.push(LedgerEntryChange::Removed(key));
-                        }
-                    }
-                }
-            }
-            LedgerEntryChanges(changes.try_into().unwrap_or_default())
+            extract_entry_changes(self.ltx.current_delta(), delta_before)
         } else {
             LedgerEntryChanges(VecM::default())
         };
@@ -3976,45 +4004,23 @@ impl LedgerCloseContext<'_> {
         // NOTE: The V10 version upgrade path above could theoretically also
         // trigger prepareLiabilities, but Henyey only supports protocol 24+,
         // so that path is never reached. If both were active, stellar-core
-        // would run prepareLiabilities twice (once per upgrade). Our
-        // snapshot-based architecture doesn't support that two-pass pattern
-        // without a merged snapshot view, but since the V10 path is dead code,
-        // this is not an issue in practice.
+        // would run prepareLiabilities twice (once per upgrade). With LedgerTxn,
+        // both passes would see each other's changes through the read path.
         let reserve_changes = if let Some(new_reserve) = self.upgrade_ctx.base_reserve_upgrade() {
             let did_reserve_increase = new_reserve > self.prev_header.base_reserve;
             if protocol_version_starts_from(protocol_version, ProtocolVersion::V10)
                 && did_reserve_increase
             {
-                let delta_before = self.delta.num_changes();
+                let delta_before = self.ltx.current_delta().num_changes();
+                let snap = self.ltx.snapshot().clone();
                 crate::prepare_liabilities::prepare_liabilities(
-                    &self.snapshot,
-                    &mut self.delta,
+                    &snap,
+                    self.ltx.current_delta_mut(),
                     protocol_version,
                     new_reserve,
                     self.close_data.ledger_seq,
                 )?;
-                // Extract changes for UpgradeEntryMeta
-                let mut changes: Vec<LedgerEntryChange> = Vec::new();
-                let delta_after = self.delta.num_changes();
-                if delta_after > delta_before {
-                    for change in self.delta.changes().skip(delta_before) {
-                        match change {
-                            crate::delta::EntryChange::Created(entry) => {
-                                changes.push(LedgerEntryChange::Created(entry.clone()));
-                            }
-                            crate::delta::EntryChange::Updated { previous, current } => {
-                                changes.push(LedgerEntryChange::State(previous.clone()));
-                                changes.push(LedgerEntryChange::Updated(current.as_ref().clone()));
-                            }
-                            crate::delta::EntryChange::Deleted { previous } => {
-                                let key = henyey_common::entry_to_key(previous);
-                                changes.push(LedgerEntryChange::State(previous.clone()));
-                                changes.push(LedgerEntryChange::Removed(key));
-                            }
-                        }
-                    }
-                }
-                LedgerEntryChanges(changes.try_into().unwrap_or_default())
+                extract_entry_changes(self.ltx.current_delta(), delta_before)
             } else {
                 LedgerEntryChanges(VecM::default())
             }
@@ -4022,18 +4028,17 @@ impl LedgerCloseContext<'_> {
             LedgerEntryChanges(VecM::default())
         };
 
-        // Apply config upgrades to the delta BEFORE extracting entries for the bucket list.
+        // Apply config upgrades through LedgerTxn BEFORE extracting entries for the bucket list.
         // In stellar-core, config upgrades are applied to the LedgerTxn before
         // getAllEntries() and addBatch(), so the upgraded ConfigSetting entries are included
         // in the bucket list update. We must do the same here.
         let mut config_state_archival_changed = false;
         let mut config_memory_cost_params_changed = false;
         let mut per_config_changes: HashMap<Vec<u8>, LedgerEntryChanges> = HashMap::new();
-        let delta_count_before_upgrades = self.delta.num_changes();
+        let delta_count_before_upgrades = self.ltx.num_changes();
         if self.upgrade_ctx.has_config_upgrades() {
             let result = self.upgrade_ctx.apply_config_upgrades(
-                &self.snapshot,
-                &mut self.delta,
+                &mut self.ltx,
                 self.close_data.ledger_seq,
                 protocol_version,
             )?;
@@ -4043,21 +4048,18 @@ impl LedgerCloseContext<'_> {
             tracing::info!(
                 ledger_seq = self.close_data.ledger_seq,
                 delta_before = delta_count_before_upgrades,
-                delta_after = self.delta.num_changes(),
+                delta_after = self.ltx.num_changes(),
                 archival_changed = config_state_archival_changed,
                 memory_cost_changed = config_memory_cost_params_changed,
                 "Delta entry count after config upgrades"
             );
         }
 
-        // Apply MaxSorobanTxSetSize upgrade to the delta (modifies CONFIG_SETTING entry).
+        // Apply MaxSorobanTxSetSize upgrade through LedgerTxn (modifies CONFIG_SETTING entry).
         // Parity: Upgrades.cpp upgradeMaxSorobanTxSetSize()
         let max_soroban_changes = if self.upgrade_ctx.max_soroban_tx_set_size_upgrade().is_some() {
-            self.upgrade_ctx.apply_max_soroban_tx_set_size(
-                &self.snapshot,
-                &mut self.delta,
-                self.close_data.ledger_seq,
-            )?
+            self.upgrade_ctx
+                .apply_max_soroban_tx_set_size(&mut self.ltx, self.close_data.ledger_seq)?
         } else {
             LedgerEntryChanges(VecM::default())
         };
@@ -4093,8 +4095,7 @@ impl LedgerCloseContext<'_> {
             || version_upgrade_triggers_state_size)
             && protocol_version >= henyey_common::MIN_SOROBAN_PROTOCOL_VERSION
         {
-            // Load rent config from delta (new upgraded values) falling back to snapshot.
-            // stellar-core loads from LedgerTxn which reflects the just-applied upgrades.
+            // Load rent config through LedgerTxn (sees post-upgrade values).
             let rent_config = self.load_rent_config_from_delta_or_snapshot();
 
             // Recompute contract code sizes with new cost params
@@ -4129,46 +4130,22 @@ impl LedgerCloseContext<'_> {
                     },
                 );
 
-                // Read the window from the delta first (it may have been resized
-                // by the config upgrade), falling back to the snapshot.
+                // Read the window through LedgerTxn (may have been resized by config upgrade).
                 // Parity: stellar-core reads from LedgerTxn which includes prior modifications.
-                let (window_vec_base, previous_entry) = {
-                    let delta_change = self.delta.get_change(&window_key);
-                    if let Some(change) = delta_change {
-                        if let Some(current) = change.current_entry() {
-                            if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
-                                stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
-                                    w,
-                                ),
-                            ) = &current.data
-                            {
-                                // Use delta's current version (includes resize)
-                                // For the "previous" in record_update, use the snapshot version
-                                let snapshot_entry =
-                                    self.snapshot.get_entry(&window_key).ok().flatten();
-                                (
-                                    Some(w.iter().copied().collect::<Vec<u64>>()),
-                                    snapshot_entry,
-                                )
-                            } else {
-                                (None, None)
-                            }
-                        } else {
-                            (None, None)
-                        }
-                    } else if let Some(entry) = self.snapshot.get_entry(&window_key).ok().flatten()
-                    {
+                let (window_vec_base, previous_entry) = match self.ltx.get_entry(&window_key)? {
+                    Some(entry) => {
                         if let stellar_xdr::curr::LedgerEntryData::ConfigSetting(
-                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(w),
-                        ) = &entry.data
+                            stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
+                                ref w,
+                            ),
+                        ) = entry.data
                         {
                             (Some(w.iter().copied().collect::<Vec<u64>>()), Some(entry))
                         } else {
                             (None, None)
                         }
-                    } else {
-                        (None, None)
                     }
+                    None => (None, None),
                 };
 
                 if let (Some(mut window_vec), Some(prev)) = (window_vec_base, previous_entry) {
@@ -4188,11 +4165,11 @@ impl LedgerCloseContext<'_> {
                         ),
                         ext: stellar_xdr::curr::LedgerEntryExt::V0,
                     };
-                    self.delta.record_update(prev, new_window_entry)?;
+                    self.ltx.record_update(prev, new_window_entry)?;
                     tracing::info!(
                         ledger_seq = self.close_data.ledger_seq,
                         new_size = new_size,
-                        delta_count = self.delta.num_changes(),
+                        delta_count = self.ltx.num_changes(),
                         "Updated all state size window entries due to memory cost params upgrade"
                     );
                 }
@@ -4218,8 +4195,9 @@ impl LedgerCloseContext<'_> {
         config_memory_cost_params_changed: bool,
     ) -> Result<(LedgerHeader, Hash256)> {
         // Log all inputs to create_next_header for debugging header mismatch
-        let total_coins = self.prev_header.total_coins + self.delta.total_coins_delta();
-        let fee_pool = self.prev_header.fee_pool + self.delta.fee_pool_delta();
+        let total_coins =
+            self.prev_header.total_coins + self.ltx.current_delta().total_coins_delta();
+        let fee_pool = self.prev_header.fee_pool + self.ltx.current_delta().fee_pool_delta();
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             prev_header_hash = %self.prev_header_hash.to_hex(),
@@ -4229,10 +4207,10 @@ impl LedgerCloseContext<'_> {
             bucket_list_hash = %bucket_list_hash.to_hex(),
             tx_result_hash = %tx_result_hash.to_hex(),
             prev_total_coins = self.prev_header.total_coins,
-            total_coins_delta = self.delta.total_coins_delta(),
+            total_coins_delta = self.ltx.current_delta().total_coins_delta(),
             total_coins = total_coins,
             prev_fee_pool = self.prev_header.fee_pool,
-            fee_pool_delta = self.delta.fee_pool_delta(),
+            fee_pool_delta = self.ltx.current_delta().fee_pool_delta(),
             fee_pool = fee_pool,
             inflation_seq = self.prev_header.inflation_seq,
             prev_ledger_version = self.prev_header.ledger_version,
@@ -4403,7 +4381,7 @@ impl LedgerCloseContext<'_> {
 
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
-            delta_count_final = self.delta.num_changes(),
+            delta_count_final = self.ltx.num_changes(),
             "Delta entry count before bucket list update"
         );
 
@@ -4411,8 +4389,8 @@ impl LedgerCloseContext<'_> {
         // The snapshot's lookup_fn tries to acquire a read lock on bucket_list, which would
         // deadlock if we're already holding the write lock.
         // Parity: In stellar-core, eviction runs after config upgrades (sealLedgerTxnAndStoreInBucketsAndDB),
-        // so it reads the post-upgrade StateArchival settings. We use load_state_archival_settings()
-        // which checks the delta first (containing any upgrade changes) before the snapshot.
+        // so it reads the post-upgrade StateArchival settings. LedgerTxn's read path
+        // provides this automatically.
         // Gate on prev_version (initialLedgerVers) to match stellar-core: on the upgrade
         // ledger (e.g. protocol 0→25), eviction does NOT run.
         let eviction_settings = if protocol_version_starts_from(prev_version, ProtocolVersion::V23)
@@ -4432,9 +4410,12 @@ impl LedgerCloseContext<'_> {
         };
 
         // Categorize delta entries for bucket list update (single pass) before acquiring write lock.
-        // Drains entries from the delta (moving instead of cloning), saving ~50K clone operations.
+        // Drains entries from the current delta (moving instead of cloning), saving ~50K clone operations.
         // Metadata (fee_pool_delta, total_coins_delta) is preserved for build_and_hash_header.
-        let cat = self.delta.drain_categorization_for_bucket_update();
+        let cat = self
+            .ltx
+            .current_delta_mut()
+            .drain_categorization_for_bucket_update();
         let init_entries = cat.init_entries;
         let mut live_entries = cat.live_entries;
         let mut dead_entries = cat.dead_keys;
@@ -5392,6 +5373,7 @@ fn create_genesis_header() -> LedgerHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::delta::LedgerDelta;
     use stellar_xdr::curr::{
         Asset, ContractDataDurability, ContractDataEntry, ContractId, ExtensionPoint,
         LedgerScpMessages, OfferEntry, OfferEntryExt, Price, ScAddress, ScVal, ScpHistoryEntry,
@@ -6965,6 +6947,8 @@ mod tests {
         let header_hash = crate::compute_header_hash(&header).expect("hash");
         let snapshot = SnapshotHandle::new(crate::snapshot::LedgerSnapshot::empty(0));
 
+        let ltx = LedgerTxn::begin(snapshot, header.clone(), header_hash, ledger_seq);
+
         LedgerCloseContext {
             manager,
             close_data: LedgerCloseData::new(
@@ -6978,8 +6962,7 @@ mod tests {
             ),
             prev_header: header.clone(),
             prev_header_hash: header_hash,
-            delta: LedgerDelta::new(ledger_seq),
-            snapshot,
+            ltx,
             stats: LedgerCloseStats::new(),
             upgrade_ctx: UpgradeContext::new(0),
             id_pool: 0,
@@ -7046,8 +7029,10 @@ mod tests {
 
         // Verify all 14 entries were created
         // 1. ContractMaxSizeBytes
-        let entry =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractMaxSizeBytes);
+        let entry = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::ContractMaxSizeBytes,
+        );
         assert!(entry.is_some(), "ContractMaxSizeBytes should exist");
         if let Some(ConfigSettingEntry::ContractMaxSizeBytes(v)) = entry {
             assert_eq!(v, 2_000);
@@ -7056,17 +7041,24 @@ mod tests {
         }
 
         // 2. ContractDataKeySizeBytes
-        let entry =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractDataKeySizeBytes);
+        let entry = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::ContractDataKeySizeBytes,
+        );
         assert!(entry.is_some(), "ContractDataKeySizeBytes should exist");
 
         // 3. ContractDataEntrySizeBytes
-        let entry =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractDataEntrySizeBytes);
+        let entry = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::ContractDataEntrySizeBytes,
+        );
         assert!(entry.is_some(), "ContractDataEntrySizeBytes should exist");
 
         // 4. ContractComputeV0
-        let entry = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractComputeV0);
+        let entry = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::ContractComputeV0,
+        );
         assert!(entry.is_some(), "ContractComputeV0 should exist");
         if let Some(ConfigSettingEntry::ContractComputeV0(ref compute)) = entry {
             assert_eq!(compute.tx_max_instructions, 2_500_000);
@@ -7074,8 +7066,10 @@ mod tests {
         }
 
         // 5. ContractLedgerCostV0
-        let entry =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractLedgerCostV0);
+        let entry = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::ContractLedgerCostV0,
+        );
         assert!(entry.is_some(), "ContractLedgerCostV0 should exist");
         if let Some(ConfigSettingEntry::ContractLedgerCostV0(ref cost)) = entry {
             assert_eq!(cost.tx_max_disk_read_entries, 3);
@@ -7087,28 +7081,41 @@ mod tests {
 
         // 6-9. Historical data, events, bandwidth, execution lanes
         assert!(
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractHistoricalDataV0)
-                .is_some(),
+            get_config_setting_from_delta(
+                ctx.ltx.current_delta(),
+                ConfigSettingId::ContractHistoricalDataV0
+            )
+            .is_some(),
             "ContractHistoricalDataV0 should exist"
         );
         assert!(
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractEventsV0).is_some(),
+            get_config_setting_from_delta(
+                ctx.ltx.current_delta(),
+                ConfigSettingId::ContractEventsV0
+            )
+            .is_some(),
             "ContractEventsV0 should exist"
         );
         assert!(
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractBandwidthV0)
-                .is_some(),
+            get_config_setting_from_delta(
+                ctx.ltx.current_delta(),
+                ConfigSettingId::ContractBandwidthV0
+            )
+            .is_some(),
             "ContractBandwidthV0 should exist"
         );
         assert!(
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractExecutionLanes)
-                .is_some(),
+            get_config_setting_from_delta(
+                ctx.ltx.current_delta(),
+                ConfigSettingId::ContractExecutionLanes
+            )
+            .is_some(),
             "ContractExecutionLanes should exist"
         );
 
         // 10-11. CPU and memory cost params (23 entries each)
         let cpu = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
         assert!(cpu.is_some(), "CPU cost params should exist");
@@ -7121,7 +7128,7 @@ mod tests {
         }
 
         let mem = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );
         assert!(mem.is_some(), "Memory cost params should exist");
@@ -7134,7 +7141,8 @@ mod tests {
         }
 
         // 12. StateArchival
-        let archival = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::StateArchival);
+        let archival =
+            get_config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::StateArchival);
         assert!(archival.is_some(), "StateArchival should exist");
         if let Some(ConfigSettingEntry::StateArchival(ref sa)) = archival {
             assert_eq!(sa.max_entry_ttl, 1_054_080);
@@ -7144,15 +7152,20 @@ mod tests {
         }
 
         // 13. LiveSorobanStateSizeWindow (30-entry window)
-        let window =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::LiveSorobanStateSizeWindow);
+        let window = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::LiveSorobanStateSizeWindow,
+        );
         assert!(window.is_some(), "LiveSorobanStateSizeWindow should exist");
         if let Some(ConfigSettingEntry::LiveSorobanStateSizeWindow(ref w)) = window {
             assert_eq!(w.len(), 30, "Window should have 30 entries");
         }
 
         // 14. EvictionIterator
-        let eviction = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::EvictionIterator);
+        let eviction = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::EvictionIterator,
+        );
         assert!(eviction.is_some(), "EvictionIterator should exist");
         if let Some(ConfigSettingEntry::EvictionIterator(ref ei)) = eviction {
             assert_eq!(ei.bucket_list_level, 6);
@@ -7190,7 +7203,7 @@ mod tests {
 
         // CPU params should now be 45 entries
         let cpu = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
         if let Some(ConfigSettingEntry::ContractCostParamsCpuInstructions(ref params)) = cpu {
@@ -7212,7 +7225,7 @@ mod tests {
 
         // Memory params should now be 45 entries
         let mem = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );
         if let Some(ConfigSettingEntry::ContractCostParamsMemoryBytes(ref params)) = mem {
@@ -7254,7 +7267,7 @@ mod tests {
 
         // CPU params should now be 70 entries
         let cpu = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
         if let Some(ConfigSettingEntry::ContractCostParamsCpuInstructions(ref params)) = cpu {
@@ -7273,7 +7286,7 @@ mod tests {
 
         // Memory params should now be 70 entries
         let mem = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );
         if let Some(ConfigSettingEntry::ContractCostParamsMemoryBytes(ref params)) = mem {
@@ -7316,15 +7329,18 @@ mod tests {
         ctx.create_and_update_ledger_entries_for_v23().expect("V23");
 
         // 1. ContractParallelComputeV0
-        let parallel =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractParallelComputeV0);
+        let parallel = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::ContractParallelComputeV0,
+        );
         assert!(parallel.is_some(), "ContractParallelComputeV0 should exist");
         if let Some(ConfigSettingEntry::ContractParallelComputeV0(ref p)) = parallel {
             assert_eq!(p.ledger_max_dependent_tx_clusters, 1);
         }
 
         // 2. ScpTiming
-        let timing = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ScpTiming);
+        let timing =
+            get_config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::ScpTiming);
         assert!(timing.is_some(), "ScpTiming should exist");
         if let Some(ConfigSettingEntry::ScpTiming(ref t)) = timing {
             assert_eq!(t.ledger_target_close_time_milliseconds, 5000);
@@ -7332,8 +7348,10 @@ mod tests {
         }
 
         // 3. ContractLedgerCostExtV0
-        let ext =
-            get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractLedgerCostExtV0);
+        let ext = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::ContractLedgerCostExtV0,
+        );
         assert!(ext.is_some(), "ContractLedgerCostExtV0 should exist");
         if let Some(ConfigSettingEntry::ContractLedgerCostExtV0(ref e)) = ext {
             // tx_max_footprint_entries should match the V0 tx_max_disk_read_entries
@@ -7342,7 +7360,10 @@ mod tests {
         }
 
         // 4. Verify rent cost params were updated
-        let cost = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::ContractLedgerCostV0);
+        let cost = get_config_setting_from_delta(
+            ctx.ltx.current_delta(),
+            ConfigSettingId::ContractLedgerCostV0,
+        );
         if let Some(ConfigSettingEntry::ContractLedgerCostV0(ref c)) = cost {
             assert_eq!(c.soroban_state_target_size_bytes, 3_000_000_000);
             assert_eq!(c.rent_fee1_kb_soroban_state_size_low, -17_000);
@@ -7351,7 +7372,8 @@ mod tests {
             panic!("ContractLedgerCostV0 not found or wrong type after V23 upgrade");
         }
 
-        let archival = get_config_setting_from_delta(&ctx.delta, ConfigSettingId::StateArchival);
+        let archival =
+            get_config_setting_from_delta(ctx.ltx.current_delta(), ConfigSettingId::StateArchival);
         if let Some(ConfigSettingEntry::StateArchival(ref sa)) = archival {
             assert_eq!(sa.persistent_rent_rate_denominator, 1_215);
             assert_eq!(sa.temp_rent_rate_denominator, 2_430);
@@ -7388,7 +7410,7 @@ mod tests {
 
         // CPU cost params should have 85 entries (BN254)
         let cpu = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
         if let Some(ConfigSettingEntry::ContractCostParamsCpuInstructions(ref params)) = cpu {
@@ -7413,7 +7435,7 @@ mod tests {
 
         // Memory cost params should also have 85 entries
         let mem = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );
         if let Some(ConfigSettingEntry::ContractCostParamsMemoryBytes(ref params)) = mem {
@@ -7457,7 +7479,7 @@ mod tests {
 
         // CPU cost params should have 86 entries (Bn254G1Msm at index 85)
         let cpu = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsCpuInstructions,
         );
         if let Some(ConfigSettingEntry::ContractCostParamsCpuInstructions(ref params)) = cpu {
@@ -7491,7 +7513,7 @@ mod tests {
 
         // Memory cost params should also have 86 entries
         let mem = get_config_setting_from_delta(
-            &ctx.delta,
+            ctx.ltx.current_delta(),
             ConfigSettingId::ContractCostParamsMemoryBytes,
         );
         if let Some(ConfigSettingEntry::ContractCostParamsMemoryBytes(ref params)) = mem {

@@ -33,9 +33,8 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info, warn};
 
-use crate::delta::LedgerDelta;
 use crate::error::LedgerError;
-use crate::snapshot::SnapshotHandle;
+use crate::ltx::LedgerTxn;
 
 /// Validity of a configuration upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +150,7 @@ impl ConfigUpgradeSetFrame {
     /// - The value is not SCV_BYTES
     /// - The XDR cannot be decoded
     pub fn make_from_key(
-        snapshot: &SnapshotHandle,
+        ltx: &LedgerTxn,
         key: &ConfigUpgradeSetKey,
         closing_ledger_seq: u32,
         protocol_version: u32,
@@ -159,11 +158,11 @@ impl ConfigUpgradeSetFrame {
         let lk = Self::get_ledger_key(key);
 
         // Load the CONTRACT_DATA entry
-        let entry = snapshot.get_entry(&lk).ok()??;
+        let entry = ltx.get_entry(&lk).ok()??;
 
         // Check TTL (entry must be live)
         let ttl_key = Self::get_ttl_key(&lk);
-        let ttl_entry = snapshot.get_entry(&ttl_key).ok()??;
+        let ttl_entry = ltx.get_entry(&ttl_key).ok()??;
         if !Self::is_live(&ttl_entry, closing_ledger_seq) {
             debug!(
                 hash = format!("{:02x?}", &key.content_hash.0[..8]),
@@ -316,8 +315,7 @@ impl ConfigUpgradeSetFrame {
     // SECURITY: config entries validated during upgrade proposal phase before reaching apply
     pub fn apply_to(
         &self,
-        snapshot: &SnapshotHandle,
-        delta: &mut LedgerDelta,
+        ltx: &mut LedgerTxn,
     ) -> Result<(bool, bool, stellar_xdr::curr::LedgerEntryChanges), LedgerError> {
         use stellar_xdr::curr::LedgerEntryChange;
 
@@ -334,11 +332,11 @@ impl ConfigUpgradeSetFrame {
             // since delta IDs don't have their own stored config setting entries.
             // Parity: Upgrades.cpp:1458-1517
             if setting_id == ConfigSettingId::FrozenLedgerKeysDelta {
-                self.apply_frozen_keys_delta(new_entry, snapshot, delta, &mut changes)?;
+                self.apply_frozen_keys_delta(new_entry, ltx, &mut changes)?;
                 continue;
             }
             if setting_id == ConfigSettingId::FreezeBypassTxsDelta {
-                self.apply_freeze_bypass_delta(new_entry, snapshot, delta, &mut changes)?;
+                self.apply_freeze_bypass_delta(new_entry, ltx, &mut changes)?;
                 continue;
             }
 
@@ -347,8 +345,9 @@ impl ConfigUpgradeSetFrame {
                 config_setting_id: setting_id,
             });
 
-            // Load the current entry from the ledger
-            let current_entry = snapshot.get_entry(&key).map_err(|e| {
+            // Load the current entry from the ledger (reads through the full
+            // LedgerTxn chain: current → committed → snapshot)
+            let current_entry = ltx.get_entry(&key).map_err(|e| {
                 LedgerError::Internal(format!(
                     "Failed to load config setting {:?}: {}",
                     setting_id, e
@@ -392,7 +391,7 @@ impl ConfigUpgradeSetFrame {
 
             // Create the new entry
             let new_ledger_entry = LedgerEntry {
-                last_modified_ledger_seq: delta.ledger_seq(),
+                last_modified_ledger_seq: ltx.ledger_seq(),
                 data: LedgerEntryData::ConfigSetting(new_entry.clone()),
                 ext: LedgerEntryExt::V0,
             };
@@ -402,7 +401,7 @@ impl ConfigUpgradeSetFrame {
             changes.push(LedgerEntryChange::Updated(new_ledger_entry.clone()));
 
             // Record the update
-            delta.record_update(previous.clone(), new_ledger_entry)?;
+            ltx.record_update(previous.clone(), new_ledger_entry)?;
 
             info!(
                 setting_id = ?setting_id,
@@ -415,7 +414,7 @@ impl ConfigUpgradeSetFrame {
         // This must happen AFTER all config settings are applied but BEFORE
         // entries are extracted for the bucket list.
         if window_sample_size_changed {
-            self.maybe_update_state_size_window(snapshot, delta)?;
+            self.maybe_update_state_size_window(ltx)?;
         }
 
         let entry_changes = stellar_xdr::curr::LedgerEntryChanges(
@@ -441,8 +440,7 @@ impl ConfigUpgradeSetFrame {
     fn apply_frozen_keys_delta(
         &self,
         delta_entry: &ConfigSettingEntry,
-        snapshot: &SnapshotHandle,
-        delta: &mut LedgerDelta,
+        ltx: &mut LedgerTxn,
         changes: &mut Vec<stellar_xdr::curr::LedgerEntryChange>,
     ) -> Result<(), LedgerError> {
         use stellar_xdr::curr::LedgerEntryChange;
@@ -451,7 +449,7 @@ impl ConfigUpgradeSetFrame {
         let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::FrozenLedgerKeys,
         });
-        let previous = snapshot
+        let previous = ltx
             .get_entry(&key)
             .map_err(|e| {
                 LedgerError::Internal(format!(
@@ -505,7 +503,7 @@ impl ConfigUpgradeSetFrame {
         };
 
         let new_ledger_entry = LedgerEntry {
-            last_modified_ledger_seq: delta.ledger_seq(),
+            last_modified_ledger_seq: ltx.ledger_seq(),
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::FrozenLedgerKeys(frozen_keys)),
             ext: LedgerEntryExt::V0,
         };
@@ -514,7 +512,7 @@ impl ConfigUpgradeSetFrame {
         changes.push(LedgerEntryChange::State(previous.clone()));
         changes.push(LedgerEntryChange::Updated(new_ledger_entry.clone()));
 
-        delta.record_update(previous, new_ledger_entry)?;
+        ltx.record_update(previous, new_ledger_entry)?;
 
         info!("Applied frozen ledger keys delta");
         Ok(())
@@ -530,8 +528,7 @@ impl ConfigUpgradeSetFrame {
     fn apply_freeze_bypass_delta(
         &self,
         delta_entry: &ConfigSettingEntry,
-        snapshot: &SnapshotHandle,
-        delta: &mut LedgerDelta,
+        ltx: &mut LedgerTxn,
         changes: &mut Vec<stellar_xdr::curr::LedgerEntryChange>,
     ) -> Result<(), LedgerError> {
         use stellar_xdr::curr::LedgerEntryChange;
@@ -540,7 +537,7 @@ impl ConfigUpgradeSetFrame {
         let key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::FreezeBypassTxs,
         });
-        let previous = snapshot
+        let previous = ltx
             .get_entry(&key)
             .map_err(|e| {
                 LedgerError::Internal(format!(
@@ -593,7 +590,7 @@ impl ConfigUpgradeSetFrame {
         };
 
         let new_ledger_entry = LedgerEntry {
-            last_modified_ledger_seq: delta.ledger_seq(),
+            last_modified_ledger_seq: ltx.ledger_seq(),
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::FreezeBypassTxs(bypass_txs)),
             ext: LedgerEntryExt::V0,
         };
@@ -602,7 +599,7 @@ impl ConfigUpgradeSetFrame {
         changes.push(LedgerEntryChange::State(previous.clone()));
         changes.push(LedgerEntryChange::Updated(new_ledger_entry.clone()));
 
-        delta.record_update(previous, new_ledger_entry)?;
+        ltx.record_update(previous, new_ledger_entry)?;
 
         info!("Applied freeze bypass txs delta");
         Ok(())
@@ -613,11 +610,7 @@ impl ConfigUpgradeSetFrame {
     ///
     /// Parity: NetworkConfig.cpp:2080 `maybeUpdateSorobanStateSizeWindowSize`
     // SECURITY: config entries validated during upgrade proposal phase before reaching apply
-    fn maybe_update_state_size_window(
-        &self,
-        snapshot: &SnapshotHandle,
-        delta: &mut LedgerDelta,
-    ) -> Result<(), LedgerError> {
+    fn maybe_update_state_size_window(&self, ltx: &mut LedgerTxn) -> Result<(), LedgerError> {
         // Get the new sample size from the upgrade set
         let new_sample_size = self
             .config_upgrade_set
@@ -636,11 +629,11 @@ impl ConfigUpgradeSetFrame {
             None => return Ok(()),
         };
 
-        // Load the current window from the snapshot
+        // Load the current window from the LedgerTxn (sees prior config upgrades)
         let window_key = LedgerKey::ConfigSetting(stellar_xdr::curr::LedgerKeyConfigSetting {
             config_setting_id: ConfigSettingId::LiveSorobanStateSizeWindow,
         });
-        let window_entry = snapshot.get_entry(&window_key).map_err(|e| {
+        let window_entry = ltx.get_entry(&window_key).map_err(|e| {
             LedgerError::Internal(format!("Failed to load LiveSorobanStateSizeWindow: {}", e))
         })?;
 
@@ -684,14 +677,14 @@ impl ConfigUpgradeSetFrame {
             .map_err(|_| LedgerError::Internal("Failed to convert window vec".to_string()))?;
 
         let new_window_entry = LedgerEntry {
-            last_modified_ledger_seq: delta.ledger_seq(),
+            last_modified_ledger_seq: ltx.ledger_seq(),
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::LiveSorobanStateSizeWindow(
                 new_window,
             )),
             ext: LedgerEntryExt::V0,
         };
 
-        delta.record_update(window_entry.clone(), new_window_entry)?;
+        ltx.record_update(window_entry.clone(), new_window_entry)?;
 
         Ok(())
     }

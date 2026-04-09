@@ -152,7 +152,7 @@ impl EntryChange {
 ///
 /// Changes are tracked in insertion order to ensure deterministic iteration.
 /// This is critical for producing consistent bucket list updates across nodes.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LedgerDelta {
     /// The ledger sequence this delta applies to.
     ledger_seq: u32,

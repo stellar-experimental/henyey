@@ -35,8 +35,9 @@
 use henyey_bucket::{BucketList, HotArchiveBucketList};
 use henyey_common::Hash256;
 use henyey_ledger::{
-    compute_header_hash, ConfigUpgradeSetFrame, LedgerCloseData, LedgerDelta, LedgerManager,
-    LedgerManagerConfig, SnapshotBuilder, SnapshotHandle, TransactionSetVariant, UpgradeContext,
+    compute_header_hash, ConfigUpgradeSetFrame, LedgerCloseData, LedgerManager,
+    LedgerManagerConfig, LedgerTxn, SnapshotBuilder, SnapshotHandle, TransactionSetVariant,
+    UpgradeContext,
 };
 use stellar_xdr::curr::{
     ConfigSettingEntry, ConfigSettingId, ConfigUpgradeSet, ConfigUpgradeSetKey,
@@ -349,8 +350,14 @@ fn test_config_upgrade_sees_stale_protocol_version() {
 
     // Pass the post-upgrade version (25) explicitly to make_from_key.
     let closing_ledger_seq = snapshot_ledger + 1;
+    let ltx = LedgerTxn::begin(
+        handle.clone(),
+        header.clone(),
+        header_hash,
+        closing_ledger_seq,
+    );
     let frame = ConfigUpgradeSetFrame::make_from_key(
-        &handle,
+        &ltx,
         &upgrade_key,
         closing_ledger_seq,
         post_upgrade_version,
@@ -405,7 +412,7 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
     let ttl_entry = make_ttl_entry(&data_key, snapshot_ledger);
 
     let snapshot = SnapshotBuilder::new(snapshot_ledger)
-        .with_header(header, header_hash)
+        .with_header(header.clone(), header_hash)
         .add_entry(data_key, data_entry)
         .add_entry(ttl_key, ttl_entry)
         .build()
@@ -414,7 +421,8 @@ fn test_config_upgrade_ttl_checked_against_snapshot_ledger_seq() {
 
     // make_from_key now uses closing_ledger (100) for TTL check.
     // Entry with live_until=99 is expired because 99 < 100.
-    let frame = ConfigUpgradeSetFrame::make_from_key(&handle, &upgrade_key, closing_ledger, 25);
+    let ltx = LedgerTxn::begin(handle.clone(), header.clone(), header_hash, closing_ledger);
+    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &upgrade_key, closing_ledger, 25);
 
     assert!(
         frame.is_none(),
@@ -622,7 +630,7 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     let header_hash = compute_header_hash(&header).expect("hash");
 
     let snapshot = SnapshotBuilder::new(0)
-        .with_header(header, header_hash)
+        .with_header(header.clone(), header_hash)
         .build()
         .expect("build snapshot");
     let handle = SnapshotHandle::new(snapshot);
@@ -633,7 +641,8 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     };
 
     // make_from_key returns None — key doesn't exist in ledger
-    let frame = ConfigUpgradeSetFrame::make_from_key(&handle, &bogus_key, 1, 25);
+    let ltx = LedgerTxn::begin(handle.clone(), header.clone(), header_hash, 1);
+    let frame = ConfigUpgradeSetFrame::make_from_key(&ltx, &bogus_key, 1, 25);
     assert!(
         frame.is_none(),
         "Nonexistent config upgrade key should not be loadable"
@@ -645,8 +654,8 @@ fn test_config_upgrade_nonexistent_key_rejected() {
     let mut ctx = UpgradeContext::new(25);
     ctx.add_upgrade(LedgerUpgrade::Config(bogus_key));
 
-    let mut delta = LedgerDelta::new(1);
-    let result = ctx.apply_config_upgrades(&handle, &mut delta, 1, 25);
+    let mut ltx = LedgerTxn::begin(handle, header, header_hash, 1);
+    let result = ctx.apply_config_upgrades(&mut ltx, 1, 25);
 
     assert!(
         result.is_err(),

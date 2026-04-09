@@ -32,9 +32,8 @@ use stellar_xdr::curr::{
 };
 
 use crate::config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
-use crate::delta::LedgerDelta;
 use crate::error::LedgerError;
-use crate::snapshot::SnapshotHandle;
+use crate::ltx::LedgerTxn;
 
 /// A transaction paired with an optional per-component base fee override.
 pub type TxWithFee = (Arc<TransactionEnvelope>, Option<u32>);
@@ -1207,8 +1206,7 @@ impl UpgradeContext {
     /// - The delta update fails
     pub fn apply_config_upgrades(
         &self,
-        snapshot: &SnapshotHandle,
-        delta: &mut LedgerDelta,
+        ltx: &mut LedgerTxn,
         closing_ledger_seq: u32,
         protocol_version: u32,
     ) -> Result<ConfigUpgradeResult, LedgerError> {
@@ -1224,7 +1222,7 @@ impl UpgradeContext {
             // upgrade set cannot be loaded or is invalid at apply time, since
             // isValidForApply should have already filtered it during SCP.
             let frame = match ConfigUpgradeSetFrame::make_from_key(
-                snapshot,
+                ltx,
                 &key,
                 closing_ledger_seq,
                 protocol_version,
@@ -1250,7 +1248,7 @@ impl UpgradeContext {
             }
 
             // Apply the upgrade (includes window resize if sample size changed)
-            let (archival, memory_cost, entry_changes) = frame.apply_to(snapshot, delta)?;
+            let (archival, memory_cost, entry_changes) = frame.apply_to(ltx)?;
             state_archival_changed |= archival;
             memory_cost_params_changed |= memory_cost;
 
@@ -1330,8 +1328,7 @@ impl UpgradeContext {
     /// Matches upstream `upgradeMaxSorobanTxSetSize()` in Upgrades.cpp.
     pub fn apply_max_soroban_tx_set_size(
         &self,
-        snapshot: &SnapshotHandle,
-        delta: &mut LedgerDelta,
+        ltx: &mut LedgerTxn,
         ledger_seq: u32,
     ) -> Result<stellar_xdr::curr::LedgerEntryChanges, LedgerError> {
         use stellar_xdr::curr::{
@@ -1348,13 +1345,8 @@ impl UpgradeContext {
             config_setting_id: ConfigSettingId::ContractExecutionLanes,
         });
 
-        // Load existing entry from delta (if previously modified) or snapshot
-        let existing = delta
-            .get_change(&key)
-            .and_then(|c| c.current_entry().cloned())
-            .or_else(|| snapshot.get_entry(&key).ok().flatten());
-
-        let previous = existing.ok_or_else(|| {
+        // Load existing entry through ltx (current → committed → snapshot)
+        let previous = ltx.get_entry(&key)?.ok_or_else(|| {
             LedgerError::Internal(
                 "CONFIG_SETTING_CONTRACT_EXECUTION_LANES entry not found".to_string(),
             )
@@ -1373,7 +1365,7 @@ impl UpgradeContext {
         }
         updated.last_modified_ledger_seq = ledger_seq;
 
-        delta.record_update(previous.clone(), updated.clone())?;
+        ltx.record_update(previous.clone(), updated.clone())?;
 
         let changes = vec![
             LedgerEntryChange::State(previous),
