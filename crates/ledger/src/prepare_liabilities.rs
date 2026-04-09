@@ -365,7 +365,7 @@ fn update_sponsor_num_sponsoring(
     });
 
     // Load the current version of the sponsor account through the CloseLedgerState
-    // read path (current delta → committed chain → snapshot).
+    // read path (current delta → base snapshot).
     let entry = ltx.get_entry(&key)?.ok_or_else(|| {
         LedgerError::Internal(format!("sponsor account not found: {:?}", sponsor_id))
     })?;
@@ -518,7 +518,7 @@ pub fn prepare_liabilities(
     tracing::info!("Starting prepareLiabilities");
 
     // Step 1: Load all offers through the CloseLedgerState merged read path
-    // (current delta → committed chain → snapshot) and group by account.
+    // (current delta → base snapshot) and group by account.
     // Parity: ltx.loadAllOffers()
     let all_entries = ltx.all_offers()?;
     let mut offers_by_account: BTreeMap<AccountId, Vec<(LedgerEntry, OfferEntry)>> =

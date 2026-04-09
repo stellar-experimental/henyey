@@ -509,4 +509,37 @@ mod tests {
         state.current_delta_mut().record_total_coins_delta(-100);
         assert_eq!(state.total_coins_delta(), -100);
     }
+
+    #[test]
+    fn test_drain_preserves_metadata_deltas() {
+        let snapshot = make_empty_snapshot(100);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            ledger_seq: 100,
+            ..Default::default()
+        };
+        let mut state =
+            CloseLedgerState::begin(snapshot, header, henyey_common::Hash256::ZERO, 101);
+
+        // Accumulate some entry changes plus metadata deltas
+        let entry = make_test_account_entry(1, 1000, 101);
+        state.record_create(entry).unwrap();
+        state.record_fee_pool_delta(750);
+        state.current_delta_mut().record_total_coins_delta(-200);
+
+        assert_eq!(state.num_changes(), 1);
+        assert_eq!(state.fee_pool_delta(), 750);
+        assert_eq!(state.total_coins_delta(), -200);
+
+        // Drain entry changes for bucket update
+        let categorization = state.drain_for_bucket_update();
+        assert_eq!(categorization.created_count, 1);
+
+        // After drain, entry changes are gone but metadata deltas are preserved.
+        // This is critical: manager.rs reads fee_pool_delta() and total_coins_delta()
+        // after draining to construct the final ledger header.
+        assert_eq!(state.num_changes(), 0);
+        assert_eq!(state.fee_pool_delta(), 750);
+        assert_eq!(state.total_coins_delta(), -200);
+    }
 }

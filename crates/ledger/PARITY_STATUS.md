@@ -20,7 +20,7 @@
 | Offer Sorting / Comparison | Full | OfferDescriptor, AssetPair |
 | In-Memory Soroban State | Full | Contract data/code with TTL |
 | Config Upgrade Handling | Full | Validation, apply, protocol upgrade synthesis |
-| LedgerTxn Nested Transactions | Full | `LedgerTxn` with child/commit/rollback; `EntryReader` trait for generic reads |
+| CloseLedgerState (merged reads) | Full | `CloseLedgerState` flat wrapper with checkpoint API; `EntryReader` trait for generic reads. stellar-core's nested `LedgerTxn` child/commit/rollback not replicated — intentionally simplified to flat delta. |
 | Parallel Apply / Threading | Partial | Parallel cluster execution via tokio; no ApplyState phase machine |
 | Soroban Metrics | None | No metrics collection |
 | Shared Module Cache | Partial | Single-threaded `rebuild_module_cache` + per-TX `PersistentModuleCache`; no multi-threaded compilation |
@@ -31,8 +31,8 @@
 |--------------------|-------------|-------|
 | `LedgerManager.h` / `LedgerManagerImpl.h` / `LedgerManagerImpl.cpp` | `manager.rs` | Core ledger manager |
 | `LedgerHeaderUtils.h` / `LedgerHeaderUtils.cpp` | `header.rs` | Header hash, skip list |
-| `LedgerTxn.h` / `LedgerTxn.cpp` | `ltx.rs`, `delta.rs` | `LedgerTxn` nested transactions in `ltx.rs`; change tracking in `delta.rs` |
-| `LedgerTxnImpl.h` | `ltx.rs`, `delta.rs` | Nesting via move semantics in `ltx.rs` |
+| `LedgerTxn.h` / `LedgerTxn.cpp` | `close_state.rs`, `delta.rs` | `CloseLedgerState` merged-read wrapper in `close_state.rs`; change tracking in `delta.rs` |
+| `LedgerTxnImpl.h` | `close_state.rs`, `delta.rs` | Nesting not replicated; flat delta with checkpoint API in `close_state.rs` |
 | `LedgerTxnEntry.h` / `LedgerTxnEntry.cpp` | `delta.rs` | Entry handles simplified |
 | `LedgerTxnHeader.h` / `LedgerTxnHeader.cpp` | `delta.rs`, `snapshot.rs` | Header access via snapshot |
 | `LedgerStateSnapshot.h` / `LedgerStateSnapshot.cpp` | `snapshot.rs` | Read-only snapshots |
@@ -352,8 +352,8 @@ Features not yet implemented. These ARE counted against parity %.
 
 1. **State Management Model**
    - **stellar-core**: Uses `LedgerTxn` with arbitrarily nested parent/child relationships for transactional isolation. Each nested transaction can be independently committed or rolled back. Entries have activation tracking (`EntryPtrState`) to prevent concurrent access. Uses `InternalLedgerEntry`/`InternalLedgerKey` generalized types that extend `LedgerEntry`/`LedgerKey` with sponsorship and sequence number tracking.
-   - **Rust**: Uses a two-layer model: `LedgerTxn` (`ltx.rs`) provides nested transactional reads during ledger close (current delta → committed chain → base snapshot), while `LedgerDelta` (`delta.rs`) provides change coalescing and per-operation savepoints for the execution loop. The `EntryReader` trait unifies read access across `SnapshotHandle` and `LedgerTxn`, allowing config loading and other read paths to work generically. Works directly with `LedgerEntry`/`LedgerKey` XDR types.
-   - **Rationale**: `LedgerTxn` ensures upgrade and liability preparation phases see each other's changes (eliminating stale-read bugs), while the execution layer uses `LedgerDelta` with savepoints for per-operation rollback. The `InternalLedgerEntry` generalization is unnecessary because sponsorship tracking is handled inline during operation execution.
+   - **Rust**: Uses a two-layer model: `CloseLedgerState` (`close_state.rs`) provides a flat merged-read view during ledger close (current delta → base snapshot), while `LedgerDelta` (`delta.rs`) provides change coalescing and per-operation savepoints for the execution loop. Per-upgrade entry change extraction uses explicit checkpoints (`change_checkpoint()` / `entry_changes_since()`) instead of nested transaction scopes. The `EntryReader` trait unifies read access across `SnapshotHandle` and `CloseLedgerState`, allowing config loading and other read paths to work generically. The execution layer intentionally uses decomposed `(SnapshotHandle, LedgerDelta)` for `Send + Sync` parallel tasks. Works directly with `LedgerEntry`/`LedgerKey` XDR types.
+   - **Rationale**: `CloseLedgerState` ensures upgrade and liability preparation phases see each other's changes (eliminating stale-read bugs) without the complexity of nested transaction nesting. The execution layer uses `LedgerDelta` with savepoints for per-operation rollback. The `InternalLedgerEntry` generalization is unnecessary because sponsorship tracking is handled inline during operation execution.
 
 2. **Threading Model**
    - **stellar-core**: Multi-threaded with dedicated apply thread and parallel Soroban execution threads. Uses an `ApplyState` phase machine (SETTING_UP_STATE -> READY_TO_APPLY -> APPLYING -> COMMITTING) to coordinate thread access. `LedgerTxn` enforces same-thread invariant. `LedgerEntryScope` provides compile-time and runtime scope checking for entry access across threads. Transaction execution split into `preParallelApply` (sequential on primary thread) and `parallelApply` (on worker threads).
@@ -384,7 +384,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Area | stellar-core Tests | Rust Tests | Notes |
 |------|-------------------|------------|-------|
-| LedgerTxn | 32 TEST_CASE / 254 SECTION | 39 #[test] in `delta.rs`, 9 #[test] in `ltx.rs` | `delta.rs` covers coalescing; `ltx.rs` covers nested child/commit/rollback and merged reads |
+| LedgerTxn | 32 TEST_CASE / 254 SECTION | 39 #[test] in `delta.rs`, 7 #[test] in `close_state.rs` | `delta.rs` covers coalescing; `close_state.rs` covers merged reads, checkpoints, and delta accessors |
 | Liabilities | 3 TEST_CASE / 37 SECTION | 42 #[test] in `lib.rs` | Good parity on reserve/liability tests |
 | Ledger Header | 3 TEST_CASE / 1 SECTION | 3 #[test] in `header.rs` | Covers hash, skip list, chain verify |
 | Ledger Close Meta | 3 TEST_CASE / 6 SECTION | 7 #[test] in `close.rs` | Covers tx set handling, ordering |
@@ -399,7 +399,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 ### Test Gaps
 
-- **LedgerTxn nested transaction tests** (32 upstream TEST_CASE / 254 SECTION): The Rust crate does not replicate the full LedgerTxn test suite since it uses a different state model (delta vs nested transactions). The coalescing tests in `delta.rs` cover the equivalent behavior.
+- **LedgerTxn nested transaction tests** (32 upstream TEST_CASE / 254 SECTION): The Rust crate does not replicate the full LedgerTxn test suite since it uses a flat delta model (`CloseLedgerState`) rather than nested transactions. The coalescing tests in `delta.rs` and checkpoint/merged-read tests in `close_state.rs` cover the equivalent behavior.
 - **Ledger close meta stream tests**: No equivalent for `LedgerCloseMetaStreamTests.cpp` (3 TEST_CASE / 6 SECTION) which tests meta file rotation and streaming.
 - **Entry activation/deactivation tests**: Not applicable since Rust does not use the activation tracking pattern.
 
@@ -416,7 +416,7 @@ The ledger crate has been verified against testnet for ledger close correctness.
 | Intentional Omissions | 30 |
 | **Parity** | **139 / (139 + 9) = 94%** |
 
-The 139 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (28, including `commonPreApply`/`preParallelApply`/`parallelApply` and all v20-v26 network-config synthesis paths), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7), LedgerTxn nested transactions with `EntryReader` (1), module cache rebuild (1 — partial, not counted here).
+The 139 implemented items cover: LedgerManager core operations (31, including `applySorobanStages`, `applySorobanStageClustersInParallel`, `applyThread`, `getModuleCache`), header utilities (8), delta/change tracking (13), close data (8), snapshots (8), execution pipeline (28, including `commonPreApply`/`preParallelApply`/`parallelApply` and all v20-v26 network-config synthesis paths), config upgrade (6), offer utilities (5), in-memory Soroban state (15), fee/reserve calculations (8), trustline utilities (7), CloseLedgerState merged reads with `EntryReader` (1), module cache rebuild (1 — partial, not counted here).
 
 The 9 gap items include: timing utilities (2), metrics methods (2), ApplyState phase machine (1), multi-threaded module cache compilation (1 Partial), CompleteConstLedgerState (1 Partial), prefetch (1), and meta streaming (1).
 

@@ -345,8 +345,8 @@ impl ConfigUpgradeSetFrame {
                 config_setting_id: setting_id,
             });
 
-            // Load the current entry from the ledger (reads through the full
-            // CloseLedgerState chain: current → committed → snapshot)
+            // Load the current entry from the ledger (reads through
+            // CloseLedgerState: current delta → base snapshot)
             let current_entry = ltx.get_entry(&key).map_err(|e| {
                 LedgerError::Internal(format!(
                     "Failed to load config setting {:?}: {}",
