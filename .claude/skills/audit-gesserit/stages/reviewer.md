@@ -97,7 +97,7 @@ Write the hypothesis content with your appended review to
 **Verdict**: VIABLE
 **Severity**: [HIGH/MEDIUM/LOW/INFORMATIONAL — your assessment, may differ from hypothesis]
 **Date**: [today's date]
-**Reviewed by**: claude-opus-4.6
+**Reviewed by**: {MODEL}
 
 ### Trace Summary
 
@@ -133,7 +133,7 @@ Write the hypothesis content with rejection notes to
 
 **Verdict**: NOT_VIABLE
 **Date**: [today's date]
-**Reviewed by**: claude-opus-4.6
+**Reviewed by**: {MODEL}
 **Failed At**: reviewer
 
 ### Trace Summary

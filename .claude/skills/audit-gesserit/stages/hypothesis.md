@@ -111,7 +111,7 @@ Write to `ai-summary/hypothesis/{CRATE}/NNN-short-description.md`:
 **Date**: [today's date]
 **Crate**: {CRATE}
 **Severity**: [CRITICAL/HIGH/MEDIUM/LOW]
-**Hypothesis by**: claude-opus-4.6
+**Hypothesis by**: {MODEL}
 
 ## Expected Behavior
 
@@ -153,7 +153,7 @@ with the same format plus an appended Review section:
 **Verdict**: NOT_VIABLE
 **Date**: [today's date]
 **Failed At**: hypothesis
-**Reviewed by**: claude-opus-4.6
+**Reviewed by**: {MODEL}
 
 ### Why It Failed
 

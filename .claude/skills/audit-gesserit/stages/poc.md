@@ -86,7 +86,7 @@ The test code is preserved in the markdown document, not in the source tree.
 
 **Result**: POC_PASS
 **Date**: [today's date]
-**PoC by**: claude-opus-4.6
+**PoC by**: {MODEL}
 **Test File**: crates/{CRATE}/tests/audit_poc_{NNN}.rs
 **Test Name**: [test function name]
 
@@ -120,7 +120,7 @@ The test code is preserved in the markdown document, not in the source tree.
 
 **Result**: POC_FAIL
 **Date**: [today's date]
-**PoC by**: claude-opus-4.6
+**PoC by**: {MODEL}
 **Failed At**: poc
 **Iterations**: [how many build-test cycles attempted]
 

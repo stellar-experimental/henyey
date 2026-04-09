@@ -99,7 +99,7 @@ Write a success document to `ai-summary/success/{CRATE}/{SAME_FILENAME}`:
 **Date**: [today's date]
 **Severity**: [HIGH/MEDIUM/LOW/INFORMATIONAL — from severity scale]
 **Crate**: {CRATE}
-**Final review by**: claude-opus-4.6
+**Final review by**: {MODEL}
 
 ## Summary
 
@@ -166,7 +166,7 @@ Write to `ai-summary/fail/{CRATE}/NNN-description.md` (next file number in fail/
 
 **Verdict**: REJECTED
 **Date**: [today's date]
-**Final review by**: claude-opus-4.6
+**Final review by**: {MODEL}
 **Failed At**: final-review
 
 ### Adversarial Analysis

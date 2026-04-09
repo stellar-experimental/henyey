@@ -1,12 +1,14 @@
 ---
 name: audit-gesserit
 description: Multi-stage adversarial security audit with hypothesis, review, PoC, publish
-argument-hint: "[--crate <name>] [--max-rounds N] [--no-hypothesis] [--no-poc] [--no-publish] [--dry-run] [--resume] [--promote <path>]"
+argument-hint: "[--crate <name>] [--max-rounds N] [--model <model>] [--light-model <model>] [--no-hypothesis] [--no-poc] [--no-publish] [--dry-run] [--resume] [--promote <path>]"
 ---
 
 Parse `$ARGUMENTS`:
 - `--crate <name>`: Restrict to a single crate. Default: all crates by priority.
 - `--max-rounds N`: Maximum orchestrator iterations (default: 30).
+- `--model <model>`: Model for hypothesis/reviewer/poc/final-review agents (default: `"claude-opus-4.6"`).
+- `--light-model <model>`: Model for publish/condensation agents (default: `"claude-haiku-4.5"`).
 - `--no-hypothesis`: Skip hypothesis generation; only process existing pipeline state.
 - `--no-poc`: Skip PoC stage; promote reviewed hypotheses directly to final review.
 - `--no-publish`: Skip publishing to GitHub issues.
@@ -245,6 +247,8 @@ For the selected work item, assemble the agent prompt:
    - `{SUCCESS_FILE}` → path to success file (for publish)
    - `{DRY_RUN}` → "true" or "false"
    - `{SAME_FILENAME}` → filename of the input file (preserved across stages)
+   - `{MODEL}` → the `--model` value (used in stage output metadata)
+   - `{LIGHT_MODEL}` → the `--light-model` value (used in stage output metadata)
 
 7. **Concatenate** the assembled prompt:
    ```
@@ -277,7 +281,7 @@ For the selected work item, assemble the agent prompt:
 
 8. **Spawn the Agent** using the Task tool:
    - `agent_type`: `"general-purpose"` for hypothesis/reviewer/poc/final-review; `"task"` for publish/condensation
-   - `model`: `"claude-opus-4.6"` for hypothesis/reviewer/poc/final-review; `"claude-haiku-4.5"` for publish/condensation
+   - `model`: the `--model` value for hypothesis/reviewer/poc/final-review; the `--light-model` value for publish/condensation
    - `prompt`: the assembled prompt
    - `description`: e.g., "hypothesis for tx" or "review H-003"
 
