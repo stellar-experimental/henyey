@@ -811,11 +811,11 @@ pub fn envelope_sequence_number(envelope: &TransactionEnvelope) -> i64 {
     }
 }
 
-fn is_soroban_ledger_key(key: &LedgerKey) -> bool {
+pub fn is_soroban_ledger_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
 }
 
-fn soroban_disk_read_entries(
+pub fn soroban_disk_read_entries(
     resources: &stellar_xdr::curr::SorobanResources,
     ext: Option<&SorobanTransactionDataExt>,
     is_restore_footprint: bool,

@@ -14,10 +14,10 @@ use std::collections::{HashMap, HashSet};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::SorobanNetworkInfo;
-use henyey_tx::{validate_basic, LedgerContext, TransactionFrame};
+use henyey_tx::{soroban_disk_read_entries, validate_basic, LedgerContext, TransactionFrame};
 use stellar_xdr::curr::{
-    AccountId, GeneralizedTransactionSet, LedgerHeader, TransactionEnvelope, TransactionPhase,
-    TxSetComponent,
+    AccountId, GeneralizedTransactionSet, LedgerHeader, SorobanTransactionDataExt,
+    TransactionEnvelope, TransactionPhase, TxSetComponent,
 };
 use tracing::debug;
 
@@ -495,6 +495,37 @@ fn envelope_soroban_resources(
     }
 }
 
+/// Extract `SorobanTransactionDataExt` from a transaction envelope.
+fn envelope_soroban_data_ext(env: &TransactionEnvelope) -> Option<&SorobanTransactionDataExt> {
+    let ext = match env {
+        TransactionEnvelope::Tx(e) => &e.tx.ext,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.ext,
+        },
+        _ => return None,
+    };
+    match ext {
+        stellar_xdr::curr::TransactionExt::V1(data) => Some(&data.ext),
+        _ => None,
+    }
+}
+
+/// Check if a transaction is a RestoreFootprint operation.
+fn is_restore_footprint_envelope(env: &TransactionEnvelope) -> bool {
+    let ops = match env {
+        TransactionEnvelope::TxV0(e) => &e.tx.operations,
+        TransactionEnvelope::Tx(e) => &e.tx.operations,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
+        },
+    };
+    ops.len() == 1
+        && matches!(
+            ops[0].body,
+            stellar_xdr::curr::OperationBody::RestoreFootprint(_)
+        )
+}
+
 /// Validate that component base fees and per-TX inclusion fees meet minimums.
 ///
 /// Mirrors stellar-core's `checkFeeMap()` (TxSetFrame.cpp:722-751).
@@ -522,7 +553,7 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
                 // Check each TX's inclusion fee meets the minimum
                 let component_base_fee = comp.base_fee;
                 for tx in comp.txs.iter() {
-                    let tx_inclusion_fee = inclusion_fee(tx, component_base_fee);
+                    let tx_inclusion_fee = envelope_inclusion_fee(tx);
                     let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
                     if tx_inclusion_fee < min_fee {
                         debug!(
@@ -549,7 +580,7 @@ pub(crate) fn check_fee_map(phase: &TransactionPhase, lcl_base_fee: u32) -> bool
             for stage in parallel.execution_stages.iter() {
                 for cluster in stage.iter() {
                     for tx in cluster.iter() {
-                        let tx_inclusion_fee = inclusion_fee(tx, component_base_fee);
+                        let tx_inclusion_fee = envelope_inclusion_fee(tx);
                         let min_fee = get_min_inclusion_fee(tx, lcl_base_fee, component_base_fee);
                         if tx_inclusion_fee < min_fee {
                             debug!(
@@ -670,11 +701,12 @@ pub(crate) fn check_valid_soroban(
         }
         if let Some(resources) = envelope_soroban_resources(tx) {
             total_instructions = total_instructions.saturating_add(resources.instructions as i64);
-            // read_only + read_write entries
-            total_read_entries = total_read_entries.saturating_add(
-                resources.footprint.read_only.len() as i64
-                    + resources.footprint.read_write.len() as i64,
-            );
+            // Parity: For protocol >= 23, use disk read entries (only classic + archived)
+            // matching stellar-core's getNumDiskReadEntries().
+            let ext = envelope_soroban_data_ext(tx);
+            let is_restore = is_restore_footprint_envelope(tx);
+            let disk_read = soroban_disk_read_entries(resources, ext, is_restore, protocol);
+            total_read_entries = total_read_entries.saturating_add(disk_read);
             total_read_bytes = total_read_bytes.saturating_add(resources.disk_read_bytes as i64);
             total_write_entries =
                 total_write_entries.saturating_add(resources.footprint.read_write.len() as i64);

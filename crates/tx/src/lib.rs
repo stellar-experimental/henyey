@@ -158,7 +158,8 @@ pub use lumen_reconciler::{reconcile_events, LumenEventReconciler, ReconcilerCon
 
 // Re-export frame types
 pub use frame::{
-    envelope_sequence_number, muxed_to_account_id, muxed_to_ed25519, TransactionFrame,
+    envelope_sequence_number, muxed_to_account_id, muxed_to_ed25519, soroban_disk_read_entries,
+    TransactionFrame,
 };
 
 // Re-export apply types and functions
