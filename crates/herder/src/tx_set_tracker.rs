@@ -196,8 +196,13 @@ impl TxSetTracker {
         self.valid_cache.get(key).map(|v| *v)
     }
 
-    /// Store a validity result.
+    /// Store a validity result. Evicts an arbitrary entry if at capacity (64).
     pub fn store_valid(&self, key: (Hash256, Hash256, u64), valid: bool) {
+        if self.valid_cache.len() >= 64 {
+            if let Some(entry) = self.valid_cache.iter().next().map(|e| *e.key()) {
+                self.valid_cache.remove(&entry);
+            }
+        }
         self.valid_cache.insert(key, valid);
     }
 
@@ -445,5 +450,22 @@ mod tests {
         assert!(!tracker.has_stale_pending(9999));
         // With 0 timeout, everything is stale
         assert!(tracker.has_stale_pending(0));
+    }
+
+    #[test]
+    fn test_valid_cache_bounded_at_64() {
+        let tracker = TxSetTracker::new(256);
+        let lcl = Hash256::from_bytes([0; 32]);
+        // Fill to capacity
+        for i in 0..64u8 {
+            let h = Hash256::from_bytes([i; 32]);
+            tracker.store_valid((lcl, h, 0), true);
+        }
+        assert_eq!(tracker.sizes().valid_cache, 64);
+
+        // Insert one more — should evict, staying at 64
+        let extra = Hash256::from_bytes([99; 32]);
+        tracker.store_valid((lcl, extra, 0), true);
+        assert_eq!(tracker.sizes().valid_cache, 64);
     }
 }

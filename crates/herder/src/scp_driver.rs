@@ -321,8 +321,6 @@ impl ScpDriver {
             return cached;
         }
 
-        // Bound cache size (evict one if >= 64)
-        // Note: valid_cache is small enough that this simple approach works
         let network_id = NetworkId(self.network_id);
 
         // prepare_for_apply validates XDR structure, fees, sort order, dedup
