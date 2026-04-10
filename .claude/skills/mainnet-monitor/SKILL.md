@@ -129,10 +129,10 @@ skill file.
 ```
 Check the henyey mainnet monitor log at ~/data/<session-id>/logs/monitor.log.
 
-CHECKS:
+HEALTH CHECKS:
 (1) Log scan — run: tail -n 500 ~/data/<session-id>/logs/monitor.log. Scan for: hash mismatches ("hash mismatch", "HashMismatch", differing expected/actual hashes), panics/crashes ("panic", "thread.*panicked", "SIGABRT", "SIGSEGV"), ERROR-level log lines, assertion failures ("assertion failed").
 (2) Ledger progression — from the last 2+ Heartbeat lines, verify the ledger number is advancing. If the same ledger appears for 10+ minutes, flag as STUCK.
-(3) Process alive — run: pgrep -af 'henyey.*run'. If not running, restart: RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey --mainnet run -c <CONFIG> > ~/data/<session-id>/logs/monitor.log 2>&1 &
+(3) Process alive — run: pgrep -af 'henyey.*run'. If not running, restart: RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey --mainnet run <RUN_FLAGS> -c <CONFIG> > ~/data/<session-id>/logs/monitor.log 2>&1 &
 (4) Memory — run: ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1) and convert to MB. If RSS > 12 GB, flag HIGH MEMORY. If RSS > 16 GB or free memory < 4 GB, restart the node.
 (5) Disk — run: df -h ~/data | tail -1. If usage > 85%, flag LOW DISK.
 (6) Session disk — run: du -sh ~/data/<session-id>/ and du -sh ~/data/mainnet/. If combined > 200 GB, flag SESSION DISK HIGH.
@@ -141,18 +141,29 @@ CHECKS:
 (9) OBSRVR Radar (validator mode only) — get public key from: curl -s http://localhost:11627/info (extract public_key). Then: curl -s https://radar.withobsrvr.com/api/v1/nodes/<PUBLIC_KEY>. Check: isValidating (if false and node running > 30 min, flag NOT VALIDATING), validating24HoursPercentage (if < 50 and running > 6 hours, flag LOW VALIDATION RATE), lag (if > 500, flag HIGH LAG). If API errors, note but don't flag.
 
 REMOTE SYNC & REDEPLOY:
-(10) Remote sync — run: git fetch origin main && git rev-parse HEAD && git rev-parse origin/main. If they differ (origin/main is ahead): (a) git pull --rebase, (b) CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey, (c) if build succeeds: kill the node (kill <PID>, wait 5s, kill -9 if needed), restart with same command from check (3), report: DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>, (d) if build fails: report BUILD FAILED, do NOT restart — the old binary is still running. Investigate the build error. If HEAD == origin/main: no action (already up to date).
-  DEPLOY REGRESSION: If the node fails to catch up or close ledgers after a deploy (e.g. event loop frozen for >5 min, no heartbeat progression for >10 min), this is a regression introduced by the new commits. Do NOT roll back. Instead: (a) identify which commit range was deployed, (b) bisect or inspect the diff to find the offending change, (c) fix the regression on main, (d) rebuild and redeploy the fix. The node may be down during investigation — that is acceptable. Rolling back masks bugs and delays fixes.
+(10) Remote sync — run: git fetch origin main. If in detached HEAD state (git symbolic-ref HEAD fails), run git checkout main first. Then compare: git rev-parse HEAD vs git rev-parse origin/main. If they differ (origin/main is ahead): (a) check CI status on origin/main — run: gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'. If any recent run has conclusion "failure", do NOT deploy — report: DEPLOY SKIPPED (CI failing). (b) Otherwise: git pull --rebase, (c) CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey, (d) if build succeeds: kill the node (kill <PID>, wait 5s, kill -9 if needed), restart with same command from check (3), report: DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>, (e) if build fails: report BUILD FAILED, do NOT restart — the old binary is still running. Investigate the build error. If HEAD == origin/main: no action (already up to date).
+
+DEPLOY REGRESSION POLICY:
+If the node fails to catch up or close ledgers after a deploy (e.g. event loop frozen for >5 min, no heartbeat progression for >10 min), this is a regression introduced by the new commits. Do NOT roll back. Instead: (a) identify which commit range was deployed, (b) bisect or inspect the diff to find the offending change, (c) fix the regression on main, (d) rebuild and redeploy the fix. The node may be down during investigation — that is acceptable. Rolling back masks bugs and delays fixes.
 
 CI OBSERVABILITY:
-(11) CI observability — run: gh run list --limit 5 --json databaseId,name,status,conclusion,headSha,createdAt --jq '.[] | "\(.name)|\(.status)|\(.conclusion)|\(.headSha[:8])|\(.databaseId)|\(.createdAt)"'. Scan for completed runs with conclusion "failure" created within the last 2 hours. If failures found: (a) gh run view <ID> --log-failed 2>&1 | tail -40, (b) categorize: build error, test failure, timeout, infrastructure, (c) if fixable code issue: investigate, fix, cargo test --all, commit, push, report: CI FIX — <workflow> failed on <sha>, fixed in <commit>, (d) if infrastructure/flaky: note but don't act. If all recent runs passing: no action.
+(11) CI observability — run: gh run list --limit 5 --json databaseId,name,status,conclusion,headSha,createdAt --jq '.[] | "\(.name)|\(.status)|\(.conclusion)|\(.headSha[:8])|\(.databaseId)|\(.createdAt)"'. Scan for completed runs with conclusion "failure". Compare createdAt with current UTC time (date -u +%Y-%m-%dT%H:%M:%SZ) — only investigate failures from the last 2 hours. For each failure: (a) gh run view <ID> --log-failed 2>&1 | tail -40, (b) categorize: build error, test failure, timeout, infrastructure, (c) investigate root cause and fix the code — whether it's a code bug, flaky test, or infrastructure issue. For flaky tests: fix the flakiness (increase timeout, add retry, fix the race). For infrastructure: fix the workflow config. (d) cargo test --all, commit, push, report: CI FIX — <workflow> failed on <sha>, fixed in <commit>. The goal is all-green CI — no persistent failures are acceptable.
 
 INVESTIGATION: For ANY anomaly, investigate to root cause — read source code, check logs, trace code paths. Never dismiss as "expected". See the mainnet-monitor skill's Resource Investigation sections for detailed procedures.
 
 BUG FIX WORKFLOW: If a hash mismatch, error, or crash is found: (1) identify failing ledger and error type, (2) reproduce offline: ~/data/<session-id>/cargo-target/release/henyey --mainnet verify-execution --from LEDGER --to LEDGER --stop-on-error --show-diff --cache-dir ~/data/<session-id>/cache, (3) write a failing unit test, (4) fix the code, (5) verify test passes, (6) cargo test --all, (7) commit with imperative message, (8) git push (if rejected: git pull --rebase && git push), (9) /review-fix --apply, (10) rebuild: CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release, (11) restart node with same command from check (3), (12) report: ledger, error type, commit hash, summary.
 
-OUTPUT: If healthy, print one line:
-MONITOR OK — L<ledger> — <timestamp> — mode: <MODE> — session: <session-id> — mem: <RSS_MB>MB (allocated: <alloc>MB, resident: <resident>MB, frag: <pct>%) — components: <heap>MB heap + <mmap>MB mmap, unaccounted: <sign><unaccounted>MB — disk: <used>/<total> (<pct>%) — session+data: <size> — rpc: <healthy oldestL=X latestL=Y window=Z | N/A> — obsrvr: <validating=Y/N val24h=pct% lag=N | N/A> — deploy: <up-to-date | pulled N commits> — ci: <all green | WORKFLOW failed>
+OUTPUT: Print a multiline status report:
+MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
+  node:   mode=<MODE> session=<session-id> pid=<PID>
+  mem:    <RSS_MB>MB rss | alloc=<alloc>MB resident=<resident>MB frag=<pct>%
+          heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB
+  disk:   <used>/<total> (<pct>%) | session+data=<size>
+  rpc:    <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
+  obsrvr: validating=<Y/N> val24h=<pct>% lag=<N>
+  deploy: <up-to-date | pulled N commits (old..new) | SKIPPED (reason)>
+  ci:     <all green | WORKFLOW failed — investigating>
+Use WARNING for threshold breaches. Use ACTION when a corrective action was taken (restart, deploy, fix).
 ```
 
 ## Bug Fix Workflow
