@@ -201,6 +201,15 @@ pub enum QuorumTrackerError {
     ExpandFailed,
 }
 
+/// Errors returned by [`TransitiveQuorumTracker::expand`].
+#[derive(Debug, thiserror::Error)]
+pub enum ExpandError {
+    #[error("node not found in quorum map")]
+    NodeNotFound,
+    #[error("node already has a different quorum set")]
+    AlreadyExpanded,
+}
+
 /// Tracks the transitive quorum set and path information.
 ///
 /// The transitive quorum set includes all nodes reachable through the quorum
@@ -252,14 +261,21 @@ impl QuorumTracker {
     }
 
     /// Expand the quorum map for a node using its quorum set.
-    pub fn expand(&mut self, node_id: &NodeId, quorum_set: ScpQuorumSet) -> bool {
+    pub fn expand(
+        &mut self,
+        node_id: &NodeId,
+        quorum_set: ScpQuorumSet,
+    ) -> Result<(), ExpandError> {
         let (node_distance, closest_validators) = {
             let Some(node_info) = self.quorum.get_mut(node_id) else {
-                return false;
+                return Err(ExpandError::NodeNotFound);
             };
 
             if let Some(ref existing) = node_info.quorum_set {
-                return existing == &quorum_set;
+                if existing == &quorum_set {
+                    return Ok(());
+                }
+                return Err(ExpandError::AlreadyExpanded);
             }
 
             node_info.quorum_set = Some(quorum_set.clone());
@@ -306,7 +322,11 @@ impl QuorumTracker {
             }
         });
 
-        ok
+        if ok {
+            Ok(())
+        } else {
+            Err(ExpandError::AlreadyExpanded)
+        }
     }
 
     /// Rebuild the transitive quorum using a quorum-set lookup function.
@@ -336,7 +356,7 @@ impl QuorumTracker {
                     for_each_quorum_node(&qset, &mut |member| {
                         backlog.push_back(member.clone());
                     });
-                    if !self.expand(&node, qset) {
+                    if let Err(_) = self.expand(&node, qset) {
                         return Err(QuorumTrackerError::ExpandFailed);
                     }
                 }
@@ -483,7 +503,7 @@ mod tests {
         let qset = make_quorum_set(vec![local.clone(), node_b.clone(), node_c.clone()], 2);
 
         let mut tracker = QuorumTracker::new(local.clone());
-        assert!(tracker.expand(&local, qset));
+        tracker.expand(&local, qset).unwrap();
 
         assert!(tracker.is_node_definitely_in_quorum(&local));
         assert!(tracker.is_node_definitely_in_quorum(&node_b));
@@ -536,9 +556,9 @@ mod tests {
         let qset_conflict = make_quorum_set(vec![node_b.clone()], 1);
 
         let mut tracker = QuorumTracker::new(local.clone());
-        assert!(tracker.expand(&local, qset_local));
-        assert!(tracker.expand(&node_b, qset_b));
-        assert!(!tracker.expand(&node_b, qset_conflict));
+        tracker.expand(&local, qset_local).unwrap();
+        tracker.expand(&node_b, qset_b).unwrap();
+        assert!(tracker.expand(&node_b, qset_conflict).is_err());
     }
 
     #[test]
@@ -550,9 +570,9 @@ mod tests {
         let qset_b = make_quorum_set(vec![node_b.clone()], 1);
 
         let mut tracker = QuorumTracker::new(local.clone());
-        assert!(tracker.expand(&local, qset_local));
-        assert!(tracker.expand(&node_b, qset_b.clone()));
-        assert!(tracker.expand(&node_b, qset_b));
+        tracker.expand(&local, qset_local).unwrap();
+        tracker.expand(&node_b, qset_b.clone()).unwrap();
+        tracker.expand(&node_b, qset_b).unwrap();
     }
 
     #[test]
@@ -596,7 +616,7 @@ mod tests {
         let qset_local = make_quorum_set_with_inners(vec![local.clone()], vec![inner], 1);
 
         let mut tracker = QuorumTracker::new(local.clone());
-        assert!(tracker.expand(&local, qset_local));
+        tracker.expand(&local, qset_local).unwrap();
 
         assert!(tracker.is_node_definitely_in_quorum(&node_b));
         assert!(tracker.is_node_definitely_in_quorum(&node_c));

@@ -576,7 +576,7 @@ impl Herder {
         self.scp_driver
             .store_quorum_set(node_id, quorum_set.clone());
         let mut tracker = self.quorum_tracker.write();
-        if !tracker.expand(node_id, quorum_set.clone()) {
+        if tracker.expand(node_id, quorum_set.clone()).is_err() {
             if let Err(err) = tracker.rebuild(|id| self.scp_driver.get_quorum_set(id)) {
                 warn!(error = %err, "Failed to rebuild quorum tracker");
             }
@@ -2365,7 +2365,8 @@ mod tests {
         herder
             .quorum_tracker
             .write()
-            .expand(&local_node_id, quorum_set);
+            .expand(&local_node_id, quorum_set)
+            .unwrap();
 
         let tracking = herder.tracking_slot(); // 101
 
@@ -2462,7 +2463,8 @@ mod tests {
         herder
             .quorum_tracker
             .write()
-            .expand(&other_node_id, quorum_set);
+            .expand(&other_node_id, quorum_set)
+            .unwrap();
 
         let tracking = herder.tracking_slot(); // 101
 
@@ -2512,7 +2514,8 @@ mod tests {
         herder
             .quorum_tracker
             .write()
-            .expand(&other_node_id, quorum_set);
+            .expand(&other_node_id, quorum_set)
+            .unwrap();
 
         let tracking = herder.tracking_slot(); // 101
 
@@ -2560,7 +2563,8 @@ mod tests {
         herder
             .quorum_tracker
             .write()
-            .expand(&other_node_id, quorum_set);
+            .expand(&other_node_id, quorum_set)
+            .unwrap();
 
         // Simulate losing sync: force herder back to Syncing
         herder.set_state(HerderState::Syncing);
@@ -3124,7 +3128,8 @@ mod tests {
         herder
             .quorum_tracker
             .write()
-            .expand(&other_node_id, quorum_set);
+            .expand(&other_node_id, quorum_set)
+            .unwrap();
 
         let tracking = herder.tracking_slot(); // 101
 

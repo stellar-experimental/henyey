@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Error returned when disconnecting a peer fails.
+#[derive(Debug, thiserror::Error)]
+pub enum DisconnectError {
+    #[error("overlay not available")]
+    OverlayUnavailable,
+    #[error("peer not found")]
+    PeerNotFound,
+}
+
 impl App {
     pub async fn peer_snapshots(&self) -> Vec<PeerSnapshot> {
         match self.overlay().await {
@@ -26,11 +35,16 @@ impl App {
         overlay.connect(&addr).await.map_err(|e| anyhow::anyhow!(e))
     }
 
-    pub async fn disconnect_peer(&self, peer_id: &PeerId) -> bool {
-        let Some(overlay) = self.overlay().await else {
-            return false;
-        };
-        overlay.disconnect(peer_id).await
+    pub async fn disconnect_peer(&self, peer_id: &PeerId) -> Result<(), DisconnectError> {
+        let overlay = self
+            .overlay()
+            .await
+            .ok_or(DisconnectError::OverlayUnavailable)?;
+        if overlay.disconnect(peer_id).await {
+            Ok(())
+        } else {
+            Err(DisconnectError::PeerNotFound)
+        }
     }
 
     pub async fn ban_peer(&self, peer_id: PeerId) -> anyhow::Result<()> {

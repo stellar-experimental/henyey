@@ -25,7 +25,11 @@ pub(crate) async fn start_survey_collecting_handler(
     if !survey_booted(&state).await {
         return survey_unavailable();
     }
-    let ok = state.app.start_survey_collecting(params.nonce).await;
+    let ok = state
+        .app
+        .start_survey_collecting(params.nonce)
+        .await
+        .is_ok();
     survey_response(
         ok,
         "Requested network to start survey collecting.",
@@ -39,7 +43,7 @@ pub(crate) async fn stop_survey_collecting_handler(
     if !survey_booted(&state).await {
         return survey_unavailable();
     }
-    let ok = state.app.stop_survey_collecting().await;
+    let ok = state.app.stop_survey_collecting().await.is_ok();
     survey_response(
         ok,
         "Requested network to stop survey collecting.",

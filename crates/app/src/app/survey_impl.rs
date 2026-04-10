@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// Error returned when stopping a survey fails.
+#[derive(Debug, thiserror::Error)]
+pub enum SurveyStopError {
+    #[error("no active survey to stop")]
+    NoActiveSurvey,
+}
+
 impl App {
     pub async fn survey_report(&self) -> SurveyReport {
         let (phase, nonce, local_node, inbound_peers, outbound_peers) = {
@@ -65,19 +72,19 @@ impl App {
         }
     }
 
-    pub async fn start_survey_collecting(&self, nonce: u32) -> bool {
+    pub async fn start_survey_collecting(&self, nonce: u32) -> anyhow::Result<()> {
         let ledger_num = self.survey_local_ledger().await;
         self.broadcast_survey_start(nonce, ledger_num).await
     }
 
-    pub async fn stop_survey_collecting(&self) -> bool {
+    pub async fn stop_survey_collecting(&self) -> Result<(), SurveyStopError> {
         let ledger_num = self.survey_local_ledger().await;
         let nonce = { self.survey_data.read().await.nonce() };
         let Some(nonce) = nonce else {
-            return false;
+            return Err(SurveyStopError::NoActiveSurvey);
         };
         self.broadcast_survey_stop(nonce, ledger_num).await;
-        true
+        Ok(())
     }
 
     pub async fn stop_survey_reporting(&self) {
@@ -309,39 +316,33 @@ impl App {
 
         self.broadcast_survey_message(StellarMessage::TimeSlicedSurveyRequest(signed))
             .await
+            .is_ok()
     }
 
-    async fn broadcast_survey_start(&self, nonce: u32, ledger_num: u32) -> bool {
+    async fn broadcast_survey_start(&self, nonce: u32, ledger_num: u32) -> anyhow::Result<()> {
         let start = TimeSlicedSurveyStartCollectingMessage {
             surveyor_id: self.local_node_id(),
             nonce,
             ledger_num,
         };
-        let start_bytes = match start.to_xdr(stellar_xdr::curr::Limits::none()) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to encode survey start message");
-                return false;
-            }
-        };
+        let start_bytes = start
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map_err(|e| anyhow::anyhow!("Failed to encode survey start message: {e}"))?;
         let signature = self.sign_survey_message(&start_bytes);
         let signed = stellar_xdr::curr::SignedTimeSlicedSurveyStartCollectingMessage {
             signature,
             start_collecting: start.clone(),
         };
 
-        let sent = self
-            .broadcast_survey_message(StellarMessage::TimeSlicedSurveyStartCollecting(signed))
-            .await;
-        if sent {
-            self.survey_results
-                .write()
-                .await
-                .entry(nonce)
-                .or_insert_with(HashMap::new);
-            self.start_local_survey_collecting(&start).await;
-        }
-        sent
+        self.broadcast_survey_message(StellarMessage::TimeSlicedSurveyStartCollecting(signed))
+            .await?;
+        self.survey_results
+            .write()
+            .await
+            .entry(nonce)
+            .or_insert_with(HashMap::new);
+        self.start_local_survey_collecting(&start).await;
+        Ok(())
     }
 
     async fn broadcast_survey_stop(&self, nonce: u32, ledger_num: u32) {
@@ -371,18 +372,17 @@ impl App {
         self.stop_local_survey_collecting(&stop).await;
     }
 
-    async fn broadcast_survey_message(&self, message: StellarMessage) -> bool {
-        let Some(overlay) = self.overlay().await else {
-            return false;
-        };
+    async fn broadcast_survey_message(&self, message: StellarMessage) -> anyhow::Result<()> {
+        let overlay = self
+            .overlay()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Overlay not available"))?;
 
-        match overlay.broadcast(message).await {
-            Ok(_) => true,
-            Err(e) => {
-                tracing::debug!(error = %e, "Failed to broadcast survey message");
-                false
-            }
-        }
+        overlay
+            .broadcast(message)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to broadcast survey message: {e}"))
     }
 
     async fn ensure_survey_secret(&self, nonce: u32) -> CurveSecretKey {

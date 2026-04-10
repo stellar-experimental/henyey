@@ -112,12 +112,12 @@ pub(crate) async fn droppeer_handler(
     };
 
     let ban_requested = params.ban.unwrap_or(0) == 1;
-    if !state.app.disconnect_peer(&peer_id).await {
+    if let Err(e) = state.app.disconnect_peer(&peer_id).await {
         (
             StatusCode::NOT_FOUND,
             Json(SurveyCommandResponse {
                 success: false,
-                message: "Peer not found".to_string(),
+                message: format!("{e}"),
             }),
         )
     } else {
