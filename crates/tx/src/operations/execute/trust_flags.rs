@@ -2943,4 +2943,238 @@ mod tests {
             other => panic!("unexpected: {:?}", other),
         }
     }
+
+    /// AllowTrust revoke returns OpTooManySponsoring (not LowReserve) when the
+    /// claimable balance sponsor's num_sponsoring is at u32::MAX.
+    ///
+    /// Non-sandwich path: the trustor owns the pool share trustline directly
+    /// (no entry sponsor) and has num_sponsoring == u32::MAX.
+    #[test]
+    fn test_allow_trust_revoke_too_many_sponsoring_non_sandwich() {
+        use crate::test_utils::create_test_account_with_sponsorship;
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(200);
+        let trustor_id = create_test_account_id(201);
+        let other_issuer_id = create_test_account_id(202);
+
+        // Issuer needs AUTH_REQUIRED | AUTH_REVOCABLE
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
+        ));
+        // Trustor: num_sponsoring == u32::MAX so any +1 would overflow
+        state.create_account(create_test_account_with_sponsorship(
+            trustor_id.clone(),
+            100_000_000,
+            4,        // num_sub_entries (2 asset TLs + 1 pool share TL × multiplier 2)
+            0,        // num_sponsored
+            u32::MAX, // num_sponsoring — at the limit
+        ));
+        state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"AAA\0"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"BBB\0"),
+            issuer: other_issuer_id.clone(),
+        });
+
+        let pool_id = PoolId(Hash([200u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            2000,
+            500,
+            1,
+        ));
+
+        // Asset trustlines
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"AAA\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"BBB\0"),
+                issuer: other_issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        // Pool share trustline with non-zero balance
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        // No sponsorship sandwich — cb_sponsoring_acc_id IS the trustor
+        let op = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: AssetCode::CreditAlphanum4(AssetCode4(*b"AAA\0")),
+            authorize: 0,
+        };
+
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result, OperationResult::OpTooManySponsoring),
+            "Expected OpTooManySponsoring, got {:?}",
+            result
+        );
+    }
+
+    /// AllowTrust revoke returns OpTooManySponsoring (not LowReserve) when a
+    /// sandwich sponsor's num_sponsoring is at u32::MAX.
+    ///
+    /// Sandwich path: the trustor is in a sponsorship sandwich; the sandwich
+    /// sponsor exists but has num_sponsoring == u32::MAX.
+    #[test]
+    fn test_allow_trust_revoke_too_many_sponsoring_sandwich() {
+        use crate::test_utils::create_test_account_with_sponsorship;
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(210);
+        let trustor_id = create_test_account_id(211);
+        let other_issuer_id = create_test_account_id(212);
+        let sandwich_sponsor_id = create_test_account_id(213);
+
+        // Issuer needs AUTH_REQUIRED | AUTH_REVOCABLE
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+        state.create_account(create_test_account(other_issuer_id.clone(), 100_000_000, 0));
+        // Sandwich sponsor: exists but num_sponsoring == u32::MAX
+        state.create_account(create_test_account_with_sponsorship(
+            sandwich_sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            u32::MAX,
+        ));
+
+        let asset_a = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"AAA\0"),
+            issuer: issuer_id.clone(),
+        });
+        let asset_b = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"BBB\0"),
+            issuer: other_issuer_id.clone(),
+        });
+
+        let pool_id = PoolId(Hash([210u8; 32]));
+        state.create_liquidity_pool(create_pool_entry(
+            pool_id.clone(),
+            asset_a.clone(),
+            asset_b.clone(),
+            1000,
+            2000,
+            500,
+            1,
+        ));
+
+        // Asset trustlines
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"AAA\0"),
+                issuer: issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+        state.create_trustline(create_trustline_v2(
+            trustor_id.clone(),
+            TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"BBB\0"),
+                issuer: other_issuer_id.clone(),
+            }),
+            5000,
+            100_000,
+            AUTHORIZED_FLAG,
+            1,
+        ));
+
+        // Pool share trustline with non-zero balance
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::PoolShare(pool_id.clone()),
+            balance: 100,
+            limit: i64::MAX,
+            flags: 0,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        if let Some(acct) = state.get_account_mut(&trustor_id) {
+            acct.num_sub_entries += 4;
+        }
+
+        // Push sandwich: trustor is sponsored by sandwich_sponsor_id
+        state.push_sponsorship(sandwich_sponsor_id.clone(), trustor_id.clone());
+
+        let op = AllowTrustOp {
+            trustor: trustor_id.clone(),
+            asset: AssetCode::CreditAlphanum4(AssetCode4(*b"AAA\0")),
+            authorize: 0,
+        };
+
+        let result = execute_allow_trust(
+            &op,
+            &issuer_id,
+            &TxIdentity {
+                source_id: &issuer_id,
+                seq: 1,
+                op_index: 0,
+            },
+            &mut state,
+            &context,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result, OperationResult::OpTooManySponsoring),
+            "Expected OpTooManySponsoring, got {:?}",
+            result
+        );
+    }
 }
