@@ -2151,4 +2151,42 @@ mod tests {
         let phase = make_v0_phase_with_fee(vec![tx], Some(100));
         assert!(!check_valid_classic(&phase, 100));
     }
+
+    /// Regression: get_invalid_tx_list must reject txs that fail check_valid_pre_seq_num
+    /// even when they would pass validate_basic.
+    #[test]
+    fn test_get_invalid_tx_list_rejects_inflation_via_pre_seq_num() {
+        let ctx = test_context(); // protocol 21
+        let bounds = CloseTimeBounds::exact();
+
+        // Build an Inflation tx — structurally valid for validate_basic but
+        // rejected by check_valid_pre_seq_num (OpNotSupported on p12+).
+        let source = MuxedAccount::Ed25519(Uint256([10u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Inflation,
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        let invalid = get_invalid_tx_list(&[envelope], &ctx, &bounds, None);
+        assert_eq!(invalid.len(), 1, "Inflation tx should be rejected at p21");
+    }
 }
