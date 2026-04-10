@@ -4337,6 +4337,18 @@ impl LedgerCloseContext<'_> {
         let (config_state_archival_changed, config_memory_cost_params_changed, upgrades_meta) =
             self.apply_upgrades_to_delta(prev_version, protocol_version)?;
 
+        // Reload soroban_fee_write_1kb from post-upgrade config state.
+        // The value cached at apply_transactions() time reflects pre-upgrade config;
+        // config-entry upgrades may have changed rent fee parameters. The refreshed
+        // value is used in LedgerCloseMetaExtV1.sorobanFeeWrite1KB.
+        if protocol_version_starts_from(self.prev_header.ledger_version, ProtocolVersion::V20) {
+            if let Ok(post_upgrade_config) =
+                crate::execution::load_soroban_config(&self.ltx, protocol_version)
+            {
+                self.soroban_fee_write_1kb = post_upgrade_config.rent_fee_config.fee_per_write_1kb;
+            }
+        }
+
         tracing::debug!(
             ledger_seq = self.close_data.ledger_seq,
             delta_count_final = self.ltx.num_changes(),
@@ -5026,10 +5038,13 @@ impl LedgerCloseContext<'_> {
         )?;
         let commit_close_us = commit_close_start.elapsed().as_micros() as u64;
 
-        // If protocol upgraded to a new major version, rebuild the module cache.
-        // Transactions in THIS ledger ran under prev_version; the NEXT ledger
-        // needs a cache matching the new protocol version.
-        if needs_upgrade_to_version(ProtocolVersion::V25, prev_version, protocol_version) {
+        // If protocol upgraded to a new version in the Soroban era, rebuild
+        // the module cache. Compilation artifacts are protocol-version-dependent,
+        // so any Soroban-era protocol change (V25→V26, V26→V27, etc.) requires
+        // a fresh cache for the NEXT ledger.
+        if prev_version != protocol_version
+            && protocol_version_starts_from(protocol_version, ProtocolVersion::V25)
+        {
             self.manager.rebuild_module_cache(protocol_version);
         }
 

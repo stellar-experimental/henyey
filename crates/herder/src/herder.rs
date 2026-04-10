@@ -1537,9 +1537,11 @@ impl Herder {
             close_time = lcl_close_time + 1;
         }
 
-        // 4. Upgrades: config + runtime, filtered against current state
+        // 4. Upgrades: config + runtime, filtered against current state.
+        // Use lcl_close_time (not candidate close_time) for upgrade parameter
+        // decisions to prevent one-ledger-early activation (#1166).
         let state = CurrentLedgerState {
-            close_time,
+            close_time: lcl_close_time,
             protocol_version: header.ledger_version,
             base_fee: header.base_fee,
             max_tx_set_size: header.max_tx_set_size,

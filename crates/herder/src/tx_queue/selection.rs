@@ -391,7 +391,9 @@ impl TransactionQueue {
             .copied()
             .unwrap_or(false);
 
-        let mut soroban_limit = self.config.max_soroban_resources.clone();
+        // Use 1x ledger-max Soroban limits for tx-set selection, not the 2x
+        // queue-admission limits. Falls back to static config if not yet seeded.
+        let mut soroban_limit = self.effective_selection_soroban_resources();
         if soroban_limit.is_none() {
             if let Some(byte_limit) = self.config.max_soroban_bytes {
                 let mut values = vec![i64::MAX; NUM_SOROBAN_TX_RESOURCES];

@@ -759,6 +759,20 @@ impl App {
             self.herder
                 .tx_queue()
                 .update_soroban_resource_limits(soroban_limit);
+
+            // Seed 1x ledger-max limits for tx-set selection (#1175).
+            let selection_limit = henyey_common::Resource::soroban_ledger_limits(
+                soroban_info.ledger_max_tx_count as i64,
+                soroban_info.ledger_max_instructions,
+                soroban_info.ledger_max_tx_size_bytes as i64,
+                soroban_info.ledger_max_read_bytes as i64,
+                soroban_info.ledger_max_write_bytes as i64,
+                soroban_info.ledger_max_read_ledger_entries as i64,
+                soroban_info.ledger_max_write_ledger_entries as i64,
+            );
+            self.herder
+                .tx_queue()
+                .update_soroban_selection_limits(selection_limit);
         }
     }
 
@@ -1790,6 +1804,20 @@ impl App {
             self.herder
                 .tx_queue()
                 .update_soroban_resource_limits(soroban_limit);
+
+            // Update 1x ledger-max limits for tx-set selection (#1175).
+            let selection_limit = henyey_common::Resource::soroban_ledger_limits(
+                info.ledger_max_tx_count as i64,
+                info.ledger_max_instructions,
+                info.ledger_max_tx_size_bytes as i64,
+                info.ledger_max_read_bytes as i64,
+                info.ledger_max_write_bytes as i64,
+                info.ledger_max_read_ledger_entries as i64,
+                info.ledger_max_write_ledger_entries as i64,
+            );
+            self.herder
+                .tx_queue()
+                .update_soroban_selection_limits(selection_limit);
         }
 
         let shift_result = self.herder.tx_queue().shift();

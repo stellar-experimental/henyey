@@ -965,7 +965,11 @@ impl ScpDriver {
         let current_version = lm_ref
             .map(|lm| lm.current_header().ledger_version)
             .unwrap_or(0);
-        let close_time = stellar_value.close_time.0;
+        // Use LCL close time (not candidate close_time) for upgrade validity
+        // to prevent one-ledger-early activation (#1166).
+        let lcl_close_time = lm_ref
+            .map(|lm| lm.current_header().scp_value.close_time.0)
+            .unwrap_or(0);
         let mut valid_upgrades = Vec::new();
         let mut last_upgrade_type = None;
         for upgrade_bytes in stellar_value.upgrades.iter() {
@@ -984,7 +988,7 @@ impl ScpDriver {
                 let valid_for_nomination = if let Some(ref upgrades_arc) = *self.upgrades.read() {
                     upgrades_arc
                         .read()
-                        .is_valid_for_nomination(&upgrade, close_time)
+                        .is_valid_for_nomination(&upgrade, lcl_close_time)
                 } else {
                     true // No upgrade config — can't filter
                 };
@@ -1020,7 +1024,8 @@ impl ScpDriver {
         };
         let current_version = lm_ref.current_header().ledger_version;
 
-        let close_time = stellar_value.close_time.0;
+        // Use LCL close time for upgrade validity, not candidate close_time (#1166).
+        let lcl_close_time = lm_ref.current_header().scp_value.close_time.0;
 
         for upgrade_bytes in stellar_value.upgrades.iter() {
             let upgrade = match LedgerUpgrade::from_xdr(
@@ -1037,7 +1042,7 @@ impl ScpDriver {
             if nomination {
                 if let Some(ref upgrades_arc) = *self.upgrades.read() {
                     let upgrades = upgrades_arc.read();
-                    if !upgrades.is_valid_for_nomination(&upgrade, close_time) {
+                    if !upgrades.is_valid_for_nomination(&upgrade, lcl_close_time) {
                         debug!(?upgrade, "Invalid upgrade for nomination");
                         return false;
                     }
@@ -2443,10 +2448,17 @@ impl SCPDriver for HerderScpCallback {
     }
 
     /// Parity: get the nomination timeout limit for upgrade stripping.
+    /// In stellar-core: mUpgrades.getParameters().mNominationTimeoutLimit
     fn get_upgrade_nomination_timeout_limit(&self) -> u32 {
-        // In stellar-core, this comes from mUpgrades.getParameters().mNominationTimeoutLimit
-        // Default is u32::MAX (never strip), which matches stellar-core default
-        u32::MAX
+        if let Some(ref upgrades_arc) = *self.driver.upgrades.read() {
+            upgrades_arc
+                .read()
+                .parameters()
+                .nomination_timeout_limit
+                .unwrap_or(u32::MAX)
+        } else {
+            u32::MAX
+        }
     }
 }
 
@@ -4127,6 +4139,45 @@ mod compare_tx_sets_tests {
         assert_eq!(
             partial_sv.tx_set_hash.0, tx_set_b.hash.0,
             "AUDIT-014: Missing tx set A should be filtered out, B should win"
+        );
+    }
+
+    #[test]
+    fn test_nomination_timeout_limit_wired_from_upgrades() {
+        use std::sync::Arc;
+
+        let driver = make_driver();
+        let callback = super::HerderScpCallback::new(Arc::new(driver));
+
+        // Default: no upgrades set → u32::MAX
+        assert_eq!(
+            callback.get_upgrade_nomination_timeout_limit(),
+            u32::MAX,
+            "Default should be u32::MAX when no upgrades configured"
+        );
+    }
+
+    #[test]
+    fn test_nomination_timeout_limit_reads_configured_value() {
+        use crate::upgrades::{UpgradeParameters, Upgrades};
+        use std::sync::Arc;
+
+        let driver = make_driver();
+
+        // Set up Upgrades with a specific timeout limit
+        let mut params = UpgradeParameters::default();
+        params.nomination_timeout_limit = Some(300);
+        let upgrades = Arc::new(parking_lot::RwLock::new(Upgrades::new(
+            UpgradeParameters::default(),
+        )));
+        upgrades.write().set_parameters(params, 26).unwrap();
+        driver.set_upgrades(upgrades);
+
+        let callback = super::HerderScpCallback::new(Arc::new(driver));
+        assert_eq!(
+            callback.get_upgrade_nomination_timeout_limit(),
+            300,
+            "Should read nomination_timeout_limit from Upgrades"
         );
     }
 }

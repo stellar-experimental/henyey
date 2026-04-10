@@ -606,6 +606,9 @@ pub struct TransactionQueue {
     /// Dynamic Soroban resource limits, updated after each ledger close from
     /// `SorobanNetworkInfo`.  Takes precedence over `config.max_queue_soroban_resources`.
     dynamic_queue_soroban_resources: RwLock<Option<Resource>>,
+    /// Dynamic Soroban resource limits for tx-set selection (1x ledger max).
+    /// Separate from queue-admission limits which use POOL_LEDGER_MULTIPLIER (2x).
+    dynamic_selection_soroban_resources: RwLock<Option<Resource>>,
 }
 
 /// Default ban depth (number of ledgers transactions stay banned).
@@ -656,6 +659,7 @@ impl TransactionQueue {
             #[cfg(any(test, feature = "test-utils"))]
             skip_fee_balance_check: std::sync::atomic::AtomicBool::new(false),
             dynamic_queue_soroban_resources: RwLock::new(None),
+            dynamic_selection_soroban_resources: RwLock::new(None),
         }
     }
 
@@ -689,6 +693,24 @@ impl TransactionQueue {
     /// the pool ledger multiplier.
     pub fn update_soroban_resource_limits(&self, resources: Resource) {
         *self.dynamic_queue_soroban_resources.write() = Some(resources);
+    }
+
+    /// Update Soroban resource limits for tx-set selection (1x ledger max).
+    /// Called alongside `update_soroban_resource_limits` but without the
+    /// POOL_LEDGER_MULTIPLIER scaling.
+    pub fn update_soroban_selection_limits(&self, resources: Resource) {
+        *self.dynamic_selection_soroban_resources.write() = Some(resources);
+    }
+
+    /// Return the effective Soroban resource limits for tx-set selection.
+    /// Uses the 1x ledger-max dynamic value, falling back to the config value.
+    pub fn effective_selection_soroban_resources(&self) -> Option<Resource> {
+        let dynamic = self.dynamic_selection_soroban_resources.read();
+        if dynamic.is_some() {
+            dynamic.clone()
+        } else {
+            self.config.max_soroban_resources.clone()
+        }
     }
 
     /// Return the effective Soroban resource limits for queue admission.
@@ -4095,6 +4117,32 @@ mod tests {
         queue.update_soroban_resource_limits(dynamic_limit.clone());
         let eff = queue.effective_queue_soroban_resources().unwrap();
         assert_eq!(eff, dynamic_limit);
+    }
+
+    /// Selection limits (1x ledger max) are separate from queue-admission limits (2x).
+    #[test]
+    fn test_selection_soroban_resources_separate_from_queue() {
+        let queue = TransactionQueue::with_defaults();
+
+        // Initially both are None.
+        assert!(queue.effective_selection_soroban_resources().is_none());
+        assert!(queue.effective_queue_soroban_resources().is_none());
+
+        // Set queue-admission limits (2x) and selection limits (1x).
+        let queue_limit = Resource::new(vec![200; NUM_SOROBAN_TX_RESOURCES]);
+        let selection_limit = Resource::new(vec![100; NUM_SOROBAN_TX_RESOURCES]);
+        queue.update_soroban_resource_limits(queue_limit.clone());
+        queue.update_soroban_selection_limits(selection_limit.clone());
+
+        // They should be independent.
+        assert_eq!(
+            queue.effective_queue_soroban_resources().unwrap(),
+            queue_limit
+        );
+        assert_eq!(
+            queue.effective_selection_soroban_resources().unwrap(),
+            selection_limit
+        );
     }
 
     /// Regression: soroban_ledger_limits() produces the canonical ResourceType ordering
