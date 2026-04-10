@@ -141,13 +141,16 @@ HEALTH CHECKS:
 (9) OBSRVR Radar (validator mode only) — get public key from: curl -s http://localhost:11627/info (extract public_key). Then: curl -s https://radar.withobsrvr.com/api/v1/nodes/<PUBLIC_KEY>. Check: isValidating (if false and node running > 30 min, flag NOT VALIDATING), validating24HoursPercentage (if < 50 and running > 6 hours, flag LOW VALIDATION RATE), lag (if > 500, flag HIGH LAG). If API errors, note but don't flag.
 
 REMOTE SYNC & REDEPLOY:
-(10) Remote sync — run: git fetch origin main. If in detached HEAD state (git symbolic-ref HEAD fails), run git checkout main first. Then compare: git rev-parse HEAD vs git rev-parse origin/main. If they differ (origin/main is ahead): (a) check CI status on origin/main — run: gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'. If any recent run has conclusion "failure", do NOT deploy — report: DEPLOY SKIPPED (CI failing). (b) Otherwise: git pull --rebase, (c) CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey, (d) if build succeeds: kill the node (kill <PID>, wait 5s, kill -9 if needed), restart with same command from check (3), report: DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>, (e) if build fails: report BUILD FAILED, do NOT restart — the old binary is still running. Investigate the build error. If HEAD == origin/main: no action (already up to date).
+(10) Remote sync — run: git fetch origin main. If in detached HEAD state (git symbolic-ref HEAD fails), run git checkout main first. Then compare: git rev-parse HEAD vs git rev-parse origin/main. If they differ (origin/main is ahead): (a) check CI status on origin/main — run: gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'. If any recent run has conclusion "failure", do NOT deploy — instead, immediately investigate and fix the CI failure using the CI FIX WORKFLOW below (check 11). After pushing the fix, wait for the next loop iteration to deploy. (b) If all conclusions are "success" (ignore "" for in-progress and "cancelled"): git pull --rebase, (c) CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey, (d) if build succeeds: kill the node (kill <PID>, wait 5s, kill -9 if needed), restart with same command from check (3), report: DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>, (e) if build fails: report BUILD FAILED, do NOT restart — the old binary is still running. Investigate the build error. If HEAD == origin/main: no action (already up to date).
 
 DEPLOY REGRESSION POLICY:
 If the node fails to catch up or close ledgers after a deploy (e.g. event loop frozen for >5 min, no heartbeat progression for >10 min), this is a regression introduced by the new commits. Do NOT roll back. Instead: (a) identify which commit range was deployed, (b) bisect or inspect the diff to find the offending change, (c) fix the regression on main, (d) rebuild and redeploy the fix. The node may be down during investigation — that is acceptable. Rolling back masks bugs and delays fixes.
 
-CI OBSERVABILITY:
-(11) CI observability — run: gh run list --limit 5 --json databaseId,name,status,conclusion,headSha,createdAt --jq '.[] | "\(.name)|\(.status)|\(.conclusion)|\(.headSha[:8])|\(.databaseId)|\(.createdAt)"'. Scan for completed runs with conclusion "failure". Compare createdAt with current UTC time (date -u +%Y-%m-%dT%H:%M:%SZ) — only investigate failures from the last 2 hours. For each failure: (a) gh run view <ID> --log-failed 2>&1 | tail -40, (b) categorize: build error, test failure, timeout, infrastructure, (c) investigate root cause and fix the code — whether it's a code bug, flaky test, or infrastructure issue. For flaky tests: fix the flakiness (increase timeout, add retry, fix the race). For infrastructure: fix the workflow config. (d) cargo test --all, commit, push, report: CI FIX — <workflow> failed on <sha>, fixed in <commit>. The goal is all-green CI — no persistent failures are acceptable.
+CI FIX WORKFLOW:
+(11) CI check — TWO levels of detection are required:
+  (11a) Run-level: gh run list --limit 5 --json databaseId,name,status,conclusion,headSha,createdAt --jq '.[] | "\(.name)|\(.status)|\(.conclusion)|\(.headSha[:8])|\(.databaseId)|\(.createdAt)"'. Scan for completed runs with conclusion "failure".
+  (11b) Job-level (CRITICAL — catches continue-on-error failures): For the latest completed Quickstart run, check individual jobs: gh run view <ID> --json jobs --jq '.jobs[] | select(.conclusion == "failure") | "\(.name)|\(.conclusion)"'. Workflows with continue-on-error jobs report run-level conclusion "success" even when jobs fail — you MUST check job-level conclusions to catch these. If any jobs have conclusion "failure", treat it the same as a run-level failure.
+Compare createdAt with current UTC time (date -u +%Y-%m-%dT%H:%M:%SZ) — only investigate failures from the last 2 hours. CI failures are bugs — they MUST be investigated and fixed immediately, never deferred to "next cycle". For each failure: (a) gh run view <ID> --log-failed 2>&1 | tail -80, (b) categorize: build error, test failure, timeout, infrastructure, (c) investigate root cause and fix the code — whether it's a code bug, flaky test, or infrastructure issue. For flaky tests: fix the flakiness (increase timeout, add retry, fix the race). For infrastructure: fix the workflow config. (d) cargo test --all, commit, push, report: CI FIX — <workflow> failed on <sha>, fixed in <commit>. The goal is all-green CI — no persistent failures are acceptable. If CI is red, this check takes priority over all other checks except process-alive.
 
 INVESTIGATION: For ANY anomaly, investigate to root cause — read source code, check logs, trace code paths. Never dismiss as "expected". See the mainnet-monitor skill's Resource Investigation sections for detailed procedures.
 
@@ -162,7 +165,7 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   rpc:    <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
   obsrvr: validating=<Y/N> val24h=<pct>% lag=<N>
   deploy: <up-to-date | pulled N commits (old..new) | SKIPPED (reason)>
-  ci:     <all green | WORKFLOW failed — investigating>
+  ci:     <all green | WORKFLOW failed — investigating | WORKFLOW jobs failed (continue-on-error) — investigating>
 Use WARNING for threshold breaches. Use ACTION when a corrective action was taken (restart, deploy, fix).
 ```
 
@@ -199,6 +202,43 @@ loop or discovered manually):
     with the same command from Startup step 5.
 12. **Report** what was fixed: ledger number, error type, commit hash,
     and a one-line summary.
+
+## CI Fix Workflow
+
+When a CI run completes with `conclusion: "failure"` (detected by
+check 11 in the loop, or by check 10 when a deploy is blocked):
+
+1. **Get logs**: `gh run view <ID> --log-failed 2>&1 | tail -80`.
+2. **Categorize** the failure:
+   - **Build error** — compilation failure, missing dependency
+   - **Test failure** — a test assertion failed
+   - **Flaky test** — test passes locally but fails intermittently in CI
+   - **Timeout** — job exceeded time limit
+   - **Infrastructure** — runner issue, network error, GitHub outage
+3. **Fix** based on category:
+   - **Build error**: Read the compiler error, fix the code, run
+     `cargo build --all` locally.
+   - **Test failure**: Reproduce locally with
+     `cargo test -p <crate> <test_name>`. Read the test and the code
+     it exercises. Fix the code (or the test if the test is wrong).
+   - **Flaky test**: Fix the flakiness — increase timeout, add retry
+     logic, fix the race condition. Do NOT disable or `#[ignore]` the
+     test.
+   - **Timeout**: Check if a test is doing too much work or hanging.
+     Fix the root cause.
+   - **Infrastructure**: Fix the workflow config in
+     `.github/workflows/`. If it's a transient GitHub outage, re-run
+     the job: `gh run rerun <ID> --failed`.
+4. **Verify locally**: `cargo test --all`.
+5. **Commit and push**: Follow CLAUDE.md commit guidelines.
+6. **Verify CI goes green**: `gh run list --limit 3` after push.
+   If the new run also fails, repeat from step 1.
+7. **Report**: `CI FIX — <workflow> failed on <sha>, root cause:
+   <description>, fixed in <commit>`.
+
+CI failures are treated with the same urgency as node errors. A red
+CI blocks deploys and means the codebase has a known defect. Do not
+defer, do not mark as "will investigate later".
 
 ## Resource Investigation
 
