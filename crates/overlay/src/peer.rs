@@ -524,8 +524,10 @@ impl Peer {
             )));
         }
 
-        // Port validation: XDR uses i32, but valid ports are u16 range (0-65535)
-        if hello.listening_port < 0 || hello.listening_port > u16::MAX as i32 {
+        // Port validation: XDR uses i32, but valid ports are 1-65535.
+        // Reject port 0 — matches stellar-core Peer::recvHello() which rejects
+        // listeningPort <= 0 to prevent poisoning peer gossip with ephemeral ports.
+        if hello.listening_port <= 0 || hello.listening_port > u16::MAX as i32 {
             return Err(OverlayError::InvalidMessage(format!(
                 "invalid listening port: {}",
                 hello.listening_port
