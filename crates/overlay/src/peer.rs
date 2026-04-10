@@ -28,6 +28,8 @@ use crate::{
     flow_control::{msg_body_size, FlowControlConfig},
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
+use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -241,7 +243,7 @@ impl Peer {
         };
 
         // Perform handshake
-        peer.handshake(timeout_secs).await?;
+        peer.handshake(timeout_secs, None).await?;
 
         Ok(peer)
     }
@@ -272,7 +274,7 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
         };
 
-        peer.handshake(timeout_secs).await?;
+        peer.handshake(timeout_secs, None).await?;
         Ok(peer)
     }
 
@@ -281,6 +283,7 @@ impl Peer {
         connection: Connection,
         local_node: LocalNode,
         timeout_secs: u64,
+        banned_peers: Arc<RwLock<HashSet<PeerId>>>,
     ) -> Result<Self> {
         debug!("Accepting peer from: {}", connection.remote_addr());
 
@@ -304,8 +307,8 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
         };
 
-        // Perform handshake
-        peer.handshake(timeout_secs).await?;
+        // Perform handshake (with ban check after HELLO for inbound)
+        peer.handshake(timeout_secs, Some(banned_peers)).await?;
 
         Ok(peer)
     }
@@ -320,7 +323,11 @@ impl Peer {
     ///
     /// After authentication, both sides exchange SEND_MORE_EXTENDED for flow
     /// control and GET_SCP_STATE to synchronize consensus state.
-    async fn handshake(&mut self, timeout_secs: u64) -> Result<()> {
+    async fn handshake(
+        &mut self,
+        timeout_secs: u64,
+        banned_peers: Option<Arc<RwLock<HashSet<PeerId>>>>,
+    ) -> Result<()> {
         self.state = PeerState::Handshaking;
         let handshake_start = std::time::Instant::now();
         debug!("Starting handshake with {}", self.connection.remote_addr());
@@ -334,6 +341,20 @@ impl Peer {
         } else {
             // --- Responder (inbound): Receive HELLO first, then reply ---
             self.recv_hello(timeout_secs).await?;
+
+            // Check ban status immediately after learning peer identity,
+            // before sending any response. Mirrors stellar-core's
+            // Peer::recvHello() which checks isBanned() before AUTH.
+            if let Some(ref banned) = banned_peers {
+                if banned.read().contains(&self.info.peer_id) {
+                    warn!(
+                        "Rejected banned inbound peer {} during handshake",
+                        self.info.peer_id
+                    );
+                    return Err(OverlayError::PeerBanned(self.info.peer_id.to_string()));
+                }
+            }
+
             self.send_hello().await?;
             self.recv_auth(timeout_secs).await?;
             self.send_auth_msg().await?;

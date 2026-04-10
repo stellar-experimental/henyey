@@ -316,7 +316,7 @@ impl OverlayManager {
 
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
-                                    match Peer::accept(connection, local_node, auth_timeout).await {
+                                    match Peer::accept(connection, local_node, auth_timeout, Arc::clone(&shared.banned_peers)).await {
                                         Ok(peer) => {
                                             Self::handle_accepted_inbound_peer(peer, shared, pool).await;
                                         }
