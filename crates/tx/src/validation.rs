@@ -786,9 +786,8 @@ fn has_hashx_signature(
     key: &stellar_xdr::curr::Uint256,
 ) -> bool {
     signatures.iter().any(|sig| {
-        if sig.signature.0.len() != 32 {
-            return false;
-        }
+        // No length restriction on HashX preimages — stellar-core accepts any
+        // length allowed by XDR and checks only sha256(preimage) == key.
         let expected_hint = [key.0[28], key.0[29], key.0[30], key.0[31]];
         if sig.hint.0 != expected_hint {
             return false;
@@ -2474,6 +2473,54 @@ mod tests {
         assert!(
             matches!(err, PreSeqNumError::SorobanInvalid(_)),
             "expected SorobanInvalid for dup footprint, got {err:?}"
+        );
+    }
+
+    /// AUDIT-074: HashX extra_signers must accept non-32-byte preimages.
+    #[test]
+    fn test_audit_074_hashx_extra_signer_non_32_byte_preimage() {
+        use henyey_common::Hash256;
+        use stellar_xdr::curr::{DecoratedSignature, Signature, SignatureHint, Uint256};
+
+        // 5-byte preimage "hello"
+        let preimage = b"hello";
+        let hash = Hash256::hash(preimage);
+        let key = Uint256(hash.0);
+        let hint = SignatureHint([key.0[28], key.0[29], key.0[30], key.0[31]]);
+
+        let sig = DecoratedSignature {
+            hint: hint.clone(),
+            signature: Signature(preimage.to_vec().try_into().unwrap()),
+        };
+
+        // Should match: sha256("hello") == key
+        assert!(
+            has_hashx_signature(&[sig.clone()], &key),
+            "5-byte HashX preimage should be accepted"
+        );
+
+        // 32-byte preimage should also still work
+        let preimage32 = [0xABu8; 32];
+        let hash32 = Hash256::hash(&preimage32);
+        let key32 = Uint256(hash32.0);
+        let hint32 = SignatureHint([key32.0[28], key32.0[29], key32.0[30], key32.0[31]]);
+        let sig32 = DecoratedSignature {
+            hint: hint32,
+            signature: Signature(preimage32.to_vec().try_into().unwrap()),
+        };
+        assert!(
+            has_hashx_signature(&[sig32], &key32),
+            "32-byte HashX preimage should still work"
+        );
+
+        // Wrong preimage should fail
+        let wrong_sig = DecoratedSignature {
+            hint,
+            signature: Signature(b"wrong".to_vec().try_into().unwrap()),
+        };
+        assert!(
+            !has_hashx_signature(&[wrong_sig], &key),
+            "Wrong preimage should be rejected"
         );
     }
 }
