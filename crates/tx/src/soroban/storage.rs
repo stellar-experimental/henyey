@@ -463,8 +463,7 @@ mod tests {
         storage.record_code_read(code_hash.clone(), Some(code.clone()));
 
         let retrieved = storage.get_code(&code_hash);
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), &code);
+        assert_eq!(retrieved.expect("expected Some"), &code);
 
         // Non-existent code
         let missing_hash = Hash([99u8; 32]);

@@ -1219,8 +1219,9 @@ mod tests {
 
         // Verify pool exists with trust_line_count=1
         let pool = state.get_liquidity_pool(&pool_id);
-        assert!(pool.is_some(), "Pool should exist after creating trustline");
-        let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool.unwrap().body;
+        let LiquidityPoolEntryBody::LiquidityPoolConstantProduct(cp) = &pool
+            .expect("Pool should exist after creating trustline")
+            .body;
         assert_eq!(
             cp.pool_shares_trust_line_count, 1,
             "Pool should have trust_line_count=1"
@@ -2212,8 +2213,7 @@ mod tests {
         };
 
         let result = execute_change_trust(&op, &source, &mut state, &context);
-        assert!(result.is_ok());
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpTooManySubentries => {
                 // Correct: combined cap enforced
             }

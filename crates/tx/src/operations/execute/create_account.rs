@@ -191,8 +191,7 @@ mod tests {
 
         // Verify destination was created
         let dest_acc = state.get_account(&dest_id);
-        assert!(dest_acc.is_some());
-        let dest_acc = dest_acc.unwrap();
+        let dest_acc = dest_acc.expect("expected Some");
         assert_eq!(dest_acc.balance, 20_000_000);
         assert_eq!(dest_acc.seq_num.0, (100_i64) << 32);
 
@@ -217,9 +216,7 @@ mod tests {
         };
 
         let result = execute_create_account(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
                 assert!(matches!(r, CreateAccountResult::AlreadyExist));
             }
@@ -243,9 +240,7 @@ mod tests {
         };
 
         let result = execute_create_account(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
                 assert!(matches!(r, CreateAccountResult::LowReserve));
             }
@@ -273,9 +268,7 @@ mod tests {
         };
 
         let result = execute_create_account(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
                 assert!(matches!(r, CreateAccountResult::Underfunded));
             }
@@ -312,9 +305,7 @@ mod tests {
         };
 
         let result = execute_create_account(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
                 assert!(
                     matches!(r, CreateAccountResult::Underfunded),
@@ -353,9 +344,7 @@ mod tests {
         };
 
         let result = execute_create_account(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
                 assert!(matches!(r, CreateAccountResult::Success));
             }
@@ -363,8 +352,13 @@ mod tests {
         }
 
         // Verify destination was created
-        assert!(state.get_account(&dest_id).is_some());
-        assert_eq!(state.get_account(&dest_id).unwrap().balance, 20_000_000);
+        assert_eq!(
+            state
+                .get_account(&dest_id)
+                .expect("account should exist")
+                .balance,
+            20_000_000
+        );
     }
 
     /// Test CreateAccount with sponsorship - sponsor pays reserve.
@@ -394,9 +388,7 @@ mod tests {
         };
 
         let result = execute_create_account(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
                 assert!(matches!(r, CreateAccountResult::Success), "got {:?}", r);
             }
@@ -431,9 +423,7 @@ mod tests {
         };
 
         let result = execute_create_account(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
                 assert!(
                     matches!(r, CreateAccountResult::LowReserve),
@@ -473,9 +463,7 @@ mod tests {
         };
 
         let result = execute_create_account(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
                 assert!(
                     matches!(r, CreateAccountResult::LowReserve),
@@ -703,8 +691,7 @@ mod tests {
         };
 
         let result = execute_create_account(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::CreateAccount(r)) => {
                 assert!(matches!(r, CreateAccountResult::Success), "got {:?}", r);
             }

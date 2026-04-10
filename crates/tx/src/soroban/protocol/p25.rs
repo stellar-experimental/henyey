@@ -336,8 +336,7 @@ mod tests {
         let snapshot = LedgerSnapshotAdapter::new(&state, current_ledger);
         let result = snapshot.get_local(&key).expect("get_local should succeed");
 
-        assert!(result.is_some(), "Entry with valid TTL should be returned");
-        let (entry, live_until) = result.unwrap();
+        let (entry, live_until) = result.expect("Entry with valid TTL should be returned");
         assert_eq!(live_until, Some(current_ledger + 100));
         assert!(matches!(entry.data, LedgerEntryData::ContractData(_)));
     }

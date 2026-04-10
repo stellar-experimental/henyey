@@ -403,9 +403,7 @@ mod tests {
         };
 
         let result = execute_manage_data(&op, &source_id, &mut state, &context);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
+        match result.expect("expected Ok") {
             OperationResult::OpInner(OperationResultTr::ManageData(r)) => {
                 assert!(matches!(r, ManageDataResult::LowReserve));
             }

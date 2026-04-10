@@ -574,8 +574,7 @@ mod tests {
         let master_signer = signers
             .iter()
             .find(|s| matches!(&s.key, SignerKey::Ed25519(k) if k.0 == master_key_bytes.0));
-        assert!(master_signer.is_some());
-        assert_eq!(master_signer.unwrap().weight, 10);
+        assert_eq!(master_signer.expect("expected Some").weight, 10);
     }
 
     #[test]

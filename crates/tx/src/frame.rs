@@ -1189,8 +1189,7 @@ mod tests {
 
         let hash = frame.compute_hash(&network).unwrap();
 
-        assert!(frame.cached_hash().is_some());
-        assert_eq!(frame.cached_hash().unwrap(), hash);
+        assert_eq!(frame.cached_hash().expect("expected Some"), hash);
     }
 
     #[test]
@@ -1272,8 +1271,7 @@ mod tests {
         let envelope = create_soroban_transaction_with_fees(200, 1000);
         let frame = TransactionFrame::from_owned(envelope);
         let refundable = frame.refundable_fee();
-        assert!(refundable.is_some());
-        assert_eq!(refundable.unwrap(), 200);
+        assert_eq!(refundable.expect("expected Some"), 200);
     }
 
     #[test]

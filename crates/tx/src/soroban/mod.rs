@@ -311,8 +311,7 @@ mod tests {
 
         // Key that exists
         let result = archive.get(&key).unwrap();
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().last_modified_ledger_seq, 100);
+        assert_eq!(result.expect("expected Some").last_modified_ledger_seq, 100);
 
         // Key that doesn't exist
         let other_key = LedgerKey::ContractData(LedgerKeyContractData {

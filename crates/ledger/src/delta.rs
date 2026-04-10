@@ -1547,8 +1547,9 @@ mod tests {
 
         // get_change should return Deleted
         let change = delta.get_change(&key);
-        assert!(change.is_some(), "deleted entry should be findable");
-        assert!(change.unwrap().is_deleted());
+        assert!(change
+            .expect("deleted entry should be findable")
+            .is_deleted());
 
         // dead_entries should contain the key
         let dead = delta.dead_entries();
