@@ -92,7 +92,7 @@ pub(crate) fn execute_allow_trust(
     }
 
     // Handle deauthorization: remove offers and redeem pool shares if revoking liabilities
-    if let Some(RemoveResult::LowReserve) = handle_deauthorization(
+    match handle_deauthorization(
         trustline.flags,
         new_flags,
         &op.trustor,
@@ -101,7 +101,13 @@ pub(crate) fn execute_allow_trust(
         state,
         _context,
     )? {
-        return Ok(make_allow_trust_result(AllowTrustResultCode::LowReserve));
+        Some(RemoveResult::LowReserve) => {
+            return Ok(make_allow_trust_result(AllowTrustResultCode::LowReserve));
+        }
+        Some(RemoveResult::TooManySponsoring) => {
+            return Ok(OperationResult::OpTooManySponsoring);
+        }
+        _ => {}
     }
 
     // Update the trustline
@@ -244,7 +250,7 @@ pub(crate) fn execute_set_trust_line_flags(
     }
 
     // Handle deauthorization: remove offers and redeem pool shares if revoking liabilities
-    if let Some(RemoveResult::LowReserve) = handle_deauthorization(
+    match handle_deauthorization(
         trustline.flags,
         new_flags,
         &op.trustor,
@@ -253,9 +259,15 @@ pub(crate) fn execute_set_trust_line_flags(
         state,
         _context,
     )? {
-        return Ok(make_set_flags_result(
-            SetTrustLineFlagsResultCode::LowReserve,
-        ));
+        Some(RemoveResult::LowReserve) => {
+            return Ok(make_set_flags_result(
+                SetTrustLineFlagsResultCode::LowReserve,
+            ));
+        }
+        Some(RemoveResult::TooManySponsoring) => {
+            return Ok(OperationResult::OpTooManySponsoring);
+        }
+        _ => {}
     }
 
     // Update the trustline
@@ -286,8 +298,8 @@ fn asset_from_code(code: &stellar_xdr::curr::AssetCode, issuer: &AccountId) -> A
 
 /// Handle deauthorization cleanup: remove offers and redeem pool share trustlines
 /// when revoking liabilities authorization. Returns `Some(RemoveResult::LowReserve)`
-/// if pool share redemption fails due to low reserve, `None` if no deauthorization
-/// occurred or it succeeded.
+/// or `Some(RemoveResult::TooManySponsoring)` if pool share redemption fails,
+/// `None` if no deauthorization occurred or it succeeded.
 fn handle_deauthorization(
     old_flags: u32,
     new_flags: u32,
@@ -303,8 +315,8 @@ fn handle_deauthorization(
     if was_authorized_to_maintain && !will_be_authorized_to_maintain {
         remove_offers_with_cleanup(state, trustor, asset);
         let result = redeem_pool_share_trustlines(state, context, trustor, asset, tx_id)?;
-        if result == RemoveResult::LowReserve {
-            return Ok(Some(RemoveResult::LowReserve));
+        if result != RemoveResult::Success {
+            return Ok(Some(result));
         }
     }
     Ok(None)
@@ -429,6 +441,7 @@ fn release_offer_liabilities(state: &mut LedgerStateManager, offer: &OfferEntry)
 enum RemoveResult {
     Success,
     LowReserve,
+    TooManySponsoring,
 }
 
 /// Generate a claimable balance ID for a pool share revocation.
@@ -658,15 +671,21 @@ fn redeem_into_claimable_balance(
             return Ok(RemoveResult::LowReserve);
         }
 
-        if state
-            .apply_entry_sponsorship_with_sponsor(
-                cb_ledger_key,
-                &sandwich_sponsor,
-                None, // claimable balances are not subentries
-                1,
-            )
-            .is_err()
-        {
+        if let Err(_) = state.apply_entry_sponsorship_with_sponsor(
+            cb_ledger_key,
+            &sandwich_sponsor,
+            None, // claimable balances are not subentries
+            1,
+        ) {
+            // Distinguish sponsoring capacity exhaustion from low reserve.
+            // stellar-core returns opTOO_MANY_SPONSORING when num_sponsoring
+            // would exceed u32::MAX.
+            let (num_sponsoring, _) = state
+                .sponsorship_counts_for_account(&sandwich_sponsor)
+                .unwrap_or((0, 0));
+            if num_sponsoring >= u32::MAX as i64 {
+                return Ok(RemoveResult::TooManySponsoring);
+            }
             return Ok(RemoveResult::LowReserve);
         }
     } else {
@@ -675,7 +694,7 @@ fn redeem_into_claimable_balance(
             .sponsorship_counts_for_account(cb_sponsoring_acc_id)
             .unwrap_or((0, 0));
         if num_sponsoring > u32::MAX as i64 - 1 {
-            panic!("no numSponsoring available for revoke");
+            return Ok(RemoveResult::TooManySponsoring);
         }
 
         state.set_entry_sponsor(cb_ledger_key, cb_sponsoring_acc_id.clone());
