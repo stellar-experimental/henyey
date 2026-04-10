@@ -134,6 +134,7 @@ impl TransactionQueue {
                     base_reserve: vc.base_reserve,
                     protocol_version: vc.protocol_version,
                     network_id: self.config.network_id,
+                    ledger_flags: vc.ledger_flags,
                 }
             };
             let close_time_bounds = crate::tx_set_utils::CloseTimeBounds::exact();

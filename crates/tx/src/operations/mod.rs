@@ -18,9 +18,10 @@ use stellar_xdr::curr::{
     ClawbackClaimableBalanceOp, ClawbackOp, CreateAccountOp, CreateClaimableBalanceOp,
     CreatePassiveSellOfferOp, ExtendFootprintTtlOp, InvokeHostFunctionOp, LedgerHeaderFlags,
     LedgerKey, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp, ManageDataOp,
-    ManageSellOfferOp, Operation, OperationBody, OperationType, PathPaymentStrictReceiveOp,
-    PathPaymentStrictSendOp, PaymentOp, RestoreFootprintOp, RevokeSponsorshipOp, SetOptionsOp,
-    SetTrustLineFlagsOp, SignerKey, TrustLineFlags, MASK_ACCOUNT_FLAGS_V17,
+    ManageSellOfferOp, MuxedAccount, Operation, OperationBody, OperationType,
+    PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, RestoreFootprintOp,
+    RevokeSponsorshipOp, SetOptionsOp, SetTrustLineFlagsOp, SignerKey, TrustLineFlags,
+    MASK_ACCOUNT_FLAGS_V17,
 };
 
 /// Extension trait for `stellar_xdr::curr::OperationType` providing Soroban classification
@@ -185,16 +186,16 @@ pub fn validate_operation(
         OperationBody::AllowTrust(inner) => {
             validate_allow_trust(inner, protocol_version, source_account)
         }
-        OperationBody::AccountMerge(_) => Ok(()), // No specific validation needed
-        OperationBody::Inflation => Ok(()),       // No validation needed
-        OperationBody::ManageData(inner) => validate_manage_data(inner),
+        OperationBody::AccountMerge(dest) => validate_account_merge(dest, source_account),
+        OperationBody::Inflation => Ok(()), // No validation needed
+        OperationBody::ManageData(inner) => validate_manage_data(inner, protocol_version),
         OperationBody::BumpSequence(inner) => validate_bump_sequence(inner),
         OperationBody::CreateClaimableBalance(inner) => {
             validate_create_claimable_balance(inner, protocol_version)
         }
         OperationBody::ClaimClaimableBalance(inner) => validate_claim_claimable_balance(inner),
         OperationBody::BeginSponsoringFutureReserves(inner) => {
-            validate_begin_sponsoring_future_reserves(inner)
+            validate_begin_sponsoring_future_reserves(inner, source_account)
         }
         OperationBody::EndSponsoringFutureReserves => Ok(()),
         OperationBody::RevokeSponsorship(inner) => {
@@ -592,12 +593,34 @@ fn validate_allow_trust(
     Ok(())
 }
 
+/// Validate AccountMerge operation.
+/// Mirrors stellar-core MergeOpFrame::doCheckValid.
+fn validate_account_merge(
+    dest: &MuxedAccount,
+    source_account: Option<&AccountId>,
+) -> std::result::Result<(), OperationValidationError> {
+    // Destination must not be the same as source (ACCOUNT_MERGE_MALFORMED)
+    if let Some(src) = source_account {
+        let dest_id = muxed_to_account_id(dest);
+        if *src == dest_id {
+            return Err(OperationValidationError::InvalidDestination);
+        }
+    }
+    Ok(())
+}
+
 /// Validate ManageData operation.
-fn validate_manage_data(op: &ManageDataOp) -> std::result::Result<(), OperationValidationError> {
-    // Data name must not be empty
-    if op.data_name.is_empty() {
+/// Mirrors stellar-core ManageDataOpFrame::doCheckValid.
+fn validate_manage_data(
+    op: &ManageDataOp,
+    _protocol_version: u32,
+) -> std::result::Result<(), OperationValidationError> {
+    // Data name must not be empty and must be a valid string
+    if op.data_name.is_empty()
+        || !is_string_valid(std::str::from_utf8(op.data_name.as_ref()).unwrap_or("\0"))
+    {
         return Err(OperationValidationError::InvalidDataValue(
-            "data name cannot be empty".to_string(),
+            "data name is empty or contains invalid characters".to_string(),
         ));
     }
     // Data value (if present) must be <= 64 bytes
@@ -684,10 +707,17 @@ fn validate_claim_claimable_balance(
 }
 
 /// Validate BeginSponsoringFutureReserves operation.
+/// Mirrors stellar-core BeginSponsoringFutureReservesOpFrame::doCheckValid.
 fn validate_begin_sponsoring_future_reserves(
-    _op: &BeginSponsoringFutureReservesOp,
+    op: &BeginSponsoringFutureReservesOp,
+    source_account: Option<&AccountId>,
 ) -> std::result::Result<(), OperationValidationError> {
-    // Account ID validation is handled by XDR
+    // Sponsored account must not be the source (BEGIN_SPONSORING_FUTURE_RESERVES_MALFORMED)
+    if let Some(src) = source_account {
+        if *src == op.sponsored_id {
+            return Err(OperationValidationError::InvalidDestination);
+        }
+    }
     Ok(())
 }
 
@@ -1655,14 +1685,21 @@ mod tests {
             data_name: stellar_xdr::curr::String64::try_from(b"test".to_vec()).unwrap(),
             data_value: Some(b"value".to_vec().try_into().unwrap()),
         };
-        assert!(validate_manage_data(&valid).is_ok());
+        assert!(validate_manage_data(&valid, 21).is_ok());
 
         // Delete operation (None value) is also valid
         let delete = ManageDataOp {
             data_name: stellar_xdr::curr::String64::try_from(b"test".to_vec()).unwrap(),
             data_value: None,
         };
-        assert!(validate_manage_data(&delete).is_ok());
+        assert!(validate_manage_data(&delete, 21).is_ok());
+
+        // Invalid string (contains null byte)
+        let invalid_name = ManageDataOp {
+            data_name: stellar_xdr::curr::String64::try_from(b"te\x00st".to_vec()).unwrap(),
+            data_value: None,
+        };
+        assert!(validate_manage_data(&invalid_name, 21).is_err());
     }
 
     /// Test all operation types have names.
@@ -1765,5 +1802,45 @@ mod tests {
 
         let err = OperationValidationError::InvalidDestination;
         assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_validate_account_merge_self_merge() {
+        let src = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        assert!(validate_account_merge(&dest, Some(&src)).is_err());
+    }
+
+    #[test]
+    fn test_validate_account_merge_valid() {
+        let src = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let dest = MuxedAccount::Ed25519(Uint256([2u8; 32]));
+        assert!(validate_account_merge(&dest, Some(&src)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_account_merge_no_source() {
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        // Without source_account, check is skipped
+        assert!(validate_account_merge(&dest, None).is_ok());
+    }
+
+    #[test]
+    fn test_validate_begin_sponsoring_self_sponsorship() {
+        let src = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let op = BeginSponsoringFutureReservesOp {
+            sponsored_id: src.clone(),
+        };
+        assert!(validate_begin_sponsoring_future_reserves(&op, Some(&src)).is_err());
+    }
+
+    #[test]
+    fn test_validate_begin_sponsoring_valid() {
+        let src = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let other = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])));
+        let op = BeginSponsoringFutureReservesOp {
+            sponsored_id: other,
+        };
+        assert!(validate_begin_sponsoring_future_reserves(&op, Some(&src)).is_ok());
     }
 }

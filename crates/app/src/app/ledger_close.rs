@@ -1731,6 +1731,10 @@ impl App {
                     base_reserve: result.header.base_reserve,
                     protocol_version: result.header.ledger_version,
                     network_id: NetworkId(self.network_id()),
+                    ledger_flags: match &result.header.ext {
+                        stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+                        _ => 0,
+                    },
                 };
                 let fee_provider = self.herder.tx_queue().get_fee_balance_provider();
                 let invalid = get_invalid_tx_list(

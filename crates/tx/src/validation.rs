@@ -2126,4 +2126,257 @@ mod tests {
             "errors should include InvalidStructure mentioning non-Soroban: {errors:?}"
         );
     }
+
+    // --- check_valid_pre_seq_num tests ---
+
+    #[test]
+    fn test_check_valid_pre_seq_num_valid_classic_tx() {
+        let frame = create_test_frame();
+        assert!(check_valid_pre_seq_num(&frame, 21, 0).is_ok());
+    }
+
+    #[test]
+    fn test_check_valid_pre_seq_num_missing_operation() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::from_owned(envelope);
+        let err = check_valid_pre_seq_num(&frame, 21, 0).unwrap_err();
+        assert!(
+            matches!(err, PreSeqNumError::MissingOperation),
+            "expected MissingOperation, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_valid_pre_seq_num_duplicate_extra_signers() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let signer = SignerKey::Ed25519(Uint256([42u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::V2(PreconditionsV2 {
+                time_bounds: None,
+                ledger_bounds: None,
+                min_seq_num: None,
+                min_seq_ledger_gap: 0,
+                min_seq_age: Duration(0),
+                extra_signers: vec![signer.clone(), signer].try_into().unwrap(),
+            }),
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: dest,
+                    asset: Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::from_owned(envelope);
+        let err = check_valid_pre_seq_num(&frame, 21, 0).unwrap_err();
+        assert!(
+            matches!(err, PreSeqNumError::Malformed(_)),
+            "expected Malformed for duplicate signers, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_valid_pre_seq_num_empty_signed_payload_extra_signer() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let signer =
+            SignerKey::Ed25519SignedPayload(stellar_xdr::curr::SignerKeyEd25519SignedPayload {
+                ed25519: Uint256([42u8; 32]),
+                payload: vec![].try_into().unwrap(),
+            });
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::V2(PreconditionsV2 {
+                time_bounds: None,
+                ledger_bounds: None,
+                min_seq_num: None,
+                min_seq_ledger_gap: 0,
+                min_seq_age: Duration(0),
+                extra_signers: vec![signer].try_into().unwrap(),
+            }),
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: dest,
+                    asset: Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::from_owned(envelope);
+        let err = check_valid_pre_seq_num(&frame, 21, 0).unwrap_err();
+        assert!(
+            matches!(err, PreSeqNumError::Malformed(_)),
+            "expected Malformed for empty payload, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_valid_pre_seq_num_op_not_supported() {
+        // Inflation is not supported on protocol >= 12
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Inflation,
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::from_owned(envelope);
+        let err = check_valid_pre_seq_num(&frame, 21, 0).unwrap_err();
+        assert!(
+            matches!(err, PreSeqNumError::OpNotSupported),
+            "expected OpNotSupported, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_valid_pre_seq_num_classic_ext_rejection_p21() {
+        // Classic tx with non-V0 ext should be rejected on p21+
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: dest,
+                    asset: Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: vec![].try_into().unwrap(),
+                        read_write: vec![].try_into().unwrap(),
+                    },
+                    instructions: 0,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 0,
+            }),
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::from_owned(envelope);
+        let err = check_valid_pre_seq_num(&frame, 21, 0).unwrap_err();
+        assert!(
+            matches!(err, PreSeqNumError::Malformed(_)),
+            "expected Malformed for classic ext, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_valid_pre_seq_num_soroban_duplicate_footprint_key() {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dup_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(stellar_xdr::curr::ContractId(Hash([99u8; 32]))),
+            key: ScVal::Symbol(ScSymbol("test".try_into().unwrap())),
+            durability: ContractDataDurability::Persistent,
+        });
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![dup_key.clone(), dup_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 100,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 50,
+        };
+        let tx = Transaction {
+            source_account: source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                        contract_address: ScAddress::Contract(stellar_xdr::curr::ContractId(Hash(
+                            [1u8; 32],
+                        ))),
+                        function_name: ScSymbol("test".try_into().unwrap()),
+                        args: vec![].try_into().unwrap(),
+                    }),
+                    auth: vec![].try_into().unwrap(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V1(soroban_data),
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::from_owned(envelope);
+        let err = check_valid_pre_seq_num(&frame, 21, 0).unwrap_err();
+        assert!(
+            matches!(err, PreSeqNumError::SorobanInvalid(_)),
+            "expected SorobanInvalid for dup footprint, got {err:?}"
+        );
+    }
 }

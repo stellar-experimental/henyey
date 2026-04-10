@@ -14,7 +14,10 @@ use std::collections::{HashMap, HashSet};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::SorobanNetworkInfo;
-use henyey_tx::{soroban_disk_read_entries, validate_basic, LedgerContext, TransactionFrame};
+use henyey_tx::{
+    check_valid_pre_seq_num, soroban_disk_read_entries, validate_basic, LedgerContext,
+    TransactionFrame,
+};
 use stellar_xdr::curr::{
     AccountId, GeneralizedTransactionSet, LedgerHeader, SorobanTransactionDataExt,
     TransactionEnvelope, TransactionPhase, TxSetComponent,
@@ -131,6 +134,8 @@ pub struct TxSetValidationContext {
     pub protocol_version: u32,
     /// Network identifier.
     pub network_id: NetworkId,
+    /// Ledger header flags (LP disable flags etc.).
+    pub ledger_flags: u32,
 }
 
 impl TxSetValidationContext {
@@ -145,6 +150,7 @@ impl TxSetValidationContext {
     /// * `base_reserve` - Base reserve per ledger entry.
     /// * `protocol_version` - Protocol version.
     /// * `network_id` - Network identifier.
+    /// * `ledger_flags` - Ledger header flags (LP disable flags etc.).
     pub fn new(
         last_closed_ledger_seq: u32,
         close_time: u64,
@@ -152,6 +158,7 @@ impl TxSetValidationContext {
         base_reserve: u32,
         protocol_version: u32,
         network_id: NetworkId,
+        ledger_flags: u32,
     ) -> Self {
         Self {
             next_ledger_seq: last_closed_ledger_seq.saturating_add(1),
@@ -160,6 +167,7 @@ impl TxSetValidationContext {
             base_reserve,
             protocol_version,
             network_id,
+            ledger_flags,
         }
     }
 
@@ -262,6 +270,15 @@ pub fn get_invalid_tx_list_with_fee_map(
 
     for tx in txs {
         let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);
+
+        // Stateless structural + per-op validation (shared with queue admission).
+        if check_valid_pre_seq_num(&frame, ctx.protocol_version, ctx.ledger_flags).is_err() {
+            if let Ok(h) = Hash256::hash_xdr(tx) {
+                seen_invalid.insert(h);
+            }
+            invalid_txs.push(tx.clone());
+            continue;
+        }
 
         // Validate with upper bound close time (catches max_time violations).
         let upper_result = validate_basic(&frame, &upper_ledger_ctx);
@@ -922,6 +939,10 @@ pub(crate) fn check_tx_set_valid(
         protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V26);
 
     // Build validation context for per-TX checks
+    let ledger_flags = match &lcl_header.ext {
+        stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+        _ => 0,
+    };
     let ctx = TxSetValidationContext::new(
         lcl_header.ledger_seq,
         lcl_header.scp_value.close_time.0,
@@ -929,6 +950,7 @@ pub(crate) fn check_tx_set_valid(
         lcl_header.base_reserve,
         lcl_header.ledger_version,
         network_id,
+        ledger_flags,
     );
     let close_time_bounds = CloseTimeBounds::with_offsets(close_time_offset, close_time_offset);
 
@@ -1193,6 +1215,7 @@ mod tests {
             5_000_000, // base reserve
             21,        // protocol version
             NetworkId::testnet(),
+            0, // ledger flags
         )
     }
 
@@ -1415,15 +1438,23 @@ mod tests {
 
     #[test]
     fn test_validation_context_next_ledger_seq() {
-        let ctx = TxSetValidationContext::new(100, 1000, 100, 5_000_000, 21, NetworkId::testnet());
+        let ctx =
+            TxSetValidationContext::new(100, 1000, 100, 5_000_000, 21, NetworkId::testnet(), 0);
         assert_eq!(ctx.next_ledger_seq, 101, "next ledger should be LCL + 1");
     }
 
     #[test]
     fn test_validation_context_saturating_add() {
         // Edge case: LCL at u32::MAX should not overflow
-        let ctx =
-            TxSetValidationContext::new(u32::MAX, 1000, 100, 5_000_000, 21, NetworkId::testnet());
+        let ctx = TxSetValidationContext::new(
+            u32::MAX,
+            1000,
+            100,
+            5_000_000,
+            21,
+            NetworkId::testnet(),
+            0,
+        );
         assert_eq!(ctx.next_ledger_seq, u32::MAX, "should saturate at u32::MAX");
     }
 
