@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 
+use henyey_common::Hash256;
 use stellar_xdr::curr::{
     AccountId, Asset, ChangeTrustAsset, Hash, LedgerFootprint, LedgerKey, Limits, MuxedAccount,
     Operation, OperationBody, RevokeSponsorshipOp, WriteXdr,
@@ -21,7 +22,7 @@ pub struct FrozenKeyConfig {
     /// Set of frozen ledger keys (stored as XDR-encoded bytes for efficient comparison).
     frozen_keys: HashSet<Vec<u8>>,
     /// Set of transaction hashes that bypass the frozen key check.
-    bypass_txs: HashSet<[u8; 32]>,
+    bypass_txs: HashSet<Hash256>,
 }
 
 impl FrozenKeyConfig {
@@ -36,7 +37,7 @@ impl FrozenKeyConfig {
     /// Create from frozen key bytes and bypass tx hashes.
     pub fn new(frozen_key_bytes: Vec<Vec<u8>>, bypass_tx_hashes: Vec<Hash>) -> Self {
         let frozen_keys: HashSet<Vec<u8>> = frozen_key_bytes.into_iter().collect();
-        let bypass_txs: HashSet<[u8; 32]> = bypass_tx_hashes.iter().map(|h| h.0).collect();
+        let bypass_txs: HashSet<Hash256> = bypass_tx_hashes.iter().map(|h| Hash256(h.0)).collect();
         Self {
             frozen_keys,
             bypass_txs,
@@ -63,7 +64,7 @@ impl FrozenKeyConfig {
     }
 
     /// Returns true if the given transaction hash is in the freeze bypass set.
-    pub fn is_freeze_bypass_tx(&self, tx_hash: &[u8; 32]) -> bool {
+    pub fn is_freeze_bypass_tx(&self, tx_hash: &Hash256) -> bool {
         self.bypass_txs.contains(tx_hash)
     }
 }
@@ -420,8 +421,8 @@ mod tests {
     fn test_bypass_tx_hash() {
         let config = FrozenKeyConfig::new(vec![], vec![Hash([42u8; 32])]);
 
-        assert!(config.is_freeze_bypass_tx(&[42u8; 32]));
-        assert!(!config.is_freeze_bypass_tx(&[0u8; 32]));
+        assert!(config.is_freeze_bypass_tx(&Hash256([42u8; 32])));
+        assert!(!config.is_freeze_bypass_tx(&Hash256([0u8; 32])));
     }
 
     fn make_credit_asset(code: &[u8; 4], issuer_seed: u8) -> Asset {

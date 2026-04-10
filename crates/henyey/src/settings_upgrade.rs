@@ -345,7 +345,10 @@ fn get_invoke_tx(
 }
 
 /// Compute the transaction hash for a given transaction envelope and network passphrase.
-fn compute_tx_hash(envelope: &TransactionEnvelope, network_passphrase: &str) -> [u8; 32] {
+fn compute_tx_hash(
+    envelope: &TransactionEnvelope,
+    network_passphrase: &str,
+) -> henyey_common::Hash256 {
     let network_id = sha256(network_passphrase.as_bytes());
 
     let payload = match envelope {
@@ -357,7 +360,7 @@ fn compute_tx_hash(envelope: &TransactionEnvelope, network_passphrase: &str) -> 
     };
 
     let payload_bytes = payload.to_xdr(stellar_xdr::curr::Limits::none()).unwrap();
-    sha256(&payload_bytes).0
+    sha256(&payload_bytes)
 }
 
 /// Sign a transaction envelope with the given secret key.
@@ -365,10 +368,10 @@ fn sign_tx(
     envelope: &mut TransactionEnvelope,
     secret_key: &SecretKey,
     network_passphrase: &str,
-) -> [u8; 32] {
+) -> henyey_common::Hash256 {
     let tx_hash = compute_tx_hash(envelope, network_passphrase);
 
-    let signature = secret_key.sign(&tx_hash);
+    let signature = secret_key.sign(&tx_hash.0);
     let pub_key = secret_key.public_key();
     let pub_key_bytes = pub_key.as_bytes();
 
@@ -462,7 +465,7 @@ pub fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
             let tx_hash = sign_tx(tx, &secret_key, params.network_passphrase);
             let tx_bytes = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
             println!("{}", BASE64.encode(&tx_bytes));
-            println!("{}", hex::encode(tx_hash));
+            println!("{}", hex::encode(tx_hash.0));
         }
     } else {
         // Output unsigned transactions with labels on stderr and tx hashes on stdout.
@@ -481,7 +484,7 @@ pub fn run(params: &SettingsUpgradeParams<'_>) -> anyhow::Result<()> {
             let tx_bytes = txs[i].to_xdr(stellar_xdr::curr::Limits::none())?;
             println!("{}", BASE64.encode(&tx_bytes));
             let tx_hash = compute_tx_hash(txs[i], params.network_passphrase);
-            println!("{}", hex::encode(tx_hash));
+            println!("{}", hex::encode(tx_hash.0));
         }
     }
 

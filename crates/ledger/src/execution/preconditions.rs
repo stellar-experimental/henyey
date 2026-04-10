@@ -439,7 +439,7 @@ impl TransactionExecutor {
             && self
                 .frozen_key_config
                 .is_key_frozen(&henyey_tx::frozen_keys::account_key(&fee_source_id))
-            && !self.frozen_key_config.is_freeze_bypass_tx(&outer_hash.0)
+            && !self.frozen_key_config.is_freeze_bypass_tx(&outer_hash)
         {
             return Ok(Err(fee_bump_outer_fail(
                 TransactionResultCode::TxFrozenKeyAccessed,
@@ -459,7 +459,7 @@ impl TransactionExecutor {
                 frame.operations(),
                 soroban_footprint,
                 &self.frozen_key_config,
-            ) && !self.frozen_key_config.is_freeze_bypass_tx(&outer_hash.0)
+            ) && !self.frozen_key_config.is_freeze_bypass_tx(&outer_hash)
             {
                 return Ok(Err(post_seq_fail(
                     TransactionResultCode::TxFrozenKeyAccessed,

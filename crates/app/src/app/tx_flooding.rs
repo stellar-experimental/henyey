@@ -674,14 +674,16 @@ impl App {
     }
 
     /// Send a TxSet to a peer in response to GetTxSet.
-    pub(super) async fn send_tx_set(&self, peer_id: &henyey_overlay::PeerId, hash: &[u8; 32]) {
-        let hash256 = henyey_common::Hash256::from_bytes(*hash);
-
+    pub(super) async fn send_tx_set(
+        &self,
+        peer_id: &henyey_overlay::PeerId,
+        hash: &henyey_common::Hash256,
+    ) {
         // Get the tx set from cache
-        let tx_set = match self.herder.get_tx_set(&hash256) {
+        let tx_set = match self.herder.get_tx_set(hash) {
             Some(ts) => ts,
             None => {
-                tracing::debug!(hash = hex::encode(hash), peer = %peer_id, "TxSet not found in cache");
+                tracing::debug!(hash = hex::encode(hash.0), peer = %peer_id, "TxSet not found in cache");
                 if let Some(overlay) = self.overlay().await {
                     let ledger_version = self.ledger_manager.current_header().ledger_version;
                     let message_type =
@@ -692,10 +694,10 @@ impl App {
                         };
                     let msg = StellarMessage::DontHave(stellar_xdr::curr::DontHave {
                         type_: message_type,
-                        req_hash: stellar_xdr::curr::Uint256(*hash),
+                        req_hash: stellar_xdr::curr::Uint256(hash.0),
                     });
                     if let Err(e) = overlay.try_send_to(peer_id, msg) {
-                        tracing::debug!(hash = hex::encode(hash), peer = %peer_id, error = %e, "Failed to send DontHave for TxSet");
+                        tracing::debug!(hash = hex::encode(hash.0), peer = %peer_id, error = %e, "Failed to send DontHave for TxSet");
                     }
                 }
                 return;
@@ -716,22 +718,22 @@ impl App {
             let gen_hash = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
                 Ok(bytes) => henyey_common::Hash256::hash(&bytes),
                 Err(e) => {
-                    tracing::warn!(hash = %hash256, error = %e, "Failed to encode GeneralizedTxSet");
+                    tracing::warn!(hash = %hash, error = %e, "Failed to encode GeneralizedTxSet");
                     henyey_common::Hash256::ZERO
                 }
             };
-            if gen_hash == hash256 {
+            if gen_hash == *hash {
                 let message = StellarMessage::GeneralizedTxSet(gen_tx_set);
                 if let Some(overlay) = self.overlay().await {
                     if let Err(e) = overlay.try_send_to(peer_id, message) {
-                        tracing::warn!(hash = %hash256, peer = %peer_id, error = %e, "Failed to send GeneralizedTxSet");
+                        tracing::warn!(hash = %hash, peer = %peer_id, error = %e, "Failed to send GeneralizedTxSet");
                     } else {
-                        tracing::debug!(hash = %hash256, peer = %peer_id, "Sent GeneralizedTxSet");
+                        tracing::debug!(hash = %hash, peer = %peer_id, "Sent GeneralizedTxSet");
                     }
                 }
                 return;
             }
-            tracing::warn!(hash = %hash256, computed = %gen_hash, "GeneralizedTxSet hash mismatch; falling back");
+            tracing::warn!(hash = %hash, computed = %gen_hash, "GeneralizedTxSet hash mismatch; falling back");
         }
 
         // Convert to legacy XDR TransactionSet

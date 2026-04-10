@@ -1300,7 +1300,8 @@ impl App {
                 };
                 if allowed {
                     tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested TxSet");
-                    self.send_tx_set(&msg.from_peer, &hash.0).await;
+                    self.send_tx_set(&msg.from_peer, &henyey_common::Hash256(hash.0))
+                        .await;
                 } else {
                     tracing::debug!(peer = %msg.from_peer, "Dropping GET_TX_SET request (rate limited)");
                 }
