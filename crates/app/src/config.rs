@@ -1429,11 +1429,14 @@ impl AppConfig {
             );
         }
 
-        // Warn if metadata stream is configured on a validator node
+        // Reject metadata stream on a validator node.
+        // Matches stellar-core's validateAndLogConfig() which forbids
+        // METADATA_OUTPUT_STREAM on networked validators because synchronous
+        // FIFO opens can block indefinitely and stall consensus.
         if self.metadata.output_stream.is_some() && self.node.is_validator {
-            tracing::warn!(
-                "metadata.output_stream is set on a validator node; \
-                 this may impact consensus performance"
+            anyhow::bail!(
+                "metadata.output_stream cannot be used on a validator node \
+                 (set node.is_validator = false for watcher/captive-core mode)"
             );
         }
 
@@ -2095,5 +2098,26 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
         // Contains "Test" but is NOT the testnet passphrase
         assert!(tricky.contains("Test"));
         assert_ne!(tricky, "Test SDF Network ; September 2015");
+    }
+
+    /// Regression test for AUDIT-063: validator nodes must not have metadata streaming.
+    #[test]
+    fn test_audit_063_validator_metadata_stream_rejected() {
+        let mut config = AppConfig::testnet();
+        config.node.is_validator = true;
+        config.node.node_seed =
+            Some("SCZANGBA5YHTNYVVV3C7CAZMCLXPILHSE6VHMWG4DRTBIU6VIV7MBQVW".to_string());
+        config.metadata.output_stream = Some("/tmp/meta.pipe".to_string());
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "Validator with metadata stream should fail validation"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("metadata.output_stream cannot be used on a validator"),
+            "Expected metadata rejection error, got: {}",
+            err
+        );
     }
 }
