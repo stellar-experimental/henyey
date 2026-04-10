@@ -1120,6 +1120,7 @@ impl TransactionQueue {
     /// Check lane-based eviction fees and collect evictions for all applicable lanes.
     ///
     /// Returns the list of transactions to evict, or an early rejection result.
+    #[allow(clippy::too_many_arguments)]
     fn check_and_collect_evictions(
         &self,
         by_hash: &HashMap<Hash256, QueuedTransaction>,
@@ -1128,6 +1129,7 @@ impl TransactionQueue {
         queued_frame: &henyey_tx::TransactionFrame,
         ledger_version: u32,
         seed: u64,
+        replaced_tx: Option<&QueuedTransaction>,
     ) -> std::result::Result<Vec<QueuedTransaction>, TxQueueResult> {
         // Phase 1: Check minimum inclusion fee for each lane (cheap, read-only)
         if !queued_is_soroban {
@@ -1161,6 +1163,13 @@ impl TransactionQueue {
         // Phase 2: Collect evictions (more expensive, involves scanning queue)
         let mut pending_evictions: HashSet<Hash256> = HashSet::new();
         let mut pending_eviction_list: Vec<QueuedTransaction> = Vec::new();
+
+        // If this is a replace-by-fee, pre-exclude the old tx from capacity
+        // calculations. stellar-core's TxQueueLimiter subtracts the old tx's
+        // resources before calling canFitWithEviction.
+        if let Some(old_tx) = replaced_tx {
+            pending_evictions.insert(old_tx.hash);
+        }
 
         if !queued_is_soroban {
             if let Some(lane_config) = self.build_classic_lane_config() {
@@ -1339,6 +1348,7 @@ impl TransactionQueue {
             &queued_frame,
             ledger_version,
             seed,
+            replaced_tx.as_ref(),
         ) {
             Ok(evictions) => evictions,
             Err(result) => return result,
@@ -4155,6 +4165,49 @@ mod tests {
             "fee-bump remove_applied should not match by outer fee source"
         );
         assert_eq!(queue.len(), 1);
+    }
+
+    /// AUDIT-088: Replace-by-fee must succeed when the queue is at the max_queue_ops
+    /// limit, because the old tx's ops should be excluded from capacity calculations.
+    /// Without the fix, the fee-bump would be rejected as QueueFull because the
+    /// eviction check doesn't account for the to-be-replaced tx's resources.
+    #[test]
+    fn test_audit_088_replace_by_fee_at_ops_limit() {
+        // max_queue_ops = 3: room for exactly 3 ops total
+        let config = TxQueueConfig {
+            max_queue_ops: Some(3),
+            max_size: 10,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // tx_a: 2 ops from source 50, seq=1, fee=200
+        let mut tx_a = make_test_envelope(200, 2);
+        set_source(&mut tx_a, 50);
+
+        // tx_b: 1 op from source 51, fee=100
+        let mut tx_b = make_test_envelope(100, 1);
+        set_source(&mut tx_b, 51);
+
+        // Add both: now at 3/3 ops
+        assert_eq!(queue.try_add(tx_a.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_b), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // Build a fee-bump wrapping the same inner tx (source 50, seq 1)
+        // with a higher fee. This should succeed because the old tx's 2 ops
+        // are excluded from the capacity check.
+        let inner = match tx_a {
+            TransactionEnvelope::Tx(ref env) => env.clone(),
+            _ => panic!("expected v1"),
+        };
+        let fee_bump = make_fee_bump_envelope(inner, 60, 10000);
+
+        let result = queue.try_add(fee_bump);
+        assert_eq!(result, TxQueueResult::Added);
+        // The old tx_a should be replaced, queue still has 2 entries
+        assert_eq!(queue.len(), 2);
     }
 
     /// pending_envelopes returns all queued transaction envelopes.
