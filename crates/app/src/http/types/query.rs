@@ -4,6 +4,7 @@
 //! - `/getledgerentryraw` — Returns raw ledger entries from the bucket list
 //! - `/getledgerentry` — Returns entries with TTL state classification
 
+use henyey_common::LedgerSeq;
 use serde::Serialize;
 
 /// Response body for `/getledgerentryraw`.
@@ -11,7 +12,7 @@ use serde::Serialize;
 pub struct GetLedgerEntryRawResponse {
     /// The ledger sequence of the snapshot used.
     #[serde(rename = "ledgerSeq")]
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
     /// Found entries, each as a base64-encoded XDR `LedgerEntry`.
     pub entries: Vec<RawEntryResult>,
 }
@@ -28,7 +29,7 @@ pub struct RawEntryResult {
 pub struct GetLedgerEntryResponse {
     /// The ledger sequence of the snapshot used.
     #[serde(rename = "ledgerSeq")]
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
     /// Entry results in the same order as the request keys.
     pub entries: Vec<LedgerEntryResult>,
 }

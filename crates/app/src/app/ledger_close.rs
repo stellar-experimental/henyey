@@ -5,10 +5,10 @@ use super::*;
 impl App {
     pub(crate) fn externalized_iteration_window(
         last_processed: u64,
-        current_ledger: u32,
+        current_ledger: LedgerSeq,
         latest_externalized: u64,
     ) -> (u64, u64) {
-        let first_replay = current_ledger as u64 + 1;
+        let first_replay = current_ledger.get() as u64 + 1;
         let replay_checkpoint = checkpoint_containing(first_replay as u32);
         let checkpoint_unpublished = replay_checkpoint > latest_externalized as u32;
 
@@ -203,13 +203,13 @@ impl App {
 
         self.db.transaction(|conn| {
             conn.store_ledger_header(header, &header_xdr)?;
-            conn.store_tx_history_entry(header.ledger_seq, &tx_history_entry)?;
-            conn.store_tx_result_entry(header.ledger_seq, &tx_result_entry)?;
+            conn.store_tx_history_entry(header.ledger_seq.into(), &tx_history_entry)?;
+            conn.store_tx_result_entry(header.ledger_seq.into(), &tx_result_entry)?;
             if is_checkpoint_ledger(header.ledger_seq) {
                 let levels = self.ledger_manager.bucket_list_levels();
-                conn.store_bucket_list(header.ledger_seq, &levels)?;
+                conn.store_bucket_list(header.ledger_seq.into(), &levels)?;
                 if self.is_validator && hot_archive_persisted {
-                    conn.enqueue_publish(header.ledger_seq, &has_json)?;
+                    conn.enqueue_publish(header.ledger_seq.into(), &has_json)?;
                 }
             }
             for index in 0..tx_count {
@@ -244,7 +244,7 @@ impl App {
                 };
 
                 conn.store_transaction(&henyey_db::StoreTxParams {
-                    ledger_seq: header.ledger_seq,
+                    ledger_seq: header.ledger_seq.into(),
                     tx_index: index as u32,
                     tx_id: &tx_id,
                     body: &tx_body,
@@ -257,7 +257,7 @@ impl App {
             // Extract and store contract events from transaction metadata
             if let Some(metas) = tx_metas {
                 let events = Self::extract_contract_events(
-                    header.ledger_seq,
+                    header.ledger_seq.into(),
                     &ordered_txs,
                     tx_results,
                     metas,
@@ -268,7 +268,7 @@ impl App {
                 }
             }
 
-            conn.store_scp_history(header.ledger_seq, &scp_envelopes)?;
+            conn.store_scp_history(header.ledger_seq.into(), &scp_envelopes)?;
             for (hash, qset) in &scp_quorum_sets {
                 conn.store_scp_quorum_set(hash, header.ledger_seq, qset)?;
             }
@@ -285,7 +285,7 @@ impl App {
 
     /// Extract contract events from transaction metadata for indexing.
     fn extract_contract_events(
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
         ordered_txs: &[std::sync::Arc<stellar_xdr::curr::TransactionEnvelope>],
         tx_results: &[TransactionResultPair],
         tx_metas: &[TransactionMeta],
@@ -347,8 +347,9 @@ impl App {
 
             for (event_index, (op_index, event)) in contract_events.iter().enumerate() {
                 // Compute TOID-based event ID
-                let toid =
-                    ((ledger_seq as u64) << 32) | ((tx_index as u64) << 12) | (*op_index as u64);
+                let toid = ((ledger_seq.get() as u64) << 32)
+                    | ((tx_index as u64) << 12)
+                    | (*op_index as u64);
                 let event_id = format!("{:019}-{:010}", toid, event_index);
 
                 // Event type
@@ -437,7 +438,7 @@ impl App {
         if has.current_ledger != lcl_seq {
             tracing::warn!(
                 lcl_seq,
-                has_ledger = has.current_ledger,
+                has_ledger = has.current_ledger.get(),
                 "LCL and HAS disagree on current ledger, cannot restore"
             );
             return Ok(false);
@@ -543,7 +544,7 @@ impl App {
             BucketList::restore_from_has_parallel(&live_hash_pairs, &live_next_states, load_bucket)
                 .map_err(|e| anyhow::anyhow!("Failed to restore live bucket list: {}", e))?;
         bucket_list.set_bucket_dir(bucket_dir.clone());
-        bucket_list.set_ledger_seq(lcl_seq);
+        bucket_list.set_ledger_seq(lcl_seq.into());
         henyey_ledger::log_startup_memory("after_restore_bucket_list");
 
         // Step 6b: Extract Arc<Bucket> pairs before starting merges.
@@ -716,7 +717,7 @@ impl App {
         };
 
         self.herder.tx_queue().update_validation_context(
-            header.ledger_seq,
+            header.ledger_seq.into(),
             header.scp_value.close_time.0,
             header.ledger_version,
             header.base_fee,
@@ -902,7 +903,7 @@ impl App {
 
         let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
         bucket_list.set_bucket_dir(bucket_dir.clone());
-        bucket_list.set_ledger_seq(lcl_seq);
+        bucket_list.set_ledger_seq(lcl_seq.into());
 
         // Restart pending merges from HAS state.
         // This matches stellar-core loadLastKnownLedgerInternal() which calls
@@ -1021,19 +1022,18 @@ impl App {
 
         let lcl_seq = has.current_ledger;
 
-        let header = self
-            .db
-            .get_ledger_header(lcl_seq)?
-            .ok_or_else(|| anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq))?;
+        let header = self.db.get_ledger_header(lcl_seq.get())?.ok_or_else(|| {
+            anyhow::anyhow!("LCL header missing from DB at seq {}", lcl_seq.get())
+        })?;
 
         let (bucket_list, hot_archive) = self
-            .reconstruct_bucket_lists(&has, &header, lcl_seq)
+            .reconstruct_bucket_lists(&has, &header, lcl_seq.get())
             .await?;
 
         let network_id = NetworkId(self.network_id());
 
         tracing::info!(
-            lcl_seq,
+            lcl_seq = lcl_seq.get(),
             bucket_list_hash = %bucket_list.hash().to_hex(),
             hot_archive_hash = %hot_archive.hash().to_hex(),
             "Rebuilt bucket lists from persisted HAS for Case 1 replay"
@@ -1129,7 +1129,7 @@ impl App {
                 // slot handler, they match with already-fetched tx_sets.
                 let (iter_start, next_advance_to) = Self::externalized_iteration_window(
                     last_processed,
-                    current_ledger,
+                    current_ledger.into(),
                     latest_externalized,
                 );
                 advance_to = next_advance_to;
@@ -1248,7 +1248,7 @@ impl App {
 
     pub(super) fn trim_syncing_ledgers(
         buffer: &mut BTreeMap<u32, henyey_herder::LedgerCloseInfo>,
-        current_ledger: u32,
+        current_ledger: LedgerSeq,
     ) {
         // Hard limit on buffer size to prevent unbounded memory growth.
         // With ~50 slots per checkpoint and large tx sets, keeping more than
@@ -1257,7 +1257,7 @@ impl App {
 
         // Step 1: Remove entries already closed (at or below current_ledger).
         let min_keep = current_ledger.saturating_add(1);
-        buffer.retain(|seq, _| *seq >= min_keep);
+        buffer.retain(|seq, _| *seq >= min_keep.get());
         if buffer.is_empty() {
             return;
         }
@@ -1270,7 +1270,7 @@ impl App {
         // create an artificial gap that prevents progress.
         let first_buffered = *buffer.keys().next().expect("checked non-empty above");
         let last_buffered = *buffer.keys().next_back().expect("checked non-empty above");
-        let gap = first_buffered.saturating_sub(current_ledger);
+        let gap = first_buffered.saturating_sub(current_ledger.get());
         if gap >= checkpoint_frequency() {
             let trim_before = if Self::is_first_ledger_in_checkpoint(last_buffered) {
                 if last_buffered == 0 {
@@ -1430,7 +1430,7 @@ impl App {
 
         let close_info = {
             let mut buffer = self.syncing_ledgers.write().await;
-            Self::trim_syncing_ledgers(&mut buffer, current_ledger);
+            Self::trim_syncing_ledgers(&mut buffer, current_ledger.into());
             match buffer.get(&next_seq) {
                 Some(info) if info.tx_set.is_some() => info.clone(),
                 Some(info) => {
@@ -1522,13 +1522,17 @@ impl App {
         let decoded_upgrades = decode_upgrades(close_info.upgrades.clone());
         let close_time = close_info.close_time;
 
-        let mut close_data =
-            LedgerCloseData::new(next_seq, tx_set_variant.clone(), close_time, prev_hash)
-                .with_stellar_value_ext(close_info.stellar_value_ext);
+        let mut close_data = LedgerCloseData::new(
+            next_seq.into(),
+            tx_set_variant.clone(),
+            close_time,
+            prev_hash,
+        )
+        .with_stellar_value_ext(close_info.stellar_value_ext);
         if !decoded_upgrades.is_empty() {
             close_data = close_data.with_upgrades(decoded_upgrades);
         }
-        if let Some(entry) = self.build_scp_history_entry(next_seq) {
+        if let Some(entry) = self.build_scp_history_entry(next_seq.into()) {
             close_data = close_data.with_scp_history(vec![entry]);
         }
 
@@ -1550,7 +1554,7 @@ impl App {
 
         Some(PendingLedgerClose {
             handle: join_handle,
-            ledger_seq: next_seq,
+            ledger_seq: next_seq.into(),
             tx_set,
             tx_set_variant,
             close_time,
@@ -1574,7 +1578,7 @@ impl App {
             Ok(Err(e)) => {
                 let is_hash_mismatch = e.contains("hash mismatch");
                 tracing::error!(
-                    ledger_seq = pending.ledger_seq,
+                    ledger_seq = pending.ledger_seq.get(),
                     error = %e,
                     is_hash_mismatch,
                     "Background ledger close failed"
@@ -1584,7 +1588,7 @@ impl App {
                     let cleared_count = buffer.len();
                     buffer.clear();
                     tracing::warn!(
-                        ledger_seq = pending.ledger_seq,
+                        ledger_seq = pending.ledger_seq.get(),
                         cleared_count,
                         "Hash mismatch detected - cleared all buffered ledgers, will trigger catchup"
                     );
@@ -1593,7 +1597,7 @@ impl App {
             }
             Err(e) => {
                 tracing::error!(
-                    ledger_seq = pending.ledger_seq,
+                    ledger_seq = pending.ledger_seq.get(),
                     error = %e,
                     "Ledger close task panicked"
                 );
@@ -1610,7 +1614,7 @@ impl App {
                 if let Err(e) = writer.write_meta(meta.clone(), pending.ledger_seq).await {
                     tracing::error!(
                         error = %e,
-                        ledger_seq = pending.ledger_seq,
+                        ledger_seq = pending.ledger_seq.get(),
                         "Fatal: metadata writer channel failed"
                     );
                     std::process::abort();
@@ -1621,7 +1625,7 @@ impl App {
                     if let Err(e) = stream.maybe_rotate_debug_stream(pending.ledger_seq) {
                         tracing::warn!(
                             error = %e,
-                            ledger_seq = pending.ledger_seq,
+                            ledger_seq = pending.ledger_seq.get(),
                             "Failed to rotate debug meta stream"
                         );
                     }
@@ -1630,7 +1634,7 @@ impl App {
                         Err(MetaStreamError::MainStreamWrite(e)) => {
                             tracing::error!(
                                 error = %e,
-                                ledger_seq = pending.ledger_seq,
+                                ledger_seq = pending.ledger_seq.get(),
                                 "Fatal: metadata output stream write failed"
                             );
                             std::process::abort();
@@ -1638,7 +1642,7 @@ impl App {
                         Err(MetaStreamError::DebugStreamWrite(e)) => {
                             tracing::warn!(
                                 error = %e,
-                                ledger_seq = pending.ledger_seq,
+                                ledger_seq = pending.ledger_seq.get(),
                                 "Debug metadata stream write failed"
                             );
                         }
@@ -1668,11 +1672,11 @@ impl App {
                 Ok(meta_xdr) => {
                     if let Err(err) = self
                         .db
-                        .store_ledger_close_meta(pending.ledger_seq, &meta_xdr)
+                        .store_ledger_close_meta(pending.ledger_seq.get(), &meta_xdr)
                     {
                         tracing::warn!(
                             error = %err,
-                            ledger_seq = pending.ledger_seq,
+                            ledger_seq = pending.ledger_seq.get(),
                             "Failed to persist LedgerCloseMeta"
                         );
                     }
@@ -1680,7 +1684,7 @@ impl App {
                 Err(err) => {
                     tracing::warn!(
                         error = %err,
-                        ledger_seq = pending.ledger_seq,
+                        ledger_seq = pending.ledger_seq.get(),
                         "Failed to serialize LedgerCloseMeta"
                     );
                 }
@@ -1722,7 +1726,7 @@ impl App {
         // Sequence-based removal: drops any queued tx where seq <= applied seq
         // for the same source account (matches stellar-core removeApplied).
         self.herder.ledger_closed(
-            pending.ledger_seq as u64,
+            pending.ledger_seq.get() as u64,
             &all_txs,
             &pending.upgrades,
             pending.close_time,
@@ -1732,7 +1736,7 @@ impl App {
         // Mirrors upstream HerderImpl::eraseBelow() -> clearLedgersBelow().
         {
             if let Some(overlay) = self.overlay().await {
-                overlay.clear_ledgers_below(pending.ledger_seq, pending.ledger_seq);
+                overlay.clear_ledgers_below(pending.ledger_seq, pending.ledger_seq.get());
             }
         }
 
@@ -1865,8 +1869,8 @@ impl App {
         }
 
         // Update current ledger tracking.
-        *self.current_ledger.write().await = pending.ledger_seq;
-        *self.last_processed_slot.write().await = pending.ledger_seq as u64;
+        *self.current_ledger.write().await = pending.ledger_seq.get();
+        *self.last_processed_slot.write().await = pending.ledger_seq.get() as u64;
         self.clear_tx_advert_history(pending.ledger_seq).await;
 
         // Re-bootstrap the herder so tracking_slot advances past the
@@ -1884,11 +1888,11 @@ impl App {
         // lingering and causing timeout → DontHave → recovery loops.
         let stale_cleared = self
             .herder
-            .cleanup_old_pending_tx_sets(pending.ledger_seq as u64 + 1);
+            .cleanup_old_pending_tx_sets(pending.ledger_seq.get() as u64 + 1);
         if stale_cleared > 0 {
             tracing::debug!(
                 stale_cleared,
-                ledger_seq = pending.ledger_seq,
+                ledger_seq = pending.ledger_seq.get(),
                 "Cleared stale pending tx_set requests after ledger close"
             );
         }

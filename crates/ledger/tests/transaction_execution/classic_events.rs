@@ -8,7 +8,7 @@ fn test_classic_events_emitted_for_payment() {
 
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 20_000_000);
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 1_000_000);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .build_with_default_header();
@@ -105,7 +105,7 @@ fn test_classic_events_payment_with_muxed_destination() {
 
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 20_000_000);
     let (dest_key, dest_entry) = create_account_entry(dest_account_id.clone(), 1, 1_000_000);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .build_with_default_header();
@@ -197,7 +197,7 @@ fn test_classic_events_payment_with_memo_data() {
 
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 20_000_000);
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 1_000_000);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .build_with_default_header();
@@ -287,7 +287,7 @@ fn test_classic_events_payment_memo_precedence() {
 
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 20_000_000);
     let (dest_key, dest_entry) = create_account_entry(dest_account_id.clone(), 1, 1_000_000);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .build_with_default_header();
@@ -376,7 +376,7 @@ fn test_classic_events_emitted_for_account_merge() {
     let source_balance = 20_000_000;
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, source_balance);
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 1_000_000);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .build_with_default_header();
@@ -463,7 +463,7 @@ fn test_classic_events_emitted_for_create_account() {
     let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([11u8; 32])));
 
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 200_000_000);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -549,7 +549,7 @@ fn test_classic_events_emitted_for_create_claimable_balance() {
     let claimant_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([12u8; 32])));
 
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 200_000_000);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -668,7 +668,7 @@ fn test_classic_events_emitted_for_claim_claimable_balance() {
         balance_id: balance_id.clone(),
     });
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(claimable_key, claimable_entry)
         .build_with_default_header();
@@ -769,7 +769,7 @@ fn test_classic_events_emitted_for_allow_trust() {
     let (trustline_key, trustline_entry) =
         create_trustline_entry(trustor_id.clone(), trustline_asset, 0, 100_000_000, 0);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(issuer_key, issuer_entry)
         .add_entry(trustor_key, trustor_entry)
         .add_entry(trustline_key, trustline_entry)
@@ -865,7 +865,7 @@ fn test_classic_events_emitted_for_set_trustline_flags() {
     let (trustline_key, trustline_entry) =
         create_trustline_entry(trustor_id.clone(), trustline_asset, 0, 100_000_000, 0);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(issuer_key, issuer_entry)
         .add_entry(trustor_key, trustor_entry)
         .add_entry(trustline_key, trustline_entry)
@@ -969,7 +969,7 @@ fn test_classic_events_emitted_for_clawback() {
         0x5,
     );
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(issuer_key, issuer_entry)
         .add_entry(trustor_key, trustor_entry)
         .add_entry(trustline_key, trustline_entry)
@@ -1080,7 +1080,7 @@ fn test_classic_events_emitted_for_clawback_claimable_balance() {
         balance_id: balance_id.clone(),
     });
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(issuer_key, issuer_entry)
         .add_entry(claimable_key, claimable_entry)
         .build_with_default_header();
@@ -1191,7 +1191,7 @@ fn test_classic_events_emitted_for_liquidity_pool_deposit() {
         0,
     );
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(issuer_key, issuer_entry)
         .add_entry(pool_key, pool_entry)
@@ -1326,7 +1326,7 @@ fn test_classic_events_emitted_for_liquidity_pool_withdraw() {
         0,
     );
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(issuer_key, issuer_entry)
         .add_entry(pool_key, pool_entry)
@@ -1453,7 +1453,7 @@ fn test_classic_events_emitted_for_claim_atoms_order_book() {
         classic_events,
     );
     let source_muxed = MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes()));
-    op_event_manager.events_for_claim_atoms(&source_muxed, &[claim.clone()]);
+    op_event_manager.events_for_claim_atoms(&source_muxed, std::slice::from_ref(&claim));
 
     let events = op_event_manager.finalize();
     assert_eq!(events.len(), 2);
@@ -1510,7 +1510,7 @@ fn test_classic_events_emitted_for_manage_sell_offer() {
         Price { n: 1, d: 1 },
     );
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(offer_key.clone(), offer_entry)
         .add_entry(issuer_key, issuer_entry)
@@ -1647,7 +1647,7 @@ fn test_classic_events_emitted_for_path_payment_strict_send() {
         Price { n: 1, d: 1 },
     );
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .add_entry(offer_key.clone(), offer_entry)

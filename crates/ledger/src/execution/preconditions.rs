@@ -193,7 +193,7 @@ impl TransactionExecutor {
 
         // Phase 4: Time/ledger bounds and precondition validation
         let validation_ctx = ValidationContext::new(
-            self.ledger_seq,
+            self.ledger_seq.get(),
             self.close_time,
             base_fee,
             self.base_reserve,
@@ -234,8 +234,8 @@ impl TransactionExecutor {
 
         // Phase 5: Sequence number validation
         // This combines stellar-core's isBadSeq (including min_seq_num) check.
-        if self.ledger_seq <= i32::MAX as u32 {
-            let starting_seq = (self.ledger_seq as i64) << 32;
+        if self.ledger_seq.get() <= i32::MAX as u32 {
+            let starting_seq = (self.ledger_seq.get() as i64) << 32;
             if frame.sequence_number() == starting_seq {
                 return Ok(Err(pre_seq_fail(
                     TransactionResultCode::TxBadSeq,
@@ -305,8 +305,8 @@ impl TransactionExecutor {
             if cond.min_seq_ledger_gap > 0 {
                 let acc_seq_ledger = get_account_seq_ledger(&source_account);
                 let min_seq_ledger_gap = cond.min_seq_ledger_gap;
-                if min_seq_ledger_gap > self.ledger_seq
-                    || self.ledger_seq - min_seq_ledger_gap < acc_seq_ledger
+                if min_seq_ledger_gap > self.ledger_seq.get()
+                    || self.ledger_seq.get() - min_seq_ledger_gap < acc_seq_ledger
                 {
                     return Ok(Err(post_seq_fail(
                         TransactionResultCode::TxBadMinSeqAgeOrGap,

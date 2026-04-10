@@ -293,7 +293,7 @@ impl HistoryArchive {
     /// the current ledger sequence.
     pub async fn fetch_current_ledger(&self) -> Result<u32, HistoryError> {
         let has = self.fetch_root_has().await?;
-        Ok(has.current_ledger())
+        Ok(has.current_ledger().get())
     }
 
     /// Download a single ledger header by sequence.

@@ -94,7 +94,11 @@ fn run_eviction_scan(
         EvictionIterator::new(context.eviction_settings.starting_eviction_scan_level)
     });
     let eviction_result = bucket_list
-        .scan_for_eviction_incremental(iter, context.header.ledger_seq, context.eviction_settings)
+        .scan_for_eviction_incremental(
+            iter,
+            context.header.ledger_seq.into(),
+            context.eviction_settings,
+        )
         .map_err(HistoryError::Bucket)?;
 
     tracing::info!(
@@ -526,7 +530,7 @@ pub fn replay_ledger_with_execution(
 
     // Create snapshot with the correct id_pool from the previous ledger.
     // This is critical for correct offer ID assignment during transaction execution.
-    let mut snapshot = LedgerSnapshot::empty(header.ledger_seq);
+    let mut snapshot = LedgerSnapshot::empty(header.ledger_seq.into());
     snapshot.set_id_pool(prev_id_pool);
     let bucket_list_ref = std::sync::Arc::new(std::sync::RwLock::new(bucket_list.clone()));
     // Also include hot archive bucket list for archived entries and their TTLs.
@@ -567,7 +571,7 @@ pub fn replay_ledger_with_execution(
         snapshot.set_entries_lookup(entries_fn);
     }
 
-    let mut delta = LedgerDelta::new(header.ledger_seq);
+    let mut delta = LedgerDelta::new(header.ledger_seq.into());
     let transactions = tx_set.transactions_with_base_fee();
     // Load SorobanConfig from ledger ConfigSettingEntry for accurate Soroban execution.
     // Only loaded for protocol >= 20 (Soroban protocol) with non-empty tx sets,
@@ -777,7 +781,7 @@ pub fn replay_ledger_with_execution(
         // restored_keys contains entries restored via RestoreFootprint or InvokeHostFunction
         hot_archive_bucket_list
             .add_batch(
-                header.ledger_seq,
+                header.ledger_seq.into(),
                 header.ledger_version,
                 eviction.archived_entries,
                 tx_set_result.hot_archive_restored_keys.clone(),
@@ -809,7 +813,7 @@ pub fn replay_ledger_with_execution(
     );
     bucket_list
         .add_batch(
-            header.ledger_seq,
+            header.ledger_seq.into(),
             header.ledger_version,
             BucketListType::Live,
             init_entries.clone(),
@@ -1075,7 +1079,7 @@ mod tests {
         };
         bucket_list
             .add_batch(
-                1,
+                1u32.into(),
                 25,
                 BucketListType::Live,
                 vec![],
@@ -1094,7 +1098,7 @@ mod tests {
         };
         bucket_list
             .add_batch(
-                2,
+                2u32.into(),
                 25,
                 BucketListType::Live,
                 vec![],
@@ -1150,7 +1154,7 @@ mod tests {
         };
         bucket_list
             .add_batch(
-                1,
+                1u32.into(),
                 25,
                 BucketListType::Live,
                 vec![],
@@ -1168,7 +1172,7 @@ mod tests {
         };
         bucket_list
             .add_batch(
-                2,
+                2u32.into(),
                 25,
                 BucketListType::Live,
                 vec![],
@@ -1212,7 +1216,7 @@ mod tests {
         };
         bucket_list
             .add_batch(
-                1,
+                1u32.into(),
                 25,
                 BucketListType::Live,
                 vec![],
@@ -1230,7 +1234,7 @@ mod tests {
         };
         bucket_list
             .add_batch(
-                2,
+                2u32.into(),
                 25,
                 BucketListType::Live,
                 vec![],

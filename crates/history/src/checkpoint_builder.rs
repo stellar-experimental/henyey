@@ -48,6 +48,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use henyey_common::fs_utils::durable_rename;
+use henyey_common::LedgerSeq;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -270,10 +271,10 @@ impl XdrStreamWriter {
     }
 
     /// Write an XDR entry with record marking.
-    fn write_xdr<T: WriteXdr>(&mut self, entry: &T, ledger_seq: u32) -> Result<()> {
+    fn write_xdr<T: WriteXdr>(&mut self, entry: &T, ledger_seq: LedgerSeq) -> Result<()> {
         write_record_marked_xdr(&mut self.encoder, entry)?;
         self.entry_count += 1;
-        self.last_ledger = ledger_seq;
+        self.last_ledger = ledger_seq.get();
         Ok(())
     }
 
@@ -399,7 +400,7 @@ impl CheckpointBuilder {
         self.headers_writer
             .as_mut()
             .unwrap()
-            .write_xdr(header, ledger_seq)?;
+            .write_xdr(header, ledger_seq.into())?;
 
         debug!(ledger_seq, checkpoint, "Appended ledger header");
         Ok(())
@@ -425,12 +426,12 @@ impl CheckpointBuilder {
         self.transactions_writer
             .as_mut()
             .unwrap()
-            .write_xdr(tx_entry, ledger_seq)?;
+            .write_xdr(tx_entry, ledger_seq.into())?;
 
         self.results_writer
             .as_mut()
             .unwrap()
-            .write_xdr(result_entry, ledger_seq)?;
+            .write_xdr(result_entry, ledger_seq.into())?;
 
         debug!(ledger_seq, checkpoint, "Appended transaction set");
         Ok(())

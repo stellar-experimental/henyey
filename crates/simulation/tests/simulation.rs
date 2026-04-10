@@ -8,7 +8,10 @@ async fn test_3_nodes_close_10_ledgers() {
     sim.start_all_nodes().await;
 
     let ok = sim
-        .crank_until(|s| s.have_all_externalized(11, 2), Duration::from_secs(30))
+        .crank_until(
+            |s| s.have_all_externalized(11.into(), 2),
+            Duration::from_secs(30),
+        )
         .await;
 
     assert!(ok, "all nodes should externalize at least 10 ledgers");
@@ -20,7 +23,10 @@ async fn test_partition_and_recovery() {
     sim.start_all_nodes().await;
 
     let _ = sim
-        .crank_until(|s| s.have_all_externalized(5, 2), Duration::from_secs(20))
+        .crank_until(
+            |s| s.have_all_externalized(5.into(), 2),
+            Duration::from_secs(20),
+        )
         .await;
 
     let ids = sim.node_ids();
@@ -34,7 +40,10 @@ async fn test_partition_and_recovery() {
 
     sim.heal_partition(&node2);
     let ok = sim
-        .crank_until(|s| s.have_all_externalized(10, 2), Duration::from_secs(30))
+        .crank_until(
+            |s| s.have_all_externalized(10.into(), 2),
+            Duration::from_secs(30),
+        )
         .await;
     assert!(ok);
 }
@@ -45,7 +54,10 @@ async fn test_deterministic_replay() {
         let mut sim = Topologies::core3(SimulationMode::OverLoopback);
         sim.start_all_nodes().await;
         let _ = sim
-            .crank_until(|s| s.have_all_externalized(11, 2), Duration::from_secs(30))
+            .crank_until(
+                |s| s.have_all_externalized(11.into(), 2),
+                Duration::from_secs(30),
+            )
             .await;
         sim.ledger_hashes().into_iter().map(|h| h.0).collect()
     }
@@ -65,7 +77,10 @@ async fn test_message_loss() {
     }
 
     let ok = sim
-        .crank_until(|s| s.have_all_externalized(11, 3), Duration::from_secs(60))
+        .crank_until(
+            |s| s.have_all_externalized(11.into(), 3),
+            Duration::from_secs(60),
+        )
         .await;
     assert!(ok, "consensus should survive bounded message loss");
 }
@@ -76,7 +91,10 @@ async fn test_cycle_topology_converges() {
     sim.start_all_nodes().await;
 
     let ok = sim
-        .crank_until(|s| s.have_all_externalized(9, 2), Duration::from_secs(30))
+        .crank_until(
+            |s| s.have_all_externalized(9.into(), 2),
+            Duration::from_secs(30),
+        )
         .await;
     assert!(ok);
 }

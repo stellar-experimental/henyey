@@ -131,6 +131,8 @@ mod tx_set_tracker;
 pub mod tx_set_utils;
 pub mod upgrades;
 
+use henyey_common::LedgerSeq;
+
 // Re-export main types
 pub use error::HerderError;
 pub use fetching_envelopes::{FetchingConfig, FetchingEnvelopes, FetchingStats, RecvResult};
@@ -223,7 +225,7 @@ pub struct PendingTransaction {
 #[derive(Debug, Clone)]
 pub struct ExternalizedValue {
     /// The ledger sequence number this value is for.
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
     /// Hash of the transaction set agreed upon by consensus.
     pub tx_set_hash: henyey_common::Hash256,
     /// The ledger close time agreed upon by consensus (Unix timestamp).
@@ -252,7 +254,7 @@ pub trait HerderCallback: Send + Sync {
     /// The hash of the new ledger header after closing.
     async fn close_ledger(
         &self,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
         tx_set: TransactionSet,
         close_time: u64,
         upgrades: Vec<stellar_xdr::curr::UpgradeType>,
@@ -294,7 +296,7 @@ mod tests {
         herder.start_syncing();
         assert_eq!(herder.state(), HerderState::Syncing);
 
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
         assert_eq!(herder.state(), HerderState::Tracking);
         assert_eq!(herder.tracking_slot(), 101);
     }

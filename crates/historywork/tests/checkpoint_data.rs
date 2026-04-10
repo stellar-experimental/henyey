@@ -18,7 +18,7 @@ async fn test_build_checkpoint_data_takes_state() {
     work.has = Some(HistoryArchiveState {
         version: 2,
         server: None,
-        current_ledger: 64,
+        current_ledger: 64.into(),
         network_passphrase: None,
         current_buckets: Vec::new(),
         hot_archive_buckets: None,

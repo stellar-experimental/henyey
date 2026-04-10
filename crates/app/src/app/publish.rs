@@ -99,7 +99,7 @@ impl App {
                 .await
             {
                 Ok(()) => {
-                    if let Err(e) = app.db.remove_publish(checkpoint) {
+                    if let Err(e) = app.db.remove_publish(checkpoint.into()) {
                         tracing::warn!(checkpoint, error = %e, "Failed to dequeue published checkpoint");
                     }
                     tracing::info!(checkpoint, "Checkpoint published successfully");
@@ -148,13 +148,13 @@ impl App {
 
             let tx_entry = self
                 .db
-                .get_tx_history_entry(seq)?
+                .get_tx_history_entry(seq.into())?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx history entry {}", seq))?;
             tx_entries.push(tx_entry);
 
             let tx_result = self
                 .db
-                .get_tx_result_entry(seq)?
+                .get_tx_result_entry(seq.into())?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx result entry {}", seq))?;
             tx_results.push(tx_result);
         }
@@ -165,7 +165,7 @@ impl App {
         // Load bucket list for this checkpoint
         let levels = self
             .db
-            .load_bucket_list(checkpoint)?
+            .load_bucket_list(checkpoint.into())?
             .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot {}", checkpoint))?;
 
         let bucket_manager = BucketManager::with_cache_size(
@@ -190,7 +190,7 @@ impl App {
         // are only available at close time, not at publish time.
         let has_json = self
             .db
-            .load_publish_has(checkpoint)?
+            .load_publish_has(checkpoint.into())?
             .ok_or_else(|| anyhow::anyhow!("Missing HAS for checkpoint {}", checkpoint))?;
         let has: henyey_history::HistoryArchiveState = serde_json::from_str(&has_json)?;
 
@@ -311,7 +311,7 @@ impl App {
 
         let mut entries = Vec::new();
         for seq in start_ledger..=checkpoint {
-            let envelopes = self.db.load_scp_history(seq)?;
+            let envelopes = self.db.load_scp_history(seq.into())?;
             if envelopes.is_empty() {
                 continue;
             }

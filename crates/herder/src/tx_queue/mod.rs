@@ -42,6 +42,7 @@
 //! 10x the existing fee rate. Transactions that are not included in a ledger
 //! for too many consecutive ledgers (pending_depth) are automatically banned.
 
+use henyey_common::LedgerSeq;
 use parking_lot::RwLock;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -215,7 +216,7 @@ impl Default for TxQueueConfig {
 #[derive(Debug, Clone)]
 pub struct ValidationContext {
     /// Current ledger sequence.
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
     /// Current close time (Unix timestamp).
     pub close_time: u64,
     /// Protocol version.
@@ -252,7 +253,7 @@ pub struct SorobanTxLimits {
 impl Default for ValidationContext {
     fn default() -> Self {
         Self {
-            ledger_seq: 0,
+            ledger_seq: LedgerSeq::new(0),
             close_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -760,7 +761,7 @@ impl TransactionQueue {
     /// Update the validation context (should be called when ledger closes).
     pub fn update_validation_context(
         &self,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
         close_time: u64,
         protocol_version: u32,
         base_fee: u32,
@@ -806,7 +807,7 @@ impl TransactionQueue {
 
         // Build ledger context once for time-bound and signature validation.
         let ledger_ctx = LedgerContext::new(
-            ctx.ledger_seq,
+            ctx.ledger_seq.get(),
             ctx.close_time,
             base_fee,
             5_000_000, // base reserve
@@ -846,7 +847,7 @@ impl TransactionQueue {
                 self.config.expected_ledger_close_secs * EXPECTED_CLOSE_TIME_MULT + drift;
             let upper_close_time = ctx.close_time.saturating_add(upper_offset);
             let upper_ctx = LedgerContext::new(
-                ctx.ledger_seq,
+                ctx.ledger_seq.get(),
                 upper_close_time,
                 base_fee,
                 5_000_000,
@@ -2952,7 +2953,7 @@ mod tests {
     fn test_queue_rejects_below_current_base_fee() {
         let queue = TransactionQueue::with_defaults();
 
-        queue.update_validation_context(1, 0, 25, 500, 5_000_000, 0);
+        queue.update_validation_context(1.into(), 0, 25, 500, 5_000_000, 0);
 
         let low_fee = make_test_envelope(200, 1);
         let high_fee = make_test_envelope(600, 1);
@@ -4620,7 +4621,7 @@ mod tests {
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
-        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0);
+        queue.update_validation_context(100.into(), lcl_close_time, 21, 100, 5_000_000, 0);
 
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
         let operations: Vec<Operation> = vec![Operation {
@@ -4679,7 +4680,7 @@ mod tests {
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
-        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0);
+        queue.update_validation_context(100.into(), lcl_close_time, 21, 100, 5_000_000, 0);
 
         // max_time is before lcl_close_time — already expired.
         let max_time = lcl_close_time - 1;

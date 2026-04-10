@@ -4,6 +4,7 @@
 //! genesis bucket list, and bootstrapping the node from database state.
 
 use henyey_bucket::{BucketList, HotArchiveBucketList};
+use henyey_common::LedgerSeq;
 use henyey_common::{deterministic_seed, NetworkId};
 use henyey_db::queries::StateQueries;
 
@@ -87,7 +88,14 @@ impl App {
         let mut bucket_list = BucketList::new();
         bucket_list.set_bucket_dir(bucket_dir.to_path_buf());
         bucket_list
-            .add_batch(1, 0, BucketListType::Live, genesis_entries, vec![], vec![])
+            .add_batch(
+                LedgerSeq::new(1),
+                0,
+                BucketListType::Live,
+                genesis_entries,
+                vec![],
+                vec![],
+            )
             .map_err(|e| anyhow::anyhow!("Failed to create genesis bucket list: {}", e))?;
 
         // Persist all non-empty buckets to disk so they're available for
@@ -161,12 +169,12 @@ impl App {
 
         let info = self.ledger_info();
         tracing::info!(
-            lcl_seq = info.ledger_seq,
+            lcl_seq = info.ledger_seq.get(),
             "Bootstrapped from genesis state via force-scp"
         );
 
         self.set_state(super::AppState::Synced).await;
-        self.set_current_ledger(lcl_seq).await;
+        self.set_current_ledger(lcl_seq.into()).await;
 
         // Seed validation context so tx queue rejects invalid Soroban txs immediately.
         self.seed_validation_context();

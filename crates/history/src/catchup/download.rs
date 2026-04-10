@@ -5,6 +5,7 @@ use crate::{
 };
 use henyey_bucket::canonical_bucket_filename;
 use henyey_common::Hash256;
+use henyey_common::LedgerSeq;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -294,7 +295,7 @@ impl CatchupManager {
         }
 
         for seq in start..=to_ledger {
-            self.progress.current_ledger = seq;
+            self.progress.current_ledger = seq.into();
             let checkpoint = checkpoint::checkpoint_containing(seq);
 
             if let std::collections::hash_map::Entry::Vacant(e) = checkpoint_cache.entry(checkpoint)
@@ -486,10 +487,13 @@ impl CatchupManager {
     /// The hash from the archive is authoritative - it's what the network used.
     pub(super) async fn download_checkpoint_header(
         &self,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
     ) -> Result<(LedgerHeader, Hash256)> {
         for archive in &self.archives {
-            match archive.fetch_ledger_header_with_hash(ledger_seq).await {
+            match archive
+                .fetch_ledger_header_with_hash(ledger_seq.get())
+                .await
+            {
                 Ok((header, hash)) => {
                     debug!(
                         "Downloaded header for ledger {}: bucket_list_hash={}, ledger_seq={}, hash={}",

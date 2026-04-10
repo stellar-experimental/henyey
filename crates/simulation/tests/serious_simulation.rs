@@ -9,7 +9,10 @@ async fn run_core7_fault_schedule() -> (Simulation, Vec<Hash256>) {
     sim.start_all_nodes().await;
 
     let converged_20 = sim
-        .crank_until(|s| s.have_all_externalized(20, 2), Duration::from_secs(60))
+        .crank_until(
+            |s| s.have_all_externalized(20.into(), 2),
+            Duration::from_secs(60),
+        )
         .await;
     assert!(converged_20, "core7 should converge to ledger 20");
 
@@ -52,7 +55,10 @@ async fn run_core7_fault_schedule() -> (Simulation, Vec<Hash256>) {
     }
 
     let converged_60 = sim
-        .crank_until(|s| s.have_all_externalized(60, 2), Duration::from_secs(120))
+        .crank_until(
+            |s| s.have_all_externalized(60.into(), 2),
+            Duration::from_secs(120),
+        )
         .await;
     assert!(
         converged_60,
@@ -71,7 +77,7 @@ async fn test_core7_long_run_with_fault_schedule() {
         .node_ids()
         .into_iter()
         .map(|id| {
-            let seq = sim.ledger_seq(&id);
+            let seq = sim.ledger_seq(&id).get();
             (id, seq)
         })
         .collect();

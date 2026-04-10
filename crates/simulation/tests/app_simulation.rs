@@ -3,10 +3,11 @@ use std::time::Duration;
 use henyey_app::config::QuorumSetConfig;
 use henyey_app::AppState;
 use henyey_common::Hash256;
+use henyey_common::LedgerSeq;
 use henyey_crypto::SecretKey;
 use henyey_simulation::{Simulation, SimulationMode, Topologies};
 
-async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout: Duration) {
+async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: LedgerSeq, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if sim.have_all_app_nodes_externalized(target_ledger, 1) {
@@ -17,7 +18,7 @@ async fn wait_for_app_ledger_close(sim: &Simulation, target_ledger: u32, timeout
     assert!(sim.have_all_app_nodes_externalized(target_ledger, 1));
 }
 
-async fn manual_close_until(sim: &Simulation, target_ledger: u32, timeout: Duration) {
+async fn manual_close_until(sim: &Simulation, target_ledger: LedgerSeq, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if sim.have_all_app_nodes_externalized(target_ledger, 1) {
@@ -64,7 +65,7 @@ async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
     let mut ledger_target = sim
         .app("node0")
         .map(|app| app.ledger_info().ledger_seq)
-        .unwrap_or(1);
+        .unwrap_or(LedgerSeq::new(1));
     let mut funded_total = 0usize;
     let mut rounds = 0usize;
     while funded_total < expected && rounds < 8 {
@@ -149,13 +150,13 @@ async fn test_single_node_app_simulation_can_manual_close_over_tcp() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
-        if sim.have_all_app_nodes_externalized(2, 0) {
+        if sim.have_all_app_nodes_externalized(2.into(), 0) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    assert!(sim.have_all_app_nodes_externalized(2, 0));
+    assert!(sim.have_all_app_nodes_externalized(2.into(), 0));
     sim.stop_all_nodes().await.expect("stop app-backed nodes");
 }
 
@@ -196,7 +197,7 @@ async fn test_three_nodes_two_running_threshold_two_over_tcp() {
         .manual_close_all_app_nodes()
         .await
         .expect("manual close two-of-three tcp");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
 
     sim.stop_all_nodes().await.expect("stop two-of-three tcp");
 }
@@ -209,7 +210,7 @@ async fn test_three_nodes_two_running_threshold_two_over_loopback() {
         .manual_close_all_app_nodes()
         .await
         .expect("manual close two-of-three loopback");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
 
     sim.stop_all_nodes()
         .await
@@ -246,7 +247,7 @@ async fn test_core3_app_simulation_can_attempt_multi_node_close() {
         .await
         .expect("manual close all nodes");
 
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
     sim.stop_all_nodes().await.expect("stop core3 app nodes");
 }
 
@@ -258,7 +259,7 @@ async fn test_pair_app_simulation_can_close_ledgers_over_tcp() {
         .manual_close_all_app_nodes()
         .await
         .expect("manual close pair");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
 
     sim.stop_all_nodes().await.expect("stop pair app nodes");
 }
@@ -272,7 +273,7 @@ async fn test_pair_app_simulation_can_close_ledgers_over_loopback() {
         .manual_close_all_app_nodes()
         .await
         .expect("manual close pair loopback");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
 
     sim.stop_all_nodes()
         .await
@@ -338,7 +339,7 @@ async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
         .manual_close_all_app_nodes()
         .await
         .expect("manual close core4");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
 
     sim.stop_all_nodes().await.expect("stop core4 app nodes");
 }
@@ -351,7 +352,7 @@ async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
         .manual_close_all_app_nodes()
         .await
         .expect("manual close cycle4");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
 
     sim.stop_all_nodes().await.expect("stop cycle4 app nodes");
 }
@@ -365,7 +366,7 @@ async fn test_core3_app_simulation_can_close_ledgers_over_loopback() {
         .manual_close_all_app_nodes()
         .await
         .expect("manual close core3 loopback");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
 
     sim.stop_all_nodes()
         .await
@@ -383,7 +384,7 @@ async fn test_separate_app_simulation_stays_partitioned_over_tcp() {
         .expect("manual close separate");
 
     tokio::time::sleep(Duration::from_secs(3)).await;
-    assert!(!sim.have_all_app_nodes_externalized(2, 1));
+    assert!(!sim.have_all_app_nodes_externalized(2.into(), 1));
 
     sim.stop_all_nodes().await.expect("stop separate app nodes");
 }
@@ -396,7 +397,7 @@ async fn test_core3_restart_rejoin_over_tcp() {
         .manual_close_all_app_nodes()
         .await
         .expect("close ledger 2 tcp");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
 
     sim.remove_node("node0").await.expect("remove node0 tcp");
     wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(5)).await;
@@ -406,7 +407,7 @@ async fn test_core3_restart_rejoin_over_tcp() {
         .manual_close_all_app_nodes()
         .await
         .expect("close ledger 3 tcp");
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 3.into(), Duration::from_secs(20)).await;
 
     sim.restart_node("node0").await.expect("restart node0 tcp");
     wait_for_app_operational(&sim, "node0", Duration::from_secs(5)).await;
@@ -428,10 +429,10 @@ async fn test_core3_restart_rejoin_over_tcp() {
         .await;
 
     // Wait for node0 to catch up to ledger 3 (where node1/node2 are).
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 3.into(), Duration::from_secs(20)).await;
 
     // Now advance all nodes to ledger 4.
-    manual_close_until(&sim, 4, Duration::from_secs(30)).await;
+    manual_close_until(&sim, 4.into(), Duration::from_secs(30)).await;
 
     sim.stop_all_nodes()
         .await
@@ -447,7 +448,7 @@ async fn test_core3_restart_rejoin_over_loopback() {
         .manual_close_all_app_nodes()
         .await
         .expect("close ledger 2 loopback");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2.into(), Duration::from_secs(20)).await;
 
     sim.remove_node("node0")
         .await
@@ -459,7 +460,7 @@ async fn test_core3_restart_rejoin_over_loopback() {
         .manual_close_all_app_nodes()
         .await
         .expect("close ledger 3 loopback");
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 3.into(), Duration::from_secs(20)).await;
 
     sim.restart_node("node0")
         .await
@@ -477,10 +478,10 @@ async fn test_core3_restart_rejoin_over_loopback() {
         .await;
 
     // Wait for node0 to catch up to ledger 3 before triggering ledger 4.
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 3.into(), Duration::from_secs(20)).await;
 
     // Now advance all nodes to ledger 4.
-    manual_close_until(&sim, 4, Duration::from_secs(30)).await;
+    manual_close_until(&sim, 4.into(), Duration::from_secs(30)).await;
 
     sim.stop_all_nodes()
         .await

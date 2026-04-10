@@ -8,6 +8,7 @@
 //! This allows the node to resume publishing after a restart without
 //! missing checkpoints.
 
+use henyey_common::LedgerSeq;
 use rusqlite::{params, Connection};
 
 use crate::error::DbError;
@@ -25,13 +26,13 @@ pub trait PublishQueueQueries {
     /// exact HAS (including hot archive bucket hashes) from the
     /// checkpoint ledger rather than rebuilding it later when the state
     /// may have advanced.
-    fn enqueue_publish(&self, ledger_seq: u32, has_json: &str) -> Result<(), DbError>;
+    fn enqueue_publish(&self, ledger_seq: LedgerSeq, has_json: &str) -> Result<(), DbError>;
 
     /// Removes a checkpoint ledger from the publish queue.
     ///
     /// Called after successful publication. This is a no-op if the
     /// ledger is not in the queue.
-    fn remove_publish(&self, ledger_seq: u32) -> Result<(), DbError>;
+    fn remove_publish(&self, ledger_seq: LedgerSeq) -> Result<(), DbError>;
 
     /// Removes all queued checkpoint ledgers above the given LCL.
     ///
@@ -50,7 +51,7 @@ pub trait PublishQueueQueries {
     ///
     /// Returns the History Archive State JSON that was stored at enqueue
     /// time, or `None` if the checkpoint is not in the queue.
-    fn load_publish_has(&self, ledger_seq: u32) -> Result<Option<String>, DbError>;
+    fn load_publish_has(&self, ledger_seq: LedgerSeq) -> Result<Option<String>, DbError>;
 
     /// Loads all HAS JSON values from the publish queue.
     ///
@@ -60,20 +61,20 @@ pub trait PublishQueueQueries {
 }
 
 impl PublishQueueQueries for Connection {
-    fn enqueue_publish(&self, ledger_seq: u32, has_json: &str) -> Result<(), DbError> {
+    fn enqueue_publish(&self, ledger_seq: LedgerSeq, has_json: &str) -> Result<(), DbError> {
         self.execute(
             "INSERT INTO publishqueue (ledgerseq, state) VALUES (?1, ?2) \
              ON CONFLICT(ledgerseq) DO UPDATE SET state = excluded.state \
              WHERE publishqueue.state = 'pending'",
-            params![ledger_seq as i64, has_json],
+            params![ledger_seq, has_json],
         )?;
         Ok(())
     }
 
-    fn remove_publish(&self, ledger_seq: u32) -> Result<(), DbError> {
+    fn remove_publish(&self, ledger_seq: LedgerSeq) -> Result<(), DbError> {
         self.execute(
             "DELETE FROM publishqueue WHERE ledgerseq = ?1",
-            params![ledger_seq as i64],
+            params![ledger_seq],
         )?;
         Ok(())
     }
@@ -102,11 +103,11 @@ impl PublishQueueQueries for Connection {
             .map_err(DbError::from)
     }
 
-    fn load_publish_has(&self, ledger_seq: u32) -> Result<Option<String>, DbError> {
+    fn load_publish_has(&self, ledger_seq: LedgerSeq) -> Result<Option<String>, DbError> {
         use rusqlite::OptionalExtension;
         self.query_row(
             "SELECT state FROM publishqueue WHERE ledgerseq = ?1",
-            params![ledger_seq as i64],
+            params![ledger_seq],
             |row| row.get(0),
         )
         .optional()
@@ -147,9 +148,9 @@ mod tests {
         .unwrap();
 
         let has_json = r#"{"version":2,"currentLedger":63}"#;
-        conn.enqueue_publish(63, has_json).unwrap();
+        conn.enqueue_publish(63.into(), has_json).unwrap();
 
-        let stored = conn.load_publish_has(63).unwrap().unwrap();
+        let stored = conn.load_publish_has(63.into()).unwrap().unwrap();
         assert_eq!(stored, has_json);
     }
 
@@ -160,10 +161,10 @@ mod tests {
         let first_has = r#"{"version":2,"currentLedger":63,"marker":"first"}"#;
         let second_has = r#"{"version":2,"currentLedger":63,"marker":"second"}"#;
 
-        conn.enqueue_publish(63, first_has).unwrap();
-        conn.enqueue_publish(63, second_has).unwrap();
+        conn.enqueue_publish(63.into(), first_has).unwrap();
+        conn.enqueue_publish(63.into(), second_has).unwrap();
 
-        let stored = conn.load_publish_has(63).unwrap().unwrap();
+        let stored = conn.load_publish_has(63.into()).unwrap().unwrap();
         assert_eq!(stored, first_has);
     }
 }

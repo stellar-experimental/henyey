@@ -12,6 +12,7 @@ use crate::{
     peer::Peer,
     PeerId,
 };
+use henyey_common::LedgerSeq;
 use sha2::Digest;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -717,7 +718,7 @@ impl OverlayManager {
         let message_size = msg_body_size(message);
         if helpers::is_flood_message(message) {
             let hash = compute_message_hash(message);
-            let lcl = state.last_closed_ledger.load(Ordering::Relaxed);
+            let lcl = LedgerSeq::new(state.last_closed_ledger.load(Ordering::Relaxed));
             let unique = state
                 .flood_gate
                 .record_seen(hash, Some(peer_id.clone()), lcl);

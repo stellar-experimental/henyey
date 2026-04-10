@@ -1,5 +1,6 @@
 //! Types for info, status, health, and ledger endpoints.
 
+use henyey_common::LedgerSeq;
 use serde::{Deserialize, Serialize};
 
 /// Response for the root endpoint.
@@ -73,7 +74,7 @@ pub struct LedgerResponse {
 pub struct HealthResponse {
     pub status: String,
     pub state: String,
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
     pub peer_count: usize,
 }
 
@@ -110,7 +111,7 @@ pub struct SelfCheckResponse {
 /// Response for the /metrics endpoint (Prometheus format).
 #[derive(Serialize)]
 pub struct MetricsResponse {
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
     pub peer_count: usize,
     pub pending_transactions: u64,
     pub uptime_seconds: u64,

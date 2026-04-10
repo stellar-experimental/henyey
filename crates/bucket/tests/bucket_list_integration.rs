@@ -8,6 +8,7 @@ use henyey_bucket::{
     HotArchiveBucketList,
 };
 use henyey_common::Hash256;
+use henyey_common::LedgerSeq;
 use stellar_xdr::curr::*;
 
 const TEST_PROTOCOL: u32 = 25;
@@ -22,9 +23,9 @@ fn make_contract_id(seed: u8) -> Hash {
     Hash(bytes)
 }
 
-fn make_contract_code_entry(seed: u8, last_modified: u32) -> LedgerEntry {
+fn make_contract_code_entry(seed: u8, last_modified: LedgerSeq) -> LedgerEntry {
     LedgerEntry {
-        last_modified_ledger_seq: last_modified,
+        last_modified_ledger_seq: last_modified.into(),
         data: LedgerEntryData::ContractCode(ContractCodeEntry {
             ext: ContractCodeEntryExt::V0,
             hash: make_contract_id(seed),
@@ -43,13 +44,13 @@ fn make_contract_code_key(seed: u8) -> LedgerKey {
 fn make_contract_data_entry(
     seed: u8,
     durability: ContractDataDurability,
-    last_modified: u32,
+    last_modified: LedgerSeq,
 ) -> LedgerEntry {
     let mut key_bytes = [0u8; 32];
     key_bytes[0] = seed;
 
     LedgerEntry {
-        last_modified_ledger_seq: last_modified,
+        last_modified_ledger_seq: last_modified.into(),
         data: LedgerEntryData::ContractData(ContractDataEntry {
             ext: ExtensionPoint::V0,
             contract: ScAddress::Contract(ContractId(Hash(key_bytes))),
@@ -73,7 +74,7 @@ fn make_contract_data_key(seed: u8, durability: ContractDataDurability) -> Ledge
     })
 }
 
-fn make_ttl_entry(key: &LedgerKey, live_until: u32, last_modified: u32) -> LedgerEntry {
+fn make_ttl_entry(key: &LedgerKey, live_until: LedgerSeq, last_modified: LedgerSeq) -> LedgerEntry {
     use sha2::{Digest, Sha256};
 
     let key_bytes = key.to_xdr(Limits::none()).unwrap();
@@ -84,10 +85,10 @@ fn make_ttl_entry(key: &LedgerKey, live_until: u32, last_modified: u32) -> Ledge
     key_hash.copy_from_slice(&hash);
 
     LedgerEntry {
-        last_modified_ledger_seq: last_modified,
+        last_modified_ledger_seq: last_modified.into(),
         data: LedgerEntryData::Ttl(TtlEntry {
             key_hash: Hash(key_hash),
-            live_until_ledger_seq: live_until,
+            live_until_ledger_seq: live_until.into(),
         }),
         ext: LedgerEntryExt::V0,
     }
@@ -177,7 +178,7 @@ async fn test_hot_archive_tombstones_expire_at_bottom_level() {
     let mut restored_keys = Vec::new();
 
     for i in 0..5 {
-        let entry = make_contract_code_entry(i, 1);
+        let entry = make_contract_code_entry(i, 1.into());
         let key = make_contract_code_key(i);
         archived_entries.push(entry);
         restored_keys.push(key);
@@ -185,7 +186,7 @@ async fn test_hot_archive_tombstones_expire_at_bottom_level() {
 
     // Add archived entries to the bucket list
     bl.add_batch(
-        1,
+        1.into(),
         TEST_PROTOCOL,
         archived_entries.clone(),
         vec![], // No restorations yet
@@ -194,13 +195,14 @@ async fn test_hot_archive_tombstones_expire_at_bottom_level() {
 
     // Add restoration markers (Live tombstones) for some entries
     let keys_to_restore: Vec<_> = restored_keys.iter().take(2).cloned().collect();
-    bl.add_batch(2, TEST_PROTOCOL, vec![], keys_to_restore.clone())
+    bl.add_batch(2.into(), TEST_PROTOCOL, vec![], keys_to_restore.clone())
         .unwrap();
 
     // Continue adding empty batches to push entries through levels
     // This simulates ledger progression
     for ledger in 3..50 {
-        bl.add_batch(ledger, TEST_PROTOCOL, vec![], vec![]).unwrap();
+        bl.add_batch(ledger.into(), TEST_PROTOCOL, vec![], vec![])
+            .unwrap();
     }
 
     // Verify that archived entries for non-restored keys still exist
@@ -231,27 +233,28 @@ async fn test_hot_archive_multiple_archives_and_restores() {
     let mut bl = HotArchiveBucketList::new();
 
     // Create initial archived entry V0
-    let entry_v0 = make_contract_code_entry(1, 1);
+    let entry_v0 = make_contract_code_entry(1, 1.into());
     let key = make_contract_code_key(1);
 
     // Create updated archived entry V1 (same key, different last_modified)
-    let entry_v1 = make_contract_code_entry(1, 10);
+    let entry_v1 = make_contract_code_entry(1, 10.into());
 
     // Archive V0
-    bl.add_batch(1, TEST_PROTOCOL, vec![entry_v0.clone()], vec![])
+    bl.add_batch(1.into(), TEST_PROTOCOL, vec![entry_v0.clone()], vec![])
         .unwrap();
 
     // Restore (adds Live tombstone)
-    bl.add_batch(2, TEST_PROTOCOL, vec![], vec![key.clone()])
+    bl.add_batch(2.into(), TEST_PROTOCOL, vec![], vec![key.clone()])
         .unwrap();
 
     // Re-archive V1
-    bl.add_batch(3, TEST_PROTOCOL, vec![entry_v1.clone()], vec![])
+    bl.add_batch(3.into(), TEST_PROTOCOL, vec![entry_v1.clone()], vec![])
         .unwrap();
 
     // Push through more ledgers to merge everything
     for ledger in 4..100 {
-        bl.add_batch(ledger, TEST_PROTOCOL, vec![], vec![]).unwrap();
+        bl.add_batch(ledger.into(), TEST_PROTOCOL, vec![], vec![])
+            .unwrap();
     }
 
     // The newest archived version (V1) should ultimately win
@@ -272,15 +275,15 @@ async fn test_hot_archive_concurrent_archive_and_restore() {
     let mut bl = HotArchiveBucketList::new();
 
     // Archive entry 1
-    let entry1 = make_contract_code_entry(1, 1);
+    let entry1 = make_contract_code_entry(1, 1.into());
     let key1 = make_contract_code_key(1);
-    bl.add_batch(1, TEST_PROTOCOL, vec![entry1], vec![])
+    bl.add_batch(1.into(), TEST_PROTOCOL, vec![entry1], vec![])
         .unwrap();
 
     // Archive entry 2 and restore entry 1 in the same batch
-    let entry2 = make_contract_code_entry(2, 2);
+    let entry2 = make_contract_code_entry(2, 2.into());
     let key2 = make_contract_code_key(2);
-    bl.add_batch(2, TEST_PROTOCOL, vec![entry2], vec![key1.clone()])
+    bl.add_batch(2.into(), TEST_PROTOCOL, vec![entry2], vec![key1.clone()])
         .unwrap();
 
     // Entry 1 should be shadowed (was restored)
@@ -322,7 +325,7 @@ async fn test_bucket_list_basic_operations() {
         };
 
         bl.add_batch(
-            i,
+            i.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             entries,
@@ -380,7 +383,7 @@ async fn test_bucket_list_snap_steady_state() {
             .collect();
 
         bl.add_batch(
-            i,
+            i.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             entries,
@@ -416,7 +419,7 @@ async fn test_bucket_list_deepest_curr_accumulates() {
             .collect();
 
         bl.add_batch(
-            i,
+            i.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             entries,
@@ -455,7 +458,7 @@ async fn test_single_entry_bubbling_up() {
     let key = make_account_key(1);
 
     bl.add_batch(
-        1,
+        1.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![entry.clone()],
@@ -471,7 +474,7 @@ async fn test_single_entry_bubbling_up() {
     // Add many empty batches to push entry through levels
     for i in 2..=5000 {
         bl.add_batch(
-            i,
+            i.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -506,7 +509,7 @@ async fn test_init_dead_annihilation() {
     let key = make_account_key(1);
 
     bl.add_batch(
-        1,
+        1.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![entry],
@@ -517,7 +520,7 @@ async fn test_init_dead_annihilation() {
 
     // Delete the entry (creates DEAD at level 0)
     bl.add_batch(
-        2,
+        2.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![],
@@ -533,7 +536,7 @@ async fn test_init_dead_annihilation() {
     // Push through more ledgers to ensure INIT + DEAD merge and annihilate
     for i in 3..=100 {
         bl.add_batch(
-            i,
+            i.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -580,7 +583,7 @@ async fn test_tombstones_expire_at_bottom_level() {
     let key = make_account_key(1);
 
     bl.add_batch(
-        1,
+        1.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![entry],
@@ -593,7 +596,7 @@ async fn test_tombstones_expire_at_bottom_level() {
     // This means the INIT will be in snap, DEAD in curr, and they won't annihilate immediately
     for i in 2..=10 {
         bl.add_batch(
-            i,
+            i.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -605,7 +608,7 @@ async fn test_tombstones_expire_at_bottom_level() {
 
     // Now delete
     bl.add_batch(
-        11,
+        11.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![],
@@ -621,7 +624,7 @@ async fn test_tombstones_expire_at_bottom_level() {
     // Push through many more ledgers to get tombstone to bottom level
     for i in 12..=5000 {
         bl.add_batch(
-            i,
+            i.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -660,7 +663,7 @@ async fn test_searchable_bucket_list_snapshots() {
             entry.last_modified_ledger_seq = ledger_seq;
 
             bl.add_batch(
-                ledger_seq,
+                ledger_seq.into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![],
@@ -670,7 +673,7 @@ async fn test_searchable_bucket_list_snapshots() {
             .unwrap();
         } else {
             bl.add_batch(
-                ledger_seq,
+                ledger_seq.into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![],
@@ -711,7 +714,7 @@ async fn test_eviction_iterator_preserved_when_no_spill() {
 
     // At ledger 100, level 6 shouldn't spill (spills at multiples of 8192)
     // Note: update_starting_eviction_iterator takes (iter, first_scan_level, ledger_seq)
-    let was_reset = update_starting_eviction_iterator(&mut iter, 6, 100);
+    let was_reset = update_starting_eviction_iterator(&mut iter, 6, 100.into());
 
     assert!(!was_reset, "No reset should occur at ledger 100");
     assert_eq!(iter.bucket_file_offset, 1000, "Offset should be preserved");
@@ -734,7 +737,7 @@ async fn test_eviction_iterator_resets_on_spill() {
     // Level 5 spills at level_half(5) = 2048.
     // update_starting_eviction_iterator checks prev_ledger = ledger_seq - 1,
     // so at ledger_seq = 2049, prev_ledger = 2048 which is a spill boundary for level 5.
-    let was_reset = update_starting_eviction_iterator(&mut iter, 6, 2049);
+    let was_reset = update_starting_eviction_iterator(&mut iter, 6, 2049.into());
 
     // A spill occurred, iterator should reset
     assert!(
@@ -762,9 +765,9 @@ async fn test_eviction_scan_basic() {
     let ttl_expiration = current_ledger + 5; // Entries expire at ledger 6
 
     for i in 0..5 {
-        let code_entry = make_contract_code_entry(i, current_ledger);
+        let code_entry = make_contract_code_entry(i, current_ledger.into());
         let code_key = make_contract_code_key(i);
-        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration, current_ledger);
+        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration.into(), current_ledger.into());
 
         entries_with_ttl.push(code_entry);
         entries_with_ttl.push(ttl_entry);
@@ -772,7 +775,7 @@ async fn test_eviction_scan_basic() {
 
     // Add entries to bucket list
     bl.add_batch(
-        current_ledger,
+        current_ledger.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         entries_with_ttl,
@@ -795,7 +798,7 @@ async fn test_eviction_scan_basic() {
     // Advance ledgers (add empty batches)
     for ledger in 2..=5 {
         bl.add_batch(
-            ledger,
+            ledger.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -818,7 +821,7 @@ async fn test_eviction_scan_basic() {
 
     // Now perform eviction scan at ledger 7 (after TTL expiration at 6)
     let eviction_ledger = 7;
-    let (archived_entries, deleted_keys) = bl.scan_for_eviction(eviction_ledger).unwrap();
+    let (archived_entries, deleted_keys) = bl.scan_for_eviction(eviction_ledger.into()).unwrap();
 
     // All 5 ContractCode entries should be archived (they're persistent)
     assert_eq!(
@@ -858,12 +861,12 @@ async fn test_eviction_scan_shadowed_entries_not_evicted() {
     let initial_ttl = current_ledger + 3; // Initially expires at ledger 4
 
     // Create a ContractCode entry with short TTL
-    let code_entry = make_contract_code_entry(1, current_ledger);
+    let code_entry = make_contract_code_entry(1, current_ledger.into());
     let code_key = make_contract_code_key(1);
-    let ttl_entry = make_ttl_entry(&code_key, initial_ttl, current_ledger);
+    let ttl_entry = make_ttl_entry(&code_key, initial_ttl.into(), current_ledger.into());
 
     bl.add_batch(
-        current_ledger,
+        current_ledger.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![code_entry, ttl_entry],
@@ -874,7 +877,7 @@ async fn test_eviction_scan_shadowed_entries_not_evicted() {
 
     // Advance to ledger 2
     bl.add_batch(
-        2,
+        2.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![],
@@ -885,10 +888,10 @@ async fn test_eviction_scan_shadowed_entries_not_evicted() {
 
     // Update the TTL to extend it (shadow the old TTL)
     let extended_ttl = 20; // Now expires at ledger 20
-    let updated_ttl_entry = make_ttl_entry(&code_key, extended_ttl, 2);
+    let updated_ttl_entry = make_ttl_entry(&code_key, extended_ttl.into(), 2.into());
 
     bl.add_batch(
-        3,
+        3.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![],
@@ -898,7 +901,7 @@ async fn test_eviction_scan_shadowed_entries_not_evicted() {
     .unwrap();
 
     // Perform eviction scan at ledger 10 (after original TTL but before extended TTL)
-    let (archived_entries, deleted_keys) = bl.scan_for_eviction(10).unwrap();
+    let (archived_entries, deleted_keys) = bl.scan_for_eviction(10.into()).unwrap();
 
     // Entry should NOT be evicted because TTL was extended
     assert_eq!(
@@ -930,15 +933,15 @@ async fn test_eviction_scan_incremental() {
     // Create entries
     let mut entries = Vec::new();
     for i in 0..10 {
-        let code_entry = make_contract_code_entry(i, current_ledger);
+        let code_entry = make_contract_code_entry(i, current_ledger.into());
         let code_key = make_contract_code_key(i);
-        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration, current_ledger);
+        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration.into(), current_ledger.into());
         entries.push(code_entry);
         entries.push(ttl_entry);
     }
 
     bl.add_batch(
-        current_ledger,
+        current_ledger.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         entries,
@@ -964,7 +967,7 @@ async fn test_eviction_scan_incremental() {
 
     // Perform incremental scan at ledger 5 (after expiration)
     let result = bl
-        .scan_for_eviction_incremental(iter, 5, &settings)
+        .scan_for_eviction_incremental(iter, 5.into(), &settings)
         .unwrap();
 
     // Should have scanned some bytes
@@ -1006,15 +1009,15 @@ async fn test_snapshot_eviction_scan_matches_bucket_list() {
     // Create 10 contract code entries with TTLs that expire at ledger 3
     let mut entries = Vec::new();
     for i in 0..10 {
-        let code_entry = make_contract_code_entry(i, current_ledger);
+        let code_entry = make_contract_code_entry(i, current_ledger.into());
         let code_key = make_contract_code_key(i);
-        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration, current_ledger);
+        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration.into(), current_ledger.into());
         entries.push(code_entry);
         entries.push(ttl_entry);
     }
 
     bl.add_batch(
-        current_ledger,
+        current_ledger.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         entries,
@@ -1040,7 +1043,7 @@ async fn test_snapshot_eviction_scan_matches_bucket_list() {
 
     // Run scan on the bucket list directly
     let bl_result = bl
-        .scan_for_eviction_incremental(iter.clone(), scan_ledger, &settings)
+        .scan_for_eviction_incremental(iter.clone(), scan_ledger.into(), &settings)
         .unwrap();
 
     // Take a snapshot and run the same scan on it
@@ -1068,7 +1071,7 @@ async fn test_snapshot_eviction_scan_matches_bucket_list() {
     };
     let snapshot = BucketListSnapshot::new(&bl, header);
     let snap_result = snapshot
-        .scan_for_eviction_incremental(iter, scan_ledger, &settings)
+        .scan_for_eviction_incremental(iter, scan_ledger.into(), &settings)
         .unwrap();
 
     // Results must be identical
@@ -1134,15 +1137,15 @@ async fn test_snapshot_eviction_scan_on_background_thread() {
 
     let mut entries = Vec::new();
     for i in 0..5 {
-        let code_entry = make_contract_code_entry(i, current_ledger);
+        let code_entry = make_contract_code_entry(i, current_ledger.into());
         let code_key = make_contract_code_key(i);
-        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration, current_ledger);
+        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration.into(), current_ledger.into());
         entries.push(code_entry);
         entries.push(ttl_entry);
     }
 
     bl.add_batch(
-        current_ledger,
+        current_ledger.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         entries,
@@ -1192,7 +1195,7 @@ async fn test_snapshot_eviction_scan_on_background_thread() {
     let snapshot = BucketListSnapshot::new(&bl, header);
 
     let handle = std::thread::spawn(move || {
-        snapshot.scan_for_eviction_incremental(iter, target_ledger, &settings)
+        snapshot.scan_for_eviction_incremental(iter, target_ledger.into(), &settings)
     });
 
     let result = handle.join().expect("thread should not panic").unwrap();
@@ -1226,12 +1229,12 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
     let initial_ttl = current_ledger + 3; // Expires at ledger 4
 
     // Create entry with short TTL
-    let code_entry = make_contract_code_entry(1, current_ledger);
+    let code_entry = make_contract_code_entry(1, current_ledger.into());
     let code_key = make_contract_code_key(1);
-    let ttl_entry = make_ttl_entry(&code_key, initial_ttl, current_ledger);
+    let ttl_entry = make_ttl_entry(&code_key, initial_ttl.into(), current_ledger.into());
 
     bl.add_batch(
-        current_ledger,
+        current_ledger.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![code_entry, ttl_entry],
@@ -1242,7 +1245,7 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
 
     // Advance and extend the TTL
     bl.add_batch(
-        2,
+        2.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![],
@@ -1252,10 +1255,10 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
     .unwrap();
 
     let extended_ttl = 20; // Now expires at ledger 20
-    let updated_ttl = make_ttl_entry(&code_key, extended_ttl, 3);
+    let updated_ttl = make_ttl_entry(&code_key, extended_ttl.into(), 3.into());
 
     bl.add_batch(
-        3,
+        3.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![],
@@ -1303,7 +1306,7 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
 
     // Scan at ledger 10: after original TTL (4) but before extended TTL (20)
     let result = snapshot
-        .scan_for_eviction_incremental(iter.clone(), 10, &settings)
+        .scan_for_eviction_incremental(iter.clone(), 10.into(), &settings)
         .unwrap();
 
     // Entry should NOT be evicted because the snapshot sees the extended TTL
@@ -1315,7 +1318,7 @@ async fn test_snapshot_eviction_scan_respects_extended_ttl() {
 
     // Now scan at ledger 25: after the extended TTL
     let result2 = snapshot
-        .scan_for_eviction_incremental(iter, 25, &settings)
+        .scan_for_eviction_incremental(iter, 25.into(), &settings)
         .unwrap();
 
     // Entry SHOULD be evicted now
@@ -1341,24 +1344,24 @@ async fn test_snapshot_eviction_scan_temporary_entries() {
     let mut entries = Vec::new();
     for i in 0..3 {
         let data_entry =
-            make_contract_data_entry(i, ContractDataDurability::Temporary, current_ledger);
+            make_contract_data_entry(i, ContractDataDurability::Temporary, current_ledger.into());
         let data_key = make_contract_data_key(i, ContractDataDurability::Temporary);
-        let ttl_entry = make_ttl_entry(&data_key, ttl_expiration, current_ledger);
+        let ttl_entry = make_ttl_entry(&data_key, ttl_expiration.into(), current_ledger.into());
         entries.push(data_entry);
         entries.push(ttl_entry);
     }
 
     // Also add 2 persistent entries
     for i in 10..12 {
-        let code_entry = make_contract_code_entry(i, current_ledger);
+        let code_entry = make_contract_code_entry(i, current_ledger.into());
         let code_key = make_contract_code_key(i);
-        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration, current_ledger);
+        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration.into(), current_ledger.into());
         entries.push(code_entry);
         entries.push(ttl_entry);
     }
 
     bl.add_batch(
-        current_ledger,
+        current_ledger.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         entries,
@@ -1404,7 +1407,7 @@ async fn test_snapshot_eviction_scan_temporary_entries() {
     };
 
     let result = snapshot
-        .scan_for_eviction_incremental(iter, 5, &settings)
+        .scan_for_eviction_incremental(iter, 5.into(), &settings)
         .unwrap();
 
     // Should find all 5 expired entries (3 temporary + 2 persistent)
@@ -1677,12 +1680,12 @@ async fn test_scan_for_entries_of_types_basic() {
     let entries = vec![
         make_account_entry(1, 1000),
         make_offer_entry(2, 100),
-        make_contract_code_entry(3, 1),
-        make_contract_data_entry(4, ContractDataDurability::Persistent, 1),
+        make_contract_code_entry(3, 1.into()),
+        make_contract_data_entry(4, ContractDataDurability::Persistent, 1.into()),
     ];
 
     bl.add_batch(
-        1,
+        1.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         entries,
@@ -1724,7 +1727,7 @@ async fn test_scan_for_entries_of_types_deduplication() {
 
     // Ledger 1: add an offer and an account
     bl.add_batch(
-        1,
+        1.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![make_offer_entry(1, 100), make_account_entry(10, 500)],
@@ -1735,10 +1738,10 @@ async fn test_scan_for_entries_of_types_deduplication() {
 
     // Ledger 2: update the same offer (same key, new balance) + add contract code
     bl.add_batch(
-        2,
+        2.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
-        vec![make_contract_code_entry(5, 2)],
+        vec![make_contract_code_entry(5, 2.into())],
         vec![make_offer_entry(1, 100)], // update with same offer_id
         vec![],
     )
@@ -1774,13 +1777,13 @@ async fn test_scan_for_entries_of_types_excludes_dead_and_unmatched() {
 
     // Ledger 1: add entries of multiple types
     bl.add_batch(
-        1,
+        1.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![
             make_offer_entry(1, 100),
             make_account_entry(2, 1000),
-            make_contract_code_entry(3, 1),
+            make_contract_code_entry(3, 1.into()),
         ],
         vec![],
         vec![],
@@ -1797,7 +1800,7 @@ async fn test_scan_for_entries_of_types_excludes_dead_and_unmatched() {
         offer_id: 100,
     });
     bl.add_batch(
-        2,
+        2.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![],
@@ -1836,13 +1839,13 @@ async fn test_scan_for_entries_of_types_matches_single_type_variant() {
     // Add a mix of entries across multiple ledgers
     for i in 1u8..=10 {
         bl.add_batch(
-            i as u32,
+            (i as u32).into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![
                 make_account_entry(i * 10, 1000),
                 make_offer_entry(i * 10 + 1, i as i64 * 100),
-                make_contract_code_entry(i * 10 + 2, i as u32),
+                make_contract_code_entry(i * 10 + 2, (i as u32).into()),
             ],
             vec![],
             vec![],
@@ -1889,14 +1892,14 @@ async fn test_scan_for_entries_of_types_early_termination() {
     let mut bl = BucketList::new();
 
     bl.add_batch(
-        1,
+        1.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![
             make_offer_entry(1, 100),
             make_offer_entry(2, 200),
             make_offer_entry(3, 300),
-            make_contract_code_entry(4, 1),
+            make_contract_code_entry(4, 1.into()),
         ],
         vec![],
         vec![],
@@ -1928,13 +1931,13 @@ async fn test_scan_for_entries_of_types_early_termination() {
 async fn test_scan_for_entries_of_types_soroban_combined() {
     let mut bl = BucketList::new();
 
-    let code_entry = make_contract_code_entry(1, 1);
-    let data_entry = make_contract_data_entry(2, ContractDataDurability::Persistent, 1);
+    let code_entry = make_contract_code_entry(1, 1.into());
+    let data_entry = make_contract_data_entry(2, ContractDataDurability::Persistent, 1.into());
     let code_key = make_contract_code_key(1);
-    let ttl_entry = make_ttl_entry(&code_key, 1000, 1);
+    let ttl_entry = make_ttl_entry(&code_key, 1000.into(), 1.into());
 
     bl.add_batch(
-        1,
+        1.into(),
         TEST_PROTOCOL,
         BucketListType::Live,
         vec![

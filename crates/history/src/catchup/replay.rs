@@ -235,7 +235,7 @@ impl CatchupManager {
         let mut pq_fell_behind = false;
 
         for (i, data) in ledger_data.iter().enumerate() {
-            self.progress.current_ledger = data.header.ledger_seq;
+            self.progress.current_ledger = data.header.ledger_seq.into();
 
             // Apply publish queue backpressure if enabled (offline catchup).
             if self.replay_config.wait_for_publish {
@@ -246,7 +246,7 @@ impl CatchupManager {
             let upgrades = decode_upgrades_from_header(&data.header);
 
             let close_data = LedgerCloseData::new(
-                data.header.ledger_seq,
+                data.header.ledger_seq.into(),
                 data.tx_set.clone(),
                 data.header.scp_value.close_time.0,
                 ledger_manager.current_header_hash(),
@@ -283,7 +283,7 @@ impl CatchupManager {
             // Emit metadata to SQLite and external consumers (e.g., stellar-rpc's
             // meta pipe in bounded replay mode: `catchup --metadata-output-stream fd:3`).
             if let Some(meta) = result.meta {
-                self.emit_meta(data.header.ledger_seq, meta);
+                self.emit_meta(data.header.ledger_seq.into(), meta);
             }
 
             debug!(

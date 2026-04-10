@@ -5,6 +5,7 @@
 //! The data is stored as raw XDR and cleaned up by the Maintainer using the
 //! RPC retention window.
 
+use henyey_common::LedgerSeq;
 use rusqlite::{params, Connection};
 
 use crate::error::DbError;
@@ -36,7 +37,11 @@ pub trait LedgerCloseMetaQueries {
     ///
     /// Removes at most `count` entries to limit the amount of work per call.
     /// Returns the number of entries actually deleted.
-    fn delete_old_ledger_close_meta(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
+    fn delete_old_ledger_close_meta(
+        &self,
+        max_ledger: LedgerSeq,
+        count: u32,
+    ) -> Result<u32, DbError>;
 }
 
 impl LedgerCloseMetaQueries for Connection {
@@ -78,7 +83,11 @@ impl LedgerCloseMetaQueries for Connection {
         Ok(results?)
     }
 
-    fn delete_old_ledger_close_meta(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
+    fn delete_old_ledger_close_meta(
+        &self,
+        max_ledger: LedgerSeq,
+        count: u32,
+    ) -> Result<u32, DbError> {
         let deleted = self.execute(
             "DELETE FROM ledger_close_meta WHERE sequence IN (\
                 SELECT sequence FROM ledger_close_meta \
@@ -163,11 +172,11 @@ mod tests {
         }
 
         // Delete up to seq 5, but only 3 at a time
-        let deleted = conn.delete_old_ledger_close_meta(5, 3).unwrap();
+        let deleted = conn.delete_old_ledger_close_meta(5.into(), 3).unwrap();
         assert_eq!(deleted, 3);
 
         // Delete remaining
-        let deleted = conn.delete_old_ledger_close_meta(5, 10).unwrap();
+        let deleted = conn.delete_old_ledger_close_meta(5.into(), 10).unwrap();
         assert_eq!(deleted, 2);
 
         // Verify 6-10 remain

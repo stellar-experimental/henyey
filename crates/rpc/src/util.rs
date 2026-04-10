@@ -1,6 +1,7 @@
 //! Shared utility functions for the RPC crate.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use henyey_common::LedgerSeq;
 use serde::Serialize;
 use stellar_xdr::curr::{
     DiagnosticEvent, LedgerCloseMeta, LedgerHeaderHistoryEntry, LedgerKey, Limits, ReadXdr,
@@ -214,8 +215,8 @@ const TX_ORDER_MASK: u64 = 0x000F_FFFF; // 20 bits
 const OP_INDEX_MASK: u64 = 0x0000_0FFF; // 12 bits
 
 /// Encode a (ledger, tx_order, op_index) triple into a TOID.
-pub(crate) fn toid_encode(ledger_seq: u32, tx_order: u32, op_index: u32) -> i64 {
-    let v = ((ledger_seq as u64) << LEDGER_SHIFT)
+pub(crate) fn toid_encode(ledger_seq: LedgerSeq, tx_order: u32, op_index: u32) -> i64 {
+    let v = ((ledger_seq.get() as u64) << LEDGER_SHIFT)
         | (((tx_order as u64) & TX_ORDER_MASK) << TX_ORDER_SHIFT)
         | ((op_index as u64) & OP_INDEX_MASK);
     v as i64
@@ -324,11 +325,11 @@ pub(crate) fn oldest_ledger(app: &henyey_app::App) -> u32 {
 }
 
 /// Get the close time (unix seconds) for a given ledger, returning 0 on error.
-pub(crate) fn ledger_close_time(app: &henyey_app::App, ledger_seq: u32) -> u64 {
+pub(crate) fn ledger_close_time(app: &henyey_app::App, ledger_seq: LedgerSeq) -> u64 {
     app.database()
         .with_connection(|conn| {
             use henyey_db::LedgerQueries;
-            conn.load_ledger_header(ledger_seq)
+            conn.load_ledger_header(ledger_seq.into())
         })
         .ok()
         .flatten()
@@ -353,7 +354,7 @@ impl LedgerContext {
     pub fn from_app(app: &henyey_app::App) -> Self {
         let summary = app.ledger_summary();
         let oldest = oldest_ledger(app);
-        let oldest_close = ledger_close_time(app, oldest);
+        let oldest_close = ledger_close_time(app, oldest.into());
         Self {
             latest_ledger: summary.num,
             latest_close_time: summary.close_time,
@@ -515,14 +516,14 @@ mod tests {
 
     #[test]
     fn test_toid_roundtrip() {
-        let cases = [
-            (1u32, 0u32, 0u32),
+        let cases: [(u32, u32, u32); 4] = [
+            (1, 0, 0),
             (100, 5, 3),
             (u32::MAX >> 1, (1 << 20) - 1, (1 << 12) - 1), // max values
             (0, 0, 0),
         ];
         for (ledger, tx_order, op_index) in cases {
-            let encoded = toid_encode(ledger, tx_order, op_index);
+            let encoded = toid_encode(ledger.into(), tx_order, op_index);
             let (l, t, o) = toid_decode(encoded);
             assert_eq!(
                 (l, t, o),
@@ -535,16 +536,16 @@ mod tests {
     #[test]
     fn test_toid_ordering() {
         // Transactions in later ledgers have higher TOID values
-        assert!(toid_encode(2, 0, 0) > toid_encode(1, 0, 0));
+        assert!(toid_encode(2.into(), 0, 0) > toid_encode(1.into(), 0, 0));
         // Higher tx_order in same ledger has higher TOID
-        assert!(toid_encode(1, 2, 0) > toid_encode(1, 1, 0));
+        assert!(toid_encode(1.into(), 2, 0) > toid_encode(1.into(), 1, 0));
         // Higher op_index has higher TOID
-        assert!(toid_encode(1, 1, 2) > toid_encode(1, 1, 1));
+        assert!(toid_encode(1.into(), 1, 2) > toid_encode(1.into(), 1, 1));
     }
 
     #[test]
     fn test_toid_parse_cursor() {
-        let toid = toid_encode(100, 5, 0);
+        let toid = toid_encode(100.into(), 5, 0);
         let s = toid.to_string();
         assert_eq!(toid_parse_cursor(&s).unwrap(), toid);
 
@@ -574,7 +575,7 @@ mod tests {
             oldest_ledger: 1,
             oldest_close_time: 0,
         };
-        let toid = toid_encode(50, 3, 0);
+        let toid = toid_encode(50.into(), 3, 0);
         let cursor_str = toid.to_string();
         let (start, cursor, limit) =
             validate_pagination(None, Some(&cursor_str), Some(20), 5, 200, &lctx).unwrap();
@@ -591,7 +592,7 @@ mod tests {
             oldest_ledger: 1,
             oldest_close_time: 0,
         };
-        let toid = toid_encode(50, 3, 0);
+        let toid = toid_encode(50.into(), 3, 0);
         let cursor_str = toid.to_string();
         let result = validate_pagination(Some(10), Some(&cursor_str), None, 5, 200, &lctx);
         assert!(result.is_err());

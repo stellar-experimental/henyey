@@ -58,7 +58,7 @@ use henyey_bucket::{
 };
 use henyey_clock::{Clock, RealClock};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
-use henyey_common::{Hash256, NetworkId};
+use henyey_common::{Hash256, LedgerSeq, NetworkId};
 use henyey_db::queries::StateQueries;
 use henyey_db::schema::state_keys;
 use henyey_db::{
@@ -980,8 +980,8 @@ impl App {
     }
 
     /// Set the tracked current ledger sequence.
-    pub(crate) async fn set_current_ledger(&self, seq: u32) {
-        *self.current_ledger.write().await = seq;
+    pub(crate) async fn set_current_ledger(&self, seq: LedgerSeq) {
+        *self.current_ledger.write().await = seq.get();
     }
 
     /// Check if the force-scp flag is set in the database.
@@ -1054,7 +1054,7 @@ impl App {
         let hash = self.ledger_manager.current_header_hash();
         let close_time = ledger_close_time(&header);
         LedgerInfo {
-            ledger_seq: header.ledger_seq,
+            ledger_seq: header.ledger_seq.into(),
             hash,
             close_time,
             protocol_version: header.ledger_version,
@@ -1083,7 +1083,7 @@ impl App {
             stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
         };
         LedgerSummary {
-            num: info.ledger_seq,
+            num: info.ledger_seq.get(),
             hash: info.hash,
             close_time: info.close_time,
             version: info.protocol_version,
@@ -1177,7 +1177,7 @@ impl App {
     }
 
     /// Get the current ledger sequence number.
-    pub fn current_ledger_seq(&self) -> u32 {
+    pub fn current_ledger_seq(&self) -> LedgerSeq {
         self.ledger_manager.current_ledger_seq()
     }
 
@@ -1226,7 +1226,7 @@ impl App {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to trigger next ledger: {}", e))?;
 
-        Ok(next_ledger)
+        Ok(next_ledger.get())
     }
 
     pub fn self_check(&self, depth: u32) -> anyhow::Result<SelfCheckResult> {
@@ -1315,7 +1315,7 @@ impl App {
         let current_ledger = self.ledger_info().ledger_seq;
         let quorum_slot = herder_stats
             .tracking_slot
-            .max(current_ledger as u64 + 1)
+            .max(current_ledger.get() as u64 + 1)
             .max(1);
         let slot_state = self.herder.get_slot_state(quorum_slot);
         SimulationDebugStats {
@@ -1391,12 +1391,18 @@ impl App {
 
         tracing::info!(
             count = count,
-            lcl = lcl,
+            lcl = lcl.get(),
             min_queued = ?min_queued,
             "Performing manual maintenance"
         );
 
-        crate::maintainer::run_maintenance(&self.db, lcl, min_queued, rpc_retention_window, count);
+        crate::maintainer::run_maintenance(
+            &self.db,
+            lcl.get(),
+            min_queued,
+            rpc_retention_window,
+            count,
+        );
     }
 
     /// Delete bucket files on disk that are no longer referenced by the live
@@ -1480,7 +1486,7 @@ impl App {
         let latest_slot = self
             .herder
             .latest_externalized_slot()
-            .unwrap_or(ledger_seq as u64);
+            .unwrap_or(ledger_seq.get() as u64);
         let mut slot = latest_slot;
         let mut snapshots = Vec::new();
 
@@ -1532,14 +1538,14 @@ impl App {
         match overlay.request_scp_state(ledger_seq).await {
             Ok(count) => {
                 tracing::info!(
-                    ledger_seq,
+                    ledger_seq = ledger_seq.get(),
                     peers_sent = count,
                     "Requested SCP state from peers"
                 );
             }
             Err(e) => {
                 tracing::warn!(
-                    ledger_seq,
+                    ledger_seq = ledger_seq.get(),
                     error = %e,
                     "Failed to request SCP state from peers"
                 );
@@ -1639,7 +1645,7 @@ impl App {
                 .load_publish_queue(Some(1))
                 .ok()
                 .and_then(|queue| queue.first().copied());
-            (lcl, min_queued)
+            (lcl.get(), min_queued)
         };
 
         let maintainer = Maintainer::with_config(db, config, shutdown_rx, get_ledger_bounds);
@@ -1853,7 +1859,7 @@ mod tests {
     #[test]
     fn test_catchup_result_display() {
         let result = CatchupResult {
-            ledger_seq: 1000,
+            ledger_seq: 1000.into(),
             ledger_hash: henyey_common::Hash256::ZERO,
             buckets_applied: 22,
             ledgers_replayed: 64,
@@ -1868,7 +1874,7 @@ mod tests {
     fn test_buffered_catchup_target_large_gap() {
         let current = 100;
         let first_buffered = current + checkpoint_frequency() + 5; // 169
-        let target = App::buffered_catchup_target(current, first_buffered, first_buffered);
+        let target = App::buffered_catchup_target(current.into(), first_buffered, first_buffered);
         // Target should be capped at the latest checkpoint (127) to avoid replaying
         // individual ledgers which can cause bucket list hash mismatches.
         assert_eq!(target, Some(127));
@@ -1879,11 +1885,11 @@ mod tests {
         let current = 100;
         let first_buffered = 120;
         let last_buffered = 120;
-        let target = App::buffered_catchup_target(current, first_buffered, last_buffered);
+        let target = App::buffered_catchup_target(current.into(), first_buffered, last_buffered);
         assert_eq!(target, None);
 
         let last_buffered = 130;
-        let target = App::buffered_catchup_target(current, first_buffered, last_buffered);
+        let target = App::buffered_catchup_target(current.into(), first_buffered, last_buffered);
         assert_eq!(target, Some(127));
     }
 
@@ -1903,19 +1909,19 @@ mod tests {
         // Test case 1: first_buffered in middle of checkpoint, current_ledger far behind
         // first_buffered=100 is in checkpoint starting at 64
         // Target should be 63 (end of previous checkpoint)
-        let target = App::compute_catchup_target_for_timeout(150, 100, 50);
+        let target = App::compute_catchup_target_for_timeout(150, 100, 50.into());
         assert_eq!(target, Some(63));
 
         // Test case 2: first_buffered at start of checkpoint
         // first_buffered=128 is in checkpoint starting at 128
         // Target should be 127 (end of previous checkpoint)
-        let target = App::compute_catchup_target_for_timeout(150, 128, 50);
+        let target = App::compute_catchup_target_for_timeout(150, 128, 50.into());
         assert_eq!(target, Some(127));
 
         // Test case 3: current_ledger already past first_buffered's checkpoint target
         // first_buffered=100 -> checkpoint start 64 -> target 63, but current is 70
         // Should fall through to last_buffered's checkpoint (128) -> target 127
-        let target = App::compute_catchup_target_for_timeout(150, 100, 70);
+        let target = App::compute_catchup_target_for_timeout(150, 100, 70.into());
         assert_eq!(target, Some(127));
 
         // Test case 4: current_ledger past all checkpoint targets but before first_buffered
@@ -1924,23 +1930,23 @@ mod tests {
         // last_buffered checkpoint start=64, alt_target=63 (but 63 < 95)
         // direct_target = first_buffered - 1 = 99 > 95, so return Some(99)
         // This bridges the tiny gap with a Case 1 replay (95 -> 99)
-        let target = App::compute_catchup_target_for_timeout(110, 100, 95);
+        let target = App::compute_catchup_target_for_timeout(110, 100, 95.into());
         assert_eq!(target, Some(99));
 
         // Test case 5: current_ledger already at or past first_buffered, return None
         // This happens when we've caught up but buffered ledgers haven't been processed
-        let target = App::compute_catchup_target_for_timeout(110, 100, 100);
+        let target = App::compute_catchup_target_for_timeout(110, 100, 100.into());
         assert!(target.is_none());
 
         // Test case 6: very early ledger (first checkpoint)
         // first_buffered=50 is in checkpoint starting at 0
         // Since checkpoint_start is 0, target = first_buffered - 1 = 49
         // 49 > current_ledger (10), so return Some(49)
-        let target = App::compute_catchup_target_for_timeout(60, 50, 10);
+        let target = App::compute_catchup_target_for_timeout(60, 50, 10.into());
         assert_eq!(target, Some(49));
 
         // Test case 7: edge case with very small ledgers
-        let target = App::compute_catchup_target_for_timeout(5, 3, 0);
+        let target = App::compute_catchup_target_for_timeout(5, 3, 0.into());
         // first_buffered=3, checkpoint start=0, target=first_buffered-1=2
         // 2 > current_ledger(0), so return Some(2)
         assert_eq!(target, Some(2));
@@ -1952,7 +1958,7 @@ mod tests {
         // last_buffered checkpoint start=922752, alt_target=922751 (== current_ledger)
         // direct_target = 922752 > 922751, so return Some(922752)
         // This bridges the 1-slot gap with a Case 1 replay
-        let target = App::compute_catchup_target_for_timeout(922753, 922753, 922751);
+        let target = App::compute_catchup_target_for_timeout(922753, 922753, 922751.into());
         assert_eq!(target, Some(922752));
     }
 
@@ -1968,7 +1974,7 @@ mod tests {
         use std::time::Instant;
 
         let state = ConsensusStuckState {
-            current_ledger: 1000,
+            current_ledger: 1000.into(),
             first_buffered: 1001,
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
@@ -2395,7 +2401,7 @@ mod tests {
         // Simulate a failed close result.
         let pending = PendingLedgerClose {
             handle: tokio::task::spawn_blocking(|| Err("simulated error".to_string())),
-            ledger_seq: 1,
+            ledger_seq: 1.into(),
             tx_set: henyey_herder::TransactionSet {
                 hash: henyey_common::Hash256::ZERO,
                 previous_ledger_hash: henyey_common::Hash256::ZERO,
@@ -2437,7 +2443,7 @@ mod tests {
             handle: tokio::task::spawn_blocking(|| {
                 panic!("simulated panic");
             }),
-            ledger_seq: 1,
+            ledger_seq: 1.into(),
             tx_set: henyey_herder::TransactionSet {
                 hash: henyey_common::Hash256::ZERO,
                 previous_ledger_hash: henyey_common::Hash256::ZERO,
@@ -2495,7 +2501,7 @@ mod tests {
             handle: tokio::task::spawn_blocking(
                 || Err("previous ledger hash mismatch".to_string()),
             ),
-            ledger_seq: 1,
+            ledger_seq: 1.into(),
             tx_set: henyey_herder::TransactionSet {
                 hash: henyey_common::Hash256::ZERO,
                 previous_ledger_hash: henyey_common::Hash256::ZERO,
@@ -2738,7 +2744,7 @@ mod tests {
             warned.insert(Hash256::from_bytes([1u8; 32]));
         }
         *app.consensus_stuck_state.write().await = Some(ConsensusStuckState {
-            current_ledger: 100,
+            current_ledger: 100.into(),
             first_buffered: 101,
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
@@ -2839,7 +2845,7 @@ mod tests {
         }
         let original_count = buffer.len();
 
-        App::trim_syncing_ledgers(&mut buffer, current_ledger);
+        App::trim_syncing_ledgers(&mut buffer, current_ledger.into());
 
         // All entries should survive — they're all above current_ledger and
         // the gap (1) is less than CHECKPOINT_FREQUENCY
@@ -2876,7 +2882,7 @@ mod tests {
             buffer.insert(slot, make_entry(slot));
         }
 
-        App::trim_syncing_ledgers(&mut buffer, current_ledger);
+        App::trim_syncing_ledgers(&mut buffer, current_ledger.into());
 
         // After trim: checkpoint boundary of 280 is first_ledger_in_checkpoint(280) = 256
         // Entries below 256 should be removed
@@ -2913,7 +2919,7 @@ mod tests {
             buffer.insert(slot, make_entry(slot));
         }
 
-        App::trim_syncing_ledgers(&mut buffer, current_ledger);
+        App::trim_syncing_ledgers(&mut buffer, current_ledger.into());
 
         // Entries 100-105 should be removed, 106-110 kept
         assert!(!buffer.contains_key(&100));
@@ -2931,7 +2937,7 @@ mod tests {
         // lower slot numbers, changing first_buffered. The stuck timer must
         // NOT reset when first_buffered shifts.
         let state = ConsensusStuckState {
-            current_ledger: 100,
+            current_ledger: 100.into(),
             first_buffered: 105,
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
@@ -2996,7 +3002,7 @@ mod tests {
             warned.insert(Hash256::from_bytes([2u8; 32]));
         }
         *app.consensus_stuck_state.write().await = Some(ConsensusStuckState {
-            current_ledger: 50,
+            current_ledger: 50.into(),
             first_buffered: 51,
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
@@ -3080,7 +3086,7 @@ mod tests {
             warned.insert(Hash256::from_bytes([3u8; 32]));
         }
         *app.consensus_stuck_state.write().await = Some(ConsensusStuckState {
-            current_ledger: 200,
+            current_ledger: 200.into(),
             first_buffered: 201,
             stuck_start: Instant::now(),
             last_recovery_attempt: Instant::now(),
@@ -3146,8 +3152,11 @@ mod tests {
         let current_ledger = 129u32;
         let latest_externalized = 127u64;
 
-        let (iter_start, advance_to) =
-            App::externalized_iteration_window(last_processed, current_ledger, latest_externalized);
+        let (iter_start, advance_to) = App::externalized_iteration_window(
+            last_processed,
+            current_ledger.into(),
+            latest_externalized,
+        );
 
         assert_eq!(iter_start, last_processed + 1);
         assert_eq!(advance_to, last_processed);
@@ -3161,8 +3170,11 @@ mod tests {
         let current_ledger = 110u32;
         let latest_externalized = 150u64; // gap from last_processed is 50 > 12
 
-        let (iter_start, advance_to) =
-            App::externalized_iteration_window(last_processed, current_ledger, latest_externalized);
+        let (iter_start, advance_to) = App::externalized_iteration_window(
+            last_processed,
+            current_ledger.into(),
+            latest_externalized,
+        );
 
         let expected_skip_to = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW);
         assert_eq!(iter_start, expected_skip_to + 1);
@@ -3207,7 +3219,8 @@ mod tests {
         let first_buffered = 61200836u32; // slot 61200835 was skipped
         let last_buffered = 61200850u32;
 
-        let target = App::buffered_catchup_target(current_ledger, first_buffered, last_buffered);
+        let target =
+            App::buffered_catchup_target(current_ledger.into(), first_buffered, last_buffered);
         // With first_buffered > current_ledger + 1 and gap < CHECKPOINT_FREQUENCY,
         // should compute a valid target
         if let Some(t) = target {
@@ -3218,8 +3231,11 @@ mod tests {
             assert!(t < first_buffered, "target must be before first_buffered");
         }
         // If None, compute_catchup_target_for_timeout should provide a fallback
-        let timeout_target =
-            App::compute_catchup_target_for_timeout(last_buffered, first_buffered, current_ledger);
+        let timeout_target = App::compute_catchup_target_for_timeout(
+            last_buffered,
+            first_buffered,
+            current_ledger.into(),
+        );
         // For a small gap like this, we should get first_buffered - 1 as target
         assert_eq!(timeout_target, Some(first_buffered - 1));
     }

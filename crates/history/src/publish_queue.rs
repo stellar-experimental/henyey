@@ -48,6 +48,7 @@
 //! queue.dequeue(checkpoint_ledger)?;
 //! ```
 
+use henyey_common::LedgerSeq;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -151,9 +152,9 @@ impl PublishQueue {
     /// # Errors
     ///
     /// Returns an error if `ledger_seq` is not a valid checkpoint ledger.
-    pub fn enqueue(&self, ledger_seq: u32, has: &HistoryArchiveState) -> Result<()> {
-        if !is_checkpoint_ledger(ledger_seq) {
-            return Err(HistoryError::NotCheckpointLedger(ledger_seq));
+    pub fn enqueue(&self, ledger_seq: LedgerSeq, has: &HistoryArchiveState) -> Result<()> {
+        if !is_checkpoint_ledger(ledger_seq.get()) {
+            return Err(HistoryError::NotCheckpointLedger(ledger_seq.get()));
         }
 
         let state_json = serde_json::to_string(has).map_err(|e| {
@@ -163,13 +164,13 @@ impl PublishQueue {
         self.db.with_connection(|conn| {
             conn.execute(
                 "INSERT OR REPLACE INTO publishqueue (ledgerseq, state) VALUES (?1, ?2)",
-                rusqlite::params![ledger_seq as i64, state_json],
+                rusqlite::params![ledger_seq.get() as i64, state_json],
             )?;
             Ok(())
         })?;
 
         debug!(
-            ledger_seq = ledger_seq,
+            ledger_seq = ledger_seq.get(),
             "Enqueued checkpoint for publishing"
         );
         Ok(())
@@ -179,26 +180,29 @@ impl PublishQueue {
     ///
     /// Removes the checkpoint from the queue. This is a no-op if the
     /// checkpoint is not in the queue.
-    pub fn dequeue(&self, ledger_seq: u32) -> Result<()> {
+    pub fn dequeue(&self, ledger_seq: LedgerSeq) -> Result<()> {
         self.db.with_connection(|conn| {
             conn.execute(
                 "DELETE FROM publishqueue WHERE ledgerseq = ?1",
-                rusqlite::params![ledger_seq as i64],
+                rusqlite::params![ledger_seq.get() as i64],
             )?;
             Ok(())
         })?;
 
-        debug!(ledger_seq = ledger_seq, "Dequeued published checkpoint");
+        debug!(
+            ledger_seq = ledger_seq.get(),
+            "Dequeued published checkpoint"
+        );
         Ok(())
     }
 
     /// Check if a checkpoint is in the queue.
-    pub fn contains(&self, ledger_seq: u32) -> Result<bool> {
+    pub fn contains(&self, ledger_seq: LedgerSeq) -> Result<bool> {
         self.db
             .with_connection(|conn| {
                 let count: i64 = conn.query_row(
                     "SELECT COUNT(*) FROM publishqueue WHERE ledgerseq = ?1",
-                    rusqlite::params![ledger_seq as i64],
+                    rusqlite::params![ledger_seq.get() as i64],
                     |row| row.get(0),
                 )?;
                 Ok(count > 0)
@@ -209,12 +213,12 @@ impl PublishQueue {
     /// Get the HistoryArchiveState for a queued checkpoint.
     ///
     /// Returns `None` if the checkpoint is not in the queue.
-    pub fn get_state(&self, ledger_seq: u32) -> Result<Option<HistoryArchiveState>> {
+    pub fn get_state(&self, ledger_seq: LedgerSeq) -> Result<Option<HistoryArchiveState>> {
         self.db
             .with_connection(|conn| {
                 let result: std::result::Result<String, _> = conn.query_row(
                     "SELECT state FROM publishqueue WHERE ledgerseq = ?1",
-                    rusqlite::params![ledger_seq as i64],
+                    rusqlite::params![ledger_seq.get() as i64],
                     |row| row.get(0),
                 );
 
@@ -318,9 +322,9 @@ pub struct PublishQueueStats {
     /// Number of checkpoints in the queue.
     pub queue_length: usize,
     /// Minimum (oldest) ledger in the queue.
-    pub min_ledger: u32,
+    pub min_ledger: LedgerSeq,
     /// Maximum (newest) ledger in the queue.
-    pub max_ledger: u32,
+    pub max_ledger: LedgerSeq,
     /// Number of unique buckets referenced by queued checkpoints.
     pub bucket_count: usize,
 }
@@ -334,8 +338,8 @@ impl PublishQueue {
 
         Ok(PublishQueueStats {
             queue_length,
-            min_ledger,
-            max_ledger,
+            min_ledger: min_ledger.into(),
+            max_ledger: max_ledger.into(),
             bucket_count,
         })
     }
@@ -350,10 +354,10 @@ mod tests {
         Arc::new(Database::open_in_memory().expect("Failed to create test database"))
     }
 
-    fn create_test_has(ledger_seq: u32) -> HistoryArchiveState {
+    fn create_test_has(ledger_seq: LedgerSeq) -> HistoryArchiveState {
         // Create valid 64-character hex hashes based on ledger_seq
-        let curr_hash = format!("{:064x}", ledger_seq as u128 * 2);
-        let snap_hash = format!("{:064x}", ledger_seq as u128 * 2 + 1);
+        let curr_hash = format!("{:064x}", ledger_seq.get() as u128 * 2);
+        let snap_hash = format!("{:064x}", ledger_seq.get() as u128 * 2 + 1);
 
         HistoryArchiveState {
             version: 2,
@@ -385,16 +389,16 @@ mod tests {
         let db = create_test_db();
         let queue = PublishQueue::new(db);
 
-        let has = create_test_has(63);
-        queue.enqueue(63, &has).unwrap();
+        let has = create_test_has(63u32.into());
+        queue.enqueue(63u32.into(), &has).unwrap();
 
         assert!(!queue.is_empty().unwrap());
         assert_eq!(queue.len().unwrap(), 1);
-        assert!(queue.contains(63).unwrap());
+        assert!(queue.contains(63u32.into()).unwrap());
         assert_eq!(queue.min_ledger().unwrap(), Some(63));
         assert_eq!(queue.max_ledger().unwrap(), Some(63));
 
-        queue.dequeue(63).unwrap();
+        queue.dequeue(63u32.into()).unwrap();
         assert!(queue.is_empty().unwrap());
     }
 
@@ -403,9 +407,15 @@ mod tests {
         let db = create_test_db();
         let queue = PublishQueue::new(db);
 
-        queue.enqueue(63, &create_test_has(63)).unwrap();
-        queue.enqueue(127, &create_test_has(127)).unwrap();
-        queue.enqueue(191, &create_test_has(191)).unwrap();
+        queue
+            .enqueue(63u32.into(), &create_test_has(63u32.into()))
+            .unwrap();
+        queue
+            .enqueue(127u32.into(), &create_test_has(127u32.into()))
+            .unwrap();
+        queue
+            .enqueue(191u32.into(), &create_test_has(191u32.into()))
+            .unwrap();
 
         assert_eq!(queue.len().unwrap(), 3);
         assert_eq!(queue.ledger_range().unwrap(), (63, 191));
@@ -422,14 +432,14 @@ mod tests {
         let db = create_test_db();
         let queue = PublishQueue::new(db);
 
-        let has = create_test_has(63);
-        queue.enqueue(63, &has).unwrap();
+        let has = create_test_has(63u32.into());
+        queue.enqueue(63u32.into(), &has).unwrap();
 
-        let loaded = queue.get_state(63).unwrap().unwrap();
+        let loaded = queue.get_state(63u32.into()).unwrap().unwrap();
         assert_eq!(loaded.current_ledger, 63);
         assert_eq!(loaded.network_passphrase, Some("Test Network".to_string()));
 
-        assert!(queue.get_state(127).unwrap().is_none());
+        assert!(queue.get_state(127u32.into()).unwrap().is_none());
     }
 
     #[test]
@@ -437,8 +447,12 @@ mod tests {
         let db = create_test_db();
         let queue = PublishQueue::new(db);
 
-        queue.enqueue(63, &create_test_has(63)).unwrap();
-        queue.enqueue(127, &create_test_has(127)).unwrap();
+        queue
+            .enqueue(63u32.into(), &create_test_has(63u32.into()))
+            .unwrap();
+        queue
+            .enqueue(127u32.into(), &create_test_has(127u32.into()))
+            .unwrap();
 
         let buckets = queue.get_referenced_bucket_hashes().unwrap();
         assert_eq!(buckets.len(), 4); // 2 checkpoints × 2 buckets each
@@ -449,8 +463,8 @@ mod tests {
         let db = create_test_db();
         let queue = PublishQueue::new(db);
 
-        let has = create_test_has(64); // Not a checkpoint ledger
-        let result = queue.enqueue(64, &has);
+        let has = create_test_has(64u32.into()); // Not a checkpoint ledger
+        let result = queue.enqueue(64u32.into(), &has);
         assert!(result.is_err());
     }
 
@@ -459,13 +473,17 @@ mod tests {
         let db = create_test_db();
         let queue = PublishQueue::new(db);
 
-        queue.enqueue(63, &create_test_has(63)).unwrap();
-        queue.enqueue(127, &create_test_has(127)).unwrap();
+        queue
+            .enqueue(63u32.into(), &create_test_has(63u32.into()))
+            .unwrap();
+        queue
+            .enqueue(127u32.into(), &create_test_has(127u32.into()))
+            .unwrap();
 
         let stats = queue.stats().unwrap();
         assert_eq!(stats.queue_length, 2);
-        assert_eq!(stats.min_ledger, 63);
-        assert_eq!(stats.max_ledger, 127);
+        assert_eq!(stats.min_ledger, LedgerSeq::from(63));
+        assert_eq!(stats.max_ledger, LedgerSeq::from(127));
         assert_eq!(stats.bucket_count, 4);
     }
 
@@ -474,8 +492,12 @@ mod tests {
         let db = create_test_db();
         let queue = PublishQueue::new(db);
 
-        queue.enqueue(63, &create_test_has(63)).unwrap();
-        queue.enqueue(127, &create_test_has(127)).unwrap();
+        queue
+            .enqueue(63u32.into(), &create_test_has(63u32.into()))
+            .unwrap();
+        queue
+            .enqueue(127u32.into(), &create_test_has(127u32.into()))
+            .unwrap();
         assert_eq!(queue.len().unwrap(), 2);
 
         queue.clear().unwrap();

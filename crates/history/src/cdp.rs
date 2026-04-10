@@ -958,7 +958,7 @@ pub fn extract_ledger_close_data(
         .collect();
 
     LedgerCloseData::new(
-        header.ledger_seq,
+        header.ledger_seq.into(),
         tx_set,
         header.scp_value.close_time.0,
         prev_ledger_hash,
@@ -1080,13 +1080,16 @@ mod tests {
         let cdp = CdpDataLake::new("https://example.com/stellar/ledgers/testnet", "2025-12-18");
 
         // Ledger 310079 should be in partition 256000-319999
-        assert_eq!(cdp.partition_for_ledger(310079), "FFFC17FF--256000-319999");
+        assert_eq!(
+            cdp.partition_for_ledger(310079u32),
+            "FFFC17FF--256000-319999"
+        );
 
         // Ledger 0 should be in partition 0-63999
-        assert_eq!(cdp.partition_for_ledger(0), "FFFFFFFF--0-63999");
+        assert_eq!(cdp.partition_for_ledger(0u32), "FFFFFFFF--0-63999");
 
         // Ledger 64000 should be in partition 64000-127999
-        assert_eq!(cdp.partition_for_ledger(64000), "FFFF05FF--64000-127999");
+        assert_eq!(cdp.partition_for_ledger(64000u32), "FFFF05FF--64000-127999");
     }
 
     #[test]
@@ -1094,10 +1097,10 @@ mod tests {
         let cdp = CdpDataLake::new("https://example.com/stellar/ledgers/testnet", "2025-12-18");
 
         // Ledger 310079 -> inverted = 0xFFFB44C0
-        assert_eq!(cdp.batch_filename(310079), "FFFB44C0--310079.xdr.zst");
+        assert_eq!(cdp.batch_filename(310079u32), "FFFB44C0--310079.xdr.zst");
 
         // Ledger 0 -> inverted = 0xFFFFFFFF
-        assert_eq!(cdp.batch_filename(0), "FFFFFFFF--0.xdr.zst");
+        assert_eq!(cdp.batch_filename(0u32), "FFFFFFFF--0.xdr.zst");
     }
 
     #[test]
@@ -1107,7 +1110,7 @@ mod tests {
             "2025-12-18",
         );
 
-        let url = cdp.url_for_ledger(310079);
+        let url = cdp.url_for_ledger(310079u32);
         assert_eq!(
             url,
             "https://aws-public-blockchain.s3.us-east-2.amazonaws.com/v1.1/stellar/ledgers/testnet/2025-12-18/FFFC17FF--256000-319999/FFFB44C0--310079.xdr.zst"

@@ -34,6 +34,7 @@
 //! 1. **Quorum membership**: Sender must be in our transitive quorum set
 //! 2. **Slot distance limit**: Slot must be within [`MAX_EXTERNALIZE_SLOT_DISTANCE`] of current
 
+use henyey_common::LedgerSeq;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -503,13 +504,13 @@ impl Herder {
     }
 
     /// Compute the minimum ledger sequence to ask peers for SCP state.
-    pub fn get_min_ledger_seq_to_ask_peers(&self) -> u32 {
+    pub fn get_min_ledger_seq_to_ask_peers(&self) -> LedgerSeq {
         let lcl = self
             .ledger_manager
             .read()
             .as_ref()
             .map(|manager| manager.current_ledger_seq())
-            .unwrap_or_else(|| self.tracking_slot().min(u32::MAX as u64) as u32);
+            .unwrap_or_else(|| (self.tracking_slot().min(u32::MAX as u64) as u32).into());
         let mut low = lcl.saturating_add(1);
         let max_slots = self.config.max_externalized_slots.max(1) as u32;
         let extra = 3u32;
@@ -517,7 +518,7 @@ impl Herder {
         if low > window {
             low = low.saturating_sub(window);
         } else {
-            low = 1;
+            low = 1.into();
         }
         low
     }
@@ -694,8 +695,8 @@ impl Herder {
     ///
     /// This transitions the Herder from Syncing to Tracking state,
     /// setting the next consensus ledger as the tracking slot.
-    pub fn bootstrap(&self, ledger_seq: u32) {
-        let lcl = ledger_seq as u64;
+    pub fn bootstrap(&self, ledger_seq: LedgerSeq) {
+        let lcl = ledger_seq.get() as u64;
         let slot = lcl + 1;
 
         debug!("Bootstrapping Herder at ledger {}", ledger_seq);
@@ -930,7 +931,7 @@ impl Herder {
             .ledger_manager
             .read()
             .as_ref()
-            .map(|m| m.current_ledger_seq() as u64);
+            .map(|m| m.current_ledger_seq().get() as u64);
 
         let effective_min = lcl.map_or(min_ledger_seq, |l| min_ledger_seq.max(l + 1));
 
@@ -1290,7 +1291,7 @@ impl Herder {
     /// Trigger consensus for the next ledger (for validators).
     ///
     /// This is called periodically by the consensus timer.
-    pub async fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<()> {
+    pub async fn trigger_next_ledger(&self, ledger_seq: LedgerSeq) -> Result<()> {
         if !self.is_validator() {
             return Err(HerderError::NotValidating);
         }
@@ -1299,7 +1300,7 @@ impl Herder {
             return Err(HerderError::NotValidating);
         }
 
-        let slot = ledger_seq as u64;
+        let slot = ledger_seq.get() as u64;
         tracing::debug!("Triggering consensus for ledger {}", ledger_seq);
 
         let value = self
@@ -1685,7 +1686,7 @@ impl Herder {
         if ledger_seq > i32::MAX as u32 {
             return None;
         }
-        let starting_seq = (ledger_seq as i64) << 32;
+        let starting_seq = (ledger_seq.get() as i64) << 32;
         let mut map: HashMap<Vec<u8>, i64> = HashMap::new();
         for account in self.tx_queue.pending_accounts() {
             let key = account_key_from_account_id(&account);
@@ -2283,7 +2284,7 @@ mod tests {
         herder.start_syncing();
         assert_eq!(herder.state(), HerderState::Syncing);
 
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
         assert_eq!(herder.state(), HerderState::Tracking);
         assert_eq!(herder.tracking_slot(), 101);
         assert!(herder.is_tracking());
@@ -2319,7 +2320,7 @@ mod tests {
     #[test]
     fn test_stats() {
         let herder = make_test_herder();
-        herder.bootstrap(50);
+        herder.bootstrap(50.into());
 
         let stats = herder.stats();
         assert_eq!(stats.state, HerderState::Tracking);
@@ -2360,7 +2361,7 @@ mod tests {
 
         let herder = Herder::with_secret_key(config, local_secret.clone());
         herder.start_syncing();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
 
         herder
             .quorum_tracker
@@ -2394,7 +2395,7 @@ mod tests {
     fn test_self_message_rejected() {
         let (herder, secret) = make_validator_herder();
         herder.start_syncing();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
 
         let tracking = herder.tracking_slot(); // 101
 
@@ -2458,7 +2459,7 @@ mod tests {
 
         let herder = Herder::with_secret_key(config, local_secret);
         herder.start_syncing();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
 
         herder
             .quorum_tracker
@@ -2509,7 +2510,7 @@ mod tests {
 
         let herder = Herder::with_secret_key(config, local_secret);
         herder.start_syncing();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
 
         herder
             .quorum_tracker
@@ -2558,7 +2559,7 @@ mod tests {
 
         let herder = Herder::with_secret_key(config, local_secret);
         herder.start_syncing();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
 
         herder
             .quorum_tracker
@@ -2740,18 +2741,18 @@ mod tests {
         assert_eq!(herder.get_most_recent_checkpoint_seq(), 1);
 
         // Bootstrap to slot 100 (tracking_slot = 101)
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
         // tracking_consensus_index = 100
         // checkpoint containing 100: ((100/64 + 1) * 64) - 1 = 127, size = 64, first = 64
         assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
 
         // Bootstrap to slot 127 (tracking_slot = 128)
-        herder.bootstrap(127);
+        herder.bootstrap(127.into());
         // checkpoint containing 127: ((127/64 + 1) * 64) - 1 = 127, size = 64, first = 64
         assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
 
         // Bootstrap to slot 129 (tracking_slot = 129, LCL = 128)
-        herder.bootstrap(129);
+        herder.bootstrap(129.into());
         // checkpoint containing 128: ((128/64 + 1) * 64) - 1 = 191, size = 64, first = 128
         assert_eq!(herder.get_most_recent_checkpoint_seq(), 128);
     }
@@ -2760,7 +2761,7 @@ mod tests {
     fn test_check_envelope_close_time_basic() {
         // check_envelope_close_time(envelope, false) — basic structural check
         let herder = make_test_herder();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2789,7 +2790,7 @@ mod tests {
     fn test_check_envelope_close_time_recency_enforcement() {
         // check_envelope_close_time(envelope, true) — enforces recency
         let herder = make_test_herder();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2814,7 +2815,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
         // Set tracking consensus close time
         herder.tracking_state.write().consensus_close_time = now;
 
@@ -2831,7 +2832,7 @@ mod tests {
         // so even an envelope with an invalid signature should be rejected
         // with Invalid (not InvalidSignature) if close time is bad
         let herder = make_test_herder();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
 
         // Create envelope with close time 0 for a future slot (102)
         // This has no valid signature, but close-time check should reject first
@@ -2859,12 +2860,12 @@ mod tests {
             .expect("set_upgrade_parameters should succeed");
 
         // Bootstrap herder to Tracking state (required for trigger_next_ledger)
-        herder.bootstrap(1);
+        herder.bootstrap(1.into());
         assert_eq!(herder.state(), HerderState::Tracking);
 
         // Trigger consensus for ledger 2 (no LedgerManager, so header defaults
         // to version=0, base_reserve=0 — upgrades should fire)
-        let result = herder.trigger_next_ledger(2).await;
+        let result = herder.trigger_next_ledger(2.into()).await;
         assert!(
             result.is_ok(),
             "trigger_next_ledger should succeed: {:?}",
@@ -2924,7 +2925,7 @@ mod tests {
         let public = secret.public_key();
         let config = HerderConfig {
             is_validator: true,
-            node_public_key: public.clone(),
+            node_public_key: public,
             local_quorum_set: Some(stellar_xdr::curr::ScpQuorumSet {
                 threshold: 1,
                 validators: vec![stellar_xdr::curr::NodeId(
@@ -2955,9 +2956,9 @@ mod tests {
             .set_upgrade_parameters(upgrade_params)
             .expect("set_upgrade_parameters should succeed");
 
-        herder.bootstrap(1);
+        herder.bootstrap(1.into());
 
-        let result = herder.trigger_next_ledger(2).await;
+        let result = herder.trigger_next_ledger(2.into()).await;
         assert!(
             result.is_ok(),
             "trigger_next_ledger failed: {:?}",
@@ -3123,7 +3124,7 @@ mod tests {
 
         let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[7u8; 32]));
         herder.start_syncing();
-        herder.bootstrap(100);
+        herder.bootstrap(100.into());
 
         herder
             .quorum_tracker

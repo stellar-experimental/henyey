@@ -132,7 +132,7 @@ pub(crate) async fn health_handler(State(state): State<Arc<ServerState>>) -> imp
 pub(crate) async fn ledger_handler(State(state): State<Arc<ServerState>>) -> Json<LedgerResponse> {
     let info = state.app.ledger_info();
     Json(LedgerResponse {
-        sequence: info.ledger_seq,
+        sequence: info.ledger_seq.get(),
         hash: info.hash.to_hex(),
         close_time: info.close_time,
         protocol_version: info.protocol_version,

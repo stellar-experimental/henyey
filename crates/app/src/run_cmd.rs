@@ -46,6 +46,7 @@ use crate::app::{App, AppState, CatchupTarget};
 use crate::compat_http::CompatServer;
 use crate::config::AppConfig;
 use crate::http::{QueryServer, StatusServer};
+use henyey_common::LedgerSeq;
 
 /// Node running mode determining behavior and consensus participation.
 ///
@@ -368,7 +369,7 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
             Ok(true) => {
                 let info = app.ledger_info();
                 tracing::info!(
-                    lcl_seq = info.ledger_seq,
+                    lcl_seq = info.ledger_seq.get(),
                     "Restored state from disk, skipping full catchup"
                 );
                 app.set_state(AppState::Synced).await;
@@ -542,7 +543,7 @@ async fn wait_for_shutdown_signal() {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct NodeStatus {
     /// Current ledger sequence number.
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
     /// Hash of the current ledger header (hex-encoded).
     pub ledger_hash: Option<String>,
     /// Number of currently connected peers.
@@ -686,7 +687,7 @@ mod tests {
     #[test]
     fn test_node_status_display() {
         let status = NodeStatus {
-            ledger_seq: 1000,
+            ledger_seq: 1000.into(),
             ledger_hash: None,
             peer_count: 5,
             consensus_state: "tracking".to_string(),

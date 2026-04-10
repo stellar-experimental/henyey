@@ -77,7 +77,7 @@ pub async fn handle(
     let mut event_json: Vec<serde_json::Value> = Vec::with_capacity(events.len());
     for event in &events {
         let close_time_unix = *close_time_cache
-            .entry(event.ledger_seq)
+            .entry(event.ledger_seq.into())
             .or_insert_with(|| util::ledger_close_time(&ctx.app, event.ledger_seq));
         let close_time = format_unix_timestamp_utc(close_time_unix);
 

@@ -22,6 +22,7 @@ use crate::close_state::CloseLedgerState;
 use crate::{reserves, trustlines, LedgerError, Result};
 use henyey_common::asset::{add_balance, is_issuer};
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+use henyey_common::LedgerSeq;
 use henyey_tx::operations::execute::{
     adjust_offer_amount, exchange_v10_without_price_error_thresholds, RoundingType,
 };
@@ -305,7 +306,7 @@ fn erase_offer_with_possible_sponsorship(
     offer_entry: &LedgerEntry,
     account: &mut AccountEntry,
     ltx: &mut CloseLedgerState,
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
 ) -> Result<Option<AccountId>> {
     let is_sponsored =
         matches!(&offer_entry.ext, LedgerEntryExt::V1(v1) if v1.sponsoring_id.0.is_some());
@@ -358,7 +359,7 @@ fn update_sponsor_num_sponsoring(
     sponsor_id: &AccountId,
     delta_val: i64,
     ltx: &mut CloseLedgerState,
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
 ) -> Result<()> {
     let key = LedgerKey::Account(LedgerKeyAccount {
         account_id: sponsor_id.clone(),
@@ -384,7 +385,7 @@ fn update_sponsor_num_sponsoring(
         ext_v2.num_sponsoring = new_val as u32;
     }
 
-    updated.last_modified_ledger_seq = ledger_seq;
+    updated.last_modified_ledger_seq = ledger_seq.get();
     ltx.record_update(previous, updated)?;
 
     Ok(())
@@ -513,7 +514,7 @@ pub fn prepare_liabilities(
     ltx: &mut CloseLedgerState,
     protocol_version: u32,
     base_reserve: u32,
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
 ) -> Result<()> {
     tracing::info!("Starting prepareLiabilities");
 
@@ -662,7 +663,7 @@ pub fn prepare_liabilities(
         for (original_entry, updated_offer) in &offers_to_update {
             let mut new_entry = original_entry.clone();
             new_entry.data = LedgerEntryData::Offer(updated_offer.clone());
-            new_entry.last_modified_ledger_seq = ledger_seq;
+            new_entry.last_modified_ledger_seq = ledger_seq.get();
             ltx.record_update(original_entry.clone(), new_entry)?;
         }
 
@@ -750,7 +751,7 @@ pub fn prepare_liabilities(
                     tl_liab.buying = new_buying;
 
                     if delta_selling != 0 || delta_buying != 0 {
-                        tl_entry_new.last_modified_ledger_seq = ledger_seq;
+                        tl_entry_new.last_modified_ledger_seq = ledger_seq.get();
                         ltx.record_update(tl_entry.clone(), tl_entry_new)?;
                     }
                 }
@@ -762,7 +763,7 @@ pub fn prepare_liabilities(
         // and replaces the current with our updated entry.
         if account_mut != &account_before {
             changed_accounts.insert(account_key.clone());
-            account_entry_current.last_modified_ledger_seq = ledger_seq;
+            account_entry_current.last_modified_ledger_seq = ledger_seq.get();
             ltx.record_update(account_entry.clone(), account_entry_current)?;
         }
     }

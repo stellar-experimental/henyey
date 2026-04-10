@@ -287,7 +287,7 @@ fn print_catchup_result(result: &CatchupResult) {
 
 /// Verify the catchup result.
 fn verify_catchup(result: &CatchupResult) -> anyhow::Result<()> {
-    tracing::info!(ledger = result.ledger_seq, "Verifying catchup result");
+    tracing::info!(ledger = result.ledger_seq.get(), "Verifying catchup result");
 
     // In a full implementation, this would:
     // 1. Verify the bucket list hash
@@ -354,7 +354,7 @@ impl CatchupProgressCallback for TracingProgressCallback {
 
     fn on_complete(&self, result: &CatchupResult) {
         tracing::info!(
-            ledger = result.ledger_seq,
+            ledger = result.ledger_seq.get(),
             hash = %result.ledger_hash,
             "Catchup complete"
         );

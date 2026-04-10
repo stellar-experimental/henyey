@@ -25,6 +25,7 @@
 
 use std::sync::RwLock;
 
+use henyey_common::LedgerSeq;
 use stellar_xdr::curr::{
     InnerTransactionResultResult, LedgerCloseMeta, Limits, ReadXdr, SorobanTransactionMetaExt,
     TransactionMeta, TransactionResultPair, TransactionResultResult,
@@ -125,7 +126,7 @@ pub(crate) fn compute_fee_distribution(fees: &mut [u64], ledger_count: u32) -> F
 
 /// A single ledger's fee data.
 struct LedgerBucket {
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     fees: Vec<u64>,
 }
 
@@ -159,7 +160,7 @@ impl LedgerBucketWindow {
         if self.buckets.is_empty() {
             0
         } else {
-            self.get(self.len() - 1).ledger_seq
+            self.get(self.len() - 1).ledger_seq.into()
         }
     }
 
@@ -176,7 +177,7 @@ impl LedgerBucketWindow {
         }
 
         let bucket = LedgerBucket {
-            ledger_seq: seq,
+            ledger_seq: seq.into(),
             fees,
         };
 

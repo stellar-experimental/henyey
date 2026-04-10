@@ -230,7 +230,7 @@ impl SimulationContext {
             max_entry_ttl: soroban_info.max_entry_ttl,
         };
 
-        let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger.num);
+        let snapshot_source = BucketListSnapshotSource::new(bl_snapshot, ledger.num.into());
 
         Ok(Self {
             snapshot_source,

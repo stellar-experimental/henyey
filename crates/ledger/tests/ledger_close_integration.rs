@@ -59,7 +59,7 @@ fn test_ledger_close_with_empty_tx_set() {
         .expect("init");
 
     let close_data = LedgerCloseData::new(
-        1,
+        1.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash([0u8; 32]),
             txs: VecM::default(),
@@ -111,7 +111,7 @@ fn test_ledger_close_meta_structural_validation() {
         .expect("init");
 
     let close_data = LedgerCloseData::new(
-        1,
+        1.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash([0u8; 32]),
             txs: VecM::default(),
@@ -174,7 +174,7 @@ fn test_ledger_close_meta_with_scp_history() {
     });
 
     let close_data = LedgerCloseData::new(
-        1,
+        1.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash([0u8; 32]),
             txs: VecM::default(),
@@ -221,7 +221,7 @@ async fn test_multiple_consecutive_ledger_closes() {
     for seq in 1..=5u32 {
         let prev_hash = ledger.current_header_hash();
         let close_data = LedgerCloseData::new(
-            seq,
+            seq.into(),
             TransactionSetVariant::Classic(TransactionSet {
                 previous_ledger_hash: Hash::from(prev_hash),
                 txs: VecM::default(),
@@ -271,7 +271,7 @@ fn test_unsupported_protocol_version_too_high_integration() {
 
     // Close at current version should work
     let close_data = LedgerCloseData::new(
-        1,
+        1.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash::from(header_hash),
             txs: VecM::default(),
@@ -288,7 +288,7 @@ fn test_unsupported_protocol_version_too_high_integration() {
 
     let prev_hash = ledger.current_header_hash();
     let close_data2 = LedgerCloseData::new(
-        2,
+        2.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash::from(prev_hash),
             txs: VecM::default(),
@@ -324,7 +324,7 @@ fn test_unsupported_protocol_version_too_low_integration() {
 
     // Close at current version should work
     let close_data = LedgerCloseData::new(
-        1,
+        1.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash::from(header_hash),
             txs: VecM::default(),
@@ -341,7 +341,7 @@ fn test_unsupported_protocol_version_too_low_integration() {
 
     let prev_hash = ledger.current_header_hash();
     let close_data2 = LedgerCloseData::new(
-        2,
+        2.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash::from(prev_hash),
             txs: VecM::default(),
@@ -373,7 +373,7 @@ async fn test_close_ledger_from_spawn_blocking() {
         .expect("init");
 
     let close_data = LedgerCloseData::new(
-        1,
+        1.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash([0u8; 32]),
             txs: VecM::default(),
@@ -428,7 +428,7 @@ async fn test_consecutive_close_ledger_from_spawn_blocking() {
     // Close ledger 1.
     let prev_hash = ledger.current_header_hash();
     let close_data1 = LedgerCloseData::new(
-        1,
+        1.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash::from(prev_hash),
             txs: VecM::default(),
@@ -451,7 +451,7 @@ async fn test_consecutive_close_ledger_from_spawn_blocking() {
     // Close ledger 2 (chained).
     let prev_hash2 = ledger.current_header_hash();
     let close_data2 = LedgerCloseData::new(
-        2,
+        2.into(),
         TransactionSetVariant::Classic(TransactionSet {
             previous_ledger_hash: Hash::from(prev_hash2),
             txs: VecM::default(),

@@ -260,7 +260,7 @@ impl TransactionExecutor {
         // Create ledger context for operation execution
         let ledger_context = if let Some(prng_seed) = soroban_prng_seed {
             LedgerContext::with_prng_seed(
-                self.ledger_seq,
+                self.ledger_seq.get(),
                 self.close_time,
                 base_fee,
                 self.base_reserve,
@@ -270,7 +270,7 @@ impl TransactionExecutor {
             )
         } else {
             LedgerContext::new(
-                self.ledger_seq,
+                self.ledger_seq.get(),
                 self.close_time,
                 base_fee,
                 self.base_reserve,
@@ -438,7 +438,7 @@ impl TransactionExecutor {
                         if op_type.is_soroban() {
                             let is_success_before_refund_check = is_operation_success(&op_result);
                             tracing::debug!(
-                                ledger_seq = self.ledger_seq,
+                                ledger_seq = self.ledger_seq.get(),
                                 op_index,
                                 op_type = ?op_type,
                                 op_result = ?op_result,
@@ -451,7 +451,7 @@ impl TransactionExecutor {
                         if let Some(meta) = &op_exec.soroban_meta {
                             if let Some(tracker) = refundable_fee_tracker.as_mut() {
                                 tracing::debug!(
-                                    ledger_seq = self.ledger_seq,
+                                    ledger_seq = self.ledger_seq.get(),
                                     op_index,
                                     rent_fee = meta.rent_fee,
                                     event_size_bytes = meta.event_size_bytes,
@@ -468,7 +468,7 @@ impl TransactionExecutor {
                                     meta.rent_fee,
                                 ) {
                                     tracing::debug!(
-                                        ledger_seq = self.ledger_seq,
+                                        ledger_seq = self.ledger_seq.get(),
                                         op_index,
                                         "InsufficientRefundableFee"
                                     );
@@ -482,7 +482,7 @@ impl TransactionExecutor {
                         if !is_operation_success(&op_result) {
                             all_success = false;
                             tracing::debug!(
-                                ledger_seq = self.ledger_seq,
+                                ledger_seq = self.ledger_seq.get(),
                                 op_index,
                                 op_type = ?op_type,
                                 op_result = ?op_result,
@@ -585,7 +585,7 @@ impl TransactionExecutor {
                             error = %e,
                             op_index = op_index,
                             op_type = ?OperationType::from_body(&op.body),
-                            ledger_seq = self.ledger_seq,
+                            ledger_seq = self.ledger_seq.get(),
                             "Operation execution returned Err (mapped to txInternalError)"
                         );
                         // stellar-core maps std::runtime_error during operation execution
@@ -687,7 +687,7 @@ impl TransactionExecutor {
                 .collect::<Vec<_>>()
                 .join(",");
             tracing::debug!(
-                ledger_seq = self.ledger_seq,
+                ledger_seq = self.ledger_seq.get(),
                 total_us,
                 validation_us,
                 val_account_load_us,
@@ -857,7 +857,7 @@ impl TransactionExecutor {
         // ensuring the full max_refundable_fee is refunded on any transaction failure.
         if let Some(tracker) = refundable_fee_tracker.as_mut() {
             tracing::debug!(
-                ledger_seq = self.ledger_seq,
+                ledger_seq = self.ledger_seq.get(),
                 is_soroban = frame.is_soroban(),
                 max_refundable_fee = tracker.max_refundable_fee,
                 consumed_before_reset = tracker.consumed_refundable_fee,

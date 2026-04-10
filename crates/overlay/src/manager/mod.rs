@@ -46,6 +46,7 @@ use crate::{
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, Result,
 };
 use dashmap::DashMap;
+use henyey_common::LedgerSeq;
 use parking_lot::RwLock;
 use rand::seq::SliceRandom;
 use std::collections::HashSet;
@@ -602,7 +603,7 @@ impl OverlayManager {
         // Record in flood gate and get filtered peer list
         let forward_peers: Option<Vec<PeerId>> = if is_flood {
             let hash = compute_message_hash(&message);
-            let lcl = self.last_closed_ledger.load(Ordering::Relaxed);
+            let lcl = LedgerSeq::new(self.last_closed_ledger.load(Ordering::Relaxed));
             self.flood_gate.record_seen(hash, None, lcl);
             // Only forward to peers that haven't already sent us this message
             let all_peers: Vec<PeerId> = self.peers.iter().map(|e| e.key().clone()).collect();
@@ -960,10 +961,14 @@ impl OverlayManager {
     /// signature `(uint32_t ledgerSeq, uint32_t lclSeq)` but is unused here
     /// because survey cleanup and per-peer TxAdverts cleanup are handled
     /// separately by the app layer in Rust.
-    pub fn clear_ledgers_below(&self, ledger_seq: u32, _lcl_seq: u32) {
-        self.last_closed_ledger.store(ledger_seq, Ordering::Relaxed);
+    pub fn clear_ledgers_below(&self, ledger_seq: LedgerSeq, _lcl_seq: u32) {
+        self.last_closed_ledger
+            .store(ledger_seq.get(), Ordering::Relaxed);
         self.flood_gate.clear_below(ledger_seq);
-        trace!(ledger_seq, "Cleared overlay state below ledger");
+        trace!(
+            ledger_seq = ledger_seq.get(),
+            "Cleared overlay state below ledger"
+        );
     }
 
     /// Notify all connected peers that the maximum transaction size has
@@ -1060,8 +1065,8 @@ impl OverlayManager {
     }
 
     /// Request SCP state from all peers.
-    pub async fn request_scp_state(&self, ledger_seq: u32) -> Result<usize> {
-        let message = StellarMessage::GetScpState(ledger_seq);
+    pub async fn request_scp_state(&self, ledger_seq: LedgerSeq) -> Result<usize> {
+        let message = StellarMessage::GetScpState(ledger_seq.get());
         self.broadcast(message).await
     }
 
@@ -1260,16 +1265,16 @@ mod tests {
         // Record some flood messages at ledger 100
         let hash1 = henyey_common::Hash256([1u8; 32]);
         let hash2 = henyey_common::Hash256([2u8; 32]);
-        manager.flood_gate.record_seen(hash1, None, 100);
-        manager.flood_gate.record_seen(hash2, None, 100);
+        manager.flood_gate.record_seen(hash1, None, 100.into());
+        manager.flood_gate.record_seen(hash2, None, 100.into());
         assert_eq!(manager.flood_stats().seen_count, 2);
 
         // clear_ledgers_below should not remove entries at or above the threshold
-        manager.clear_ledgers_below(100, 100);
+        manager.clear_ledgers_below(100.into(), 100);
         assert_eq!(manager.flood_stats().seen_count, 2);
 
         // clear_ledgers_below with a higher seq removes them
-        manager.clear_ledgers_below(101, 101);
+        manager.clear_ledgers_below(101.into(), 101);
         assert_eq!(manager.flood_stats().seen_count, 0);
     }
 
@@ -1282,9 +1287,9 @@ mod tests {
         let manager = OverlayManager::new(config, local_node).unwrap();
 
         // Should not panic with empty flood gate
-        manager.clear_ledgers_below(0, 0);
-        manager.clear_ledgers_below(100, 50);
-        manager.clear_ledgers_below(u32::MAX, u32::MAX);
+        manager.clear_ledgers_below(0.into(), 0);
+        manager.clear_ledgers_below(100.into(), 50);
+        manager.clear_ledgers_below(u32::MAX.into(), u32::MAX);
     }
 
     /// Regression test for AUDIT-H13: known_peers must be capped at MAX_KNOWN_PEERS.

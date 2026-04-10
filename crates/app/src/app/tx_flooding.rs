@@ -147,7 +147,7 @@ impl App {
         Duration::from_millis(delay_ms.min(2000) as u64)
     }
 
-    pub(super) async fn clear_tx_advert_history(&self, ledger_seq: u32) {
+    pub(super) async fn clear_tx_advert_history(&self, ledger_seq: LedgerSeq) {
         let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
         for adverts in adverts_by_peer.values_mut() {
             adverts.clear_below(ledger_seq);
@@ -399,7 +399,7 @@ impl App {
         let entry = adverts_by_peer
             .entry(peer_id.clone())
             .or_insert_with(PeerTxAdverts::new);
-        entry.queue_incoming(&advert.tx_hashes.0, ledger_seq, max_ops);
+        entry.queue_incoming(&advert.tx_hashes.0, ledger_seq.into(), max_ops);
     }
 
     pub(super) async fn handle_flood_demand(

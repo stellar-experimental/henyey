@@ -14,6 +14,7 @@
 
 use henyey_common::xdr_stream::XdrOutputStream;
 use henyey_common::Hash256;
+use henyey_common::LedgerSeq;
 use rusqlite::{params, Connection, OptionalExtension};
 use stellar_xdr::curr::{
     Hash, LedgerScpMessages, Limits, NodeId, PublicKey, ReadXdr, ScpEnvelope, ScpHistoryEntry,
@@ -33,12 +34,16 @@ pub trait ScpQueries {
     ///
     /// Replaces any existing envelopes for the ledger. Envelopes are stored
     /// sorted by node ID for deterministic ordering.
-    fn store_scp_history(&self, ledger_seq: u32, envelopes: &[ScpEnvelope]) -> Result<(), DbError>;
+    fn store_scp_history(
+        &self,
+        ledger_seq: LedgerSeq,
+        envelopes: &[ScpEnvelope],
+    ) -> Result<(), DbError>;
 
     /// Loads SCP envelopes for a ledger.
     ///
     /// Returns envelopes sorted by node ID.
-    fn load_scp_history(&self, ledger_seq: u32) -> Result<Vec<ScpEnvelope>, DbError>;
+    fn load_scp_history(&self, ledger_seq: LedgerSeq) -> Result<Vec<ScpEnvelope>, DbError>;
 
     /// Stores a quorum set by its hash.
     ///
@@ -76,11 +81,15 @@ pub trait ScpQueries {
     /// Returns the total number of entries deleted (history + quorums).
     ///
     /// This is used by the Maintainer to garbage collect old SCP state.
-    fn delete_old_scp_entries(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
+    fn delete_old_scp_entries(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32, DbError>;
 }
 
 impl ScpQueries for Connection {
-    fn store_scp_history(&self, ledger_seq: u32, envelopes: &[ScpEnvelope]) -> Result<(), DbError> {
+    fn store_scp_history(
+        &self,
+        ledger_seq: LedgerSeq,
+        envelopes: &[ScpEnvelope],
+    ) -> Result<(), DbError> {
         self.execute(
             "DELETE FROM scphistory WHERE ledgerseq = ?1",
             params![ledger_seq],
@@ -105,7 +114,7 @@ impl ScpQueries for Connection {
         Ok(())
     }
 
-    fn load_scp_history(&self, ledger_seq: u32) -> Result<Vec<ScpEnvelope>, DbError> {
+    fn load_scp_history(&self, ledger_seq: LedgerSeq) -> Result<Vec<ScpEnvelope>, DbError> {
         let mut stmt =
             self.prepare("SELECT envelope FROM scphistory WHERE ledgerseq = ?1 ORDER BY nodeid")?;
         let rows = stmt.query_map(params![ledger_seq], |row| row.get::<_, Vec<u8>>(0))?;
@@ -125,7 +134,7 @@ impl ScpQueries for Connection {
         quorum_set: &ScpQuorumSet,
     ) -> Result<(), DbError> {
         let hash_hex = hash.to_hex();
-        let existing: Option<u32> = self
+        let existing: Option<LedgerSeq> = self
             .query_row(
                 "SELECT lastledgerseq FROM scpquorums WHERE qsethash = ?1",
                 params![hash_hex],
@@ -181,7 +190,7 @@ impl ScpQueries for Connection {
         let mut seq_stmt = self.prepare(
             "SELECT DISTINCT ledgerseq FROM scphistory WHERE ledgerseq >= ?1 AND ledgerseq < ?2 ORDER BY ledgerseq ASC",
         )?;
-        let ledger_seqs: Vec<u32> = seq_stmt
+        let ledger_seqs: Vec<LedgerSeq> = seq_stmt
             .query_map(params![begin, end], |row| row.get(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
@@ -220,7 +229,7 @@ impl ScpQueries for Connection {
                     DbError::Integrity("too many quorum sets for XDR vec".to_string())
                 })?,
                 ledger_messages: LedgerScpMessages {
-                    ledger_seq,
+                    ledger_seq: ledger_seq.get(),
                     messages: envelopes.try_into().map_err(|_| {
                         DbError::Integrity("too many SCP messages for XDR vec".to_string())
                     })?,
@@ -236,7 +245,7 @@ impl ScpQueries for Connection {
         Ok(written)
     }
 
-    fn delete_old_scp_entries(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
+    fn delete_old_scp_entries(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32, DbError> {
         // Delete old SCP history entries by complete ledger boundary.
         // scphistory may have multiple rows per ledger (one per validator),
         // so row-limit deletion can split a ledger's data. Instead, select
@@ -565,7 +574,7 @@ mod tests {
             },
             signature: stellar_xdr::curr::Signature::default(),
         };
-        conn.store_scp_history(100, &[envelope]).unwrap();
+        conn.store_scp_history(100.into(), &[envelope]).unwrap();
 
         // Store the referenced quorum set
         let hash = Hash256::from([0u8; 32]);
@@ -629,7 +638,7 @@ mod tests {
                 },
                 signature: stellar_xdr::curr::Signature::default(),
             };
-            conn.store_scp_history(seq, &[envelope]).unwrap();
+            conn.store_scp_history(seq.into(), &[envelope]).unwrap();
 
             let hash = Hash256::from([seq as u8; 32]);
             let qset = ScpQuorumSet {
@@ -728,20 +737,20 @@ mod tests {
                     signature: stellar_xdr::curr::Signature::default(),
                 });
             }
-            conn.store_scp_history(seq, &envelopes).unwrap();
+            conn.store_scp_history(seq.into(), &envelopes).unwrap();
         }
 
         // 3 ledgers × 3 validators = 9 rows total.
         // Delete with count=1 (1 distinct ledger). Should delete ALL 3 rows
         // for ledger 1, not just 1 row.
-        let deleted = conn.delete_old_scp_entries(3, 1).unwrap();
+        let deleted = conn.delete_old_scp_entries(3.into(), 1).unwrap();
         assert_eq!(deleted, 3, "should delete all 3 rows for ledger 1");
 
         // Ledger 1 should be completely gone
-        assert!(conn.load_scp_history(1).unwrap().is_empty());
+        assert!(conn.load_scp_history(1.into()).unwrap().is_empty());
         // Ledgers 2 and 3 should still have all 3 envelopes
-        assert_eq!(conn.load_scp_history(2).unwrap().len(), 3);
-        assert_eq!(conn.load_scp_history(3).unwrap().len(), 3);
+        assert_eq!(conn.load_scp_history(2.into()).unwrap().len(), 3);
+        assert_eq!(conn.load_scp_history(3.into()).unwrap().len(), 3);
     }
 
     #[test]
@@ -772,7 +781,7 @@ mod tests {
                 },
                 signature: stellar_xdr::curr::Signature::default(),
             };
-            conn.store_scp_history(seq, &[envelope]).unwrap();
+            conn.store_scp_history(seq.into(), &[envelope]).unwrap();
 
             // Also store a quorum set
             let hash = Hash256::from([seq as u8; 32]);
@@ -786,27 +795,27 @@ mod tests {
 
         // Verify we have 10 entries
         for seq in 1..=10 {
-            let history = conn.load_scp_history(seq).unwrap();
+            let history = conn.load_scp_history(seq.into()).unwrap();
             assert_eq!(history.len(), 1);
         }
 
         // Delete entries up to ledger 5, with count limit of 3
-        let deleted = conn.delete_old_scp_entries(5, 3).unwrap();
+        let deleted = conn.delete_old_scp_entries(5.into(), 3).unwrap();
         assert!(deleted > 0);
 
         // Delete remaining old entries
-        let _deleted = conn.delete_old_scp_entries(5, 100).unwrap();
+        let _deleted = conn.delete_old_scp_entries(5.into(), 100).unwrap();
         // May have deleted more from both tables
 
         // Verify old entries are gone (1-5)
         for seq in 1..=5 {
-            let history = conn.load_scp_history(seq).unwrap();
+            let history = conn.load_scp_history(seq.into()).unwrap();
             assert!(history.is_empty(), "ledger {} should have no history", seq);
         }
 
         // Verify recent entries remain (6-10)
         for seq in 6..=10 {
-            let history = conn.load_scp_history(seq).unwrap();
+            let history = conn.load_scp_history(seq.into()).unwrap();
             assert_eq!(
                 history.len(),
                 1,

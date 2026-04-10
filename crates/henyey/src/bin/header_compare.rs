@@ -27,7 +27,7 @@
 
 use clap::Parser;
 use henyey_app::config::AppConfig;
-use henyey_common::Hash256;
+use henyey_common::{Hash256, LedgerSeq};
 use henyey_history::HistoryArchive;
 use henyey_ledger::compute_header_hash;
 use std::path::PathBuf;
@@ -153,7 +153,7 @@ async fn compare_tx_results(
     checkpoint: u32,
 ) -> anyhow::Result<()> {
     let local_entry = db
-        .get_tx_result_entry(ledger)?
+        .get_tx_result_entry(LedgerSeq::new(ledger))?
         .ok_or_else(|| anyhow::anyhow!("missing tx result entry {} in db", ledger))?;
 
     let archive_entries = archive.fetch_results(checkpoint).await?;

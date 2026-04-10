@@ -1,6 +1,7 @@
 //! Catchup logic: driving ledger replay from history archives to reach the network tip.
 
 use super::*;
+use henyey_common::LedgerSeq;
 
 impl App {
     pub(crate) fn should_skip_externalized_catchup_cooldown(
@@ -96,7 +97,7 @@ impl App {
             // We need to wait for the next checkpoint to become available.
             *self.last_catchup_completed_at.write().await = Some(self.clock.now());
             return Ok(CatchupResult {
-                ledger_seq: current,
+                ledger_seq: current.into(),
                 ledger_hash: Hash256::default(),
                 buckets_applied: 0,
                 ledgers_replayed: 0,
@@ -273,7 +274,7 @@ impl App {
         }
 
         tracing::info!(
-            ledger_seq = output.ledger_seq,
+            ledger_seq = output.ledger_seq.get(),
             "Ledger manager initialized from catchup"
         );
 
@@ -288,7 +289,7 @@ impl App {
             let old_count = buffer.len();
             let new_lcl = output.ledger_seq;
             // Keep ledgers > new_lcl (i.e., remove ledgers <= new_lcl)
-            buffer.retain(|seq, _| *seq > new_lcl);
+            buffer.retain(|seq, _| *seq > new_lcl.get());
             let kept_count = buffer.len();
             let removed_count = old_count - kept_count;
             if removed_count > 0 || kept_count > 0 {
@@ -296,7 +297,7 @@ impl App {
                     old_count,
                     removed_count,
                     kept_count,
-                    new_lcl,
+                    new_lcl = new_lcl.get(),
                     first_buffered = buffer.keys().next(),
                     "Trimmed stale buffered ledgers after catchup, keeping future ledgers"
                 );
@@ -393,8 +394,8 @@ impl App {
         // buffered ledgers. If we clear them, peers may have already evicted those
         // old tx_sets, causing "DontHave" responses and sync failures.
         let new_lcl = output.ledger_seq;
-        self.herder.trim_scp_driver_caches(new_lcl as u64);
-        self.herder.trim_fetching_caches(new_lcl as u64);
+        self.herder.trim_scp_driver_caches(new_lcl.get() as u64);
+        self.herder.trim_fetching_caches(new_lcl.get() as u64);
 
         // Clear all pending envelopes — they are stale after catchup.
         // Envelopes for future slots arrive via the fetching_envelopes path
@@ -424,7 +425,7 @@ impl App {
         // Update cache with the ledger we caught up to (it's a checkpoint)
         {
             let mut cache = self.cached_archive_checkpoint.write().await;
-            *cache = Some((output.ledger_seq, self.clock.now()));
+            *cache = Some((output.ledger_seq.get(), self.clock.now()));
         }
 
         // Populate syncing_ledgers from externalized cache before returning.
@@ -436,7 +437,7 @@ impl App {
         // check_ledger_close and insert into syncing_ledgers so the main
         // loop's pending_close chaining can close them.
         {
-            let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl);
+            let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl.get());
             let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
             let mut buffer = self.syncing_ledgers.write().await;
             let mut populated = 0u32;
@@ -484,7 +485,7 @@ impl App {
         // call to try_apply_buffered_ledgers() in handle_catchup_result()
         // kicks off the first close, and chaining takes it from there.
         {
-            let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl);
+            let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl.get());
             let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
             let buffered = self.syncing_ledgers.read().await.len();
             tracing::info!(
@@ -500,9 +501,12 @@ impl App {
         // while the main loop is still closing buffered ledgers.
         *self.last_catchup_completed_at.write().await = Some(self.clock.now());
 
-        let final_ledger = self.get_current_ledger().await.unwrap_or(output.ledger_seq);
+        let final_ledger = self
+            .get_current_ledger()
+            .await
+            .unwrap_or(output.ledger_seq.get());
         Ok(CatchupResult {
-            ledger_seq: final_ledger,
+            ledger_seq: final_ledger.into(),
             ledger_hash: output.ledger_hash,
             buckets_applied: output.buckets_downloaded,
             ledgers_replayed: output.ledgers_applied,
@@ -1221,7 +1225,7 @@ impl App {
             let pre_trim_count = buffer.len();
             let pre_trim_first = buffer.keys().next().copied();
             let pre_trim_last = buffer.keys().next_back().copied();
-            Self::trim_syncing_ledgers(&mut buffer, current_ledger);
+            Self::trim_syncing_ledgers(&mut buffer, current_ledger.into());
 
             // When all peers have reported DontHave for tx_sets, evict buffered
             // entries starting from current_ledger+1 that have no tx_set. These
@@ -1519,7 +1523,7 @@ impl App {
                                 "Buffered gap detected; starting recovery timer"
                             );
                             *stuck_state = Some(ConsensusStuckState {
-                                current_ledger,
+                                current_ledger: current_ledger.into(),
                                 first_buffered,
                                 stuck_start: now,
                                 last_recovery_attempt: now,
@@ -1534,7 +1538,7 @@ impl App {
                 match action {
                     ConsensusStuckAction::Wait => return,
                     ConsensusStuckAction::AttemptRecovery => {
-                        self.out_of_sync_recovery(current_ledger).await;
+                        self.out_of_sync_recovery(current_ledger.into()).await;
                         return;
                     }
                     ConsensusStuckAction::TriggerCatchup => {
@@ -1551,7 +1555,8 @@ impl App {
             last_buffered,
             "maybe_start_buffered_catchup: computing catchup target"
         );
-        let target = Self::buffered_catchup_target(current_ledger, first_buffered, last_buffered);
+        let target =
+            Self::buffered_catchup_target(current_ledger.into(), first_buffered, last_buffered);
         let target = match target {
             Some(t) => Some(t),
             None => {
@@ -1560,7 +1565,7 @@ impl App {
                 Self::compute_catchup_target_for_timeout(
                     last_buffered,
                     first_buffered,
-                    current_ledger,
+                    current_ledger.into(),
                 )
             }
         };
@@ -1684,14 +1689,15 @@ impl App {
                     if reset_stuck_state {
                         *self.consensus_stuck_state.write().await = None;
                     }
-                    *self.current_ledger.write().await = result.ledger_seq;
-                    *self.last_processed_slot.write().await = result.ledger_seq as u64;
+                    *self.current_ledger.write().await = result.ledger_seq.get();
+                    *self.last_processed_slot.write().await = result.ledger_seq.get() as u64;
                     self.clear_tx_advert_history(result.ledger_seq).await;
                     self.herder.bootstrap(result.ledger_seq);
-                    self.herder.purge_slots_below(result.ledger_seq as u64);
+                    self.herder
+                        .purge_slots_below(result.ledger_seq.get() as u64);
                     let cleaned = self
                         .herder
-                        .cleanup_old_pending_tx_sets(result.ledger_seq as u64 + 1);
+                        .cleanup_old_pending_tx_sets(result.ledger_seq.get() as u64 + 1);
                     if cleaned > 0 {
                         tracing::info!(
                             cleaned,
@@ -1709,7 +1715,7 @@ impl App {
                         let mut buffer = self.syncing_ledgers.write().await;
                         let stale_count = buffer.len();
                         buffer.retain(|&seq, entry| {
-                            if seq <= result.ledger_seq {
+                            if seq <= result.ledger_seq.get() {
                                 return false; // Already applied by catchup
                             }
                             // Keep entries above catchup target only if they have a tx_set.
@@ -1723,7 +1729,7 @@ impl App {
                             tracing::info!(
                                 removed,
                                 kept,
-                                catchup_ledger = result.ledger_seq,
+                                catchup_ledger = result.ledger_seq.get(),
                                 "Cleaned syncing_ledgers after catchup (kept entries with tx_sets)"
                             );
                         }
@@ -1735,7 +1741,11 @@ impl App {
                     // the state restored by catchup.
                     self.update_bucket_snapshot();
 
-                    tracing::info!(ledger_seq = result.ledger_seq, "{} catchup complete", label);
+                    tracing::info!(
+                        ledger_seq = result.ledger_seq.get(),
+                        "{} catchup complete",
+                        label
+                    );
 
                     // Request fresh SCP state from peers now that our LCL is
                     // close to the network head.  This brings EXTERNALIZE for
@@ -1745,7 +1755,7 @@ impl App {
                     if let Some(overlay) = self.overlay().await {
                         let _ = overlay.request_scp_state(result.ledger_seq).await;
                         tracing::info!(
-                            ledger_seq = result.ledger_seq,
+                            ledger_seq = result.ledger_seq.get(),
                             "Requested fresh SCP state before rapid close"
                         );
                         // Brief pause to let SCP state responses + tx_set
@@ -1767,7 +1777,7 @@ impl App {
                     let buffer_count = self.syncing_ledgers.read().await.len();
                     tracing::debug!(
                         latest_externalized = latest_ext,
-                        last_processed = result.ledger_seq,
+                        last_processed = result.ledger_seq.get(),
                         pending_tx_sets = pending_count,
                         buffered_ledgers = buffer_count,
                         tx_set_cache_size = self.herder.scp_driver().tx_set_cache_size(),
@@ -1851,7 +1861,7 @@ impl App {
                     // will trigger catchup if the gap persists.
                     if let Some(overlay) = self.overlay().await {
                         let current_ledger = *self.current_ledger.read().await;
-                        let _ = overlay.request_scp_state(current_ledger).await;
+                        let _ = overlay.request_scp_state(current_ledger.into()).await;
                         tracing::info!(
                             current_ledger,
                             "Requested SCP state from peers after catchup to fill gap"
@@ -1859,7 +1869,7 @@ impl App {
                     }
                 } else {
                     tracing::info!(
-                        ledger_seq = result.ledger_seq,
+                        ledger_seq = result.ledger_seq.get(),
                         "{} catchup skipped (already at target); preserving tx_set tracking",
                         label
                     );
@@ -2067,15 +2077,15 @@ impl App {
     }
 
     pub(super) fn buffered_catchup_target(
-        current_ledger: u32,
+        current_ledger: LedgerSeq,
         first_buffered: u32,
         last_buffered: u32,
     ) -> Option<u32> {
-        if first_buffered <= current_ledger + 1 {
+        if first_buffered <= current_ledger.get() + 1 {
             return None;
         }
 
-        let gap = first_buffered.saturating_sub(current_ledger);
+        let gap = first_buffered.saturating_sub(current_ledger.get());
         if gap >= checkpoint_frequency() {
             // When the gap is large enough to span a checkpoint boundary, target
             // the latest checkpoint before first_buffered. This ensures we catch
@@ -2110,7 +2120,7 @@ impl App {
     pub(super) fn compute_catchup_target_for_timeout(
         last_buffered: u32,
         first_buffered: u32,
-        current_ledger: u32,
+        current_ledger: LedgerSeq,
     ) -> Option<u32> {
         // We need to catch up to a point that lets us make progress.
         // The best target is just before first_buffered, so we can then apply the buffered ledgers.
@@ -2128,11 +2138,11 @@ impl App {
         };
 
         // If target is not better than current_ledger, try targeting last_buffered's checkpoint
-        if target <= current_ledger {
+        if target <= current_ledger.get() {
             let last_checkpoint_start = Self::first_ledger_in_checkpoint(last_buffered);
             let alt_target = last_checkpoint_start.saturating_sub(1);
 
-            if alt_target > current_ledger {
+            if alt_target > current_ledger.get() {
                 return Some(alt_target);
             }
 
@@ -2142,7 +2152,7 @@ impl App {
             // bridges the gap (e.g., replay 1 ledger from 922751 to 922752),
             // then the buffer starting at 922753 can drain.
             let direct_target = first_buffered.saturating_sub(1);
-            if direct_target > current_ledger {
+            if direct_target > current_ledger.get() {
                 return Some(direct_target);
             }
 

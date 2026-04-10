@@ -3,6 +3,7 @@
 //! These tests match the behavior of the BucketIndexTests.cpp
 //! loadPoolShareTrustLinesByAccountAndAsset tests to ensure parity with stellar-core.
 
+use henyey_common::LedgerSeq;
 use std::collections::BTreeMap;
 
 use henyey_bucket::{BucketList, BucketListSnapshot, SearchableBucketListSnapshot};
@@ -79,7 +80,7 @@ fn make_pool_id(byte: u8) -> PoolId {
 }
 
 /// Create a minimal ledger header for testing.
-fn make_ledger_header(ledger_seq: u32) -> LedgerHeader {
+fn make_ledger_header(ledger_seq: LedgerSeq) -> LedgerHeader {
     LedgerHeader {
         ledger_version: TEST_PROTOCOL,
         previous_ledger_hash: Hash([0u8; 32]),
@@ -91,7 +92,7 @@ fn make_ledger_header(ledger_seq: u32) -> LedgerHeader {
         },
         tx_set_result_hash: Hash([0u8; 32]),
         bucket_list_hash: Hash([0u8; 32]),
-        ledger_seq,
+        ledger_seq: ledger_seq.get(),
         total_coins: 100_000_000_000_000_000,
         fee_pool: 0,
         inflation_seq: 0,
@@ -111,7 +112,7 @@ fn make_ledger_header(ledger_seq: u32) -> LedgerHeader {
 
 /// Helper to create a snapshot and searchable bucket list.
 fn create_searchable_snapshot(bucket_list: &BucketList) -> SearchableBucketListSnapshot {
-    let header = make_ledger_header(1);
+    let header = make_ledger_header(1.into());
     let snapshot = BucketListSnapshot::new(bucket_list, header);
     SearchableBucketListSnapshot::new(snapshot, BTreeMap::new())
 }
@@ -155,7 +156,7 @@ async fn test_load_pool_share_trustlines_by_account_and_asset() {
     // Add all entries to the bucket list
     bucket_list
         .add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             stellar_xdr::curr::BucketListType::Live,
             vec![
@@ -222,7 +223,7 @@ async fn test_load_pool_share_trustlines_no_match() {
 
     bucket_list
         .add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             stellar_xdr::curr::BucketListType::Live,
             vec![pool, tl],
@@ -260,7 +261,7 @@ async fn test_load_pool_share_trustlines_deleted_pool() {
     // Add pool and trustline
     bucket_list
         .add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             stellar_xdr::curr::BucketListType::Live,
             vec![pool, tl],
@@ -283,7 +284,7 @@ async fn test_load_pool_share_trustlines_deleted_pool() {
         });
     bucket_list
         .add_batch(
-            2,
+            2.into(),
             TEST_PROTOCOL,
             stellar_xdr::curr::BucketListType::Live,
             vec![],
@@ -320,7 +321,7 @@ async fn test_load_pool_share_trustlines_multi_version() {
 
     bucket_list
         .add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             stellar_xdr::curr::BucketListType::Live,
             vec![pool, tl.clone()],
@@ -337,7 +338,7 @@ async fn test_load_pool_share_trustlines_multi_version() {
 
     bucket_list
         .add_batch(
-            2,
+            2.into(),
             TEST_PROTOCOL,
             stellar_xdr::curr::BucketListType::Live,
             vec![],
@@ -422,7 +423,7 @@ async fn test_load_trustlines_for_account() {
 
     bucket_list
         .add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             stellar_xdr::curr::BucketListType::Live,
             vec![tl1, tl2, tl3],
@@ -461,7 +462,7 @@ async fn test_load_pool_share_trustlines_asset_in_b_position() {
 
     bucket_list
         .add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             stellar_xdr::curr::BucketListType::Live,
             vec![pool, tl],

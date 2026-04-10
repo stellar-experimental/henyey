@@ -26,7 +26,7 @@ impl App {
             // This shouldn't happen if run_cmd did catchup, but handle it just in case
             tracing::info!("No ledger state, running catchup first");
             let result = self.catchup(CatchupTarget::Current).await?;
-            *self.current_ledger.write().await = result.ledger_seq;
+            *self.current_ledger.write().await = result.ledger_seq.get();
         } else {
             // Ledger manager was already initialized (e.g., catchup ran before run())
             *self.current_ledger.write().await = current_ledger;
@@ -36,7 +36,7 @@ impl App {
         let ledger_seq = *self.current_ledger.read().await;
         *self.last_processed_slot.write().await = ledger_seq as u64;
         self.herder.start_syncing();
-        self.herder.bootstrap(ledger_seq);
+        self.herder.bootstrap(ledger_seq.into());
         tracing::info!(ledger_seq, "Herder bootstrapped");
 
         // Populate the initial bucket snapshot for the query server.
@@ -278,7 +278,7 @@ impl App {
                                 "Rapid close cycle ended; requesting SCP state from peers"
                             );
                             if let Some(overlay) = self.overlay().await {
-                                let _ = overlay.request_scp_state(current_ledger).await;
+                                let _ = overlay.request_scp_state(current_ledger.into()).await;
                             }
                             *self.last_scp_state_request_at.write().await = self.clock.now();
                         }
@@ -450,7 +450,7 @@ impl App {
                         // SyncRecoveryManager triggered recovery - perform it now
                         if let Ok(current_ledger) = self.get_current_ledger().await {
                             tracing::info!(current_ledger, "Calling out_of_sync_recovery");
-                            self.out_of_sync_recovery(current_ledger).await;
+                            self.out_of_sync_recovery(current_ledger.into()).await;
                             tracing::info!("out_of_sync_recovery completed");
                         }
                         // Also check for buffered catchup (this handles timeout-based catchup)
@@ -488,7 +488,7 @@ impl App {
                                         "Gap detected: next slot EXTERNALIZE missing, requesting SCP state"
                                     );
                                     if let Some(overlay) = self.overlay().await {
-                                        let _ = overlay.request_scp_state(cl).await;
+                                        let _ = overlay.request_scp_state(cl.into()).await;
                                     }
                                     *self.last_scp_state_request_at.write().await = self.clock.now();
                                 }
@@ -1350,7 +1350,7 @@ impl App {
     pub(super) async fn get_current_ledger(&self) -> anyhow::Result<u32> {
         // Check if ledger manager is initialized
         if self.ledger_manager.is_initialized() {
-            return Ok(self.ledger_manager.current_ledger_seq());
+            return Ok(self.ledger_manager.current_ledger_seq().get());
         }
         // No state yet
         Ok(0)

@@ -519,7 +519,7 @@ mod tests {
         let error_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| {
             Err(LedgerError::Internal("simulated I/O error".to_string()))
         });
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), error_lookup);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), error_lookup);
 
         // Before the fix, this would return Ok(None) — silently swallowing the error.
         // After the fix, it must return Err.
@@ -543,7 +543,7 @@ mod tests {
         // Create an empty snapshot with no config settings.
         // The lookup returns Ok(None) for everything (entry not found).
         let empty_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| Ok(None));
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), empty_lookup);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), empty_lookup);
 
         // Before the fix, this would return a SorobanConfig with hardcoded defaults.
         // After the fix, it must return Err because required settings are missing.
@@ -569,7 +569,7 @@ mod tests {
         let error_lookup: crate::EntryLookupFn = std::sync::Arc::new(|_key: &LedgerKey| {
             Err(LedgerError::Internal("disk read failed".to_string()))
         });
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), error_lookup);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), error_lookup);
 
         let result = load_soroban_config(&snapshot, 21);
         assert!(

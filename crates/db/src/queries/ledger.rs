@@ -6,6 +6,7 @@
 
 use henyey_common::xdr_stream::XdrOutputStream;
 use henyey_common::Hash256;
+use henyey_common::LedgerSeq;
 use rusqlite::{params, Connection, OptionalExtension};
 use stellar_xdr::curr::{LedgerHeader, LedgerHeaderHistoryEntry, Limits, ReadXdr};
 
@@ -63,7 +64,7 @@ pub trait LedgerQueries {
     /// Returns the number of entries actually deleted.
     ///
     /// This is used by the Maintainer to garbage collect old ledger history.
-    fn delete_old_ledger_headers(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
+    fn delete_old_ledger_headers(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32, DbError>;
 
     /// Returns the lowest ledger sequence number in the database.
     ///
@@ -187,7 +188,7 @@ impl LedgerQueries for Connection {
         Ok(written)
     }
 
-    fn delete_old_ledger_headers(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
+    fn delete_old_ledger_headers(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32, DbError> {
         // Delete up to `count` entries with ledgerseq <= max_ledger
         // Use a subquery to find the entries to delete (SQLite doesn't support LIMIT in DELETE)
         let deleted = self.execute(
@@ -429,11 +430,11 @@ mod tests {
         }
 
         // Delete ledgers up to 5, but only 3 at a time
-        let deleted = conn.delete_old_ledger_headers(5, 3).unwrap();
+        let deleted = conn.delete_old_ledger_headers(5.into(), 3).unwrap();
         assert_eq!(deleted, 3);
 
         // Delete more
-        let deleted = conn.delete_old_ledger_headers(5, 10).unwrap();
+        let deleted = conn.delete_old_ledger_headers(5.into(), 10).unwrap();
         assert_eq!(deleted, 2); // Only 2 remaining under threshold
 
         // Verify ledgers 6-10 remain

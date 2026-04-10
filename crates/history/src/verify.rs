@@ -787,7 +787,7 @@ mod tests {
     #[test]
     fn test_chain_anchors_valid_bottom_anchor() {
         let prev_hash = Hash256::hash(b"checkpoint header bytes");
-        let h1 = make_test_header(10, prev_hash.clone());
+        let h1 = make_test_header(10, prev_hash);
         let anchors = ChainTrustAnchors {
             previous_ledger_hash: Some(prev_hash),
             ..Default::default()
@@ -864,9 +864,9 @@ mod tests {
     fn test_chain_anchors_both_bottom_and_lcl() {
         // Test both anchors simultaneously
         let prev_hash = Hash256::hash(b"prev");
-        let h1 = make_test_header(10, prev_hash.clone());
+        let h1 = make_test_header(10, prev_hash);
         let h1_hash = compute_header_hash(&h1).unwrap();
-        let h2 = make_test_header(11, h1_hash.clone());
+        let h2 = make_test_header(11, h1_hash);
 
         let anchors = ChainTrustAnchors {
             previous_ledger_hash: Some(prev_hash),
@@ -912,7 +912,7 @@ mod tests {
         HistoryArchiveState {
             version: 2,
             server: None,
-            current_ledger: 63,
+            current_ledger: 63u32.into(),
             network_passphrase: passphrase.map(|s| s.to_string()),
             current_buckets: vec![HASBucketLevel {
                 curr: "00".repeat(32),
@@ -980,7 +980,7 @@ mod tests {
         HistoryArchiveState {
             version,
             server: None,
-            current_ledger: 63,
+            current_ledger: 63u32.into(),
             network_passphrase: passphrase.map(|s| s.to_string()),
             current_buckets: vec![level; n_levels],
             hot_archive_buckets: None,

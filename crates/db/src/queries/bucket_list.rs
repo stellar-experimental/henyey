@@ -13,6 +13,7 @@
 //! This structure allows efficient merging and pruning of ledger state.
 
 use henyey_common::Hash256;
+use henyey_common::LedgerSeq;
 use rusqlite::{params, Connection};
 
 use crate::error::DbError;
@@ -28,7 +29,7 @@ pub trait BucketListQueries {
     /// data for the ledger is replaced.
     fn store_bucket_list(
         &self,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
         levels: &[(Hash256, Hash256)],
     ) -> Result<(), DbError>;
 
@@ -37,14 +38,16 @@ pub trait BucketListQueries {
     /// Returns `None` if no snapshot exists for the given ledger.
     /// The returned vector contains (curr_hash, snap_hash) pairs
     /// indexed by level number.
-    fn load_bucket_list(&self, ledger_seq: u32)
-        -> Result<Option<Vec<(Hash256, Hash256)>>, DbError>;
+    fn load_bucket_list(
+        &self,
+        ledger_seq: LedgerSeq,
+    ) -> Result<Option<Vec<(Hash256, Hash256)>>, DbError>;
 }
 
 impl BucketListQueries for Connection {
     fn store_bucket_list(
         &self,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
         levels: &[(Hash256, Hash256)],
     ) -> Result<(), DbError> {
         self.execute(
@@ -65,7 +68,7 @@ impl BucketListQueries for Connection {
 
     fn load_bucket_list(
         &self,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
     ) -> Result<Option<Vec<(Hash256, Hash256)>>, DbError> {
         let mut stmt = self.prepare(
             r#"
@@ -140,14 +143,14 @@ mod tests {
             (Hash256::hash(b"curr1"), Hash256::hash(b"snap1")),
         ];
 
-        conn.store_bucket_list(64, &levels).unwrap();
-        let loaded = conn.load_bucket_list(64).unwrap().unwrap();
+        conn.store_bucket_list(64.into(), &levels).unwrap();
+        let loaded = conn.load_bucket_list(64.into()).unwrap().unwrap();
         assert_eq!(loaded, levels);
     }
 
     #[test]
     fn test_load_missing_bucket_list() {
         let conn = setup_db();
-        assert!(conn.load_bucket_list(128).unwrap().is_none());
+        assert!(conn.load_bucket_list(128.into()).unwrap().is_none());
     }
 }

@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use henyey_common::xdr_stream::XdrOutputStream;
+use henyey_common::LedgerSeq;
 use stellar_xdr::curr::LedgerCloseMeta;
 
 use crate::config::MetadataConfig;
@@ -175,7 +176,7 @@ impl MetaStreamManager {
     /// At every 256-ledger boundary, the current debug segment is closed,
     /// gzip-compressed, and a new segment is opened. Old segments are trimmed
     /// to keep approximately `ceil(debug_ledgers / 256) + 1` files.
-    pub fn maybe_rotate_debug_stream(&mut self, ledger_seq: u32) -> io::Result<()> {
+    pub fn maybe_rotate_debug_stream(&mut self, ledger_seq: LedgerSeq) -> io::Result<()> {
         if self.debug_dir.is_none() || self.debug_ledgers == 0 {
             return Ok(());
         }
@@ -200,7 +201,7 @@ impl MetaStreamManager {
         // Open new segment
         let debug_dir = self.debug_dir.as_ref().unwrap();
         let random_hex = format!("{:08x}", rand::random::<u32>());
-        let filename = format!("meta-debug-{:08x}-{}.xdr", ledger_seq, random_hex);
+        let filename = format!("meta-debug-{:08x}-{}.xdr", ledger_seq.get(), random_hex);
         let path = debug_dir.join(&filename);
 
         match XdrOutputStream::open(path.to_str().unwrap_or_default()) {
@@ -349,11 +350,11 @@ mod tests {
         let meta = LedgerCloseMeta::V2(LedgerCloseMetaV2::default());
 
         // Open initial segment at ledger 256
-        manager.maybe_rotate_debug_stream(256).unwrap();
+        manager.maybe_rotate_debug_stream(256.into()).unwrap();
         manager.emit_meta(&meta).unwrap();
 
         // Should create a new segment at ledger 512
-        manager.maybe_rotate_debug_stream(512).unwrap();
+        manager.maybe_rotate_debug_stream(512.into()).unwrap();
         manager.emit_meta(&meta).unwrap();
 
         drop(manager);

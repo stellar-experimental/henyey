@@ -43,7 +43,7 @@ fn test_soroban_refund_event_after_all_txs() {
     };
     let ttl_key = LedgerKey::Ttl(LedgerKeyTtl { key_hash });
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(contract_key.clone(), contract_entry)
         .add_entry(ttl_key, ttl_entry)
@@ -322,7 +322,7 @@ fn test_set_options_loads_signer_sponsor_accounts() {
     let (sponsor_key, sponsor_entry) =
         create_sponsor_account_entry(sponsor_id.clone(), 1, 50_000_000, 1);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(sponsor_key, sponsor_entry)
         .build_with_default_header();
@@ -443,7 +443,7 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
     let account_id: AccountId = (&secret.public_key()).into();
 
     let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(key, entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -478,7 +478,7 @@ fn test_execute_transaction_set_accepts_hot_archive_parameter() {
         env.signatures = vec![decorated].try_into().unwrap();
     }
 
-    let mut delta = LedgerDelta::new(1);
+    let mut delta = LedgerDelta::new(1.into());
     let transactions = vec![(Arc::new(envelope), None)];
 
     // Create an empty hot archive bucket list wrapped in the expected type
@@ -624,7 +624,7 @@ fn test_deleted_offer_not_reloaded_from_snapshot() {
     );
 
     // Build snapshot with all entries
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .add_entry(offer_owner_key, offer_owner_entry)
@@ -902,7 +902,7 @@ async fn test_parallel_soroban_multi_cluster_execution() {
     let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
 
     // Build snapshot with all entries
-    let mut builder = SnapshotBuilder::new(1);
+    let mut builder = SnapshotBuilder::new(1.into());
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
         builder = builder.add_entry(key, entry);
     }
@@ -917,7 +917,7 @@ async fn test_parallel_soroban_multi_cluster_execution() {
         ]],
     };
 
-    let mut delta = LedgerDelta::new(1);
+    let mut delta = LedgerDelta::new(1.into());
     let context = henyey_tx::LedgerContext::new(
         1,         // ledger_seq
         1_000,     // close_time
@@ -986,7 +986,7 @@ async fn test_parallel_soroban_matches_sequential() {
     let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
 
     // Build snapshot with all entries.
-    let mut builder = SnapshotBuilder::new(1);
+    let mut builder = SnapshotBuilder::new(1.into());
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
         builder = builder.add_entry(key, entry);
     }
@@ -1009,7 +1009,7 @@ async fn test_parallel_soroban_matches_sequential() {
             vec![(std::sync::Arc::new(tx2.clone()), None)],
         ]],
     };
-    let mut parallel_delta = LedgerDelta::new(1);
+    let mut parallel_delta = LedgerDelta::new(1.into());
     let par = execute_soroban_parallel_phase(
         &snapshot,
         &parallel_phase,
@@ -1040,7 +1040,7 @@ async fn test_parallel_soroban_matches_sequential() {
             vec![vec![(std::sync::Arc::new(tx2.clone()), None)]],
         ],
     };
-    let mut sequential_delta = LedgerDelta::new(1);
+    let mut sequential_delta = LedgerDelta::new(1.into());
     let seq = execute_soroban_parallel_phase(
         &snapshot,
         &sequential_phase,
@@ -1124,7 +1124,7 @@ async fn test_parallel_soroban_deterministic() {
     let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
     let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
 
-    let mut builder = SnapshotBuilder::new(1);
+    let mut builder = SnapshotBuilder::new(1.into());
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
         builder = builder.add_entry(key, entry);
     }
@@ -1145,7 +1145,7 @@ async fn test_parallel_soroban_deterministic() {
     let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
 
     for run in 0..5 {
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = LedgerDelta::new(1.into());
         let result = execute_soroban_parallel_phase(
             &snapshot,
             &phase,
@@ -1213,7 +1213,7 @@ async fn test_parallel_soroban_from_spawn_blocking() {
     let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
     let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
 
-    let mut builder = SnapshotBuilder::new(1);
+    let mut builder = SnapshotBuilder::new(1.into());
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
         builder = builder.add_entry(key, entry);
     }
@@ -1233,7 +1233,7 @@ async fn test_parallel_soroban_from_spawn_blocking() {
     // Execute on a spawn_blocking thread with Some(handle).
     // This exercises the Handle::block_on path (not block_in_place).
     let outer_result = tokio::task::spawn_blocking(move || {
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = LedgerDelta::new(1.into());
         let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
         let result = execute_soroban_parallel_phase(
             &snapshot,
@@ -1289,7 +1289,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
     let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
 
-    let mut builder = SnapshotBuilder::new(1);
+    let mut builder = SnapshotBuilder::new(1.into());
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
         builder = builder.add_entry(key, entry);
     }
@@ -1304,7 +1304,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     };
 
     // Run with None (block_in_place path, on worker thread).
-    let mut delta_worker = LedgerDelta::new(1);
+    let mut delta_worker = LedgerDelta::new(1.into());
     let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
     let worker_result = execute_soroban_parallel_phase(
         &snapshot,
@@ -1331,7 +1331,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     // Run with Some(handle) (Handle::block_on path, on spawn_blocking thread).
     let handle = tokio::runtime::Handle::current();
     let snapshot2 = SnapshotHandle::new({
-        let mut b = SnapshotBuilder::new(1);
+        let mut b = SnapshotBuilder::new(1.into());
         let (_, e1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
         let (_, e2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
         for (key, entry) in e1.into_iter().chain(e2.into_iter()) {
@@ -1342,7 +1342,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     let phase2 = phase.clone();
 
     let (blocking_result, delta_blocking) = tokio::task::spawn_blocking(move || {
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = LedgerDelta::new(1.into());
         let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
         let result = execute_soroban_parallel_phase(
             &snapshot2,
@@ -1447,7 +1447,7 @@ fn test_cross_tx_deleted_trustline_not_reloaded() {
         1,         // AUTHORIZED_FLAG
     );
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(issuer_key, issuer_entry)
         .add_entry(tl_key, tl_entry)
@@ -1720,7 +1720,7 @@ fn test_advance_to_ledger() {
     );
 
     // Build snapshot
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .add_entry(issuer_key, issuer_entry)
@@ -1812,7 +1812,7 @@ fn test_advance_to_ledger() {
     // ===== ADVANCE TO LEDGER 2 =====
     // This is the key operation under test: preserving offers across ledger boundaries
     executor.advance_to_ledger(
-        2,         // new ledger_seq
+        2.into(),  // new ledger_seq
         2_000,     // new close_time
         5_000_000, // base_reserve
         25,        // protocol_version
@@ -1974,7 +1974,7 @@ fn test_internal_error_maps_to_tx_internal_error() {
         Price { n: 1, d: 1 },
     );
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .add_entry(seller_key, seller_entry)
@@ -2071,7 +2071,7 @@ fn test_create_account_sponsor_low_reserve_before_underfunded() {
     let (sponsor_key, sponsor_entry) =
         create_sponsor_account_entry(sponsor_id.clone(), 1, 10_000_000, 0);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(sponsor_key, sponsor_entry)
         .build_with_default_header();
@@ -2220,7 +2220,7 @@ fn test_clawback_claimable_balance_not_issuer_error_code() {
         ext: LedgerEntryExt::V0,
     };
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(cb_key, cb_entry)
         .build_with_default_header();
@@ -2325,7 +2325,7 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
 
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 100, source_balance);
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 10_000_000);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .build_with_default_header();
@@ -2346,7 +2346,7 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
 
         let tx = Transaction {
             source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
-            fee: base_fee * 1, // 1 op
+            fee: base_fee, // 1 op
             seq_num: SequenceNumber(101 + i as i64),
             cond: Preconditions::None,
             memo: Memo::None,
@@ -2369,7 +2369,7 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
 
     let context =
         henyey_tx::LedgerContext::new(2, 1_000, base_fee, base_reserve as u32, 25, network_id);
-    let mut delta = LedgerDelta::new(2);
+    let mut delta = LedgerDelta::new(2.into());
     let soroban = SorobanContext {
         config: SorobanConfig::default(),
         base_prng_seed: [0u8; 32],
@@ -2585,7 +2585,7 @@ fn test_set_trust_line_flags_redeems_pool_shares_loaded_from_snapshot() {
     );
 
     // Build snapshot WITHOUT the pool share trustline — it's "on disk" only.
-    let snapshot = SnapshotBuilder::new(10)
+    let snapshot = SnapshotBuilder::new(10.into())
         .add_entry(issuer_key, issuer_entry)
         .add_entry(trustor_key, trustor_entry)
         .add_entry(other_issuer_key, other_issuer_entry)
@@ -2781,7 +2781,7 @@ fn test_fee_bump_charges_outer_fee_when_inner_auth_fails_at_apply() {
     // 20_000_000 gives the fee source ample room above the 2*base_reserve minimum (10_000_000)
     let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 20_000_000);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(inner_key, inner_entry)
         .add_entry(fee_key, fee_entry)
         .build_with_default_header();
@@ -2945,7 +2945,7 @@ fn test_op_source_merged_in_prior_tx_returns_bad_auth() {
         create_account_entry(op_source_id.clone(), 1, 20_000_000);
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 10_000_000);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(op_source_key, op_source_entry)
         .add_entry(dest_key, dest_entry)
@@ -3098,7 +3098,7 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 100, 100_000_000);
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 10_000_000);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .build_with_default_header();
@@ -3225,7 +3225,7 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
         25, // protocol version
         network_id,
     );
-    let mut delta = LedgerDelta::new(2);
+    let mut delta = LedgerDelta::new(2.into());
     let soroban = SorobanContext {
         config: SorobanConfig::default(),
         base_prng_seed: [0u8; 32],
@@ -3313,7 +3313,7 @@ fn test_fee_bump_soroban_checks_inner_signatures() {
 
     let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 20_000_000);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(inner_key, inner_entry)
         .add_entry(fee_key, fee_entry)
         .build_with_default_header();
@@ -3500,7 +3500,7 @@ fn test_should_apply_false_skips_operation_body() {
     };
     let ttl_key = LedgerKey::Ttl(LedgerKeyTtl { key_hash });
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(contract_key.clone(), contract_entry)
         .add_entry(ttl_key, ttl_entry)
@@ -3659,7 +3659,7 @@ fn test_pre_charged_fee_override_on_validation_failure() {
     let missing_secret = SecretKey::from_seed(&[98u8; 32]);
     let _missing_id: AccountId = (&missing_secret.public_key()).into();
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -3714,7 +3714,7 @@ fn test_pre_charged_fee_override_on_validation_failure() {
     }];
 
     let transactions = vec![(std::sync::Arc::new(envelope), None)];
-    let mut delta = LedgerDelta::new(2);
+    let mut delta = LedgerDelta::new(2.into());
 
     let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
         executor: &mut executor,
@@ -3765,7 +3765,7 @@ fn test_audit_577_pre_charged_should_apply_false_skips_body() {
     // Give source enough balance for the TX to succeed IF it were applied.
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 100_000_000);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -3820,7 +3820,7 @@ fn test_audit_577_pre_charged_should_apply_false_skips_body() {
     }];
 
     let transactions = vec![(std::sync::Arc::new(envelope), None)];
-    let mut delta = LedgerDelta::new(2);
+    let mut delta = LedgerDelta::new(2.into());
 
     let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
         executor: &mut executor,
@@ -3860,8 +3860,8 @@ fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
     use henyey_ledger::LedgerDelta;
     use stellar_xdr::curr::AccountMergeResult;
 
-    let ledger_seq: u32 = 2;
-    let starting_seq: i64 = (ledger_seq as i64) << 32; // 8589934592
+    let ledger_seq: LedgerSeq = 2.into();
+    let starting_seq: i64 = (ledger_seq.get() as i64) << 32; // 8589934592
 
     let secret = SecretKey::from_seed(&[78u8; 32]);
     let source_id: AccountId = (&secret.public_key()).into();
@@ -3875,7 +3875,7 @@ fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
     let dest_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([89u8; 32])));
     let (dest_key, dest_entry) = create_account_entry(dest_id.clone(), 1, 50_000_000);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(dest_key, dest_entry)
         .build_with_default_header();
@@ -3908,8 +3908,14 @@ fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
         env.signatures = vec![sig].try_into().unwrap();
     }
 
-    let context =
-        henyey_tx::LedgerContext::new(ledger_seq, 1_000, base_fee, base_reserve, 25, network_id);
+    let context = henyey_tx::LedgerContext::new(
+        ledger_seq.into(),
+        1_000,
+        base_fee,
+        base_reserve,
+        25,
+        network_id,
+    );
     let mut executor = TransactionExecutor::new(
         &context,
         0,
@@ -3979,7 +3985,7 @@ fn test_single_op_tx_failure_rolls_back_without_per_op_savepoint() {
     let initial_balance: i64 = 20_000_000; // > 2 * base_reserve (5_000_000) + fee
     let fee: u32 = 100;
     let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, initial_balance);
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .build_with_default_header();
     let snapshot = SnapshotHandle::new(snapshot);
@@ -4158,7 +4164,7 @@ fn test_audit_005_fee_bump_pre_auth_signer_removed_from_fee_source() {
 
     let (inner_key, inner_entry) = create_account_entry(inner_account_id.clone(), 1, 20_000_000);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(fee_key, fee_entry)
         .add_entry(inner_key, inner_entry)
         .build_with_default_header();
@@ -4290,7 +4296,7 @@ fn test_audit_005_fee_bump_inner_hash_for_signer_removal() {
 
     let (fee_key, fee_entry) = create_account_entry(fee_account_id.clone(), 1, 20_000_000);
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(inner_key, inner_entry)
         .add_entry(fee_key, fee_entry)
         .build_with_default_header();
@@ -4405,7 +4411,7 @@ fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
     };
     let ttl_key = LedgerKey::Ttl(LedgerKeyTtl { key_hash });
 
-    let snapshot = SnapshotBuilder::new(1)
+    let snapshot = SnapshotBuilder::new(1.into())
         .add_entry(source_key, source_entry)
         .add_entry(contract_key.clone(), contract_entry)
         .add_entry(ttl_key, ttl_entry)
@@ -4477,7 +4483,7 @@ fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
     }];
 
     let transactions = vec![(std::sync::Arc::new(envelope), None)];
-    let mut delta = LedgerDelta::new(2);
+    let mut delta = LedgerDelta::new(2.into());
 
     let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
         executor: &mut executor,
@@ -4545,7 +4551,7 @@ async fn test_audit_095_pre_parallel_apply_globalizes_seq_bumps() {
     let acct2_id: AccountId = (&secret2.public_key()).into();
 
     // Build snapshot with all entries.
-    let mut builder = SnapshotBuilder::new(1);
+    let mut builder = SnapshotBuilder::new(1.into());
     for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
         builder = builder.add_entry(key, entry);
     }
@@ -4560,7 +4566,7 @@ async fn test_audit_095_pre_parallel_apply_globalizes_seq_bumps() {
         ]],
     };
 
-    let mut delta = LedgerDelta::new(1);
+    let mut delta = LedgerDelta::new(1.into());
     let context = henyey_tx::LedgerContext::new(
         1,         // ledger_seq
         1_000,     // close_time

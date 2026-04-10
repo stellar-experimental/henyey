@@ -679,7 +679,8 @@ impl ApplyLoad {
     /// Matches stellar-core `ApplyLoad::setup()`.
     fn setup(&mut self) -> Result<()> {
         // Load root account.
-        self.tx_gen.find_account(self.root_account_id, LedgerSeq::new(1));
+        self.tx_gen
+            .find_account(self.root_account_id, LedgerSeq::new(1));
         ensure!(
             self.tx_gen.load_account(self.root_account_id),
             "failed to load root account"
@@ -819,7 +820,9 @@ impl ApplyLoad {
         );
 
         // Construct the ContractInstance from the deployed contract.
-        let root_account = self.tx_gen.find_account(self.root_account_id, LedgerSeq::new(0));
+        let root_account = self
+            .tx_gen
+            .find_account(self.root_account_id, LedgerSeq::new(0));
         let root_pk = root_account.secret_key.public_key();
         let deployer_address = crate::loadgen_soroban::make_account_address(&root_pk);
         let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {

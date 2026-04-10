@@ -4,6 +4,7 @@
 //! the bucket list snapshots for ledger entry data. These match stellar-core's
 //! QueryServer endpoints.
 
+use henyey_common::LedgerSeq;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -165,16 +166,19 @@ pub(crate) async fn getledgerentryraw_handler(
 
     // Load entries.
     let (ledger_seq, entries) = match params.ledger_seq {
-        Some(seq) => match live_bl.load_keys_from_ledger(&keys, seq) {
-            Some(entries) => (seq, entries),
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Ledger {} not available", seq)})),
-                )
-                    .into_response();
+        Some(seq) => {
+            let seq: LedgerSeq = seq.into();
+            match live_bl.load_keys_from_ledger(&keys, seq) {
+                Some(entries) => (seq, entries),
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": format!("Ledger {} not available", seq)})),
+                    )
+                        .into_response();
+                }
             }
-        },
+        }
         None => {
             let seq = live_bl.ledger_seq();
             let entries = match live_bl.load_keys_result(&keys) {
@@ -298,7 +302,10 @@ pub(crate) async fn getledgerentry_handler(
             }
         };
 
-    let ledger_seq = params.ledger_seq.unwrap_or_else(|| live_bl.ledger_seq());
+    let ledger_seq: LedgerSeq = params
+        .ledger_seq
+        .map(LedgerSeq::from)
+        .unwrap_or_else(|| live_bl.ledger_seq());
 
     // ── Pass 1: Load all keys from live bucket list ──────────────────
     let live_entries =
@@ -419,7 +426,7 @@ pub(crate) async fn getledgerentry_handler(
 
                 if let Some(ttl_e) = ttl_entry {
                     let live_until = get_ttl_live_until(ttl_e).unwrap_or(0);
-                    let is_live = live_until >= ledger_seq;
+                    let is_live = live_until >= ledger_seq.get();
 
                     if is_live {
                         results.push(LedgerEntryResult {
@@ -511,7 +518,7 @@ fn encode_entry(entry: &LedgerEntry) -> Option<String> {
 fn load_from_live(
     bl: &SearchableBucketListSnapshot,
     keys: &[LedgerKey],
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     historical: bool,
 ) -> Result<Vec<LedgerEntry>, (StatusCode, Json<serde_json::Value>)> {
     if historical {
@@ -535,7 +542,7 @@ fn load_from_live(
 fn load_from_hot_archive(
     bl: &SearchableHotArchiveBucketListSnapshot,
     keys: &[LedgerKey],
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     historical: bool,
 ) -> Result<Vec<HotArchiveBucketEntry>, (StatusCode, Json<serde_json::Value>)> {
     if historical {

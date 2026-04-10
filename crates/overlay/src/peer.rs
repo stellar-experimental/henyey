@@ -29,6 +29,7 @@ use crate::{
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
 use dashmap::DashMap;
+use henyey_common::LedgerSeq;
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -769,8 +770,8 @@ impl Peer {
     }
 
     /// Request SCP state from peer.
-    pub async fn request_scp_state(&mut self, ledger_seq: u32) -> Result<()> {
-        let message = StellarMessage::GetScpState(ledger_seq);
+    pub async fn request_scp_state(&mut self, ledger_seq: LedgerSeq) -> Result<()> {
+        let message = StellarMessage::GetScpState(ledger_seq.get());
         self.send(message).await
     }
 

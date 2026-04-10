@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use henyey_common::Hash256;
+use henyey_common::LedgerSeq;
 use henyey_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
     AccountId, ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader,
@@ -114,7 +115,7 @@ pub struct ConfigUpgradeResult {
 #[derive(Debug, Clone)]
 pub struct LedgerCloseData {
     /// The sequence number of the ledger being closed.
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
 
     /// The transaction set to apply during this ledger close.
     pub tx_set: TransactionSetVariant,
@@ -158,7 +159,7 @@ pub struct LedgerCloseData {
 impl LedgerCloseData {
     /// Create new ledger close data.
     pub fn new(
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
         tx_set: TransactionSetVariant,
         close_time: u64,
         prev_ledger_hash: Hash256,
@@ -1081,8 +1082,8 @@ impl LedgerCloseResult {
     }
 
     /// Get the ledger sequence.
-    pub fn ledger_seq(&self) -> u32 {
-        self.header.ledger_seq
+    pub fn ledger_seq(&self) -> LedgerSeq {
+        self.header.ledger_seq.into()
     }
 
     /// Get the transaction result set.
@@ -1222,7 +1223,7 @@ impl UpgradeContext {
     pub fn apply_config_upgrades(
         &self,
         ltx: &mut CloseLedgerState,
-        closing_ledger_seq: u32,
+        closing_ledger_seq: LedgerSeq,
         protocol_version: u32,
     ) -> Result<ConfigUpgradeResult, LedgerError> {
         use stellar_xdr::curr::{Limits, WriteXdr};
@@ -1344,7 +1345,7 @@ impl UpgradeContext {
     pub fn apply_max_soroban_tx_set_size(
         &self,
         ltx: &mut CloseLedgerState,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
     ) -> Result<stellar_xdr::curr::LedgerEntryChanges, LedgerError> {
         use stellar_xdr::curr::{
             ConfigSettingEntry, ConfigSettingId, LedgerEntryChange, LedgerEntryChanges,
@@ -1378,8 +1379,7 @@ impl UpgradeContext {
                 "CONFIG_SETTING_CONTRACT_EXECUTION_LANES has unexpected type".to_string(),
             ));
         }
-        updated.last_modified_ledger_seq = ledger_seq;
-
+        updated.last_modified_ledger_seq = ledger_seq.get();
         ltx.record_update(previous.clone(), updated.clone())?;
 
         let changes = vec![
@@ -1644,7 +1644,7 @@ mod tests {
         let mut queues: Vec<std::collections::VecDeque<TransactionEnvelope>> = by_account
             .into_values()
             .map(|mut txs| {
-                txs.sort_by(|a, b| seq_num(a).cmp(&seq_num(b)));
+                txs.sort_by_key(|a| seq_num(a));
                 txs.into_iter().collect()
             })
             .collect();
@@ -1699,7 +1699,7 @@ mod tests {
     fn test_ledger_close_data() {
         let prev_hash = Hash256::hash(b"prev");
         let close_data = LedgerCloseData::new(
-            100,
+            100.into(),
             TransactionSetVariant::Classic(TransactionSet {
                 previous_ledger_hash: prev_hash.into(),
                 txs: vec![].try_into().unwrap(),
@@ -1832,7 +1832,7 @@ mod tests {
         );
         let expected: Vec<Hash256> = classic_expected
             .into_iter()
-            .chain(soroban_expected.into_iter())
+            .chain(soroban_expected)
             .collect();
 
         let variant = TransactionSetVariant::Generalized(gen_set);

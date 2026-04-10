@@ -187,7 +187,7 @@ pub fn build_history_archive_state(
     Ok(HistoryArchiveState {
         version,
         server: Some("rs-stellar-core".to_string()),
-        current_ledger: ledger_seq,
+        current_ledger: ledger_seq.into(),
         network_passphrase,
         current_buckets,
         hot_archive_buckets,
@@ -623,7 +623,7 @@ mod tests {
                 ext: LedgerEntryExt::V0,
             };
             bl.add_batch(
-                seq,
+                seq.into(),
                 25, // protocol 25
                 BucketListType::Live,
                 vec![entry],
@@ -733,10 +733,17 @@ mod tests {
                 }),
                 ext: LedgerEntryExt::V0,
             };
-            bl.add_batch(seq, 25, BucketListType::Live, vec![entry], vec![], vec![])
-                .unwrap();
+            bl.add_batch(
+                seq.into(),
+                25,
+                BucketListType::Live,
+                vec![entry],
+                vec![],
+                vec![],
+            )
+            .unwrap();
             // Add empty batch to hot archive to advance it
-            habl.add_batch(seq, 25, vec![], vec![]).unwrap();
+            habl.add_batch(seq.into(), 25, vec![], vec![]).unwrap();
         }
 
         let has = build_history_archive_state(7, &bl, Some(&habl), None).unwrap();
@@ -985,8 +992,15 @@ mod tests {
             }),
             ext: LedgerEntryExt::V0,
         };
-        bl.add_batch(1, 0, BucketListType::Live, vec![root_entry], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            1u32.into(),
+            0,
+            BucketListType::Live,
+            vec![root_entry],
+            vec![],
+            vec![],
+        )
+        .unwrap();
 
         // Genesis header: protocol 0, bucket_list_hash = live_hash only
         let genesis_live_hash = bl.hash();
@@ -1007,11 +1021,18 @@ mod tests {
         // stellar-core gates addHotArchiveBatch behind prev_version (0 < 23),
         // so hot archive is NOT updated. But the hash combination uses the
         // upgraded version (25 >= 23), so header hash = SHA256(live || hot).
-        bl.add_batch(2, 25, BucketListType::Live, vec![], vec![], vec![])
-            .unwrap();
+        bl.add_batch(
+            2u32.into(),
+            25,
+            BucketListType::Live,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
         // Don't call habl.add_batch — matching stellar-core's behavior on upgrade ledger.
         // Just advance the ledger_seq so subsequent ledgers don't try to backfill.
-        habl.set_ledger_seq(2);
+        habl.set_ledger_seq(2u32.into());
 
         let live_hash = bl.hash();
         let hot_hash = habl.hash();
@@ -1043,9 +1064,9 @@ mod tests {
 
         // Close ledgers 3..=7 (first checkpoint at accelerated frequency)
         for seq in 3..=7u32 {
-            bl.add_batch(seq, 25, BucketListType::Live, vec![], vec![], vec![])
+            bl.add_batch(seq.into(), 25, BucketListType::Live, vec![], vec![], vec![])
                 .unwrap();
-            habl.add_batch(seq, 25, vec![], vec![]).unwrap();
+            habl.add_batch(seq.into(), 25, vec![], vec![]).unwrap();
 
             let live_hash = bl.hash();
             let hot_hash = habl.hash();

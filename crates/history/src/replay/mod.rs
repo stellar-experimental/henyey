@@ -275,7 +275,7 @@ pub fn apply_replay_to_bucket_list(
 ) -> Result<()> {
     bucket_list
         .add_batch(
-            replay_result.sequence,
+            replay_result.sequence.into(),
             replay_result.protocol_version,
             BucketListType::Live,
             replay_result.init_entries.clone(),

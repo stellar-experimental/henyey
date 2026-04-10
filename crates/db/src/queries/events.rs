@@ -3,6 +3,7 @@
 //! This module provides database operations for contract events,
 //! used by the `getEvents` RPC endpoint.
 
+use henyey_common::LedgerSeq;
 use rusqlite::{params, Connection};
 use stellar_xdr::curr::ContractEventType;
 
@@ -14,7 +15,7 @@ pub struct EventRecord {
     /// TOID-based event ID (e.g. "0006320903369523200-0000000001")
     pub id: String,
     /// Ledger sequence where the event occurred.
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
     /// Transaction index within the ledger.
     pub tx_index: u32,
     /// Operation index within the transaction.
@@ -56,7 +57,7 @@ pub trait EventQueries {
     fn query_events(&self, params: &EventQueryParams) -> Result<Vec<EventRecord>, DbError>;
 
     /// Deletes events at or below the given ledger sequence.
-    fn delete_old_events(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
+    fn delete_old_events(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32, DbError>;
 }
 
 impl EventQueries for Connection {
@@ -230,7 +231,7 @@ impl EventQueries for Connection {
         Ok(results?)
     }
 
-    fn delete_old_events(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
+    fn delete_old_events(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32, DbError> {
         let deleted = self.execute(
             "DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE ledgerseq <= ?1 LIMIT ?2)",
             params![max_ledger, count],
@@ -270,7 +271,7 @@ mod tests {
         conn
     }
 
-    fn make_event(ledger_seq: u32, index: u32) -> EventRecord {
+    fn make_event(ledger_seq: LedgerSeq, index: u32) -> EventRecord {
         EventRecord {
             id: format!("{ledger_seq}-{index}"),
             ledger_seq,
@@ -295,12 +296,12 @@ mod tests {
         // Regression: delete_old_events must use <= (not <) so events at
         // exactly max_ledger are deleted, matching all other delete functions.
         let conn = setup_db();
-        let events: Vec<EventRecord> = (10..=14).map(|s| make_event(s, 0)).collect();
+        let events: Vec<EventRecord> = (10..=14).map(|s| make_event(s.into(), 0)).collect();
         conn.store_events(&events).unwrap();
         assert_eq!(count_events(&conn), 5);
 
         // Delete events at or below ledger 12
-        let deleted = conn.delete_old_events(12, 1000).unwrap();
+        let deleted = conn.delete_old_events(12.into(), 1000).unwrap();
         assert_eq!(deleted, 3); // ledgers 10, 11, 12
         assert_eq!(count_events(&conn), 2); // ledgers 13, 14 remain
     }
@@ -308,11 +309,11 @@ mod tests {
     #[test]
     fn test_delete_old_events_respects_limit() {
         let conn = setup_db();
-        let events: Vec<EventRecord> = (1..=10).map(|s| make_event(s, 0)).collect();
+        let events: Vec<EventRecord> = (1..=10).map(|s| make_event(s.into(), 0)).collect();
         conn.store_events(&events).unwrap();
 
         // Delete at most 3 events
-        let deleted = conn.delete_old_events(10, 3).unwrap();
+        let deleted = conn.delete_old_events(10.into(), 3).unwrap();
         assert_eq!(deleted, 3);
         assert_eq!(count_events(&conn), 7);
     }
@@ -320,17 +321,17 @@ mod tests {
     #[test]
     fn test_delete_old_events_empty_table() {
         let conn = setup_db();
-        let deleted = conn.delete_old_events(100, 1000).unwrap();
+        let deleted = conn.delete_old_events(100.into(), 1000).unwrap();
         assert_eq!(deleted, 0);
     }
 
     #[test]
     fn test_delete_old_events_none_below_threshold() {
         let conn = setup_db();
-        let events: Vec<EventRecord> = (100..=105).map(|s| make_event(s, 0)).collect();
+        let events: Vec<EventRecord> = (100..=105).map(|s| make_event(s.into(), 0)).collect();
         conn.store_events(&events).unwrap();
 
-        let deleted = conn.delete_old_events(50, 1000).unwrap();
+        let deleted = conn.delete_old_events(50.into(), 1000).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(count_events(&conn), 6);
     }

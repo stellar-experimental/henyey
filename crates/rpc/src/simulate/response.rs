@@ -78,7 +78,7 @@ pub(super) fn build_invoke_response(
             &resources,
             &rent_changes,
             ctx.soroban_info,
-            ctx.latest_ledger,
+            ctx.latest_ledger.into(),
             sim_result.contract_events_and_return_value_size,
             tx_size,
             sim_result.restored_rw_entry_indices.len() as u32,

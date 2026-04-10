@@ -3,6 +3,7 @@
 use std::rc::Rc;
 
 use henyey_bucket::SearchableBucketListSnapshot;
+use henyey_common::LedgerSeq;
 use soroban_env_host_p25 as soroban_host;
 use stellar_xdr::curr::{
     AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountEntryExtensionV2,
@@ -28,7 +29,7 @@ use crate::util::ttl_key_for_ledger_key;
 /// `write_bytes` resource estimates.
 pub(crate) struct BucketListSnapshotSource {
     snapshot: SearchableBucketListSnapshot,
-    current_ledger: u32,
+    current_ledger: LedgerSeq,
 }
 
 // Safety: BucketListSnapshotSource contains only owned, immutable data.
@@ -37,7 +38,7 @@ pub(crate) struct BucketListSnapshotSource {
 unsafe impl Send for BucketListSnapshotSource {}
 
 impl BucketListSnapshotSource {
-    pub(crate) fn new(snapshot: SearchableBucketListSnapshot, current_ledger: u32) -> Self {
+    pub(crate) fn new(snapshot: SearchableBucketListSnapshot, current_ledger: LedgerSeq) -> Self {
         Self {
             snapshot,
             current_ledger,
@@ -84,7 +85,7 @@ impl SnapshotSource for BucketListSnapshotSource {
             LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
         ) {
             match live_until {
-                Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
+                Some(ttl) if self.current_ledger <= ttl => {} // live, proceed
                 _ => return Ok(None),                         // expired or no TTL
             }
         }

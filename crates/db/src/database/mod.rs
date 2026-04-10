@@ -4,6 +4,7 @@ mod history;
 mod network;
 mod scp;
 
+use henyey_common::LedgerSeq;
 use std::path::Path;
 
 use tracing::info;
@@ -160,7 +161,7 @@ impl Database {
     ///
     /// Removes at most `count` entries. Used by the Maintainer for garbage
     /// collection of old ledger history.
-    pub fn delete_old_ledger_headers(&self, max_ledger: u32, count: u32) -> Result<u32> {
+    pub fn delete_old_ledger_headers(&self, max_ledger: LedgerSeq, count: u32) -> Result<u32> {
         self.with_connection(|conn| {
             use queries::LedgerQueries;
             conn.delete_old_ledger_headers(max_ledger, count)

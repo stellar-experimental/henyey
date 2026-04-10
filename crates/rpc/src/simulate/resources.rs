@@ -1,6 +1,7 @@
 //! Resource estimation and adjustment: CPU/memory budgets, read/write bytes
 //! computation, fee estimation, resource bumping.
 
+use henyey_common::LedgerSeq;
 use soroban_env_host_p25 as soroban_host;
 use stellar_xdr::curr::{LedgerKey, OperationBody, SorobanResources};
 
@@ -194,7 +195,7 @@ pub(super) fn compute_invoke_resource_fee(
     resources: &SorobanResources,
     rent_changes: &[soroban_host::fees::LedgerEntryRentChange],
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
-    current_ledger_seq: u32,
+    current_ledger_seq: LedgerSeq,
     contract_events_and_return_value_size: u32,
     tx_size: u32,
     restored_entry_count: u32,
@@ -237,7 +238,7 @@ pub(super) fn compute_resource_fee_with_rent(
     resources: &SorobanResources,
     rent_changes: &[soroban_host::fees::LedgerEntryRentChange],
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
-    current_ledger_seq: u32,
+    current_ledger_seq: LedgerSeq,
     contract_events_size: u32,
     tx_size: u32,
 ) -> i64 {
@@ -261,7 +262,7 @@ fn compute_resource_fee_core(
     disk_read_entries: u32,
     rent_changes: &[soroban_host::fees::LedgerEntryRentChange],
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
-    current_ledger_seq: u32,
+    current_ledger_seq: LedgerSeq,
     contract_events_size_bytes: u32,
     tx_size: u32,
 ) -> i64 {
@@ -285,7 +286,7 @@ fn compute_resource_fee_core(
     let rent_fee = compute_rent_fee(
         rent_changes,
         &build_rent_fee_config(soroban_info),
-        current_ledger_seq,
+        current_ledger_seq.get(),
     );
 
     let total_refundable = refundable.saturating_add(rent_fee);
@@ -489,13 +490,13 @@ mod tests {
             vec![],
         );
         let info = test_soroban_network_info();
-        let fee = compute_invoke_resource_fee(&resources, &[], &info, 100, 0, 1000, 0);
+        let fee = compute_invoke_resource_fee(&resources, &[], &info, 100.into(), 0, 1000, 0);
         // Fee should be > 0
         assert!(fee > 0);
         // The fee with only 1 disk read entry should be less than with 2
         let resources2 =
             test_soroban_resources(vec![test_account_key(1), test_account_key(2)], vec![]);
-        let fee2 = compute_invoke_resource_fee(&resources2, &[], &info, 100, 0, 1000, 0);
+        let fee2 = compute_invoke_resource_fee(&resources2, &[], &info, 100.into(), 0, 1000, 0);
         // 2 account entries = 2 disk reads, should cost more
         assert!(
             fee2 > fee,
@@ -507,8 +508,10 @@ mod tests {
     fn test_disk_read_entries_includes_restored() {
         let resources = test_soroban_resources(vec![], vec![]);
         let info = test_soroban_network_info();
-        let fee_no_restore = compute_invoke_resource_fee(&resources, &[], &info, 100, 0, 1000, 0);
-        let fee_with_restore = compute_invoke_resource_fee(&resources, &[], &info, 100, 0, 1000, 3);
+        let fee_no_restore =
+            compute_invoke_resource_fee(&resources, &[], &info, 100.into(), 0, 1000, 0);
+        let fee_with_restore =
+            compute_invoke_resource_fee(&resources, &[], &info, 100.into(), 0, 1000, 3);
         // 3 restored entries should add disk read cost
         assert!(fee_with_restore > fee_no_restore);
     }
@@ -521,7 +524,7 @@ mod tests {
             vec![test_contract_data_key(0xCC)],
         );
         let info = test_soroban_network_info();
-        let fee = compute_invoke_resource_fee(&resources, &[], &info, 100, 0, 1000, 1);
+        let fee = compute_invoke_resource_fee(&resources, &[], &info, 100.into(), 0, 1000, 1);
         assert!(fee > 0);
     }
 
@@ -542,7 +545,8 @@ mod tests {
             new_live_until_ledger: 200,
         }];
 
-        let fee = compute_invoke_resource_fee(&resources, &rent_changes, &info, 50, 0, 1000, 0);
+        let fee =
+            compute_invoke_resource_fee(&resources, &rent_changes, &info, 50.into(), 0, 1000, 0);
         // Fee should be positive and include rent
         assert!(fee > 0);
     }

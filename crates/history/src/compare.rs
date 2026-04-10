@@ -507,7 +507,7 @@ mod tests {
         HistoryArchiveState {
             version: 2,
             server: None,
-            current_ledger: ledger,
+            current_ledger: ledger.into(),
             network_passphrase: None,
             current_buckets: levels,
             hot_archive_buckets: None,

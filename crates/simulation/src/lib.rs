@@ -683,7 +683,11 @@ impl Simulation {
                 continue;
             }
 
-            let current = self.nodes.get(id).map(|n| n.ledger_seq).unwrap_or(LedgerSeq::new(1));
+            let current = self
+                .nodes
+                .get(id)
+                .map(|n| n.ledger_seq)
+                .unwrap_or(LedgerSeq::new(1));
             if current < max_seq && self.has_connected_peer(id, &ids) {
                 self.advance_node(id, current + 1);
                 did_work = true;
@@ -757,7 +761,10 @@ impl Simulation {
     }
 
     pub fn ledger_seq(&self, node_id: &str) -> LedgerSeq {
-        self.nodes.get(node_id).map(|n| n.ledger_seq).unwrap_or(LedgerSeq::new(0))
+        self.nodes
+            .get(node_id)
+            .map(|n| n.ledger_seq)
+            .unwrap_or(LedgerSeq::new(0))
     }
 
     pub fn node_ids(&self) -> Vec<String> {
@@ -1361,7 +1368,14 @@ pub fn initialize_genesis_ledger(
 
     let mut bucket_list = BucketList::new();
     bucket_list
-        .add_batch(LedgerSeq::new(1), 0, BucketListType::Live, genesis_entries, vec![], vec![])
+        .add_batch(
+            LedgerSeq::new(1),
+            0,
+            BucketListType::Live,
+            genesis_entries,
+            vec![],
+            vec![],
+        )
         .map_err(|e| anyhow::anyhow!("Failed to add genesis entries to bucket list: {}", e))?;
 
     let bucket_list_hash = bucket_list.hash();

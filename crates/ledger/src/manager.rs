@@ -49,7 +49,7 @@ use henyey_bucket::{
 use henyey_common::protocol::{
     needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
 };
-use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
+use henyey_common::{BucketListDbConfig, Hash256, LedgerSeq, NetworkId};
 use henyey_tx::soroban::PersistentModuleCache;
 use henyey_tx::{ClassicEventConfig, LedgerContext, TxEventManager};
 use parking_lot::{Mutex, RwLock};
@@ -258,8 +258,8 @@ impl LevelScanner {
                     key_hash: ttl.key_hash.clone(),
                 };
                 let ttl_data = crate::soroban_state::TtlData::new(
-                    ttl.live_until_ledger_seq,
-                    le.last_modified_ledger_seq,
+                    ttl.live_until_ledger_seq.into(),
+                    le.last_modified_ledger_seq.into(),
                 );
                 self.ttl_entries
                     .insert(ttl.key_hash.clone(), (ttl_key, ttl_data));
@@ -527,8 +527,8 @@ fn scan_and_merge_streaming(
                                 key_hash: key_hash.clone(),
                             };
                             let ttl_data = crate::soroban_state::TtlData::new(
-                                ttl.live_until_ledger_seq,
-                                le.last_modified_ledger_seq,
+                                ttl.live_until_ledger_seq.into(),
+                                le.last_modified_ledger_seq.into(),
                             );
                             if let Err(e) = soroban_state.create_ttl(&ttl_key, ttl_data) {
                                 tracing::trace!(error = %e, "Failed to add TTL to soroban state (may be pending)");
@@ -1296,8 +1296,8 @@ impl LedgerManager {
     }
 
     /// Get the current ledger sequence number.
-    pub fn current_ledger_seq(&self) -> u32 {
-        self.state.read().header.ledger_seq
+    pub fn current_ledger_seq(&self) -> LedgerSeq {
+        self.state.read().header.ledger_seq.into()
     }
 
     /// Get the current ledger header.
@@ -1565,7 +1565,7 @@ impl LedgerManager {
         // Set the ledger sequence and BucketListDB config on bucket lists.
         {
             let mut bl = self.bucket_list.write();
-            bl.set_ledger_seq(header.ledger_seq);
+            bl.set_ledger_seq(header.ledger_seq.into());
             bl.set_bucket_list_db_config(self.config.bucket_list_db.clone());
             // Re-wire merge map on the new bucket list if one is configured.
             if let Some(ref merge_map) = self.finished_merges {
@@ -1573,7 +1573,7 @@ impl LedgerManager {
             }
         }
         if let Some(ref mut habl) = *self.hot_archive_bucket_list.write() {
-            habl.set_ledger_seq(header.ledger_seq);
+            habl.set_ledger_seq(header.ledger_seq.into());
         }
 
         state.header = header;
@@ -1739,7 +1739,7 @@ impl LedgerManager {
         if close_data.ledger_seq != expected_seq {
             return Err(LedgerError::InvalidSequence {
                 expected: expected_seq,
-                actual: close_data.ledger_seq,
+                actual: close_data.ledger_seq.get(),
             });
         }
 
@@ -1782,7 +1782,7 @@ impl LedgerManager {
             let skip_list_3 = Hash256::from_bytes(state.header.skip_list[3].0).to_hex();
             tracing::error!(
                 current_seq = state.header.ledger_seq,
-                close_seq = close_data.ledger_seq,
+                close_seq = close_data.ledger_seq.get(),
                 our_hash = %state.header_hash.to_hex(),
                 network_prev_hash = %close_data.prev_ledger_hash.to_hex(),
                 header_version = state.header.ledger_version,
@@ -1814,7 +1814,7 @@ impl LedgerManager {
                 let live_hash = bucket_list.hash();
                 tracing::error!(
                     ledger_seq = state.header.ledger_seq,
-                    bucket_list_ledger_seq = bucket_list.ledger_seq(),
+                    bucket_list_ledger_seq = bucket_list.ledger_seq().get(),
                     live_bucket_list_hash = %live_hash.to_hex(),
                     "HASH_MISMATCH_DEBUG: Live bucket list state"
                 );
@@ -1837,7 +1837,7 @@ impl LedgerManager {
                     let hot_hash = ha.hash();
                     tracing::error!(
                         ledger_seq = state.header.ledger_seq,
-                        hot_archive_ledger_seq = ha.ledger_seq(),
+                        hot_archive_ledger_seq = ha.ledger_seq().get(),
                         hot_archive_hash = %hot_hash.to_hex(),
                         "HASH_MISMATCH_DEBUG: Hot archive bucket list state"
                     );
@@ -1897,7 +1897,7 @@ impl LedgerManager {
             snapshot,
             state.header.clone(),
             state.header_hash,
-            expected_seq,
+            expected_seq.into(),
         );
 
         Ok(LedgerCloseContext {
@@ -2191,7 +2191,7 @@ impl LedgerManager {
     ///
     /// Acquires read locks on each component and calls estimate_heap_bytes().
     /// Total cost: <100μs.
-    pub fn build_memory_report(&self, ledger_seq: u32) -> crate::memory_report::MemoryReport {
+    pub fn build_memory_report(&self, ledger_seq: LedgerSeq) -> crate::memory_report::MemoryReport {
         use henyey_common::memory::ComponentMemory;
 
         let mut components = Vec::new();
@@ -2311,7 +2311,7 @@ impl LedgerManager {
     pub fn inject_synthetic_contract_data(
         &self,
         entry: LedgerEntry,
-        live_until_ledger: u32,
+        live_until_ledger: LedgerSeq,
     ) -> Result<()> {
         use stellar_xdr::curr::LedgerEntryData;
 
@@ -2326,7 +2326,7 @@ impl LedgerManager {
         };
 
         let last_modified = entry.last_modified_ledger_seq;
-        let ttl_data = crate::soroban_state::TtlData::new(live_until_ledger, last_modified);
+        let ttl_data = crate::soroban_state::TtlData::new(live_until_ledger, last_modified.into());
 
         // Build the LedgerKey for TTL
         let data_key = LedgerKey::ContractData(stellar_xdr::curr::LedgerKeyContractData {
@@ -2562,7 +2562,7 @@ impl LedgerCloseContext<'_> {
         let ledger_seq = self.close_data.ledger_seq;
         let make_entry = |config: ConfigSettingEntry| -> LedgerEntry {
             LedgerEntry {
-                last_modified_ledger_seq: ledger_seq,
+                last_modified_ledger_seq: ledger_seq.get(),
                 data: LedgerEntryData::ConfigSetting(config),
                 ext: LedgerEntryExt::V0,
             }
@@ -2734,7 +2734,7 @@ impl LedgerCloseContext<'_> {
             )))?;
 
         tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             "Applied createLedgerEntriesForV20: created 14 CONFIG_SETTING entries"
         );
 
@@ -2871,7 +2871,7 @@ impl LedgerCloseContext<'_> {
             }
 
             let new_entry = LedgerEntry {
-                last_modified_ledger_seq: self.close_data.ledger_seq,
+                last_modified_ledger_seq: self.close_data.ledger_seq.get(),
                 data: LedgerEntryData::ConfigSetting(wrap(ContractCostParams(
                     params
                         .try_into()
@@ -2965,7 +2965,7 @@ impl LedgerCloseContext<'_> {
         self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
 
         tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             new_size = NEW_SIZE,
             "Applied createCostTypesForV21: resized cost params with ParseWasm/InstantiateWasm entries"
         );
@@ -3041,7 +3041,7 @@ impl LedgerCloseContext<'_> {
         self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
 
         tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             new_size = NEW_SIZE,
             "Applied createCostTypesForV22: resized cost params with BLS12-381 entries"
         );
@@ -3065,7 +3065,7 @@ impl LedgerCloseContext<'_> {
         // 1. CONFIG_SETTING_CONTRACT_PARALLEL_COMPUTE_V0
         // Parity: NetworkConfig.cpp:1069-1076 initialParallelComputeEntry
         self.ltx.record_create(LedgerEntry {
-            last_modified_ledger_seq: ledger_seq,
+            last_modified_ledger_seq: ledger_seq.get(),
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractParallelComputeV0(
                 ConfigSettingContractParallelComputeV0 {
                     ledger_max_dependent_tx_clusters: 1, // LEDGER_MAX_DEPENDENT_TX_CLUSTERS
@@ -3077,7 +3077,7 @@ impl LedgerCloseContext<'_> {
         // 2. CONFIG_SETTING_SCP_TIMING
         // Parity: NetworkConfig.cpp:1092-1108 initialScpTimingEntry
         self.ltx.record_create(LedgerEntry {
-            last_modified_ledger_seq: ledger_seq,
+            last_modified_ledger_seq: ledger_seq.get(),
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ScpTiming(
                 ConfigSettingScpTiming {
                     ledger_target_close_time_milliseconds: 5000,
@@ -3114,7 +3114,7 @@ impl LedgerCloseContext<'_> {
         };
 
         self.ltx.record_create(LedgerEntry {
-            last_modified_ledger_seq: ledger_seq,
+            last_modified_ledger_seq: ledger_seq.get(),
             data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostExtV0(
                 ConfigSettingContractLedgerCostExtV0 {
                     tx_max_footprint_entries: tx_max_disk_read_entries,
@@ -3129,7 +3129,7 @@ impl LedgerCloseContext<'_> {
         self.update_rent_cost_params_for_v23()?;
 
         tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             "Applied createAndUpdateLedgerEntriesForV23: 3 new entries + rent param update"
         );
 
@@ -3162,7 +3162,7 @@ impl LedgerCloseContext<'_> {
             new_settings.rent_fee1_kb_soroban_state_size_high = 10_000;
 
             let new_entry = LedgerEntry {
-                last_modified_ledger_seq: ledger_seq,
+                last_modified_ledger_seq: ledger_seq.get(),
                 data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::ContractLedgerCostV0(
                     new_settings,
                 )),
@@ -3191,7 +3191,7 @@ impl LedgerCloseContext<'_> {
             new_settings.temp_rent_rate_denominator = 2_430;
 
             let new_entry = LedgerEntry {
-                last_modified_ledger_seq: ledger_seq,
+                last_modified_ledger_seq: ledger_seq.get(),
                 data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::StateArchival(
                     new_settings,
                 )),
@@ -3272,7 +3272,7 @@ impl LedgerCloseContext<'_> {
         self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
 
         tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             new_size = NEW_SIZE,
             "Applied createCostTypesForV25: resized cost params with BN254 entries"
         );
@@ -3323,7 +3323,7 @@ impl LedgerCloseContext<'_> {
         self.resize_and_update_cost_params(NEW_SIZE, cpu_updates, mem_updates)?;
 
         tracing::info!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             new_size = NEW_SIZE,
             "Applied updateCostTypesForV26: updated BLS12-381/BN254 cost params and added Bn254G1Msm"
         );
@@ -3341,7 +3341,7 @@ impl LedgerCloseContext<'_> {
         let ledger_seq = self.close_data.ledger_seq;
         let make_entry = |config: ConfigSettingEntry| -> LedgerEntry {
             LedgerEntry {
-                last_modified_ledger_seq: ledger_seq,
+                last_modified_ledger_seq: ledger_seq.get(),
                 data: LedgerEntryData::ConfigSetting(config),
                 ext: LedgerEntryExt::V0,
             }
@@ -3364,7 +3364,7 @@ impl LedgerCloseContext<'_> {
             )))?;
 
         tracing::info!(
-            ledger_seq,
+            ledger_seq = ledger_seq.get(),
             "Applied createLedgerEntriesForV26: created 2 CONFIG_SETTING entries for frozen keys"
         );
 
@@ -3527,7 +3527,7 @@ impl LedgerCloseContext<'_> {
 
         let executor_ref = executor.get_or_insert_with(|| {
             let mut ctx = LedgerContext::new(
-                self.close_data.ledger_seq,
+                self.close_data.ledger_seq.get(),
                 self.close_data.close_time,
                 self.prev_header.base_fee,
                 self.prev_header.base_reserve,
@@ -3646,7 +3646,7 @@ impl LedgerCloseContext<'_> {
             // Execute Soroban parallel phase (fees already deducted on delta).
             let soroban_start = std::time::Instant::now();
             let mut ledger_context = LedgerContext::new(
-                self.close_data.ledger_seq,
+                self.close_data.ledger_seq.get(),
                 self.close_data.close_time,
                 self.prev_header.base_fee,
                 self.prev_header.base_reserve,
@@ -3691,7 +3691,7 @@ impl LedgerCloseContext<'_> {
                 .extend(soroban_result.hot_archive_restored_keys);
 
             tracing::debug!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 classic_tx_count = classic_txs.len(),
                 soroban_stages = phase.stages.len(),
                 soroban_clusters = phase.stages.iter().map(|s| s.len()).sum::<usize>(),
@@ -3826,7 +3826,7 @@ impl LedgerCloseContext<'_> {
 
         // Emit comprehensive profiling line at debug level
         debug!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             tx_count = tx_count,
             op_count = op_count,
             prepare_us,
@@ -4010,7 +4010,7 @@ impl LedgerCloseContext<'_> {
             config_memory_cost_params_changed = result.memory_cost_params_changed;
             per_config_changes = result.per_upgrade_changes;
             tracing::info!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 delta_before = delta_count_before_upgrades,
                 delta_after = self.ltx.num_changes(),
                 archival_changed = config_state_archival_changed,
@@ -4071,7 +4071,7 @@ impl LedgerCloseContext<'_> {
                 let data_count = soroban_state.contract_data_count();
                 soroban_state.recompute_contract_code_sizes(protocol_version, rent_config.as_ref());
                 tracing::info!(
-                    ledger_seq = self.close_data.ledger_seq,
+                    ledger_seq = self.close_data.ledger_seq.get(),
                     code_size_before = code_size_before,
                     code_size_after = soroban_state.contract_code_state_size(),
                     data_size = data_size_before,
@@ -4121,7 +4121,7 @@ impl LedgerCloseContext<'_> {
                             LedgerError::Internal("Failed to convert window vec".to_string())
                         })?;
                     let new_window_entry = stellar_xdr::curr::LedgerEntry {
-                        last_modified_ledger_seq: self.close_data.ledger_seq,
+                        last_modified_ledger_seq: self.close_data.ledger_seq.get(),
                         data: stellar_xdr::curr::LedgerEntryData::ConfigSetting(
                             stellar_xdr::curr::ConfigSettingEntry::LiveSorobanStateSizeWindow(
                                 new_window,
@@ -4131,7 +4131,7 @@ impl LedgerCloseContext<'_> {
                     };
                     self.ltx.record_update(prev, new_window_entry)?;
                     tracing::info!(
-                        ledger_seq = self.close_data.ledger_seq,
+                        ledger_seq = self.close_data.ledger_seq.get(),
                         new_size = new_size,
                         delta_count = self.ltx.num_changes(),
                         "Updated all state size window entries due to memory cost params upgrade"
@@ -4162,7 +4162,7 @@ impl LedgerCloseContext<'_> {
         let total_coins = self.prev_header.total_coins + self.ltx.total_coins_delta();
         let fee_pool = self.prev_header.fee_pool + self.ltx.fee_pool_delta();
         tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             prev_header_hash = %self.prev_header_hash.to_hex(),
             prev_ledger_seq = self.prev_header.ledger_seq,
             close_time = self.close_data.close_time,
@@ -4206,13 +4206,13 @@ impl LedgerCloseContext<'_> {
         // before bucket list add_batch, matching stellar-core ordering)
         if config_state_archival_changed {
             tracing::info!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 "State archival settings changed via config upgrade"
             );
         }
         if config_memory_cost_params_changed {
             tracing::info!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 "Memory cost params changed via config upgrade"
             );
         }
@@ -4279,7 +4279,7 @@ impl LedgerCloseContext<'_> {
     /// ordering is preserved.
     fn commit(mut self, rss_before: u64) -> Result<LedgerCloseResult> {
         tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             "LedgerCloseContext::commit starting"
         );
 
@@ -4322,7 +4322,7 @@ impl LedgerCloseContext<'_> {
 
         // Log transaction results for debugging - helps identify tx execution differences
         tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             tx_count = self.tx_results.len(),
             tx_result_hash = %tx_result_hash.to_hex(),
             "TX_RESULT: Transaction result hash computed"
@@ -4333,7 +4333,7 @@ impl LedgerCloseContext<'_> {
         let protocol_version = upgraded_header.ledger_version;
         let prev_version = self.prev_header.ledger_version;
         tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             prev_protocol_version = prev_version,
             upgraded_protocol_version = protocol_version,
             "Protocol version for commit"
@@ -4355,7 +4355,7 @@ impl LedgerCloseContext<'_> {
         }
 
         tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             delta_count_final = self.ltx.num_changes(),
             "Delta entry count before bucket list update"
         );
@@ -4371,12 +4371,12 @@ impl LedgerCloseContext<'_> {
         let eviction_settings = if protocol_version_starts_from(prev_version, ProtocolVersion::V23)
         {
             tracing::debug!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 "Loading state archival settings"
             );
             let settings = self.load_state_archival_settings().unwrap_or_default();
             tracing::debug!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 "Loaded state archival settings"
             );
             Some(settings)
@@ -4403,7 +4403,7 @@ impl LedgerCloseContext<'_> {
         // Apply delta to bucket list FIRST, then compute its hash
         // This ensures the bucket_list_hash in the header matches the actual state
         tracing::debug!(
-            ledger_seq = self.close_data.ledger_seq,
+            ledger_seq = self.close_data.ledger_seq.get(),
             "Acquiring bucket list write lock"
         );
         let (
@@ -4420,7 +4420,7 @@ impl LedgerCloseContext<'_> {
             let mut bucket_list = self.manager.bucket_list.write();
             let bucket_lock_wait_us = lock_wait_start.elapsed().as_micros() as u64;
             tracing::debug!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 "Acquired bucket list write lock"
             );
 
@@ -4435,7 +4435,7 @@ impl LedgerCloseContext<'_> {
                 dead_entries.retain(|key| !restored_set.contains(key));
                 if dead_entries.len() != before_count {
                     tracing::debug!(
-                        ledger_seq = self.close_data.ledger_seq,
+                        ledger_seq = self.close_data.ledger_seq.get(),
                         before_count = before_count,
                         after_count = dead_entries.len(),
                         filtered_count = before_count - dead_entries.len(),
@@ -4446,7 +4446,7 @@ impl LedgerCloseContext<'_> {
 
             // Log bucket list entries for debugging hash mismatch
             tracing::debug!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 init_count = init_entries.len(),
                 live_count = live_entries.len(),
                 dead_count = dead_entries.len(),
@@ -4457,7 +4457,7 @@ impl LedgerCloseContext<'_> {
             for (i, entry) in init_entries.iter().take(5).enumerate() {
                 let key = henyey_common::entry_to_key(entry);
                 tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
+                    ledger_seq = self.close_data.ledger_seq.get(),
                     index = i,
                     key = ?key,
                     last_modified = entry.last_modified_ledger_seq,
@@ -4467,7 +4467,7 @@ impl LedgerCloseContext<'_> {
             for (i, entry) in live_entries.iter().take(5).enumerate() {
                 let key = henyey_common::entry_to_key(entry);
                 tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
+                    ledger_seq = self.close_data.ledger_seq.get(),
                     index = i,
                     key = ?key,
                     last_modified = entry.last_modified_ledger_seq,
@@ -4476,14 +4476,17 @@ impl LedgerCloseContext<'_> {
             }
             for (i, key) in dead_entries.iter().take(5).enumerate() {
                 tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
+                    ledger_seq = self.close_data.ledger_seq.get(),
                     index = i,
                     key = ?key,
                     "DEAD entry"
                 );
             }
 
-            tracing::debug!(ledger_seq = self.close_data.ledger_seq, "Got delta entries");
+            tracing::debug!(
+                ledger_seq = self.close_data.ledger_seq.get(),
+                "Got delta entries"
+            );
 
             // Run incremental eviction scan for Protocol 23+
             // This must happen BEFORE applying transaction changes to match stellar-core.
@@ -4508,9 +4511,9 @@ impl LedgerCloseContext<'_> {
                     let eviction_result = {
                         let pending = self.manager.pending_eviction_scan.lock().take();
                         let background_result = pending.and_then(|scan| {
-                            if scan.target_ledger_seq != self.close_data.ledger_seq {
+                            if self.close_data.ledger_seq != scan.target_ledger_seq {
                                 tracing::debug!(
-                                    ledger_seq = self.close_data.ledger_seq,
+                                    ledger_seq = self.close_data.ledger_seq.get(),
                                     target = scan.target_ledger_seq,
                                     "Discarding background eviction scan: ledger mismatch"
                                 );
@@ -4518,7 +4521,7 @@ impl LedgerCloseContext<'_> {
                             }
                             if scan.settings != eviction_settings {
                                 tracing::debug!(
-                                    ledger_seq = self.close_data.ledger_seq,
+                                    ledger_seq = self.close_data.ledger_seq.get(),
                                     "Discarding background eviction scan: settings changed"
                                 );
                                 return None;
@@ -4526,7 +4529,7 @@ impl LedgerCloseContext<'_> {
                             match scan.handle.join() {
                                 Ok(Ok(result)) => {
                                     tracing::debug!(
-                                        ledger_seq = self.close_data.ledger_seq,
+                                        ledger_seq = self.close_data.ledger_seq.get(),
                                         candidates = result.candidates.len(),
                                         bytes_scanned = result.bytes_scanned,
                                         "Using background eviction scan result"
@@ -4535,7 +4538,7 @@ impl LedgerCloseContext<'_> {
                                 }
                                 Ok(Err(e)) => {
                                     tracing::warn!(
-                                        ledger_seq = self.close_data.ledger_seq,
+                                        ledger_seq = self.close_data.ledger_seq.get(),
                                         error = %e,
                                         "Background eviction scan failed, falling back to inline"
                                     );
@@ -4543,7 +4546,7 @@ impl LedgerCloseContext<'_> {
                                 }
                                 Err(_) => {
                                     tracing::warn!(
-                                        ledger_seq = self.close_data.ledger_seq,
+                                        ledger_seq = self.close_data.ledger_seq.get(),
                                         "Background eviction scan panicked, falling back to inline"
                                     );
                                     None
@@ -4558,7 +4561,7 @@ impl LedgerCloseContext<'_> {
                                 let iter = load_eviction_iterator_from_bucket_list(&bucket_list)
                                     .unwrap_or_else(|| {
                                         tracing::debug!(
-                                            ledger_seq = self.close_data.ledger_seq,
+                                            ledger_seq = self.close_data.ledger_seq.get(),
                                             starting_level =
                                                 eviction_settings.starting_eviction_scan_level,
                                             "Creating new EvictionIterator (no entry found)"
@@ -4581,7 +4584,7 @@ impl LedgerCloseContext<'_> {
                     eviction_us = eviction_duration.as_micros() as u64;
 
                     tracing::debug!(
-                        ledger_seq = self.close_data.ledger_seq,
+                        ledger_seq = self.close_data.ledger_seq.get(),
                         bytes_scanned = eviction_result.bytes_scanned,
                         candidates = eviction_result.candidates.len(),
                         duration_ms = eviction_duration.as_millis(),
@@ -4623,7 +4626,7 @@ impl LedgerCloseContext<'_> {
 
                     // Log before moving end_iterator into the entry
                     tracing::debug!(
-                        ledger_seq = self.close_data.ledger_seq,
+                        ledger_seq = self.close_data.ledger_seq.get(),
                         bytes_scanned = bytes_scanned,
                         level = resolved.end_iterator.bucket_list_level,
                         is_curr = resolved.end_iterator.is_curr_bucket,
@@ -4633,7 +4636,7 @@ impl LedgerCloseContext<'_> {
 
                     // Add EvictionIterator update to live entries
                     let eviction_iter_entry = LedgerEntry {
-                        last_modified_ledger_seq: self.close_data.ledger_seq,
+                        last_modified_ledger_seq: self.close_data.ledger_seq.get(),
                         data: LedgerEntryData::ConfigSetting(ConfigSettingEntry::EvictionIterator(
                             resolved.end_iterator,
                         )),
@@ -4679,7 +4682,7 @@ impl LedgerCloseContext<'_> {
                     let soroban_state_size = self.manager.soroban_state.read().total_size();
 
                     if let Some(window_entry) = crate::execution::compute_state_size_window_entry(
-                        self.close_data.ledger_seq,
+                        self.close_data.ledger_seq.get(),
                         protocol_version,
                         &bucket_list,
                         soroban_state_size,
@@ -4696,7 +4699,7 @@ impl LedgerCloseContext<'_> {
                             )
                         });
                         tracing::info!(
-                            ledger_seq = self.close_data.ledger_seq,
+                            ledger_seq = self.close_data.ledger_seq.get(),
                             soroban_state_size = soroban_state_size,
                             "Adding state size window entry to live entries (from in-memory state)"
                         );
@@ -4770,7 +4773,7 @@ impl LedgerCloseContext<'_> {
                 }
 
                 tracing::debug!(
-                    ledger_seq = self.close_data.ledger_seq,
+                    ledger_seq = self.close_data.ledger_seq.get(),
                     total_size = soroban_state.total_size(),
                     data_count = soroban_state.contract_data_count(),
                     code_count = soroban_state.contract_code_count(),
@@ -4785,8 +4788,8 @@ impl LedgerCloseContext<'_> {
             // between consensus rounds. This ensures proper merge timing.
             let current_bl_ledger = bucket_list.ledger_seq();
             tracing::debug!(
-                current_bl_ledger = current_bl_ledger,
-                target_ledger = self.close_data.ledger_seq,
+                current_bl_ledger = current_bl_ledger.get(),
+                target_ledger = self.close_data.ledger_seq.get(),
                 needs_advance = current_bl_ledger < self.close_data.ledger_seq - 1,
                 "Checking if bucket list advance is needed"
             );
@@ -4794,13 +4797,13 @@ impl LedgerCloseContext<'_> {
                 let advance_from = current_bl_ledger + 1;
                 let advance_to = self.close_data.ledger_seq;
                 tracing::debug!(
-                    current_bl_ledger = current_bl_ledger,
-                    target_ledger = self.close_data.ledger_seq,
+                    current_bl_ledger = current_bl_ledger.get(),
+                    target_ledger = self.close_data.ledger_seq.get(),
                     skipped_count = advance_to - advance_from,
                     "Advancing bucket list through empty ledgers"
                 );
                 bucket_list.advance_to_ledger(
-                    self.close_data.ledger_seq,
+                    self.close_data.ledger_seq.get(),
                     protocol_version,
                     BucketListType::Live,
                 )?;
@@ -4809,7 +4812,7 @@ impl LedgerCloseContext<'_> {
             // Log bucket list hash BEFORE add_batch
             let pre_add_batch_hash = bucket_list.hash();
             tracing::debug!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 pre_add_batch_hash = %pre_add_batch_hash.to_hex(),
                 init_count = init_entries.len(),
                 live_count = live_entries.len(),
@@ -4821,7 +4824,7 @@ impl LedgerCloseContext<'_> {
             for (i, entry) in init_entries.iter().enumerate() {
                 let key = henyey_common::entry_to_key(entry);
                 tracing::trace!(
-                    ledger_seq = self.close_data.ledger_seq,
+                    ledger_seq = self.close_data.ledger_seq.get(),
                     idx = i,
                     entry_type = ?std::mem::discriminant(&entry.data),
                     key = ?key,
@@ -4837,7 +4840,7 @@ impl LedgerCloseContext<'_> {
                     _ => None,
                 };
                 tracing::trace!(
-                    ledger_seq = self.close_data.ledger_seq,
+                    ledger_seq = self.close_data.ledger_seq.get(),
                     idx = i,
                     entry_type = ?std::mem::discriminant(&entry.data),
                     key = ?key,
@@ -4848,7 +4851,7 @@ impl LedgerCloseContext<'_> {
             }
             for (i, key) in dead_entries.iter().enumerate() {
                 tracing::trace!(
-                    ledger_seq = self.close_data.ledger_seq,
+                    ledger_seq = self.close_data.ledger_seq.get(),
                     idx = i,
                     key = ?key,
                     "DEAD entry"
@@ -4856,7 +4859,7 @@ impl LedgerCloseContext<'_> {
             }
 
             tracing::debug!(
-                ledger_seq = self.close_data.ledger_seq,
+                ledger_seq = self.close_data.ledger_seq.get(),
                 init_count = init_entries.len(),
                 live_count = live_entries.len(),
                 dead_count = dead_entries.len(),
@@ -4917,13 +4920,15 @@ impl LedgerCloseContext<'_> {
                         let current_hot_ledger = hot_archive.ledger_seq();
                         if current_hot_ledger < self.close_data.ledger_seq - 1 {
                             tracing::debug!(
-                                current_hot_ledger = current_hot_ledger,
-                                target_ledger = self.close_data.ledger_seq,
+                                current_hot_ledger = current_hot_ledger.get(),
+                                target_ledger = self.close_data.ledger_seq.get(),
                                 skipped_count = self.close_data.ledger_seq - current_hot_ledger - 1,
                                 "Advancing hot archive bucket list through empty ledgers"
                             );
-                            hot_archive
-                                .advance_to_ledger(self.close_data.ledger_seq, protocol_version)?;
+                            hot_archive.advance_to_ledger(
+                                self.close_data.ledger_seq.get(),
+                                protocol_version,
+                            )?;
                         }
 
                         // Add archived entries to hot archive bucket list
@@ -5002,10 +5007,14 @@ impl LedgerCloseContext<'_> {
         // The scan runs on a snapshot of the bucket list (taken above while the write
         // lock was held), so it doesn't interfere with subsequent operations.
         if let Some((snapshot, iter, settings)) = bg_eviction_data {
-            let target_ledger_seq = self.close_data.ledger_seq + 1;
+            let target_ledger_seq = (self.close_data.ledger_seq + 1).get();
             let settings_clone = settings.clone();
             let handle = std::thread::spawn(move || {
-                snapshot.scan_for_eviction_incremental(iter, target_ledger_seq, &settings_clone)
+                snapshot.scan_for_eviction_incremental(
+                    iter,
+                    target_ledger_seq.into(),
+                    &settings_clone,
+                )
             });
             *self.manager.pending_eviction_scan.lock() = Some(PendingEvictionScan {
                 handle,
@@ -5191,7 +5200,9 @@ impl LedgerCloseContext<'_> {
 
         // Periodic memory report (every 64 ledgers, ~5 minutes)
         if new_header.ledger_seq % 64 == 0 {
-            let report = self.manager.build_memory_report(new_header.ledger_seq);
+            let report = self
+                .manager
+                .build_memory_report(new_header.ledger_seq.into());
             report.log();
         }
 
@@ -5397,12 +5408,12 @@ mod tests {
         }
     }
 
-    fn make_ttl_entry(key_hash_bytes: [u8; 32], live_until: u32) -> LedgerEntry {
+    fn make_ttl_entry(key_hash_bytes: [u8; 32], live_until: LedgerSeq) -> LedgerEntry {
         LedgerEntry {
             last_modified_ledger_seq: 1,
             data: LedgerEntryData::Ttl(TtlEntry {
                 key_hash: Hash(key_hash_bytes),
-                live_until_ledger_seq: live_until,
+                live_until_ledger_seq: live_until.into(),
             }),
             ext: LedgerEntryExt::V0,
         }
@@ -5424,7 +5435,7 @@ mod tests {
         let offer1 = make_offer_entry(1, [1u8; 32]);
         let offer2 = make_offer_entry(2, [2u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer1, offer2],
@@ -5445,7 +5456,7 @@ mod tests {
         let cd1 = make_contract_data_entry([10u8; 32]);
         let cd2 = make_contract_data_entry([20u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![cd1, cd2],
@@ -5461,9 +5472,9 @@ mod tests {
     #[test]
     fn test_scan_ttl_entries_from_bucket_list() {
         let mut bl = BucketList::new();
-        let ttl = make_ttl_entry([30u8; 32], 1000);
+        let ttl = make_ttl_entry([30u8; 32], 1000.into());
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![ttl],
@@ -5483,10 +5494,10 @@ mod tests {
         let mut bl = BucketList::new();
         let offer = make_offer_entry(42, [1u8; 32]);
         let cd = make_contract_data_entry([10u8; 32]);
-        let ttl = make_ttl_entry([30u8; 32], 500);
+        let ttl = make_ttl_entry([30u8; 32], 500.into());
 
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer, cd, ttl],
@@ -5508,7 +5519,7 @@ mod tests {
         let mut bl = BucketList::new();
         let offer = make_offer_entry(99, [5u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer],
@@ -5522,7 +5533,7 @@ mod tests {
             offer_id: 99,
         });
         bl.add_batch(
-            2,
+            2.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -5547,7 +5558,7 @@ mod tests {
         // Add offer at ledger 1 (will be in a higher level after more adds)
         let old_offer = make_offer_entry(1, [1u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![old_offer],
@@ -5562,7 +5573,7 @@ mod tests {
             o.amount = 9999;
         }
         bl.add_batch(
-            2,
+            2.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -5594,7 +5605,7 @@ mod tests {
                 b
             });
             bl.add_batch(
-                (i + 1) as u32,
+                ((i + 1) as u32).into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![offer],
@@ -5621,7 +5632,7 @@ mod tests {
         let offer = make_offer_entry(1, [1u8; 32]);
         let cd = make_contract_data_entry([10u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             pre_soroban_protocol,
             BucketListType::Live,
             vec![offer, cd],
@@ -5798,7 +5809,7 @@ mod tests {
         let seller_bytes = [7u8; 32];
         let offer = make_offer_entry(10, seller_bytes);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer],
@@ -5825,7 +5836,7 @@ mod tests {
                 b
             });
             bl.add_batch(
-                (i + 1) as u32,
+                ((i + 1) as u32).into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![offer],
@@ -5858,7 +5869,7 @@ mod tests {
         let mut bl = BucketList::new();
         let offer = make_offer_entry(77, [7u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer],
@@ -5872,7 +5883,7 @@ mod tests {
             offer_id: 77,
         });
         bl.add_batch(
-            2,
+            2.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -5899,7 +5910,7 @@ mod tests {
         for i in 1u32..=8 {
             let offer = make_offer_entry(i as i64, [i as u8; 32]);
             bl.add_batch(
-                i,
+                i.into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![offer],
@@ -5958,7 +5969,7 @@ mod tests {
         let offer1 = make_offer_entry(1, [1u8; 32]);
         let offer2 = make_offer_entry(2, [2u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer1, offer2],
@@ -5979,7 +5990,7 @@ mod tests {
         let cd1 = make_contract_data_entry([10u8; 32]);
         let cd2 = make_contract_data_entry([20u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![cd1, cd2],
@@ -5999,7 +6010,7 @@ mod tests {
         let cd1 = make_contract_data_entry([30u8; 32]);
         let cd2 = make_contract_data_entry([31u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![cd1, cd2],
@@ -6021,9 +6032,9 @@ mod tests {
         let mut bl = BucketList::new();
         let offer = make_offer_entry(1, [1u8; 32]);
         let cd = make_contract_data_entry([10u8; 32]);
-        let ttl = make_ttl_entry([30u8; 32], 1000);
+        let ttl = make_ttl_entry([30u8; 32], 1000.into());
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer, cd, ttl],
@@ -6047,7 +6058,7 @@ mod tests {
         // Add an offer at ledger 1
         let offer = make_offer_entry(1, [1u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer.clone()],
@@ -6061,7 +6072,7 @@ mod tests {
             offer_id: 1,
         });
         bl.add_batch(
-            2,
+            2.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -6083,7 +6094,7 @@ mod tests {
         // Add offer at ledger 1 (will end up at a higher/older level after merges)
         let offer_v1 = make_offer_entry(1, [1u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer_v1],
@@ -6097,7 +6108,7 @@ mod tests {
             o.amount = 9999;
         }
         bl.add_batch(
-            2,
+            2.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -6122,7 +6133,7 @@ mod tests {
         for i in 1u32..=20 {
             let offer = make_offer_entry(i as i64, [i as u8; 32]);
             bl.add_batch(
-                i,
+                i.into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![offer],
@@ -6143,7 +6154,7 @@ mod tests {
         let offer = make_offer_entry(1, [1u8; 32]);
         let cd = make_contract_data_entry([10u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             pre_soroban_protocol,
             BucketListType::Live,
             vec![offer, cd],
@@ -6167,7 +6178,7 @@ mod tests {
         // Add offer at ledger 1 (goes into snap after ledger 2 closes)
         let offer_v1 = make_offer_entry(1, [1u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer_v1],
@@ -6181,7 +6192,7 @@ mod tests {
             o.amount = 7777;
         }
         bl.add_batch(
-            2,
+            2.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -6210,7 +6221,7 @@ mod tests {
         // Create offer at ledger 1
         let offer_v1 = make_offer_entry(1, [1u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer_v1],
@@ -6225,7 +6236,7 @@ mod tests {
                 o.amount = i as i64 * 1000;
             }
             bl.add_batch(
-                i,
+                i.into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![],
@@ -6267,7 +6278,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![tl_entry],
@@ -6297,7 +6308,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![config_entry],
@@ -6370,7 +6381,7 @@ mod tests {
         for i in 1i64..=5 {
             let offer = make_offer_entry(i, [i as u8; 32]);
             bl.add_batch(
-                i as u32,
+                (i as u32).into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![offer],
@@ -6390,9 +6401,9 @@ mod tests {
         for i in 1u32..=8 {
             let offer = make_offer_entry(i as i64, [i as u8; 32]);
             let cd = make_contract_data_entry([(i + 100) as u8; 32]);
-            let ttl = make_ttl_entry([(i + 200) as u8; 32], i * 1000);
+            let ttl = make_ttl_entry([(i + 200) as u8; 32], (i * 1000).into());
             bl.add_batch(
-                i,
+                i.into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![offer, cd, ttl],
@@ -6413,7 +6424,7 @@ mod tests {
         for i in 1i64..=5 {
             let offer = make_offer_entry(i, [i as u8; 32]);
             bl.add_batch(
-                i as u32,
+                (i as u32).into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![offer],
@@ -6432,7 +6443,7 @@ mod tests {
             offer_id: 4,
         });
         bl.add_batch(
-            6,
+            6.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![],
@@ -6452,7 +6463,7 @@ mod tests {
         let offer_init = make_offer_entry(1, [1u8; 32]);
         let cd_init = make_contract_data_entry([1u8; 32]);
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             vec![offer_init, cd_init],
@@ -6468,7 +6479,7 @@ mod tests {
             }
             let cd = make_contract_data_entry([1u8; 32]);
             bl.add_batch(
-                i,
+                i.into(),
                 TEST_PROTOCOL,
                 BucketListType::Live,
                 vec![],
@@ -6540,7 +6551,7 @@ mod tests {
 
         // begin_close at CURRENT version should pass the version check
         let close_data = LedgerCloseData::new(
-            2,
+            2.into(),
             TransactionSetVariant::Classic(TransactionSet {
                 previous_ledger_hash: header_hash.into(),
                 txs: VecM::default(),
@@ -6588,7 +6599,7 @@ mod tests {
         manager.set_header_version_for_test(CURRENT_LEDGER_PROTOCOL_VERSION + 1);
 
         let close_data = LedgerCloseData::new(
-            2,
+            2.into(),
             TransactionSetVariant::Classic(TransactionSet {
                 previous_ledger_hash: header_hash.into(),
                 txs: VecM::default(),
@@ -6635,7 +6646,7 @@ mod tests {
         manager.set_header_version_for_test(MIN_LEDGER_PROTOCOL_VERSION - 1);
 
         let close_data = LedgerCloseData::new(
-            2,
+            2.into(),
             TransactionSetVariant::Classic(TransactionSet {
                 previous_ledger_hash: header_hash.into(),
                 txs: VecM::default(),
@@ -6757,7 +6768,7 @@ mod tests {
             },
         });
         let close_data = LedgerCloseData::new(
-            1,
+            1.into(),
             TransactionSetVariant::Classic(TransactionSet {
                 previous_ledger_hash: Hash::from(Hash256::ZERO),
                 txs: VecM::default(),
@@ -6813,7 +6824,7 @@ mod tests {
         let iter = EvictionIterator::new(settings.starting_eviction_scan_level);
         let settings_clone = settings.clone();
         let handle = std::thread::spawn(move || {
-            snapshot.scan_for_eviction_incremental(iter, 2, &settings_clone)
+            snapshot.scan_for_eviction_incremental(iter, 2.into(), &settings_clone)
         });
         *manager.pending_eviction_scan.lock() = Some(PendingEvictionScan {
             handle,
@@ -6879,7 +6890,7 @@ mod tests {
         }
 
         bl.add_batch(
-            1,
+            1.into(),
             TEST_PROTOCOL,
             BucketListType::Live,
             entries,
@@ -6901,8 +6912,9 @@ mod tests {
             bucket_file_offset: 0,
         };
 
-        let handle =
-            std::thread::spawn(move || snapshot.scan_for_eviction_incremental(iter, 5, &settings));
+        let handle = std::thread::spawn(move || {
+            snapshot.scan_for_eviction_incremental(iter, 5.into(), &settings)
+        });
 
         let result = handle.join().expect("thread should not panic").unwrap();
         assert_eq!(result.candidates.len(), 3, "Should find 3 expired entries");
@@ -6915,10 +6927,13 @@ mod tests {
     ///
     /// The returned context has an empty snapshot and delta at the given ledger_seq.
     /// The manager is initialized with an empty bucket list.
-    fn make_test_close_context(manager: &LedgerManager, ledger_seq: u32) -> LedgerCloseContext<'_> {
+    fn make_test_close_context(
+        manager: &LedgerManager,
+        ledger_seq: LedgerSeq,
+    ) -> LedgerCloseContext<'_> {
         let header = create_genesis_header();
         let header_hash = crate::compute_header_hash(&header).expect("hash");
-        let snapshot = SnapshotHandle::new(crate::snapshot::LedgerSnapshot::empty(0));
+        let snapshot = SnapshotHandle::new(crate::snapshot::LedgerSnapshot::empty(0.into()));
 
         let ltx = CloseLedgerState::begin(snapshot, header.clone(), header_hash, ledger_seq);
 
@@ -6996,7 +7011,7 @@ mod tests {
             .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
             .expect("init");
 
-        let mut ctx = make_test_close_context(&manager, 2);
+        let mut ctx = make_test_close_context(&manager, 2.into());
         ctx.create_ledger_entries_for_v20()
             .expect("V20 entries should be created");
 
@@ -7164,7 +7179,7 @@ mod tests {
             .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
             .expect("init");
 
-        let mut ctx = make_test_close_context(&manager, 2);
+        let mut ctx = make_test_close_context(&manager, 2.into());
 
         // First create V20 entries (prerequisite)
         ctx.create_ledger_entries_for_v20()
@@ -7231,7 +7246,7 @@ mod tests {
             .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
             .expect("init");
 
-        let mut ctx = make_test_close_context(&manager, 2);
+        let mut ctx = make_test_close_context(&manager, 2.into());
 
         // Chain V20 -> V21 -> V22
         ctx.create_ledger_entries_for_v20().expect("V20");
@@ -7293,7 +7308,7 @@ mod tests {
             .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
             .expect("init");
 
-        let mut ctx = make_test_close_context(&manager, 2);
+        let mut ctx = make_test_close_context(&manager, 2.into());
 
         // Chain V20 -> V21 -> V22 -> V23
         ctx.create_ledger_entries_for_v20().expect("V20");
@@ -7372,7 +7387,7 @@ mod tests {
             .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
             .expect("init");
 
-        let mut ctx = make_test_close_context(&manager, 2);
+        let mut ctx = make_test_close_context(&manager, 2.into());
 
         // Full chain: V20 -> V21 -> V22 -> V23 -> V25
         ctx.create_ledger_entries_for_v20().expect("V20");
@@ -7440,7 +7455,7 @@ mod tests {
             .initialize(bucket_list, hot_archive_bucket_list, header, header_hash)
             .expect("init");
 
-        let mut ctx = make_test_close_context(&manager, 2);
+        let mut ctx = make_test_close_context(&manager, 2.into());
 
         // Full chain: V20 -> V21 -> V22 -> V23 -> V25 -> V26
         ctx.create_ledger_entries_for_v20().expect("V20");
@@ -7561,7 +7576,7 @@ mod tests {
             },
         );
 
-        let mut ctx = make_test_close_context(&manager, 2);
+        let mut ctx = make_test_close_context(&manager, 2.into());
 
         // Simulate what begin_close does: add upgrades to both close_data and upgrade_ctx.
         let upgrades = vec![

@@ -77,6 +77,7 @@ use henyey_app::{
     CatchupOptions, LogConfig, LogFormat, RunMode, RunOptions,
 };
 use henyey_common::deterministic_seed;
+use henyey_common::LedgerSeq;
 
 // ---------------------------------------------------------------------------
 // LoadGenRunner implementation (bridges henyey-simulation into henyey-app)
@@ -1553,8 +1554,8 @@ fn initialize_genesis_ledger(
     let mut bucket_list = BucketList::new();
     bucket_list
         .add_batch(
-            1, // ledger_seq
-            0, // protocol_version (genesis is v0)
+            LedgerSeq::new(1), // ledger_seq
+            0,                 // protocol_version (genesis is v0)
             BucketListType::Live,
             genesis_entries, // init_entries
             vec![],          // live_entries
@@ -1662,9 +1663,9 @@ fn initialize_genesis_ledger(
         use henyey_db::queries::{BucketListQueries, LedgerQueries, StateQueries};
 
         conn.store_ledger_header(&header, &header_xdr)?;
-        conn.store_tx_history_entry(1, &genesis_tx_history)?;
-        conn.store_tx_result_entry(1, &genesis_tx_result)?;
-        conn.store_bucket_list(1, &bucket_levels)?;
+        conn.store_tx_history_entry(LedgerSeq::new(1), &genesis_tx_history)?;
+        conn.store_tx_result_entry(LedgerSeq::new(1), &genesis_tx_result)?;
+        conn.store_bucket_list(LedgerSeq::new(1), &bucket_levels)?;
         conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
         conn.set_state(state_keys::NETWORK_PASSPHRASE, network_passphrase)?;
         conn.set_last_closed_ledger(1)?;
@@ -2252,7 +2253,7 @@ async fn cmd_verify_history(
     let current_ledger = root_has.current_ledger;
 
     let start = from.unwrap_or(1);
-    let end = to.unwrap_or(current_ledger);
+    let end = to.unwrap_or(current_ledger.get());
 
     println!("Verifying ledger range: {} to {}", start, end);
     println!();
@@ -2530,7 +2531,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
         let ledger = if root_path.exists() {
             let json = fs::read_to_string(&root_path)?;
             let has = HistoryArchiveState::from_json(&json)?;
-            has.current_ledger()
+            has.current_ledger().get()
         } else {
             0
         };
@@ -2613,12 +2614,12 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             });
 
             let tx_entry = db
-                .get_tx_history_entry(seq)?
+                .get_tx_history_entry(seq.into())?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx history entry {}", seq))?;
             tx_entries.push(tx_entry);
 
             let tx_result = db
-                .get_tx_result_entry(seq)?
+                .get_tx_result_entry(seq.into())?
                 .ok_or_else(|| anyhow::anyhow!("Missing tx result entry {}", seq))?;
             tx_results.push(tx_result);
         }
@@ -2655,7 +2656,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
         }
 
         let levels = db
-            .load_bucket_list(checkpoint)?
+            .load_bucket_list(checkpoint.into())?
             .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot {}", checkpoint))?;
         let mut bucket_list = BucketList::new();
         bucket_list.set_bucket_dir(bucket_manager.bucket_dir().to_path_buf());
@@ -2779,7 +2780,7 @@ async fn cmd_publish_history(config: AppConfig, force: bool) -> anyhow::Result<(
             println!("SKIP (already published)");
         }
 
-        if let Err(err) = db.remove_publish(checkpoint) {
+        if let Err(err) = db.remove_publish(checkpoint.into()) {
             tracing::warn!(checkpoint, error = %err, "Failed to remove publish queue entry");
         }
     }
@@ -2807,7 +2808,7 @@ fn build_scp_history_entries(
 
     let mut entries = Vec::new();
     for seq in start_ledger..=checkpoint {
-        let envelopes = db.load_scp_history(seq)?;
+        let envelopes = db.load_scp_history(seq.into())?;
         if envelopes.is_empty() {
             continue;
         }
@@ -3652,7 +3653,8 @@ async fn cmd_verify_execution(
     let current_ledger = root_has.current_ledger;
 
     let end_ledger = to.unwrap_or_else(|| {
-        checkpoint::latest_checkpoint_before_or_at(current_ledger).unwrap_or(current_ledger)
+        checkpoint::latest_checkpoint_before_or_at(current_ledger.get())
+            .unwrap_or(current_ledger.get())
     });
     let start_ledger = from.unwrap_or_else(|| {
         let freq = henyey_history::checkpoint_frequency();
@@ -4905,7 +4907,7 @@ async fn cmd_dump_ledger(
     println!("Using checkpoint: {}", checkpoint);
 
     let levels = db
-        .load_bucket_list(checkpoint)?
+        .load_bucket_list(checkpoint.into())?
         .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot at {}", checkpoint))?;
 
     // Open output file
@@ -5061,7 +5063,7 @@ async fn cmd_self_check(config: AppConfig) -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("No checkpoint available for ledger {}", latest_seq))?;
 
     let levels = db
-        .load_bucket_list(checkpoint)?
+        .load_bucket_list(checkpoint.into())?
         .ok_or_else(|| anyhow::anyhow!("Missing bucket list snapshot at {}", checkpoint))?;
 
     let mut buckets_verified = 0;
@@ -5176,7 +5178,7 @@ async fn cmd_verify_checkpoints(
     let current_ledger = root_has.current_ledger;
 
     let start = from.unwrap_or(63); // First checkpoint
-    let end = to.unwrap_or(current_ledger);
+    let end = to.unwrap_or(current_ledger.get());
 
     println!("Verifying checkpoint range: {} to {}", start, end);
     println!();
@@ -5583,7 +5585,7 @@ mod tests {
             },
         });
 
-        write_scp_history_file(tmp.path(), 63, &[entry.clone()]).unwrap();
+        write_scp_history_file(tmp.path(), 63, std::slice::from_ref(&entry)).unwrap();
 
         let path = tmp.path().join(checkpoint_path("scp", 63, "xdr.gz"));
         let file = std::fs::File::open(path).unwrap();

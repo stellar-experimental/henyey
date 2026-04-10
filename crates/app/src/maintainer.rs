@@ -262,7 +262,7 @@ pub fn run_maintenance(
     );
 
     // Delete old SCP history
-    if let Err(e) = db.delete_old_scp_entries(lmin, count) {
+    if let Err(e) = db.delete_old_scp_entries(lmin.into(), count) {
         warn!(error = %e, "Failed to delete old SCP entries");
     }
 
@@ -279,7 +279,7 @@ pub fn run_maintenance(
     } else {
         lmin
     };
-    if let Err(e) = db.delete_old_ledger_headers(header_lmin, count) {
+    if let Err(e) = db.delete_old_ledger_headers(header_lmin.into(), count) {
         warn!(error = %e, "Failed to delete old ledger headers");
     }
 
@@ -287,15 +287,15 @@ pub fn run_maintenance(
     if let Some(retention_window) = rpc_retention_window {
         let rpc_lmin = lcl.saturating_sub(retention_window);
 
-        if let Err(e) = db.delete_old_events(rpc_lmin, count) {
+        if let Err(e) = db.delete_old_events(rpc_lmin.into(), count) {
             warn!(error = %e, "Failed to delete old events");
         }
 
-        if let Err(e) = db.delete_old_ledger_close_meta(rpc_lmin, count) {
+        if let Err(e) = db.delete_old_ledger_close_meta(rpc_lmin.into(), count) {
             warn!(error = %e, "Failed to delete old ledger close meta");
         }
 
-        if let Err(e) = db.delete_old_tx_history(rpc_lmin, count) {
+        if let Err(e) = db.delete_old_tx_history(rpc_lmin.into(), count) {
             warn!(error = %e, "Failed to delete old tx history");
         }
     }
@@ -388,7 +388,7 @@ mod tests {
             for &seq in ledger_seqs {
                 let event = henyey_db::queries::events::EventRecord {
                     id: format!("{seq}-0"),
-                    ledger_seq: seq,
+                    ledger_seq: seq.into(),
                     tx_index: 0,
                     op_index: 0,
                     tx_hash: "aabb".to_string(),

@@ -371,13 +371,13 @@ mod tests {
     fn test_checkpoint_range() {
         assert_eq!(checkpoint_range(63), (1, 63));
         assert_eq!(checkpoint_range(127), (64, 127));
-        assert_eq!(checkpoint_range(191), (128, 191));
+        assert_eq!(checkpoint_range(191u32), (128, 191));
     }
 
     #[test]
     #[should_panic(expected = "not a checkpoint ledger")]
     fn test_checkpoint_range_invalid() {
-        checkpoint_range(64);
+        checkpoint_range(64u32);
     }
 
     #[test]

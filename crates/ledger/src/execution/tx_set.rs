@@ -283,7 +283,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
             fee = result.fee_charged,
             fee_refund = result.fee_refund,
             ops = result.operation_results.len(),
-            ledger_seq = ledger_seq,
+            ledger_seq = ledger_seq.get(),
             tx_index = tx_index,
             "Executed transaction"
         );
@@ -312,7 +312,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
                     total_refunds += refund;
 
                     tracing::debug!(
-                        ledger_seq = ledger_seq,
+                        ledger_seq = ledger_seq.get(),
                         tx_index = idx,
                         refund = refund,
                         fee_source = %account_id_to_strkey(&fee_source_id),
@@ -320,7 +320,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
                     );
                 } else {
                     tracing::debug!(
-                        ledger_seq = ledger_seq,
+                        ledger_seq = ledger_seq.get(),
                         tx_index = idx,
                         refund = refund,
                         fee_source = %account_id_to_strkey(&fee_source_id),
@@ -331,7 +331,7 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
         }
         if total_refunds > 0 {
             tracing::debug!(
-                ledger_seq = ledger_seq,
+                ledger_seq = ledger_seq.get(),
                 total_refunds = total_refunds,
                 tx_count = transactions.len(),
                 "P23+ Soroban fee refunds applied"
@@ -539,7 +539,7 @@ pub fn execute_soroban_parallel_phase(
             phase,
             context.base_fee,
             context.network_id,
-            context.sequence,
+            LedgerSeq::new(context.sequence),
             delta,
         )?;
         if total_pre_deducted != 0 {
@@ -759,7 +759,7 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
     soroban_phase: &crate::close::SorobanPhaseStructure,
     base_fee: u32,
     network_id: NetworkId,
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     delta: &mut LedgerDelta,
     snapshot: &SnapshotHandle,
 ) -> Result<(Vec<PreChargedFee>, Vec<PreChargedFee>, i64)> {
@@ -1099,7 +1099,7 @@ pub(super) fn execute_single_cluster(
 
     // Apply this cluster's state changes to a local delta.
     let apply_delta_start = std::time::Instant::now();
-    let mut cluster_delta = LedgerDelta::new(context.sequence);
+    let mut cluster_delta = LedgerDelta::new(LedgerSeq::new(context.sequence));
     executor.apply_to_delta(&mut cluster_delta)?;
     let apply_delta_us = apply_delta_start.elapsed().as_micros() as u64;
 

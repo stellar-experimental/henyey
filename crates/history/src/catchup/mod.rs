@@ -60,6 +60,7 @@ use crate::{
     verify, CatchupResult, HistoryError, Result,
 };
 use henyey_bucket::{canonical_bucket_filename, BucketList, BucketManager, HotArchiveBucketList};
+use henyey_common::LedgerSeq;
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::Database;
 use std::collections::HashMap;
@@ -130,7 +131,7 @@ pub struct CatchupProgress {
     /// Current ledger being processed during replay.
     ///
     /// Only meaningful when `status` is `Replaying` or `DownloadingLedgers`.
-    pub current_ledger: u32,
+    pub current_ledger: LedgerSeq,
 
     /// Target ledger sequence for this catchup operation.
     pub target_ledger: u32,
@@ -147,7 +148,7 @@ impl Default for CatchupProgress {
             total_steps: 7,
             buckets_downloaded: 0,
             buckets_total: 0,
-            current_ledger: 0,
+            current_ledger: LedgerSeq::from(0),
             target_ledger: 0,
             message: String::new(),
         }
@@ -402,7 +403,7 @@ impl CatchupManager {
         )
         .await?;
 
-        self.persist_bucket_list_snapshot(checkpoint_seq, &bucket_list)?;
+        self.persist_bucket_list_snapshot(checkpoint_seq.into(), &bucket_list)?;
 
         if ledger_manager.is_initialized() {
             ledger_manager.reset();
@@ -453,7 +454,7 @@ impl CatchupManager {
                 "Emitting synthetic LedgerCloseMeta for bucket-applied ledger {}",
                 checkpoint_header.ledger_seq
             );
-            self.emit_meta(checkpoint_header.ledger_seq, meta);
+            self.emit_meta(checkpoint_header.ledger_seq.into(), meta);
 
             (checkpoint_header.clone(), checkpoint_hash, 0)
         } else {
@@ -471,7 +472,7 @@ impl CatchupManager {
         );
 
         Ok(CatchupResult {
-            ledger_seq: final_header.ledger_seq,
+            ledger_seq: final_header.ledger_seq.into(),
             ledger_hash: final_hash,
             ledgers_applied,
             buckets_downloaded,
@@ -560,8 +561,9 @@ impl CatchupManager {
         let buckets = self.download_buckets(&bucket_hashes).await?;
 
         // Steps 4-5: Apply buckets and initialize LedgerManager
-        let (checkpoint_header, checkpoint_hash) =
-            self.download_checkpoint_header(checkpoint_seq).await?;
+        let (checkpoint_header, checkpoint_hash) = self
+            .download_checkpoint_header(checkpoint_seq.into())
+            .await?;
 
         self.apply_buckets_and_init_ledger_manager(
             &has,
@@ -654,8 +656,9 @@ impl CatchupManager {
             let buckets = self.download_buckets(&bucket_hashes).await?;
 
             // Apply buckets and initialize LedgerManager
-            let (checkpoint_header, checkpoint_hash) =
-                self.download_checkpoint_header(bucket_apply_at).await?;
+            let (checkpoint_header, checkpoint_hash) = self
+                .download_checkpoint_header(bucket_apply_at.into())
+                .await?;
 
             self.apply_buckets_and_init_ledger_manager(
                 &has,
@@ -680,7 +683,7 @@ impl CatchupManager {
                             "Case 1 replay: initializing ledger manager from existing state at LCL {}",
                             lcl
                         );
-                        let (header, hash) = self.download_checkpoint_header(lcl).await?;
+                        let (header, hash) = self.download_checkpoint_header(lcl.into()).await?;
                         ledger_manager
                             .initialize(
                                 state.bucket_list,
@@ -714,7 +717,9 @@ impl CatchupManager {
                 checkpoint_seq
             );
         }
-        let (header, hash) = self.download_checkpoint_header(checkpoint_seq).await?;
+        let (header, hash) = self
+            .download_checkpoint_header(checkpoint_seq.into())
+            .await?;
         self.replay_and_finish(
             target,
             checkpoint_seq,

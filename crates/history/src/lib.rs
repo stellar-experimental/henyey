@@ -146,6 +146,7 @@ pub use checkpoint_builder::write_record_marked_xdr;
 pub use compare::{compare_checkpoint, Category, CheckpointComparison, Mismatch};
 pub use download::DownloadConfig;
 pub use error::HistoryError;
+use henyey_common::LedgerSeq;
 pub use paths::{
     bucket_path, checkpoint_path, checkpoint_path_dirty, dirty_to_final_path, final_to_dirty_path,
     is_dirty_path,
@@ -344,7 +345,7 @@ impl HistoryManager {
 #[derive(Debug)]
 pub struct CatchupResult {
     /// The ledger sequence that was caught up to.
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
 
     /// The SHA-256 hash of the final ledger header.
     pub ledger_hash: henyey_common::Hash256,
@@ -659,7 +660,7 @@ impl HistoryArchiveManager {
         let has = HistoryArchiveState {
             version: 2,
             server: Some("rs-stellar-core".to_string()),
-            current_ledger: 0,
+            current_ledger: LedgerSeq::from(0),
             network_passphrase: Some(self.network_passphrase.clone()),
             current_buckets: vec![empty_level.clone(); henyey_bucket::BUCKET_LIST_LEVELS],
             hot_archive_buckets: None,

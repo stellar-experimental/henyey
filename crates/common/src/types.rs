@@ -1,10 +1,164 @@
 //! Common types for rs-stellar-core.
 //!
 //! This module provides fundamental types used throughout the codebase,
-//! particularly the [`Hash256`] type for cryptographic hashes.
+//! particularly the [`Hash256`] type for cryptographic hashes and the
+//! [`LedgerSeq`] newtype for ledger sequence numbers.
 
 use sha2::{Digest, Sha256};
 use std::fmt;
+
+// ============================================================================
+// LedgerSeq — Ledger Sequence Number Newtype
+// ============================================================================
+
+/// A ledger sequence number.
+///
+/// Wraps `u32` to distinguish ledger sequences from other integer values
+/// (protocol versions, timestamps, counts) at the type level.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct LedgerSeq(u32);
+
+impl LedgerSeq {
+    /// The zero ledger sequence (genesis).
+    pub const ZERO: Self = Self(0);
+
+    /// Creates a new `LedgerSeq` from a raw `u32`.
+    pub fn new(seq: u32) -> Self {
+        Self(seq)
+    }
+
+    /// Returns the underlying `u32` value.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Saturating addition with a `u32` offset.
+    pub fn saturating_add(self, n: u32) -> Self {
+        Self(self.0.saturating_add(n))
+    }
+
+    /// Saturating subtraction of a `u32` offset.
+    pub fn saturating_sub(self, n: u32) -> Self {
+        Self(self.0.saturating_sub(n))
+    }
+}
+
+impl fmt::Display for LedgerSeq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl fmt::Debug for LedgerSeq {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LedgerSeq({})", self.0)
+    }
+}
+
+impl From<u32> for LedgerSeq {
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl From<LedgerSeq> for u32 {
+    fn from(v: LedgerSeq) -> u32 {
+        v.0
+    }
+}
+
+impl PartialEq<u32> for LedgerSeq {
+    fn eq(&self, other: &u32) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialOrd<u32> for LedgerSeq {
+    fn partial_cmp(&self, other: &u32) -> Option<std::cmp::Ordering> {
+        Some(self.0.cmp(other))
+    }
+}
+
+impl std::ops::Add<u32> for LedgerSeq {
+    type Output = Self;
+    fn add(self, rhs: u32) -> Self {
+        Self(self.0 + rhs)
+    }
+}
+
+impl std::ops::Sub<u32> for LedgerSeq {
+    type Output = Self;
+    fn sub(self, rhs: u32) -> Self {
+        Self(self.0 - rhs)
+    }
+}
+
+impl std::ops::Sub<LedgerSeq> for LedgerSeq {
+    type Output = u32;
+    fn sub(self, rhs: Self) -> u32 {
+        self.0 - rhs.0
+    }
+}
+
+impl std::ops::Rem<u32> for LedgerSeq {
+    type Output = u32;
+    fn rem(self, rhs: u32) -> u32 {
+        self.0 % rhs
+    }
+}
+
+impl std::ops::AddAssign<u32> for LedgerSeq {
+    fn add_assign(&mut self, rhs: u32) {
+        self.0 += rhs;
+    }
+}
+
+impl std::ops::SubAssign<u32> for LedgerSeq {
+    fn sub_assign(&mut self, rhs: u32) {
+        self.0 -= rhs;
+    }
+}
+
+impl std::str::FromStr for LedgerSeq {
+    type Err = std::num::ParseIntError;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        s.parse::<u32>().map(Self)
+    }
+}
+
+impl serde::Serialize for LedgerSeq {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LedgerSeq {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        u32::deserialize(deserializer).map(Self)
+    }
+}
+
+#[cfg(feature = "rusqlite")]
+impl rusqlite::types::ToSql for LedgerSeq {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::from(self.0 as i64))
+    }
+}
+
+#[cfg(feature = "rusqlite")]
+impl rusqlite::types::FromSql for LedgerSeq {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let v = value.as_i64()?;
+        u32::try_from(v)
+            .map(Self::new)
+            .map_err(|_| rusqlite::types::FromSqlError::OutOfRange(v))
+    }
+}
 
 /// The type of a peer record as stored in the database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -245,7 +245,7 @@ pub(super) fn simulate_extend_ttl_op(
         &resources,
         &rent_changes,
         soroban_info,
-        ledger_info.sequence_number,
+        ledger_info.sequence_number.into(),
         0, // no contract events
         tx_size,
     );
@@ -364,7 +364,7 @@ pub(super) fn simulate_restore_op(
         &resources,
         &rent_changes,
         soroban_info,
-        ledger_info.sequence_number,
+        ledger_info.sequence_number.into(),
         0, // no contract events
         tx_size,
     );

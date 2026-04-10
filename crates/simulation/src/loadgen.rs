@@ -558,8 +558,10 @@ impl TxGenerator {
         inclusion_fee: u32,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let wasm_size = DEFAULT_WASM_SIZE;
-        let wasm =
-            SorobanTxBuilder::random_wasm(wasm_size, deterministic_rand(account_id, ledger_num.get()));
+        let wasm = SorobanTxBuilder::random_wasm(
+            wasm_size,
+            deterministic_rand(account_id, ledger_num.get()),
+        );
         let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
         let builder = self.soroban_builder();
         let envelope = builder.upload_wasm_tx(&sk, seq, &wasm, inclusion_fee)?;
@@ -1285,7 +1287,8 @@ impl LoadGenerator {
         }
 
         // Deterministic weighted selection
-        let rand_val = deterministic_rand(source_account_id, ledger_num.get()) % total_weight as u64;
+        let rand_val =
+            deterministic_rand(source_account_id, ledger_num.get()) % total_weight as u64;
         let pay_threshold = config.mix_pay_weight as u64;
         let upload_threshold = pay_threshold + config.mix_upload_weight as u64;
 
