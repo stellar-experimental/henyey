@@ -1347,29 +1347,34 @@ impl TransactionQueue {
         for evicted in &pending_eviction_list {
             by_hash.remove(&evicted.hash);
         }
-        // Clean up seen set for evicted transactions.
-        // Matches stellar-core prepareDropTransaction → mKnownTxHashes.erase().
+        // Clean up seen set and account state for evicted transactions.
+        // Matches stellar-core prepareDropTransaction → mKnownTxHashes.erase()
+        // + dropTransaction() → releaseFeeMaybeEraseAccountState().
         if !pending_eviction_list.is_empty() {
             let mut seen = self.seen.write();
+            let mut account_states = self.account_states.write();
             for evicted in &pending_eviction_list {
                 seen.remove(&evicted.hash);
+                Self::drop_transaction(&mut account_states, evicted);
             }
         }
 
         // Check queue size
         if by_hash.len() >= self.config.max_size {
             // Try to evict expired transactions
-            let expired: Vec<Hash256> = by_hash
+            let expired: Vec<QueuedTransaction> = by_hash
                 .iter()
                 .filter(|(_, tx)| tx.is_expired(self.config.max_age_secs))
-                .map(|(h, _)| *h)
+                .map(|(_, tx)| tx.clone())
                 .collect();
 
             if !expired.is_empty() {
                 let mut seen = self.seen.write();
-                for hash in &expired {
-                    by_hash.remove(hash);
-                    seen.remove(hash);
+                let mut account_states = self.account_states.write();
+                for tx in &expired {
+                    by_hash.remove(&tx.hash);
+                    seen.remove(&tx.hash);
+                    Self::drop_transaction(&mut account_states, tx);
                 }
             }
 
@@ -1392,6 +1397,8 @@ impl TransactionQueue {
                     if queued.is_better_than(&evict_tx) {
                         by_hash.remove(&evict_hash);
                         self.seen.write().remove(&evict_hash);
+                        let mut account_states = self.account_states.write();
+                        Self::drop_transaction(&mut account_states, &evict_tx);
                     } else {
                         return TxQueueResult::QueueFull;
                     }
@@ -2432,9 +2439,9 @@ mod tests {
         // Try to add tx2 - should fail as banned (not in seen set)
         assert_eq!(queue.try_add(tx2.clone()), TxQueueResult::Banned);
 
-        // tx1 would return Duplicate because it was seen (added before ban)
-        // This is correct behavior - seen takes precedence
-        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Duplicate);
+        // tx1 was seen (added before ban), but ban() now clears seen.
+        // So tx1 is rejected as Banned, not Duplicate.
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Banned);
 
         // Verify ban depth tracking
         let counts = queue.banned_count_by_depth();
@@ -5614,6 +5621,39 @@ mod tests {
         assert!(
             !queue.seen.read().contains(&hash),
             "shift-evicted tx hash should be removed from seen set"
+        );
+    }
+
+    /// Regression test for AUDIT-006: fee-rate eviction cleans up account state.
+    /// Before fix, evicted txs left ghost account_states entries, blocking
+    /// future submissions from the same account with TryAgainLater.
+    #[test]
+    fn test_audit_006_eviction_cleans_account_state() {
+        // Queue with max_size=1 to force eviction on second add
+        let queue = TransactionQueue::with_max_size(1);
+
+        // tx1: low-fee from source 1
+        let mut tx1 = make_test_envelope(100, 1);
+        set_source(&mut tx1, 1);
+
+        // tx2: high-fee from source 2 — will evict tx1
+        let mut tx2 = make_test_envelope(500, 1);
+        set_source(&mut tx2, 2);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        // 1 account state entry (source 1 = both seq-source and fee-source)
+        assert_eq!(queue.account_states.read().len(), 1);
+
+        // tx2 evicts tx1 via fee-rate eviction
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
+
+        // Before fix: account_states had 2 entries (ghost state for source 1).
+        // After fix: only source 2 remains.
+        assert_eq!(
+            queue.account_states.read().len(),
+            1,
+            "evicted tx's account state should be cleaned up"
         );
     }
 }
