@@ -192,14 +192,12 @@ impl Slot {
 
         if let Some(value) = self.ballot.get_externalized_value() {
             self.externalized_value = Some(value.clone());
-            // Restore fully_validated for validators so that the pending
-            // EXTERNALIZE envelope can be emitted.  Non-validators start
-            // with fully_validated=false and stellar-core never sets it
-            // back to true (mFullyValidated is only set false in
-            // BallotProtocol::processEnvelope, never set true after init).
-            if self.is_validator {
-                self.set_fully_validated(true);
-            }
+            // Do NOT restore fully_validated here.  Upstream stellar-core
+            // never sets mFullyValidated back to true after clearing it on
+            // MaybeValid.  The local EXTERNALIZE envelope was already
+            // recorded by emit_current_state; it will be visible through
+            // get_externalizing_state only when fully_validated is true
+            // (i.e., when externalization was reached while fully validated).
         }
     }
 
@@ -218,21 +216,21 @@ impl Slot {
     /// Check if the ballot protocol has externalized and record the result.
     ///
     /// When the ballot protocol reaches externalization, this captures the
-    /// externalized value, marks the slot as fully validated, and stops all
-    /// consensus timers. No-op if already externalized or if the ballot
-    /// protocol hasn't reached externalization.
+    /// externalized value and stops all consensus timers.
+    /// No-op if already externalized or if the ballot protocol hasn't reached
+    /// externalization.
+    ///
+    /// Does NOT force-emit the EXTERNALIZE envelope.  Upstream stellar-core
+    /// never restores `mFullyValidated` after a MaybeValid clears it, so the
+    /// local EXTERNALIZE is only emitted if the slot was fully validated when
+    /// externalization occurred.  `send_latest_envelope` will naturally emit
+    /// from the ballot state machine's own call sites when appropriate.
     fn maybe_record_externalization<D: SCPDriver>(&mut self, driver: &Arc<D>) {
         if !self.ballot.is_externalized() || self.externalized_value.is_some() {
             return;
         }
         if self.ballot.get_externalized_value().is_some() {
             self.sync_externalized_value_from_ballot();
-            // sync_externalized_value_from_ballot resets fully_validated = true.
-            // The EXTERNALIZE envelope was already recorded by set_confirm_commit →
-            // emit_current_state, but send_latest_envelope was blocked because
-            // fully_validated was still false (set by MaybeValid during validation).
-            // Now that fully_validated is true, emit the pending EXTERNALIZE.
-            self.ballot.send_latest_envelope(driver);
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Ballot);
         }
@@ -1631,6 +1629,68 @@ mod tests {
                 ScpStatementPledges::Prepare(_)
             ),
             "should prefer ballot envelope over nomination"
+        );
+    }
+
+    /// Regression test for AUDIT-052: sync_externalized_value_from_ballot must
+    /// NOT restore fully_validated after MaybeValid clears it.
+    /// In stellar-core, mFullyValidated is only set false on MaybeValid and
+    /// never set back to true. A local EXTERNALIZE reached during MaybeValid
+    /// processing should NOT be re-emitted.
+    #[test]
+    fn test_audit_052_maybe_valid_no_reemit_after_externalize() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set();
+        let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
+
+        // Start fully validated (validator)
+        assert!(slot.fully_validated);
+
+        // Simulate MaybeValid clearing fully_validated
+        slot.set_fully_validated(false);
+        assert!(!slot.fully_validated);
+
+        // Simulate externalization happening while not fully validated:
+        // set_state_from_envelope with an EXTERNALIZE populates ballot state
+        let value: Value = vec![42].try_into().unwrap();
+        let externalize = stellar_xdr::curr::ScpStatementExternalize {
+            commit: stellar_xdr::curr::ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            n_h: 1,
+            commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Externalize(externalize),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        slot.set_state_from_envelope(&envelope);
+
+        // After externalization, sync_externalized_value_from_ballot should
+        // NOT have restored fully_validated — it should still be false.
+        slot.sync_externalized_value_from_ballot();
+        assert!(
+            !slot.fully_validated,
+            "sync_externalized_value_from_ballot must not restore fully_validated"
+        );
+
+        // Externalized value should still be captured
+        assert!(
+            slot.externalized_value.is_some(),
+            "externalized value should be captured"
+        );
+
+        // get_externalizing_state should NOT include our own envelope
+        let state = slot.get_externalizing_state();
+        assert!(
+            state.is_empty(),
+            "self EXTERNALIZE should not be returned when not fully validated"
         );
     }
 }
