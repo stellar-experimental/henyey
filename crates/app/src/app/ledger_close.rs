@@ -744,36 +744,41 @@ impl App {
             );
         }
 
-        // Also seed the dynamic Soroban resource limits for queue admission.
+        // Also seed the dynamic Soroban resource limits for queue admission and selection.
         if let Some(soroban_info) = self.soroban_network_info() {
-            let m = POOL_LEDGER_MULTIPLIER as i64;
-            let soroban_limit = henyey_common::Resource::soroban_ledger_limits(
-                soroban_info.ledger_max_tx_count as i64 * m,
-                soroban_info.ledger_max_instructions * m,
-                soroban_info.ledger_max_tx_size_bytes as i64 * m,
-                soroban_info.ledger_max_read_bytes as i64 * m,
-                soroban_info.ledger_max_write_bytes as i64 * m,
-                soroban_info.ledger_max_read_ledger_entries as i64 * m,
-                soroban_info.ledger_max_write_ledger_entries as i64 * m,
-            );
-            self.herder
-                .tx_queue()
-                .update_soroban_resource_limits(soroban_limit);
-
-            // Seed 1x ledger-max limits for tx-set selection (#1175).
-            let selection_limit = henyey_common::Resource::soroban_ledger_limits(
-                soroban_info.ledger_max_tx_count as i64,
-                soroban_info.ledger_max_instructions,
-                soroban_info.ledger_max_tx_size_bytes as i64,
-                soroban_info.ledger_max_read_bytes as i64,
-                soroban_info.ledger_max_write_bytes as i64,
-                soroban_info.ledger_max_read_ledger_entries as i64,
-                soroban_info.ledger_max_write_ledger_entries as i64,
-            );
-            self.herder
-                .tx_queue()
-                .update_soroban_selection_limits(selection_limit);
+            self.update_herder_soroban_limits(&soroban_info);
         }
+    }
+
+    /// Update herder queue-admission (2x) and selection (1x) Soroban limits
+    /// from `SorobanNetworkInfo`. Called at bootstrap and after each ledger close.
+    fn update_herder_soroban_limits(&self, info: &henyey_ledger::SorobanNetworkInfo) {
+        let m = POOL_LEDGER_MULTIPLIER as i64;
+        let queue_limit = henyey_common::Resource::soroban_ledger_limits(
+            info.ledger_max_tx_count as i64 * m,
+            info.ledger_max_instructions * m,
+            info.ledger_max_tx_size_bytes as i64 * m,
+            info.ledger_max_read_bytes as i64 * m,
+            info.ledger_max_write_bytes as i64 * m,
+            info.ledger_max_read_ledger_entries as i64 * m,
+            info.ledger_max_write_ledger_entries as i64 * m,
+        );
+        self.herder
+            .tx_queue()
+            .update_soroban_resource_limits(queue_limit);
+
+        let selection_limit = henyey_common::Resource::soroban_ledger_limits(
+            info.ledger_max_tx_count as i64,
+            info.ledger_max_instructions,
+            info.ledger_max_tx_size_bytes as i64,
+            info.ledger_max_read_bytes as i64,
+            info.ledger_max_write_bytes as i64,
+            info.ledger_max_read_ledger_entries as i64,
+            info.ledger_max_write_ledger_entries as i64,
+        );
+        self.herder
+            .tx_queue()
+            .update_soroban_selection_limits(selection_limit);
     }
 
     /// Restore checkpoint state on startup (crash recovery).
@@ -1789,35 +1794,9 @@ impl App {
             ledger_flags,
         );
 
-        // Update dynamic Soroban resource limits for queue admission.
+        // Update dynamic Soroban resource limits for queue admission and selection.
         if let Some(info) = self.soroban_network_info() {
-            let m = POOL_LEDGER_MULTIPLIER as i64;
-            let soroban_limit = henyey_common::Resource::soroban_ledger_limits(
-                info.ledger_max_tx_count as i64 * m,
-                info.ledger_max_instructions * m,
-                info.ledger_max_tx_size_bytes as i64 * m,
-                info.ledger_max_read_bytes as i64 * m,
-                info.ledger_max_write_bytes as i64 * m,
-                info.ledger_max_read_ledger_entries as i64 * m,
-                info.ledger_max_write_ledger_entries as i64 * m,
-            );
-            self.herder
-                .tx_queue()
-                .update_soroban_resource_limits(soroban_limit);
-
-            // Update 1x ledger-max limits for tx-set selection (#1175).
-            let selection_limit = henyey_common::Resource::soroban_ledger_limits(
-                info.ledger_max_tx_count as i64,
-                info.ledger_max_instructions,
-                info.ledger_max_tx_size_bytes as i64,
-                info.ledger_max_read_bytes as i64,
-                info.ledger_max_write_bytes as i64,
-                info.ledger_max_read_ledger_entries as i64,
-                info.ledger_max_write_ledger_entries as i64,
-            );
-            self.herder
-                .tx_queue()
-                .update_soroban_selection_limits(selection_limit);
+            self.update_herder_soroban_limits(&info);
         }
 
         let shift_result = self.herder.tx_queue().shift();
