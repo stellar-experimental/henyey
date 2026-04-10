@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use henyey_app::App;
-use henyey_common::{Hash256, NetworkId};
+use henyey_common::{Hash256, LedgerSeq, NetworkId};
 use henyey_crypto::SecretKey;
 use henyey_herder::TxQueueResult;
 use henyey_tx::TxResultCode;
@@ -336,7 +336,7 @@ impl TxGenerator {
         SorobanTxBuilder::new(self.network_passphrase.clone())
     }
 
-    fn next_source_sequence(&mut self, account_id: u64, ledger_num: u32) -> (SecretKey, i64) {
+    fn next_source_sequence(&mut self, account_id: u64, ledger_num: LedgerSeq) -> (SecretKey, i64) {
         let source = self.find_account(account_id, ledger_num);
         (source.secret_key.clone(), source.next_sequence_number())
     }
@@ -346,7 +346,7 @@ impl TxGenerator {
     /// Matches stellar-core `TxGenerator::findAccount()`.
     /// For the root account, uses the network root secret key.
     /// For numbered accounts, creates a deterministic keypair from `"TestAccount-{id}"`.
-    pub fn find_account(&mut self, account_id: u64, ledger_num: u32) -> &mut TestAccount {
+    pub fn find_account(&mut self, account_id: u64, ledger_num: LedgerSeq) -> &mut TestAccount {
         if let std::collections::btree_map::Entry::Vacant(entry) = self.accounts.entry(account_id) {
             let account = if account_id == ROOT_ACCOUNT_ID {
                 let network_id = NetworkId::from_passphrase(&self.network_passphrase);
@@ -356,7 +356,7 @@ impl TxGenerator {
                 let seq = self
                     .app
                     .load_account_sequence(&aid)
-                    .unwrap_or((ledger_num as i64) << 32);
+                    .unwrap_or((ledger_num.get() as i64) << 32);
                 TestAccount {
                     secret_key: sk,
                     account_id: aid,
@@ -364,7 +364,7 @@ impl TxGenerator {
                 }
             } else {
                 let name = format!("TestAccount-{}", account_id);
-                let initial_seq = (ledger_num as i64) << 32;
+                let initial_seq = (ledger_num.get() as i64) << 32;
                 let mut account = TestAccount::from_name(&name, initial_seq);
                 // Try to load real sequence from DB
                 if let Some(seq) = self.app.load_account_sequence(&account.account_id) {
@@ -399,11 +399,11 @@ impl TxGenerator {
         &mut self,
         start: u64,
         count: u64,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         balance: i64,
     ) -> Vec<Operation> {
         let mut ops = Vec::with_capacity(count as usize);
-        let initial_seq = (ledger_num as i64) << 32;
+        let initial_seq = (ledger_num.get() as i64) << 32;
         for i in start..start + count {
             let name = format!("TestAccount-{}", i);
             let account = TestAccount::from_name(&name, initial_seq);
@@ -427,14 +427,14 @@ impl TxGenerator {
         &mut self,
         n_accounts: u32,
         offset: u32,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         source_account_id: u64,
     ) -> (u64, u64) {
         // Ensure source is cached
         let _ = self.find_account(source_account_id, ledger_num);
         // Pick a random destination
         let dest_id = if n_accounts > 1 {
-            let raw = deterministic_rand(source_account_id, ledger_num) % (n_accounts as u64);
+            let raw = deterministic_rand(source_account_id, ledger_num.get()) % (n_accounts as u64);
             raw + offset as u64
         } else {
             offset as u64
@@ -470,7 +470,7 @@ impl TxGenerator {
         &mut self,
         n_accounts: u32,
         offset: u32,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         source_account_id: u64,
         max_fee_rate: Option<u32>,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
@@ -505,7 +505,7 @@ impl TxGenerator {
         source_id: u64,
         ops: Vec<Operation>,
         fee: u32,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
     ) -> anyhow::Result<TransactionEnvelope> {
         let source = self.find_account(source_id, ledger_num);
         let seq = source.next_sequence_number();
@@ -553,13 +553,13 @@ impl TxGenerator {
     /// Matches stellar-core `TxGenerator::sorobanRandomWasmTransaction()`.
     pub fn soroban_random_wasm_transaction(
         &mut self,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         account_id: u64,
         inclusion_fee: u32,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let wasm_size = DEFAULT_WASM_SIZE;
         let wasm =
-            SorobanTxBuilder::random_wasm(wasm_size, deterministic_rand(account_id, ledger_num));
+            SorobanTxBuilder::random_wasm(wasm_size, deterministic_rand(account_id, ledger_num.get()));
         let (sk, seq) = self.next_source_sequence(account_id, ledger_num);
         let builder = self.soroban_builder();
         let envelope = builder.upload_wasm_tx(&sk, seq, &wasm, inclusion_fee)?;
@@ -571,7 +571,7 @@ impl TxGenerator {
     /// Matches stellar-core `TxGenerator::createUploadWasmTransaction()`.
     pub fn create_upload_wasm_transaction(
         &mut self,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         account_id: u64,
         wasm: &[u8],
         max_fee_rate: Option<u32>,
@@ -588,7 +588,7 @@ impl TxGenerator {
     /// Matches stellar-core `TxGenerator::createContractTransaction()`.
     pub fn create_contract_transaction(
         &mut self,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         account_id: u64,
         wasm_hash: &Hash256,
         salt: &Uint256,
@@ -607,7 +607,7 @@ impl TxGenerator {
     /// loadgen contract. Matches stellar-core `TxGenerator::invokeSorobanLoadTransaction()`.
     pub fn invoke_soroban_load_transaction(
         &mut self,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         account_id: u64,
         instance: &ContractInstance,
         max_fee_rate: Option<u32>,
@@ -615,7 +615,7 @@ impl TxGenerator {
         let fee = self.generate_fee(max_fee_rate, 1, account_id);
 
         // Sample workload parameters deterministically
-        let rand_val = deterministic_rand(account_id, ledger_num);
+        let rand_val = deterministic_rand(account_id, ledger_num.get());
         let target_instructions: u32 =
             INVOKE_BASE_INSTRUCTIONS + (rand_val % INVOKE_INSTRUCTIONS_RANGE) as u32;
 
@@ -673,7 +673,7 @@ impl TxGenerator {
     /// Matches stellar-core `TxGenerator::createSACTransaction()`.
     pub fn create_sac_transaction(
         &mut self,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         account_id: Option<u64>,
         asset: Asset,
         max_fee_rate: Option<u32>,
@@ -691,7 +691,7 @@ impl TxGenerator {
     /// Matches stellar-core `TxGenerator::invokeSACPayment()`.
     pub fn invoke_sac_payment(
         &mut self,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         from_account_id: u64,
         to_address: ScAddress,
         instance: &ContractInstance,
@@ -723,7 +723,7 @@ impl TxGenerator {
     /// Matches stellar-core `TxGenerator::invokeBatchTransfer()`.
     pub fn invoke_batch_transfer(
         &mut self,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
         source_account_id: u64,
         batch_instance: &ContractInstance,
         sac_instance: &ContractInstance,
@@ -1044,7 +1044,7 @@ impl LoadGenerator {
     /// has no pending transactions in the herder queue.
     ///
     /// Matches stellar-core `LoadGenerator::getNextAvailableAccount()`.
-    fn get_next_available_account(&mut self, ledger_num: u32) -> Option<u64> {
+    fn get_next_available_account(&mut self, ledger_num: LedgerSeq) -> Option<u64> {
         // Try up to `available.len()` times to find a non-pending account
         let max_attempts = self.accounts_available.len();
         for _ in 0..max_attempts {
@@ -1053,7 +1053,7 @@ impl LoadGenerator {
             }
 
             // Pick deterministically using size-based index
-            let idx = deterministic_rand(self.total_submitted as u64, ledger_num) as usize
+            let idx = deterministic_rand(self.total_submitted as u64, ledger_num.get()) as usize
                 % self.accounts_available.len();
 
             let id = *self
@@ -1114,7 +1114,7 @@ impl LoadGenerator {
         &mut self,
         config: &mut GeneratedLoadConfig,
         source_account_id: u64,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
     ) -> bool {
         let mut num_tries = 0u32;
 
@@ -1179,7 +1179,7 @@ impl LoadGenerator {
         &mut self,
         config: &mut GeneratedLoadConfig,
         source_account_id: u64,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         match config.mode {
             LoadGenMode::Pay => self.tx_generator.payment_transaction(
@@ -1217,7 +1217,7 @@ impl LoadGenerator {
                     let wasm_hash = SorobanTxBuilder::loadgen_wasm_hash();
                     let salt = Uint256(
                         Hash256::hash(
-                            &deterministic_rand(source_account_id, ledger_num).to_le_bytes(),
+                            &deterministic_rand(source_account_id, ledger_num.get()).to_le_bytes(),
                         )
                         .0,
                     );
@@ -1276,7 +1276,7 @@ impl LoadGenerator {
         &mut self,
         config: &GeneratedLoadConfig,
         source_account_id: u64,
-        ledger_num: u32,
+        ledger_num: LedgerSeq,
     ) -> anyhow::Result<(u64, TransactionEnvelope)> {
         let total_weight =
             config.mix_pay_weight + config.mix_upload_weight + config.mix_invoke_weight;
@@ -1285,7 +1285,7 @@ impl LoadGenerator {
         }
 
         // Deterministic weighted selection
-        let rand_val = deterministic_rand(source_account_id, ledger_num) % total_weight as u64;
+        let rand_val = deterministic_rand(source_account_id, ledger_num.get()) % total_weight as u64;
         let pay_threshold = config.mix_pay_weight as u64;
         let upload_threshold = pay_threshold + config.mix_upload_weight as u64;
 

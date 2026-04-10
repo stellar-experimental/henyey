@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use anyhow::{ensure, Context, Result};
 use henyey_app::App;
-use henyey_common::Hash256;
+use henyey_common::{Hash256, LedgerSeq};
 use henyey_ledger::{LedgerCloseData, LedgerClosePerf, TransactionSetVariant};
 use stellar_xdr::curr::{
     ConfigSettingEntry, ContractDataDurability, ContractId, ContractIdPreimage,
@@ -391,7 +391,7 @@ impl ApplyLoad {
         let tx_set = self.build_tx_set_from_envelopes(txs, &header_hash);
 
         let close_data = LedgerCloseData::new(
-            header.ledger_seq + 1,
+            LedgerSeq::new(header.ledger_seq + 1),
             tx_set,
             header.scp_value.close_time.0 + 1,
             header_hash,
@@ -679,7 +679,7 @@ impl ApplyLoad {
     /// Matches stellar-core `ApplyLoad::setup()`.
     fn setup(&mut self) -> Result<()> {
         // Load root account.
-        self.tx_gen.find_account(self.root_account_id, 1);
+        self.tx_gen.find_account(self.root_account_id, LedgerSeq::new(1));
         ensure!(
             self.tx_gen.load_account(self.root_account_id),
             "failed to load root account"
@@ -819,7 +819,7 @@ impl ApplyLoad {
         );
 
         // Construct the ContractInstance from the deployed contract.
-        let root_account = self.tx_gen.find_account(self.root_account_id, 0);
+        let root_account = self.tx_gen.find_account(self.root_account_id, LedgerSeq::new(0));
         let root_pk = root_account.secret_key.public_key();
         let deployer_address = crate::loadgen_soroban::make_account_address(&root_pk);
         let preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
@@ -1023,7 +1023,7 @@ impl ApplyLoad {
 
                 generate_live_entries(
                     &base_live_entry,
-                    header.ledger_seq,
+                    header.ledger_seq.into(),
                     entry_count,
                     &mut current_live_key,
                     &mut live_entries,
@@ -1036,7 +1036,7 @@ impl ApplyLoad {
                 };
 
                 generate_archived_entries(
-                    header.ledger_seq,
+                    header.ledger_seq.into(),
                     archived_entry_count,
                     &mut current_hot_archive_key,
                     &mut archived_entries,
@@ -1045,7 +1045,7 @@ impl ApplyLoad {
 
             // Add to live bucket list.
             lm.bucket_list_mut().add_batch(
-                header.ledger_seq,
+                LedgerSeq::new(header.ledger_seq),
                 header.ledger_version,
                 stellar_xdr::curr::BucketListType::Live,
                 Vec::new(), // init_entries
@@ -1058,7 +1058,7 @@ impl ApplyLoad {
                 let mut ha_guard = lm.hot_archive_bucket_list_mut();
                 if let Some(ref mut hot_archive) = *ha_guard {
                     hot_archive.add_batch(
-                        header.ledger_seq,
+                        LedgerSeq::new(header.ledger_seq),
                         header.ledger_version,
                         archived_entries,
                         Vec::new(), // deleted entries
@@ -1443,7 +1443,7 @@ impl ApplyLoad {
         // Build the CONTRACT_DATA entry
         let ledger_seq = self.app.ledger_manager().current_ledger_seq();
         let contract_data_entry = LedgerEntry {
-            last_modified_ledger_seq: ledger_seq,
+            last_modified_ledger_seq: ledger_seq.get(),
             data: LedgerEntryData::ContractData(ContractDataEntry {
                 ext: ExtensionPoint::V0,
                 contract: ScAddress::Contract(ContractId(Hash(contract_id.0))),
@@ -1639,14 +1639,14 @@ impl ApplyLoad {
 /// Generate live entries and their TTL entries for a bucket list batch.
 fn generate_live_entries(
     base_entry: &LedgerEntry,
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     count: u32,
     current_key: &mut u64,
     entries: &mut Vec<LedgerEntry>,
 ) {
     for _ in 0..count {
         let mut le = base_entry.clone();
-        le.last_modified_ledger_seq = ledger_seq;
+        le.last_modified_ledger_seq = ledger_seq.get();
         if let LedgerEntryData::ContractData(ref mut cd) = le.data {
             cd.key = ScVal::U64(*current_key);
         }
@@ -1654,7 +1654,7 @@ fn generate_live_entries(
 
         let ttl_key_hash = Hash256::hash(&le.to_xdr(Limits::none()).unwrap_or_default());
         let ttl_entry = LedgerEntry {
-            last_modified_ledger_seq: ledger_seq,
+            last_modified_ledger_seq: ledger_seq.get(),
             data: LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
                 key_hash: Hash(ttl_key_hash.0),
                 live_until_ledger_seq: 1_000_000_000,
@@ -1668,7 +1668,7 @@ fn generate_live_entries(
 
 /// Generate archived entries for a hot archive bucket list batch.
 fn generate_archived_entries(
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     count: u32,
     current_key: &mut u64,
     entries: &mut Vec<LedgerEntry>,
@@ -1676,7 +1676,7 @@ fn generate_archived_entries(
     for _ in 0..count {
         let lk = ApplyLoad::key_for_archived_entry(*current_key);
         let le = LedgerEntry {
-            last_modified_ledger_seq: ledger_seq,
+            last_modified_ledger_seq: ledger_seq.get(),
             data: LedgerEntryData::ContractData(stellar_xdr::curr::ContractDataEntry {
                 ext: ExtensionPoint::V0,
                 contract: match &lk {

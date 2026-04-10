@@ -1,6 +1,7 @@
 //! Deterministic multi-node simulation harness for validating consensus,
 //! overlay, and ledger-close behavior across configurable topologies.
 
+use henyey_common::LedgerSeq;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -43,20 +44,20 @@ pub enum SimulationMode {
 
 /// Check whether all sequence numbers in `seqs` are at least `min_ledger`
 /// and within `max_spread` of each other.
-fn seqs_within_spread(seqs: &[u32], min_ledger: u32, max_spread: u32) -> bool {
+fn seqs_within_spread(seqs: &[u32], min_ledger: LedgerSeq, max_spread: u32) -> bool {
     if seqs.is_empty() {
         return false;
     }
     let min_seq = *seqs.iter().min().unwrap_or(&0);
     let max_seq = *seqs.iter().max().unwrap_or(&0);
-    min_seq >= min_ledger && max_seq.saturating_sub(min_seq) <= max_spread
+    min_seq >= min_ledger.get() && max_seq.saturating_sub(min_seq) <= max_spread
 }
 
 #[derive(Debug, Clone)]
 pub struct SimNode {
     pub node_id: String,
     pub secret_key: SecretKey,
-    pub ledger_seq: u32,
+    pub ledger_seq: LedgerSeq,
     pub ledger_hash: Hash256,
 }
 
@@ -144,7 +145,7 @@ impl Simulation {
         let node = SimNode {
             node_id: node_id.clone(),
             secret_key,
-            ledger_seq: 1,
+            ledger_seq: LedgerSeq::new(1),
             ledger_hash: Hash256::hash(node_id.as_bytes()),
         };
         self.nodes.insert(node_id, node);
@@ -417,7 +418,7 @@ impl Simulation {
     pub fn app_ledger_seq(&self, node_id: &str) -> Option<u32> {
         self.running_apps
             .get(node_id)
-            .map(|n| n.app.ledger_info().ledger_seq)
+            .map(|n| n.app.ledger_info().ledger_seq.get())
     }
 
     pub fn app_latest_externalized_slot(&self, node_id: &str) -> Option<u64> {
@@ -561,20 +562,20 @@ impl Simulation {
         Ok(false)
     }
 
-    pub fn have_all_app_nodes_externalized(&self, ledger_seq: u32, max_spread: u32) -> bool {
+    pub fn have_all_app_nodes_externalized(&self, ledger_seq: LedgerSeq, max_spread: u32) -> bool {
         if self.running_apps.is_empty() {
             return false;
         }
         let seqs: Vec<u32> = self
             .running_apps
             .values()
-            .map(|n| n.app.ledger_info().ledger_seq)
+            .map(|n| n.app.ledger_info().ledger_seq.get())
             .collect();
         seqs_within_spread(&seqs, ledger_seq, max_spread)
     }
 
     /// Advance a SimNode's ledger sequence and recompute its hash.
-    fn advance_node(&mut self, node_id: &str, next_seq: u32) {
+    fn advance_node(&mut self, node_id: &str, next_seq: LedgerSeq) {
         let hash_input = format!("{}:{}", node_id, next_seq);
         if let Some(node) = self.nodes.get_mut(node_id) {
             node.ledger_seq = next_seq;
@@ -675,14 +676,14 @@ impl Simulation {
             .iter()
             .filter_map(|id| self.nodes.get(id).map(|n| n.ledger_seq))
             .max()
-            .unwrap_or(1);
+            .unwrap_or(LedgerSeq::new(1));
 
         for id in &ids {
             if self.loopback.is_partitioned(id) {
                 continue;
             }
 
-            let current = self.nodes.get(id).map(|n| n.ledger_seq).unwrap_or(1);
+            let current = self.nodes.get(id).map(|n| n.ledger_seq).unwrap_or(LedgerSeq::new(1));
             if current < max_seq && self.has_connected_peer(id, &ids) {
                 self.advance_node(id, current + 1);
                 did_work = true;
@@ -698,7 +699,7 @@ impl Simulation {
 
     /// Attempt to advance all non-partitioned, fully-caught-up nodes by one
     /// ledger if they are mutually connected.
-    fn try_advance_non_partitioned(&mut self, ids: &[String], max_seq: u32) -> bool {
+    fn try_advance_non_partitioned(&mut self, ids: &[String], max_seq: LedgerSeq) -> bool {
         let non_partitioned: Vec<String> = ids
             .iter()
             .filter(|id| !self.loopback.is_partitioned(id))
@@ -742,7 +743,7 @@ impl Simulation {
         predicate(self)
     }
 
-    pub fn have_all_externalized(&self, ledger_seq: u32, max_spread: u32) -> bool {
+    pub fn have_all_externalized(&self, ledger_seq: LedgerSeq, max_spread: u32) -> bool {
         if self.nodes.is_empty() {
             return false;
         }
@@ -750,13 +751,13 @@ impl Simulation {
             .nodes
             .iter()
             .filter(|(id, _)| !self.loopback.is_partitioned(id))
-            .map(|(_, n)| n.ledger_seq)
+            .map(|(_, n)| n.ledger_seq.get())
             .collect();
         seqs_within_spread(&seqs, ledger_seq, max_spread)
     }
 
-    pub fn ledger_seq(&self, node_id: &str) -> u32 {
-        self.nodes.get(node_id).map(|n| n.ledger_seq).unwrap_or(0)
+    pub fn ledger_seq(&self, node_id: &str) -> LedgerSeq {
+        self.nodes.get(node_id).map(|n| n.ledger_seq).unwrap_or(LedgerSeq::new(0))
     }
 
     pub fn node_ids(&self) -> Vec<String> {
@@ -904,7 +905,7 @@ impl Simulation {
             Ok(true) => {
                 let info = app.ledger_info();
                 tracing::info!(
-                    lcl_seq = info.ledger_seq,
+                    lcl_seq = info.ledger_seq.get(),
                     "Restored restarted node from disk"
                 );
             }
@@ -1360,7 +1361,7 @@ pub fn initialize_genesis_ledger(
 
     let mut bucket_list = BucketList::new();
     bucket_list
-        .add_batch(1, 0, BucketListType::Live, genesis_entries, vec![], vec![])
+        .add_batch(LedgerSeq::new(1), 0, BucketListType::Live, genesis_entries, vec![], vec![])
         .map_err(|e| anyhow::anyhow!("Failed to add genesis entries to bucket list: {}", e))?;
 
     let bucket_list_hash = bucket_list.hash();
@@ -1415,9 +1416,9 @@ pub fn initialize_genesis_ledger(
 
     db.with_connection(|conn| {
         conn.store_ledger_header(&header, &header_xdr)?;
-        conn.store_tx_history_entry(1, &genesis_tx_history)?;
-        conn.store_tx_result_entry(1, &genesis_tx_result)?;
-        conn.store_bucket_list(1, &bucket_levels)?;
+        conn.store_tx_history_entry(LedgerSeq::new(1), &genesis_tx_history)?;
+        conn.store_tx_result_entry(LedgerSeq::new(1), &genesis_tx_result)?;
+        conn.store_bucket_list(LedgerSeq::new(1), &bucket_levels)?;
         conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
         conn.set_state(state_keys::NETWORK_PASSPHRASE, network_passphrase)?;
         conn.set_last_closed_ledger(1)?;
