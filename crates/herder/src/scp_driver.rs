@@ -27,22 +27,23 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use parking_lot::RwLock;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, trace, warn};
 
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{PublicKey, SecretKey, Signature};
 use henyey_ledger::LedgerManager;
-use henyey_scp::{hash_quorum_set, SCPDriver, SlotIndex, ValidationLevel};
+use henyey_scp::{SCPDriver, SlotIndex, ValidationLevel};
 use stellar_xdr::curr::{
     EnvelopeType, LedgerUpgrade, NodeId, ReadXdr, ScpEnvelope, ScpQuorumSet, ScpStatement,
     StellarValue, StellarValueExt, Value, WriteXdr,
 };
 
 use crate::error::HerderError;
+use crate::quorum_set_tracker::QuorumSetTracker;
 use crate::tx_queue::TransactionSet;
+use crate::tx_set_tracker::TxSetTracker;
 use crate::upgrades::Upgrades;
 use crate::Result;
 
@@ -133,7 +134,7 @@ pub struct CachedTxSet {
 }
 
 impl CachedTxSet {
-    fn new(tx_set: TransactionSet) -> Self {
+    pub(crate) fn new(tx_set: TransactionSet) -> Self {
         Self {
             tx_set,
             cached_at: std::time::Instant::now(),
@@ -194,6 +195,8 @@ pub struct ScpDriverCacheSizes {
     pub quorum_sets: usize,
     /// Quorum sets by hash.
     pub quorum_sets_by_hash: usize,
+    /// Cached tx-set validity results.
+    pub tx_set_valid_cache: usize,
 }
 
 /// Callback type for broadcasting SCP envelopes to peers.
@@ -212,12 +215,11 @@ pub struct ScpDriver {
     config: ScpDriverConfig,
     /// Secret key for signing (None if not a validator).
     secret_key: Option<SecretKey>,
-    /// Cached transaction sets by hash.
-    tx_set_cache: DashMap<Hash256, CachedTxSet>,
-    /// Pending transaction set requests (hashes we need but don't have).
-    pending_tx_sets: DashMap<Hash256, PendingTxSet>,
-    /// Pending quorum set requests (hashes we need but don't have).
-    pending_quorum_sets: DashMap<Hash256, PendingQuorumSet>,
+    /// Quorum-set tracker (replaces quorum_sets, quorum_sets_by_hash,
+    /// pending_quorum_sets, local_quorum_set).
+    qset_tracker: QuorumSetTracker,
+    /// Tx-set tracker (replaces tx_set_cache, pending_tx_sets, tx_set_valid_cache).
+    tx_tracker: TxSetTracker,
     /// Externalized slots.
     externalized: RwLock<HashMap<SlotIndex, ExternalizedSlot>>,
     /// Latest externalized slot.
@@ -226,12 +228,6 @@ pub struct ScpDriver {
     envelope_sender: RwLock<Option<EnvelopeSender>>,
     /// Network ID for signing.
     network_id: Hash256,
-    /// Quorum sets by node ID (key is 32-byte public key).
-    quorum_sets: DashMap<[u8; 32], ScpQuorumSet>,
-    /// Quorum sets by quorum set hash.
-    quorum_sets_by_hash: DashMap<Hash256, ScpQuorumSet>,
-    /// Our local quorum set.
-    local_quorum_set: RwLock<Option<ScpQuorumSet>>,
     /// Ledger manager for network configuration lookups.
     ledger_manager: RwLock<Option<Arc<LedgerManager>>>,
     /// Upgrade parameters for nomination validation.
@@ -239,9 +235,6 @@ pub struct ScpDriver {
     upgrades: RwLock<Option<Arc<RwLock<Upgrades>>>>,
     /// Shared tracking consensus state (owned by Herder, read by ScpDriver).
     tracking_state: Arc<RwLock<SharedTrackingState>>,
-    /// Cache for tx set validity checks, keyed on (lcl_hash, tx_set_hash, close_time_offset).
-    /// Bounded to ~64 entries. Cleared on ledger close.
-    tx_set_valid_cache: DashMap<(Hash256, Hash256, u64), bool>,
 }
 
 impl ScpDriver {
@@ -252,31 +245,22 @@ impl ScpDriver {
         tracking_state: Arc<RwLock<SharedTrackingState>>,
     ) -> Self {
         let local_quorum_set = config.local_quorum_set.clone();
-        let quorum_sets = DashMap::new();
-        let quorum_sets_by_hash = DashMap::new();
+        let local_node_key = *config.node_id.as_bytes();
+        let qset_tracker = QuorumSetTracker::new(local_node_key, local_quorum_set);
+        let tx_tracker = TxSetTracker::new(config.max_tx_set_cache);
 
-        if let Some(ref quorum_set) = local_quorum_set {
-            let hash = hash_quorum_set(quorum_set);
-            quorum_sets_by_hash.insert(hash, quorum_set.clone());
-            quorum_sets.insert(*config.node_id.as_bytes(), quorum_set.clone());
-        }
         Self {
             config,
             secret_key: None,
-            tx_set_cache: DashMap::new(),
-            pending_tx_sets: DashMap::new(),
-            pending_quorum_sets: DashMap::new(),
+            qset_tracker,
+            tx_tracker,
             externalized: RwLock::new(HashMap::new()),
             latest_externalized: RwLock::new(None),
             envelope_sender: RwLock::new(None),
             network_id,
-            quorum_sets,
-            quorum_sets_by_hash,
-            local_quorum_set: RwLock::new(local_quorum_set),
             ledger_manager: RwLock::new(None),
             upgrades: RwLock::new(None),
             tracking_state,
-            tx_set_valid_cache: DashMap::new(),
         }
     }
 
@@ -312,7 +296,7 @@ impl ScpDriver {
 
     /// Clear the tx set validity cache (call on ledger close).
     pub fn clear_tx_set_valid_cache(&self) {
-        self.tx_set_valid_cache.clear();
+        self.tx_tracker.clear_valid_cache();
     }
 
     /// Check and cache whether a transaction set is valid for application.
@@ -333,18 +317,12 @@ impl ScpDriver {
         let cache_key = (lcl_hash, tx_set.hash, close_time_offset);
 
         // Check cache
-        if let Some(cached) = self.tx_set_valid_cache.get(&cache_key) {
-            return *cached;
+        if let Some(cached) = self.tx_tracker.check_valid(&cache_key) {
+            return cached;
         }
 
-        // Bound cache size
-        if self.tx_set_valid_cache.len() >= 64 {
-            // Evict an arbitrary entry
-            if let Some(entry) = self.tx_set_valid_cache.iter().next().map(|e| *e.key()) {
-                self.tx_set_valid_cache.remove(&entry);
-            }
-        }
-
+        // Bound cache size (evict one if >= 64)
+        // Note: valid_cache is small enough that this simple approach works
         let network_id = NetworkId(self.network_id);
 
         // prepare_for_apply validates XDR structure, fees, sort order, dedup
@@ -355,7 +333,7 @@ impl ScpDriver {
                     "check_and_cache_tx_set_valid: prepare_for_apply failed: {}",
                     e
                 );
-                self.tx_set_valid_cache.insert(cache_key, false);
+                self.tx_tracker.store_valid(cache_key, false);
                 return false;
             }
         };
@@ -391,214 +369,91 @@ impl ScpDriver {
             true
         };
 
-        self.tx_set_valid_cache.insert(cache_key, result);
+        self.tx_tracker.store_valid(cache_key, result);
         result
     }
 
     /// Cache a transaction set.
     pub fn cache_tx_set(&self, tx_set: TransactionSet) {
-        let hash = tx_set.hash;
-
-        // Check cache size limit
-        if self.tx_set_cache.len() >= self.config.max_tx_set_cache {
-            // Evict oldest entry
-            if let Some(oldest) = self
-                .tx_set_cache
-                .iter()
-                .min_by_key(|e| e.cached_at)
-                .map(|e| *e.key())
-            {
-                self.tx_set_cache.remove(&oldest);
-            }
-        }
-
-        self.tx_set_cache.insert(hash, CachedTxSet::new(tx_set));
+        self.tx_tracker.store(tx_set);
     }
 
     /// Get a cached transaction set by hash.
     pub fn get_tx_set(&self, hash: &Hash256) -> Option<TransactionSet> {
-        self.tx_set_cache.get_mut(hash).map(|mut entry| {
-            entry.request_count += 1;
-            entry.tx_set.clone()
-        })
+        self.tx_tracker.get(hash)
     }
 
     /// Check if a transaction set is cached.
     pub fn has_tx_set(&self, hash: &Hash256) -> bool {
-        self.tx_set_cache.contains_key(hash)
+        self.tx_tracker.is_cached(hash)
     }
 
     /// Register a pending tx set request.
     /// Returns true if this is a new request, false if already pending.
     pub fn request_tx_set(&self, hash: Hash256, slot: SlotIndex) -> bool {
-        if self.tx_set_cache.contains_key(&hash) {
-            // Already have it
-            return false;
-        }
-
-        if self.pending_tx_sets.contains_key(&hash) {
-            // Already requested, increment count
-            if let Some(mut entry) = self.pending_tx_sets.get_mut(&hash) {
-                entry.request_count += 1;
-            }
-            return false;
-        }
-
-        // New request
-        self.pending_tx_sets.insert(
-            hash,
-            PendingTxSet {
-                hash,
-                slot,
-                requested_at: std::time::Instant::now(),
-                request_count: 1,
-            },
-        );
-        debug!(%hash, slot, "Registered pending tx set request");
-        true
+        self.tx_tracker.request(hash, slot)
     }
 
     /// Register a pending quorum set request.
     /// Returns true if this is a new request, false if already pending or known.
     /// The node_id is the envelope sender that uses this quorum set.
     pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId) -> bool {
-        // If we already have this quorum set, store the association with this node_id
-        // Clone the quorum set before dropping the lock to avoid deadlock
-        let existing_qs = self.quorum_sets_by_hash.get(&hash).map(|qs| qs.clone());
-        if let Some(qs) = existing_qs {
-            trace!(%hash, node_id = ?node_id, "Associating existing quorum set with node");
-            self.store_quorum_set(&node_id, qs);
-            return false;
-        }
-
-        // If already pending, add this node_id to the set
-        if let Some(mut entry) = self.pending_quorum_sets.get_mut(&hash) {
-            entry.request_count += 1;
-            entry.node_ids.insert(node_id);
-            return false;
-        }
-
-        // New request - create pending entry with this node_id
-        let mut node_ids = HashSet::new();
-        node_ids.insert(node_id);
-        self.pending_quorum_sets.insert(
-            hash,
-            PendingQuorumSet {
-                request_count: 1,
-                node_ids,
-            },
-        );
-        info!(%hash, "Registered pending quorum set request");
-        true
+        self.qset_tracker.request(hash, node_id)
     }
 
     /// Clear a quorum set request once it has been satisfied.
     pub fn clear_quorum_set_request(&self, hash: &Hash256) {
-        self.pending_quorum_sets.remove(hash);
+        self.qset_tracker.clear_pending(hash);
     }
 
     /// Get the node IDs that are waiting for a quorum set with the given hash.
     pub fn get_pending_quorum_set_node_ids(&self, hash: &Hash256) -> Vec<NodeId> {
-        self.pending_quorum_sets
-            .get(hash)
-            .map(|entry| entry.node_ids.iter().cloned().collect())
-            .unwrap_or_default()
+        self.qset_tracker.pending_node_ids(hash)
     }
 
     /// Get all pending tx set hashes that need to be fetched.
     pub fn get_pending_tx_set_hashes(&self) -> Vec<Hash256> {
-        self.pending_tx_sets
-            .iter()
-            .map(|entry| *entry.key())
-            .collect()
+        self.tx_tracker.pending_hashes()
     }
 
     /// Get all pending tx sets with their slots.
     pub fn get_pending_tx_sets(&self) -> Vec<(Hash256, SlotIndex)> {
-        self.pending_tx_sets
-            .iter()
-            .map(|entry| {
-                let pending = entry.value();
-                (pending.hash, pending.slot)
-            })
-            .collect()
+        self.tx_tracker.pending_entries()
     }
 
     /// Clear all pending tx set requests.
     /// Used after rapid close cycles to discard stale requests whose tx_sets
     /// are no longer available from peers.
     pub fn clear_pending_tx_sets(&self) {
-        let count = self.pending_tx_sets.len();
-        self.pending_tx_sets.clear();
-        if count > 0 {
-            debug!(cleared = count, "Cleared stale pending tx_set requests");
-        }
+        self.tx_tracker.clear_pending();
     }
 
     /// Check if we need a tx set.
     pub fn needs_tx_set(&self, hash: &Hash256) -> bool {
-        self.pending_tx_sets.contains_key(hash) && !self.tx_set_cache.contains_key(hash)
+        self.tx_tracker.needs(hash)
     }
 
     /// Receive a tx set from the network.
     /// Returns the slot it was needed for, if any.
     pub fn receive_tx_set(&self, tx_set: TransactionSet) -> Option<SlotIndex> {
-        let hash = tx_set.hash;
-        if let Some(recomputed) = tx_set.recompute_hash() {
-            if recomputed != hash {
-                warn!(
-                    expected = %hash,
-                    computed = %recomputed,
-                    "Rejecting tx set with mismatched hash"
-                );
-                return None;
-            }
-        } else {
-            warn!(%hash, "Rejecting tx set without recomputable hash");
-            return None;
-        }
-
-        // Remove from pending
-        let pending = self.pending_tx_sets.remove(&hash);
-        let slot = pending.map(|(_, p)| p.slot);
-
-        // Cache it
-        self.cache_tx_set(tx_set);
-
-        if let Some(s) = slot {
-            debug!(%hash, slot = s, "Received pending tx set");
-        } else {
-            debug!(%hash, "Received tx set (not pending)");
-        }
-
-        slot
+        self.tx_tracker.receive(tx_set)
     }
 
     /// Clean up old pending requests.
     pub fn cleanup_pending_tx_sets(&self, max_age_secs: u64) {
-        let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(max_age_secs);
-        self.pending_tx_sets.retain(|_, v| v.requested_at > cutoff);
+        self.tx_tracker.cleanup_by_age(max_age_secs);
     }
 
     /// Clean up pending requests for slots older than the given slot.
     /// Returns the number of requests removed.
     pub fn cleanup_old_pending_slots(&self, current_slot: SlotIndex) -> usize {
-        let old_count = self.pending_tx_sets.len();
-        // Only keep requests for the current slot - peers don't cache old tx sets long
-        // We use >= current_slot to keep current and future (shouldn't happen but be safe)
-        self.pending_tx_sets.retain(|_, v| v.slot >= current_slot);
-        let new_count = self.pending_tx_sets.len();
-        old_count - new_count
+        self.tx_tracker.cleanup_old_slots(current_slot)
     }
 
     /// Check if any pending tx set request has been waiting longer than the given duration.
     /// Returns true if at least one request has exceeded the timeout.
     pub fn has_stale_pending_tx_set(&self, max_wait_secs: u64) -> bool {
-        let now = std::time::Instant::now();
-        let max_wait = std::time::Duration::from_secs(max_wait_secs);
-        self.pending_tx_sets
-            .iter()
-            .any(|entry| now.duration_since(entry.value().requested_at) >= max_wait)
+        self.tx_tracker.has_stale_pending(max_wait_secs)
     }
 
     /// Get the network ID.
@@ -940,9 +795,9 @@ impl ScpDriver {
                 debug!("Missing transaction set: {}", tx_set_hash);
                 return ValueValidation::Invalid;
             }
-            if let Some(tx_set) = self.tx_set_cache.get(&tx_set_hash) {
+            if let Some(tx_set) = self.tx_tracker.get(&tx_set_hash) {
                 // Parity: verify hash integrity
-                match tx_set.tx_set.recompute_hash() {
+                match tx_set.recompute_hash() {
                     Some(computed) if computed == tx_set_hash => {}
                     Some(computed) => {
                         debug!(
@@ -960,10 +815,10 @@ impl ScpDriver {
                 // Parity: check previousLedgerHash matches the LCL hash
                 let lcl_hash = if let Some(ref lm) = *self.ledger_manager.read() {
                     let hash = lm.current_header_hash();
-                    if tx_set.tx_set.previous_ledger_hash != hash {
+                    if tx_set.previous_ledger_hash != hash {
                         debug!(
                             "Tx set previousLedgerHash mismatch: expected {}, got {}",
-                            hash, tx_set.tx_set.previous_ledger_hash
+                            hash, tx_set.previous_ledger_hash
                         );
                         return ValueValidation::Invalid;
                     }
@@ -976,9 +831,7 @@ impl ScpDriver {
                 // For generalized tx sets, per-component sort order is validated
                 // during extraction (tx_set.rs:validate_component). The global
                 // hash-sort check only applies to legacy (non-generalized) sets.
-                if tx_set.tx_set.generalized_tx_set.is_none()
-                    && !Self::is_tx_set_well_formed(&tx_set.tx_set)
-                {
+                if tx_set.generalized_tx_set.is_none() && !Self::is_tx_set_well_formed(&tx_set) {
                     debug!("Legacy tx set is not well-formed (unsorted or has duplicates)");
                     return ValueValidation::Invalid;
                 }
@@ -987,11 +840,7 @@ impl ScpDriver {
                 // Mirrors stellar-core's checkAndCacheTxSetValid()
                 if let Some(lcl_hash) = lcl_hash {
                     let close_time_offset = close_time.saturating_sub(lcl_close_time);
-                    if !self.check_and_cache_tx_set_valid(
-                        &tx_set.tx_set,
-                        lcl_hash,
-                        close_time_offset,
-                    ) {
+                    if !self.check_and_cache_tx_set_valid(&tx_set, lcl_hash, close_time_offset) {
                         debug!("Tx set content validation failed for slot {}", slot_index);
                         return ValueValidation::Invalid;
                     }
@@ -1315,7 +1164,7 @@ impl ScpDriver {
         // during combineCandidates — we filter instead to be defensive.
         decoded.retain(|sv| {
             let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-            if self.tx_set_cache.get(&tx_set_hash).is_some() {
+            if self.tx_tracker.is_cached(&tx_set_hash) {
                 true
             } else {
                 warn!(
@@ -1334,9 +1183,8 @@ impl ScpDriver {
             let lcl_hash = lm.current_header_hash();
             decoded.retain(|sv| {
                 let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                // Safe to unwrap: we just filtered out missing tx sets above
-                let tx_set = self.tx_set_cache.get(&tx_set_hash).unwrap();
-                tx_set.tx_set.previous_ledger_hash == lcl_hash
+                let tx_set = self.tx_tracker.get(&tx_set_hash).unwrap();
+                tx_set.previous_ledger_hash == lcl_hash
             });
             if decoded.is_empty() {
                 // All candidates filtered out — fall back to first value
@@ -1450,13 +1298,13 @@ impl ScpDriver {
     ) -> std::cmp::Ordering {
         // Parity: stellar-core releaseAssert(cTxSet) at HerderSCPDriver.cpp:780
         // Tx sets must be in cache by the time we compare them.
-        let a_set = self.tx_set_cache.get(a_hash).unwrap_or_else(|| {
+        let a_set = self.tx_tracker.get(a_hash).unwrap_or_else(|| {
             panic!(
                 "compare_tx_sets: tx set {} not in cache (parity: releaseAssert)",
                 a_hash
             )
         });
-        let b_set = self.tx_set_cache.get(b_hash).unwrap_or_else(|| {
+        let b_set = self.tx_tracker.get(b_hash).unwrap_or_else(|| {
             panic!(
                 "compare_tx_sets: tx set {} not in cache (parity: releaseAssert)",
                 b_hash
@@ -1464,32 +1312,32 @@ impl ScpDriver {
         });
 
         // 1. Compare by number of operations (more is better)
-        let a_ops = Self::tx_set_num_ops(&a_set.tx_set);
-        let b_ops = Self::tx_set_num_ops(&b_set.tx_set);
+        let a_ops = Self::tx_set_num_ops(&a_set);
+        let b_ops = Self::tx_set_num_ops(&b_set);
         let ops_cmp = a_ops.cmp(&b_ops);
         if ops_cmp != std::cmp::Ordering::Equal {
             return ops_cmp;
         }
 
         // 2. Compare by total inclusion fees (higher is better)
-        let a_inclusion_fees = Self::tx_set_total_inclusion_fees(&a_set.tx_set);
-        let b_inclusion_fees = Self::tx_set_total_inclusion_fees(&b_set.tx_set);
+        let a_inclusion_fees = Self::tx_set_total_inclusion_fees(&a_set);
+        let b_inclusion_fees = Self::tx_set_total_inclusion_fees(&b_set);
         let inclusion_fees_cmp = a_inclusion_fees.cmp(&b_inclusion_fees);
         if inclusion_fees_cmp != std::cmp::Ordering::Equal {
             return inclusion_fees_cmp;
         }
 
         // 3. Compare by total full fees (higher is better)
-        let a_fees = Self::tx_set_total_fees(&a_set.tx_set);
-        let b_fees = Self::tx_set_total_fees(&b_set.tx_set);
+        let a_fees = Self::tx_set_total_fees(&a_set);
+        let b_fees = Self::tx_set_total_fees(&b_set);
         let fees_cmp = a_fees.cmp(&b_fees);
         if fees_cmp != std::cmp::Ordering::Equal {
             return fees_cmp;
         }
 
         // 4. Compare by encoded size (smaller is better — note reversed order)
-        let a_size = Self::tx_set_encoded_size(&a_set.tx_set);
-        let b_size = Self::tx_set_encoded_size(&b_set.tx_set);
+        let a_size = Self::tx_set_encoded_size(&a_set);
+        let b_size = Self::tx_set_encoded_size(&b_set);
         let size_cmp = b_size.cmp(&a_size); // reversed: smaller is better
         if size_cmp != std::cmp::Ordering::Equal {
             return size_cmp;
@@ -1773,17 +1621,17 @@ impl ScpDriver {
 
     /// Get the cache size.
     pub fn tx_set_cache_size(&self) -> usize {
-        self.tx_set_cache.len()
+        self.tx_tracker.cache_count()
     }
 
     /// Get the pending tx sets count.
     pub fn pending_tx_sets_size(&self) -> usize {
-        self.pending_tx_sets.len()
+        self.tx_tracker.pending_count()
     }
 
     /// Get the pending quorum sets count.
     pub fn pending_quorum_sets_size(&self) -> usize {
-        self.pending_quorum_sets.len()
+        self.qset_tracker.pending_count()
     }
 
     /// Get the externalized slots count.
@@ -1793,23 +1641,26 @@ impl ScpDriver {
 
     /// Get the quorum sets count (by node ID).
     pub fn quorum_sets_size(&self) -> usize {
-        self.quorum_sets.len()
+        self.qset_tracker.by_node_count()
     }
 
     /// Get the quorum sets by hash count.
     pub fn quorum_sets_by_hash_size(&self) -> usize {
-        self.quorum_sets_by_hash.len()
+        self.qset_tracker.by_hash_count()
     }
 
     /// Get all cache sizes for diagnostics.
     pub fn cache_sizes(&self) -> ScpDriverCacheSizes {
+        let qset_sizes = self.qset_tracker.sizes();
+        let tx_sizes = self.tx_tracker.sizes();
         ScpDriverCacheSizes {
-            tx_set_cache: self.tx_set_cache.len(),
-            pending_tx_sets: self.pending_tx_sets.len(),
-            pending_quorum_sets: self.pending_quorum_sets.len(),
+            tx_set_cache: tx_sizes.cache,
+            pending_tx_sets: tx_sizes.pending,
+            pending_quorum_sets: qset_sizes.pending,
             externalized: self.externalized.read().len(),
-            quorum_sets: self.quorum_sets.len(),
-            quorum_sets_by_hash: self.quorum_sets_by_hash.len(),
+            quorum_sets: qset_sizes.by_node,
+            quorum_sets_by_hash: qset_sizes.by_hash,
+            tx_set_valid_cache: tx_sizes.valid_cache,
         }
     }
 
@@ -1833,44 +1684,31 @@ impl ScpDriver {
 
     /// Clear the transaction set cache.
     pub fn clear_tx_set_cache(&self) {
-        let count = self.tx_set_cache.len();
-        self.tx_set_cache.clear();
-        if count > 0 {
-            tracing::info!(count, "Cleared scp_driver tx_set_cache");
-        }
+        self.tx_tracker.clear_cache();
     }
 
     /// Clear all caches in scp_driver.
     /// Called after catchup to release stale cached data.
     pub fn clear_all_caches(&self) {
-        let tx_set_count = self.tx_set_cache.len();
-        let pending_count = self.pending_tx_sets.len();
+        let tx_sizes = self.tx_tracker.sizes();
+        let qset_sizes = self.qset_tracker.sizes();
         let externalized_count = self.externalized.read().len();
-        let qs_count = self.quorum_sets.len();
-        let qs_hash_count = self.quorum_sets_by_hash.len();
 
-        self.tx_set_cache.clear();
-        self.pending_tx_sets.clear();
+        self.tx_tracker.clear_all();
         self.externalized.write().clear();
+        self.qset_tracker.clear_validated_preserving_local();
 
-        // Clear quorum set caches, preserving only the local node's entry.
-        let local_key: [u8; 32] = *self.config.node_id.as_bytes();
-        let local_qs = self.local_quorum_set.read().clone();
-        self.quorum_sets.clear();
-        self.quorum_sets_by_hash.clear();
-        if let Some(qs) = local_qs {
-            let hash = hash_quorum_set(&qs);
-            self.quorum_sets.insert(local_key, qs.clone());
-            self.quorum_sets_by_hash.insert(hash, qs);
-        }
-
-        if tx_set_count > 0 || pending_count > 0 || externalized_count > 0 || qs_count > 1 {
+        if tx_sizes.cache > 0
+            || tx_sizes.pending > 0
+            || externalized_count > 0
+            || qset_sizes.by_node > 1
+        {
             tracing::info!(
-                tx_set_count,
-                pending_count,
+                tx_set_count = tx_sizes.cache,
+                pending_count = tx_sizes.pending,
                 externalized_count,
-                qs_count,
-                qs_hash_count,
+                qs_count = qset_sizes.by_node,
+                qs_hash_count = qset_sizes.by_hash,
                 "Cleared scp_driver caches"
             );
         }
@@ -1880,12 +1718,10 @@ impl ScpDriver {
     /// Called after catchup to release memory while keeping tx_sets and
     /// pending requests that will be needed for buffered ledgers.
     pub fn trim_stale_caches(&self, keep_after_slot: SlotIndex) {
-        let initial_pending_count = self.pending_tx_sets.len();
+        let initial_pending_count = self.tx_tracker.pending_count();
         let initial_externalized_count = self.externalized.read().len();
 
-        // Trim pending_tx_sets - keep requests for slots > keep_after_slot
-        self.pending_tx_sets
-            .retain(|_, pending| pending.slot > keep_after_slot);
+        self.tx_tracker.trim_stale_pending(keep_after_slot);
 
         // Trim externalized - keep slots > keep_after_slot
         {
@@ -1893,11 +1729,7 @@ impl ScpDriver {
             externalized.retain(|slot, _| *slot > keep_after_slot);
         }
 
-        // Note: we don't trim tx_set_cache because it's keyed by hash, not slot.
-        // The tx_sets we need are also cached in fetching_envelopes which we DO trim.
-        // The tx_set_cache is small and will be naturally evicted by max size limits.
-
-        let kept_pending = self.pending_tx_sets.len();
+        let kept_pending = self.tx_tracker.pending_count();
         let kept_externalized = self.externalized.read().len();
 
         tracing::info!(
@@ -1931,32 +1763,7 @@ impl ScpDriver {
         self.cleanup_old_pending_slots(slot);
 
         // Clean up quorum set caches to prevent unbounded growth.
-        // In stellar-core these use weak_ptr and expire automatically;
-        // here we clear and re-insert only the local node's quorum set.
-        // Missing entries will be re-fetched from peers on demand via
-        // the pending_quorum_sets mechanism.
-        let local_key: [u8; 32] = *self.config.node_id.as_bytes();
-        let local_qs = self.local_quorum_set.read().clone();
-
-        let prev_by_node = self.quorum_sets.len();
-        let prev_by_hash = self.quorum_sets_by_hash.len();
-
-        self.quorum_sets.clear();
-        self.quorum_sets_by_hash.clear();
-
-        if let Some(qs) = local_qs {
-            let hash = hash_quorum_set(&qs);
-            self.quorum_sets.insert(local_key, qs.clone());
-            self.quorum_sets_by_hash.insert(hash, qs);
-        }
-
-        if prev_by_node > 1 || prev_by_hash > 1 {
-            tracing::debug!(
-                prev_by_node,
-                prev_by_hash,
-                "Cleared quorum set caches during slot purge"
-            );
-        }
+        self.qset_tracker.clear_validated_preserving_local();
     }
 
     /// Get local SCP envelopes for a slot.
@@ -1972,55 +1779,32 @@ impl ScpDriver {
 
     /// Get our local quorum set.
     pub fn get_local_quorum_set(&self) -> Option<ScpQuorumSet> {
-        self.local_quorum_set.read().clone()
+        self.qset_tracker.get_local()
     }
 
     /// Set our local quorum set.
     pub fn set_local_quorum_set(&self, quorum_set: ScpQuorumSet) {
-        *self.local_quorum_set.write() = Some(quorum_set);
-        if let Some(local) = self.local_quorum_set.read().clone() {
-            let hash = hash_quorum_set(&local);
-            self.quorum_sets_by_hash.insert(hash, local.clone());
-            self.quorum_sets
-                .insert(*self.config.node_id.as_bytes(), local);
-            self.pending_quorum_sets.remove(&hash);
-        }
+        self.qset_tracker.set_local(quorum_set);
     }
 
     /// Store a quorum set for a node.
     pub fn store_quorum_set(&self, node_id: &stellar_xdr::curr::NodeId, quorum_set: ScpQuorumSet) {
-        let key: [u8; 32] = match &node_id.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
-        };
-        let hash = hash_quorum_set(&quorum_set);
-        self.quorum_sets.insert(key, quorum_set.clone());
-        self.quorum_sets_by_hash.insert(hash, quorum_set);
-        self.pending_quorum_sets.remove(&hash);
+        self.qset_tracker.store(node_id, quorum_set);
     }
 
     /// Get a quorum set for a node.
     pub fn get_quorum_set(&self, node_id: &stellar_xdr::curr::NodeId) -> Option<ScpQuorumSet> {
-        let key: [u8; 32] = match &node_id.0 {
-            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(key) => key.0,
-        };
-
-        // Check if this is our own node
-        let our_key: [u8; 32] = *self.config.node_id.as_bytes();
-        if key == our_key {
-            return self.local_quorum_set.read().clone();
-        }
-
-        self.quorum_sets.get(&key).map(|v| v.clone())
+        self.qset_tracker.get_by_node(node_id)
     }
 
     /// Get a quorum set by its hash.
     pub fn get_quorum_set_by_hash(&self, hash: &Hash256) -> Option<ScpQuorumSet> {
-        self.quorum_sets_by_hash.get(hash).map(|v| v.clone())
+        self.qset_tracker.get_by_hash(hash)
     }
 
     /// Whether we already have a quorum set with the given hash.
     pub fn has_quorum_set_hash(&self, hash: &Hash256) -> bool {
-        self.quorum_sets_by_hash.contains_key(hash)
+        self.qset_tracker.has_hash(hash)
     }
 
     /// Get our node ID.
@@ -4336,7 +4120,7 @@ mod compare_tx_sets_tests {
         );
 
         // Only B cached, A missing: A should be filtered out, B wins by default
-        driver.tx_set_cache.clear();
+        driver.tx_tracker.clear_cache();
         cache_tx_set(&driver, tx_set_b.clone());
         let partial_result = driver.combine_candidates_impl(1, &values);
         let partial_sv = StellarValue::from_xdr(&partial_result.0, Limits::none()).unwrap();

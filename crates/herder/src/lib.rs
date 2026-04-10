@@ -117,6 +117,7 @@ mod ledger_close_data;
 pub mod parallel_tx_set_builder;
 mod pending;
 mod persistence;
+mod quorum_set_tracker;
 mod quorum_tracker;
 mod scp_driver;
 mod state;
@@ -126,6 +127,7 @@ pub mod timer_manager;
 pub mod tx_broadcast;
 mod tx_queue;
 mod tx_queue_limiter;
+mod tx_set_tracker;
 pub mod tx_set_utils;
 pub mod upgrades;
 
