@@ -27,8 +27,12 @@ pub fn is_newer_nomination_or_ballot_st(old_st: &ScpStatement, new_st: &ScpState
     let old_rank = type_rank(&old_st.pledges);
     let new_rank = type_rank(&new_st.pledges);
 
+    // Cross-phase replacement is not allowed: a ballot statement never
+    // replaces a nomination and vice-versa.  Matches stellar-core
+    // Slot.cpp:isNewerNominationOrBallotSt which returns false when the
+    // statement types belong to different phases.
     if old_rank != new_rank {
-        return new_rank > old_rank;
+        return false;
     }
 
     match (&old_st.pledges, &new_st.pledges) {
@@ -210,5 +214,72 @@ mod tests {
         assert!(!is_newer_confirm(&conf_b, &conf_a));
         // Same ballot and fields: neither is newer
         assert!(!is_newer_confirm(&conf_a, &conf_a));
+    }
+
+    /// Regression test for AUDIT-070: cross-phase statements must never replace
+    /// each other.  A ballot/externalize must not replace a nomination and
+    /// vice-versa.
+    #[test]
+    fn test_audit_070_cross_phase_never_replaces() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let value = make_value(&[1]);
+
+        let nominate_st = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Nominate(ScpNomination {
+                quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+                votes: vec![value.clone()].try_into().unwrap(),
+                accepted: vec![].try_into().unwrap(),
+            }),
+        };
+
+        let prepare_st = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+                ballot: make_ballot(1, &[1]),
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+
+        let externalize_st = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Externalize(stellar_xdr::curr::ScpStatementExternalize {
+                commit: make_ballot(1, &[1]),
+                n_h: 1,
+                commit_quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            }),
+        };
+
+        // Cross-phase: ballot must NOT replace nomination
+        assert!(!is_newer_nomination_or_ballot_st(&nominate_st, &prepare_st));
+        assert!(!is_newer_nomination_or_ballot_st(
+            &nominate_st,
+            &externalize_st
+        ));
+
+        // Cross-phase: nomination must NOT replace ballot
+        assert!(!is_newer_nomination_or_ballot_st(&prepare_st, &nominate_st));
+        assert!(!is_newer_nomination_or_ballot_st(
+            &externalize_st,
+            &nominate_st
+        ));
+
+        // Cross-phase within ballot: different ballot types must NOT replace each other
+        assert!(!is_newer_nomination_or_ballot_st(
+            &prepare_st,
+            &externalize_st
+        ));
+        assert!(!is_newer_nomination_or_ballot_st(
+            &externalize_st,
+            &prepare_st
+        ));
     }
 }
