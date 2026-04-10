@@ -127,7 +127,9 @@ impl TxSetTracker {
     // --- Cache management ---
 
     /// Cache a parsed tx set, evicting oldest if at capacity.
-    pub fn store(&self, tx_set: TransactionSet) {
+    /// `pub(crate)` to ensure network-received tx sets go through `receive()`,
+    /// which enforces the pending check (AUDIT-080).
+    pub(crate) fn store(&self, tx_set: TransactionSet) {
         let hash = tx_set.hash;
 
         if self.cache.len() >= self.max_cache_size {

@@ -709,10 +709,20 @@ impl OverlayManager {
             .get(peer_id)
             .ok_or_else(|| OverlayError::PeerNotFound(peer_id.to_string()))?;
 
+        // Route flow-controlled messages through the Flood path so they
+        // consume per-peer SEND_MORE_EXTENDED credit, matching stellar-core's
+        // Peer::sendMessage() which always flow-controls flood messages
+        // regardless of broadcast vs. targeted send (AUDIT-086).
+        let outbound = if helpers::is_flood_message(&message) {
+            OutboundMessage::Flood(message)
+        } else {
+            OutboundMessage::Send(message)
+        };
+
         entry
             .value()
             .outbound_tx
-            .try_send(OutboundMessage::Send(message))
+            .try_send(outbound)
             .map_err(|_| OverlayError::ChannelSend)
     }
 
@@ -1607,6 +1617,67 @@ mod tests {
         assert!(
             !evicted,
             "should not evict outbound peers for inbound admission"
+        );
+    }
+
+    /// Regression test for AUDIT-086: targeted sends of flow-controlled messages
+    /// (SCP, Transaction, FloodAdvert, FloodDemand) must go through the Flood
+    /// path, not the direct Send path, so they consume per-peer flow-control credit.
+    #[tokio::test]
+    async fn test_audit_086_targeted_flood_uses_flow_control() {
+        use crate::flow_control::{FlowControl, FlowControlConfig};
+        use crate::peer::PeerStats;
+        use stellar_xdr::curr::*;
+
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+        let manager = OverlayManager::new(config, local_node).unwrap();
+
+        let peer_id = PeerId::from_bytes([99u8; 32]);
+        let (outbound_tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let handle = super::PeerHandle {
+            outbound_tx,
+            stats: Arc::new(PeerStats::default()),
+            flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+        };
+        manager.peers.insert(peer_id.clone(), handle);
+
+        // Flow-controlled SCP message should be routed as Flood
+        let scp_msg = StellarMessage::ScpMessage(ScpEnvelope {
+            statement: ScpStatement {
+                node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot {
+                        counter: 1,
+                        value: vec![].try_into().unwrap(),
+                    },
+                    n_h: 1,
+                    commit_quorum_set_hash: Hash([0; 32]),
+                }),
+            },
+            signature: vec![].try_into().unwrap(),
+        });
+
+        manager
+            .try_send_to(&peer_id, scp_msg)
+            .expect("send should succeed");
+        let msg = rx.recv().await.expect("should receive message");
+        assert!(
+            matches!(msg, OutboundMessage::Flood(_)),
+            "SCP message should be routed through Flood path for flow control"
+        );
+
+        // Non-flood messages (e.g. GetScpState) should still use Send
+        let get_state = StellarMessage::GetScpState(1);
+        manager
+            .try_send_to(&peer_id, get_state)
+            .expect("send should succeed");
+        let msg = rx.recv().await.expect("should receive message");
+        assert!(
+            matches!(msg, OutboundMessage::Send(_)),
+            "GetScpState should use direct Send path"
         );
     }
 }
