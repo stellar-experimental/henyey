@@ -5535,6 +5535,87 @@ mod tests {
         // Before fix: re-add would return Duplicate even after unban
         assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
     }
+
+    /// Regression test for AUDIT-072: evict_expired() clears seen set.
+    #[test]
+    fn test_audit_072_seen_cleared_on_evict_expired() {
+        let config = TxQueueConfig {
+            max_age_secs: 1,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 10);
+        let hash = Hash256::hash_xdr(&tx).unwrap();
+
+        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+        assert!(queue.seen.read().contains(&hash));
+
+        // Artificially expire the transaction
+        {
+            let mut by_hash = queue.by_hash.write();
+            for tx in by_hash.values_mut() {
+                tx.received_at = tx
+                    .received_at
+                    .checked_sub(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|| {
+                        std::time::Instant::now() - std::time::Duration::from_secs(10)
+                    });
+            }
+        }
+        queue.evict_expired();
+        assert!(queue.is_empty());
+
+        assert!(
+            !queue.seen.read().contains(&hash),
+            "expired tx hash should be removed from seen set"
+        );
+    }
+
+    /// Regression test for AUDIT-072: remove_applied() clears seen set.
+    #[test]
+    fn test_audit_072_seen_cleared_on_remove_applied() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 20);
+        let hash = Hash256::hash_xdr(&tx).unwrap();
+
+        assert_eq!(queue.try_add(tx.clone()), TxQueueResult::Added);
+        assert!(queue.seen.read().contains(&hash));
+
+        queue.remove_applied(&[(tx.clone(), 1)]);
+        assert_eq!(queue.len(), 0);
+
+        assert!(
+            !queue.seen.read().contains(&hash),
+            "applied tx hash should be removed from seen set"
+        );
+    }
+
+    /// Regression test for AUDIT-072: shift() auto-ban clears seen set.
+    #[test]
+    fn test_audit_072_seen_cleared_on_shift_autoban() {
+        // pending_depth=1 so the first shift auto-bans
+        let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 10, 1);
+
+        let mut tx = make_test_envelope(200, 1);
+        set_source(&mut tx, 30);
+        let hash = Hash256::hash_xdr(&tx).unwrap();
+
+        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+        assert!(queue.seen.read().contains(&hash));
+
+        let result = queue.shift();
+        assert_eq!(result.evicted_due_to_age, 1);
+        assert_eq!(queue.len(), 0);
+
+        assert!(
+            !queue.seen.read().contains(&hash),
+            "shift-evicted tx hash should be removed from seen set"
+        );
+    }
 }
 
 #[cfg(test)]
