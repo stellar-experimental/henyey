@@ -7604,4 +7604,43 @@ mod tests {
         assert!(matches!(decoded[0], LedgerUpgrade::Version(25)));
         assert!(matches!(decoded[1], LedgerUpgrade::BaseReserve(5_000_000)));
     }
+
+    /// Regression test: bucket_list() read guard must be dropped before
+    /// bucket_list_mut() write guard is acquired on the same RwLock.
+    /// Holding both simultaneously deadlocks (parking_lot RwLock is not
+    /// reentrant). This pattern caused the post-catchup HAS persist to
+    /// deadlock, preventing the node from transitioning to real-time
+    /// consensus.
+    #[test]
+    fn test_bucket_list_read_then_write_no_deadlock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let bucket_list: parking_lot::RwLock<BucketList> =
+            parking_lot::RwLock::new(BucketList::new());
+
+        // Correct pattern: read, extract, drop, then write.
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let hash = {
+                let guard = bucket_list.read();
+                let h = guard.hash();
+                drop(guard);
+                h
+            };
+            // Write lock should succeed immediately after read is dropped.
+            let _write_guard = bucket_list.write();
+            let _ = tx.send(hash);
+        });
+
+        // If the thread doesn't finish within 2 seconds, it's deadlocked.
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(_hash) => {} // Success — no deadlock
+            Err(_) => panic!(
+                "Deadlock detected: bucket_list read guard was not \
+                 dropped before write guard acquisition"
+            ),
+        }
+        handle.join().unwrap();
+    }
 }

@@ -203,45 +203,57 @@ impl App {
         // setLastClosedLedger() (persisting both LCL and HAS) after bucket apply.
         {
             let final_header = self.ledger_manager.current_header();
-            let bucket_list = self.ledger_manager.bucket_list();
-            let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
-            let default_hot_archive = HotArchiveBucketList::default();
-            let hot_archive_ref = hot_archive_guard.as_ref().unwrap_or(&default_hot_archive);
 
-            // Ensure hot archive buckets are persisted to disk for restart recovery.
-            // In catchup, this is fatal — we can't write HAS referencing missing files.
-            self.persist_hot_archive_buckets(hot_archive_ref)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to persist hot archive buckets during catchup: {}",
-                        e
-                    )
-                })?;
+            // Build HAS and serialize while holding read locks, then drop
+            // them before acquiring the write lock for flush_pending_persist.
+            // bucket_list() returns a RwLockReadGuard; bucket_list_mut()
+            // needs a write lock on the same RwLock — holding both in the
+            // same scope is a deadlock.
+            let (has_json, header_xdr) = {
+                let bucket_list = self.ledger_manager.bucket_list();
+                let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
+                let default_hot_archive = HotArchiveBucketList::default();
+                let hot_archive_ref = hot_archive_guard.as_ref().unwrap_or(&default_hot_archive);
 
-            // Only include hot archive in HAS when protocol >= 23
-            let hot_archive_for_has = if final_header.ledger_version >= 23 {
-                Some(hot_archive_ref)
-            } else {
-                None
+                // Ensure hot archive buckets are persisted to disk for restart recovery.
+                // In catchup, this is fatal — we can't write HAS referencing missing files.
+                self.persist_hot_archive_buckets(hot_archive_ref)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to persist hot archive buckets during catchup: {}",
+                            e
+                        )
+                    })?;
+
+                // Only include hot archive in HAS when protocol >= 23
+                let hot_archive_for_has = if final_header.ledger_version >= 23 {
+                    Some(hot_archive_ref)
+                } else {
+                    None
+                };
+
+                let has = build_history_archive_state(
+                    final_header.ledger_seq,
+                    &bucket_list,
+                    hot_archive_for_has,
+                    Some(self.config.network.passphrase.clone()),
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to build HAS after catchup: {}", e))?;
+                let has_json = has
+                    .to_json()
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize HAS after catchup: {}", e))?;
+                let header_xdr = final_header
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to serialize header XDR after catchup: {}", e)
+                    })?;
+
+                (has_json, header_xdr)
+                // Read locks (bucket_list, hot_archive_guard) drop here
             };
 
-            let has = build_history_archive_state(
-                final_header.ledger_seq,
-                &bucket_list,
-                hot_archive_for_has,
-                Some(self.config.network.passphrase.clone()),
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to build HAS after catchup: {}", e))?;
-            let has_json = has
-                .to_json()
-                .map_err(|e| anyhow::anyhow!("Failed to serialize HAS after catchup: {}", e))?;
-            let header_xdr = final_header
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to serialize header XDR after catchup: {}", e)
-                })?;
-
-            // Flush pending bucket persistence before writing HAS/LCL
+            // Flush pending bucket persistence before writing HAS/LCL.
+            // Safe to acquire write lock now that read guards are dropped.
             self.ledger_manager
                 .bucket_list_mut()
                 .flush_pending_persist()
