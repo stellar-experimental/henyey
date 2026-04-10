@@ -3,7 +3,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -102,10 +101,10 @@ impl Default for WorkSchedulerConfig {
 /// # Ownership
 ///
 /// Work items are moved into the scheduler and remain there until the scheduler
-/// is dropped. The scheduler temporarily moves work items out during execution
-/// (replacing them with a placeholder `EmptyWork`) and moves them back after
-/// completion. This design satisfies Rust's ownership rules while allowing
-/// stateful work items to be retried.
+/// is dropped. The scheduler temporarily takes work items out during execution
+/// (setting the field to `None`) and restores them after completion. This design
+/// satisfies Rust's ownership rules while allowing stateful work items to be
+/// retried.
 ///
 /// # Example
 ///
@@ -255,7 +254,9 @@ struct WorkEntry {
     cancel_token: CancellationToken,
 
     /// The actual work implementation.
-    work: Box<dyn Work + Send>,
+    ///
+    /// `None` while the work item is executing on a spawned task.
+    work: Option<Box<dyn Work + Send>>,
 }
 
 impl WorkScheduler {
@@ -314,7 +315,7 @@ impl WorkScheduler {
             attempts: 0,
             started_at: None,
             cancel_token: CancellationToken::new(),
-            work,
+            work: Some(work),
         };
 
         self.entries.insert(id, entry);
@@ -522,7 +523,10 @@ impl WorkScheduler {
 
         entry.attempts += 1;
         let attempt = entry.attempts;
-        let mut work = std::mem::replace(&mut entry.work, Box::new(EmptyWork));
+        let mut work = entry
+            .work
+            .take()
+            .expect("work should be present when starting");
         let name = entry.name.clone();
         let completion_tx = tx.clone();
         let cancel_token = entry.cancel_token.clone();
@@ -628,11 +632,11 @@ impl WorkScheduler {
     /// Restores a work item after execution and records timing.
     ///
     /// Called after a spawned work task completes, regardless of outcome.
-    /// Moves the work implementation back into the entry (replacing the
-    /// placeholder) and records the elapsed execution time.
+    /// Moves the work implementation back into the entry (replacing `None`)
+    /// and records the elapsed execution time.
     fn finalize_entry(&mut self, id: WorkId, work: Box<dyn Work + Send>) {
         if let Some(entry) = self.entries.get_mut(&id) {
-            entry.work = work;
+            entry.work = Some(work);
             entry.started_at.take();
         }
     }
@@ -764,26 +768,4 @@ struct WorkCompletion {
     /// Used to override the outcome if the work reported success but
     /// was actually cancelled.
     cancelled: bool,
-}
-
-/// A placeholder work item used during execution.
-///
-/// When a work item is spawned for execution, the scheduler must move it
-/// out of the `entries` map (Rust ownership). This placeholder takes its
-/// place temporarily. The real work item is moved back after execution
-/// completes.
-///
-/// This is an internal implementation detail and should never actually
-/// be executed.
-struct EmptyWork;
-
-#[async_trait]
-impl Work for EmptyWork {
-    fn name(&self) -> &str {
-        "empty"
-    }
-
-    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
-        WorkOutcome::Success
-    }
 }
