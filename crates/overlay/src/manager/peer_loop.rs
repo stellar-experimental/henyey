@@ -699,8 +699,14 @@ impl OverlayManager {
             }
         }
 
-        // Global rate limiter backstop (Sybil protection, SCP bypasses).
-        if !matches!(message, StellarMessage::ScpMessage(_)) && !state.flood_gate.allow_message() {
+        // Global rate limiter backstop (Sybil protection).
+        // SCP messages and fetch responses bypass the global limiter — these
+        // are critical for consensus and must not be starved by flood traffic.
+        // Matches stellar-core which has no global receive-side flood limiter
+        // and handles fetch/control traffic on a separate path.
+        let is_exempt =
+            matches!(message, StellarMessage::ScpMessage(_)) || is_fetch_message(message);
+        if !is_exempt && !state.flood_gate.allow_message() {
             debug!(
                 "Dropping {} from {}: global rate limit exceeded",
                 msg_type, peer_id
@@ -1613,5 +1619,35 @@ mod tests {
             limiter.dropped_tx_demand > 0,
             "should track dropped tx+demand"
         );
+    }
+
+    /// Regression test for AUDIT-016: fetch/control messages must bypass
+    /// the global rate limiter so one peer's flood traffic cannot starve
+    /// consensus-critical responses (TxSet, ScpQuorumset, DontHave, etc.).
+    #[test]
+    fn test_audit_016_fetch_messages_bypass_global_rate_limiter() {
+        let fetch_messages = vec![
+            StellarMessage::TxSet(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
+            StellarMessage::DontHave(stellar_xdr::curr::DontHave {
+                type_: stellar_xdr::curr::MessageType::TxSet,
+                req_hash: stellar_xdr::curr::Uint256([0; 32]),
+            }),
+            StellarMessage::ScpQuorumset(stellar_xdr::curr::ScpQuorumSet {
+                threshold: 1,
+                validators: stellar_xdr::curr::VecM::default(),
+                inner_sets: stellar_xdr::curr::VecM::default(),
+            }),
+        ];
+
+        for msg in &fetch_messages {
+            assert!(
+                is_fetch_message(msg),
+                "{:?} should be classified as fetch message",
+                helpers::message_type_name(msg)
+            );
+        }
     }
 }
