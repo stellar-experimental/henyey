@@ -4516,3 +4516,130 @@ fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
         expected_fee_charged, pre_charged_fee, fee_refund
     );
 }
+
+/// [AUDIT-095] Verify that pre_parallel_apply globalizes sequence bumps
+/// so peer-cluster Soroban TXs see bumped sequence numbers.
+///
+/// Before the fix, each cluster ran pre_apply_arc locally, so a peer cluster's
+/// executor would see stale (pre-bump) sequence numbers for accounts modified
+/// by another cluster's TX. After the fix, pre_parallel_apply runs all
+/// pre-apply mutations (seq bump, signer removal) on a shared executor and
+/// transfers them to the main delta before any cluster starts.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_audit_095_pre_parallel_apply_globalizes_seq_bumps() {
+    use henyey_ledger::{
+        execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
+        SorobanContext, SorobanPhaseStructure,
+    };
+
+    let network_id = NetworkId::testnet();
+
+    // Two independent accounts, each with their own Soroban TX.
+    let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+
+    // Get account IDs for later verification.
+    let secret1 = SecretKey::from_seed(&[33u8; 32]);
+    let acct1_id: AccountId = (&secret1.public_key()).into();
+    let secret2 = SecretKey::from_seed(&[44u8; 32]);
+    let acct2_id: AccountId = (&secret2.public_key()).into();
+
+    // Build snapshot with all entries.
+    let mut builder = SnapshotBuilder::new(1);
+    for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
+        builder = builder.add_entry(key, entry);
+    }
+    let snapshot = SnapshotHandle::new(builder.build_with_default_header());
+
+    // Create a phase with 1 stage and 2 peer clusters (triggers parallel path).
+    let phase = SorobanPhaseStructure {
+        base_fee: None,
+        stages: vec![vec![
+            vec![(std::sync::Arc::new(tx1.clone()), None)], // cluster 0: tx1
+            vec![(std::sync::Arc::new(tx2.clone()), None)], // cluster 1: tx2
+        ]],
+    };
+
+    let mut delta = LedgerDelta::new(1);
+    let context = henyey_tx::LedgerContext::new(
+        1,         // ledger_seq
+        1_000,     // close_time
+        100,       // base_fee
+        5_000_000, // base_reserve
+        25,        // protocol_version
+        network_id,
+    );
+    let result = execute_soroban_parallel_phase(
+        &snapshot,
+        &phase,
+        0, // no classic TXs in test
+        &context,
+        &mut delta,
+        SorobanContext {
+            config: SorobanConfig::default(),
+            base_prng_seed: [0u8; 32],
+            classic_events: ClassicEventConfig::default(),
+            module_cache: None,
+            hot_archive: None,
+            runtime_handle: None,
+            soroban_state: None,
+            offer_store: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
+        },
+        None,
+    )
+    .expect("execute parallel phase");
+
+    assert_eq!(result.results.len(), 2, "expected 2 results");
+
+    // Verify: the main delta should contain BOTH accounts with bumped sequences.
+    // Before the fix, sequence bumps only existed inside cluster executors'
+    // local state and were transferred to cluster deltas (then merged), but
+    // peer clusters never saw them. After the fix, pre_parallel_apply bumps
+    // sequences on the shared executor and transfers to the main delta
+    // BEFORE clusters start, so peer clusters see bumped sequences.
+    let current = delta.current_entries();
+    let _acct1_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: acct1_id.clone(),
+    });
+    let _acct2_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+        account_id: acct2_id.clone(),
+    });
+
+    // Both accounts must have been updated in the delta.
+    let acct1_entry = current
+        .iter()
+        .find(|e| {
+            if let LedgerEntryData::Account(a) = &e.data {
+                a.account_id == acct1_id
+            } else {
+                false
+            }
+        })
+        .expect("account 1 should be in delta");
+    let acct2_entry = current
+        .iter()
+        .find(|e| {
+            if let LedgerEntryData::Account(a) = &e.data {
+                a.account_id == acct2_id
+            } else {
+                false
+            }
+        })
+        .expect("account 2 should be in delta");
+
+    // Both sequences should be bumped from 1 (initial) to 2 (after TX execution).
+    if let LedgerEntryData::Account(a) = &acct1_entry.data {
+        assert_eq!(
+            a.seq_num.0, 2,
+            "account 1 seq should be bumped to 2 (was 1, tx seq_num=2)"
+        );
+    }
+    if let LedgerEntryData::Account(a) = &acct2_entry.data {
+        assert_eq!(
+            a.seq_num.0, 2,
+            "account 2 seq should be bumped to 2 (was 1, tx seq_num=2)"
+        );
+    }
+}

@@ -364,6 +364,132 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
     })
 }
 
+/// Result of a per-TX global pre-parallel-apply pass.
+///
+/// Matches stellar-core's `preParallelApply` which runs validation, fee charging,
+/// signer removal, and sequence bumping for ALL Soroban transactions on shared
+/// state before any cluster starts parallel execution.
+pub(super) enum PreParallelResult {
+    /// Pre-apply succeeded — carry the `PreApplyResult` to `apply_body` in the cluster.
+    Success(PreApplyResult),
+    /// Pre-apply failed (validation error, insufficient balance, etc.) — use this
+    /// result directly in the cluster without running `apply_body`.
+    Failed(TransactionExecutionResult),
+}
+
+/// Run `preParallelApply` for ALL Soroban transactions on a shared executor.
+///
+/// This matches stellar-core's `preParallelApplyAndCollectModifiedClassicEntries`
+/// in `ParallelApplyUtils.cpp:327-385`. The function:
+///
+/// 1. Creates a single `TransactionExecutor` using the main delta's state.
+/// 2. For each Soroban TX (across all stages/clusters, in flattened order):
+///    runs `pre_apply_arc` with `deduct_fee: false` (fees already on delta).
+/// 3. Transfers all classic mutations (sequence bumps, signer removals) to
+///    the main delta via `apply_to_delta`.
+/// 4. Returns per-TX results consumed by `execute_single_cluster`.
+///
+/// After this call, the delta contains all pre-apply mutations. Subsequent
+/// `PriorStageState::from_delta` calls will see bumped sequences and removed
+/// signers, so peer clusters observe correct state.
+#[allow(clippy::too_many_arguments)]
+fn pre_parallel_apply(
+    snapshot: &SnapshotHandle,
+    phase: &crate::close::SorobanPhaseStructure,
+    context: &LedgerContext,
+    soroban: &SorobanContext<'_>,
+    delta: &mut LedgerDelta,
+    pre_charged_fees: &[PreChargedFee],
+    classic_tx_count: usize,
+    soroban_base_prng_seed: [u8; 32],
+) -> Result<Vec<PreParallelResult>> {
+    let start = std::time::Instant::now();
+
+    // Create a shared executor operating on the main delta's state.
+    let mut executor = TransactionExecutor::new(
+        context,
+        snapshot.header().id_pool,
+        soroban.config.clone(),
+        soroban.classic_events,
+    );
+    executor.set_meta_flags(
+        soroban.emit_soroban_tx_meta_ext_v1,
+        soroban.enable_soroban_diagnostic_events,
+    );
+    if let Some(cache) = soroban.module_cache {
+        executor.set_module_cache(cache.clone());
+    }
+    if let Some(ref ha) = soroban.hot_archive {
+        executor.set_hot_archive(ha.clone());
+    }
+    if let Some(ref ss) = soroban.soroban_state {
+        executor.set_soroban_state(ss.clone());
+    }
+
+    // Load current fee-deducted account state from the delta so the executor
+    // sees balances AFTER fee pre-deduction. This is critical because
+    // pre_apply_arc's validation checks (e.g., available balance for sig
+    // weight, sequence number) must operate on post-fee-deduction state.
+    for entry in delta.current_entries() {
+        executor.state.load_entry(entry);
+    }
+    for key in &delta.dead_entries() {
+        executor.state.mark_entry_deleted(key);
+    }
+
+    let total_txs: usize = phase
+        .stages
+        .iter()
+        .flat_map(|s| s.iter())
+        .map(|c| c.len())
+        .sum();
+    let mut results = Vec::with_capacity(total_txs);
+    let mut flat_idx: usize = 0;
+    let mut global_tx_offset: usize = classic_tx_count;
+
+    for stage in &phase.stages {
+        for cluster in stage {
+            for (tx, tx_base_fee) in cluster {
+                let tx_fee = tx_base_fee.unwrap_or(context.base_fee);
+                let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, global_tx_offset as u32);
+
+                let pre_result = executor.pre_apply_arc(
+                    snapshot,
+                    tx,
+                    tx_fee,
+                    Some(tx_prng_seed),
+                    false, // deduct_fee=false — fees already on delta
+                    None,  // no fee_source_pre_state
+                )?;
+
+                match pre_result {
+                    Ok(pre) => results.push(PreParallelResult::Success(pre)),
+                    Err(early_result) => results.push(PreParallelResult::Failed(early_result)),
+                }
+
+                flat_idx += 1;
+                global_tx_offset += 1;
+            }
+        }
+    }
+    debug_assert_eq!(flat_idx, total_txs);
+    debug_assert_eq!(flat_idx, pre_charged_fees.len());
+
+    // Transfer all pre-apply mutations (sequence bumps, signer removals)
+    // to the main delta so PriorStageState::from_delta picks them up.
+    executor.apply_to_delta(delta)?;
+
+    let elapsed_us = start.elapsed().as_micros() as u64;
+    tracing::debug!(
+        ledger_seq = context.sequence,
+        total_txs,
+        elapsed_us,
+        "PROFILE pre_parallel_apply"
+    );
+
+    Ok(results)
+}
+
 /// Execute a full Soroban parallel phase (all stages sequentially,
 /// clusters within each stage in parallel).
 ///
@@ -443,6 +569,33 @@ pub fn execute_soroban_parallel_phase(
         );
     }
 
+    // Run pre-parallel-apply for ALL Soroban TXs on a shared executor.
+    // This matches stellar-core's `preParallelApplyAndCollectModifiedClassicEntries`
+    // which runs validation + sequence bump + signer removal for every Soroban TX
+    // BEFORE any cluster starts. Classic mutations (bumped seqs, removed signers)
+    // are transferred to the main delta so PriorStageState picks them up.
+    let mut pre_parallel_results = pre_parallel_apply(
+        snapshot,
+        phase,
+        context,
+        &SorobanContext {
+            config: soroban.config.clone(),
+            base_prng_seed: soroban_base_prng_seed,
+            classic_events: soroban.classic_events,
+            module_cache: soroban.module_cache,
+            hot_archive: soroban.hot_archive.clone(),
+            runtime_handle: soroban.runtime_handle.clone(),
+            soroban_state: soroban.soroban_state.clone(),
+            offer_store: None,
+            emit_soroban_tx_meta_ext_v1: soroban.emit_soroban_tx_meta_ext_v1,
+            enable_soroban_diagnostic_events: soroban.enable_soroban_diagnostic_events,
+        },
+        delta,
+        &pre_charged_fees,
+        classic_tx_count,
+        soroban_base_prng_seed,
+    )?;
+
     // Track position in the flattened pre_charged_fees vector.
     let mut pre_charge_offset: usize = 0;
 
@@ -471,6 +624,10 @@ pub fn execute_soroban_parallel_phase(
         let stage_pre_charged =
             &pre_charged_fees[pre_charge_offset..pre_charge_offset + stage_tx_count];
 
+        // Drain pre_parallel results for this stage (moves ownership).
+        let stage_pre_parallel: Vec<PreParallelResult> =
+            pre_parallel_results.drain(..stage_tx_count).collect();
+
         // Execute each cluster with its own executor, then merge results.
         // Clusters within a stage are independent (no footprint conflicts)
         // so they can be executed with isolated state.
@@ -498,6 +655,7 @@ pub fn execute_soroban_parallel_phase(
                 prior_stage: &prior_stage,
                 pre_charged_fees: stage_pre_charged,
             },
+            stage_pre_parallel,
         )?;
         total_stage_clusters_us += stage_clusters_start.elapsed().as_micros() as u64;
 
@@ -728,6 +886,7 @@ pub(super) fn execute_single_cluster(
     context: &LedgerContext,
     soroban: &SorobanContext<'_>,
     params: &ClusterParams<'_>,
+    pre_parallel: Option<Vec<PreParallelResult>>,
 ) -> Result<(TxSetResult, LedgerDelta, i64)> {
     let cluster_start = std::time::Instant::now();
 
@@ -795,6 +954,9 @@ pub(super) fn execute_single_cluster(
     let mut agg_meta_fee_refund_us: u64 = 0;
     let mut agg_meta_build_phase_us: u64 = 0;
 
+    // Consume pre-parallel results in order (if provided).
+    let mut pre_parallel_iter = pre_parallel.map(|v| v.into_iter());
+
     for (local_idx, (tx, tx_base_fee)) in cluster.iter().enumerate() {
         // Flush pending RO TTL bumps for keys in this TX's write footprint.
         // This matches stellar-core's flushRoTTLBumpsInTxWriteFootprint:
@@ -814,31 +976,42 @@ pub(super) fn execute_single_cluster(
         agg_snapshot_delta_us += snap_start.elapsed().as_micros() as u64;
 
         let tx_fee = tx_base_fee.unwrap_or(context.base_fee);
-        let global_idx = cluster_offset + local_idx;
-        let tx_prng_seed = sub_sha256(&soroban.base_prng_seed, global_idx as u32);
 
-        // Execute with deduct_fee=false — fees were already pre-deducted from
-        // the main delta by pre_deduct_soroban_fees().
-        //
-        // Pass should_apply from pre-deduction: when the fee source had
-        // insufficient balance, should_apply=false and the executor will
-        // perform the pre-apply phase (validation, seq bump, signer removal)
-        // but skip the operation body entirely. This matches stellar-core's
-        // parallelApply which returns {false, {}} when !txResult.isSuccess()
-        // after preParallelApply detected insufficient balance.
+        // Execute TX: use pre-parallel result if available (global preParallelApply
+        // already ran validation + seq bump + signer removal), otherwise fall back
+        // to the full execute_transaction_with_arc path.
         let pre = &params.pre_charged_fees[local_idx];
         let exec_start = std::time::Instant::now();
-        let mut result = executor.execute_transaction_with_arc(
-            snapshot,
-            TransactionExecutionRequest {
-                tx_envelope: Arc::clone(tx),
-                base_fee: tx_fee,
-                soroban_prng_seed: Some(tx_prng_seed),
-                deduct_fee: false,
-                fee_source_pre_state: None,
-                should_apply: pre.should_apply,
-            },
-        )?;
+        let mut result = if let Some(ref mut iter) = pre_parallel_iter {
+            let pp = iter.next().expect("pre_parallel_results length mismatch");
+            match pp {
+                PreParallelResult::Success(pre_apply) => {
+                    // Pre-apply succeeded globally; run only the operation body.
+                    executor.execute_with_pre_apply_result(snapshot, pre_apply, pre.should_apply)?
+                }
+                PreParallelResult::Failed(early_result) => {
+                    // Pre-apply failed globally (validation error); use result directly.
+                    early_result
+                }
+            }
+        } else {
+            // Legacy path: no pre-parallel apply (shouldn't happen for Soroban
+            // parallel phase, but kept for safety).
+            let tx_fee = tx_base_fee.unwrap_or(context.base_fee);
+            let global_idx = cluster_offset + local_idx;
+            let tx_prng_seed = sub_sha256(&soroban.base_prng_seed, global_idx as u32);
+            executor.execute_transaction_with_arc(
+                snapshot,
+                TransactionExecutionRequest {
+                    tx_envelope: Arc::clone(tx),
+                    base_fee: tx_fee,
+                    soroban_prng_seed: Some(tx_prng_seed),
+                    deduct_fee: false,
+                    fee_source_pre_state: None,
+                    should_apply: pre.should_apply,
+                },
+            )?
+        };
         agg_execute_us += exec_start.elapsed().as_micros() as u64;
         agg_validation_us += result.timings.validation_us;
         agg_fee_seq_us += result.timings.fee_seq_us;
@@ -969,6 +1142,7 @@ pub(super) fn execute_single_cluster(
 /// When a stage has multiple clusters, they are executed in parallel using
 /// `tokio::task::spawn_blocking` (one blocking task per cluster). Results are
 /// merged into `delta` in deterministic cluster order.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn execute_stage_clusters(
     snapshot: &SnapshotHandle,
     clusters: &[Vec<TxWithFee>],
@@ -977,6 +1151,7 @@ pub(super) fn execute_stage_clusters(
     soroban: &SorobanContext<'_>,
     delta: &mut LedgerDelta,
     params: &ClusterParams<'_>,
+    stage_pre_parallel: Vec<PreParallelResult>,
 ) -> Result<Vec<TxSetResult>> {
     // Compute per-cluster global offsets and pre_charged_fees slicing.
     let mut offsets = Vec::with_capacity(clusters.len());
@@ -990,6 +1165,19 @@ pub(super) fn execute_stage_clusters(
         pc_offset += cluster.len();
     }
 
+    // Split pre_parallel results by cluster (consuming the Vec).
+    let mut per_cluster_pre_parallel: Vec<Vec<PreParallelResult>> =
+        Vec::with_capacity(clusters.len());
+    {
+        let mut remaining = stage_pre_parallel;
+        for cluster in clusters {
+            let rest = remaining.split_off(cluster.len());
+            per_cluster_pre_parallel.push(remaining);
+            remaining = rest;
+        }
+        debug_assert!(remaining.is_empty());
+    }
+
     tracing::debug!(
         ledger_seq = context.sequence,
         num_clusters = clusters.len(),
@@ -1000,9 +1188,11 @@ pub(super) fn execute_stage_clusters(
     // Single-cluster fast path: execute inline, no thread overhead.
     if clusters.len() <= 1 {
         let mut cluster_results = Vec::with_capacity(clusters.len());
+        let mut pp_iter = per_cluster_pre_parallel.into_iter();
         for (cluster_idx, cluster) in clusters.iter().enumerate() {
             let cluster_pc = &params.pre_charged_fees
                 [pre_charge_offsets[cluster_idx]..pre_charge_offsets[cluster_idx] + cluster.len()];
+            let cluster_pp = pp_iter.next().unwrap_or_default();
             let (cr, cluster_delta, total_fees) = execute_single_cluster(
                 snapshot,
                 cluster,
@@ -1014,6 +1204,7 @@ pub(super) fn execute_stage_clusters(
                     prior_stage: params.prior_stage,
                     pre_charged_fees: cluster_pc,
                 },
+                Some(cluster_pp),
             )?;
             delta.merge(cluster_delta)?;
             if total_fees != 0 {
@@ -1065,6 +1256,12 @@ pub(super) fn execute_stage_clusters(
     };
     let clone_setup_us = clone_start.elapsed().as_micros() as u64;
 
+    // Wrap per-cluster pre-parallel results for moving into spawn_blocking closures.
+    // Each closure takes ownership of its cluster's Vec.
+    let per_cluster_pp: Vec<Option<Vec<PreParallelResult>>> =
+        per_cluster_pre_parallel.into_iter().map(Some).collect();
+    let per_cluster_pp = std::sync::Arc::new(parking_lot::Mutex::new(per_cluster_pp));
+
     // Build the async future that spawns per-cluster tasks and collects results.
     let spawn_start = std::time::Instant::now();
     let spawn_and_collect = async {
@@ -1080,6 +1277,7 @@ pub(super) fn execute_stage_clusters(
             let prior_stage = prior_stage.clone();
             let cluster_offset = offsets[idx];
             let cluster_fees = per_cluster_fees[idx].clone();
+            let cluster_pp = per_cluster_pp.lock()[idx].take().unwrap_or_default();
 
             tasks.push(tokio::task::spawn_blocking(move || {
                 let soroban = SorobanContext {
@@ -1106,6 +1304,7 @@ pub(super) fn execute_stage_clusters(
                         prior_stage: &prior_stage,
                         pre_charged_fees: &cluster_fees,
                     },
+                    Some(cluster_pp),
                 );
                 let wall_us = cluster_wall_start.elapsed().as_micros() as u64;
                 let tx_count = clusters[idx].len();

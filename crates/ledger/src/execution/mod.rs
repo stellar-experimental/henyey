@@ -1807,7 +1807,7 @@ impl TransactionExecutor {
     /// After this method returns `Ok(Ok(..))`, the executor's state has committed
     /// fee deduction, signer removal, and sequence bump. These changes persist
     /// even if the operation body later fails (matching stellar-core behavior).
-    fn pre_apply_arc(
+    pub(super) fn pre_apply_arc(
         &mut self,
         snapshot: &SnapshotHandle,
         tx_envelope: &Arc<TransactionEnvelope>,
@@ -2148,7 +2148,7 @@ impl TransactionExecutor {
     ///
     /// This matches stellar-core's `parallelApply` returning `{false, {}}` when
     /// `!txResult.isSuccess()` after `preParallelApply`.
-    fn build_skipped_result(
+    pub(super) fn build_skipped_result(
         pre: PreApplyResult,
         emit_soroban_tx_meta_ext_v1: bool,
         enable_soroban_diagnostic_events: bool,
@@ -2231,6 +2231,29 @@ impl TransactionExecutor {
         request: TransactionExecutionRequest,
     ) -> Result<TransactionExecutionResult> {
         self.execute_transaction_with_request(snapshot, request)
+    }
+
+    /// Execute a transaction whose pre-apply phase was already completed by
+    /// a global `preParallelApply` pass. Skips `pre_apply_arc` entirely and
+    /// goes straight to `apply_body` (or builds a skipped result when
+    /// `should_apply` is false).
+    ///
+    /// This matches stellar-core's `parallelApply` which consumes the result
+    /// of `preParallelApply` and only runs `doApply`.
+    pub(super) fn execute_with_pre_apply_result(
+        &mut self,
+        snapshot: &SnapshotHandle,
+        pre: PreApplyResult,
+        should_apply: bool,
+    ) -> Result<TransactionExecutionResult> {
+        if !should_apply {
+            return Ok(Self::build_skipped_result(
+                pre,
+                self.emit_soroban_tx_meta_ext_v1,
+                self.enable_soroban_diagnostic_events,
+            ));
+        }
+        self.apply_body(snapshot, pre)
     }
 
     fn execute_transaction_with_request(
