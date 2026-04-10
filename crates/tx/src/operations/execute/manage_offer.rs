@@ -4096,11 +4096,11 @@ mod tests {
     #[ignore = "Dead code: CAP-0017 (protocol 13+) removed issuer existence checks"]
     fn test_manage_buy_offer_buy_no_issuer() {}
 
-    /// Regression test for AUDIT-012: convert_with_offers must check the crossing
+    /// Regression test for AUDIT-014: convert_with_offers must check the crossing
     /// limit BEFORE performing the crossing (matching stellar-core), not after.
     /// This ensures exactly `max_offers_to_cross` crossings are allowed.
     #[test]
-    fn test_audit_012_crossing_limit_boundary() {
+    fn test_audit_014_crossing_limit_boundary() {
         use super::super::offer_exchange::{ConversionParams, RoundingType};
         use crate::frozen_keys::FrozenKeyConfig;
 
