@@ -843,6 +843,13 @@ fn convert_with_offers(
             continue;
         }
 
+        // Check maxOffersToCross limit BEFORE crossing — matching stellar-core
+        // which checks `offerTrail.size() >= maxOffersToCross` before calling
+        // crossOffer. This allows exactly maxOffersToCross crossings.
+        if params.offer_trail.len() as i64 >= max_offers_to_cross {
+            return Ok(ConvertResult::CrossedTooMany);
+        }
+
         let (num_wheat_received, num_sheep_send, wheat_stays) = cross_offer_v10(
             &offer,
             max_wheat_receive,
@@ -856,11 +863,6 @@ fn convert_with_offers(
         *wheat_received += num_wheat_received;
         max_sheep_send -= num_sheep_send;
         max_wheat_receive -= num_wheat_received;
-
-        // Check maxOffersToCross limit (stellar-core: eCrossedTooMany)
-        if params.offer_trail.len() as i64 >= max_offers_to_cross {
-            return Ok(ConvertResult::CrossedTooMany);
-        }
 
         need_more = !wheat_stays && max_wheat_receive > 0 && max_sheep_send > 0;
         if !need_more {
@@ -4093,4 +4095,161 @@ mod tests {
     #[test]
     #[ignore = "Dead code: CAP-0017 (protocol 13+) removed issuer existence checks"]
     fn test_manage_buy_offer_buy_no_issuer() {}
+
+    /// Regression test for AUDIT-012: convert_with_offers must check the crossing
+    /// limit BEFORE performing the crossing (matching stellar-core), not after.
+    /// This ensures exactly `max_offers_to_cross` crossings are allowed.
+    #[test]
+    fn test_audit_012_crossing_limit_boundary() {
+        use super::super::offer_exchange::{ConversionParams, RoundingType};
+        use crate::frozen_keys::FrozenKeyConfig;
+
+        fn setup_state_with_offers(
+            n_offers: u8,
+        ) -> (LedgerStateManager, LedgerContext, AccountId, Asset) {
+            let mut state = LedgerStateManager::new(5_000_000, 100);
+            let context = create_test_context();
+            let buyer_id = create_test_account_id(0);
+            let issuer_id = create_test_account_id(99);
+            state.create_account(create_test_account(buyer_id.clone(), 1_000_000_000));
+            state.create_account(create_test_account(issuer_id.clone(), 1_000_000_000));
+
+            let usd = Asset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            });
+            let usd_tla = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4([b'U', b'S', b'D', b'C']),
+                issuer: issuer_id.clone(),
+            });
+
+            // Buyer needs USD trustline to receive
+            state.create_trustline(create_test_trustline(
+                buyer_id.clone(),
+                usd_tla.clone(),
+                0,
+                i64::MAX,
+                AUTHORIZED_FLAG,
+            ));
+
+            // Create n sellers, each selling 100 USD for XLM at 1:1
+            for i in 1..=n_offers {
+                let seller_id = create_test_account_id(i);
+                // Account with buying liabilities for native (100 buying)
+                let mut acc = create_test_account(seller_id.clone(), 1_000_000_000);
+                acc.num_sub_entries = 2; // 1 trustline + 1 offer
+                acc.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+                    liabilities: Liabilities {
+                        buying: 100,
+                        selling: 0,
+                    },
+                    ext: AccountEntryExtensionV1Ext::V0,
+                });
+                state.create_account(acc);
+
+                // Trustline with selling liabilities (100 selling)
+                state.create_trustline(TrustLineEntry {
+                    account_id: seller_id.clone(),
+                    asset: usd_tla.clone(),
+                    balance: 1_000,
+                    limit: i64::MAX,
+                    flags: AUTHORIZED_FLAG,
+                    ext: TrustLineEntryExt::V1(TrustLineEntryV1 {
+                        liabilities: Liabilities {
+                            buying: 0,
+                            selling: 100,
+                        },
+                        ext: TrustLineEntryV1Ext::V0,
+                    }),
+                });
+
+                state.create_offer(OfferEntry {
+                    seller_id,
+                    offer_id: i as i64,
+                    selling: usd.clone(),
+                    buying: Asset::Native,
+                    amount: 100,
+                    price: Price { n: 1, d: 1 },
+                    flags: 0,
+                    ext: OfferEntryExt::V0,
+                });
+            }
+            (state, context, buyer_id, usd)
+        }
+
+        let frozen = FrozenKeyConfig::default();
+
+        // Test 1: With max_offers_to_cross=3, all 3 crossings should succeed
+        {
+            let (mut state, context, buyer_id, usd) = setup_state_with_offers(3);
+            let mut trail = Vec::new();
+            let mut sheep_sent = 0i64;
+            let mut wheat_received = 0i64;
+            let result = convert_with_offers(
+                &mut ConversionParams {
+                    source: &buyer_id,
+                    selling: &Asset::Native,
+                    buying: &usd,
+                    max_send: 300,
+                    max_receive: 300,
+                    round: RoundingType::Normal,
+                    offer_trail: &mut trail,
+                    state: &mut state,
+                    context: &context,
+                    frozen_key_config: &frozen,
+                },
+                &mut sheep_sent,
+                &mut wheat_received,
+                0,
+                false,
+                &Price { n: i32::MAX, d: 1 },
+                3, // exactly 3 allowed
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                ConvertResult::Ok,
+                "3 crossings with limit=3 should succeed"
+            );
+            assert_eq!(trail.len(), 3);
+            assert_eq!(wheat_received, 300);
+        }
+
+        // Test 2: With max_offers_to_cross=2 and 3 offers, the 3rd should be rejected
+        {
+            let (mut state, context, buyer_id, usd) = setup_state_with_offers(3);
+            let mut trail = Vec::new();
+            let mut sheep_sent = 0i64;
+            let mut wheat_received = 0i64;
+            let result = convert_with_offers(
+                &mut ConversionParams {
+                    source: &buyer_id,
+                    selling: &Asset::Native,
+                    buying: &usd,
+                    max_send: 300,
+                    max_receive: 300,
+                    round: RoundingType::Normal,
+                    offer_trail: &mut trail,
+                    state: &mut state,
+                    context: &context,
+                    frozen_key_config: &frozen,
+                },
+                &mut sheep_sent,
+                &mut wheat_received,
+                0,
+                false,
+                &Price { n: i32::MAX, d: 1 },
+                2, // only 2 allowed
+            )
+            .unwrap();
+            assert_eq!(
+                result,
+                ConvertResult::CrossedTooMany,
+                "3rd crossing with limit=2 should fail"
+            );
+            // The first 2 crossings should have succeeded
+            assert_eq!(trail.len(), 2);
+            assert_eq!(wheat_received, 200);
+        }
+    }
 }
