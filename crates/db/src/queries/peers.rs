@@ -370,4 +370,17 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].0, "1.2.3.4");
     }
+
+    #[test]
+    fn test_invalid_peer_type_errors() {
+        let conn = setup_db();
+        // Insert a row with an invalid peer type directly via SQL
+        conn.execute(
+            "INSERT INTO peers (ip, port, nextattempt, numfailures, type) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["1.2.3.4", 11625i64, 0i64, 0i64, 99i32],
+        )
+        .unwrap();
+        let result = conn.load_peer("1.2.3.4", 11625);
+        assert!(result.is_err(), "should reject invalid peer type");
+    }
 }

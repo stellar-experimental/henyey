@@ -111,7 +111,11 @@ impl EventQueries for Connection {
                 "contract" => ContractEventType::Contract as i32,
                 "system" => ContractEventType::System as i32,
                 "diagnostic" => ContractEventType::Diagnostic as i32,
-                _ => ContractEventType::Contract as i32,
+                other => {
+                    return Err(DbError::Integrity(format!(
+                        "unknown event type filter: {other}"
+                    )));
+                }
             };
             sql.push_str(" AND event_type = ?");
             param_values.push(Box::new(type_code));
@@ -329,5 +333,43 @@ mod tests {
         let deleted = conn.delete_old_events(50, 1000).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(count_events(&conn), 6);
+    }
+
+    #[test]
+    fn test_invalid_event_type_errors() {
+        let conn = setup_db();
+        // Insert a row with an invalid event type directly via SQL
+        conn.execute(
+            "INSERT INTO events (id, ledgerseq, tx_index, op_index, tx_hash, contract_id, event_type, \
+             topic1, topic2, topic3, topic4, event_xdr, in_successful_contract_call) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL, ?9, ?10)",
+            params!["bad-1", 100u32, 0u32, 0u32, "aabb", "CABC", 99i32, "t1", "deadbeef", 1i32],
+        )
+        .unwrap();
+        let result = conn.query_events(&EventQueryParams {
+            start_ledger: 99,
+            end_ledger: Some(101),
+            event_type: None,
+            contract_ids: &[],
+            topics: &[],
+            cursor: None,
+            limit: 100,
+        });
+        assert!(result.is_err(), "should reject invalid event type from DB");
+    }
+
+    #[test]
+    fn test_unknown_event_type_filter_errors() {
+        let conn = setup_db();
+        let result = conn.query_events(&EventQueryParams {
+            start_ledger: 1,
+            end_ledger: Some(100),
+            event_type: Some("bogus"),
+            contract_ids: &[],
+            topics: &[],
+            cursor: None,
+            limit: 100,
+        });
+        assert!(result.is_err(), "should reject unknown event type filter");
     }
 }

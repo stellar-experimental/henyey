@@ -824,4 +824,26 @@ mod tests {
         assert_eq!(loaded.tx_result_set, entry.tx_result_set);
         assert_eq!(loaded.ext, entry.ext);
     }
+
+    #[test]
+    fn test_invalid_tx_status_errors() {
+        let conn = setup_db();
+        // Insert a row with an invalid status value directly via SQL
+        conn.execute(
+            "INSERT INTO txhistory (txid, ledgerseq, txindex, txbody, txresult, txmeta, status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                "bad_tx",
+                100u32,
+                0u32,
+                b"body".to_vec(),
+                b"result".to_vec(),
+                b"meta".to_vec(),
+                99i32
+            ],
+        )
+        .unwrap();
+        let result = conn.load_transaction("bad_tx");
+        assert!(result.is_err(), "should reject invalid tx status");
+    }
 }

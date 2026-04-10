@@ -255,8 +255,15 @@ impl PeerManager {
             .map_err(|e| OverlayError::DatabaseError(format!("Failed to query peers: {}", e)))?;
 
         let mut cache = HashMap::new();
-        for record in rows.flatten() {
-            cache.insert((record.ip.clone(), record.port), record);
+        for result in rows {
+            match result {
+                Ok(record) => {
+                    cache.insert((record.ip.clone(), record.port), record);
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping corrupt peer record: {e}");
+                }
+            }
         }
 
         Ok(cache)
