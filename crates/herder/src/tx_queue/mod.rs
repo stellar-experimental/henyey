@@ -1344,8 +1344,16 @@ impl TransactionQueue {
             Err(result) => return result,
         };
 
-        for evicted in pending_eviction_list {
+        for evicted in &pending_eviction_list {
             by_hash.remove(&evicted.hash);
+        }
+        // Clean up seen set for evicted transactions.
+        // Matches stellar-core prepareDropTransaction → mKnownTxHashes.erase().
+        if !pending_eviction_list.is_empty() {
+            let mut seen = self.seen.write();
+            for evicted in &pending_eviction_list {
+                seen.remove(&evicted.hash);
+            }
         }
 
         // Check queue size
@@ -1357,8 +1365,12 @@ impl TransactionQueue {
                 .map(|(h, _)| *h)
                 .collect();
 
-            for hash in expired {
-                by_hash.remove(&hash);
+            if !expired.is_empty() {
+                let mut seen = self.seen.write();
+                for hash in &expired {
+                    by_hash.remove(hash);
+                    seen.remove(hash);
+                }
             }
 
             if by_hash.len() >= self.config.max_size {
@@ -1379,6 +1391,7 @@ impl TransactionQueue {
                 {
                     if queued.is_better_than(&evict_tx) {
                         by_hash.remove(&evict_hash);
+                        self.seen.write().remove(&evict_hash);
                     } else {
                         return TxQueueResult::QueueFull;
                     }
@@ -1444,8 +1457,9 @@ impl TransactionQueue {
 
         // Handle fee-bump replacement if applicable
         if let Some(ref old_tx) = replaced_tx {
-            // Remove the old transaction from by_hash
+            // Remove the old transaction from by_hash and seen
             by_hash.remove(&old_tx.hash);
+            self.seen.write().remove(&old_tx.hash);
 
             // If the old tx has a different fee-source, release the fee from that account
             let old_fee_source_key = fee_source_key(&old_tx.envelope);
@@ -1597,6 +1611,12 @@ impl TransactionQueue {
                 Self::drop_transaction(&mut account_states, &removed);
             }
         }
+        if !expired_hashes.is_empty() {
+            let mut seen = self.seen.write();
+            for hash in &expired_hashes {
+                seen.remove(hash);
+            }
+        }
 
         // Mirror stellar-core: clear eviction thresholds after aging to avoid
         // carrying stale min-fee requirements.
@@ -1641,10 +1661,12 @@ impl TransactionQueue {
         // Mirrors stellar-core's ban() which calls dropTransaction().
         let mut by_hash = self.by_hash.write();
         let mut account_states = self.account_states.write();
+        let mut seen = self.seen.write();
         for hash in tx_hashes {
             if let Some(removed) = by_hash.remove(hash) {
                 Self::drop_transaction(&mut account_states, &removed);
             }
+            seen.remove(hash);
         }
     }
 
@@ -1720,6 +1742,7 @@ impl TransactionQueue {
         // Collect fee releases to apply after processing all transactions
         let mut fee_releases: Vec<(Vec<u8>, i64)> = Vec::new();
         let mut accounts_to_cleanup: Vec<Vec<u8>> = Vec::new();
+        let mut removed_hashes: Vec<Hash256> = Vec::new();
 
         for (envelope, applied_seq) in applied_txs {
             let frame = henyey_tx::TransactionFrame::from_owned_with_network(
@@ -1741,7 +1764,9 @@ impl TransactionQueue {
                     // Drop if queued tx has seq <= applied seq
                     if queued_tx.sequence_number() <= *applied_seq {
                         // Remove from by_hash
-                        by_hash.remove(&queued_tx.hash);
+                        let removed_hash = queued_tx.hash;
+                        by_hash.remove(&removed_hash);
+                        removed_hashes.push(removed_hash);
 
                         // Collect fee release info
                         let tx_fee = queued_tx.total_fee as i64;
@@ -1789,6 +1814,13 @@ impl TransactionQueue {
                 }
             }
         }
+        // Clean up seen set for removed transactions
+        if !removed_hashes.is_empty() {
+            let mut seen = self.seen.write();
+            for hash in &removed_hashes {
+                seen.remove(hash);
+            }
+        }
     }
 
     /// Shift the queue after a ledger close.
@@ -1817,6 +1849,7 @@ impl TransactionQueue {
         let mut accounts_to_remove = Vec::new();
         // Collect fee releases to apply after iteration (to avoid borrow conflicts)
         let mut fee_releases: Vec<(Vec<u8>, u64)> = Vec::new();
+        let mut evicted_hashes: Vec<Hash256> = Vec::new();
 
         // Process account states: increment age, auto-ban stale transactions
         for (account_key, state) in account_states.iter_mut() {
@@ -1831,8 +1864,9 @@ impl TransactionQueue {
                         if let Some(newest) = banned.back_mut() {
                             newest.insert(queued_tx.hash);
                         }
-                        // Remove from by_hash
+                        // Remove from by_hash and track for seen cleanup
                         by_hash.remove(&queued_tx.hash);
+                        evicted_hashes.push(queued_tx.hash);
 
                         // Track fee release for the fee-source account
                         let tx_fee_source_key = fee_source_key(&queued_tx.envelope);
@@ -1870,6 +1904,14 @@ impl TransactionQueue {
 
         // Reset eviction thresholds for the new ledger
         self.reset_eviction_thresholds();
+
+        // Clean up seen set for evicted transactions
+        if !evicted_hashes.is_empty() {
+            let mut seen = self.seen.write();
+            for hash in &evicted_hashes {
+                seen.remove(hash);
+            }
+        }
 
         ShiftResult {
             unbanned_count,
@@ -5431,6 +5473,67 @@ mod tests {
         let frame = make_soroban_frame_with_resources(0, 0, 0, 4, 3);
         let err = queue.check_soroban_resources(&frame).unwrap_err();
         assert!(err.contains("read entries"), "Error: {}", err);
+    }
+
+    /// Regression test for AUDIT-072: seen-set hashes never clear on eviction.
+    ///
+    /// Before the fix, evicting a tx left its hash in the `seen` set, so
+    /// re-adding the same tx after eviction returned `Duplicate` instead of
+    /// `Added`.
+    #[test]
+    fn test_audit_072_seen_cleared_on_eviction() {
+        // Queue with max_size=2 to force fee-rate eviction
+        let queue = TransactionQueue::with_max_size(2);
+
+        // All txs need different sources to avoid per-account limit
+        let mut tx1 = make_test_envelope(100, 1); // low fee — eviction candidate
+        set_source(&mut tx1, 1);
+        let hash1 = Hash256::hash_xdr(&tx1).unwrap();
+        let mut tx2 = make_test_envelope(200, 1);
+        set_source(&mut tx2, 2);
+        let mut tx3 = make_test_envelope(300, 1);
+        set_source(&mut tx3, 3);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert!(queue.seen.read().contains(&hash1));
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // tx3 has higher fee than tx1, so tx1 gets fee-rate evicted
+        assert_eq!(queue.try_add(tx3), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // Before fix: hash1 remained in seen forever.
+        // After fix: hash1 is removed from seen on eviction.
+        assert!(
+            !queue.seen.read().contains(&hash1),
+            "evicted tx hash should be removed from seen set"
+        );
+    }
+
+    /// Regression test for AUDIT-072: ban() clears seen set.
+    #[test]
+    fn test_audit_072_seen_cleared_on_ban() {
+        let queue = TransactionQueue::with_ban_depth(TxQueueConfig::default(), 3);
+
+        let tx1 = make_test_envelope(200, 1);
+        let hash1 = Hash256::hash_xdr(&tx1).unwrap();
+
+        assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
+
+        // Ban tx1
+        queue.ban(&[hash1]);
+        assert_eq!(queue.len(), 0);
+        assert!(queue.is_banned(&hash1));
+
+        // Shift 3 times to unban (ban_depth=3)
+        queue.shift();
+        queue.shift();
+        queue.shift();
+        assert!(!queue.is_banned(&hash1));
+
+        // Before fix: re-add would return Duplicate even after unban
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
     }
 }
 
