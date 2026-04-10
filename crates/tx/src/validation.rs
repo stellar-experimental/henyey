@@ -862,6 +862,167 @@ pub fn verify_signature_with_raw_key(
     }
 }
 
+/// Error types for pre-sequence-number validation.
+///
+/// Maps to the subset of `TransactionResultCode` values that can be produced by
+/// stateless structural validation (before account loading or sequence checks).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreSeqNumError {
+    /// Transaction has no operations.
+    MissingOperation,
+    /// Transaction or operation is structurally malformed.
+    Malformed(String),
+    /// An operation type is not supported at the current protocol version or
+    /// ledger flags.
+    OpNotSupported,
+    /// Soroban-specific structural constraint violated.
+    SorobanInvalid(String),
+}
+
+impl PreSeqNumError {
+    /// Map to the corresponding `TransactionResultCode`.
+    pub fn to_tx_result_code(&self) -> stellar_xdr::curr::TransactionResultCode {
+        use stellar_xdr::curr::TransactionResultCode;
+        match self {
+            Self::MissingOperation => TransactionResultCode::TxMissingOperation,
+            Self::Malformed(_) => TransactionResultCode::TxMalformed,
+            Self::OpNotSupported => TransactionResultCode::TxNotSupported,
+            Self::SorobanInvalid(_) => TransactionResultCode::TxSorobanInvalid,
+        }
+    }
+}
+
+impl std::fmt::Display for PreSeqNumError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingOperation => write!(f, "transaction has no operations"),
+            Self::Malformed(msg) => write!(f, "malformed: {}", msg),
+            Self::OpNotSupported => write!(f, "operation not supported"),
+            Self::SorobanInvalid(msg) => write!(f, "soroban invalid: {}", msg),
+        }
+    }
+}
+
+/// Stateless structural validation of a transaction envelope.
+///
+/// Mirrors the stateless subset of stellar-core's
+/// `TransactionFrame::commonValidPreSeqNum()` (TransactionFrame.cpp:1274-1502).
+/// Does not include checks that require account state, fee context, time bounds,
+/// or `SorobanNetworkConfig` — those remain in their respective callers (queue
+/// admission and ledger preconditions).
+///
+/// Called by both queue admission and ledger preconditions as Phase 1.
+pub fn check_valid_pre_seq_num(
+    frame: &TransactionFrame,
+    protocol_version: u32,
+    ledger_flags: u32,
+) -> std::result::Result<(), PreSeqNumError> {
+    // 1. Structure: op count, fee > 0, soroban single-op consistency
+    if frame.operations().is_empty() {
+        return Err(PreSeqNumError::MissingOperation);
+    }
+    if !frame.is_valid_structure() {
+        return Err(PreSeqNumError::Malformed(
+            "invalid transaction structure".to_string(),
+        ));
+    }
+
+    // 2. Extra signer structural checks (stellar-core commonValidPreSeqNum:1305-1324)
+    //    - Duplicate extra signers
+    //    - Empty ed25519 signed payload
+    if let Preconditions::V2(cond) = frame.preconditions() {
+        let extra_signers = &cond.extra_signers;
+        if extra_signers.len() == 2 && extra_signers[0] == extra_signers[1] {
+            return Err(PreSeqNumError::Malformed(
+                "duplicate extra signers".to_string(),
+            ));
+        }
+        for signer in extra_signers.iter() {
+            if let SignerKey::Ed25519SignedPayload(payload) = signer {
+                if payload.payload.is_empty() {
+                    return Err(PreSeqNumError::Malformed(
+                        "extra signer has empty ed25519 signed payload".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // 3. Per-op: isOpSupported + doCheckValid
+    let tx_source = frame.source_account_id();
+    for op in frame.operations() {
+        let effective_source = match &op.source_account {
+            Some(muxed) => crate::frame::muxed_to_account_id(muxed),
+            None => tx_source.clone(),
+        };
+        match crate::operations::validate_operation(
+            op,
+            protocol_version,
+            ledger_flags,
+            Some(&effective_source),
+        ) {
+            Ok(()) => {}
+            Err(crate::operations::OperationValidationError::NotSupported(_)) => {
+                return Err(PreSeqNumError::OpNotSupported);
+            }
+            Err(e) => {
+                return Err(PreSeqNumError::Malformed(e.to_string()));
+            }
+        }
+    }
+
+    // 4. Soroban-specific stateless checks
+    if frame.is_soroban() {
+        // 4a. Memo/muxed constraints (stellar-core commonValidPreSeqNum:1351-1362)
+        if !frame.validate_soroban_memo() {
+            return Err(PreSeqNumError::SorobanInvalid(
+                "Soroban transactions must not use memo or muxed source accounts".to_string(),
+            ));
+        }
+
+        // 4b. Host function pairing
+        if !frame.validate_host_fn() {
+            return Err(PreSeqNumError::SorobanInvalid(
+                "invalid host function pairing".to_string(),
+            ));
+        }
+
+        // 4c. Resource fee bound (non-fee-bump only)
+        // stellar-core commonValidPreSeqNum:1376-1393
+        if !frame.is_fee_bump() && frame.declared_soroban_resource_fee() > frame.total_fee() {
+            return Err(PreSeqNumError::SorobanInvalid(
+                "soroban resource fee exceeds full transaction fee".to_string(),
+            ));
+        }
+
+        // 4d. Duplicate footprint keys (stellar-core commonValidPreSeqNum:1424-1450)
+        if let Some(data) = frame.soroban_data() {
+            let fp = &data.resources.footprint;
+            let mut seen = std::collections::HashSet::new();
+            for key in fp.read_only.iter().chain(fp.read_write.iter()) {
+                if !seen.insert(key) {
+                    return Err(PreSeqNumError::SorobanInvalid(
+                        "duplicate key in Soroban footprint".to_string(),
+                    ));
+                }
+            }
+        }
+    } else {
+        // 5. Classic: reject ext != 0 on p21+ (stellar-core commonValidPreSeqNum:1454-1467)
+        if protocol_version >= 21 {
+            if let TransactionEnvelope::Tx(env) = frame.envelope() {
+                if env.tx.ext != stellar_xdr::curr::TransactionExt::V0 {
+                    return Err(PreSeqNumError::Malformed(
+                        "classic transaction must not carry extension data".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3552,6 +3552,10 @@ impl LedgerCloseContext<'_> {
                 id_pool,
                 soroban_config.clone(),
                 frozen_key_config.clone(),
+                match &self.prev_header.ext {
+                    stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+                    stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+                },
             );
             // Update module cache and hot archive references (they may have changed)
             if let Some(cache) = module_cache {

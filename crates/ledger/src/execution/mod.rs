@@ -540,6 +540,8 @@ pub struct TransactionExecutor {
     base_reserve: u32,
     /// Protocol version.
     protocol_version: u32,
+    /// Ledger header flags (e.g. LP disable flags). 0 if pre-v1 extension.
+    ledger_flags: u32,
     /// Network ID.
     network_id: NetworkId,
     /// State manager for execution.
@@ -590,6 +592,7 @@ impl TransactionExecutor {
             close_time: context.close_time,
             base_reserve: context.base_reserve,
             protocol_version: context.protocol_version,
+            ledger_flags: 0,
             network_id: context.network_id,
             state,
             loaded_accounts: HashMap::new(),
@@ -709,11 +712,13 @@ impl TransactionExecutor {
         _id_pool: u64, // Intentionally unused - see note above
         soroban_config: SorobanConfig,
         frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig,
+        ledger_flags: u32,
     ) {
         self.ledger_seq = ledger_seq;
         self.close_time = close_time;
         self.base_reserve = base_reserve;
         self.protocol_version = protocol_version;
+        self.ledger_flags = ledger_flags;
         self.soroban_config = soroban_config;
         self.frozen_key_config = frozen_key_config;
         self.state.set_ledger_seq(ledger_seq);

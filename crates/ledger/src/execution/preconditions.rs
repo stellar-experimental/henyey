@@ -57,17 +57,17 @@ impl TransactionExecutor {
             }
         };
 
-        // Phase 1: Structure validation
-        if !frame.is_valid_structure() {
-            let failure = if frame.operations().is_empty() {
-                TransactionResultCode::TxMissingOperation
-            } else {
-                TransactionResultCode::TxMalformed
-            };
+        // Phase 1: Shared stateless structural validation
+        // Mirrors the stateless subset of stellar-core's commonValidPreSeqNum.
+        // Called by both queue admission and preconditions.
+        if let Err(e) =
+            henyey_tx::check_valid_pre_seq_num(&frame, self.protocol_version, self.ledger_flags)
+        {
+            let code = e.to_tx_result_code();
             return Ok(Err(if is_fee_bump {
-                fee_bump_outer_fail(failure, "Invalid transaction structure")
+                fee_bump_outer_fail(code, &e.to_string())
             } else {
-                pre_seq_fail(failure, "Invalid transaction structure")
+                pre_seq_fail(code, &e.to_string())
             }));
         }
 

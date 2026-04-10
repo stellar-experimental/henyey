@@ -1658,12 +1658,17 @@ impl App {
             }
         }
 
+        let ledger_flags = match &result.header.ext {
+            stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+            stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+        };
         self.herder.tx_queue().update_validation_context(
             pending.ledger_seq,
             result.header.scp_value.close_time.0,
             result.header.ledger_version,
             result.header.base_fee,
             result.header.base_reserve,
+            ledger_flags,
         );
 
         // Update dynamic Soroban resource limits for queue admission.

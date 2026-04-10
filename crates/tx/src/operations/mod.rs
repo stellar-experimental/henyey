@@ -8,14 +8,19 @@ pub use execute::prefetch::collect_prefetch_keys;
 
 use std::collections::HashSet;
 
+use crate::frame::muxed_to_account_id;
+use henyey_common::asset::{
+    is_asset_valid, is_change_trust_asset_valid, is_string_valid, is_trustline_asset_valid,
+};
 use stellar_xdr::curr::{
-    AllowTrustOp, BeginSponsoringFutureReservesOp, BumpSequenceOp, ChangeTrustOp,
-    ClaimClaimableBalanceOp, ClaimPredicate, Claimant, ClawbackClaimableBalanceOp, ClawbackOp,
-    CreateAccountOp, CreateClaimableBalanceOp, CreatePassiveSellOfferOp, ExtendFootprintTtlOp,
-    InvokeHostFunctionOp, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp,
-    ManageDataOp, ManageSellOfferOp, Operation, OperationBody, OperationType,
-    PathPaymentStrictReceiveOp, PathPaymentStrictSendOp, PaymentOp, RestoreFootprintOp,
-    SetOptionsOp, SetTrustLineFlagsOp,
+    AccountId, AllowTrustOp, Asset, BeginSponsoringFutureReservesOp, BumpSequenceOp,
+    ChangeTrustAsset, ChangeTrustOp, ClaimClaimableBalanceOp, ClaimPredicate, Claimant,
+    ClawbackClaimableBalanceOp, ClawbackOp, CreateAccountOp, CreateClaimableBalanceOp,
+    CreatePassiveSellOfferOp, ExtendFootprintTtlOp, InvokeHostFunctionOp, LedgerHeaderFlags,
+    LedgerKey, LiquidityPoolDepositOp, LiquidityPoolWithdrawOp, ManageBuyOfferOp, ManageDataOp,
+    ManageSellOfferOp, Operation, OperationBody, OperationType, PathPaymentStrictReceiveOp,
+    PathPaymentStrictSendOp, PaymentOp, RestoreFootprintOp, RevokeSponsorshipOp, SetOptionsOp,
+    SetTrustLineFlagsOp, SignerKey, TrustLineFlags, MASK_ACCOUNT_FLAGS_V17,
 };
 
 /// Extension trait for `stellar_xdr::curr::OperationType` providing Soroban classification
@@ -77,6 +82,8 @@ pub enum OperationValidationError {
     InvalidHostFunction(String),
     /// Invalid Soroban data.
     InvalidSorobanData(String),
+    /// Operation type not supported at the current protocol version or ledger flags.
+    NotSupported(OperationType),
     /// Generic validation error.
     Other(String),
 }
@@ -96,62 +103,150 @@ impl std::fmt::Display for OperationValidationError {
             Self::InvalidPoolId => write!(f, "invalid pool ID"),
             Self::InvalidHostFunction(msg) => write!(f, "invalid host function: {}", msg),
             Self::InvalidSorobanData(msg) => write!(f, "invalid Soroban data: {}", msg),
+            Self::NotSupported(op) => write!(f, "operation not supported: {:?}", op),
             Self::Other(msg) => write!(f, "{}", msg),
         }
     }
 }
 
+/// Check whether an operation type is supported at the given protocol version
+/// and ledger header flags.
+///
+/// Mirrors stellar-core's `OperationFrame::isOpSupported(LedgerHeader)`.
+pub fn is_op_supported(
+    op_type: &OperationType,
+    _protocol_version: u32,
+    ledger_flags: u32,
+) -> std::result::Result<(), OperationValidationError> {
+    match op_type {
+        // Inflation removed in protocol 12; Henyey minimum is p24.
+        OperationType::Inflation => Err(OperationValidationError::NotSupported(*op_type)),
+        // LP deposit/withdraw gated by ledger header flags.
+        OperationType::LiquidityPoolDeposit => {
+            if ledger_flags & (LedgerHeaderFlags::DepositFlag as u32) != 0 {
+                Err(OperationValidationError::NotSupported(*op_type))
+            } else {
+                Ok(())
+            }
+        }
+        OperationType::LiquidityPoolWithdraw => {
+            if ledger_flags & (LedgerHeaderFlags::WithdrawalFlag as u32) != 0 {
+                Err(OperationValidationError::NotSupported(*op_type))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Validate an operation.
-pub fn validate_operation(op: &Operation) -> std::result::Result<(), OperationValidationError> {
+///
+/// Mirrors stellar-core's `OperationFrame::checkValid()`: first checks
+/// `isOpSupported` (protocol version + ledger flags), then dispatches to
+/// per-operation structural validation (`doCheckValid`).
+///
+/// `source_account` is the effective source for this operation (op-level source
+/// if set, otherwise the transaction source). Some checks (e.g. destination !=
+/// source, issuer == source) require it. When `None`, those checks are skipped.
+pub fn validate_operation(
+    op: &Operation,
+    protocol_version: u32,
+    ledger_flags: u32,
+    source_account: Option<&AccountId>,
+) -> std::result::Result<(), OperationValidationError> {
+    // Phase 1: Protocol/flag gating (isOpSupported)
+    let op_type = OperationType::from_body(&op.body);
+    is_op_supported(&op_type, protocol_version, ledger_flags)?;
+
+    // Phase 2: Per-op structural checks (doCheckValid)
     match &op.body {
-        OperationBody::CreateAccount(op) => validate_create_account(op),
-        OperationBody::Payment(op) => validate_payment(op),
-        OperationBody::PathPaymentStrictReceive(op) => validate_path_payment_strict_receive(op),
-        OperationBody::PathPaymentStrictSend(op) => validate_path_payment_strict_send(op),
-        OperationBody::ManageSellOffer(op) => validate_manage_sell_offer(op),
-        OperationBody::ManageBuyOffer(op) => validate_manage_buy_offer(op),
-        OperationBody::CreatePassiveSellOffer(op) => validate_create_passive_sell_offer(op),
-        OperationBody::SetOptions(op) => validate_set_options(op),
-        OperationBody::ChangeTrust(op) => validate_change_trust(op),
-        OperationBody::AllowTrust(op) => validate_allow_trust(op),
+        OperationBody::CreateAccount(inner) => validate_create_account(inner, source_account),
+        OperationBody::Payment(inner) => validate_payment(inner, protocol_version),
+        OperationBody::PathPaymentStrictReceive(inner) => {
+            validate_path_payment_strict_receive(inner, protocol_version)
+        }
+        OperationBody::PathPaymentStrictSend(inner) => {
+            validate_path_payment_strict_send(inner, protocol_version)
+        }
+        OperationBody::ManageSellOffer(inner) => {
+            validate_manage_sell_offer(inner, protocol_version)
+        }
+        OperationBody::ManageBuyOffer(inner) => validate_manage_buy_offer(inner, protocol_version),
+        OperationBody::CreatePassiveSellOffer(inner) => {
+            validate_create_passive_sell_offer(inner, protocol_version)
+        }
+        OperationBody::SetOptions(inner) => {
+            validate_set_options(inner, protocol_version, source_account)
+        }
+        OperationBody::ChangeTrust(inner) => {
+            validate_change_trust(inner, protocol_version, source_account)
+        }
+        OperationBody::AllowTrust(inner) => {
+            validate_allow_trust(inner, protocol_version, source_account)
+        }
         OperationBody::AccountMerge(_) => Ok(()), // No specific validation needed
         OperationBody::Inflation => Ok(()),       // No validation needed
-        OperationBody::ManageData(op) => validate_manage_data(op),
-        OperationBody::BumpSequence(op) => validate_bump_sequence(op),
-        OperationBody::CreateClaimableBalance(op) => validate_create_claimable_balance(op),
-        OperationBody::ClaimClaimableBalance(op) => validate_claim_claimable_balance(op),
-        OperationBody::BeginSponsoringFutureReserves(op) => {
-            validate_begin_sponsoring_future_reserves(op)
+        OperationBody::ManageData(inner) => validate_manage_data(inner),
+        OperationBody::BumpSequence(inner) => validate_bump_sequence(inner),
+        OperationBody::CreateClaimableBalance(inner) => {
+            validate_create_claimable_balance(inner, protocol_version)
         }
-        OperationBody::EndSponsoringFutureReserves => Ok(()), // No validation needed
-        OperationBody::RevokeSponsorship(_) => Ok(()),        // Complex, trust for now
-        OperationBody::Clawback(op) => validate_clawback(op),
-        OperationBody::ClawbackClaimableBalance(op) => validate_clawback_claimable_balance(op),
-        OperationBody::SetTrustLineFlags(op) => validate_set_trust_line_flags(op),
-        OperationBody::LiquidityPoolDeposit(op) => validate_liquidity_pool_deposit(op),
-        OperationBody::LiquidityPoolWithdraw(op) => validate_liquidity_pool_withdraw(op),
-        OperationBody::InvokeHostFunction(op) => validate_invoke_host_function(op),
-        OperationBody::ExtendFootprintTtl(op) => validate_extend_footprint_ttl(op),
-        OperationBody::RestoreFootprint(op) => validate_restore_footprint(op),
+        OperationBody::ClaimClaimableBalance(inner) => validate_claim_claimable_balance(inner),
+        OperationBody::BeginSponsoringFutureReserves(inner) => {
+            validate_begin_sponsoring_future_reserves(inner)
+        }
+        OperationBody::EndSponsoringFutureReserves => Ok(()),
+        OperationBody::RevokeSponsorship(inner) => {
+            validate_revoke_sponsorship(inner, protocol_version)
+        }
+        OperationBody::Clawback(inner) => {
+            validate_clawback(inner, protocol_version, source_account)
+        }
+        OperationBody::ClawbackClaimableBalance(inner) => {
+            validate_clawback_claimable_balance(inner)
+        }
+        OperationBody::SetTrustLineFlags(inner) => {
+            validate_set_trust_line_flags(inner, protocol_version, source_account)
+        }
+        OperationBody::LiquidityPoolDeposit(inner) => validate_liquidity_pool_deposit(inner),
+        OperationBody::LiquidityPoolWithdraw(inner) => validate_liquidity_pool_withdraw(inner),
+        OperationBody::InvokeHostFunction(inner) => validate_invoke_host_function(inner),
+        OperationBody::ExtendFootprintTtl(inner) => validate_extend_footprint_ttl(inner),
+        OperationBody::RestoreFootprint(inner) => validate_restore_footprint(inner),
     }
 }
 
 /// Validate CreateAccount operation.
 fn validate_create_account(
     op: &CreateAccountOp,
+    source_account: Option<&AccountId>,
 ) -> std::result::Result<(), OperationValidationError> {
-    // Spec: TX_SPEC §12.1 — @version(>=14): startingBalance MUST be >= 0.
-    // Henyey only supports protocol 24+, so zero is allowed.
+    // Henyey only supports protocol 24+, so zero starting balance is allowed.
     if op.starting_balance < 0 {
         return Err(OperationValidationError::InvalidAmount(op.starting_balance));
+    }
+    // destination must not be source (stellar-core CreateAccountOpFrame.cpp:187)
+    if let Some(src) = source_account {
+        if &op.destination == src {
+            return Err(OperationValidationError::InvalidDestination);
+        }
     }
     Ok(())
 }
 
 /// Validate Payment operation.
-fn validate_payment(op: &PaymentOp) -> std::result::Result<(), OperationValidationError> {
+fn validate_payment(
+    op: &PaymentOp,
+    protocol_version: u32,
+) -> std::result::Result<(), OperationValidationError> {
     if op.amount <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.amount));
+    }
+    if !is_asset_valid(&op.asset, protocol_version) {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
     }
     Ok(())
 }
@@ -159,6 +254,7 @@ fn validate_payment(op: &PaymentOp) -> std::result::Result<(), OperationValidati
 /// Validate PathPaymentStrictReceive operation.
 fn validate_path_payment_strict_receive(
     op: &PathPaymentStrictReceiveOp,
+    protocol_version: u32,
 ) -> std::result::Result<(), OperationValidationError> {
     if op.dest_amount <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.dest_amount));
@@ -166,12 +262,27 @@ fn validate_path_payment_strict_receive(
     if op.send_max <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.send_max));
     }
+    if !is_asset_valid(&op.send_asset, protocol_version)
+        || !is_asset_valid(&op.dest_asset, protocol_version)
+    {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
+    }
+    for p in op.path.iter() {
+        if !is_asset_valid(p, protocol_version) {
+            return Err(OperationValidationError::InvalidAsset(
+                "invalid asset in path".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
 /// Validate PathPaymentStrictSend operation.
 fn validate_path_payment_strict_send(
     op: &PathPaymentStrictSendOp,
+    protocol_version: u32,
 ) -> std::result::Result<(), OperationValidationError> {
     if op.send_amount <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.send_amount));
@@ -179,41 +290,114 @@ fn validate_path_payment_strict_send(
     if op.dest_min <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.dest_min));
     }
+    if !is_asset_valid(&op.send_asset, protocol_version)
+        || !is_asset_valid(&op.dest_asset, protocol_version)
+    {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
+    }
+    for p in op.path.iter() {
+        if !is_asset_valid(p, protocol_version) {
+            return Err(OperationValidationError::InvalidAsset(
+                "invalid asset in path".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
 /// Validate ManageSellOffer operation.
+/// Mirrors stellar-core ManageOfferOpFrameBase::doCheckValid.
 fn validate_manage_sell_offer(
     op: &ManageSellOfferOp,
+    protocol_version: u32,
 ) -> std::result::Result<(), OperationValidationError> {
+    if !is_asset_valid(&op.selling, protocol_version)
+        || !is_asset_valid(&op.buying, protocol_version)
+    {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
+    }
+    if op.selling == op.buying {
+        return Err(OperationValidationError::InvalidAsset(
+            "selling and buying assets must differ".into(),
+        ));
+    }
     // Amount of 0 is valid (deletes offer)
     if op.amount < 0 {
         return Err(OperationValidationError::InvalidAmount(op.amount));
     }
-    // Price must be positive
     if op.price.n <= 0 || op.price.d <= 0 {
         return Err(OperationValidationError::InvalidPrice);
+    }
+    // p11+: creating an offer (id==0) with amount==0 is malformed
+    if op.offer_id == 0 && op.amount == 0 {
+        return Err(OperationValidationError::InvalidAmount(op.amount));
+    }
+    // p15+: negative offer IDs are invalid
+    if op.offer_id < 0 {
+        return Err(OperationValidationError::InvalidOfferId);
     }
     Ok(())
 }
 
 /// Validate ManageBuyOffer operation.
+/// Validate ManageBuyOffer operation.
+/// Same checks as ManageSellOffer (shared base in stellar-core).
 fn validate_manage_buy_offer(
     op: &ManageBuyOfferOp,
+    protocol_version: u32,
 ) -> std::result::Result<(), OperationValidationError> {
+    if !is_asset_valid(&op.selling, protocol_version)
+        || !is_asset_valid(&op.buying, protocol_version)
+    {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
+    }
+    if op.selling == op.buying {
+        return Err(OperationValidationError::InvalidAsset(
+            "selling and buying assets must differ".into(),
+        ));
+    }
     if op.buy_amount < 0 {
         return Err(OperationValidationError::InvalidAmount(op.buy_amount));
     }
     if op.price.n <= 0 || op.price.d <= 0 {
         return Err(OperationValidationError::InvalidPrice);
     }
+    // p11+: creating an offer (id==0) with amount==0 is malformed
+    if op.offer_id == 0 && op.buy_amount == 0 {
+        return Err(OperationValidationError::InvalidAmount(op.buy_amount));
+    }
+    // p15+: negative offer IDs are invalid
+    if op.offer_id < 0 {
+        return Err(OperationValidationError::InvalidOfferId);
+    }
     Ok(())
 }
 
 /// Validate CreatePassiveSellOffer operation.
+/// Uses the same base validation as ManageSellOffer but amount must be > 0 and
+/// there's no offer ID (passive offers are always new).
 fn validate_create_passive_sell_offer(
     op: &CreatePassiveSellOfferOp,
+    protocol_version: u32,
 ) -> std::result::Result<(), OperationValidationError> {
+    if !is_asset_valid(&op.selling, protocol_version)
+        || !is_asset_valid(&op.buying, protocol_version)
+    {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
+    }
+    if op.selling == op.buying {
+        return Err(OperationValidationError::InvalidAsset(
+            "selling and buying assets must differ".into(),
+        ));
+    }
     if op.amount <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.amount));
     }
@@ -225,7 +409,35 @@ fn validate_create_passive_sell_offer(
 
 // SECURITY: signer weight bounded by XDR u32 type; protocol 8-bit limit enforced during operation execution in set_options.rs
 /// Validate SetOptions operation.
-fn validate_set_options(op: &SetOptionsOp) -> std::result::Result<(), OperationValidationError> {
+/// Mirrors stellar-core SetOptionsOpFrame::doCheckValid.
+fn validate_set_options(
+    op: &SetOptionsOp,
+    _protocol_version: u32,
+    source_account: Option<&AccountId>,
+) -> std::result::Result<(), OperationValidationError> {
+    // Flag mask validation (p24+ uses V17 masks)
+    let mask = MASK_ACCOUNT_FLAGS_V17 as u32;
+    if let Some(flags) = op.set_flags {
+        if flags & !mask != 0 {
+            return Err(OperationValidationError::Other("unknown set flags".into()));
+        }
+    }
+    if let Some(flags) = op.clear_flags {
+        if flags & !mask != 0 {
+            return Err(OperationValidationError::Other(
+                "unknown clear flags".into(),
+            ));
+        }
+    }
+    // setFlags and clearFlags must not overlap
+    if let (Some(set), Some(clear)) = (op.set_flags, op.clear_flags) {
+        if (set & clear) != 0 {
+            return Err(OperationValidationError::Other(
+                "set and clear flags overlap".into(),
+            ));
+        }
+    }
+
     // Check master weight if set
     if let Some(weight) = op.master_weight {
         if weight > 255 {
@@ -248,21 +460,135 @@ fn validate_set_options(op: &SetOptionsOp) -> std::result::Result<(), OperationV
             return Err(OperationValidationError::InvalidThreshold);
         }
     }
+
+    // Signer validation
+    if let Some(signer) = &op.signer {
+        // signer key must not be self
+        if let Some(src) = source_account {
+            if let SignerKey::Ed25519(key) = &signer.key {
+                let signer_acct = AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    key.clone(),
+                ));
+                if &signer_acct == src {
+                    return Err(OperationValidationError::Other(
+                        "signer cannot be source account".into(),
+                    ));
+                }
+            }
+        }
+        // p10+: signer weight must fit in u8
+        if signer.weight > 255 {
+            return Err(OperationValidationError::InvalidWeight);
+        }
+        // p19+: ED25519_SIGNED_PAYLOAD must have non-empty payload
+        if let SignerKey::Ed25519SignedPayload(sp) = &signer.key {
+            if sp.payload.is_empty() {
+                return Err(OperationValidationError::Other(
+                    "signed payload signer has empty payload".into(),
+                ));
+            }
+        }
+    }
+
+    // Home domain string validation
+    if let Some(domain) = &op.home_domain {
+        let bytes: &[u8] = domain.as_ref();
+        if !is_string_valid(std::str::from_utf8(bytes).unwrap_or("\0")) {
+            return Err(OperationValidationError::Other(
+                "invalid home domain string".into(),
+            ));
+        }
+    }
+
     Ok(())
 }
 
 /// Validate ChangeTrust operation.
-fn validate_change_trust(op: &ChangeTrustOp) -> std::result::Result<(), OperationValidationError> {
-    // Limit of 0 is valid (removes trustline)
+/// Mirrors stellar-core ChangeTrustOpFrame::doCheckValid.
+fn validate_change_trust(
+    op: &ChangeTrustOp,
+    protocol_version: u32,
+    source_account: Option<&AccountId>,
+) -> std::result::Result<(), OperationValidationError> {
     if op.limit < 0 {
         return Err(OperationValidationError::InvalidAmount(op.limit));
+    }
+    if !is_change_trust_asset_valid(&op.line, protocol_version) {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
+    }
+    // p10+: cannot create trustline for native asset
+    if matches!(op.line, ChangeTrustAsset::Native) {
+        return Err(OperationValidationError::InvalidAsset(
+            "cannot create trustline for native asset".into(),
+        ));
+    }
+    // p16+: source must not be issuer of the asset
+    if let Some(src) = source_account {
+        if is_change_trust_asset_issuer(src, &op.line) {
+            return Err(OperationValidationError::InvalidAsset(
+                "source is issuer of asset".into(),
+            ));
+        }
     }
     Ok(())
 }
 
+/// Check if an account is the issuer of a ChangeTrustAsset.
+/// Pool shares have no issuer, so this returns false for them.
+fn is_change_trust_asset_issuer(acc: &AccountId, asset: &ChangeTrustAsset) -> bool {
+    match asset {
+        ChangeTrustAsset::CreditAlphanum4(a) => acc == &a.issuer,
+        ChangeTrustAsset::CreditAlphanum12(a) => acc == &a.issuer,
+        ChangeTrustAsset::Native | ChangeTrustAsset::PoolShare(_) => false,
+    }
+}
+
 /// Validate AllowTrust operation.
-fn validate_allow_trust(_op: &AllowTrustOp) -> std::result::Result<(), OperationValidationError> {
-    // Basic structure is validated by XDR
+/// Mirrors stellar-core AllowTrustOpFrame::doCheckValid.
+fn validate_allow_trust(
+    op: &AllowTrustOp,
+    _protocol_version: u32,
+    source_account: Option<&AccountId>,
+) -> std::result::Result<(), OperationValidationError> {
+    // asset must not be native
+    if matches!(
+        op.asset,
+        stellar_xdr::curr::AssetCode::CreditAlphanum4(_)
+            | stellar_xdr::curr::AssetCode::CreditAlphanum12(_)
+    ) {
+        // valid asset code types — continue
+    } else {
+        return Err(OperationValidationError::InvalidAsset(
+            "AllowTrust asset must be credit".into(),
+        ));
+    }
+    // authorize must be a valid trust line flag combination
+    // AUTHORIZED_FLAG=1, AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG=2
+    // Valid values: 0, 1, 2 — NOT 3 (both auth flags)
+    let auth = op.authorize;
+    if auth > (TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32) {
+        return Err(OperationValidationError::Other(
+            "invalid authorize value".into(),
+        ));
+    }
+    // Both auth flags set simultaneously is invalid (p13+)
+    let both_auth = (TrustLineFlags::AuthorizedFlag as u32)
+        | (TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32);
+    if (auth & both_auth) == both_auth {
+        return Err(OperationValidationError::Other(
+            "cannot set both auth flags".into(),
+        ));
+    }
+    // p16+: trustor must not be source
+    if let Some(src) = source_account {
+        if &op.trustor == src {
+            return Err(OperationValidationError::Other(
+                "trustor cannot be source".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -298,7 +624,13 @@ fn validate_bump_sequence(
 /// Validate CreateClaimableBalance operation.
 fn validate_create_claimable_balance(
     op: &CreateClaimableBalanceOp,
+    protocol_version: u32,
 ) -> std::result::Result<(), OperationValidationError> {
+    if !is_asset_valid(&op.asset, protocol_version) {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
+    }
     if op.amount <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.amount));
     }
@@ -359,10 +691,100 @@ fn validate_begin_sponsoring_future_reserves(
     Ok(())
 }
 
-/// Validate Clawback operation.
-fn validate_clawback(op: &ClawbackOp) -> std::result::Result<(), OperationValidationError> {
+/// Validate RevokeSponsorship operation.
+/// Mirrors stellar-core RevokeSponsorshipOpFrame::doCheckValid.
+fn validate_revoke_sponsorship(
+    op: &RevokeSponsorshipOp,
+    protocol_version: u32,
+) -> std::result::Result<(), OperationValidationError> {
+    if let RevokeSponsorshipOp::LedgerEntry(lk) = op {
+        match lk {
+            LedgerKey::Account(_) | LedgerKey::ClaimableBalance(_) => {
+                // No specific validation
+            }
+            LedgerKey::Trustline(tl) => {
+                if !is_trustline_asset_valid(&tl.asset, protocol_version) {
+                    return Err(OperationValidationError::InvalidAsset(
+                        "invalid trustline asset".into(),
+                    ));
+                }
+                if matches!(tl.asset, stellar_xdr::curr::TrustLineAsset::Native) {
+                    return Err(OperationValidationError::InvalidAsset(
+                        "trustline asset cannot be native".into(),
+                    ));
+                }
+                if henyey_common::asset::is_trustline_asset_issuer(&tl.account_id, &tl.asset) {
+                    return Err(OperationValidationError::Other(
+                        "trustline account is issuer".into(),
+                    ));
+                }
+            }
+            LedgerKey::Offer(offer) => {
+                if offer.offer_id <= 0 {
+                    return Err(OperationValidationError::InvalidOfferId);
+                }
+            }
+            LedgerKey::Data(data) => {
+                let name_bytes: &[u8] = data.data_name.as_ref();
+                if name_bytes.is_empty()
+                    || !is_string_valid(std::str::from_utf8(name_bytes).unwrap_or(""))
+                {
+                    return Err(OperationValidationError::InvalidDataValue(
+                        "invalid data name".into(),
+                    ));
+                }
+            }
+            // Unsupported ledger key types
+            LedgerKey::LiquidityPool(_)
+            | LedgerKey::ContractData(_)
+            | LedgerKey::ContractCode(_)
+            | LedgerKey::ConfigSetting(_)
+            | LedgerKey::Ttl(_) => {
+                return Err(OperationValidationError::Other(
+                    "unsupported ledger key type for revoke sponsorship".into(),
+                ));
+            }
+        }
+    }
+    // REVOKE_SPONSORSHIP_SIGNER has no additional validation in stellar-core
+    Ok(())
+}
+/// Mirrors stellar-core ClawbackOpFrame::doCheckValid.
+fn validate_clawback(
+    op: &ClawbackOp,
+    protocol_version: u32,
+    source_account: Option<&AccountId>,
+) -> std::result::Result<(), OperationValidationError> {
+    // from must not be source
+    if let Some(src) = source_account {
+        let from_acct = muxed_to_account_id(&op.from);
+        if &from_acct == src {
+            return Err(OperationValidationError::Other(
+                "cannot clawback from self".into(),
+            ));
+        }
+    }
     if op.amount <= 0 {
         return Err(OperationValidationError::InvalidAmount(op.amount));
+    }
+    // asset must not be native
+    if matches!(op.asset, Asset::Native) {
+        return Err(OperationValidationError::InvalidAsset(
+            "cannot clawback native asset".into(),
+        ));
+    }
+    if !is_asset_valid(&op.asset, protocol_version) {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
+    }
+    // source must be issuer of the asset
+    if let Some(src) = source_account {
+        if !henyey_common::asset::is_issuer(src, &op.asset) {
+            return Err(OperationValidationError::Other(
+                "source must be asset issuer for clawback".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -376,10 +798,70 @@ fn validate_clawback_claimable_balance(
 }
 
 /// Validate SetTrustLineFlags operation.
+/// Mirrors stellar-core SetTrustLineFlagsOpFrame::doCheckValid.
 fn validate_set_trust_line_flags(
-    _op: &SetTrustLineFlagsOp,
+    op: &SetTrustLineFlagsOp,
+    protocol_version: u32,
+    source_account: Option<&AccountId>,
 ) -> std::result::Result<(), OperationValidationError> {
-    // Flags validation is handled by XDR
+    // asset must not be native
+    if matches!(op.asset, Asset::Native) {
+        return Err(OperationValidationError::InvalidAsset(
+            "cannot set trust line flags for native asset".into(),
+        ));
+    }
+    if !is_asset_valid(&op.asset, protocol_version) {
+        return Err(OperationValidationError::InvalidAsset(
+            "invalid asset".into(),
+        ));
+    }
+    // source must be issuer
+    if let Some(src) = source_account {
+        if !henyey_common::asset::is_issuer(src, &op.asset) {
+            return Err(OperationValidationError::Other(
+                "source must be asset issuer".into(),
+            ));
+        }
+        // trustor must not be source
+        if &op.trustor == src {
+            return Err(OperationValidationError::Other(
+                "trustor cannot be source".into(),
+            ));
+        }
+    }
+    // setFlags and clearFlags must not overlap
+    if (op.set_flags & op.clear_flags) != 0 {
+        return Err(OperationValidationError::Other(
+            "set and clear flags overlap".into(),
+        ));
+    }
+    // setFlags must be valid trust line flags, and must not include clawback
+    let set = op.set_flags;
+    let both_auth = (TrustLineFlags::AuthorizedFlag as u32)
+        | (TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32);
+    if (set & both_auth) == both_auth {
+        return Err(OperationValidationError::Other(
+            "invalid set flags: both auth flags".into(),
+        ));
+    }
+    if (set & (TrustLineFlags::TrustlineClawbackEnabledFlag as u32)) != 0 {
+        return Err(OperationValidationError::Other(
+            "cannot set clawback flag via SetTrustLineFlags".into(),
+        ));
+    }
+    // For p24+, valid trust line flag mask = AuthorizedFlag | AuthorizedToMaintainLiabilitiesFlag | TrustlineClawbackEnabledFlag
+    let valid_mask = (TrustLineFlags::AuthorizedFlag as u32)
+        | (TrustLineFlags::AuthorizedToMaintainLiabilitiesFlag as u32)
+        | (TrustLineFlags::TrustlineClawbackEnabledFlag as u32);
+    if (set & !valid_mask) != 0 {
+        return Err(OperationValidationError::Other("unknown set flags".into()));
+    }
+    // clearFlags mask check (same valid mask)
+    if (op.clear_flags & !valid_mask) != 0 {
+        return Err(OperationValidationError::Other(
+            "unknown clear flags".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -554,21 +1036,21 @@ mod tests {
             asset: Asset::Native,
             amount: 1000,
         };
-        assert!(validate_payment(&valid).is_ok());
+        assert!(validate_payment(&valid, 24).is_ok());
 
         let invalid = PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([0u8; 32])),
             asset: Asset::Native,
             amount: 0,
         };
-        assert!(validate_payment(&invalid).is_err());
+        assert!(validate_payment(&invalid, 24).is_err());
 
         let negative = PaymentOp {
             destination: MuxedAccount::Ed25519(Uint256([0u8; 32])),
             asset: Asset::Native,
             amount: -100,
         };
-        assert!(validate_payment(&negative).is_err());
+        assert!(validate_payment(&negative, 24).is_err());
     }
 
     #[test]
@@ -577,21 +1059,21 @@ mod tests {
             destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
             starting_balance: 10_000_000,
         };
-        assert!(validate_create_account(&valid).is_ok());
+        assert!(validate_create_account(&valid, None).is_ok());
 
         // P14+ allows startingBalance == 0
         let zero = CreateAccountOp {
             destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
             starting_balance: 0,
         };
-        assert!(validate_create_account(&zero).is_ok());
+        assert!(validate_create_account(&zero, None).is_ok());
 
         // Negative startingBalance is always rejected
         let negative = CreateAccountOp {
             destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32]))),
             starting_balance: -1,
         };
-        assert!(validate_create_account(&negative).is_err());
+        assert!(validate_create_account(&negative, None).is_err());
     }
 
     #[test]
@@ -667,7 +1149,7 @@ mod tests {
             claimants: vec![claimant.clone(), claimant].try_into().unwrap(),
         };
 
-        assert!(validate_create_claimable_balance(&op).is_err());
+        assert!(validate_create_claimable_balance(&op, 24).is_err());
     }
 
     #[test]
@@ -683,7 +1165,7 @@ mod tests {
             claimants: vec![claimant].try_into().unwrap(),
         };
 
-        assert!(validate_create_claimable_balance(&op).is_err());
+        assert!(validate_create_claimable_balance(&op, 24).is_err());
     }
 
     #[test]
@@ -935,35 +1417,35 @@ mod tests {
             dest_amount: 500,
             path: vec![].try_into().unwrap(),
         };
-        assert!(validate_path_payment_strict_receive(&valid).is_ok());
+        assert!(validate_path_payment_strict_receive(&valid, 24).is_ok());
 
         // Zero send_max
         let invalid_send = PathPaymentStrictReceiveOp {
             send_max: 0,
             ..valid.clone()
         };
-        assert!(validate_path_payment_strict_receive(&invalid_send).is_err());
+        assert!(validate_path_payment_strict_receive(&invalid_send, 24).is_err());
 
         // Zero dest_amount
         let invalid_dest = PathPaymentStrictReceiveOp {
             dest_amount: 0,
             ..valid.clone()
         };
-        assert!(validate_path_payment_strict_receive(&invalid_dest).is_err());
+        assert!(validate_path_payment_strict_receive(&invalid_dest, 24).is_err());
 
         // Negative send_max
         let negative_send = PathPaymentStrictReceiveOp {
             send_max: -100,
             ..valid.clone()
         };
-        assert!(validate_path_payment_strict_receive(&negative_send).is_err());
+        assert!(validate_path_payment_strict_receive(&negative_send, 24).is_err());
 
         // Negative dest_amount
         let negative_dest = PathPaymentStrictReceiveOp {
             dest_amount: -100,
             ..valid
         };
-        assert!(validate_path_payment_strict_receive(&negative_dest).is_err());
+        assert!(validate_path_payment_strict_receive(&negative_dest, 24).is_err());
     }
 
     /// Test validate_path_payment_strict_send.
@@ -977,21 +1459,21 @@ mod tests {
             dest_min: 500,
             path: vec![].try_into().unwrap(),
         };
-        assert!(validate_path_payment_strict_send(&valid).is_ok());
+        assert!(validate_path_payment_strict_send(&valid, 24).is_ok());
 
         // Zero send_amount
         let invalid_send = PathPaymentStrictSendOp {
             send_amount: 0,
             ..valid.clone()
         };
-        assert!(validate_path_payment_strict_send(&invalid_send).is_err());
+        assert!(validate_path_payment_strict_send(&invalid_send, 24).is_err());
 
         // Negative dest_min
         let negative_dest = PathPaymentStrictSendOp {
             dest_min: -100,
             ..valid
         };
-        assert!(validate_path_payment_strict_send(&negative_dest).is_err());
+        assert!(validate_path_payment_strict_send(&negative_dest, 24).is_err());
     }
 
     /// Test validate_manage_sell_offer.
@@ -1007,42 +1489,51 @@ mod tests {
             price: Price { n: 1, d: 1 },
             offer_id: 0,
         };
-        assert!(validate_manage_sell_offer(&valid).is_ok());
+        assert!(validate_manage_sell_offer(&valid, 24).is_ok());
 
-        // Zero amount is valid (delete offer)
+        // Zero amount with existing offer_id is valid (delete offer)
         let zero_amount = ManageSellOfferOp {
             amount: 0,
+            offer_id: 1,
             ..valid.clone()
         };
-        assert!(validate_manage_sell_offer(&zero_amount).is_ok());
+        assert!(validate_manage_sell_offer(&zero_amount, 24).is_ok());
+
+        // Zero amount with offer_id == 0 is malformed (p11+: cannot create empty offer)
+        let zero_create = ManageSellOfferOp {
+            amount: 0,
+            offer_id: 0,
+            ..valid.clone()
+        };
+        assert!(validate_manage_sell_offer(&zero_create, 24).is_err());
 
         // Negative amount
         let negative = ManageSellOfferOp {
             amount: -100,
             ..valid.clone()
         };
-        assert!(validate_manage_sell_offer(&negative).is_err());
+        assert!(validate_manage_sell_offer(&negative, 24).is_err());
 
         // Zero price numerator
         let zero_price_n = ManageSellOfferOp {
             price: Price { n: 0, d: 1 },
             ..valid.clone()
         };
-        assert!(validate_manage_sell_offer(&zero_price_n).is_err());
+        assert!(validate_manage_sell_offer(&zero_price_n, 24).is_err());
 
         // Zero price denominator
         let zero_price_d = ManageSellOfferOp {
             price: Price { n: 1, d: 0 },
             ..valid.clone()
         };
-        assert!(validate_manage_sell_offer(&zero_price_d).is_err());
+        assert!(validate_manage_sell_offer(&zero_price_d, 24).is_err());
 
         // Negative price
         let negative_price = ManageSellOfferOp {
             price: Price { n: -1, d: 1 },
             ..valid
         };
-        assert!(validate_manage_sell_offer(&negative_price).is_err());
+        assert!(validate_manage_sell_offer(&negative_price, 24).is_err());
     }
 
     /// Test validate_manage_buy_offer.
@@ -1058,14 +1549,14 @@ mod tests {
             price: Price { n: 1, d: 1 },
             offer_id: 0,
         };
-        assert!(validate_manage_buy_offer(&valid).is_ok());
+        assert!(validate_manage_buy_offer(&valid, 24).is_ok());
 
         // Negative buy_amount
         let negative = ManageBuyOfferOp {
             buy_amount: -100,
             ..valid
         };
-        assert!(validate_manage_buy_offer(&negative).is_err());
+        assert!(validate_manage_buy_offer(&negative, 24).is_err());
     }
 
     /// Test validate_set_options.
@@ -1082,42 +1573,42 @@ mod tests {
             home_domain: None,
             signer: None,
         };
-        assert!(validate_set_options(&valid).is_ok());
+        assert!(validate_set_options(&valid, 24, None).is_ok());
 
         // Valid master weight
         let valid_weight = SetOptionsOp {
             master_weight: Some(100),
             ..valid.clone()
         };
-        assert!(validate_set_options(&valid_weight).is_ok());
+        assert!(validate_set_options(&valid_weight, 24, None).is_ok());
 
         // Invalid master weight (> 255)
         let invalid_weight = SetOptionsOp {
             master_weight: Some(256),
             ..valid.clone()
         };
-        assert!(validate_set_options(&invalid_weight).is_err());
+        assert!(validate_set_options(&invalid_weight, 24, None).is_err());
 
         // Invalid low threshold (> 255)
         let invalid_low = SetOptionsOp {
             low_threshold: Some(256),
             ..valid.clone()
         };
-        assert!(validate_set_options(&invalid_low).is_err());
+        assert!(validate_set_options(&invalid_low, 24, None).is_err());
 
         // Invalid med threshold (> 255)
         let invalid_med = SetOptionsOp {
             med_threshold: Some(256),
             ..valid.clone()
         };
-        assert!(validate_set_options(&invalid_med).is_err());
+        assert!(validate_set_options(&invalid_med, 24, None).is_err());
 
         // Invalid high threshold (> 255)
         let invalid_high = SetOptionsOp {
             high_threshold: Some(256),
             ..valid
         };
-        assert!(validate_set_options(&invalid_high).is_err());
+        assert!(validate_set_options(&invalid_high, 24, None).is_err());
     }
 
     /// Test validate_change_trust.
@@ -1132,14 +1623,14 @@ mod tests {
             }),
             limit: 1000,
         };
-        assert!(validate_change_trust(&valid).is_ok());
+        assert!(validate_change_trust(&valid, 24, None).is_ok());
 
         // Negative limit
         let negative = ChangeTrustOp {
             limit: -100,
             ..valid
         };
-        assert!(validate_change_trust(&negative).is_err());
+        assert!(validate_change_trust(&negative, 24, None).is_err());
     }
 
     /// Test validate_bump_sequence.

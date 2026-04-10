@@ -217,6 +217,8 @@ pub struct ValidationContext {
     pub base_fee: u32,
     /// Base reserve per ledger entry (stroops).
     pub base_reserve: u32,
+    /// Ledger header flags (e.g. LP disable flags). 0 if pre-v1 extension.
+    pub ledger_flags: u32,
     /// Soroban per-transaction resource limits (if available).
     pub soroban_limits: Option<SorobanTxLimits>,
 }
@@ -251,6 +253,7 @@ impl Default for ValidationContext {
             protocol_version: 21,
             base_fee: 100,
             base_reserve: 5_000_000, // 0.5 XLM default
+            ledger_flags: 0,
             soroban_limits: None,
         }
     }
@@ -733,6 +736,7 @@ impl TransactionQueue {
         protocol_version: u32,
         base_fee: u32,
         base_reserve: u32,
+        ledger_flags: u32,
     ) {
         let mut ctx = self.validation_context.write();
         ctx.ledger_seq = ledger_seq;
@@ -740,6 +744,7 @@ impl TransactionQueue {
         ctx.protocol_version = protocol_version;
         ctx.base_fee = base_fee;
         ctx.base_reserve = base_reserve;
+        ctx.ledger_flags = ledger_flags;
     }
 
     /// Validate a transaction before queueing.
@@ -757,38 +762,10 @@ impl TransactionQueue {
         let ctx = self.validation_context.read();
         let base_fee = ctx.base_fee.max(self.config.min_fee_per_op);
 
-        // Validate basic structure
-        if !frame.is_valid_structure() {
-            return Err(TxResultCode::TxMalformed);
-        }
-
-        // Validate operation parameters
-        for op in frame.operations() {
-            if henyey_tx::operations::validate_operation(op).is_err() {
-                return Err(TxResultCode::TxMalformed);
-            }
-        }
-
-        // Validate Soroban memo/muxed constraints
-        if !frame.validate_soroban_memo() {
-            return Err(TxResultCode::TxSorobanInvalid);
-        }
-
-        // Validate Soroban create-contract host function pairing
-        if !frame.validate_host_fn() {
-            return Err(TxResultCode::TxSorobanInvalid);
-        }
-
-        // Validate Soroban resource fee does not exceed full transaction fee.
-        // stellar-core TransactionFrame.cpp:1376 — commonValidPreSeqNum:
-        //   if (validateResourceFee && sorobanData.resourceFee > getFullFee())
-        // For non-fee-bump Soroban txs, resource_fee must not exceed total_fee.
-        if !frame.is_fee_bump()
-            && frame.is_soroban()
-            && frame.declared_soroban_resource_fee() > frame.total_fee()
-        {
-            return Err(TxResultCode::TxSorobanInvalid);
-        }
+        // Phase 1: Shared stateless structural validation
+        // Mirrors stellar-core's commonValidPreSeqNum subset.
+        henyey_tx::check_valid_pre_seq_num(&frame, ctx.protocol_version, ctx.ledger_flags)
+            .map_err(|e| e.to_tx_result_code())?;
 
         // Build ledger context once for time-bound and signature validation.
         let ledger_ctx = LedgerContext::new(
@@ -2086,7 +2063,8 @@ mod tests {
             .map(|_| Operation {
                 source_account: None,
                 body: OperationBody::CreateAccount(CreateAccountOp {
-                    destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+                    // Use destination [255; 32] so it differs from any test source
+                    destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
                     starting_balance: 1000000000,
                 }),
             })
@@ -2461,7 +2439,7 @@ mod tests {
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 2);
 
-        let expected = if hash_a.0 <= hash_b.0 {
+        let expected = if hash_a.0 >= hash_b.0 {
             vec![hash_a, hash_b]
         } else {
             vec![hash_b, hash_a]
@@ -2836,7 +2814,7 @@ mod tests {
     fn test_queue_rejects_below_current_base_fee() {
         let queue = TransactionQueue::with_defaults();
 
-        queue.update_validation_context(1, 0, 25, 500, 5_000_000);
+        queue.update_validation_context(1, 0, 25, 500, 5_000_000, 0);
 
         let low_fee = make_test_envelope(200, 1);
         let high_fee = make_test_envelope(600, 1);
@@ -4752,9 +4730,10 @@ mod tests {
             .unwrap(),
         });
 
+        // stellar-core returns txMISSING_OPERATION for zero-op transactions
         match queue.try_add(envelope) {
-            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxMalformed)) => {}
-            other => panic!("expected Invalid(TxMalformed), got {:?}", other),
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxMissingOperation)) => {}
+            other => panic!("expected Invalid(TxMissingOperation), got {:?}", other),
         }
     }
 
@@ -5241,8 +5220,9 @@ mod pending_depth_tests {
             .map(|_| Operation {
                 source_account: None,
                 body: OperationBody::CreateAccount(CreateAccountOp {
+                    // Use destination [255; 32] so it differs from any test source
                     destination: stellar_xdr::curr::AccountId(
-                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])),
+                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32])),
                     ),
                     starting_balance: 1_000_000_000,
                 }),

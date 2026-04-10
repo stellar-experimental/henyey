@@ -312,6 +312,35 @@ pub async fn handle(
     // Validate memo
     validate_memo(&memo)?;
 
+    // Soroban stateless structural validation (closes drift with queue admission).
+    // We call the Soroban-specific subset here rather than full check_valid_pre_seq_num
+    // because simulation is Soroban-only and doesn't need classic op validation.
+    {
+        let frame = henyey_tx::TransactionFrame::from_owned(tx_env.clone());
+        if !frame.validate_soroban_memo() {
+            return Err(JsonRpcError::invalid_params(
+                "Soroban transactions must not use memo or muxed source accounts",
+            ));
+        }
+        if !frame.validate_host_fn() {
+            return Err(JsonRpcError::invalid_params(
+                "invalid host function pairing",
+            ));
+        }
+        // Duplicate footprint keys
+        if let Some(data) = frame.soroban_data() {
+            let fp = &data.resources.footprint;
+            let mut seen = std::collections::HashSet::new();
+            for key in fp.read_only.iter().chain(fp.read_write.iter()) {
+                if !seen.insert(key) {
+                    return Err(JsonRpcError::invalid_params(
+                        "duplicate key in Soroban footprint",
+                    ));
+                }
+            }
+        }
+    }
+
     // Parse authMode parameter
     let auth_mode_str = params
         .get("authMode")

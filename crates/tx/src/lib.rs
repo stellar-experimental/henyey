@@ -179,15 +179,16 @@ pub use signature_checker::{collect_signers_for_account, SignatureChecker};
 
 // Re-export validation types and functions
 pub use validation::{
-    validate_basic, validate_fee, validate_full, validate_ledger_bounds, validate_sequence,
-    validate_signatures, validate_structure, validate_time_bounds, verify_signature_with_key,
-    verify_signature_with_raw_key, LedgerContext, ValidationError,
+    check_valid_pre_seq_num, validate_basic, validate_fee, validate_full, validate_ledger_bounds,
+    validate_sequence, validate_signatures, validate_structure, validate_time_bounds,
+    verify_signature_with_key, verify_signature_with_raw_key, LedgerContext, PreSeqNumError,
+    ValidationError,
 };
 
 // Re-export operation types
 pub use operations::{
-    collect_prefetch_keys, validate_operation, OperationTypeExt, OperationValidationError,
-    ThresholdLevel,
+    collect_prefetch_keys, is_op_supported, validate_operation, OperationTypeExt,
+    OperationValidationError, ThresholdLevel,
 };
 pub use stellar_xdr::curr::OperationType;
 
