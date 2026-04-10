@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_clawback_not_enabled() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_clawback_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_clawback_claimable_balance_not_exist() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -396,7 +396,7 @@ mod tests {
     /// C++ Reference: ClawbackTests.cpp - "malformed negative" test section
     #[test]
     fn test_clawback_malformed_negative_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(10);
@@ -444,7 +444,7 @@ mod tests {
     /// C++ Reference: ClawbackTests.cpp - "malformed zero" test section
     #[test]
     fn test_clawback_malformed_zero_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(12);
@@ -492,7 +492,7 @@ mod tests {
     /// C++ Reference: ClawbackTests.cpp - "malformed native" test section
     #[test]
     fn test_clawback_malformed_native_asset() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(14);
@@ -531,7 +531,7 @@ mod tests {
     /// C++ Reference: ClawbackTests.cpp - "not issuer" test section
     #[test]
     fn test_clawback_not_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(16);
@@ -586,7 +586,7 @@ mod tests {
     /// C++ Reference: ClawbackTests.cpp - "no trust" test section
     #[test]
     fn test_clawback_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(19);
@@ -628,7 +628,7 @@ mod tests {
     /// C++ Reference: ClawbackTests.cpp - "underfunded" test section
     #[test]
     fn test_clawback_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(21);
@@ -676,7 +676,7 @@ mod tests {
     /// C++ Reference: ClawbackTests.cpp - "partial amount" test section
     #[test]
     fn test_clawback_partial_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(25);
@@ -734,7 +734,7 @@ mod tests {
     /// C++ Reference: ClawbackTests.cpp - "trustline not clawback enabled"
     #[test]
     fn test_clawback_trustline_not_clawback_enabled() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(27);
@@ -787,7 +787,7 @@ mod tests {
     /// C++ Reference: ClawbackOpFrame.cpp:67-71
     #[test]
     fn test_clawback_self_clawback_returns_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(40);
@@ -829,7 +829,7 @@ mod tests {
     /// C++ Reference: ClawbackOpFrame.cpp:85-89
     #[test]
     fn test_clawback_invalid_asset_code_returns_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(41);
@@ -872,7 +872,7 @@ mod tests {
     /// C++ Reference: ClawbackTests.cpp - "full amount"
     #[test]
     fn test_clawback_full_balance() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(29);
@@ -931,7 +931,7 @@ mod tests {
     /// C++ Reference: TransactionUtils.cpp:534-558 (addBalanceSkipAuthorization)
     #[test]
     fn test_clawback_underfunded_due_to_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(50);
@@ -1003,7 +1003,7 @@ mod tests {
     /// C++ Reference: TransactionUtils.cpp:534-558 (addBalanceSkipAuthorization)
     #[test]
     fn test_clawback_succeeds_up_to_available_balance() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(52);
@@ -1074,7 +1074,7 @@ mod tests {
     /// balance with the CLAWBACK_ENABLED flag set.
     #[test]
     fn test_clawback_claimable_balance_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(60);
@@ -1135,7 +1135,7 @@ mod tests {
     /// issuer of the asset in the claimable balance.
     #[test]
     fn test_clawback_claimable_balance_not_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(62);
@@ -1197,7 +1197,7 @@ mod tests {
     /// claimable balance entry does not have the CLAWBACK_ENABLED flag.
     #[test]
     fn test_clawback_claimable_balance_not_clawback_enabled() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(65);
@@ -1256,7 +1256,7 @@ mod tests {
     /// (since the issuer has no trustline for their own asset).
     #[test]
     fn test_clawback_muxed_self_not_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(70);

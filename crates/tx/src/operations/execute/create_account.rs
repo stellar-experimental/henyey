@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn test_create_account_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_create_account_already_exists() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_create_account_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -253,7 +253,7 @@ mod tests {
     /// C++ Reference: CreateAccountTests.cpp - "underfunded" test section
     #[test]
     fn test_create_account_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -281,7 +281,7 @@ mod tests {
     /// C++ Reference: CreateAccountTests.cpp - "with native selling liabilities" test section
     #[test]
     fn test_create_account_underfunded_with_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -320,7 +320,7 @@ mod tests {
     /// Test CreateAccount succeeds when source has selling liabilities but enough available.
     #[test]
     fn test_create_account_success_with_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -366,7 +366,7 @@ mod tests {
     /// C++ Reference: CreateAccountTests.cpp - "with sponsorship" test section
     #[test]
     fn test_create_account_with_sponsorship() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -404,7 +404,7 @@ mod tests {
     /// Test CreateAccount with sponsor having insufficient balance.
     #[test]
     fn test_create_account_sponsor_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -443,7 +443,7 @@ mod tests {
     /// Reproduces mainnet mismatch at ledger 61232072.
     #[test]
     fn test_create_account_sponsor_low_reserve_before_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -480,7 +480,7 @@ mod tests {
     /// stellar-core rejects startingBalance < 0 as MALFORMED in doCheckValid.
     #[test]
     fn test_create_account_negative_balance() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(10);
@@ -512,7 +512,7 @@ mod tests {
     /// Matches stellar-core's `doCheckValid` (CreateAccountOpFrame.cpp:187).
     #[test]
     fn test_create_account_self_destination() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(12);
@@ -543,7 +543,7 @@ mod tests {
     /// Without sponsorship, the minimum balance is typically > 0, so zero balance fails.
     #[test]
     fn test_create_account_zero_balance_fails_without_sponsorship() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(13);
@@ -580,7 +580,7 @@ mod tests {
     /// balance. Our old code checked balance before incrementing numSponsoring.
     #[test]
     fn test_create_account_underfunded_when_source_is_sponsor() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(20);
@@ -625,7 +625,7 @@ mod tests {
     /// source balance, effectively minting tokens.
     #[test]
     fn test_audit_c5_negative_starting_balance_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(30);
@@ -667,7 +667,7 @@ mod tests {
     /// when op source != tx source).
     #[test]
     fn test_audit_020_zero_balance_sponsored_tracks_source_modified() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -724,7 +724,7 @@ mod tests {
     /// stellar-core: CreateAccountOpFrame::doCheckValid rejects starting_balance < 0
     #[test]
     fn test_create_account_malformed_negative_starting_balance() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);

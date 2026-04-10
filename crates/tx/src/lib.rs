@@ -505,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         assert_eq!(delta.ledger_seq(), 100);
         assert!(!delta.has_changes());

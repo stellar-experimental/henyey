@@ -88,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_inflation_not_time() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -110,7 +110,7 @@ mod tests {
     /// C++ Reference: InflationTests.cpp - "no account" section
     #[test]
     fn test_inflation_no_source_account() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(1);
@@ -134,7 +134,7 @@ mod tests {
     /// C++ Reference: InflationTests.cpp - "with inflation dest" section
     #[test]
     fn test_inflation_with_inflation_dest() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(2);
@@ -195,7 +195,7 @@ mod tests {
     /// Test inflation with multiple accounts.
     #[test]
     fn test_inflation_multiple_accounts() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(5);
@@ -221,7 +221,7 @@ mod tests {
     /// Test inflation with different ledger contexts.
     #[test]
     fn test_inflation_different_context() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
         // Create context with different ledger parameters
         let context = LedgerContext::new(

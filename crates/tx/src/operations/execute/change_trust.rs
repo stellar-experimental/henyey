@@ -644,7 +644,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_create() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_invalid_limit_no_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -700,7 +700,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_no_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_self_issuer_malformed_protocol_16_plus() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 23;
 
@@ -756,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_limit_below_buying_liabilities_or_delete() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -839,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_native_asset_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_delete_with_balance_invalid() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -899,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_limit_below_balance() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -939,7 +939,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_sets_authorized_flag() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -972,7 +972,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_pool_share_creates_pool() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_cannot_delete_with_pool_use_count() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1081,7 +1081,7 @@ mod tests {
 
     #[test]
     fn test_change_trust_pool_share_increments_use_count() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1154,7 +1154,7 @@ mod tests {
     /// that references a liquidity pool causes the pool to be removed from state.
     #[test]
     fn test_change_trust_pool_deleted_when_last_trustline_removed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1263,7 +1263,7 @@ mod tests {
     /// loaded into state.
     #[test]
     fn test_change_trust_delete_sponsored_trustline_updates_sponsor() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1397,7 +1397,7 @@ mod tests {
     /// and ChangeTrust was incorrectly allowing a new trustline to be created.
     #[test]
     fn test_change_trust_too_many_subentries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1445,7 +1445,7 @@ mod tests {
     /// C++ Reference: SponsorshipUtils.cpp - canCreateEntryWithoutSponsorship uses getAvailableBalance
     #[test]
     fn test_change_trust_with_native_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1508,7 +1508,7 @@ mod tests {
     /// C++ Reference: ChangeTrustTests.cpp - "no issuer on update" test section
     #[test]
     fn test_change_trust_update_no_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1560,7 +1560,7 @@ mod tests {
     /// C++ Reference: ChangeTrustTests.cpp - "negative limit" test section
     #[test]
     fn test_change_trust_negative_limit_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1596,7 +1596,7 @@ mod tests {
     /// checked against the subentries limit.
     #[test]
     fn test_change_trust_pool_share_too_many_subentries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1678,7 +1678,7 @@ mod tests {
     /// correctly returned LowReserve because getAvailableBalance deducts selling liabilities.
     #[test]
     fn test_change_trust_low_reserve_with_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1775,7 +1775,7 @@ mod tests {
     /// subentry limit (via createEntryWithPossibleSponsorship).
     #[test]
     fn test_change_trust_no_issuer_before_too_many_subentries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1820,7 +1820,7 @@ mod tests {
     /// stellar-core: ChangeTrustOpFrame::doApply returns TRUST_LINE_MISSING
     #[test]
     fn test_change_trust_pool_share_trust_line_missing() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(90);
@@ -1884,7 +1884,7 @@ mod tests {
     /// stellar-core: ChangeTrustOpFrame::doApply returns NOT_AUTH_MAINTAIN_LIABILITIES
     #[test]
     fn test_change_trust_pool_share_not_auth_maintain_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(93);
@@ -1960,7 +1960,7 @@ mod tests {
     /// stellar-core: ChangeTrustOpFrame::doCheckValid calls isChangeTrustAssetValid
     #[test]
     fn test_change_trust_pool_share_malformed_wrong_fee() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(96);
@@ -2008,7 +2008,7 @@ mod tests {
     /// AUDIT-1114: Pool share with wrong asset ordering should be Malformed.
     #[test]
     fn test_change_trust_pool_share_malformed_wrong_asset_order() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(100);
@@ -2059,7 +2059,7 @@ mod tests {
     /// The TrustLineMissing variant exists in XDR but is not used by this implementation.
     #[test]
     fn test_change_trust_remove_nonexistent_returns_invalid_limit() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2094,7 +2094,7 @@ mod tests {
     /// (lacks both AUTHORIZED_FLAG and AUTHORIZED_TO_MAINTAIN_LIABILITIES_FLAG).
     #[test]
     fn test_change_trust_not_auth_maintain_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2158,7 +2158,7 @@ mod tests {
     /// OpTooManySubentries.
     #[test]
     fn test_audit_059_combined_subentry_sponsoring_cap() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
         let issuer = create_test_account_id(1);

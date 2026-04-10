@@ -55,12 +55,13 @@ use super::error::{convert_host_error_p24_to_p25, convert_host_error_p26_to_p25}
 use super::HostFunctionInvocation;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
+use henyey_common::LedgerSeq;
 
 /// Return type for `get_archived_with_restore_info` (p25 version).
 /// Contains: (entry, live_until, live_bl_restore_info)
 type ArchivedWithRestoreInfoP25 = Option<(
     Rc<LedgerEntry>,
-    Option<u32>,
+    Option<LedgerSeq>,
     Option<super::protocol::LiveBucketListRestore>,
 )>;
 
@@ -136,7 +137,7 @@ pub struct StorageChange {
     /// The new entry (None if deleted or read-only).
     pub new_entry: Option<LedgerEntry>,
     /// The new live_until ledger (for TTL).
-    pub live_until: Option<u32>,
+    pub live_until: Option<LedgerSeq>,
     /// Whether the TTL was extended (new > old).
     pub ttl_extended: bool,
     /// Whether the entry was included due to rent calculations (old_entry_size_bytes_for_rent > 0).
@@ -293,7 +294,7 @@ impl PersistentModuleCache {
 /// Used by both P24 and P25 execution paths to look up entries in workspace types.
 struct LedgerSnapshotAdapterP25<'a> {
     state: &'a LedgerStateManager,
-    current_ledger: u32,
+    current_ledger: LedgerSeq,
     hot_archive: Option<&'a dyn super::HotArchiveLookup>,
     ttl_key_cache: Option<&'a super::TtlKeyCache>,
 }
@@ -302,7 +303,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     /// Create a new snapshot adapter with hot archive and TTL key cache.
     pub fn with_hot_archive(
         state: &'a LedgerStateManager,
-        current_ledger: u32,
+        current_ledger: LedgerSeq,
         hot_archive: Option<&'a dyn super::HotArchiveLookup>,
         ttl_key_cache: Option<&'a super::TtlKeyCache>,
     ) -> Self {
@@ -329,8 +330,8 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         // Check TTL expiration for contract entries before looking up the entry.
         if matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)) {
             match live_until {
-                Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
-                _ => return Ok(None),                         // expired or no TTL
+                Some(ttl) if ttl >= self.current_ledger.get() => {} // live, proceed
+                _ => return Ok(None),                               // expired or no TTL
             }
         }
 
@@ -406,7 +407,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
             Some((entry, live_until)) => {
                 // Check if this is a live BL restore: entry exists AND TTL is expired
                 let live_bl_restore = if let Some(lu) = live_until {
-                    if lu < self.current_ledger {
+                    if lu < self.current_ledger.get() {
                         // Get the TTL entry for the restore info
                         let key_hash =
                             super::get_or_compute_key_hash(self.ttl_key_cache, key.as_ref());
@@ -426,7 +427,7 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
                     None
                 };
 
-                Ok(Some((entry, live_until, live_bl_restore)))
+                Ok(Some((entry, live_until.map(Into::into), live_bl_restore)))
             }
             None => Ok(None),
         }
@@ -465,8 +466,8 @@ impl soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'_
             LedgerKey::ContractData(_) | LedgerKey::ContractCode(_)
         ) {
             match live_until {
-                Some(ttl) if ttl >= self.current_ledger => {} // live, proceed
-                _ => return Ok(None),                         // expired or no TTL
+                Some(ttl) if ttl >= self.current_ledger.get() => {} // live, proceed
+                _ => return Ok(None),                               // expired or no TTL
             }
         }
 
@@ -519,7 +520,7 @@ impl soroban_env_host25::storage::SnapshotSource for LedgerSnapshotAdapterP25<'_
 fn get_entry_ttl_with_cache(
     state: &LedgerStateManager,
     key: &LedgerKey,
-    current_ledger: u32,
+    current_ledger: LedgerSeq,
     ttl_key_cache: Option<&super::TtlKeyCache>,
 ) -> Option<u32> {
     match key {
@@ -532,9 +533,9 @@ fn get_entry_ttl_with_cache(
                 .get_ttl(&key_hash)
                 .map(|ttl| ttl.live_until_ledger_seq);
             if let Some(live_until) = ttl {
-                if live_until < current_ledger {
+                if current_ledger > live_until {
                     tracing::debug!(
-                        current_ledger,
+                        current_ledger = current_ledger.get(),
                         live_until,
                         key_type = if matches!(key, LedgerKey::ContractCode(_)) {
                             "ContractCode"
@@ -871,7 +872,7 @@ fn prepare_footprint_entries(
                             .to_xdr(Limits::none())
                             .map_err(|_| make_xdr_setup_error())?,
                     );
-                    encoded_ttl_entries.push(encode_ttl(key, live_until));
+                    encoded_ttl_entries.push(encode_ttl(key, live_until.map(|l| l.get())));
                 }
             }
         } else if let Some((entry, live_until)) =
@@ -975,7 +976,7 @@ fn map_storage_changes(
                     .encoded_new_value
                     .as_ref()
                     .and_then(|bytes| LedgerEntry::from_xdr(bytes, Limits::none()).ok());
-                let live_until = change.ttl_new_live_until_ledger;
+                let live_until = change.ttl_new_live_until_ledger.map(LedgerSeq::new);
                 Some(StorageChange {
                     key,
                     new_entry,
@@ -1067,7 +1068,7 @@ fn execute_host_function_p24(
     // P24 host deserializes using P24 XDR, which is wire-compatible for all P24 types.
     let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(
         state,
-        context.sequence,
+        context.sequence.into(),
         hot_archive,
         ttl_key_cache,
     );
@@ -1304,7 +1305,7 @@ fn execute_host_function_p25(
 
     let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(
         state,
-        context.sequence,
+        context.sequence.into(),
         hot_archive,
         ttl_key_cache,
     );
@@ -1623,7 +1624,7 @@ fn execute_host_function_p26(
 
     let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(
         state,
-        context.sequence,
+        context.sequence.into(),
         hot_archive,
         ttl_key_cache,
     );
@@ -1863,14 +1864,14 @@ mod tests {
                 }),
                 ext: stellar_xdr::curr::LedgerEntryExt::V0,
             }),
-            live_until: Some(1000),
+            live_until: Some(1000.into()),
             ttl_extended: false,
             is_rent_related: false,
             is_read_only_ttl_bump: false,
         };
 
         assert!(change.new_entry.is_some());
-        assert_eq!(change.live_until, Some(1000));
+        assert_eq!(change.live_until, Some(1000.into()));
     }
 
     /// Test StorageChange struct with TTL extension.
@@ -1881,7 +1882,7 @@ mod tests {
                 hash: Hash([5u8; 32]),
             }),
             new_entry: None,
-            live_until: Some(2000),
+            live_until: Some(2000.into()),
             ttl_extended: true,
             is_rent_related: true,
             is_read_only_ttl_bump: true,

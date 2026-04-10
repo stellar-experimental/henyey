@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_create_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_low_reserve_with_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 25;
 
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_invalid_name_non_ascii() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_invalid_name_control() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -331,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_delete_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_delete_missing() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -413,7 +413,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_max_value_length() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(8);
@@ -437,7 +437,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_empty_name() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(9);
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_update_existing() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(10);
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_sponsorship_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(11);
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_sponsorship_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(13);
@@ -580,7 +580,7 @@ mod tests {
     /// C++ Reference: ManageDataTests.cpp - tooManySubentries tests via SponsorshipTestUtils
     #[test]
     fn test_manage_data_too_many_subentries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(15);
@@ -615,7 +615,7 @@ mod tests {
     /// Updating doesn't create a new subentry, so it should succeed.
     #[test]
     fn test_manage_data_update_at_subentry_limit_succeeds() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(16);

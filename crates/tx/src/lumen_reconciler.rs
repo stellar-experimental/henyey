@@ -452,7 +452,7 @@ mod tests {
         let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 1000);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = LedgerDelta::new(1.into());
         delta.record_create(entry);
 
         let balance_delta = calculate_balance_delta(&delta);
@@ -464,7 +464,7 @@ mod tests {
         let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 1000);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = LedgerDelta::new(1.into());
         delta.record_delete(make_account_key(&account_id), entry);
 
         let balance_delta = calculate_balance_delta(&delta);
@@ -477,7 +477,7 @@ mod tests {
         let prev_entry = make_account_entry(account_id.clone(), 1000);
         let curr_entry = make_account_entry(account_id.clone(), 1500);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = LedgerDelta::new(1.into());
         delta.record_update(prev_entry, curr_entry);
 
         let balance_delta = calculate_balance_delta(&delta);
@@ -490,7 +490,7 @@ mod tests {
         let account2 = create_test_account_id(2);
         let account3 = create_test_account_id(3);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = LedgerDelta::new(1.into());
 
         // Create account with 1000
         delta.record_create(make_account_entry(account1.clone(), 1000));
@@ -517,7 +517,7 @@ mod tests {
         let account_id = create_test_account_id(1);
         let entry = make_account_entry(account_id.clone(), 1000);
 
-        let mut delta = LedgerDelta::new(1);
+        let mut delta = LedgerDelta::new(1.into());
         // Update with no balance change
         delta.record_update(entry.clone(), entry);
 

@@ -50,6 +50,7 @@ mod sponsorship;
 mod ttl;
 
 use entry_store::{EntryStore, EntryStoreSavepoint};
+use henyey_common::LedgerSeq;
 
 /// Restore entries from snapshots created after the savepoint.
 ///
@@ -220,7 +221,7 @@ pub use crate::soroban::StorageKey;
 #[derive(Clone)]
 pub struct LedgerStateManager {
     /// Current ledger sequence.
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     /// Base reserve in stroops (minimum balance per sub-entry).
     base_reserve: i64,
     /// ID pool for generating offer IDs.
@@ -357,7 +358,7 @@ impl LedgerStateManager {
     ///
     /// * `base_reserve` - Base reserve in stroops (e.g., 5_000_000 for 0.5 XLM)
     /// * `ledger_seq` - The current ledger sequence number
-    pub fn new(base_reserve: i64, ledger_seq: u32) -> Self {
+    pub fn new(base_reserve: i64, ledger_seq: LedgerSeq) -> Self {
         Self {
             ledger_seq,
             base_reserve,
@@ -610,12 +611,12 @@ impl LedgerStateManager {
 
     /// Compute the starting sequence number for new accounts.
     pub fn starting_sequence_number(&self) -> crate::Result<i64> {
-        if self.ledger_seq > i32::MAX as u32 {
+        if self.ledger_seq.get() > i32::MAX as u32 {
             return Err(crate::TxError::Internal(
                 "overflowed starting sequence number".to_string(),
             ));
         }
-        Ok((self.ledger_seq as i64) << 32)
+        Ok((self.ledger_seq.get() as i64) << 32)
     }
 
     /// Set the per-account maximum sequence numbers for the current tx set.
@@ -733,12 +734,12 @@ impl LedgerStateManager {
     }
 
     /// Get the current ledger sequence.
-    pub fn ledger_seq(&self) -> u32 {
+    pub fn ledger_seq(&self) -> LedgerSeq {
         self.ledger_seq
     }
 
     /// Set the current ledger sequence.
-    pub fn set_ledger_seq(&mut self, ledger_seq: u32) {
+    pub fn set_ledger_seq(&mut self, ledger_seq: LedgerSeq) {
         self.ledger_seq = ledger_seq;
     }
 
@@ -2059,7 +2060,7 @@ impl LedgerStateManager {
         // lastModifiedLedgerSeq on every entry committed via LedgerTxn.
         // The post_state was built before set_last_modified_key updated
         // the entry_last_modified map, so it still carries the old value.
-        post_state.last_modified_ledger_seq = self.ledger_seq;
+        post_state.last_modified_ledger_seq = self.ledger_seq.get();
         self.delta.record_update(pre_state, post_state);
     }
 }
@@ -2137,19 +2138,19 @@ pub(crate) fn ensure_account_ext_v2(account: &mut AccountEntry) -> &mut AccountE
 }
 
 /// Update sequence metadata when an account's sequence number changes.
-pub fn update_account_seq_info(account: &mut AccountEntry, ledger_seq: u32, close_time: u64) {
+pub fn update_account_seq_info(account: &mut AccountEntry, ledger_seq: LedgerSeq, close_time: u64) {
     let ext_v2 = ensure_account_ext_v2(account);
     let seq_time = TimePoint(close_time);
     match &mut ext_v2.ext {
         AccountEntryExtensionV2Ext::V0 => {
             ext_v2.ext = AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
                 ext: ExtensionPoint::V0,
-                seq_ledger: ledger_seq,
+                seq_ledger: ledger_seq.get(),
                 seq_time,
             });
         }
         AccountEntryExtensionV2Ext::V3(v3) => {
-            v3.seq_ledger = ledger_seq;
+            v3.seq_ledger = ledger_seq.get();
             v3.seq_time = seq_time;
         }
     }
@@ -2209,7 +2210,7 @@ mod tests {
 
     /// Create a LedgerStateManager with a shared OfferStore pre-configured.
     fn new_manager_with_offers(base_reserve: i64, ledger_seq: u32) -> LedgerStateManager {
-        let mut manager = LedgerStateManager::new(base_reserve, ledger_seq);
+        let mut manager = LedgerStateManager::new(base_reserve, ledger_seq.into());
         manager.set_offer_store(Arc::new(Mutex::new(OfferStore::new())));
         manager
     }
@@ -2436,7 +2437,7 @@ mod tests {
 
         // Reset delta by creating a new manager with the same state
         // (simulating the start of a new transaction)
-        manager.delta = LedgerDelta::new(100);
+        manager.delta = LedgerDelta::new(100.into());
 
         // Now simulate what happens during RevokeSponsorship:
         // 1. Start operation snapshot mode
@@ -2519,7 +2520,7 @@ mod tests {
         manager.commit();
 
         // Reset delta by creating a new one (simulating the start of a new transaction)
-        manager.delta = LedgerDelta::new(100);
+        manager.delta = LedgerDelta::new(100.into());
 
         // Now simulate what happens during RevokeSponsorship:
         // 1. Start operation snapshot mode
@@ -2598,7 +2599,7 @@ mod tests {
 
         // Reset delta by creating a new manager with the same state
         // (simulating the start of a new transaction)
-        manager.delta = LedgerDelta::new(100);
+        manager.delta = LedgerDelta::new(100.into());
 
         // Now simulate what happens during RevokeSponsorship:
         // 1. Start operation snapshot mode
@@ -2665,8 +2666,8 @@ mod tests {
         manager.commit();
 
         let new_ledger = 200;
-        manager.set_ledger_seq(new_ledger);
-        manager.delta = LedgerDelta::new(new_ledger);
+        manager.set_ledger_seq(new_ledger.into());
+        manager.delta = LedgerDelta::new(new_ledger.into());
 
         manager.begin_op_snapshot();
 
@@ -3981,7 +3982,7 @@ mod tests {
         let sp = manager.create_savepoint();
 
         // extend_ttl to 700_000
-        manager.extend_ttl(&key_hash, 700_000);
+        manager.extend_ttl(&key_hash, 700_000.into());
         assert_eq!(
             manager.get_ttl(&key_hash).unwrap().live_until_ledger_seq,
             700_000
@@ -4062,7 +4063,7 @@ mod tests {
         manager.snapshot_delta();
 
         // TX 1 records an RO TTL bump (deferred — does NOT update ttl_entries)
-        manager.record_ro_ttl_bump_for_meta(&key_hash, 500_000);
+        manager.record_ro_ttl_bump_for_meta(&key_hash, 500_000.into());
 
         // Verify the bump is stored in deferred_ro_ttl_bumps
         assert_eq!(
@@ -4085,7 +4086,7 @@ mod tests {
         manager.snapshot_delta();
 
         // TX 2 records an RO TTL bump for the same key
-        manager.record_ro_ttl_bump_for_meta(&key_hash, 600_000);
+        manager.record_ro_ttl_bump_for_meta(&key_hash, 600_000.into());
 
         // TX 2 commits (no rollback)
         manager.commit();
@@ -4127,7 +4128,7 @@ mod tests {
 
         // === TX 1 (succeeds): records an RO TTL bump ===
         manager.snapshot_delta();
-        manager.record_ro_ttl_bump_for_meta(&key_hash, 500_000);
+        manager.record_ro_ttl_bump_for_meta(&key_hash, 500_000.into());
         manager.commit();
 
         // Bump is deferred — ttl_entries still has old value
@@ -4295,8 +4296,8 @@ mod tests {
 
         // Advance to a new ledger
         let new_ledger = 600;
-        manager.set_ledger_seq(new_ledger);
-        manager.delta = LedgerDelta::new(new_ledger);
+        manager.set_ledger_seq(new_ledger.into());
+        manager.delta = LedgerDelta::new(new_ledger.into());
 
         // Simulate beginning a transaction: snapshot the delta
         manager.snapshot_delta();

@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn test_native_payment_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_payment_no_destination() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -250,7 +250,7 @@ mod tests {
 
     #[test]
     fn test_payment_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn test_payment_underfunded_with_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn test_payment_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -342,7 +342,7 @@ mod tests {
     fn test_credit_payment_issuer_not_exist_succeeds_in_protocol_23() {
         // In protocol 23+, the issuer existence check was removed (CAP-0017).
         // Payments succeed as long as trustlines exist, even if the issuer account doesn't.
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -395,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_credit_payment_src_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -448,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_credit_payment_not_authorized_dest() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -501,7 +501,7 @@ mod tests {
 
     #[test]
     fn test_credit_payment_line_full_with_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -559,7 +559,7 @@ mod tests {
     fn test_credit_payment_success_no_auth_required() {
         // When issuer doesn't have AUTH_REQUIRED_FLAG, trustlines are automatically
         // authorized (per ChangeTrust logic). This test verifies payments work in this case.
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -613,7 +613,7 @@ mod tests {
 
     #[test]
     fn test_credit_payment_from_issuer_without_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -654,7 +654,7 @@ mod tests {
 
     #[test]
     fn test_credit_payment_to_issuer_without_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -700,7 +700,7 @@ mod tests {
         // 1. The destination trustline is credited first (+amount)
         // 2. Then the source trustline is debited (-amount)
         // Since they're the same trustline, the credit makes the balance available for debit.
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn test_credit_self_payment_line_full() {
         // Self-payment should fail with LineFull if amount exceeds available room
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -801,7 +801,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - "issuer large amounts" section
     #[test]
     fn test_credit_payment_issuer_to_holder() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -864,7 +864,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - holder to issuer test
     #[test]
     fn test_credit_payment_holder_to_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -923,7 +923,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - "with buying liabilities" section
     #[test]
     fn test_credit_payment_destination_buying_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1011,7 +1011,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - "pay self" test section
     #[test]
     fn test_native_payment_to_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(50);
@@ -1044,7 +1044,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - "source only has reserve" test section
     #[test]
     fn test_native_payment_source_only_has_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(51);
@@ -1084,7 +1084,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - "malformed negative amount" test section
     #[test]
     fn test_native_payment_negative_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(53);
@@ -1117,7 +1117,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - "underfunded credit" test section
     #[test]
     fn test_credit_payment_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(55);
@@ -1181,7 +1181,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - "line full" test section
     #[test]
     fn test_credit_payment_line_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(58);
@@ -1245,7 +1245,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - "src no trust" test section
     #[test]
     fn test_credit_payment_source_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(61);
@@ -1300,7 +1300,7 @@ mod tests {
     /// C++ Reference: PaymentOpFrame.cpp:136-140
     #[test]
     fn test_payment_invalid_asset_code_returns_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(70);
@@ -1365,7 +1365,7 @@ mod tests {
     /// C++ Reference: PaymentOpFrame.cpp:56-116
     #[test]
     fn test_native_payment_line_full_before_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(80);
@@ -1410,7 +1410,7 @@ mod tests {
     /// C++ Reference: PaymentTests.cpp - "no trust dest" test section
     #[test]
     fn test_credit_payment_no_trust_dest() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(64);
@@ -1470,7 +1470,7 @@ mod tests {
     /// has no trustline for the asset being sent, even though the destination does.
     #[test]
     fn test_payment_src_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(1);

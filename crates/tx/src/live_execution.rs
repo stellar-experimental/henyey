@@ -817,7 +817,7 @@ mod tests {
             protocol_version,
             henyey_common::NetworkId::testnet(),
         );
-        let state = LedgerStateManager::new(5_000_000, 1000);
+        let state = LedgerStateManager::new(5_000_000, 1000.into());
         LiveExecutionContext::new(ledger_context, state)
     }
 

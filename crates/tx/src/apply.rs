@@ -92,6 +92,7 @@ use stellar_xdr::curr::{
 use crate::frame::TransactionFrame;
 use crate::result::{TxApplyResult, TxResultWrapper};
 use crate::Result;
+use henyey_common::LedgerSeq;
 
 /// Reference to a change in a [`LedgerDelta`], preserving execution order.
 ///
@@ -151,7 +152,7 @@ pub struct DeltaLengths {
 #[derive(Clone)]
 pub struct LedgerDelta {
     /// Ledger sequence this delta applies to.
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     /// Entries created.
     created: Vec<LedgerEntry>,
     /// Entries updated (post-state after modification).
@@ -172,7 +173,7 @@ pub struct LedgerDelta {
 
 impl LedgerDelta {
     /// Create a new delta for the given ledger sequence.
-    pub fn new(ledger_seq: u32) -> Self {
+    pub fn new(ledger_seq: LedgerSeq) -> Self {
         Self {
             ledger_seq,
             created: Vec::new(),
@@ -186,7 +187,7 @@ impl LedgerDelta {
     }
 
     /// Get the ledger sequence.
-    pub fn ledger_seq(&self) -> u32 {
+    pub fn ledger_seq(&self) -> LedgerSeq {
         self.ledger_seq
     }
 
@@ -541,7 +542,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_creation() {
-        let delta = LedgerDelta::new(100);
+        let delta = LedgerDelta::new(100.into());
         assert_eq!(delta.ledger_seq(), 100);
         assert!(!delta.has_changes());
         assert_eq!(delta.change_count(), 0);
@@ -549,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_changes() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
         let entry = LedgerEntry {
@@ -592,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_fee() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
         assert_eq!(delta.fee_charged(), 0);
 
         delta.add_fee(100);
@@ -604,10 +605,10 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_merge() {
-        let mut delta1 = LedgerDelta::new(100);
+        let mut delta1 = LedgerDelta::new(100.into());
         delta1.add_fee(100);
 
-        let mut delta2 = LedgerDelta::new(100);
+        let mut delta2 = LedgerDelta::new(100.into());
         delta2.add_fee(200);
 
         delta1.merge(delta2);
@@ -646,7 +647,7 @@ mod tests {
     /// Test LedgerDelta snapshot and truncate for savepoint support.
     #[test]
     fn test_ledger_delta_snapshot_and_truncate() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         let account_id1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
         let entry1 = LedgerEntry {
@@ -703,7 +704,7 @@ mod tests {
     /// Test LedgerDelta apply_refund_to_account modifies the correct account.
     #[test]
     fn test_ledger_delta_apply_refund() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([3u8; 32])));
         let entry = LedgerEntry {
@@ -746,7 +747,7 @@ mod tests {
     /// Regression test for AUDIT-H18: unchecked `acc.balance += refund` can wrap.
     #[test]
     fn test_ledger_delta_apply_refund_overflow() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([8u8; 32])));
         let entry = LedgerEntry {
@@ -795,7 +796,7 @@ mod tests {
     fn test_ledger_delta_apply_refund_buying_liabilities() {
         use stellar_xdr::curr::{AccountEntryExtensionV1, Liabilities};
 
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
         let entry = LedgerEntry {
@@ -849,7 +850,7 @@ mod tests {
     /// Test change_order preserves execution order.
     #[test]
     fn test_ledger_delta_change_order() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([4u8; 32])));
         let entry = LedgerEntry {
@@ -923,8 +924,8 @@ mod tests {
     /// Test LedgerDelta merge preserves change order with correct offsets.
     #[test]
     fn test_ledger_delta_merge_change_order() {
-        let mut delta1 = LedgerDelta::new(100);
-        let mut delta2 = LedgerDelta::new(100);
+        let mut delta1 = LedgerDelta::new(100.into());
+        let mut delta2 = LedgerDelta::new(100.into());
 
         let account_id1 = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([6u8; 32])));
         let entry1 = LedgerEntry {
@@ -1009,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_update_states() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([8u8; 32])));
         let entry = LedgerEntry {
@@ -1052,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_delete_states() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
         let entry = LedgerEntry {
@@ -1090,13 +1091,13 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_has_changes_false() {
-        let delta = LedgerDelta::new(200);
+        let delta = LedgerDelta::new(200.into());
         assert!(!delta.has_changes());
     }
 
     #[test]
     fn test_ledger_delta_has_changes_after_create() {
-        let mut delta = LedgerDelta::new(200);
+        let mut delta = LedgerDelta::new(200.into());
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([10u8; 32])));
         let entry = LedgerEntry {
@@ -1122,7 +1123,7 @@ mod tests {
 
     #[test]
     fn test_ledger_delta_clone() {
-        let mut delta = LedgerDelta::new(300);
+        let mut delta = LedgerDelta::new(300.into());
         delta.add_fee(500);
 
         let cloned = delta.clone();
@@ -1224,7 +1225,7 @@ mod tests {
     /// within the same tx set, it exists only in `created`.
     #[test]
     fn test_audit_009_apply_refund_to_created_entry() {
-        let mut delta = LedgerDelta::new(100);
+        let mut delta = LedgerDelta::new(100.into());
 
         let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([42u8; 32])));
         let initial_balance: i64 = 100_000_000;

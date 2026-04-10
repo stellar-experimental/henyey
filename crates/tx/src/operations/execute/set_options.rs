@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn test_set_options_update_thresholds() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -566,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_set_options_set_flags() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_set_options_threshold_out_of_range() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -624,7 +624,7 @@ mod tests {
 
     #[test]
     fn test_set_options_immutable_cant_change() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn test_set_options_immutable_clear_flags_cant_change() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn test_set_options_unknown_flag() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -721,7 +721,7 @@ mod tests {
 
     #[test]
     fn test_set_options_bad_flags_overlap() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -752,7 +752,7 @@ mod tests {
 
     #[test]
     fn test_set_options_add_signer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -784,7 +784,7 @@ mod tests {
 
     #[test]
     fn test_set_options_bad_signer_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_set_options_bad_signer_weight() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_set_options_bad_signer_signed_payload_empty() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -892,7 +892,7 @@ mod tests {
 
     #[test]
     fn test_set_options_home_domain() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn test_set_options_inflation_dest_nonexistent_account() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -952,7 +952,7 @@ mod tests {
 
     #[test]
     fn test_set_options_inflation_dest_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -987,7 +987,7 @@ mod tests {
 
     #[test]
     fn test_set_options_inflation_dest_existing_account() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1028,7 +1028,7 @@ mod tests {
     /// C++ Reference: SetOptionsTests.cpp - tooManySubentries tests via SponsorshipTestUtils
     #[test]
     fn test_set_options_signer_too_many_subentries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(100);
@@ -1083,7 +1083,7 @@ mod tests {
     /// Updating doesn't create a new subentry, so it should succeed.
     #[test]
     fn test_set_options_update_signer_at_subentry_limit_succeeds() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(101);
@@ -1141,7 +1141,7 @@ mod tests {
     /// C++ Reference: SetOptionsTests.cpp - "remove signer" test section
     #[test]
     fn test_set_options_remove_signer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(30);
@@ -1198,7 +1198,7 @@ mod tests {
     /// C++ Reference: SetOptionsTests.cpp - "low reserve signer" test section
     #[test]
     fn test_set_options_signer_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(32);
@@ -1247,7 +1247,7 @@ mod tests {
     /// C++ Reference: SetOptionsTests.cpp - "too many signers" test section
     #[test]
     fn test_set_options_too_many_signers() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(34);
@@ -1308,7 +1308,7 @@ mod tests {
     /// C++ Reference: SetOptionsTests.cpp - "invalid home domain" test section
     #[test]
     fn test_set_options_home_domain_invalid() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(35);
@@ -1350,7 +1350,7 @@ mod tests {
     /// C++ Reference: SetOptionsTests.cpp - "clear auth revocable" test section
     #[test]
     fn test_set_options_clear_auth_revocable() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(36);
@@ -1401,7 +1401,7 @@ mod tests {
     /// incorrectly blocked clearing revocable when clawback was currently set.
     #[test]
     fn test_set_options_clear_revocable_and_clawback_simultaneously() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(50);
@@ -1486,7 +1486,7 @@ mod tests {
         );
 
         // Also verify that adding them in reverse order produces correct sorted order
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source_id = create_test_account_id(200);
         state.create_account(create_test_account(source_id.clone(), 1_000_000_000));
@@ -1548,7 +1548,7 @@ mod tests {
 
     #[test]
     fn test_set_options_master_weight_zero() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(37);
@@ -1583,7 +1583,7 @@ mod tests {
     /// stellar-core: SetOptionsOpFrame::doApply checks accountFlagClawbackIsValid
     #[test]
     fn test_set_options_auth_revocable_required() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(50);
@@ -1621,7 +1621,7 @@ mod tests {
     /// bytes outside 0x20-0x7E.
     #[test]
     fn test_set_options_invalid_home_domain_control_chars() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(51);
@@ -1658,7 +1658,7 @@ mod tests {
     /// auth checks). Henyey must match this ordering.
     #[test]
     fn test_set_options_inflation_checked_before_cant_change() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(52);

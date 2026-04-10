@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_account_merge_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn test_account_merge_malformed_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_account_merge_dest_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_account_merge_seqnum_too_far() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(7);
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn test_account_merge_is_sponsor() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 19;
 
@@ -365,7 +365,7 @@ mod tests {
     /// C++ Reference: MergeTests.cpp - "no destination" test section
     #[test]
     fn test_account_merge_no_destination() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -398,7 +398,7 @@ mod tests {
     /// C++ Reference: MergeTests.cpp - "has sub entries" test section
     #[test]
     fn test_account_merge_has_subentries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -435,7 +435,7 @@ mod tests {
     /// C++ Reference: MergeTests.cpp - "auth immutable" test section
     #[test]
     fn test_account_merge_auth_immutable() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -474,7 +474,7 @@ mod tests {
     /// C++ Reference: MergeTests.cpp - "with signers" test section
     #[test]
     fn test_account_merge_with_signers() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -523,7 +523,7 @@ mod tests {
     /// C++ Reference: MergeTests.cpp - "destination buying liabilities" test section
     #[test]
     fn test_account_merge_dest_buying_liabilities_overflow() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -566,7 +566,7 @@ mod tests {
     /// C++ Reference: MergeTests.cpp - "zero balance" test section
     #[test]
     fn test_account_merge_zero_balance() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -605,7 +605,7 @@ mod tests {
     /// C++ Reference: MergeTests.cpp - "source is sponsored" test section
     #[test]
     fn test_account_merge_source_is_sponsored() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -674,7 +674,7 @@ mod tests {
     /// C++ Reference: MergeOpFrame.cpp:209-223 (ImmutableSet before HasSubEntries)
     #[test]
     fn test_account_merge_immutable_checked_before_has_sub_entries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(40);
@@ -714,7 +714,7 @@ mod tests {
     /// C++ Reference: MergeOpFrame.cpp:209-229 (ImmutableSet before SeqnumTooFar)
     #[test]
     fn test_account_merge_immutable_checked_before_seqnum_too_far() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(42);
@@ -755,7 +755,7 @@ mod tests {
     /// C++ Reference: MergeTests.cpp - "seqnum boundary" test section
     #[test]
     fn test_account_merge_seqnum_at_boundary() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -797,7 +797,7 @@ mod tests {
     /// C++ Reference: MergeOpFrame.cpp:36-56 (isSeqnumTooFar / MAX_SEQ_NUM_TO_APPLY)
     #[test]
     fn test_account_merge_blocked_by_max_seq_num_to_apply() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(10);
@@ -839,7 +839,7 @@ mod tests {
     /// sequence number is below starting_seq.
     #[test]
     fn test_account_merge_allowed_when_max_seq_below_starting() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(12);
@@ -881,7 +881,7 @@ mod tests {
     /// the persistent num_sponsoring counter.
     #[test]
     fn test_audit_032_account_merge_rejects_inflight_sponsor() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(0); // A — will be the sponsor

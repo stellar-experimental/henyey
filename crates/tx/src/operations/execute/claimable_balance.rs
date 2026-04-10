@@ -587,7 +587,7 @@ mod tests {
 
     #[test]
     fn test_create_claimable_balance_malformed_no_claimants() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -622,7 +622,7 @@ mod tests {
 
     #[test]
     fn test_create_claimable_balance_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn test_create_claimable_balance_duplicate_claimants_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -719,7 +719,7 @@ mod tests {
 
     #[test]
     fn test_create_claimable_balance_invalid_predicate_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -761,7 +761,7 @@ mod tests {
 
     #[test]
     fn test_create_claimable_balance_relative_time_converted() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -817,7 +817,7 @@ mod tests {
 
     #[test]
     fn test_create_claimable_balance_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -864,7 +864,7 @@ mod tests {
 
     #[test]
     fn test_create_claimable_balance_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -920,7 +920,7 @@ mod tests {
 
     #[test]
     fn test_create_claimable_balance_issuer_clawback_flag() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 21;
 
@@ -981,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_create_claimable_balance_trustline_clawback_flag() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 21;
 
@@ -1046,7 +1046,7 @@ mod tests {
 
     #[test]
     fn test_claim_claimable_balance_not_exists() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let claimant_id = create_test_account_id(1);
@@ -1069,7 +1069,7 @@ mod tests {
 
     #[test]
     fn test_claim_claimable_balance_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1112,7 +1112,7 @@ mod tests {
         // Test that an issuer can claim their own claimable balance without a trustline.
         // This matches stellar-core TrustLineWrapper::IssuerImpl behavior where issuers have
         // unlimited trust for their own assets.
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         // Issuer is both the asset issuer AND the claimant
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn test_claim_claimable_balance_native_line_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let claimant_id = create_test_account_id(1);
@@ -1188,7 +1188,7 @@ mod tests {
 
     #[test]
     fn test_claim_claimable_balance_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1242,7 +1242,7 @@ mod tests {
 
     #[test]
     fn test_claim_claimable_balance_line_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1299,7 +1299,7 @@ mod tests {
     /// be recorded in the delta (matching stellar-core's loadSourceAccount behavior).
     #[test]
     fn test_create_claimable_balance_records_source_account_access() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         // Create two accounts: op_source (issuer) and tx_source
@@ -1381,7 +1381,7 @@ mod tests {
     /// - But sponsor doesn't have enough reserve -> returns LOW_RESERVE
     #[test]
     fn test_create_claimable_balance_low_reserve_after_underfunded_check() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1459,7 +1459,7 @@ mod tests {
     /// (balance - current_minBalance) is less than the amount.
     #[test]
     fn test_create_claimable_balance_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1515,7 +1515,7 @@ mod tests {
     /// C++ Reference: ClaimClaimableBalanceTests.cpp - "successful claim"
     #[test]
     fn test_claim_claimable_balance_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let creator_id = create_test_account_id(50);
@@ -1587,7 +1587,7 @@ mod tests {
     /// C++ Reference: ClaimClaimableBalanceTests.cpp - "cannot claim"
     #[test]
     fn test_claim_claimable_balance_cannot_claim() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         // Context with specific timestamp
         let context = LedgerContext::testnet(1, 1000);
 
@@ -1656,7 +1656,7 @@ mod tests {
     /// C++ Reference: CreateClaimableBalanceTests.cpp - "too many claimants"
     #[test]
     fn test_create_claimable_balance_too_many_claimants() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(55);
@@ -1717,7 +1717,7 @@ mod tests {
     /// C++ Reference: ClaimClaimableBalanceTests.cpp - "claim credit"
     #[test]
     fn test_claim_claimable_balance_credit_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let creator_id = create_test_account_id(70);
@@ -1820,7 +1820,7 @@ mod tests {
     /// TX hash: a56598544e7e5af878d2b88012bfa6c418a9a780fbd6aa1b271a6cb7653f6dd8
     #[test]
     fn test_claim_claimable_balance_line_full_with_buying_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(80);
@@ -1890,7 +1890,7 @@ mod tests {
     /// addBalance check: newBalance > INT64_MAX - buyingLiabilities.
     #[test]
     fn test_claim_claimable_balance_native_line_full_with_buying_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let claimant_id = create_test_account_id(82);
@@ -1944,7 +1944,7 @@ mod tests {
     /// is: `tl.limit - tl.balance < entry.amount`.
     #[test]
     fn test_claim_claimable_balance_line_full_i64_overflow() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(90);
@@ -2024,7 +2024,7 @@ mod tests {
     /// being deleted, allowing double-claiming.
     #[test]
     fn test_claim_claimable_balance_double_claim_returns_does_not_exist() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let claimant_id = create_test_account_id(1);
@@ -2096,7 +2096,7 @@ mod tests {
     /// return Underfunded because selling liabilities reduce the available balance.
     #[test]
     fn test_create_claimable_balance_native_underfunded_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2156,7 +2156,7 @@ mod tests {
     /// deduct selling liabilities from available non-native balance.
     #[test]
     fn test_create_claimable_balance_non_native_underfunded_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2237,7 +2237,7 @@ mod tests {
     /// (time is in the past relative to the ledger close time).
     #[test]
     fn test_claim_claimable_balance_cannot_claim_predicate_expired() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         // close_time = 1000
         let context = create_test_context();
 
@@ -2281,7 +2281,7 @@ mod tests {
     /// trustline for the claimable balance asset is frozen via FrozenKeyConfig.
     #[test]
     fn test_claim_claimable_balance_trustline_frozen() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
         let issuer_id = create_test_account_id(0);
         let claimant_id = create_test_account_id(1);
@@ -2346,7 +2346,7 @@ mod tests {
     /// listed as a claimant in the claimable balance entry.
     #[test]
     fn test_claim_claimable_balance_cannot_claim_not_a_claimant() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let claimer_id = create_test_account_id(0); // NOT in claimant list
@@ -2393,7 +2393,7 @@ mod tests {
     /// CreateClaimableBalance succeeds with a native asset and a single unconditional claimant.
     #[test]
     fn test_create_claimable_balance_success_native() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);

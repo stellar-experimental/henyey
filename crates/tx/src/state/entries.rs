@@ -4,7 +4,7 @@ use super::*;
 
 impl LedgerStateManager {
     pub(super) fn last_modified_for_key(&self, key: &LedgerKey) -> u32 {
-        self.get_last_modified(key).unwrap_or(self.ledger_seq)
+        self.get_last_modified(key).unwrap_or(self.ledger_seq.get())
     }
 
     pub(super) fn last_modified_snapshot_for_key(&self, key: &LedgerKey) -> Option<u32> {
@@ -22,8 +22,8 @@ impl LedgerStateManager {
         }
     }
 
-    pub(super) fn set_last_modified_key(&mut self, key: LedgerKey, seq: u32) {
-        self.insert_last_modified(key, seq);
+    pub(super) fn set_last_modified_key(&mut self, key: LedgerKey, seq: LedgerSeq) {
+        self.insert_last_modified(key, seq.get());
     }
 
     pub(super) fn remove_last_modified_key(&mut self, key: &LedgerKey) {
@@ -964,7 +964,7 @@ impl LedgerStateManager {
         // Build record and insert into canonical offer store
         let record = OfferRecord {
             entry,
-            last_modified: self.ledger_seq,
+            last_modified: self.ledger_seq.get(),
             sponsor,
             has_ext,
         };
@@ -1007,7 +1007,7 @@ impl LedgerStateManager {
             let pre = store.get(&key).map(|r| r.to_ledger_entry());
             let rec = store.get(&key).cloned().unwrap_or(OfferRecord {
                 entry: entry.clone(),
-                last_modified: self.ledger_seq,
+                last_modified: self.ledger_seq.get(),
                 sponsor: None,
                 has_ext: false,
             });
@@ -1015,7 +1015,7 @@ impl LedgerStateManager {
         };
 
         new_record.entry = entry;
-        new_record.last_modified = self.ledger_seq;
+        new_record.last_modified = self.ledger_seq.get();
         let post_state = new_record.to_ledger_entry();
 
         // Record in delta - each update gets its own STATE/UPDATED pair

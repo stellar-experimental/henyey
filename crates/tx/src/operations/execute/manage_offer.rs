@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_malformed_same_asset() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1064,7 +1064,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_create() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1106,7 +1106,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_issuer_can_sell_without_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -1142,7 +1142,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_issuer_can_buy_without_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -1178,7 +1178,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_sell_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1218,7 +1218,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_sell_authorized_to_maintain_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 13;
 
@@ -1259,7 +1259,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_buy_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1299,7 +1299,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_buy_authorized_to_maintain_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 13;
 
@@ -1340,7 +1340,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_update_denied_when_selling_maintain_only() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 13;
 
@@ -1410,7 +1410,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_update_denied_when_buying_maintain_only() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 13;
 
@@ -1480,7 +1480,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_delete_allowed_when_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 13;
 
@@ -1551,7 +1551,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_cross_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1619,7 +1619,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_cross_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1686,7 +1686,7 @@ mod tests {
     }
 
     fn manage_buy_offer_amount(price: Price, buy_amount: i64) -> i64 {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1745,7 +1745,7 @@ mod tests {
     }
 
     fn manage_sell_offer_amount(price: Price, amount: i64, seed: u8) -> i64 {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(seed);
@@ -1831,7 +1831,7 @@ mod tests {
     /// to existing offers.
     #[test]
     fn test_manage_sell_offer_new_native_low_reserve_before_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(200);
@@ -1884,7 +1884,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1926,7 +1926,7 @@ mod tests {
 
     #[test]
     fn test_manage_sell_offer_line_full_buying_limit() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1969,7 +1969,7 @@ mod tests {
         // if account can afford a new subentry reserve for a new offer.
         // This is a regression test for a bug where the LowReserve check only
         // compared balance to min_balance without considering liabilities.
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let mut context = create_test_context();
         context.protocol_version = 25;
 
@@ -2044,7 +2044,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - tooManySubentries tests via SponsorshipTestUtils
     #[test]
     fn test_manage_sell_offer_too_many_subentries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(100);
@@ -2098,7 +2098,7 @@ mod tests {
     /// the maximum subentries limit (1000).
     #[test]
     fn test_manage_buy_offer_too_many_subentries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(102);
@@ -2145,7 +2145,7 @@ mod tests {
     /// the maximum subentries limit (1000).
     #[test]
     fn test_create_passive_sell_offer_too_many_subentries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(104);
@@ -2192,7 +2192,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "malformed negative amount" test section
     #[test]
     fn test_manage_sell_offer_malformed_negative_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(110);
@@ -2224,7 +2224,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "malformed zero price" test section
     #[test]
     fn test_manage_sell_offer_malformed_zero_price() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(111);
@@ -2260,7 +2260,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "malformed invalid price" test section
     #[test]
     fn test_manage_sell_offer_malformed_zero_denominator() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(113);
@@ -2296,7 +2296,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "sell no trust" test section
     #[test]
     fn test_manage_sell_offer_sell_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(115);
@@ -2333,7 +2333,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "buy no trust" test section
     #[test]
     fn test_manage_sell_offer_buy_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(117);
@@ -2370,7 +2370,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "underfunded" test section
     #[test]
     fn test_manage_sell_offer_underfunded_zero_balance() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(119);
@@ -2418,7 +2418,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "not found" test section
     #[test]
     fn test_manage_sell_offer_not_found() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(121);
@@ -2467,7 +2467,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "delete offer" test section
     #[test]
     fn test_manage_sell_offer_delete() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(123);
@@ -2549,7 +2549,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "update offer" test section
     #[test]
     fn test_manage_sell_offer_update() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(125);
@@ -2626,7 +2626,7 @@ mod tests {
     /// C++ Reference: OfferTests.cpp - "passive offer basic" test section
     #[test]
     fn test_create_passive_sell_offer_basic() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(127);
@@ -2677,7 +2677,7 @@ mod tests {
     /// C++ Reference: ManageBuyOfferTests.cpp - "basic" test section
     #[test]
     fn test_manage_buy_offer_basic() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(129);
@@ -2728,7 +2728,7 @@ mod tests {
     /// account appears in the delta with updated lastModified.
     #[test]
     fn test_new_offer_fully_consumed_records_source_account() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         // Create issuer for two non-native assets
@@ -2901,7 +2901,7 @@ mod tests {
     /// Found at mainnet ledger 61153284.
     #[test]
     fn test_sponsored_new_offer_fully_consumed_records_sponsor_account() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         // Create issuer for two non-native assets
@@ -3073,7 +3073,7 @@ mod tests {
     /// ManageBuyOffer(LineFull) because we checked Underfunded before LineFull.
     #[test]
     fn test_manage_offer_line_full_before_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3139,7 +3139,7 @@ mod tests {
     fn test_audit_011_frozen_offer_filter_order_vs_bad_price() {
         use crate::frozen_keys::{trustline_key, FrozenKeyConfig};
 
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
         let buyer_id = create_test_account_id(0);
         let seller_id = create_test_account_id(1);
@@ -3275,7 +3275,7 @@ mod tests {
     /// rejected as Malformed.
     #[test]
     fn test_manage_sell_offer_malformed_invalid_asset_code() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3313,7 +3313,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_malformed_same_asset() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3342,7 +3342,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_sell_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3376,7 +3376,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_not_found() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3423,7 +3423,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3473,7 +3473,7 @@ mod tests {
 
     #[test]
     fn test_create_passive_sell_offer_malformed_same_asset() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3502,7 +3502,7 @@ mod tests {
 
     #[test]
     fn test_create_passive_sell_offer_sell_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3536,7 +3536,7 @@ mod tests {
 
     #[test]
     fn test_create_passive_sell_offer_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3584,7 +3584,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_buy_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3618,7 +3618,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_sell_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3663,7 +3663,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_buy_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3708,7 +3708,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_line_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3752,7 +3752,7 @@ mod tests {
 
     #[test]
     fn test_manage_buy_offer_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3800,7 +3800,7 @@ mod tests {
 
     #[test]
     fn test_create_passive_sell_offer_buy_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3834,7 +3834,7 @@ mod tests {
 
     #[test]
     fn test_create_passive_sell_offer_sell_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3879,7 +3879,7 @@ mod tests {
 
     #[test]
     fn test_create_passive_sell_offer_buy_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3924,7 +3924,7 @@ mod tests {
 
     #[test]
     fn test_create_passive_sell_offer_line_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3973,7 +3973,7 @@ mod tests {
     /// has a strictly better price, CrossSelf is returned.
     #[test]
     fn test_create_passive_sell_offer_cross_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -4051,7 +4051,7 @@ mod tests {
 
     #[test]
     fn test_create_passive_sell_offer_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -4116,7 +4116,7 @@ mod tests {
         fn setup_state_with_offers(
             n_offers: u8,
         ) -> (LedgerStateManager, LedgerContext, AccountId, Asset) {
-            let mut state = LedgerStateManager::new(5_000_000, 100);
+            let mut state = LedgerStateManager::new(5_000_000, 100.into());
             let context = create_test_context();
             let buyer_id = create_test_account_id(0);
             let issuer_id = create_test_account_id(99);

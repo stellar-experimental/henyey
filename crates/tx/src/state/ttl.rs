@@ -1,6 +1,7 @@
 //! TTL (time-to-live) entry management for Soroban contract state expiration.
 
 use super::*;
+use henyey_common::LedgerSeq;
 
 impl LedgerStateManager {
     /// Get a TTL entry by key hash (read-only).
@@ -218,7 +219,11 @@ impl LedgerStateManager {
     /// 1. Records pre/post state in delta (for transaction meta)
     /// 2. Does NOT update ttl_entries (so subsequent TX lookups return old value)
     /// 3. Stores the bump for later flushing to state
-    pub fn record_ro_ttl_bump_for_meta(&mut self, key_hash: &Hash, live_until_ledger_seq: u32) {
+    pub fn record_ro_ttl_bump_for_meta(
+        &mut self,
+        key_hash: &Hash,
+        live_until_ledger_seq: LedgerSeq,
+    ) {
         let ledger_key = LedgerKey::Ttl(LedgerKeyTtl {
             key_hash: key_hash.clone(),
         });
@@ -232,7 +237,7 @@ impl LedgerStateManager {
         if pre_state.is_none() {
             tracing::warn!(
                 key_hash = ?key_hash,
-                live_until = live_until_ledger_seq,
+                live_until = live_until_ledger_seq.get(),
                 "record_ro_ttl_bump_for_meta: TTL entry not found for RO bump"
             );
             return;
@@ -240,11 +245,11 @@ impl LedgerStateManager {
 
         // Check if TTL is actually changing
         if let Some(existing) = self.ttl_entries.get(key_hash) {
-            if existing.live_until_ledger_seq == live_until_ledger_seq {
+            if existing.live_until_ledger_seq == live_until_ledger_seq.get() {
                 // No change needed
                 tracing::debug!(
                     key_hash = ?key_hash,
-                    live_until = live_until_ledger_seq,
+                    live_until = live_until_ledger_seq.get(),
                     "record_ro_ttl_bump_for_meta: skipping - value unchanged"
                 );
                 return;
@@ -262,10 +267,10 @@ impl LedgerStateManager {
         // to see this change in their pre-state lookups.
         let ttl_entry = TtlEntry {
             key_hash: key_hash.clone(),
-            live_until_ledger_seq,
+            live_until_ledger_seq: live_until_ledger_seq.get(),
         };
         let post_state = LedgerEntry {
-            last_modified_ledger_seq: self.ledger_seq,
+            last_modified_ledger_seq: self.ledger_seq.get(),
             data: LedgerEntryData::Ttl(ttl_entry),
             ext: self.ledger_entry_ext_for(&ledger_key),
         };
@@ -275,7 +280,7 @@ impl LedgerStateManager {
 
         tracing::debug!(
             key_hash = ?key_hash,
-            live_until = live_until_ledger_seq,
+            live_until = live_until_ledger_seq.get(),
             "record_ro_ttl_bump_for_meta: recorded in delta, deferring state update"
         );
 
@@ -285,8 +290,8 @@ impl LedgerStateManager {
             .deferred_ro_ttl_bumps
             .entry(key_hash.clone())
             .or_insert(0);
-        if live_until_ledger_seq > *entry {
-            *entry = live_until_ledger_seq;
+        if live_until_ledger_seq.get() > *entry {
+            *entry = live_until_ledger_seq.get();
         }
     }
 
@@ -300,18 +305,18 @@ impl LedgerStateManager {
     /// Call `flush_deferred_ro_ttl_bumps()` at the end of ledger processing to add
     /// these bumps to the delta (after transaction meta is built, before bucket list
     /// is updated).
-    pub fn defer_ro_ttl_bump(&mut self, key_hash: &Hash, live_until_ledger_seq: u32) {
+    pub fn defer_ro_ttl_bump(&mut self, key_hash: &Hash, live_until_ledger_seq: LedgerSeq) {
         // Only keep the highest TTL bump for each key
         let entry = self
             .deferred_ro_ttl_bumps
             .entry(key_hash.clone())
             .or_insert(0);
-        if live_until_ledger_seq > *entry {
-            *entry = live_until_ledger_seq;
+        if live_until_ledger_seq.get() > *entry {
+            *entry = live_until_ledger_seq.get();
         }
         tracing::debug!(
             key_hash = ?key_hash,
-            live_until = live_until_ledger_seq,
+            live_until = live_until_ledger_seq.get(),
             "defer_ro_ttl_bump: deferred TTL bump for bucket list"
         );
     }
@@ -407,18 +412,17 @@ impl LedgerStateManager {
     }
 
     /// Extend the TTL of an entry to the specified ledger sequence.
-    pub fn extend_ttl(&mut self, key_hash: &Hash, live_until_ledger_seq: u32) {
+    pub fn extend_ttl(&mut self, key_hash: &Hash, live_until_ledger_seq: LedgerSeq) {
         if let Some(ttl_entry) = self.ttl_entries.get(key_hash).cloned() {
             // Only extend if the new TTL is greater
             if live_until_ledger_seq > ttl_entry.live_until_ledger_seq {
-                // If this entry was created in this transaction, we should NOT emit
                 // a STATE+UPDATED pair - the CREATED entry should reflect the final value.
                 // We update the delta's created entry directly instead.
                 if self.created_ttl.contains(key_hash) {
                     // Create updated entry
                     let updated = TtlEntry {
                         key_hash: ttl_entry.key_hash,
-                        live_until_ledger_seq,
+                        live_until_ledger_seq: live_until_ledger_seq.get(),
                     };
                     // Update the created entry in delta to reflect final value
                     self.delta.update_created_ttl(key_hash, &updated);
@@ -440,7 +444,7 @@ impl LedgerStateManager {
                     // Create updated entry
                     let updated = TtlEntry {
                         key_hash: ttl_entry.key_hash,
-                        live_until_ledger_seq,
+                        live_until_ledger_seq: live_until_ledger_seq.get(),
                     };
 
                     // Update state — delta recording is deferred to flush_modified_entries()
@@ -491,7 +495,7 @@ impl LedgerStateManager {
     /// Check if a TTL entry is live (not expired).
     pub fn is_entry_live(&self, key_hash: &Hash) -> bool {
         if let Some(ttl) = self.get_ttl(key_hash) {
-            ttl.live_until_ledger_seq >= self.ledger_seq
+            ttl.live_until_ledger_seq >= self.ledger_seq.get()
         } else {
             false
         }

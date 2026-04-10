@@ -50,6 +50,7 @@ use crate::soroban::{SorobanConfig, SorobanContext};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
+use henyey_common::LedgerSeq;
 
 // Shared helpers used by multiple operation submodules.
 
@@ -448,7 +449,7 @@ struct RentSnapshot {
     is_persistent: bool,
     is_code_entry: bool,
     old_size_bytes: u32,
-    old_live_until: u32,
+    old_live_until: LedgerSeq,
 }
 
 struct RentChange {
@@ -456,8 +457,8 @@ struct RentChange {
     is_code_entry: bool,
     old_size_bytes: u32,
     new_size_bytes: u32,
-    old_live_until_ledger: u32,
-    new_live_until_ledger: u32,
+    old_live_until_ledger: LedgerSeq,
+    new_live_until_ledger: LedgerSeq,
 }
 
 pub fn entry_size_for_rent_by_protocol(
@@ -624,7 +625,7 @@ fn rent_snapshot_for_keys(
             is_persistent,
             is_code_entry,
             old_size_bytes: entry_size,
-            old_live_until,
+            old_live_until: old_live_until.into(),
         });
     }
     snapshots
@@ -656,17 +657,17 @@ fn rent_changes_from_snapshots(
             cost_params,
         );
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &snapshot.key);
-        let new_live_until = state
+        let new_live_until: LedgerSeq = state
             .get_ttl(&key_hash)
-            .map(|ttl| ttl.live_until_ledger_seq)
+            .map(|ttl| LedgerSeq::new(ttl.live_until_ledger_seq))
             .unwrap_or(snapshot.old_live_until);
 
         tracing::debug!(
             ?snapshot.key,
             old_size_bytes = snapshot.old_size_bytes,
             new_size_bytes,
-            old_live_until = snapshot.old_live_until,
-            new_live_until,
+            old_live_until = snapshot.old_live_until.get(),
+            new_live_until = new_live_until.get(),
             "rent_changes_from_snapshots: processing entry"
         );
 
@@ -707,7 +708,7 @@ fn compute_rent_fee_by_protocol(
     protocol_version: u32,
     rent_changes: &[RentChange],
     config: &soroban_env_host25::fees::RentFeeConfiguration,
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
 ) -> i64 {
     let fee = if protocol_version_is_before(protocol_version, ProtocolVersion::V25) {
         let changes: Vec<soroban_env_host24::fees::LedgerEntryRentChange> = rent_changes
@@ -717,8 +718,8 @@ fn compute_rent_fee_by_protocol(
                 is_code_entry: change.is_code_entry,
                 old_size_bytes: change.old_size_bytes,
                 new_size_bytes: change.new_size_bytes,
-                old_live_until_ledger: change.old_live_until_ledger,
-                new_live_until_ledger: change.new_live_until_ledger,
+                old_live_until_ledger: change.old_live_until_ledger.get(),
+                new_live_until_ledger: change.new_live_until_ledger.get(),
             })
             .collect();
         let p24_config = rent_fee_config_p25_to_p24(config);
@@ -730,7 +731,7 @@ fn compute_rent_fee_by_protocol(
             temporary_rent_rate_denominator = p24_config.temporary_rent_rate_denominator,
             "compute_rent_fee_by_protocol: P24 config"
         );
-        soroban_env_host24::fees::compute_rent_fee(&changes, &p24_config, ledger_seq)
+        soroban_env_host24::fees::compute_rent_fee(&changes, &p24_config, ledger_seq.get())
     } else if protocol_version_starts_from(protocol_version, ProtocolVersion::V26) {
         // P26: code entry rent uses div_ceil(fee, 3) instead of P25's fee /= 3 (truncation).
         // Use the P26 host's compute_rent_fee to get the correct rounding behavior.
@@ -741,8 +742,8 @@ fn compute_rent_fee_by_protocol(
                 is_code_entry: change.is_code_entry,
                 old_size_bytes: change.old_size_bytes,
                 new_size_bytes: change.new_size_bytes,
-                old_live_until_ledger: change.old_live_until_ledger,
-                new_live_until_ledger: change.new_live_until_ledger,
+                old_live_until_ledger: change.old_live_until_ledger.get(),
+                new_live_until_ledger: change.new_live_until_ledger.get(),
             })
             .collect();
         let p26_config = soroban_env_host26::fees::RentFeeConfiguration {
@@ -752,7 +753,7 @@ fn compute_rent_fee_by_protocol(
             persistent_rent_rate_denominator: config.persistent_rent_rate_denominator,
             temporary_rent_rate_denominator: config.temporary_rent_rate_denominator,
         };
-        soroban_env_host26::fees::compute_rent_fee(&changes, &p26_config, ledger_seq)
+        soroban_env_host26::fees::compute_rent_fee(&changes, &p26_config, ledger_seq.get())
     } else {
         let changes: Vec<soroban_env_host25::fees::LedgerEntryRentChange> = rent_changes
             .iter()
@@ -761,17 +762,17 @@ fn compute_rent_fee_by_protocol(
                 is_code_entry: change.is_code_entry,
                 old_size_bytes: change.old_size_bytes,
                 new_size_bytes: change.new_size_bytes,
-                old_live_until_ledger: change.old_live_until_ledger,
-                new_live_until_ledger: change.new_live_until_ledger,
+                old_live_until_ledger: change.old_live_until_ledger.get(),
+                new_live_until_ledger: change.new_live_until_ledger.get(),
             })
             .collect();
-        soroban_env_host25::fees::compute_rent_fee(&changes, config, ledger_seq)
+        soroban_env_host25::fees::compute_rent_fee(&changes, config, ledger_seq.get())
     };
     tracing::debug!(
         rent_fee = fee,
         changes_count = rent_changes.len(),
         protocol_version,
-        ledger_seq,
+        ledger_seq = ledger_seq.get(),
         "compute_rent_fee_by_protocol: computed rent fee"
     );
     fee
@@ -917,7 +918,7 @@ pub fn execute_operation_with_soroban(
                         context.protocol_version,
                         &rent_changes,
                         &config.rent_fee_config,
-                        context.sequence,
+                        context.sequence.into(),
                     );
                     exec.soroban_meta = Some(SorobanOperationMeta {
                         events: Vec::new(),
@@ -977,7 +978,7 @@ pub fn execute_operation_with_soroban(
                                     is_persistent,
                                     is_code_entry,
                                     old_size_bytes: entry_size,
-                                    old_live_until: ttl,
+                                    old_live_until: ttl.into(),
                                 });
                             }
                         } else {
@@ -999,7 +1000,7 @@ pub fn execute_operation_with_soroban(
                                         is_persistent,
                                         is_code_entry,
                                         old_size_bytes: 0, // Hot archive entries: old_size_bytes = 0
-                                        old_live_until: 0, // Hot archive entries: old_live_until = 0
+                                        old_live_until: LedgerSeq::new(0), // Hot archive entries: old_live_until = 0
                                     });
                                     // Track this entry for RESTORED metadata emission
                                     hot_archive_restores.push(HotArchiveRestore {
@@ -1057,7 +1058,7 @@ pub fn execute_operation_with_soroban(
                         context.protocol_version,
                         &rent_changes,
                         &config.rent_fee_config,
-                        context.sequence,
+                        context.sequence.into(),
                     );
                     exec.soroban_meta = Some(SorobanOperationMeta {
                         events: Vec::new(),
@@ -1185,7 +1186,7 @@ mod tests {
 
     #[test]
     fn test_inflation_operation_dispatch() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -1365,7 +1366,7 @@ mod tests {
 
     #[test]
     fn test_bump_sequence_operation_dispatch() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -1392,7 +1393,7 @@ mod tests {
 
     #[test]
     fn test_create_account_operation_dispatch() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -1422,7 +1423,7 @@ mod tests {
 
     #[test]
     fn test_payment_operation_dispatch_no_dest() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -1452,7 +1453,7 @@ mod tests {
 
     #[test]
     fn test_manage_data_operation_dispatch() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -1478,7 +1479,7 @@ mod tests {
 
     #[test]
     fn test_operation_with_explicit_source() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let tx_source = create_test_account_id(0);
         let op_source = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([9u8; 32])));
@@ -1674,14 +1675,14 @@ mod tests {
 
     #[test]
     fn test_can_buy_at_most_native_no_account() {
-        let state = LedgerStateManager::new(5_000_000, 100);
+        let state = LedgerStateManager::new(5_000_000, 100.into());
         let source = create_test_account_id(0);
         assert_eq!(can_buy_at_most(&source, &Asset::Native, &state), 0);
     }
 
     #[test]
     fn test_can_buy_at_most_native_no_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let source = create_test_account_id(0);
         state.create_account(create_test_account(source.clone(), 100_000_000));
         let capacity = can_buy_at_most(&source, &Asset::Native, &state);
@@ -1690,7 +1691,7 @@ mod tests {
 
     #[test]
     fn test_can_buy_at_most_native_with_buying_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let source = create_test_account_id(0);
         let mut account = create_test_account(source.clone(), 100_000_000);
         account.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
@@ -1707,7 +1708,7 @@ mod tests {
 
     #[test]
     fn test_can_buy_at_most_non_native_issuer() {
-        let state = LedgerStateManager::new(5_000_000, 100);
+        let state = LedgerStateManager::new(5_000_000, 100.into());
         let issuer = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', 0]),
@@ -1718,7 +1719,7 @@ mod tests {
 
     #[test]
     fn test_can_buy_at_most_non_native_no_trustline() {
-        let state = LedgerStateManager::new(5_000_000, 100);
+        let state = LedgerStateManager::new(5_000_000, 100.into());
         let source = create_test_account_id(0);
         let asset = Asset::CreditAlphanum4(AlphaNum4 {
             asset_code: AssetCode4([b'U', b'S', b'D', 0]),
@@ -1731,7 +1732,7 @@ mod tests {
 
     #[test]
     fn test_apply_liabilities_delta_native_selling() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let source = create_test_account_id(0);
         state.create_account(create_test_account(source.clone(), 100_000_000));
 
@@ -1754,7 +1755,7 @@ mod tests {
 
     #[test]
     fn test_apply_liabilities_delta_missing_account() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let source = create_test_account_id(0);
         // No account created
 
@@ -1774,7 +1775,7 @@ mod tests {
     /// TxInternalError.
     #[test]
     fn test_audit_058_sponsored_manage_data_at_max_sponsoring() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source = create_test_account_id(1);

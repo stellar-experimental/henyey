@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn test_liquidity_pool_deposit_no_pool() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -854,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_liquidity_pool_withdraw_no_pool() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -879,7 +879,7 @@ mod tests {
 
     #[test]
     fn test_liquidity_pool_deposit_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -965,7 +965,7 @@ mod tests {
 
     #[test]
     fn test_liquidity_pool_deposit_line_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1047,7 +1047,7 @@ mod tests {
 
     #[test]
     fn test_liquidity_pool_withdraw_line_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1130,7 +1130,7 @@ mod tests {
     /// This is a regression test for the bug at ledger 419086.
     #[test]
     fn test_liquidity_pool_deposit_issuer_no_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         // The issuer is the source account depositing
@@ -1209,7 +1209,7 @@ mod tests {
     /// Test that asset issuers can withdraw from liquidity pools and receive their own assets.
     #[test]
     fn test_liquidity_pool_withdraw_issuer_no_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         // The issuer is the source account withdrawing
@@ -1289,7 +1289,7 @@ mod tests {
     /// C++ Reference: LiquidityPoolDepositTests.cpp - "deposit into empty pool"
     #[test]
     fn test_deposit_empty_pool_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(20);
@@ -1380,7 +1380,7 @@ mod tests {
     /// C++ Reference: LiquidityPoolDepositTests.cpp - "underfunded" section
     #[test]
     fn test_deposit_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(25);
@@ -1470,7 +1470,7 @@ mod tests {
     /// C++ Reference: LiquidityPoolWithdrawTests.cpp - "basic withdraw"
     #[test]
     fn test_withdraw_basic_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(30);
@@ -1561,7 +1561,7 @@ mod tests {
     /// C++ Reference: LiquidityPoolWithdrawTests.cpp - "underfunded" section
     #[test]
     fn test_withdraw_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(35);
@@ -1654,7 +1654,7 @@ mod tests {
     /// C++ Reference: LiquidityPoolWithdrawOpFrame.cpp:47
     #[test]
     fn test_withdraw_underfunded_due_to_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(60);
@@ -1751,7 +1751,7 @@ mod tests {
     /// C++ Reference: LiquidityPoolDepositTests.cpp - "bad price" section
     #[test]
     fn test_deposit_bad_price() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(40);
@@ -1844,7 +1844,7 @@ mod tests {
     /// C++ Reference: LiquidityPoolWithdrawTests.cpp - "under minimum" section
     #[test]
     fn test_withdraw_under_minimum() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(45);
@@ -1936,7 +1936,7 @@ mod tests {
     /// TrustLineWrapper::getAvailableBalance).
     #[test]
     fn test_deposit_underfunded_due_to_selling_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(50);
@@ -2109,7 +2109,7 @@ mod tests {
     /// Test deposit with max_amount_a <= 0 returns Malformed.
     #[test]
     fn test_liquidity_pool_deposit_malformed_negative_max_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2134,7 +2134,7 @@ mod tests {
     /// Test deposit with price numerator <= 0 returns Malformed.
     #[test]
     fn test_liquidity_pool_deposit_malformed_invalid_price() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2159,7 +2159,7 @@ mod tests {
     /// Test deposit with min_price > max_price returns Malformed.
     #[test]
     fn test_liquidity_pool_deposit_malformed_min_price_exceeds_max() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2184,7 +2184,7 @@ mod tests {
     /// Test deposit when pool reserve would overflow returns PoolFull.
     #[test]
     fn test_liquidity_pool_deposit_pool_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2273,7 +2273,7 @@ mod tests {
     /// Test withdraw with amount <= 0 returns Malformed.
     #[test]
     fn test_liquidity_pool_withdraw_malformed_zero_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2297,7 +2297,7 @@ mod tests {
     /// Test withdraw with negative min_amount returns Malformed.
     #[test]
     fn test_liquidity_pool_withdraw_malformed_negative_min_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2326,7 +2326,7 @@ mod tests {
     /// cleared AUTH_REQUIRED.
     #[test]
     fn test_audit_010_deposit_deauthorized_trustline_without_auth_required() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2419,7 +2419,7 @@ mod tests {
     /// pool's asset trustlines is frozen via FrozenKeyConfig.
     #[test]
     fn test_liquidity_pool_deposit_trustline_frozen() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
         let source_id = create_test_account_id(0);
         let issuer_a = create_test_account_id(1);
@@ -2519,7 +2519,7 @@ mod tests {
     /// pool's asset trustlines is frozen via FrozenKeyConfig.
     #[test]
     fn test_liquidity_pool_withdraw_trustline_frozen() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
         let source_id = create_test_account_id(0);
         let issuer_a = create_test_account_id(1);
@@ -2618,7 +2618,7 @@ mod tests {
     /// LiquidityPoolDeposit returns Malformed when max_amount_a is zero.
     #[test]
     fn test_liquidity_pool_deposit_malformed_zero_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2648,7 +2648,7 @@ mod tests {
     /// LiquidityPoolDeposit returns Malformed when min_price > max_price.
     #[test]
     fn test_liquidity_pool_deposit_malformed_min_exceeds_max_price() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);

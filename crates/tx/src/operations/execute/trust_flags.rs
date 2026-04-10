@@ -946,7 +946,7 @@ mod tests {
     fn test_allow_trust_no_auth_required() {
         // In protocol 16+ (CAP-0035), the AUTH_REQUIRED check was removed from AllowTrust.
         // AllowTrust should succeed even when issuer doesn't have AUTH_REQUIRED flag.
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1000,7 +1000,7 @@ mod tests {
 
     #[test]
     fn test_allow_trust_cant_revoke_with_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1060,7 +1060,7 @@ mod tests {
 
     #[test]
     fn test_allow_trust_self_not_allowed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1098,7 +1098,7 @@ mod tests {
 
     #[test]
     fn test_set_trust_line_flags_cant_revoke_with_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[test]
     fn test_set_trust_line_flags_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1224,7 +1224,7 @@ mod tests {
     /// where the issuer account was incorrectly appearing in the LIVE delta.
     #[test]
     fn test_set_trust_line_flags_does_not_record_issuer_in_delta() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1315,7 +1315,7 @@ mod tests {
     /// in the delta when the issuer calls it on someone else's trustline.
     #[test]
     fn test_allow_trust_does_not_record_issuer_in_delta() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(0);
@@ -1399,7 +1399,7 @@ mod tests {
     /// C++ Reference: SetTrustLineFlagsTests.cpp - "not issuer" test section
     #[test]
     fn test_set_trust_line_flags_not_issuer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(40);
@@ -1461,7 +1461,7 @@ mod tests {
     /// C++ Reference: SetTrustLineFlagsTests.cpp - "no trust line" test section
     #[test]
     fn test_set_trust_line_flags_no_trust_line() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(43);
@@ -1509,7 +1509,7 @@ mod tests {
     /// C++ Reference: AllowTrustTests.cpp - "no trust line" test section
     #[test]
     fn test_allow_trust_no_trust_line() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(45);
@@ -1557,7 +1557,7 @@ mod tests {
     /// isAuthRevocationValid() before trustline load.
     #[test]
     fn test_set_trust_line_flags_cant_revoke_before_no_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(50);
@@ -1613,7 +1613,7 @@ mod tests {
     /// C++ Reference: SetTrustLineFlagsTests.cpp - "invalid state" test section
     #[test]
     fn test_set_trust_line_flags_invalid_state() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(47);
@@ -1673,7 +1673,7 @@ mod tests {
     /// C++ Reference: SetTrustLineFlagsOpFrame::doCheckValid - "mSetTrustLineFlags.trustor == getSourceID()"
     #[test]
     fn test_set_trust_line_flags_malformed_self_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(90);
@@ -1719,7 +1719,7 @@ mod tests {
     /// C++ Reference: SetTrustLineFlagsOpFrame::doCheckValid - "!trustLineFlagIsValid"
     #[test]
     fn test_set_trust_line_flags_malformed_clawback_in_set_flags() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(91);
@@ -1765,7 +1765,7 @@ mod tests {
     /// C++ Reference: SetTrustLineFlagsOpFrame::doCheckValid - "!trustLineFlagIsValid"
     #[test]
     fn test_set_trust_line_flags_malformed_invalid_set_flags_bits() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(93);
@@ -1812,7 +1812,7 @@ mod tests {
     /// C++ Reference: SetTrustLineFlagsOpFrame::doCheckValid - "!trustLineFlagMaskCheckIsValid"
     #[test]
     fn test_set_trust_line_flags_malformed_invalid_clear_flags_bits() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(95);
@@ -1916,7 +1916,7 @@ mod tests {
     /// C++ Reference: TransactionUtils.cpp `removeOffersAndPoolShareTrustLines`
     #[test]
     fn test_set_trust_line_flags_redeems_pool_shares_on_deauthorize() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(60);
@@ -2094,7 +2094,7 @@ mod tests {
     /// trustline redemption.
     #[test]
     fn test_allow_trust_redeems_pool_shares_on_deauthorize() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(63);
@@ -2244,7 +2244,7 @@ mod tests {
     /// are created but the trustline is still deleted and pool counts are updated.
     #[test]
     fn test_deauthorize_zero_balance_pool_share_no_claimable_balances() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(66);
@@ -2388,7 +2388,7 @@ mod tests {
     /// no claimable balance is created for that asset (issuer can mint).
     #[test]
     fn test_deauthorize_pool_share_issuer_skips_claimable_balance() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(69);
@@ -2522,7 +2522,7 @@ mod tests {
     /// sequences across validators, breaking consensus.
     #[test]
     fn test_pool_share_revocation_canonical_order_with_multiple_pools() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(80);
@@ -2724,7 +2724,7 @@ mod tests {
     /// before any other checks.
     #[test]
     fn test_allow_trust_malformed_invalid_authorize_value() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(90);
@@ -2806,7 +2806,7 @@ mod tests {
     /// creation to fail with LowReserve.
     #[test]
     fn test_allow_trust_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(92);
@@ -2938,7 +2938,7 @@ mod tests {
     /// AllowTrust returns Malformed when the source (issuer) account doesn't exist.
     #[test]
     fn test_allow_trust_malformed_source_not_found() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(80);
@@ -2981,7 +2981,7 @@ mod tests {
     fn test_allow_trust_revoke_too_many_sponsoring_non_sandwich() {
         use crate::test_utils::create_test_account_with_sponsorship;
 
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(200);
@@ -3094,7 +3094,7 @@ mod tests {
     fn test_allow_trust_revoke_too_many_sponsoring_sandwich() {
         use crate::test_utils::create_test_account_with_sponsorship;
 
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(210);
@@ -3209,7 +3209,7 @@ mod tests {
     /// Test AUDIT-071: AllowTrust with invalid asset code returns Malformed.
     #[test]
     fn test_audit_071_allow_trust_invalid_asset_code_returns_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(1);
@@ -3258,7 +3258,7 @@ mod tests {
     /// Test AUDIT-071: SetTrustLineFlags with invalid asset code returns Malformed.
     #[test]
     fn test_audit_071_set_trust_line_flags_invalid_asset_returns_malformed() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(1);

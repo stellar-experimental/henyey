@@ -119,7 +119,7 @@ fn validate_footprint_entry_sizes(
     state: &LedgerStateManager,
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
-    current_ledger: u32,
+    current_ledger: LedgerSeq,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> bool {
     let max_contract_size = soroban_config.max_contract_size_bytes;
@@ -161,7 +161,7 @@ fn validate_footprint_entry_sizes(
 fn validate_footprint_entry(
     state: &LedgerStateManager,
     key: &LedgerKey,
-    current_ledger: u32,
+    current_ledger: LedgerSeq,
     max_contract_size_bytes: u32,
     max_contract_data_entry_size_bytes: u32,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
@@ -174,7 +174,7 @@ fn validate_footprint_entry(
     // Check if entry is live (has non-expired TTL)
     let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
     let is_live = match state.get_ttl(&key_hash) {
-        Some(ttl) => ttl.live_until_ledger_seq >= current_ledger,
+        Some(ttl) => ttl.live_until_ledger_seq >= current_ledger.get(),
         None => false,
     };
 
@@ -228,6 +228,7 @@ use crate::soroban::{PersistentModuleCache, SorobanConfig, SorobanContext};
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
+use henyey_common::LedgerSeq;
 
 /// Execute an InvokeHostFunction operation.
 ///
@@ -321,7 +322,7 @@ fn execute_contract_invocation(
         state,
         &soroban_data.resources.footprint,
         &soroban_data.ext,
-        context.sequence,
+        context.sequence.into(),
         hot_archive,
         ttl_key_cache,
     )? {
@@ -335,7 +336,7 @@ fn execute_contract_invocation(
         state,
         soroban_data,
         context.protocol_version,
-        context.sequence,
+        context.sequence.into(),
         ttl_key_cache,
     ) {
         return Ok(OperationExecutionResult::new(make_result(
@@ -351,7 +352,7 @@ fn execute_contract_invocation(
         state,
         soroban_data,
         soroban_config,
-        context.sequence,
+        context.sequence.into(),
         ttl_key_cache,
     ) {
         return Ok(OperationExecutionResult::new(make_result(
@@ -532,7 +533,7 @@ fn disk_read_bytes_exceeded(
     state: &LedgerStateManager,
     soroban_data: &SorobanTransactionData,
     protocol_version: u32,
-    current_ledger: u32,
+    current_ledger: LedgerSeq,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> bool {
     let mut total_read_bytes = 0u32;
@@ -545,13 +546,13 @@ fn disk_read_bytes_exceeded(
                 LedgerKey::ContractData(cd_key) => state
                     .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
                     .map(|cd| LedgerEntry {
-                        last_modified_ledger_seq: current_ledger,
+                        last_modified_ledger_seq: current_ledger.get(),
                         data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
                         ext: stellar_xdr::curr::LedgerEntryExt::V0,
                     }),
                 LedgerKey::ContractCode(cc_key) => {
                     state.get_contract_code(&cc_key.hash).map(|cc| LedgerEntry {
-                        last_modified_ledger_seq: current_ledger,
+                        last_modified_ledger_seq: current_ledger.get(),
                         data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
                         ext: stellar_xdr::curr::LedgerEntryExt::V0,
                     })
@@ -628,7 +629,7 @@ fn disk_read_bytes_exceeded(
                     // it as an in-memory soroban entry (no disk read metering).
                     let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
                     let is_still_archived = match state.get_ttl(&key_hash) {
-                        Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
+                        Some(ttl) => ttl.live_until_ledger_seq < current_ledger.get(),
                         None => true, // No TTL = not in live state = archived
                     };
                     if !is_still_archived {
@@ -1017,7 +1018,7 @@ fn apply_soroban_storage_change(
                 let existing_ttl = state.get_ttl(&key_hash);
                 let ttl = TtlEntry {
                     key_hash: key_hash.clone(),
-                    live_until_ledger_seq: live_until,
+                    live_until_ledger_seq: live_until.get(),
                 };
 
                 // For hot archive restores, check if the TTL was already created in the delta
@@ -1028,7 +1029,11 @@ fn apply_soroban_storage_change(
 
                 if is_hot_archive_restore && !ttl_already_restored {
                     // First restoration from hot archive - create TTL
-                    tracing::debug!(?key_hash, live_until, "TTL emit: hot archive restore");
+                    tracing::debug!(
+                        ?key_hash,
+                        live_until = live_until.get(),
+                        "TTL emit: hot archive restore"
+                    );
                     state.create_ttl(ttl);
                     created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                         key_hash: key_hash.clone(),
@@ -1037,7 +1042,7 @@ fn apply_soroban_storage_change(
                     // TTL was already restored by earlier TX - update
                     tracing::debug!(
                         ?key_hash,
-                        live_until,
+                        live_until = live_until.get(),
                         "TTL emit: already restored, updating"
                     );
                     state.update_ttl(ttl);
@@ -1048,7 +1053,7 @@ fn apply_soroban_storage_change(
                     let exists = existing_ttl.is_some();
                     tracing::debug!(
                         ?key_hash,
-                        live_until,
+                        live_until = live_until.get(),
                         ttl_extended = change.ttl_extended,
                         exists,
                         "TTL emit: data modified, TTL extended or new"
@@ -1061,7 +1066,11 @@ fn apply_soroban_storage_change(
                     create_or_update_ttl(state, ttl, exists);
                 } else if existing_ttl.is_none() {
                     // New entry being created - emit TTL
-                    tracing::debug!(?key_hash, live_until, "TTL emit: new TTL entry");
+                    tracing::debug!(
+                        ?key_hash,
+                        live_until = live_until.get(),
+                        "TTL emit: new TTL entry"
+                    );
                     state.create_ttl(ttl);
                     created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                         key_hash: key_hash.clone(),
@@ -1070,7 +1079,7 @@ fn apply_soroban_storage_change(
                     // TTL was NOT extended and entry already exists - skip emission
                     tracing::debug!(
                         ?key_hash,
-                        live_until,
+                        live_until = live_until.get(),
                         "TTL skip: data modified but TTL not extended"
                     );
                 }
@@ -1095,7 +1104,7 @@ fn apply_soroban_storage_change(
             let existing_ttl = state.get_ttl(&key_hash);
             let ttl = TtlEntry {
                 key_hash: key_hash.clone(),
-                live_until_ledger_seq: live_until,
+                live_until_ledger_seq: live_until.get(),
             };
 
             // Read-only TTL bumps: stellar-core includes them in transaction meta but defers state updates.
@@ -1105,7 +1114,7 @@ fn apply_soroban_storage_change(
             if change.is_read_only_ttl_bump {
                 tracing::debug!(
                     ?key_hash,
-                    live_until,
+                    live_until = live_until.get(),
                     existing = existing_ttl.is_some(),
                     "RO TTL bump: recording in delta for meta, deferring state update"
                 );
@@ -1116,7 +1125,7 @@ fn apply_soroban_storage_change(
                 let exists = existing_ttl.is_some();
                 tracing::debug!(
                     ?key_hash,
-                    live_until,
+                    live_until = live_until.get(),
                     existing = exists,
                     key_type = ?std::mem::discriminant(&change.key),
                     "TTL emit: ttl-only extended"
@@ -1165,7 +1174,7 @@ fn footprint_has_unrestored_archived_entries(
     state: &LedgerStateManager,
     footprint: &stellar_xdr::curr::LedgerFootprint,
     ext: &stellar_xdr::curr::SorobanTransactionDataExt,
-    current_ledger: u32,
+    current_ledger: LedgerSeq,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> crate::Result<bool> {
@@ -1205,7 +1214,7 @@ fn footprint_has_unrestored_archived_entries(
 fn is_archived_contract_entry(
     state: &LedgerStateManager,
     key: &LedgerKey,
-    current_ledger: u32,
+    current_ledger: LedgerSeq,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> crate::Result<bool> {
@@ -1235,7 +1244,7 @@ fn is_archived_contract_entry(
         // Entry is in live state — check its TTL
         let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
         return Ok(match state.get_ttl(&key_hash) {
-            Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
+            Some(ttl) => ttl.live_until_ledger_seq < current_ledger.get(),
             None => false, // No TTL → not archived (matches stellar-core fallthrough)
         });
     }
@@ -1348,7 +1357,7 @@ mod tests {
 
     #[test]
     fn test_invoke_host_function_no_soroban_data() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
         let config = create_test_soroban_config();
@@ -1379,7 +1388,7 @@ mod tests {
     #[test]
     #[ignore = "Test was already broken - WASM upload test setup needs fixing"]
     fn test_upload_wasm_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
         let config = create_test_soroban_config();
@@ -1433,7 +1442,7 @@ mod tests {
 
     #[test]
     fn test_invoke_host_function_entry_archived() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
         let config = create_test_soroban_config();
@@ -1511,7 +1520,7 @@ mod tests {
     /// when the TTL key is missing.
     #[test]
     fn test_invoke_host_function_missing_ttl_not_archived() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
         let config = create_test_soroban_config();
@@ -1588,7 +1597,7 @@ mod tests {
 
     #[test]
     fn test_invoke_host_function_archived_allowed_when_marked() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context_p23();
         let source = create_test_account_id(0);
         let config = create_test_soroban_config();
@@ -1668,7 +1677,7 @@ mod tests {
 
     #[test]
     fn test_invoke_host_function_disk_read_limit_exceeded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context_p23();
         let source = create_test_account_id(0);
         let config = create_test_soroban_config();
@@ -1731,7 +1740,7 @@ mod tests {
     /// restored entry's bytes, causing spurious ResourceLimitExceeded failures.
     #[test]
     fn test_disk_read_bytes_skips_already_restored_archived_entry() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context_p23();
 
         // Create an archived soroban entry that has been "restored" (live TTL)
@@ -1794,7 +1803,7 @@ mod tests {
             &state,
             &soroban_data,
             context.protocol_version,
-            context.sequence,
+            context.sequence.into(),
             None,
         );
         assert!(
@@ -1815,7 +1824,7 @@ mod tests {
             &state,
             &soroban_data,
             context.protocol_version,
-            context.sequence,
+            context.sequence.into(),
             None,
         );
         assert!(
@@ -1947,7 +1956,7 @@ mod tests {
 
     #[test]
     fn test_apply_soroban_storage_change_deletes() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
         let contract_id = ScAddress::Contract(ContractId(Hash([1u8; 32])));
         let contract_key = ScVal::U32(7);
@@ -1976,7 +1985,7 @@ mod tests {
         let change = StorageChange {
             key: key.clone(),
             new_entry: Some(ledger_entry),
-            live_until: Some(200),
+            live_until: Some(200.into()),
             ttl_extended: false,
             is_rent_related: false,
             is_read_only_ttl_bump: false,
@@ -2031,7 +2040,7 @@ mod tests {
     /// a redundant TTL update.
     #[test]
     fn test_apply_soroban_storage_change_skips_ttl_when_unchanged() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
         let contract_id = ScAddress::Contract(ContractId(Hash([2u8; 32])));
         let contract_key = ScVal::U32(42);
@@ -2066,7 +2075,7 @@ mod tests {
         state.commit();
 
         // Create a new state manager starting from this snapshot (simulating new ledger)
-        let mut state2 = LedgerStateManager::new(5_000_000, 100);
+        let mut state2 = LedgerStateManager::new(5_000_000, 100.into());
 
         // Re-populate with the same entries (simulates loading from bucket list)
         let existing_ttl = TtlEntry {
@@ -2103,7 +2112,7 @@ mod tests {
         let modify_change = StorageChange {
             key: key.clone(),
             new_entry: Some(modified_entry),
-            live_until: Some(226129), // Same TTL as before
+            live_until: Some(226129.into()), // Same TTL as before
             ttl_extended: false,
             is_rent_related: true, // This was true in the actual ledger
             is_read_only_ttl_bump: false,
@@ -2256,7 +2265,7 @@ mod tests {
         let change = StorageChange {
             key,
             new_entry: Some(ledger_entry),
-            live_until: Some(200),
+            live_until: Some(200.into()),
             ttl_extended: false,
             is_rent_related: false,
             is_read_only_ttl_bump: false,
@@ -2301,7 +2310,7 @@ mod tests {
         let change = StorageChange {
             key,
             new_entry: Some(ledger_entry),
-            live_until: Some(200),
+            live_until: Some(200.into()),
             ttl_extended: false,
             is_rent_related: false,
             is_read_only_ttl_bump: false,
@@ -2364,7 +2373,7 @@ mod tests {
         let change = StorageChange {
             key: key.clone(),
             new_entry: Some(ledger_entry),
-            live_until: Some(250000),
+            live_until: Some(250000.into()),
             ttl_extended: false,
             is_rent_related: false,
             is_read_only_ttl_bump: false,
@@ -2372,7 +2381,7 @@ mod tests {
 
         // Case 1: Entry exists in state, NOT in hot_archive_keys -> should use update (LIVE)
         {
-            let mut state = LedgerStateManager::new(5_000_000, 100);
+            let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
             // Pre-populate entry in state (simulates entry loaded from hot archive into state)
             // We do this by directly using create which will track it as created initially
@@ -2407,7 +2416,7 @@ mod tests {
         // In production, archived entries are loaded from InMemorySorobanState via load_entry,
         // which does NOT add to delta. The entry exists in state but NOT in delta.created.
         {
-            let mut state = LedgerStateManager::new(5_000_000, 100);
+            let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
             // Pre-populate entry in state using load_entry (like InMemorySorobanState does).
             // This does NOT add to delta - the entry just exists in state.
@@ -2486,7 +2495,7 @@ mod tests {
         // Case 3: Entry exists in state (pre-loaded), NOT in hot_archive_keys -> should use update (LIVE)
         // This simulates a normal live bucket list entry that was loaded for Soroban execution.
         {
-            let mut state = LedgerStateManager::new(5_000_000, 100);
+            let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
             // Pre-populate entry in state using load_entry (simulates snapshot lookup)
             state.load_entry(LedgerEntry {
@@ -2585,7 +2594,7 @@ mod tests {
         let change = StorageChange {
             key: key.clone(),
             new_entry: None, // host did not return data (read-only access)
-            live_until: Some(restored_live_until),
+            live_until: Some(restored_live_until.into()),
             ttl_extended: true, // false positive: restored_live_until > 0 = ledger_start_ttl
             is_rent_related: false,
             is_read_only_ttl_bump: false,
@@ -2595,7 +2604,7 @@ mod tests {
         let mut hot_archive_restored_keys = std::collections::HashSet::new();
         hot_archive_restored_keys.insert(key.clone());
 
-        let mut state = LedgerStateManager::new(5_000_000, 59_940_765);
+        let mut state = LedgerStateManager::new(5_000_000, 59_940_765.into());
 
         // Entry is not in state (never was in live BL — it came from hot archive).
         assert!(
@@ -2664,7 +2673,7 @@ mod tests {
         let change = StorageChange {
             key: key.clone(),
             new_entry: None,
-            live_until: Some(restored_live_until),
+            live_until: Some(restored_live_until.into()),
             ttl_extended: true,
             is_rent_related: false,
             is_read_only_ttl_bump: false,
@@ -2680,7 +2689,7 @@ mod tests {
             read_write: vec![key.clone()].try_into().unwrap(),
         };
 
-        let mut state = LedgerStateManager::new(5_000_000, 59_940_765);
+        let mut state = LedgerStateManager::new(5_000_000, 59_940_765.into());
 
         assert_eq!(
             state.delta().created_entries().len(),
@@ -2763,7 +2772,7 @@ mod tests {
             ext: LedgerEntryExt::V0,
         };
 
-        let mut state = LedgerStateManager::new(5_000_000, 60_000_000);
+        let mut state = LedgerStateManager::new(5_000_000, 60_000_000.into());
         state.load_entry(entry);
 
         // Confirm the entry is visible in state.
@@ -2845,7 +2854,7 @@ mod tests {
     /// (`invoke_host_function`) which meters XDR deserialization against the host budget.
     #[test]
     fn test_validate_footprint_entry_sizes_rejects_oversized_live_entry() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let contract_id = ScAddress::Contract(ContractId(Hash([0xEEu8; 32])));
@@ -2899,7 +2908,13 @@ mod tests {
 
         // Should return false (validation fails) because the live entry exceeds the limit
         assert!(
-            !validate_footprint_entry_sizes(&state, &soroban_data, &config, context.sequence, None),
+            !validate_footprint_entry_sizes(
+                &state,
+                &soroban_data,
+                &config,
+                context.sequence.into(),
+                None
+            ),
             "VE-14: validate_footprint_entry_sizes should reject oversized live entry"
         );
     }
@@ -2910,7 +2925,7 @@ mod tests {
     /// This matches the behavior where expired entries are not read from disk.
     #[test]
     fn test_validate_footprint_entry_sizes_passes_for_dead_entry() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let contract_id = ScAddress::Contract(ContractId(Hash([0xFFu8; 32])));
@@ -2964,7 +2979,13 @@ mod tests {
 
         // Should return true (validation passes) because the entry is dead
         assert!(
-            validate_footprint_entry_sizes(&state, &soroban_data, &config, context.sequence, None),
+            validate_footprint_entry_sizes(
+                &state,
+                &soroban_data,
+                &config,
+                context.sequence.into(),
+                None
+            ),
             "VE-14: validate_footprint_entry_sizes should pass for dead (expired) entry"
         );
     }
@@ -2972,7 +2993,7 @@ mod tests {
     /// VE-14: validate_footprint_entry_sizes passes for within-limit live entries.
     #[test]
     fn test_validate_footprint_entry_sizes_passes_for_normal_entries() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let contract_id = ScAddress::Contract(ContractId(Hash([0xDDu8; 32])));
@@ -3025,7 +3046,13 @@ mod tests {
 
         // Should pass since entry is small and live
         assert!(
-            validate_footprint_entry_sizes(&state, &soroban_data, &config, context.sequence, None),
+            validate_footprint_entry_sizes(
+                &state,
+                &soroban_data,
+                &config,
+                context.sequence.into(),
+                None
+            ),
             "VE-14: validate_footprint_entry_sizes should pass for normal-sized live entry"
         );
     }

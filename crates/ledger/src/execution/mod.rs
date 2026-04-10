@@ -40,7 +40,7 @@ use std::sync::Arc;
 use henyey_common::protocol::{
     protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
 };
-use henyey_common::{Hash256, NetworkId, LIQUIDITY_POOL_FEE_V18};
+use henyey_common::{Hash256, LedgerSeq, NetworkId, LIQUIDITY_POOL_FEE_V18};
 use henyey_crypto::account_id_to_strkey;
 use soroban_env_host_p25::fees::{
     compute_rent_write_fee_per_1kb, compute_transaction_resource_fee, FeeConfiguration,
@@ -546,7 +546,7 @@ pub(super) struct PreApplySnapshot {
 /// Context for executing transactions during ledger close.
 pub struct TransactionExecutor {
     /// Ledger sequence being processed.
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     /// Close time.
     close_time: u64,
     /// Base reserve.
@@ -598,10 +598,11 @@ impl TransactionExecutor {
         soroban_config: SorobanConfig,
         classic_events: ClassicEventConfig,
     ) -> Self {
-        let mut state = LedgerStateManager::new(context.base_reserve as i64, context.sequence);
+        let mut state =
+            LedgerStateManager::new(context.base_reserve as i64, context.sequence.into());
         state.set_id_pool(id_pool);
         Self {
-            ledger_seq: context.sequence,
+            ledger_seq: LedgerSeq::new(context.sequence),
             close_time: context.close_time,
             base_reserve: context.base_reserve,
             protocol_version: context.protocol_version,
@@ -718,7 +719,7 @@ impl TransactionExecutor {
     #[allow(clippy::too_many_arguments)]
     pub fn advance_to_ledger(
         &mut self,
-        ledger_seq: u32,
+        ledger_seq: LedgerSeq,
         close_time: u64,
         base_reserve: u32,
         protocol_version: u32,
@@ -2948,7 +2949,7 @@ fn pre_deduct_soroban_fees(
     phase: &crate::close::SorobanPhaseStructure,
     base_fee: u32,
     network_id: NetworkId,
-    ledger_seq: u32,
+    ledger_seq: LedgerSeq,
     delta: &mut LedgerDelta,
 ) -> Result<(Vec<PreChargedFee>, i64)> {
     let mut pre_charged: Vec<PreChargedFee> = Vec::new();
@@ -3493,14 +3494,14 @@ mod tests {
             }
             Ok(None)
         });
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), lookup_fn);
 
         let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
 
         // --- Build PriorStageState as if stage 0 deleted the entries ---
         // Simulate: stage 0 loaded the entries and a TX deleted them.
         // The delta after stage 0 contains the deletions.
-        let mut delta = LedgerDelta::new(101);
+        let mut delta = LedgerDelta::new(101.into());
         delta.record_delete(code_entry.clone()).unwrap();
         delta.record_delete(ttl_entry.clone()).unwrap();
 
@@ -3605,7 +3606,7 @@ mod tests {
             }
             Ok(None)
         });
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), lookup_fn);
 
         // Create executor
         let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
@@ -3684,7 +3685,7 @@ mod tests {
             }
             Ok(None)
         });
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), lookup_fn);
 
         let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
         let mut executor = TransactionExecutor::new(
@@ -3751,7 +3752,7 @@ mod tests {
                 Ok(None)
             }
         });
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(123), lookup_fn);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(123.into()), lookup_fn);
 
         let context = LedgerContext::new(200, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
         let mut executor = TransactionExecutor::new(
@@ -3825,7 +3826,7 @@ mod tests {
                 &LedgerKeyTtl {
                     key_hash: ttl_key_hash.clone(),
                 },
-                crate::soroban_state::TtlData::new(200, 100),
+                crate::soroban_state::TtlData::new(200.into(), 100.into()),
             )
             .unwrap();
             ims.create_contract_data(data_entry.clone()).unwrap();
@@ -3840,7 +3841,7 @@ mod tests {
             }
             Ok(None)
         });
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), lookup_fn);
 
         // --- Executor with soroban_state wired in ---
         let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
@@ -3924,7 +3925,7 @@ mod tests {
             }
             Ok(None)
         });
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), lookup_fn);
 
         let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
         let mut executor = TransactionExecutor::new(
@@ -4011,7 +4012,7 @@ mod tests {
             }
             Ok(None)
         });
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), lookup_fn);
 
         // No soroban_state set on executor
         let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
@@ -4089,7 +4090,7 @@ mod tests {
                 &LedgerKeyTtl {
                     key_hash: ttl_key_hash,
                 },
-                crate::soroban_state::TtlData::new(500, 90),
+                crate::soroban_state::TtlData::new(500.into(), 90.into()),
             )
             .unwrap();
             ims.create_contract_data(data_entry.clone()).unwrap();
@@ -4098,7 +4099,7 @@ mod tests {
         // Snapshot panics if anything is looked up — we must serve from IMS.
         let lookup_fn: crate::snapshot::EntryLookupFn =
             Arc::new(|_key: &LedgerKey| panic!("Bucket list must not be consulted in this test"));
-        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100), lookup_fn);
+        let snapshot = SnapshotHandle::with_lookup(LedgerSnapshot::empty(100.into()), lookup_fn);
 
         let context = LedgerContext::new(101, 1234567890, 100, 5_000_000, 25, NetworkId::testnet());
         let mut executor = TransactionExecutor::new(
@@ -4199,7 +4200,7 @@ mod tests {
         ];
 
         let entries_fn: EntriesLookupFn = Arc::new(move || Ok(offers.clone()));
-        let mut snap = SnapshotHandle::new(LedgerSnapshot::empty(1));
+        let mut snap = SnapshotHandle::new(LedgerSnapshot::empty(1.into()));
         snap.set_entries_lookup(entries_fn);
 
         let context = LedgerContext::new(100, 0, 100, 5_000_000, 25, NetworkId::testnet());

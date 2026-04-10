@@ -33,7 +33,7 @@ pub(crate) fn execute_bump_sequence(
     // Always refresh seq metadata (protocol 19+ behavior)
     crate::state::update_account_seq_info(
         &mut source_account,
-        context.sequence,
+        context.sequence.into(),
         context.close_time,
     );
 
@@ -77,7 +77,7 @@ mod tests {
 
     #[test]
     fn test_bump_sequence_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn test_bump_sequence_no_effect() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_bump_sequence_bad_seq() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -141,7 +141,7 @@ mod tests {
     /// C++ Reference: BumpSequenceTests.cpp - "bump to max" test section
     #[test]
     fn test_bump_sequence_to_max() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(1);
@@ -170,7 +170,7 @@ mod tests {
     /// C++ Reference: BumpSequenceTests.cpp - "bump same" test section
     #[test]
     fn test_bump_sequence_same() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(2);
@@ -202,7 +202,7 @@ mod tests {
     /// C++ Reference: BumpSequenceTests.cpp - "bump to zero" test section
     #[test]
     fn test_bump_sequence_to_zero() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(3);

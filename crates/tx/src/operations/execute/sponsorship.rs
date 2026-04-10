@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_begin_sponsoring_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn test_begin_sponsoring_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(0);
@@ -645,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_end_sponsoring_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(0);
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_end_sponsoring_not_sponsored() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let account_id = create_test_account_id(0);
@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_revoke_sponsorship_not_exists() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_revoke_sponsorship_removes_entry_sponsorship() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(1);
@@ -753,7 +753,7 @@ mod tests {
 
     #[test]
     fn test_revoke_sponsorship_not_sponsor() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let owner_id = create_test_account_id(1);
@@ -781,7 +781,7 @@ mod tests {
 
     #[test]
     fn test_revoke_sponsorship_transfer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let old_sponsor = create_test_account_id(1);
@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn test_revoke_sponsorship_claimable_balance_only_transferable() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(1);
@@ -858,7 +858,7 @@ mod tests {
 
     #[test]
     fn test_revoke_sponsorship_signer_removes_sponsorship() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(1);
@@ -891,7 +891,7 @@ mod tests {
 
     #[test]
     fn test_revoke_sponsorship_signer_transfer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let old_sponsor = create_test_account_id(1);
@@ -935,7 +935,7 @@ mod tests {
     /// C++ Reference: RevokeSponsorshipTests.cpp - "trustline revoke"
     #[test]
     fn test_revoke_sponsorship_trustline() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(10);
@@ -1015,7 +1015,7 @@ mod tests {
     /// C++ Reference: RevokeSponsorshipTests.cpp - "offer revoke"
     #[test]
     fn test_revoke_sponsorship_offer() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(20);
@@ -1086,7 +1086,7 @@ mod tests {
     /// C++ Reference: BeginSponsoringFutureReservesTests.cpp - "already sponsored"
     #[test]
     fn test_begin_sponsoring_already_sponsored() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor1_id = create_test_account_id(30);
@@ -1138,7 +1138,7 @@ mod tests {
     /// C++ Reference: BeginSponsoringFutureReservesTests.cpp - "recursive"
     #[test]
     fn test_begin_sponsoring_recursive_source_is_sponsored() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_a = create_test_account_id(50);
@@ -1181,7 +1181,7 @@ mod tests {
     /// Case 2: The target sponsored_id is already a sponsor in the current tx.
     #[test]
     fn test_begin_sponsoring_recursive_sponsored_is_sponsoring() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let a = create_test_account_id(53);
@@ -1222,7 +1222,7 @@ mod tests {
     /// that has no sponsor set.
     #[test]
     fn test_revoke_sponsorship_malformed_claimable_balance_no_sponsor() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(60);
@@ -1249,7 +1249,7 @@ mod tests {
     /// the account doesn't exist.
     #[test]
     fn test_revoke_sponsorship_signer_account_does_not_exist() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(61);
@@ -1274,7 +1274,7 @@ mod tests {
     /// the signer is not found on the account.
     #[test]
     fn test_revoke_sponsorship_signer_not_found() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(62);
@@ -1308,7 +1308,7 @@ mod tests {
     /// C++ Reference: RevokeSponsorshipTests.cpp - "low reserve"
     #[test]
     fn test_revoke_sponsorship_low_reserve() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(40);
@@ -1370,7 +1370,7 @@ mod tests {
     /// BeginSponsoring returns Recursive when the source account is already being sponsored.
     #[test]
     fn test_begin_sponsoring_recursive_source_already_sponsored() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let account_a = create_test_account_id(50);
@@ -1406,7 +1406,7 @@ mod tests {
     /// BeginSponsoring returns Recursive when the sponsored account is already sponsoring someone.
     #[test]
     fn test_begin_sponsoring_recursive_sponsored_already_sponsoring() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let account_a = create_test_account_id(53);
@@ -1443,7 +1443,7 @@ mod tests {
     /// and the owner has enough balance to cover the reserve.
     #[test]
     fn test_revoke_sponsorship_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(60);
@@ -1501,7 +1501,7 @@ mod tests {
     /// when there is no new sponsor to transfer to.
     #[test]
     fn test_revoke_sponsorship_only_transferable() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let sponsor_id = create_test_account_id(63);
@@ -1555,7 +1555,7 @@ mod tests {
     /// no entry sponsor set.
     #[test]
     fn test_revoke_sponsorship_malformed_cb_no_sponsor() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(65);
@@ -1604,7 +1604,7 @@ mod tests {
     #[test]
     fn test_revoke_sponsorship_transfer_too_many_sponsoring() {
         // Use base_reserve=1 so minimum balance at u32::MAX sponsoring is tractable.
-        let mut state = LedgerStateManager::new(1, 100);
+        let mut state = LedgerStateManager::new(1, 100.into());
         let context = create_test_context();
 
         let old_sponsor = create_test_account_id(180);
@@ -1659,7 +1659,7 @@ mod tests {
     #[test]
     fn test_revoke_sponsorship_establish_too_many_sponsoring() {
         // Use base_reserve=1 so minimum balance at u32::MAX sponsoring is tractable.
-        let mut state = LedgerStateManager::new(1, 100);
+        let mut state = LedgerStateManager::new(1, 100.into());
         let context = create_test_context();
 
         let new_sponsor = create_test_account_id(185);

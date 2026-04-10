@@ -185,7 +185,7 @@ pub(crate) fn execute_extend_footprint_ttl(
         }
 
         // Extend the TTL
-        state.extend_ttl(&key_hash, new_live_until);
+        state.extend_ttl(&key_hash, new_live_until.into());
     }
 
     Ok(make_result(ExtendFootprintTtlResultCode::Success))
@@ -225,7 +225,7 @@ mod tests {
     /// not rejected as Malformed. stellar-core does not check extend_to==0.
     #[test]
     fn test_extend_footprint_ttl_extend_to_zero_is_noop() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_extend_footprint_ttl_no_soroban_data() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -297,7 +297,7 @@ mod tests {
 
     #[test]
     fn test_extend_footprint_ttl_rejects_read_write() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_extend_footprint_ttl_rejects_non_ttl_entry() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -393,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_extend_footprint_ttl_rejects_large_extend_to() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -440,7 +440,7 @@ mod tests {
     /// C++ Reference: SorobanTest.cpp - "extend ttl empty footprint" test section
     #[test]
     fn test_extend_footprint_ttl_success_empty_footprint() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -492,7 +492,7 @@ mod tests {
     /// C++ Reference: SorobanTest.cpp - "extend ttl boundary" test section
     #[test]
     fn test_extend_footprint_ttl_at_max_boundary() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -546,7 +546,7 @@ mod tests {
     /// Testnet ledger 197881: ExtendFootprintTtl with archived entries must succeed.
     #[test]
     fn test_extend_footprint_ttl_skips_missing_contract_code() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -603,7 +603,7 @@ mod tests {
     /// missing entries are skipped with `continue`, not failed.
     #[test]
     fn test_extend_footprint_ttl_skips_missing_contract_data() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -664,7 +664,7 @@ mod tests {
     /// ResourceLimitExceeded where stellar-core returned Success.
     #[test]
     fn test_extend_footprint_ttl_skips_disk_read_bytes_on_protocol_23_plus() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         // Protocol 25 (mainnet current) — must skip disk_read_bytes check
         let context = LedgerContext {
             protocol_version: 25,
@@ -740,7 +740,7 @@ mod tests {
     /// This is the counterpart to the VE-17 regression test above.
     #[test]
     fn test_extend_footprint_ttl_enforces_disk_read_bytes_on_pre_v23() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         // Protocol 22 — must enforce disk_read_bytes check
         let context = LedgerContext {
             protocol_version: 22,
@@ -817,7 +817,7 @@ mod tests {
     /// `if (mResources.diskReadBytes < mMetrics.mLedgerReadByte)` has no > 0 guard.
     #[test]
     fn test_extend_footprint_ttl_zero_disk_read_bytes_rejects() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 
@@ -889,7 +889,7 @@ mod tests {
     /// limits must be rejected by extend_footprint_ttl.
     #[test]
     fn test_audit_053_extend_rejects_oversized_contract_data() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source = create_test_account_id(0);
 

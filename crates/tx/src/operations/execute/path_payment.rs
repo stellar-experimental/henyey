@@ -1200,7 +1200,7 @@ mod tests {
 
     #[test]
     fn test_path_payment_strict_receive_native() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1228,7 +1228,7 @@ mod tests {
 
     #[test]
     fn test_path_payment_strict_send_native() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1256,7 +1256,7 @@ mod tests {
 
     #[test]
     fn test_path_payment_no_destination() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -1284,7 +1284,7 @@ mod tests {
 
     #[test]
     fn test_path_payment_credit_src_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -1341,7 +1341,7 @@ mod tests {
 
     #[test]
     fn test_path_payment_credit_not_authorized_dest() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -1395,7 +1395,7 @@ mod tests {
 
     #[test]
     fn test_path_payment_credit_line_full_with_liabilities() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let issuer_id = create_test_account_id(9);
@@ -1453,7 +1453,7 @@ mod tests {
     /// C++ Reference: PathPaymentTests.cpp - "malformed negative amount" test section
     #[test]
     fn test_path_payment_malformed_negative_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(40);
@@ -1489,7 +1489,7 @@ mod tests {
     /// C++ Reference: PathPaymentStrictSendTests.cpp - "malformed negative amount" test section
     #[test]
     fn test_path_payment_strict_send_malformed_negative_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(42);
@@ -1525,7 +1525,7 @@ mod tests {
     /// C++ Reference: PathPaymentTests.cpp - "underfunded" test section
     #[test]
     fn test_path_payment_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(44);
@@ -1566,7 +1566,7 @@ mod tests {
     /// C++ Reference: PathPaymentTests.cpp - "src no trust" test section
     #[test]
     fn test_path_payment_src_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(46);
@@ -1619,7 +1619,7 @@ mod tests {
     /// C++ Reference: PathPaymentTests.cpp - "no trust dest" test section
     #[test]
     fn test_path_payment_no_trust_dest() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(49);
@@ -1672,7 +1672,7 @@ mod tests {
     /// C++ Reference: PathPaymentTests.cpp - "self native to native" test section
     #[test]
     fn test_path_payment_self_native() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(52);
@@ -1707,7 +1707,7 @@ mod tests {
     /// C++ Reference: PathPaymentTests.cpp - "send max zero" test section
     #[test]
     fn test_path_payment_send_max_zero() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(53);
@@ -1743,7 +1743,7 @@ mod tests {
     /// C++ Reference: PathPaymentTests.cpp - "dest amount zero" test section
     #[test]
     fn test_path_payment_dest_amount_zero() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(60);
@@ -1780,7 +1780,7 @@ mod tests {
     /// C++ Reference: PathPaymentStrictSendTests.cpp - "dest min zero" test section
     #[test]
     fn test_path_payment_strict_send_dest_min_zero() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(62);
@@ -1816,7 +1816,7 @@ mod tests {
     /// C++ Reference: PathPaymentTests.cpp - "negative dest amount" test section
     #[test]
     fn test_path_payment_negative_dest_amount() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(64);
@@ -1852,7 +1852,7 @@ mod tests {
     /// C++ Reference: PathPaymentTests.cpp - "line full" test section
     #[test]
     fn test_path_payment_line_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(70);
@@ -2036,7 +2036,7 @@ mod tests {
     /// max_offers_to_cross is 0 and there is still demand (fast-fail path).
     #[test]
     fn test_convert_with_offers_crossed_too_many_fast_fail() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
         let source_id = create_test_account_id(0);
 
@@ -2070,7 +2070,7 @@ mod tests {
     /// when conversion finds no matching offers.
     #[test]
     fn test_path_payment_strict_receive_too_few_offers() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(90);
@@ -2132,7 +2132,7 @@ mod tests {
     /// stellar-core: PathPaymentStrictReceiveOpFrame::doApply returns OFFER_CROSS_SELF
     #[test]
     fn test_path_payment_strict_receive_offer_cross_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(93);
@@ -2209,7 +2209,7 @@ mod tests {
     /// stellar-core: PathPaymentStrictReceiveOpFrame::doApply returns OVER_SENDMAX
     #[test]
     fn test_path_payment_strict_receive_over_sendmax() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(96);
@@ -2308,7 +2308,7 @@ mod tests {
     /// stellar-core: PathPaymentStrictSendOpFrame::doApply returns UNDER_DESTMIN
     #[test]
     fn test_path_payment_strict_send_under_destmin() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(100);
@@ -2416,7 +2416,7 @@ mod tests {
     /// as Malformed (embedded NUL byte in asset code).
     #[test]
     fn test_path_payment_strict_receive_malformed_invalid_send_asset() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2451,7 +2451,7 @@ mod tests {
     /// Regression test for #1115: Invalid asset code in path element should be rejected.
     #[test]
     fn test_path_payment_strict_receive_malformed_invalid_path_asset() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2486,7 +2486,7 @@ mod tests {
     /// Regression test for #1115: Invalid asset in strict send dest_asset.
     #[test]
     fn test_path_payment_strict_send_malformed_invalid_dest_asset() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2523,7 +2523,7 @@ mod tests {
     /// trustline for the send asset but it is not authorized.
     #[test]
     fn test_path_payment_strict_receive_src_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2583,7 +2583,7 @@ mod tests {
     /// PathPaymentStrictSend succeeds for a direct same-asset payment.
     #[test]
     fn test_path_payment_strict_send_success() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2614,7 +2614,7 @@ mod tests {
     /// PathPaymentStrictSend returns Underfunded when source doesn't have enough native balance.
     #[test]
     fn test_path_payment_strict_send_underfunded() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2650,7 +2650,7 @@ mod tests {
     /// PathPaymentStrictSend returns SrcNoTrust when source has no trustline for the send asset.
     #[test]
     fn test_path_payment_strict_send_src_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2699,7 +2699,7 @@ mod tests {
     /// PathPaymentStrictSend returns SrcNotAuthorized when source trustline is not authorized.
     #[test]
     fn test_path_payment_strict_send_src_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2755,7 +2755,7 @@ mod tests {
     /// PathPaymentStrictSend returns NoDestination when the dest account doesn't exist.
     #[test]
     fn test_path_payment_strict_send_no_destination() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2789,7 +2789,7 @@ mod tests {
     /// PathPaymentStrictSend returns NoTrust when dest has no trustline for credit asset.
     #[test]
     fn test_path_payment_strict_send_no_trust() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2838,7 +2838,7 @@ mod tests {
     /// PathPaymentStrictSend returns NotAuthorized when dest trustline is not authorized.
     #[test]
     fn test_path_payment_strict_send_not_authorized() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2894,7 +2894,7 @@ mod tests {
     /// PathPaymentStrictSend returns LineFull when dest trustline can't hold the amount.
     #[test]
     fn test_path_payment_strict_send_line_full() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -2950,7 +2950,7 @@ mod tests {
     /// TooFewOffers when no offers exist for a cross-asset strict send path.
     #[test]
     fn test_path_payment_strict_send_too_few_offers() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3008,7 +3008,7 @@ mod tests {
     /// the source's own offer in the DEX.
     #[test]
     fn test_path_payment_strict_send_offer_cross_self() {
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
         let context = create_test_context();
 
         let source_id = create_test_account_id(0);
@@ -3088,7 +3088,7 @@ mod tests {
         use sha2::Digest;
         use stellar_xdr::curr::LedgerHeaderFlags;
 
-        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let mut state = LedgerStateManager::new(5_000_000, 100.into());
 
         let source_id = create_test_account_id(0);
         let dest_id = create_test_account_id(1);
