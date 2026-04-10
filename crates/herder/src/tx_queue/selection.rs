@@ -205,6 +205,41 @@ impl TransactionQueue {
             })
         };
 
+        // Reconstruct the flat transactions list from the trimmed phases so that
+        // TransactionSet.transactions matches the generalized_tx_set contents.
+        // (AUDIT-085: previously passed the pre-trim `transactions` which could
+        // include txs removed by trim_invalid_two_phase.)
+        let trimmed_transactions = {
+            let mut all = Vec::new();
+            // Extract from classic phase
+            match &classic_phase {
+                TransactionPhase::V0(components) => {
+                    for comp in components.iter() {
+                        match comp {
+                            stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                c,
+                            ) => {
+                                all.extend(c.txs.iter().cloned());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            // Extract from soroban phase
+            match &soroban_phase {
+                TransactionPhase::V1(component) => {
+                    for stage in component.execution_stages.iter() {
+                        for cluster in stage.0.iter() {
+                            all.extend(cluster.0.iter().cloned());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            all
+        };
+
         let gen_tx_set = GeneralizedTransactionSet::V1(stellar_xdr::curr::TransactionSetV1 {
             previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
             phases: vec![classic_phase, soroban_phase]
@@ -222,7 +257,7 @@ impl TransactionQueue {
         let tx_set = TransactionSet::with_generalized(
             previous_ledger_hash,
             hash,
-            transactions,
+            trimmed_transactions,
             gen_tx_set.clone(),
         );
         (tx_set, gen_tx_set)
