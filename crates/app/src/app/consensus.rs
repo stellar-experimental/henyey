@@ -551,6 +551,15 @@ impl App {
             return;
         }
 
+        // Validate sanity before storing — matching stellar-core's
+        // PendingEnvelopes::recvSCPQuorumSet which calls
+        // isQuorumSetSane(q, false, errString) before accepting.
+        if let Err(reason) = henyey_scp::is_quorum_set_sane(&quorum_set, false) {
+            tracing::warn!(%hash, %reason, "Rejecting insane quorum set");
+            self.herder.clear_quorum_set_request(&hash);
+            return;
+        }
+
         if let Err(err) = self.db.store_scp_quorum_set(
             &hash,
             self.ledger_manager.current_ledger_seq(),
