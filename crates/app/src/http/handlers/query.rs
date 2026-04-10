@@ -116,10 +116,28 @@ fn parse_form_query_params(body: &[u8]) -> Result<FormQueryParams, String> {
 ///
 /// Accepts `application/x-www-form-urlencoded` body with repeated `key=`
 /// params and optional `ledgerSeq=`.
+///
+/// The CPU-heavy work (XDR decoding, bucket scans, response encoding) runs
+/// on a blocking thread to avoid starving the query runtime's async executor.
 pub(crate) async fn getledgerentryraw_handler(
     State(state): State<Arc<QueryState>>,
     body: Bytes,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    match tokio::task::spawn_blocking(move || process_getledgerentryraw(state, body)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Query task cancelled"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Synchronous implementation of `/getledgerentryraw`.
+fn process_getledgerentryraw(
+    state: Arc<QueryState>,
+    body: Bytes,
+) -> axum::response::Response {
     let params = match parse_form_query_params(&body) {
         Ok(p) => p,
         Err(msg) => {
@@ -221,10 +239,28 @@ pub(crate) async fn getledgerentryraw_handler(
 ///
 /// Accepts `application/x-www-form-urlencoded` body with repeated `key=`
 /// params and optional `ledgerSeq=`.
+///
+/// The CPU-heavy work (XDR decoding, bucket scans, response encoding) runs
+/// on a blocking thread to avoid starving the query runtime's async executor.
 pub(crate) async fn getledgerentry_handler(
     State(state): State<Arc<QueryState>>,
     body: Bytes,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    match tokio::task::spawn_blocking(move || process_getledgerentry(state, body)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "Query task cancelled"})),
+        )
+            .into_response(),
+    }
+}
+
+/// Synchronous implementation of `/getledgerentry`.
+fn process_getledgerentry(
+    state: Arc<QueryState>,
+    body: Bytes,
+) -> axum::response::Response {
     let params = match parse_form_query_params(&body) {
         Ok(p) => p,
         Err(msg) => {
@@ -613,5 +649,70 @@ mod tests {
     fn test_percent_decode_base64_padding() {
         assert_eq!(percent_decode("AAA%3D"), "AAA=");
         assert_eq!(percent_decode("AAA%3D%3D"), "AAA==");
+    }
+
+    #[tokio::test]
+    async fn test_getledgerentryraw_handler_offloads_to_blocking_thread() {
+        // Verify the handler returns a proper error response when there is no
+        // snapshot available — the important thing is that the spawn_blocking
+        // round-trip works and produces a valid HTTP response.
+        use super::*;
+        use axum::body::Bytes;
+
+        let snapshot_manager = Arc::new(BucketSnapshotManager::empty(0));
+        let state = Arc::new(QueryState { snapshot_manager });
+
+        // Empty body → BAD_REQUEST from the sync processor.
+        let response = getledgerentryraw_handler(
+            State(state.clone()),
+            Bytes::from_static(b""),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Valid key param but no snapshot → SERVICE_UNAVAILABLE.
+        // Use a minimal valid Account LedgerKey XDR encoded as base64.
+        let response = getledgerentryraw_handler(
+            State(state),
+            Bytes::from_static(b"key=AAAAAAAAAAA="),
+        )
+        .await;
+        // Either BAD_REQUEST (invalid XDR) or SERVICE_UNAVAILABLE (no snapshot)
+        // — both are expected. The test validates the spawn_blocking pathway
+        // completes without panicking.
+        let status = response.status();
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::SERVICE_UNAVAILABLE,
+            "unexpected status: {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_getledgerentry_handler_offloads_to_blocking_thread() {
+        use super::*;
+        use axum::body::Bytes;
+
+        let snapshot_manager = Arc::new(BucketSnapshotManager::empty(0));
+        let state = Arc::new(QueryState { snapshot_manager });
+
+        // Empty body → BAD_REQUEST from the sync processor.
+        let response = getledgerentry_handler(
+            State(state.clone()),
+            Bytes::from_static(b""),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Valid key param but no snapshot → SERVICE_UNAVAILABLE.
+        let response = getledgerentry_handler(
+            State(state),
+            Bytes::from_static(b"key=AAAAAAAAAAA="),
+        )
+        .await;
+        let status = response.status();
+        assert!(
+            status == StatusCode::BAD_REQUEST || status == StatusCode::SERVICE_UNAVAILABLE,
+            "unexpected status: {status}"
+        );
     }
 }

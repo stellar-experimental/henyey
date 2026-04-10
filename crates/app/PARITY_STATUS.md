@@ -128,6 +128,8 @@ Corresponds to: `QueryServer.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `QueryServer(...)` | `QueryServer::new()` | Full |
+| Dedicated threaded HTTP server (`httpThreaded`) | `spawn_query_server_on_dedicated_runtime()` | Full |
+| `threadPoolSize` worker threads | `query.thread_pool_size` → dedicated Tokio runtime workers | Full |
 | `getLedgerEntryRaw()` | `getledgerentryraw_handler()` | Full |
 | `getLedgerEntry()` | `getledgerentry_handler()` | Full |
 
