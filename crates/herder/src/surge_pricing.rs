@@ -283,6 +283,16 @@ pub enum VisitTxResult {
     Processed,
 }
 
+/// Result of `pop_top_txs`, containing the remaining lane resources and
+/// per-lane flags indicating whether any transaction exceeded the lane limit.
+#[allow(dead_code)]
+pub(crate) struct PopResult {
+    /// Remaining resource budget per lane after processing.
+    pub lane_left_until_limit: Vec<Resource>,
+    /// Per-lane flag: `true` if at least one transaction did not fit.
+    pub had_tx_not_fitting_lane: Vec<bool>,
+}
+
 /// Priority queue for surge pricing transaction selection.
 ///
 /// Manages transactions across multiple lanes, selecting highest-fee transactions
@@ -438,13 +448,9 @@ impl SurgePricingPriorityQueue {
         network_id: &henyey_common::NetworkId,
         ledger_version: u32,
         mut visitor: impl FnMut(&QueuedTransaction) -> VisitTxResult,
-        lane_left_until_limit: &mut Vec<Resource>,
-        had_tx_not_fitting_lane: &mut Vec<bool>,
-    ) {
-        let limits = self.lane_limits.clone();
-        *lane_left_until_limit = limits;
-        had_tx_not_fitting_lane.clear();
-        had_tx_not_fitting_lane.resize(self.lane_limits.len(), false);
+    ) -> PopResult {
+        let mut lane_left_until_limit = self.lane_limits.clone();
+        let mut had_tx_not_fitting_lane = vec![false; self.lane_limits.len()];
         let mut lane_active = vec![true; self.lane_limits.len()];
 
         loop {
@@ -504,6 +510,10 @@ impl SurgePricingPriorityQueue {
                 had_tx_not_fitting_lane[lane] = true;
             }
             self.erase(lane, &entry, ledger_version, network_id);
+        }
+        PopResult {
+            lane_left_until_limit,
+            had_tx_not_fitting_lane,
         }
     }
 

@@ -469,15 +469,9 @@ impl TxQueueLimiter {
         F: FnMut(&QueuedTransaction) -> VisitTxResult,
     {
         if let Some(ref mut flood) = self.txs_to_flood {
-            let mut had_not_fitting = vec![false; flood.get_num_lanes()];
-            flood.pop_top_txs(
-                false,
-                &self.network_id,
-                ledger_version,
-                |tx| visitor(tx),
-                lane_resources_left,
-                &mut had_not_fitting,
-            );
+            let result =
+                flood.pop_top_txs(false, &self.network_id, ledger_version, |tx| visitor(tx));
+            *lane_resources_left = result.lane_left_until_limit;
         }
     }
 }

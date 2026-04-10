@@ -89,14 +89,19 @@ pub fn compute_header_hash(header: &LedgerHeader) -> Result<Hash256> {
 ///
 /// # Arguments
 ///
-/// * `header` - The ledger header to update (modified in place)
+/// * `header` - The ledger header to compute skip values from
+///
+/// # Returns
+///
+/// The updated skip list array.
 ///
 /// # Note
 ///
 /// This must be called after setting the bucket_list_hash but before computing
 /// the header hash.
-pub fn calculate_skip_values(header: &mut LedgerHeader) {
+pub fn calculate_skip_values(header: &LedgerHeader) -> [stellar_xdr::curr::Hash; 4] {
     let seq = header.ledger_seq;
+    let mut skip_list = header.skip_list.clone();
 
     if seq % SKIP_1 == 0 {
         let v = seq.saturating_sub(SKIP_1) as i64;
@@ -108,14 +113,15 @@ pub fn calculate_skip_values(header: &mut LedgerHeader) {
                     .saturating_sub(SKIP_2)
                     .saturating_sub(SKIP_1) as i64;
                 if v3 > 0 && (v3 as u32) % SKIP_4 == 0 {
-                    header.skip_list[3] = header.skip_list[2].clone();
+                    skip_list[3] = skip_list[2].clone();
                 }
-                header.skip_list[2] = header.skip_list[1].clone();
+                skip_list[2] = skip_list[1].clone();
             }
-            header.skip_list[1] = header.skip_list[0].clone();
+            skip_list[1] = skip_list[0].clone();
         }
-        header.skip_list[0] = header.bucket_list_hash.clone();
+        skip_list[0] = header.bucket_list_hash.clone();
     }
+    skip_list
 }
 
 /// Calculate the target ledger sequence for a skip list entry.
@@ -296,7 +302,7 @@ pub fn create_next_header(
         ext: prev_header.ext.clone(),
     };
 
-    calculate_skip_values(&mut header);
+    header.skip_list = calculate_skip_values(&header);
 
     header
 }
@@ -379,18 +385,18 @@ mod tests {
     fn test_calculate_skip_values() {
         let mut header = create_test_header(5);
         header.bucket_list_hash = Hash([1u8; 32]);
-        calculate_skip_values(&mut header);
+        header.skip_list = calculate_skip_values(&header);
         assert_eq!(header.skip_list[0], Hash([0u8; 32]));
 
         let mut header = create_test_header(SKIP_1);
         header.bucket_list_hash = Hash([2u8; 32]);
-        calculate_skip_values(&mut header);
+        header.skip_list = calculate_skip_values(&header);
         assert_eq!(header.skip_list[0], Hash([2u8; 32]));
 
         let mut header = create_test_header(SKIP_2 + SKIP_1);
         header.skip_list[0] = Hash([3u8; 32]);
         header.bucket_list_hash = Hash([4u8; 32]);
-        calculate_skip_values(&mut header);
+        header.skip_list = calculate_skip_values(&header);
         assert_eq!(header.skip_list[0], Hash([4u8; 32]));
         assert_eq!(header.skip_list[1], Hash([3u8; 32]));
     }
