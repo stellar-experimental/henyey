@@ -99,7 +99,6 @@ mod disk_bucket;
 mod entry;
 mod error;
 mod eviction;
-mod eviction_scan;
 mod future_bucket;
 mod hot_archive;
 mod index;
