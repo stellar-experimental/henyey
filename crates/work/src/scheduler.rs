@@ -344,12 +344,11 @@ impl WorkScheduler {
             return false;
         }
 
-        let Some(attempts) = self.entries.get_mut(&id).map(|entry| {
-            entry.cancel_token.cancel();
-            entry.attempts
-        }) else {
+        let Some(entry) = self.entries.get_mut(&id) else {
             return false;
         };
+        entry.cancel_token.cancel();
+        let attempts = entry.attempts;
         self.finish_terminal_state(id, WorkState::Cancelled, attempts);
         true
     }
