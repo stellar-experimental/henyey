@@ -2240,9 +2240,6 @@ async fn cmd_verify_history(
     from: Option<u32>,
     to: Option<u32>,
 ) -> anyhow::Result<()> {
-    use henyey_history::verify;
-    use henyey_ledger::TransactionSetVariant;
-
     println!("Verifying history archives...");
     println!();
 
@@ -2261,154 +2258,17 @@ async fn cmd_verify_history(
     println!("Verifying ledger range: {} to {}", start, end);
     println!();
 
-    // Verify in checkpoint intervals (64 ledgers)
     let mut verified_count = 0;
     let mut error_count = 0;
 
-    // Calculate checkpoint-aligned start
     let start_checkpoint = henyey_history::checkpoint::checkpoint_containing(start);
     let end_checkpoint = henyey_history::checkpoint::checkpoint_containing(end);
 
     let mut checkpoint = start_checkpoint;
     while checkpoint <= end_checkpoint {
-        // Get checkpoint HAS (History Archive State)
-        match archive.fetch_checkpoint_has(checkpoint).await {
-            Ok(has) => {
-                // Verify the HAS structure
-                match verify::verify_has_structure(&has) {
-                    Ok(()) => {
-                        // Verify checkpoint matches
-                        match verify::verify_has_checkpoint(&has, checkpoint) {
-                            Ok(()) => {
-                                println!("  Checkpoint {}: OK", checkpoint);
-                                verified_count += 1;
-                            }
-                            Err(e) => {
-                                println!("  Checkpoint {}: FAIL - {}", checkpoint, e);
-                                error_count += 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!(
-                            "  Checkpoint {}: FAIL (invalid structure) - {}",
-                            checkpoint, e
-                        );
-                        error_count += 1;
-                    }
-                }
-
-                // Get and verify ledger headers for this checkpoint range
-                match archive.fetch_ledger_headers(checkpoint).await {
-                    Ok(history_entries) => {
-                        // Extract LedgerHeader from LedgerHeaderHistoryEntry
-                        let headers: Vec<stellar_xdr::curr::LedgerHeader> = history_entries
-                            .iter()
-                            .map(|entry| entry.header.clone())
-                            .collect();
-                        if let Err(e) = verify::verify_header_chain(&headers) {
-                            println!("    Header chain verification FAILED: {}", e);
-                            error_count += 1;
-                        }
-
-                        match archive.fetch_transactions(checkpoint).await {
-                            Ok(tx_entries) => match archive.fetch_results(checkpoint).await {
-                                Ok(tx_results) => {
-                                    let tx_map = tx_entries
-                                        .iter()
-                                        .map(|entry| (entry.ledger_seq, entry))
-                                        .collect::<std::collections::HashMap<_, _>>();
-                                    let result_map = tx_results
-                                        .iter()
-                                        .map(|entry| (entry.ledger_seq, entry))
-                                        .collect::<std::collections::HashMap<_, _>>();
-
-                                    for header in &headers {
-                                        let Some(tx_entry) = tx_map.get(&header.ledger_seq) else {
-                                            println!(
-                                                    "    Missing transaction history entry for ledger {}",
-                                                    header.ledger_seq
-                                                );
-                                            error_count += 1;
-                                            continue;
-                                        };
-                                        let Some(result_entry) = result_map.get(&header.ledger_seq)
-                                        else {
-                                            println!(
-                                                    "    Missing transaction result entry for ledger {}",
-                                                    header.ledger_seq
-                                                );
-                                            error_count += 1;
-                                            continue;
-                                        };
-
-                                        let tx_set = TransactionSetVariant::from(*tx_entry);
-                                        if let Err(e) = verify::verify_tx_set(header, &tx_set) {
-                                            println!(
-                                                    "    Tx set hash verification FAILED (ledger {}): {}",
-                                                    header.ledger_seq, e
-                                                );
-                                            error_count += 1;
-                                        }
-
-                                        let result_xdr = result_entry
-                                            .tx_result_set
-                                            .to_xdr(stellar_xdr::curr::Limits::none());
-                                        match result_xdr {
-                                            Ok(bytes) => {
-                                                if let Err(e) =
-                                                    verify::verify_tx_result_set(header, &bytes)
-                                                {
-                                                    println!(
-                                                            "    Tx result hash verification FAILED (ledger {}): {}",
-                                                            header.ledger_seq, e
-                                                        );
-                                                    error_count += 1;
-                                                }
-                                            }
-                                            Err(e) => {
-                                                println!(
-                                                        "    Failed to encode tx result set for ledger {}: {}",
-                                                        header.ledger_seq, e
-                                                    );
-                                                error_count += 1;
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    println!("    Warning: Could not verify tx results: {}", e);
-                                }
-                            },
-                            Err(e) => {
-                                println!("    Warning: Could not verify transactions: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        println!("    Warning: Could not verify headers: {}", e);
-                    }
-                }
-
-                match archive.fetch_scp_history(checkpoint).await {
-                    Ok(entries) => {
-                        if let Err(e) = verify::verify_scp_history_entries(&entries) {
-                            println!("    SCP history verification FAILED: {}", e);
-                            error_count += 1;
-                        }
-                    }
-                    Err(e) => {
-                        println!("    Warning: Could not verify SCP history: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                println!("  Checkpoint {}: ERROR - {}", checkpoint, e);
-                error_count += 1;
-            }
-        }
-
-        // Move to next checkpoint
+        let (verified, errors) = verify_single_checkpoint(archive, checkpoint).await;
+        verified_count += verified;
+        error_count += errors;
         checkpoint = henyey_history::checkpoint::next_checkpoint(checkpoint);
     }
 
@@ -2422,6 +2282,167 @@ async fn cmd_verify_history(
     }
 
     Ok(())
+}
+
+/// Verify a single checkpoint against its history archive.
+///
+/// Returns (verified, errors) counts for this checkpoint.
+async fn verify_single_checkpoint(
+    archive: &henyey_history::HistoryArchive,
+    checkpoint: u32,
+) -> (u32, u32) {
+    use henyey_history::verify;
+    use henyey_ledger::TransactionSetVariant;
+
+    let mut verified = 0u32;
+    let mut errors = 0u32;
+
+    // Fetch and verify HAS
+    let has = match archive.fetch_checkpoint_has(checkpoint).await {
+        Ok(has) => has,
+        Err(e) => {
+            println!("  Checkpoint {}: ERROR - {}", checkpoint, e);
+            return (0, 1);
+        }
+    };
+
+    if let Err(e) = verify::verify_has_structure(&has) {
+        println!(
+            "  Checkpoint {}: FAIL (invalid structure) - {}",
+            checkpoint, e
+        );
+        return (0, 1);
+    }
+
+    if let Err(e) = verify::verify_has_checkpoint(&has, checkpoint) {
+        println!("  Checkpoint {}: FAIL - {}", checkpoint, e);
+        return (0, 1);
+    }
+
+    println!("  Checkpoint {}: OK", checkpoint);
+    verified += 1;
+
+    // Verify ledger headers
+    let headers = match archive.fetch_ledger_headers(checkpoint).await {
+        Ok(history_entries) => history_entries
+            .iter()
+            .map(|entry| entry.header.clone())
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            println!("    Warning: Could not verify headers: {}", e);
+            return (verified, errors);
+        }
+    };
+
+    if let Err(e) = verify::verify_header_chain(&headers) {
+        println!("    Header chain verification FAILED: {}", e);
+        errors += 1;
+    }
+
+    // Verify transactions and results
+    let tx_entries = match archive.fetch_transactions(checkpoint).await {
+        Ok(entries) => entries,
+        Err(e) => {
+            println!("    Warning: Could not verify transactions: {}", e);
+            // Still verify SCP history below
+            verify_scp_checkpoint(archive, checkpoint, &mut errors).await;
+            return (verified, errors);
+        }
+    };
+
+    let tx_results = match archive.fetch_results(checkpoint).await {
+        Ok(results) => results,
+        Err(e) => {
+            println!("    Warning: Could not verify tx results: {}", e);
+            verify_scp_checkpoint(archive, checkpoint, &mut errors).await;
+            return (verified, errors);
+        }
+    };
+
+    let tx_map = tx_entries
+        .iter()
+        .map(|entry| (entry.ledger_seq, entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let result_map = tx_results
+        .iter()
+        .map(|entry| (entry.ledger_seq, entry))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    for header in &headers {
+        let Some(tx_entry) = tx_map.get(&header.ledger_seq) else {
+            println!(
+                "    Missing transaction history entry for ledger {}",
+                header.ledger_seq
+            );
+            errors += 1;
+            continue;
+        };
+        let Some(result_entry) = result_map.get(&header.ledger_seq) else {
+            println!(
+                "    Missing transaction result entry for ledger {}",
+                header.ledger_seq
+            );
+            errors += 1;
+            continue;
+        };
+
+        let tx_set = TransactionSetVariant::from(*tx_entry);
+        if let Err(e) = verify::verify_tx_set(header, &tx_set) {
+            println!(
+                "    Tx set hash verification FAILED (ledger {}): {}",
+                header.ledger_seq, e
+            );
+            errors += 1;
+        }
+
+        match result_entry
+            .tx_result_set
+            .to_xdr(stellar_xdr::curr::Limits::none())
+        {
+            Ok(bytes) => {
+                if let Err(e) = verify::verify_tx_result_set(header, &bytes) {
+                    println!(
+                        "    Tx result hash verification FAILED (ledger {}): {}",
+                        header.ledger_seq, e
+                    );
+                    errors += 1;
+                }
+            }
+            Err(e) => {
+                println!(
+                    "    Failed to encode tx result set for ledger {}: {}",
+                    header.ledger_seq, e
+                );
+                errors += 1;
+            }
+        }
+    }
+
+    // Verify SCP history
+    verify_scp_checkpoint(archive, checkpoint, &mut errors).await;
+
+    (verified, errors)
+}
+
+/// Verify SCP history entries for a checkpoint.
+async fn verify_scp_checkpoint(
+    archive: &henyey_history::HistoryArchive,
+    checkpoint: u32,
+    errors: &mut u32,
+) {
+    use henyey_history::verify;
+
+    match archive.fetch_scp_history(checkpoint).await {
+        Ok(entries) => {
+            if let Err(e) = verify::verify_scp_history_entries(&entries) {
+                println!("    SCP history verification FAILED: {}", e);
+                *errors += 1;
+            }
+        }
+        Err(e) => {
+            println!("    Warning: Could not verify SCP history: {}", e);
+        }
+    }
 }
 
 /// Downloads buckets in parallel from a history archive.
