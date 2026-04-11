@@ -337,10 +337,8 @@ fn merge_with_shadows_impl(
     let mut new_iter = new_bucket.iter()?;
 
     // Extract metadata from the first entries of each bucket.
-    let mut old_meta: Option<BucketMetadata> = None;
-    let mut new_meta: Option<BucketMetadata> = None;
-    let old_first = advance_skip_metadata(&mut old_iter, &mut old_meta)?;
-    let new_first = advance_skip_metadata(&mut new_iter, &mut new_meta)?;
+    let (old_meta, old_first) = advance_skip_metadata(&mut old_iter)?;
+    let (new_meta, new_first) = advance_skip_metadata(&mut new_iter)?;
 
     tracing::trace!(
         old_hash = %old_bucket.hash(),
@@ -439,10 +437,8 @@ pub fn merge_buckets_to_file(
     let mut old_iter = old_bucket.iter()?;
     let mut new_iter = new_bucket.iter()?;
 
-    let mut old_meta: Option<BucketMetadata> = None;
-    let mut new_meta: Option<BucketMetadata> = None;
-    let old_first = advance_skip_metadata(&mut old_iter, &mut old_meta)?;
-    let new_first = advance_skip_metadata(&mut new_iter, &mut new_meta)?;
+    let (old_meta, old_first) = advance_skip_metadata(&mut old_iter)?;
+    let (new_meta, new_first) = advance_skip_metadata(&mut new_iter)?;
 
     let (_, output_meta) = build_output_metadata(
         old_meta.as_ref(),
@@ -513,19 +509,21 @@ pub fn merge_buckets_to_file(
 }
 
 /// Advance a `BucketIter`, skipping metadata entries and extracting metadata.
+///
+/// Returns the extracted metadata (if any) and the first non-metadata entry.
 fn advance_skip_metadata(
     iter: &mut BucketIter<'_>,
-    meta_out: &mut Option<BucketMetadata>,
-) -> Result<Option<BucketEntry>> {
+) -> Result<(Option<BucketMetadata>, Option<BucketEntry>)> {
+    let mut meta = None;
     for entry_result in iter.by_ref() {
         let entry = entry_result?;
         if let BucketEntry::Metaentry(m) = &entry {
-            *meta_out = Some(m.clone());
+            meta = Some(m.clone());
             continue;
         }
-        return Ok(Some(entry));
+        return Ok((meta, Some(entry)));
     }
-    Ok(None)
+    Ok((meta, None))
 }
 
 /// Merge two buckets using in-memory entries (level 0 optimization).
