@@ -501,19 +501,15 @@ impl WorkScheduler {
             return false;
         }
 
-        let Some(attempts) = self.entries.get_mut(&id).map(|entry| entry.attempts) else {
+        let Some(entry) = self.entries.get_mut(&id) else {
             return false;
         };
-        if self
-            .entries
-            .get(&id)
-            .is_some_and(|entry| entry.cancel_token.is_cancelled())
-        {
+
+        if entry.cancel_token.is_cancelled() {
+            let attempts = entry.attempts;
             self.finish_terminal_state(id, WorkState::Cancelled, attempts);
             return false;
         }
-
-        let entry = self.entries.get_mut(&id).expect("entry must exist");
 
         entry.attempts += 1;
         let attempt = entry.attempts;
@@ -524,6 +520,7 @@ impl WorkScheduler {
         let name = entry.name.clone();
         let completion_tx = tx.clone();
         let cancel_token = entry.cancel_token.clone();
+
         self.transition_state(id, WorkState::Running, attempt);
 
         tokio::spawn(async move {
