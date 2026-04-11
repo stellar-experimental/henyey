@@ -23,34 +23,10 @@ impl BallotProtocol {
         match (&old.pledges, &new.pledges) {
             (ScpStatementPledges::Externalize(_), ScpStatementPledges::Externalize(_)) => false,
             (ScpStatementPledges::Confirm(old_c), ScpStatementPledges::Confirm(new_c)) => {
-                match ballot_compare(&old_c.ballot, &new_c.ballot) {
-                    Ordering::Less => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal => {
-                        if old_c.n_prepared == new_c.n_prepared {
-                            old_c.n_h < new_c.n_h
-                        } else {
-                            old_c.n_prepared < new_c.n_prepared
-                        }
-                    }
-                }
+                crate::compare::is_newer_confirm(old_c, new_c)
             }
             (ScpStatementPledges::Prepare(old_p), ScpStatementPledges::Prepare(new_p)) => {
-                match ballot_compare(&old_p.ballot, &new_p.ballot) {
-                    Ordering::Less => return true,
-                    Ordering::Greater => return false,
-                    Ordering::Equal => {}
-                }
-                match cmp_opt_ballot(&old_p.prepared, &new_p.prepared) {
-                    Ordering::Less => return true,
-                    Ordering::Greater => return false,
-                    Ordering::Equal => {}
-                }
-                match cmp_opt_ballot(&old_p.prepared_prime, &new_p.prepared_prime) {
-                    Ordering::Less => true,
-                    Ordering::Greater => false,
-                    Ordering::Equal => old_p.n_h < new_p.n_h,
-                }
+                crate::compare::is_newer_prepare(old_p, new_p)
             }
             _ => false,
         }

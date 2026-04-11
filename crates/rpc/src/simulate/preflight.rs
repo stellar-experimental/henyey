@@ -137,6 +137,73 @@ fn extract_modified_entries(
 // ExtendFootprintTtl simulation
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Shared helpers for TTL simulation
+// ---------------------------------------------------------------------------
+
+/// Resolved entry info shared by extend-TTL and restore simulations.
+struct ResolvedEntry {
+    durability: soroban_host::xdr::ContractDataDurability,
+    current_live_until: u32,
+    is_code_entry: bool,
+    entry_xdr_size: u32,
+    entry_rent_size: u32,
+}
+
+/// Look up a key in the snapshot, convert to P25 XDR, and compute its rent
+/// size. Returns `Ok(None)` when the entry doesn't exist in the snapshot.
+fn resolve_entry(
+    key: &LedgerKey,
+    snapshot: &BucketListSnapshotSource,
+    budget: &soroban_host::budget::Budget,
+) -> Result<Option<ResolvedEntry>, String> {
+    use soroban_host::e2e_invoke::entry_size_for_rent;
+    use soroban_host::ledger_info::get_key_durability;
+
+    let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25(key)
+        .ok_or_else(|| "failed to convert LedgerKey to P25 XDR".to_string())?;
+
+    let durability = get_key_durability(&p25_key).ok_or_else(|| {
+        format!(
+            "cannot operate on key {:?}: only contract data/code entries have TTL",
+            key.discriminant()
+        )
+    })?;
+
+    let Some((entry, live_until)) = snapshot.get_unfiltered(key) else {
+        return Ok(None);
+    };
+
+    let current_live_until = live_until.ok_or_else(|| {
+        format!(
+            "missing TTL for key that must have TTL: {:?}",
+            key.discriminant()
+        )
+    })?;
+
+    let entry_xdr_size = entry
+        .to_xdr(Limits::none())
+        .map(|b| b.len() as u32)
+        .unwrap_or(0);
+
+    let p25_entry: soroban_host::xdr::LedgerEntry = super::convert::ws_to_p25(&entry)
+        .ok_or_else(|| "failed to convert LedgerEntry to P25 XDR".to_string())?;
+    let entry_rent_size = entry_size_for_rent(budget, &p25_entry, entry_xdr_size)
+        .map_err(|e| format!("entry_size_for_rent failed: {e:?}"))?;
+
+    Ok(Some(ResolvedEntry {
+        durability,
+        current_live_until,
+        is_code_entry: matches!(key.discriminant(), LedgerEntryType::ContractCode),
+        entry_xdr_size,
+        entry_rent_size,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// ExtendFootprintTtl simulation
+// ---------------------------------------------------------------------------
+
 /// Simulate an `ExtendFootprintTtlOp`.
 ///
 /// For each key in the footprint, look up the current entry and TTL. Skip entries
@@ -151,9 +218,7 @@ pub(super) fn simulate_extend_ttl_op(
     extend_to: u32,
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
 ) -> Result<SorobanTransactionData, String> {
-    use soroban_host::e2e_invoke::entry_size_for_rent;
     use soroban_host::fees::LedgerEntryRentChange;
-    use soroban_host::ledger_info::get_key_durability;
 
     let budget = soroban_host::budget::Budget::default();
     let new_live_until = ledger_info.sequence_number.saturating_add(extend_to);
@@ -162,61 +227,33 @@ pub(super) fn simulate_extend_ttl_op(
     let mut extended_keys = Vec::with_capacity(keys.len());
 
     for key in keys {
-        // Convert workspace LedgerKey to P25 for get_key_durability
-        let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25(key)
-            .ok_or_else(|| "failed to convert LedgerKey to P25 XDR".to_string())?;
-
-        let durability = get_key_durability(&p25_key).ok_or_else(|| {
-            format!(
-                "cannot extend TTL for key {:?}: only contract data/code entries have TTL",
-                key.discriminant()
-            )
-        })?;
-
-        let Some((entry, live_until)) = snapshot.get_unfiltered(key) else {
+        let Some(resolved) = resolve_entry(key, snapshot, &budget)? else {
             continue; // entry doesn't exist, skip
         };
 
-        let current_live_until = live_until.ok_or_else(|| {
-            format!(
-                "missing TTL for key that must have TTL: {:?}",
-                key.discriminant()
-            )
-        })?;
-
         // Skip entries that don't need extension
-        if new_live_until <= current_live_until {
+        if new_live_until <= resolved.current_live_until {
             continue;
         }
 
         // Expired entries cannot be extended (must be restored first)
-        if current_live_until < ledger_info.sequence_number {
+        if resolved.current_live_until < ledger_info.sequence_number {
             return Err(format!(
-                "cannot extend TTL for expired entry (live_until={current_live_until}, \
+                "cannot extend TTL for expired entry (live_until={}, \
                  current_ledger={}). Restore the entry first.",
-                ledger_info.sequence_number
+                resolved.current_live_until, ledger_info.sequence_number
             ));
         }
 
         extended_keys.push(key.clone());
 
-        let entry_xdr_size = entry
-            .to_xdr(Limits::none())
-            .map(|b| b.len() as u32)
-            .unwrap_or(0);
-
-        // Convert workspace LedgerEntry to P25 for entry_size_for_rent
-        let p25_entry: soroban_host::xdr::LedgerEntry = super::convert::ws_to_p25(&entry)
-            .ok_or_else(|| "failed to convert LedgerEntry to P25 XDR".to_string())?;
-        let entry_size = entry_size_for_rent(&budget, &p25_entry, entry_xdr_size)
-            .map_err(|e| format!("entry_size_for_rent failed: {e:?}"))?;
-
         rent_changes.push(LedgerEntryRentChange {
-            is_persistent: durability == soroban_host::xdr::ContractDataDurability::Persistent,
-            is_code_entry: matches!(key.discriminant(), LedgerEntryType::ContractCode),
-            old_size_bytes: entry_size,
-            new_size_bytes: entry_size,
-            old_live_until_ledger: current_live_until,
+            is_persistent: resolved.durability
+                == soroban_host::xdr::ContractDataDurability::Persistent,
+            is_code_entry: resolved.is_code_entry,
+            old_size_bytes: resolved.entry_rent_size,
+            new_size_bytes: resolved.entry_rent_size,
+            old_live_until_ledger: resolved.current_live_until,
             new_live_until_ledger: new_live_until,
         });
     }
@@ -274,9 +311,7 @@ pub(super) fn simulate_restore_op(
     keys: &[LedgerKey],
     soroban_info: &henyey_ledger::SorobanNetworkInfo,
 ) -> Result<SorobanTransactionData, String> {
-    use soroban_host::e2e_invoke::entry_size_for_rent;
     use soroban_host::fees::LedgerEntryRentChange;
-    use soroban_host::ledger_info::get_key_durability;
 
     let budget = soroban_host::budget::Budget::default();
     let restored_live_until = ledger_info
@@ -288,54 +323,29 @@ pub(super) fn simulate_restore_op(
     let mut restored_bytes = 0u32;
 
     for key in keys {
-        // Convert workspace LedgerKey to P25 for get_key_durability
-        let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25(key)
-            .ok_or_else(|| "failed to convert LedgerKey to P25 XDR".to_string())?;
+        let resolved = resolve_entry(key, snapshot, &budget)?
+            .ok_or_else(|| format!("missing entry to restore for key {:?}", key.discriminant()))?;
 
-        let durability = get_key_durability(&p25_key);
-        if durability != Some(soroban_host::xdr::ContractDataDurability::Persistent) {
+        if resolved.durability != soroban_host::xdr::ContractDataDurability::Persistent {
             return Err(format!(
                 "cannot restore key {:?}: only persistent entries can be restored",
                 key.discriminant()
             ));
         }
 
-        let (entry, live_until) = snapshot
-            .get_unfiltered(key)
-            .ok_or_else(|| format!("missing entry to restore for key {:?}", key.discriminant()))?;
-
-        let current_live_until = live_until.ok_or_else(|| {
-            format!(
-                "missing TTL for key that must have TTL: {:?}",
-                key.discriminant()
-            )
-        })?;
-
         // Skip entries that are still live (not expired)
-        if current_live_until >= ledger_info.sequence_number {
+        if resolved.current_live_until >= ledger_info.sequence_number {
             continue;
         }
 
         restored_keys.push(key.clone());
-
-        let entry_xdr_size = entry
-            .to_xdr(Limits::none())
-            .map(|b| b.len() as u32)
-            .unwrap_or(0);
-
-        // Convert workspace LedgerEntry to P25 for entry_size_for_rent
-        let p25_entry: soroban_host::xdr::LedgerEntry = super::convert::ws_to_p25(&entry)
-            .ok_or_else(|| "failed to convert LedgerEntry to P25 XDR".to_string())?;
-        let entry_rent_size = entry_size_for_rent(&budget, &p25_entry, entry_xdr_size)
-            .map_err(|e| format!("entry_size_for_rent failed: {e:?}"))?;
-
-        restored_bytes = restored_bytes.saturating_add(entry_xdr_size);
+        restored_bytes = restored_bytes.saturating_add(resolved.entry_xdr_size);
 
         rent_changes.push(LedgerEntryRentChange {
             is_persistent: true,
-            is_code_entry: matches!(key.discriminant(), LedgerEntryType::ContractCode),
+            is_code_entry: resolved.is_code_entry,
             old_size_bytes: 0,
-            new_size_bytes: entry_rent_size,
+            new_size_bytes: resolved.entry_rent_size,
             old_live_until_ledger: 0,
             new_live_until_ledger: restored_live_until,
         });

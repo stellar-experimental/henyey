@@ -57,7 +57,7 @@ fn is_newer_nominate(old: &ScpNomination, new: &ScpNomination) -> bool {
     new_votes.len() > old_votes.len() || new_accepted.len() > old_accepted.len()
 }
 
-fn is_newer_prepare(old: &ScpStatementPrepare, new: &ScpStatementPrepare) -> bool {
+pub(crate) fn is_newer_prepare(old: &ScpStatementPrepare, new: &ScpStatementPrepare) -> bool {
     // Parity: stellar-core BallotProtocol.cpp:104 uses compareBallots which
     // compares counter then value. Must use ballot_compare, not just counter.
     match ballot_compare(&old.ballot, &new.ballot) {
@@ -77,7 +77,7 @@ fn is_newer_prepare(old: &ScpStatementPrepare, new: &ScpStatementPrepare) -> boo
     }
 }
 
-fn is_newer_confirm(old: &ScpStatementConfirm, new: &ScpStatementConfirm) -> bool {
+pub(crate) fn is_newer_confirm(old: &ScpStatementConfirm, new: &ScpStatementConfirm) -> bool {
     // Parity: stellar-core BallotProtocol.cpp:80 uses compareBallots which
     // compares counter then value. Must use ballot_compare, not just counter.
     match ballot_compare(&old.ballot, &new.ballot) {
