@@ -28,15 +28,9 @@ pub const LIQUIDITY_POOL_FEE_V18: i32 = 30;
 // ASCII Utilities
 // ============================================================================
 
-/// Check if a character is a printable ASCII non-control character.
-///
-/// Returns true for characters in the range 0x20-0x7E (space through tilde).
-#[inline]
-pub(crate) fn is_ascii_non_control(c: char) -> bool {
-    matches!(c, ' '..='~')
-}
-
 /// Check if a string contains only valid ASCII non-control characters.
+///
+/// Returns true if all characters are in the range 0x20-0x7E (space through tilde).
 ///
 /// This is used to validate strings in Stellar data entries and other
 /// user-provided text fields.
@@ -52,7 +46,7 @@ pub(crate) fn is_ascii_non_control(c: char) -> bool {
 /// assert!(!is_string_valid("hello\x00")); // Null is control char
 /// ```
 pub fn is_string_valid(s: &str) -> bool {
-    s.chars().all(is_ascii_non_control)
+    s.chars().all(|c| c.is_ascii() && !c.is_ascii_control())
 }
 
 // ============================================================================
@@ -458,16 +452,6 @@ mod tests {
             asset_code: AssetCode12(code_bytes),
             issuer: make_account_id(issuer),
         })
-    }
-
-    #[test]
-    fn test_is_ascii_non_control() {
-        assert!(is_ascii_non_control(' '));
-        assert!(is_ascii_non_control('~'));
-        assert!(is_ascii_non_control('A'));
-        assert!(!is_ascii_non_control('\n'));
-        assert!(!is_ascii_non_control('\0'));
-        assert!(!is_ascii_non_control('\x7f'));
     }
 
     #[test]

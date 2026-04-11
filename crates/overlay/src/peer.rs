@@ -317,7 +317,6 @@ impl Peer {
         Ok(peer)
     }
 
-    /// Perform the authentication handshake.
     /// Perform the authenticated handshake with a peer.
     ///
     /// OVERLAY_SPEC §4.2: The handshake ordering depends on direction:
@@ -722,40 +721,44 @@ impl Peer {
         Arc::clone(&self.stats)
     }
 
-    pub fn record_flood_stats(&self, unique: bool, bytes: u64) {
+    fn record_message_stats(
+        &self,
+        unique: bool,
+        bytes: u64,
+        unique_msgs: &AtomicU64,
+        unique_bytes: &AtomicU64,
+        dup_msgs: &AtomicU64,
+        dup_bytes: &AtomicU64,
+    ) {
         if unique {
-            self.stats
-                .unique_flood_messages_recv
-                .fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .unique_flood_bytes_recv
-                .fetch_add(bytes, Ordering::Relaxed);
+            unique_msgs.fetch_add(1, Ordering::Relaxed);
+            unique_bytes.fetch_add(bytes, Ordering::Relaxed);
         } else {
-            self.stats
-                .duplicate_flood_messages_recv
-                .fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .duplicate_flood_bytes_recv
-                .fetch_add(bytes, Ordering::Relaxed);
+            dup_msgs.fetch_add(1, Ordering::Relaxed);
+            dup_bytes.fetch_add(bytes, Ordering::Relaxed);
         }
     }
 
+    pub fn record_flood_stats(&self, unique: bool, bytes: u64) {
+        self.record_message_stats(
+            unique,
+            bytes,
+            &self.stats.unique_flood_messages_recv,
+            &self.stats.unique_flood_bytes_recv,
+            &self.stats.duplicate_flood_messages_recv,
+            &self.stats.duplicate_flood_bytes_recv,
+        );
+    }
+
     pub fn record_fetch_stats(&self, unique: bool, bytes: u64) {
-        if unique {
-            self.stats
-                .unique_fetch_messages_recv
-                .fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .unique_fetch_bytes_recv
-                .fetch_add(bytes, Ordering::Relaxed);
-        } else {
-            self.stats
-                .duplicate_fetch_messages_recv
-                .fetch_add(1, Ordering::Relaxed);
-            self.stats
-                .duplicate_fetch_bytes_recv
-                .fetch_add(bytes, Ordering::Relaxed);
-        }
+        self.record_message_stats(
+            unique,
+            bytes,
+            &self.stats.unique_fetch_messages_recv,
+            &self.stats.unique_fetch_bytes_recv,
+            &self.stats.duplicate_fetch_messages_recv,
+            &self.stats.duplicate_fetch_bytes_recv,
+        );
     }
 
     /// Get remote address.

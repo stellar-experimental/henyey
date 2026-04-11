@@ -177,23 +177,11 @@ impl EventQueries for Connection {
 
         let mut stmt = self.prepare(&sql)?;
         let rows = stmt.query_map(params_refs.as_slice(), |row| {
-            let topic1: Option<String> = row.get(7)?;
-            let topic2: Option<String> = row.get(8)?;
-            let topic3: Option<String> = row.get(9)?;
-            let topic4: Option<String> = row.get(10)?;
-
             let mut topics = Vec::new();
-            if let Some(t) = topic1 {
-                topics.push(t);
-            }
-            if let Some(t) = topic2 {
-                topics.push(t);
-            }
-            if let Some(t) = topic3 {
-                topics.push(t);
-            }
-            if let Some(t) = topic4 {
-                topics.push(t);
+            for i in 7..=10 {
+                if let Some(t) = row.get::<_, Option<String>>(i)? {
+                    topics.push(t);
+                }
             }
 
             let in_success: i32 = row.get(12)?;

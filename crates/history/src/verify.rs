@@ -83,49 +83,25 @@ pub struct ChainTrustAnchors {
 ///
 /// Ok(()) if the chain is valid, or an error describing the verification failure.
 pub fn verify_header_chain(headers: &[LedgerHeader]) -> Result<()> {
-    if headers.is_empty() {
-        return Ok(());
-    }
-
-    for i in 1..headers.len() {
-        let prev_header = &headers[i - 1];
-        let curr_header = &headers[i];
-
-        // Check sequence numbers are consecutive
-        if curr_header.ledger_seq != prev_header.ledger_seq + 1 {
-            return Err(HistoryError::InvalidSequence {
-                expected: prev_header.ledger_seq + 1,
-                got: curr_header.ledger_seq,
-            });
-        }
-
-        // Compute hash of previous header
-        let prev_hash = compute_header_hash(prev_header)?;
-
-        // Check that current header's previous_ledger_hash matches
-        let expected_prev_hash = Hash256::from(curr_header.previous_ledger_hash.clone());
-        if prev_hash != expected_prev_hash {
-            return Err(HistoryError::InvalidPreviousHash {
-                ledger: curr_header.ledger_seq,
-            });
-        }
-    }
-
-    Ok(())
+    verify_header_chain_inner(headers.iter())
 }
 
 /// Like [`verify_header_chain`] but accepts `LedgerHeaderHistoryEntry` slices
 /// directly, avoiding the need to clone every `LedgerHeader` into a
 /// contiguous `Vec` just for verification.
 pub fn verify_header_chain_from_entries(entries: &[LedgerHeaderHistoryEntry]) -> Result<()> {
-    if entries.is_empty() {
+    verify_header_chain_inner(entries.iter().map(|e| &e.header))
+}
+
+fn verify_header_chain_inner<'a>(
+    mut headers: impl Iterator<Item = &'a LedgerHeader>,
+) -> Result<()> {
+    let Some(first) = headers.next() else {
         return Ok(());
-    }
+    };
 
-    for i in 1..entries.len() {
-        let prev_header = &entries[i - 1].header;
-        let curr_header = &entries[i].header;
-
+    let mut prev_header = first;
+    for curr_header in headers {
         if curr_header.ledger_seq != prev_header.ledger_seq + 1 {
             return Err(HistoryError::InvalidSequence {
                 expected: prev_header.ledger_seq + 1,
@@ -140,6 +116,7 @@ pub fn verify_header_chain_from_entries(entries: &[LedgerHeaderHistoryEntry]) ->
                 ledger: curr_header.ledger_seq,
             });
         }
+        prev_header = curr_header;
     }
 
     Ok(())

@@ -334,38 +334,33 @@ fn extract_fees_from_lcm(lcm: &LedgerCloseMeta) -> (Vec<u64>, Vec<u64>) {
     let mut classic_fees = Vec::new();
     let mut soroban_fees = Vec::new();
 
-    let mut extract_tx_fees = |result: &TransactionResultPair, meta: &TransactionMeta| {
+    let mut process = |result: &TransactionResultPair, meta: &TransactionMeta| {
         let num_ops = count_ops_from_result(&result.result.result);
         if num_ops == 0 {
             return;
         }
-
         let fee_charged = result.result.fee_charged as u64;
-
-        // Check if this is a Soroban transaction by looking for SorobanTransactionMetaExtV1
         if let Some(inclusion_fee) = extract_soroban_inclusion_fee(meta, fee_charged) {
             soroban_fees.push(inclusion_fee);
         } else {
-            // Classic: fee per operation
-            let fee_per_op = fee_charged / num_ops as u64;
-            classic_fees.push(fee_per_op);
+            classic_fees.push(fee_charged / num_ops as u64);
         }
     };
 
     match lcm {
         LedgerCloseMeta::V0(v0) => {
             for tx in v0.tx_processing.iter() {
-                extract_tx_fees(&tx.result, &tx.tx_apply_processing);
+                process(&tx.result, &tx.tx_apply_processing);
             }
         }
         LedgerCloseMeta::V1(v1) => {
             for tx in v1.tx_processing.iter() {
-                extract_tx_fees(&tx.result, &tx.tx_apply_processing);
+                process(&tx.result, &tx.tx_apply_processing);
             }
         }
         LedgerCloseMeta::V2(v2) => {
             for tx in v2.tx_processing.iter() {
-                extract_tx_fees(&tx.result, &tx.tx_apply_processing);
+                process(&tx.result, &tx.tx_apply_processing);
             }
         }
     }

@@ -100,6 +100,12 @@ const GENESIS_LEDGER_SEQ: u64 = 1;
 /// Default checkpoint frequency (64 ledgers).
 const DEFAULT_CHECKPOINT_FREQUENCY: u64 = 64;
 
+/// Maximum age (in seconds) for pending tx sets before cleanup.
+///
+/// We keep pending tx sets longer than the consensus round to allow lagging
+/// nodes to fetch historical sets they missed.
+const PENDING_TX_SET_MAX_AGE_SECS: u64 = 120;
+
 /// Result of receiving an SCP envelope.
 ///
 /// Indicates what happened when the Herder processed an incoming SCP envelope.
@@ -1821,7 +1827,8 @@ impl Herder {
 
         // Clean up old pending tx set requests (by time).
         // Keep them longer to allow lagging nodes to fetch historical sets.
-        self.scp_driver.cleanup_pending_tx_sets(120);
+        self.scp_driver
+            .cleanup_pending_tx_sets(PENDING_TX_SET_MAX_AGE_SECS);
     }
 
     /// Clear the transaction set cache to release memory.

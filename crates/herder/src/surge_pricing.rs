@@ -283,14 +283,10 @@ pub enum VisitTxResult {
     Processed,
 }
 
-/// Result of `pop_top_txs`, containing the remaining lane resources and
-/// per-lane flags indicating whether any transaction exceeded the lane limit.
-#[allow(dead_code)]
+/// Result of `pop_top_txs`, containing the remaining lane resources.
 pub(crate) struct PopResult {
     /// Remaining resource budget per lane after processing.
     pub lane_left_until_limit: Vec<Resource>,
-    /// Per-lane flag: `true` if at least one transaction did not fit.
-    pub had_tx_not_fitting_lane: Vec<bool>,
 }
 
 /// Priority queue for surge pricing transaction selection.
@@ -450,7 +446,6 @@ impl SurgePricingPriorityQueue {
         mut visitor: impl FnMut(&QueuedTransaction) -> VisitTxResult,
     ) -> PopResult {
         let mut lane_left_until_limit = self.lane_limits.clone();
-        let mut had_tx_not_fitting_lane = vec![false; self.lane_limits.len()];
         let mut lane_active = vec![true; self.lane_limits.len()];
 
         loop {
@@ -484,11 +479,6 @@ impl SurgePricingPriorityQueue {
 
             if exceeds_lane || exceeds_generic {
                 if allow_gaps {
-                    if exceeds_lane {
-                        had_tx_not_fitting_lane[lane] = true;
-                    } else {
-                        had_tx_not_fitting_lane[GENERIC_LANE] = true;
-                    }
                     self.erase(lane, &entry, ledger_version, network_id);
                     continue;
                 } else if lane != GENERIC_LANE && exceeds_lane {
@@ -505,15 +495,11 @@ impl SurgePricingPriorityQueue {
                 if lane != GENERIC_LANE {
                     lane_left_until_limit[lane] -= resources;
                 }
-            } else if visit_res == VisitTxResult::Rejected {
-                had_tx_not_fitting_lane[GENERIC_LANE] = true;
-                had_tx_not_fitting_lane[lane] = true;
             }
             self.erase(lane, &entry, ledger_version, network_id);
         }
         PopResult {
             lane_left_until_limit,
-            had_tx_not_fitting_lane,
         }
     }
 

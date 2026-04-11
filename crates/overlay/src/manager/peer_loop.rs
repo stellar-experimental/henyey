@@ -856,13 +856,13 @@ impl OverlayManager {
                             total_messages += 1;
 
                             // Periodic per-peer stats (every 60s)
-                            if last_stats_log.elapsed() >= Duration::from_secs(60) {
-                                debug!(
-                                    "Peer {} stats: total_msgs={}, scp_msgs={}",
-                                    peer_id, total_messages, scp_messages,
-                                );
-                                last_stats_log = Instant::now();
-                            }
+                            Self::maybe_log_peer_stats(
+                                &peer_id,
+                                total_messages,
+                                scp_messages,
+                                &ping,
+                                &mut last_stats_log,
+                            );
 
                             let msg_type = helpers::message_type_name(&message);
                             trace!("Processing {} from {}", msg_type, peer_id);

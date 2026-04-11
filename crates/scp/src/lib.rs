@@ -79,9 +79,6 @@ pub use quorum_config::{
 pub use scp::{SlotState, SCP};
 pub use slot::Slot;
 
-/// Result type for SCP operations.
-pub type Result<T> = std::result::Result<T, ScpError>;
-
 /// A slot index (typically the ledger sequence number).
 pub type SlotIndex = u64;
 

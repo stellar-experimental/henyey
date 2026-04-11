@@ -108,13 +108,13 @@
 pub mod dead_node_tracker;
 pub mod drift_tracker;
 mod error;
-pub mod fetching_envelopes;
+pub(crate) mod fetching_envelopes;
 pub mod flow_control;
 mod herder;
 mod herder_utils;
 pub mod json_api;
 mod ledger_close_data;
-pub mod parallel_tx_set_builder;
+pub(crate) mod parallel_tx_set_builder;
 mod pending;
 mod persistence;
 mod quorum_set_tracker;
@@ -123,12 +123,12 @@ mod scp_driver;
 mod state;
 mod surge_pricing;
 pub mod sync_recovery;
-pub mod timer_manager;
-pub mod tx_broadcast;
+pub(crate) mod timer_manager;
+pub(crate) mod tx_broadcast;
 mod tx_queue;
 mod tx_queue_limiter;
 mod tx_set_tracker;
-pub mod tx_set_utils;
+pub(crate) mod tx_set_utils;
 pub mod upgrades;
 
 // Re-export main types
