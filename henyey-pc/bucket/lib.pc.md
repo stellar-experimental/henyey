@@ -73,9 +73,9 @@ CONST FIRST_PROTOCOL_SUPPORTING_PERSISTENT_EVICTION = 23
 
 "Merge operations"
   merge_buckets, merge_buckets_to_file,
-  merge_buckets_to_file_with_counters,
-  merge_buckets_with_options,
-  merge_buckets_with_options_and_shadows_and_counters,
+  merge_buckets_to_file,
+  merge_buckets,
+  merge_buckets,
   merge_in_memory, merge_multiple, MergeIterator
 
 "Async bucket merging"

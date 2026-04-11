@@ -63,7 +63,7 @@ Corresponds to: `BucketBase.h`, `LiveBucket.h`
 | `getHash()` / `getFilename()` / `getSize()` | `hash()` / `backing_file_path()` / `len()` | Full |
 | `isEmpty()` / `isIndexed()` | `is_empty()` / `is_disk_backed()` | Full |
 | `setIndex()` | `from_xdr_file_disk_backed_prebuilt()` | Full |
-| `merge()` / `mergeInternal()` | `merge_buckets()` / `merge_buckets_with_options()` | Full |
+| `merge()` / `mergeInternal()` | `merge_buckets()` | Full |
 | `randomBucketName()` | `canonical_bucket_filename()` | Full |
 | `containsBucketIdentity()` | `Bucket::get()` | Full |
 | `checkProtocolLegality()` | Protocol checks in merge paths | Full |

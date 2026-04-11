@@ -31,8 +31,7 @@ use henyey_common::Hash256;
 use serde::{Deserialize, Serialize};
 
 use crate::bucket::Bucket;
-use crate::merge::merge_buckets_with_options;
-use crate::merge::{DeadEntryPolicy, InitEntryPolicy};
+use crate::merge::{merge_buckets, DeadEntryPolicy, InitEntryPolicy, MergeOptions};
 use crate::{BucketError, Result};
 
 /// State of a FutureBucket.
@@ -247,12 +246,15 @@ impl FutureBucket {
 
         // Spawn the merge task
         tokio::spawn(async move {
-            let result = merge_buckets_with_options(
+            let result = merge_buckets(
                 &curr_clone,
                 &snap_clone,
-                keep_tombstones,
-                protocol_version,
-                normalize_init,
+                &MergeOptions {
+                    keep_dead_entries: keep_tombstones,
+                    max_protocol_version: protocol_version,
+                    normalize_init_entries: normalize_init,
+                    ..Default::default()
+                },
             );
             // Send the result, ignoring errors if the receiver was dropped
             let _ = sender.send(result);
@@ -456,12 +458,15 @@ impl FutureBucket {
                     .as_ref()
                     .ok_or_else(|| BucketError::Merge("missing snap input".to_string()))?;
 
-                let bucket = merge_buckets_with_options(
+                let bucket = merge_buckets(
                     curr,
                     snap,
-                    self.keep_tombstones,
-                    self.protocol_version,
-                    self.normalize_init,
+                    &MergeOptions {
+                        keep_dead_entries: self.keep_tombstones,
+                        max_protocol_version: self.protocol_version,
+                        normalize_init_entries: self.normalize_init,
+                        ..Default::default()
+                    },
                 )?;
                 Ok(self.finalize_merge(bucket))
             }
@@ -580,12 +585,15 @@ impl FutureBucket {
                 let snap_clone = snap.clone();
 
                 tokio::spawn(async move {
-                    let result = merge_buckets_with_options(
+                    let result = merge_buckets(
                         &curr_clone,
                         &snap_clone,
-                        keep_tombstones,
-                        protocol_version,
-                        normalize_init,
+                        &MergeOptions {
+                            keep_dead_entries: keep_tombstones,
+                            max_protocol_version: protocol_version,
+                            normalize_init_entries: normalize_init,
+                            ..Default::default()
+                        },
                     );
                     let _ = sender.send(result);
                 });
@@ -1020,12 +1028,15 @@ mod tests {
         .unwrap();
 
         // Re-merge to get the output bucket
-        let re_merged = crate::merge::merge_buckets_with_options(
+        let re_merged = crate::merge::merge_buckets(
             &b1_new,
             &b2_new,
-            DeadEntryPolicy::Keep,
-            25,
-            InitEntryPolicy::Preserve,
+            &crate::merge::MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 25,
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                ..Default::default()
+            },
         )
         .unwrap();
 

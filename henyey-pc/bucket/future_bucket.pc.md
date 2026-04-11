@@ -79,7 +79,7 @@ function start_merge(curr, snap, protocol_version,
   snap_hash = snap.hash()
 
   spawn background task:
-    result = merge_buckets_with_options(
+    result = merge_buckets(
       curr, snap, keep_tombstones,
       protocol_version, normalize_init)
     send result to channel
@@ -91,7 +91,7 @@ function start_merge(curr, snap, protocol_version,
       curr_hash, snap_hash)
 ```
 
-**Calls**: [merge_buckets_with_options](merge.pc.md#merge_buckets_with_options)
+**Calls**: [merge_buckets](merge.pc.md#merge_buckets)
 
 ### from_output
 
@@ -165,7 +165,7 @@ function resolve_blocking():
     → output bucket
   if LiveInputs:
     GUARD missing curr or snap → error
-    bucket = merge_buckets_with_options(
+    bucket = merge_buckets(
       curr, snap, keep_tombstones,
       protocol_version, normalize_init)
     clear inputs and merge_handle
@@ -176,7 +176,7 @@ function resolve_blocking():
   otherwise: → error "cannot resolve in this state"
 ```
 
-**Calls**: [merge_buckets_with_options](merge.pc.md#merge_buckets_with_options)
+**Calls**: [merge_buckets](merge.pc.md#merge_buckets)
 
 ### to_snapshot
 
@@ -213,7 +213,7 @@ function make_live(load_bucket, protocol_version,
 
     "Restart the merge in background task"
     spawn background task:
-      result = merge_buckets_with_options(
+      result = merge_buckets(
         curr, snap, keep_tombstones,
         protocol_version, normalize_init)
       send result to channel
@@ -226,7 +226,7 @@ function make_live(load_bucket, protocol_version,
   otherwise: → error "cannot make live in this state"
 ```
 
-**Calls**: [merge_buckets_with_options](merge.pc.md#merge_buckets_with_options)
+**Calls**: [merge_buckets](merge.pc.md#merge_buckets)
 
 ### get_hashes / merge_key
 

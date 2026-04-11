@@ -69,14 +69,17 @@ let entry: Option<LedgerEntry> = bucket_list.get(&some_key)?;
 ### Merge buckets explicitly
 
 ```rust
-use henyey_bucket::merge_buckets_with_options;
+use henyey_bucket::{merge_buckets, MergeOptions, DeadEntryPolicy, InitEntryPolicy};
 
-let merged = merge_buckets_with_options(
+let merged = merge_buckets(
     &old_bucket,
     &new_bucket,
-    true,   // keep tombstones
-    25,     // max protocol version
-    false,  // do not normalize INIT when staying within a level
+    &MergeOptions {
+        keep_dead_entries: DeadEntryPolicy::Keep,
+        max_protocol_version: 25,
+        normalize_init_entries: InitEntryPolicy::Preserve,
+        ..Default::default()
+    },
 )?;
 ```
 

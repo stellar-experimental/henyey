@@ -23,21 +23,21 @@
 ```
 function merge_buckets(old_bucket, new_bucket,
                        keep_dead_entries, max_protocol_version):
-  → merge_buckets_with_options(old_bucket, new_bucket,
+  → merge_buckets(old_bucket, new_bucket,
       keep_dead_entries, max_protocol_version,
       normalize_init_entries=true)
 ```
 
 ---
 
-### merge_buckets_with_options
+### merge_buckets
 
 "Merge two buckets with explicit normalization control."
 "Set normalize_init_entries=true when merging spills (crossing level boundaries),"
 "false for same-level merges (e.g., at level 0)."
 
 ```
-function merge_buckets_with_options(old_bucket, new_bucket,
+function merge_buckets(old_bucket, new_bucket,
     keep_dead_entries, max_protocol_version,
     normalize_init_entries):
   → merge_with_shadows_impl(old_bucket, new_bucket,
@@ -171,7 +171,7 @@ function merge_with_shadows_impl(old_bucket, new_bucket,
 function merge_buckets_to_file(old_bucket, new_bucket,
     output_path, keep_dead_entries, max_protocol_version,
     normalize_init_entries):
-  → merge_buckets_to_file_with_counters(
+  → merge_buckets_to_file(
       old_bucket, new_bucket, output_path,
       keep_dead_entries, max_protocol_version,
       normalize_init_entries, counters=null)
@@ -179,12 +179,12 @@ function merge_buckets_to_file(old_bucket, new_bucket,
 
 ---
 
-### merge_buckets_to_file_with_counters
+### merge_buckets_to_file
 
 "Streaming merge to file with optional merge counters."
 
 ```
-function merge_buckets_to_file_with_counters(old_bucket,
+function merge_buckets_to_file(old_bucket,
     new_bucket, output_path, keep_dead_entries,
     max_protocol_version, normalize_init_entries, counters):
 
@@ -405,25 +405,25 @@ function merge_in_memory(old_bucket, new_bucket,
 
 ---
 
-### merge_buckets_with_options_and_shadows
+### merge_buckets
 
 "Merge two buckets with shadow elimination for pre-shadow-removal protocols."
 "Shadows are only used before protocol 12."
 
 ```
-function merge_buckets_with_options_and_shadows(old_bucket,
+function merge_buckets(old_bucket,
     new_bucket, keep_dead_entries, max_protocol_version,
     normalize_init_entries, shadow_buckets):
-  → merge_buckets_with_options_and_shadows_and_counters(
+  → merge_buckets(
       ..., counters=null)
 ```
 
 ---
 
-### merge_buckets_with_options_and_shadows_and_counters
+### merge_buckets
 
 ```
-function merge_buckets_with_options_and_shadows_and_counters(
+function merge_buckets(
     old_bucket, new_bucket, keep_dead_entries,
     max_protocol_version, normalize_init_entries,
     shadow_buckets, counters):

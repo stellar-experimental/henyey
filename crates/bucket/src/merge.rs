@@ -90,7 +90,7 @@ impl InitEntryPolicy {
 
 /// Options controlling how two buckets are merged.
 ///
-/// Groups the configuration flags that travel together through the merge wrapper chain:
+/// Groups the configuration flags for a bucket merge operation:
 /// dead entry retention, protocol version, INIT normalization, shadow buckets, and counters.
 #[derive(Default)]
 pub struct MergeOptions<'a> {
@@ -102,8 +102,6 @@ pub struct MergeOptions<'a> {
     pub normalize_init_entries: InitEntryPolicy,
     /// Buckets whose entries shadow the merge output (pre-protocol-12 only).
     pub shadow_buckets: &'a [Bucket],
-    /// Keep shadowed lifecycle entries (protocol-specific edge case).
-    pub keep_shadowed_lifecycle_entries: bool,
     /// Optional merge counters for instrumentation.
     pub counters: Option<&'a MergeCounters>,
 }
@@ -266,69 +264,39 @@ fn two_pointer_merge(
 ///
 /// The `new_bucket` contains newer entries that shadow entries in `old_bucket`.
 ///
-/// # Arguments
-/// * `old_bucket` - The older bucket (entries may be shadowed)
-/// * `new_bucket` - The newer bucket (entries take precedence)
-/// * `keep_dead_entries` - Whether to keep dead entries in the output
-/// * `max_protocol_version` - Maximum protocol version allowed for the merge
+/// Configure merge behavior through `MergeOptions`:
+/// - `keep_dead_entries`: retain or remove DEAD (tombstone) entries
+/// - `max_protocol_version`: protocol version governing merge semantics
+/// - `normalize_init_entries`: convert INIT→LIVE when crossing level boundaries
+/// - `shadow_buckets`: buckets whose entries shadow the output (pre-protocol-12 only)
+/// - `counters`: optional merge counters for instrumentation
 ///
-/// # Merge Semantics
-/// - When keys match, the newer entry wins
-/// - Dead entries shadow live entries (the entry is deleted)
-/// - If `keep_dead_entries` is false and a dead entry shadows nothing, it's removed
-/// - Init entries are converted to Live entries when crossing level boundaries
-///
-/// Note: This wrapper always normalizes INIT→LIVE for backward compatibility with
-/// tests. For bucket list operations, use `merge_buckets_with_options`.
+/// Shadow handling is automatic: for protocol ≥ 12, shadows are ignored even
+/// if provided. For protocol ≥ 11 with non-empty shadows, shadowed lifecycle
+/// entries are preserved (CAP-0020).
 pub fn merge_buckets(
     old_bucket: &Bucket,
     new_bucket: &Bucket,
-    keep_dead_entries: DeadEntryPolicy,
-    max_protocol_version: u32,
+    opts: &MergeOptions<'_>,
 ) -> Result<Bucket> {
-    merge_buckets_with_options(
-        old_bucket,
-        new_bucket,
-        keep_dead_entries,
-        max_protocol_version,
-        InitEntryPolicy::NormalizeToLive,
-    )
-}
+    // For protocol >= 12 shadows are removed; pass empty slice.
+    let effective_shadows: &[Bucket] = if opts.shadow_buckets.is_empty()
+        || protocol_version_starts_from(opts.max_protocol_version, ProtocolVersion::V12)
+    {
+        &[]
+    } else {
+        opts.shadow_buckets
+    };
 
-/// Merge two buckets into a new bucket with explicit normalization control.
-///
-/// # Arguments
-/// * `old_bucket` - The older bucket (entries may be shadowed)
-/// * `new_bucket` - The newer bucket (entries take precedence)
-/// * `keep_dead_entries` - Whether to keep dead entries in the output
-/// * `max_protocol_version` - Maximum protocol version allowed for the merge
-/// * `normalize_init_entries` - Whether to convert INIT entries to LIVE entries.
-///   Set to true when merging spills (crossing level boundaries), false for
-///   same-level merges (e.g., at level 0).
-///
-/// # Merge Semantics
-/// - When keys match, the newer entry wins
-/// - Dead entries shadow live entries (the entry is deleted)
-/// - If `keep_dead_entries` is false and a dead entry shadows nothing, it's removed
-/// - Init entries are converted to Live entries only if `normalize_init_entries` is true
-pub fn merge_buckets_with_options(
-    old_bucket: &Bucket,
-    new_bucket: &Bucket,
-    keep_dead_entries: DeadEntryPolicy,
-    max_protocol_version: u32,
-    normalize_init_entries: InitEntryPolicy,
-) -> Result<Bucket> {
+    let keep_shadowed_lifecycle_entries = !effective_shadows.is_empty()
+        && protocol_version_starts_from(opts.max_protocol_version, ProtocolVersion::V11);
+
     merge_with_shadows_impl(
         old_bucket,
         new_bucket,
-        MergeOptions {
-            keep_dead_entries,
-            max_protocol_version,
-            normalize_init_entries,
-            shadow_buckets: &[],
-            keep_shadowed_lifecycle_entries: false,
-            counters: None,
-        },
+        effective_shadows,
+        keep_shadowed_lifecycle_entries,
+        opts,
     )
 }
 
@@ -342,16 +310,14 @@ pub fn merge_buckets_with_options(
 fn merge_with_shadows_impl(
     old_bucket: &Bucket,
     new_bucket: &Bucket,
-    options: MergeOptions<'_>,
+    shadow_buckets: &[Bucket],
+    keep_shadowed_lifecycle_entries: bool,
+    opts: &MergeOptions<'_>,
 ) -> Result<Bucket> {
-    let MergeOptions {
-        keep_dead_entries,
-        max_protocol_version,
-        normalize_init_entries,
-        shadow_buckets,
-        keep_shadowed_lifecycle_entries,
-        counters,
-    } = options;
+    let keep_dead_entries = opts.keep_dead_entries;
+    let max_protocol_version = opts.max_protocol_version;
+    let normalize_init_entries = opts.normalize_init_entries;
+    let counters = opts.counters;
     // Note: We intentionally do NOT use fast paths for empty buckets here.
     // stellar-core always goes through the full merge process even when
     // one input is empty. This is important because:
@@ -447,13 +413,8 @@ fn merge_with_shadows_impl(
 /// is written as uncompressed XDR with record marks (RFC 5531) suitable for
 /// creating a `DiskBacked` bucket.
 ///
-/// # Arguments
-/// * `old_bucket` - The older bucket (entries may be shadowed)
-/// * `new_bucket` - The newer bucket (entries take precedence)
-/// * `output_path` - Path to write the merged bucket file
-/// * `keep_dead_entries` - Whether to keep dead entries in the output
-/// * `max_protocol_version` - Maximum protocol version allowed
-/// * `normalize_init_entries` - Whether to convert INIT entries to LIVE
+/// Configure merge behavior through `MergeOptions`. Shadow buckets are not
+/// supported for file merges (they are only used for in-memory merges).
 ///
 /// # Returns
 /// The hash of the output bucket and the number of entries written.
@@ -461,30 +422,12 @@ pub fn merge_buckets_to_file(
     old_bucket: &Bucket,
     new_bucket: &Bucket,
     output_path: &Path,
-    keep_dead_entries: DeadEntryPolicy,
-    max_protocol_version: u32,
-    normalize_init_entries: InitEntryPolicy,
-) -> Result<(Hash256, usize)> {
-    merge_buckets_to_file_with_counters(
-        old_bucket,
-        new_bucket,
-        output_path,
-        &MergeOptions {
-            keep_dead_entries,
-            max_protocol_version,
-            normalize_init_entries,
-            ..Default::default()
-        },
-    )
-}
-
-/// Merge two buckets to file with merge options.
-pub fn merge_buckets_to_file_with_counters(
-    old_bucket: &Bucket,
-    new_bucket: &Bucket,
-    output_path: &Path,
     opts: &MergeOptions<'_>,
 ) -> Result<(Hash256, usize)> {
+    debug_assert!(
+        opts.shadow_buckets.is_empty(),
+        "shadow buckets are not supported for file merges"
+    );
     use std::io::{BufWriter, Write};
 
     if new_bucket.is_empty() && old_bucket.is_empty() {
@@ -765,73 +708,6 @@ pub fn merge_in_memory(
     ))
 }
 
-/// Merge two buckets with shadow elimination for pre-shadow-removal protocols.
-///
-/// Shadows are only used before protocol 12 to avoid reintroducing entries
-/// that are already shadowed by newer levels of the bucket list.
-pub fn merge_buckets_with_options_and_shadows(
-    old_bucket: &Bucket,
-    new_bucket: &Bucket,
-    keep_dead_entries: DeadEntryPolicy,
-    max_protocol_version: u32,
-    normalize_init_entries: InitEntryPolicy,
-    shadow_buckets: &[Bucket],
-) -> Result<Bucket> {
-    merge_buckets_with_options_and_shadows_and_counters(
-        old_bucket,
-        new_bucket,
-        &MergeOptions {
-            keep_dead_entries,
-            max_protocol_version,
-            normalize_init_entries,
-            shadow_buckets,
-            counters: None,
-            ..Default::default()
-        },
-    )
-}
-
-/// Merge two buckets with shadow elimination and optional merge counters.
-pub fn merge_buckets_with_options_and_shadows_and_counters(
-    old_bucket: &Bucket,
-    new_bucket: &Bucket,
-    opts: &MergeOptions<'_>,
-) -> Result<Bucket> {
-    // For protocol >= 12 (shadows removed), shadows are always
-    // empty in practice. Pass empty slice to skip shadow cursor creation.
-    if opts.shadow_buckets.is_empty()
-        || protocol_version_starts_from(opts.max_protocol_version, ProtocolVersion::V12)
-    {
-        return merge_with_shadows_impl(
-            old_bucket,
-            new_bucket,
-            MergeOptions {
-                keep_dead_entries: opts.keep_dead_entries,
-                max_protocol_version: opts.max_protocol_version,
-                normalize_init_entries: opts.normalize_init_entries,
-                shadow_buckets: &[],
-                keep_shadowed_lifecycle_entries: false,
-                counters: opts.counters,
-            },
-        );
-    }
-
-    let keep_shadowed_lifecycle_entries =
-        protocol_version_starts_from(opts.max_protocol_version, ProtocolVersion::V11);
-    merge_with_shadows_impl(
-        old_bucket,
-        new_bucket,
-        MergeOptions {
-            keep_dead_entries: opts.keep_dead_entries,
-            max_protocol_version: opts.max_protocol_version,
-            normalize_init_entries: opts.normalize_init_entries,
-            shadow_buckets: opts.shadow_buckets,
-            keep_shadowed_lifecycle_entries,
-            counters: opts.counters,
-        },
-    )
-}
-
 struct ShadowCursor<'a> {
     iter: BucketIter<'a>,
     current: Option<BucketEntry>,
@@ -1040,7 +916,7 @@ fn merge_entries(
 /// ```
 ///
 /// Note: Always normalizes `Init` entries to `Live` for backward compatibility.
-/// For more control, use `merge_buckets_with_options` instead.
+/// For more control, use `merge_buckets` with `MergeOptions` instead.
 pub struct MergeIterator {
     /// Pre-computed merged entries.
     merged_entries: Vec<BucketEntry>,
@@ -1119,7 +995,16 @@ pub fn merge_multiple(
     let mut result = buckets[0].clone();
 
     for bucket in &buckets[1..] {
-        result = merge_buckets(&result, bucket, keep_dead_entries, max_protocol_version)?;
+        result = merge_buckets(
+            &result,
+            bucket,
+            &MergeOptions {
+                keep_dead_entries,
+                max_protocol_version,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )?;
     }
 
     Ok(result)
@@ -1174,7 +1059,7 @@ fn build_output_metadata(
     };
 
     // For Protocol 23+, Live buckets must use V1 extension with BucketListType::LIVE.
-    // merge_buckets_with_options is specifically for the Live bucket list.
+    // merge_buckets is specifically for the Live bucket list.
     if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
         output.ext = BucketMetadataExt::V1(stellar_xdr::curr::BucketListType::Live);
     }
@@ -1224,7 +1109,17 @@ mod tests {
         let empty1 = Bucket::empty();
         let empty2 = Bucket::empty();
 
-        let merged = merge_buckets(&empty1, &empty2, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &empty1,
+            &empty2,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(merged.is_empty());
     }
 
@@ -1235,11 +1130,31 @@ mod tests {
         let empty = Bucket::empty();
 
         // New is empty
-        let merged = merge_buckets(&bucket, &empty, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &bucket,
+            &empty,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
 
         // Old is empty
-        let merged = merge_buckets(&empty, &bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &empty,
+            &bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
     }
 
@@ -1251,7 +1166,17 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 2);
     }
 
@@ -1263,7 +1188,17 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
 
         // Verify new entry won
@@ -1285,12 +1220,32 @@ mod tests {
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
         // With keep_dead_entries = true
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
         assert!(merged.entries()[0].is_dead());
 
         // With keep_dead_entries = false
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Remove, 0).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Remove,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 0);
     }
 
@@ -1299,7 +1254,17 @@ mod tests {
         let entries = vec![BucketEntry::Initentry(make_account_entry([1u8; 32], 100))];
         let bucket = Bucket::from_entries(entries).unwrap();
 
-        let merged = merge_buckets(&Bucket::empty(), &bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &Bucket::empty(),
+            &bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
 
         // Init should be converted to Live
@@ -1323,7 +1288,17 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         // Should have: Dead(1), Live(2, 250), Live(3, 300), Live(4, 400)
         assert_eq!(merged.len(), 4);
@@ -1410,7 +1385,17 @@ mod tests {
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
         // Even with keep_dead_entries = true, INIT + DEAD should annihilate
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 0, "INIT + DEAD should produce nothing");
     }
 
@@ -1423,7 +1408,17 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
         assert!(
             merged.entries()[0].is_live(),
@@ -1446,7 +1441,17 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(merged.len(), 1);
 
         // Should preserve INIT status with new value
@@ -1473,7 +1478,16 @@ mod tests {
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
         // This should panic
-        let _ = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0);
+        let _ = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        );
     }
 
     #[test]
@@ -1489,7 +1503,16 @@ mod tests {
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
         // This should panic
-        let _ = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0);
+        let _ = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        );
     }
 
     #[test]
@@ -1512,7 +1535,17 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 0).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 0,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         // Entry 1: INIT + DEAD = nothing (annihilated)
         let key1 = make_account_key([1u8; 32]);
@@ -1834,7 +1867,17 @@ mod tests {
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
         // Merge with max_protocol_version = 25 (current ledger's protocol)
-        let merged = merge_buckets(&old_bucket, &new_bucket, DeadEntryPolicy::Keep, 25).unwrap();
+        let merged = merge_buckets(
+            &old_bucket,
+            &new_bucket,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 25,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         // The output metadata should use max(18, 22) = 22, NOT 25
         let merged_entries: Vec<_> = merged.iter().unwrap().map(|e| e.unwrap()).collect();
@@ -1890,8 +1933,12 @@ mod tests {
         let merged_disk = merge_buckets(
             &old_bucket_disk,
             &new_bucket_disk,
-            DeadEntryPolicy::Keep,
-            max_pv,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: max_pv,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
         )
         .unwrap();
         let disk_entries: Vec<_> = merged_disk.iter().unwrap().map(|e| e.unwrap()).collect();
@@ -1949,13 +1996,16 @@ mod tests {
 
         // Protocol 11 (pre-shadow-removal): entry [1] is in the shadow bucket,
         // so it should be filtered out of the merge result
-        let merged = merge_buckets_with_options_and_shadows(
+        let merged = merge_buckets(
             &old_bucket,
             &new_bucket,
-            DeadEntryPolicy::Keep, // keep_dead_entries
-            ProtocolVersion::V11.as_u32(),
-            InitEntryPolicy::NormalizeToLive, // normalize_init_entries
-            &[shadow_bucket],
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V11.as_u32(),
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                shadow_buckets: &[shadow_bucket],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -1986,13 +2036,16 @@ mod tests {
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
         // Protocol 12 (shadow removal): shadow filtering should NOT apply
-        let merged = merge_buckets_with_options_and_shadows(
+        let merged = merge_buckets(
             &old_bucket,
             &new_bucket,
-            DeadEntryPolicy::Keep,
-            ProtocolVersion::V12.as_u32(), // exactly protocol 12
-            InitEntryPolicy::NormalizeToLive,
-            &[shadow_bucket],
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V12.as_u32(),
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                shadow_buckets: &[shadow_bucket],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2015,13 +2068,15 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets_with_options_and_shadows(
+        let merged = merge_buckets(
             &old_bucket,
             &new_bucket,
-            DeadEntryPolicy::Keep,
-            ProtocolVersion::V11.as_u32(),
-            InitEntryPolicy::NormalizeToLive,
-            &[], // no shadows
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V11.as_u32(),
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2050,13 +2105,16 @@ mod tests {
         let new_bucket = Bucket::from_entries(vec![]).unwrap();
 
         // Protocol 11 supports INITENTRY - shadow filtering should preserve INIT/DEAD
-        let merged = merge_buckets_with_options_and_shadows(
+        let merged = merge_buckets(
             &old_bucket,
             &new_bucket,
-            DeadEntryPolicy::Keep,
-            ProtocolVersion::V11.as_u32(), // protocol 11
-            InitEntryPolicy::Preserve,     // don't normalize init entries
-            &[shadow_bucket],
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V11.as_u32(),
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                shadow_buckets: &[shadow_bucket],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2090,13 +2148,16 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(vec![]).unwrap();
 
-        let merged = merge_buckets_with_options_and_shadows(
+        let merged = merge_buckets(
             &old_bucket,
             &new_bucket,
-            DeadEntryPolicy::Keep,
-            ProtocolVersion::V11.as_u32(),
-            InitEntryPolicy::Preserve,
-            &[shadow_bucket],
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V11.as_u32(),
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                shadow_buckets: &[shadow_bucket],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2129,13 +2190,16 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(vec![]).unwrap();
 
-        let merged = merge_buckets_with_options_and_shadows(
+        let merged = merge_buckets(
             &old_bucket,
             &new_bucket,
-            DeadEntryPolicy::Keep,
-            ProtocolVersion::V11.as_u32(), // 11
-            InitEntryPolicy::Preserve,
-            &[shadow_bucket],
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V11.as_u32(),
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                shadow_buckets: &[shadow_bucket],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2184,13 +2248,16 @@ mod tests {
 
         // Merge b4 (newer) with b5 (older) = INIT + DEAD should annihilate
         // regardless of shadow presence
-        let merged = merge_buckets_with_options_and_shadows(
+        let merged = merge_buckets(
             &b5,
             &b4,
-            DeadEntryPolicy::Keep,
-            ProtocolVersion::V11.as_u32(),
-            InitEntryPolicy::Preserve,
-            &[shadow],
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V11.as_u32(),
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                shadow_buckets: &[shadow],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2223,13 +2290,16 @@ mod tests {
         ))])
         .unwrap();
 
-        let merged = merge_buckets_with_options_and_shadows(
+        let merged = merge_buckets(
             &b1,
             &b2,
-            DeadEntryPolicy::Keep,
-            ProtocolVersion::V11.as_u32(),
-            InitEntryPolicy::Preserve,
-            &[shadow],
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V11.as_u32(),
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                shadow_buckets: &[shadow],
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2253,12 +2323,15 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets_with_options(
+        let merged = merge_buckets(
             &old_bucket,
             &new_bucket,
-            DeadEntryPolicy::Keep,
-            ProtocolVersion::V10.as_u32(), // protocol 10
-            InitEntryPolicy::NormalizeToLive,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V10.as_u32(),
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2281,12 +2354,15 @@ mod tests {
         let old_bucket = Bucket::from_entries(old_entries).unwrap();
         let new_bucket = Bucket::from_entries(new_entries).unwrap();
 
-        let merged = merge_buckets_with_options(
+        let merged = merge_buckets(
             &old_bucket,
             &new_bucket,
-            DeadEntryPolicy::Keep,
-            25,                               // current protocol
-            InitEntryPolicy::NormalizeToLive, // normalize_init (spill merge)
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: 25,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2323,12 +2399,15 @@ mod tests {
         ])
         .unwrap();
 
-        let merged = merge_buckets_with_options(
+        let merged = merge_buckets(
             &old_with_meta,
             &new_with_meta,
-            DeadEntryPolicy::Keep,
-            ProtocolVersion::V11.as_u32(),
-            InitEntryPolicy::Preserve,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version: ProtocolVersion::V11.as_u32(),
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -2371,7 +2450,7 @@ mod tests {
         ])
         .unwrap();
 
-        let _result = merge_buckets_with_options_and_shadows_and_counters(
+        let _result = merge_buckets(
             &old,
             &new,
             &MergeOptions {
@@ -2400,7 +2479,7 @@ mod tests {
         .unwrap();
         let new = Bucket::from_entries(vec![BucketEntry::Deadentry(key)]).unwrap();
 
-        let _result = merge_buckets_with_options_and_shadows_and_counters(
+        let _result = merge_buckets(
             &old,
             &new,
             &MergeOptions {
@@ -2433,7 +2512,7 @@ mod tests {
         let new = Bucket::from_entries(vec![]).unwrap();
 
         // Use pre-protocol-12 to enable shadow filtering
-        let _result = merge_buckets_with_options_and_shadows_and_counters(
+        let _result = merge_buckets(
             &old,
             &new,
             &MergeOptions {
@@ -2475,7 +2554,7 @@ mod tests {
 
         let temp_dir = tempfile::tempdir().unwrap();
         let output_path = temp_dir.path().join("merged.xdr");
-        let (hash, entry_count) = merge_buckets_to_file_with_counters(
+        let (hash, entry_count) = merge_buckets_to_file(
             &old,
             &new,
             &output_path,

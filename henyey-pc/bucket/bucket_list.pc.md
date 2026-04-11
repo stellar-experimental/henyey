@@ -112,10 +112,10 @@ function AsyncMergeHandle.start_merge(curr, snap,
     if bucket_dir is not null:
       // Disk-backed merge
       temp_path = temp_merge_path(bucket_dir)
-      (hash, entry_count) = merge_buckets_to_file_with_counters(
+      (hash, entry_count) = merge_buckets_to_file(
           curr, snap, temp_path, keep_dead_entries,
           protocol_version, normalize_init, counters)
-      REF: merge::merge_buckets_to_file_with_counters
+      REF: merge::merge_buckets_to_file
 
       if entry_count == 0:
         remove temp_path
@@ -133,7 +133,7 @@ function AsyncMergeHandle.start_merge(curr, snap,
       result = merge_with_options_and_shadows_and_counters(
           curr, snap, keep_dead_entries, protocol_version,
           normalize_init, shadow_buckets, counters)
-      REF: merge::merge_buckets_with_options_and_shadows_and_counters
+      REF: merge::merge_buckets
 
     counters.record_merge_completed(elapsed)
     sender.send(result)
@@ -312,7 +312,7 @@ function BucketLevel.prepare_with_normalization(ledger_seq,
     next = InMemory(merged)
 ```
 
-**Calls:** [AsyncMergeHandle.start_merge](#asyncmergehandlestart_merge), merge_buckets_with_options_and_shadows_and_counters (REF: merge.rs)
+**Calls:** [AsyncMergeHandle.start_merge](#asyncmergehandlestart_merge), merge_buckets (REF: merge.rs)
 
 ### BucketLevel.prepare_first_level
 
@@ -1066,7 +1066,7 @@ function perform_merge(input_curr, input_snap,
     → merge_with_options_and_shadows(
         input_curr, input_snap, keep_dead,
         protocol_version, normalize_init=false, shadows=[])
-    REF: merge::merge_buckets_with_options_and_shadows
+    REF: merge::merge_buckets
 ```
 
 ---

@@ -69,9 +69,8 @@ use crate::index::BucketEntryCounters;
 use crate::live_iterator::LiveEntriesIterator;
 use crate::manager::{canonical_bucket_filename, promote_temp_to_canonical, temp_merge_path};
 use crate::merge::{
-    merge_buckets_to_file, merge_buckets_to_file_with_counters,
-    merge_buckets_with_options_and_shadows, merge_buckets_with_options_and_shadows_and_counters,
-    merge_in_memory, DeadEntryPolicy, InitEntryPolicy, MergeOptions,
+    merge_buckets, merge_buckets_to_file, merge_in_memory, DeadEntryPolicy, InitEntryPolicy,
+    MergeOptions,
 };
 use crate::merge_map::BucketMergeMap;
 use crate::metrics::MergeCounters;
@@ -386,7 +385,7 @@ impl AsyncMergeHandle {
                 // Disk-backed merge: write output to temp file, create DiskBacked bucket.
                 // This keeps memory O(index_size) instead of O(data_size).
                 let temp_path = temp_merge_path(dir);
-                match merge_buckets_to_file_with_counters(
+                match merge_buckets_to_file(
                     &curr,
                     &snap,
                     &temp_path,
@@ -413,7 +412,7 @@ impl AsyncMergeHandle {
                 }
             } else {
                 // In-memory merge (used in tests or when no bucket_dir is set)
-                merge_buckets_with_options_and_shadows_and_counters(
+                merge_buckets(
                     &curr,
                     &snap,
                     &MergeOptions {
@@ -422,7 +421,6 @@ impl AsyncMergeHandle {
                         normalize_init_entries: normalize_init,
                         shadow_buckets: &shadow_buckets,
                         counters: counters_ref,
-                        ..Default::default()
                     },
                 )
             };
@@ -829,7 +827,7 @@ impl BucketLevel {
             self.next = Some(PendingMerge::Async(handle));
         } else {
             // Level 0 should use prepare_first_level, but if called here, do sync merge
-            let merged = merge_buckets_with_options_and_shadows_and_counters(
+            let merged = merge_buckets(
                 &curr_for_merge,
                 &incoming,
                 &MergeOptions {
@@ -838,7 +836,6 @@ impl BucketLevel {
                     normalize_init_entries: ctx.normalize_init,
                     shadow_buckets,
                     counters: ctx.merge_counters.as_deref(),
-                    ..Default::default()
                 },
             )?;
 
@@ -897,13 +894,15 @@ impl BucketLevel {
             );
             // Fall back to regular merge
             // Level 0 always keeps tombstones and never normalizes INIT entries
-            merge_buckets_with_options_and_shadows(
+            merge_buckets(
                 &self.curr,
                 &incoming,
-                DeadEntryPolicy::Keep, // keep_dead_entries
-                protocol_version,
-                InitEntryPolicy::Preserve, // normalize_init_entries
-                &[],                       // no shadow buckets at level 0
+                &MergeOptions {
+                    keep_dead_entries: DeadEntryPolicy::Keep,
+                    max_protocol_version: protocol_version,
+                    normalize_init_entries: InitEntryPolicy::Preserve,
+                    ..Default::default()
+                },
             )?
         };
 
@@ -1096,9 +1095,12 @@ fn perform_merge(
             input_curr,
             input_snap,
             &temp_path,
-            keep_dead,
-            protocol_version,
-            InitEntryPolicy::Preserve, // normalize_init = false
+            &MergeOptions {
+                keep_dead_entries: keep_dead,
+                max_protocol_version: protocol_version,
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                ..Default::default()
+            },
         )?;
         if entry_count == 0 {
             let _ = std::fs::remove_file(&temp_path);
@@ -1107,13 +1109,15 @@ fn perform_merge(
             promote_temp_to_canonical(&temp_path, dir, &hash, "perform_merge")
         }
     } else {
-        merge_buckets_with_options_and_shadows(
+        merge_buckets(
             input_curr,
             input_snap,
-            keep_dead,
-            protocol_version,
-            InitEntryPolicy::Preserve, // normalize_init = false
-            &[],                       // no shadows for post-protocol-12
+            &MergeOptions {
+                keep_dead_entries: keep_dead,
+                max_protocol_version: protocol_version,
+                normalize_init_entries: InitEntryPolicy::Preserve,
+                ..Default::default()
+            },
         )
     }
 }
@@ -3154,7 +3158,7 @@ pub struct BucketListStats {
 mod tests {
     use super::*;
     use crate::entry::BucketEntry as BucketListEntry;
-    use crate::merge::merge_buckets_with_options;
+    use crate::merge::{merge_buckets, MergeOptions};
     use stellar_xdr::curr::*;
 
     const TEST_PROTOCOL: u32 = 25;
@@ -3410,12 +3414,15 @@ mod tests {
     async fn test_merge_drops_dead_when_keep_dead_false() {
         let key = make_account_key([1u8; 32]);
         let bucket = Bucket::from_entries(vec![BucketListEntry::Deadentry(key)]).unwrap();
-        let merged = merge_buckets_with_options(
+        let merged = merge_buckets(
             &Bucket::empty(),
             &bucket,
-            DeadEntryPolicy::Remove,
-            TEST_PROTOCOL,
-            InitEntryPolicy::NormalizeToLive,
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Remove,
+                max_protocol_version: TEST_PROTOCOL,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
         )
         .unwrap();
         let mut has_non_meta = false;

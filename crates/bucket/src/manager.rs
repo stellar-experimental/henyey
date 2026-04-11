@@ -51,8 +51,7 @@ use henyey_common::Hash256;
 
 use crate::bucket::Bucket;
 use crate::entry::BucketEntry;
-use crate::merge::merge_buckets_to_file;
-use crate::merge::{DeadEntryPolicy, InitEntryPolicy};
+use crate::merge::{merge_buckets_to_file, DeadEntryPolicy, InitEntryPolicy, MergeOptions};
 use crate::merge_map::BucketMergeMap;
 use crate::{BucketError, Result};
 
@@ -493,9 +492,12 @@ impl BucketManager {
             old,
             new,
             &temp_path,
-            DeadEntryPolicy::Keep, // keep_dead_entries
-            max_protocol_version,
-            InitEntryPolicy::NormalizeToLive, // normalize_init_entries
+            &MergeOptions {
+                keep_dead_entries: DeadEntryPolicy::Keep,
+                max_protocol_version,
+                normalize_init_entries: InitEntryPolicy::NormalizeToLive,
+                ..Default::default()
+            },
         )?;
 
         if hash.is_zero() || entry_count == 0 {
