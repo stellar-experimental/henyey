@@ -2106,70 +2106,93 @@ fn cmd_offline_info(config: AppConfig) -> anyhow::Result<()> {
     // Get last closed ledger sequence
     let lcl_seq = db.with_connection(|conn| conn.get_last_closed_ledger())?;
 
-    let (num, hash, close_time, version, base_fee, base_reserve, max_tx_set_size, flags) =
-        if let Some(seq) = lcl_seq {
-            if let Some(header) = db.get_ledger_header(seq)? {
-                let hash = db
-                    .get_ledger_hash(seq)?
-                    .map(|h| h.to_hex())
-                    .unwrap_or_default();
-                let flags = match &header.ext {
-                    LedgerHeaderExt::V1(ext) => ext.flags as i64,
-                    LedgerHeaderExt::V0 => 0i64,
-                };
-                (
-                    seq as i64,
-                    hash,
-                    header.scp_value.close_time.0 as i64,
-                    header.ledger_version as i64,
-                    header.base_fee as i64,
-                    header.base_reserve as i64,
-                    header.max_tx_set_size as i64,
-                    flags,
-                )
-            } else {
-                (
-                    seq as i64,
-                    String::new(),
-                    0i64,
-                    0i64,
-                    0i64,
-                    0i64,
-                    0i64,
-                    0i64,
-                )
+    struct OfflineLedgerInfo {
+        num: i64,
+        hash: String,
+        close_time: i64,
+        version: i64,
+        base_fee: i64,
+        base_reserve: i64,
+        max_tx_set_size: i64,
+        flags: i64,
+    }
+
+    let info = if let Some(seq) = lcl_seq {
+        if let Some(header) = db.get_ledger_header(seq)? {
+            let hash = db
+                .get_ledger_hash(seq)?
+                .map(|h| h.to_hex())
+                .unwrap_or_default();
+            let flags = match &header.ext {
+                LedgerHeaderExt::V1(ext) => ext.flags as i64,
+                LedgerHeaderExt::V0 => 0i64,
+            };
+            OfflineLedgerInfo {
+                num: seq as i64,
+                hash,
+                close_time: header.scp_value.close_time.0 as i64,
+                version: header.ledger_version as i64,
+                base_fee: header.base_fee as i64,
+                base_reserve: header.base_reserve as i64,
+                max_tx_set_size: header.max_tx_set_size as i64,
+                flags,
             }
         } else {
-            (0i64, String::new(), 0i64, 0i64, 0i64, 0i64, 0i64, 0i64)
-        };
+            OfflineLedgerInfo {
+                num: seq as i64,
+                hash: String::new(),
+                close_time: 0,
+                version: 0,
+                base_fee: 0,
+                base_reserve: 0,
+                max_tx_set_size: 0,
+                flags: 0,
+            }
+        }
+    } else {
+        OfflineLedgerInfo {
+            num: 0,
+            hash: String::new(),
+            close_time: 0,
+            version: 0,
+            base_fee: 0,
+            base_reserve: 0,
+            max_tx_set_size: 0,
+            flags: 0,
+        }
+    };
 
     // Calculate age (seconds since close time)
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    let age = if close_time > 0 { now - close_time } else { 0 };
+    let age = if info.close_time > 0 {
+        now - info.close_time
+    } else {
+        0
+    };
 
     // Build the JSON response matching stellar-core's format.
     // The Go code only reads info.ledger.num, but we provide the full
     // structure for compatibility with other tools.
     let mut ledger = serde_json::json!({
-        "num": num,
-        "hash": hash,
-        "closeTime": close_time,
-        "version": version,
-        "baseFee": base_fee,
-        "baseReserve": base_reserve,
-        "maxTxSetSize": max_tx_set_size,
+        "num": info.num,
+        "hash": info.hash,
+        "closeTime": info.close_time,
+        "version": info.version,
+        "baseFee": info.base_fee,
+        "baseReserve": info.base_reserve,
+        "maxTxSetSize": info.max_tx_set_size,
         "age": age
     });
 
     // stellar-core only includes "flags" when non-zero
-    if flags != 0 {
+    if info.flags != 0 {
         ledger
             .as_object_mut()
             .unwrap()
-            .insert("flags".to_string(), serde_json::json!(flags));
+            .insert("flags".to_string(), serde_json::json!(info.flags));
     }
 
     let response = serde_json::json!({
