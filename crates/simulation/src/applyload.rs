@@ -1675,18 +1675,15 @@ fn generate_archived_entries(
 ) {
     for _ in 0..count {
         let lk = ApplyLoad::key_for_archived_entry(*current_key);
+        let LedgerKey::ContractData(cd) = &lk else {
+            unreachable!()
+        };
         let le = LedgerEntry {
             last_modified_ledger_seq: ledger_seq,
             data: LedgerEntryData::ContractData(stellar_xdr::curr::ContractDataEntry {
                 ext: ExtensionPoint::V0,
-                contract: match &lk {
-                    LedgerKey::ContractData(cd) => cd.contract.clone(),
-                    _ => unreachable!(),
-                },
-                key: match &lk {
-                    LedgerKey::ContractData(cd) => cd.key.clone(),
-                    _ => unreachable!(),
-                },
+                contract: cd.contract.clone(),
+                key: cd.key.clone(),
                 durability: ContractDataDurability::Persistent,
                 val: ScVal::Bytes(stellar_xdr::curr::ScBytes::default()),
             }),
