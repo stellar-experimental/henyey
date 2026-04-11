@@ -643,33 +643,25 @@ impl WorkScheduler {
 
         self.finalize_entry(id, completion.work);
 
+        // Handle cancellation uniformly: if cancelled or outcome is Cancelled,
+        // move to terminal Cancelled state regardless of reported outcome.
+        if cancelled || matches!(&completion.outcome, WorkOutcome::Cancelled) {
+            self.finish_terminal_state(id, WorkState::Cancelled, attempt);
+            return CompletionAction::None;
+        }
+
         match completion.outcome {
-            WorkOutcome::Cancelled => {
-                self.finish_terminal_state(id, WorkState::Cancelled, attempt);
-                CompletionAction::None
-            }
-            WorkOutcome::Success if cancelled => {
-                self.finish_terminal_state(id, WorkState::Cancelled, attempt);
-                CompletionAction::None
-            }
             WorkOutcome::Success => {
                 self.transition_state(id, WorkState::Success, attempt);
                 CompletionAction::Done { completed_id: id }
             }
-            WorkOutcome::Retry { delay: _ } if cancelled => {
-                self.finish_terminal_state(id, WorkState::Cancelled, attempt);
-                CompletionAction::None
-            }
             WorkOutcome::Retry { delay } => self.schedule_retry(id, attempt, delay),
-            WorkOutcome::Failed(_) if cancelled => {
-                self.finish_terminal_state(id, WorkState::Cancelled, attempt);
-                CompletionAction::None
-            }
             WorkOutcome::Failed(err) => {
                 warn!(work_id = id, error = %err, "work failed");
                 self.finish_terminal_state(id, WorkState::Failed, attempt);
                 CompletionAction::None
             }
+            WorkOutcome::Cancelled => unreachable!(),
         }
     }
 
