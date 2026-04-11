@@ -92,16 +92,20 @@ pub async fn handle(
         })
         .map_err(|e| JsonRpcError::internal(format!("database error: {}", e)))?;
 
-    // Build response
+    // Build response, caching ledger close times per ledger_seq to avoid N+1 queries
     let mut transactions = Vec::with_capacity(records.len());
     let mut last_cursor = String::new();
+    let mut close_time_cache: std::collections::HashMap<u32, u64> =
+        std::collections::HashMap::new();
 
     for record in &records {
         // Application order is 1-based (txindex is 0-based in DB)
         let application_order = record.tx_index + 1;
 
         // Ledger close time — returned as a number (not string) per upstream getTransactions
-        let created_at = util::ledger_close_time(&ctx.app, record.ledger_seq);
+        let created_at = *close_time_cache
+            .entry(record.ledger_seq)
+            .or_insert_with(|| util::ledger_close_time(&ctx.app, record.ledger_seq));
 
         // Build TOID cursor for this transaction
         let toid = util::toid_encode(record.ledger_seq, application_order, 0);

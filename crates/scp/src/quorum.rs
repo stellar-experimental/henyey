@@ -376,20 +376,7 @@ pub fn normalize_quorum_set_with_remove(
     id_to_remove: Option<&NodeId>,
 ) {
     normalize_quorum_set_simplify(quorum_set, id_to_remove);
-
-    let mut validators: Vec<_> = quorum_set.validators.iter().cloned().collect();
-    validators.sort_by(node_id_cmp);
-    quorum_set.validators = validators.try_into().unwrap_or_default();
-
-    let mut inner_sets: Vec<_> = quorum_set.inner_sets.iter().cloned().collect();
-    for inner_set in &mut inner_sets {
-        // Only pass id_to_remove for the simplify step (already done above recursively),
-        // but the reorder step doesn't need it again
-        normalize_quorum_set_reorder(inner_set);
-    }
-
-    inner_sets.sort_by(quorum_set_cmp);
-    quorum_set.inner_sets = inner_sets.try_into().unwrap_or_default();
+    normalize_quorum_set_reorder(quorum_set);
 }
 
 fn normalize_quorum_set_reorder(quorum_set: &mut ScpQuorumSet) {

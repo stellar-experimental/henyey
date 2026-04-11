@@ -29,19 +29,16 @@ pub async fn handle(
     let tx_env = TransactionEnvelope::from_xdr(&tx_bytes, Limits::none())
         .map_err(|e| JsonRpcError::invalid_params(format!("invalid XDR: {}", e)))?;
 
-    // Compute the transaction hash
+    // Compute the transaction hash from a reference (no clone needed)
     let network_id = henyey_common::NetworkId::from_passphrase(&ctx.app.info().network_passphrase);
-    let mut frame =
-        henyey_tx::TransactionFrame::from_owned_with_network(tx_env.clone(), network_id);
-    let hash = frame
-        .compute_hash(&network_id)
+    let hash = henyey_tx::TransactionFrame::hash_envelope(&tx_env, &network_id)
         .map(|h| h.to_hex())
         .unwrap_or_default();
 
     let ledger = ctx.app.ledger_summary();
 
-    // Submit to herder
-    let result = ctx.app.submit_transaction(tx_env.clone()).await;
+    // Submit to herder (move tx_env, no clone)
+    let result = ctx.app.submit_transaction(tx_env).await;
 
     // Build base response with fields common to all outcomes
     let close_time = ledger.close_time.to_string();
