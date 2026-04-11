@@ -89,10 +89,7 @@ impl TransactionQueue {
         starting_seq: Option<&HashMap<Vec<u8>, i64>>,
         close_time_offset: u64,
     ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
-        use stellar_xdr::curr::{
-            DependentTxCluster, GeneralizedTransactionSet, ParallelTxExecutionStage,
-            ParallelTxsComponent, VecM, WriteXdr,
-        };
+        use stellar_xdr::curr::{GeneralizedTransactionSet, WriteXdr};
 
         let SelectedTxs {
             transactions,
@@ -176,69 +173,9 @@ impl TransactionQueue {
             Some(base_fee)
         };
 
-        let use_parallel_builder = !soroban_txs.is_empty()
-            && self.config.ledger_max_instructions > 0
-            && self.config.ledger_max_dependent_tx_clusters > 0
-            && self.config.soroban_phase_max_stage_count > 0;
+        let soroban_phase = build_soroban_phase(soroban_txs, soroban_base_fee, &self.config);
 
-        let soroban_phase = if soroban_txs.is_empty() {
-            TransactionPhase::V1(ParallelTxsComponent {
-                base_fee: soroban_base_fee,
-                execution_stages: VecM::default(),
-            })
-        } else if use_parallel_builder {
-            let stages = crate::parallel_tx_set_builder::build_parallel_soroban_phase(
-                &soroban_txs,
-                self.config.network_id,
-                self.config.ledger_max_instructions,
-                self.config.ledger_max_dependent_tx_clusters,
-                self.config.soroban_phase_min_stage_count,
-                self.config.soroban_phase_max_stage_count,
-            );
-            crate::parallel_tx_set_builder::stages_to_xdr_phase(stages, soroban_base_fee)
-        } else {
-            let cluster = DependentTxCluster(soroban_txs.try_into().unwrap_or_default());
-            let stage = ParallelTxExecutionStage(vec![cluster].try_into().unwrap_or_default());
-            TransactionPhase::V1(ParallelTxsComponent {
-                base_fee: soroban_base_fee,
-                execution_stages: vec![stage].try_into().unwrap_or_default(),
-            })
-        };
-
-        // Reconstruct the flat transactions list from the trimmed phases so that
-        // TransactionSet.transactions matches the generalized_tx_set contents.
-        // (AUDIT-085: previously passed the pre-trim `transactions` which could
-        // include txs removed by trim_invalid_two_phase.)
-        let trimmed_transactions = {
-            let mut all = Vec::new();
-            // Extract from classic phase
-            match &classic_phase {
-                TransactionPhase::V0(components) => {
-                    for comp in components.iter() {
-                        match comp {
-                            stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                                c,
-                            ) => {
-                                all.extend(c.txs.iter().cloned());
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-            // Extract from soroban phase
-            match &soroban_phase {
-                TransactionPhase::V1(component) => {
-                    for stage in component.execution_stages.iter() {
-                        for cluster in stage.0.iter() {
-                            all.extend(cluster.0.iter().cloned());
-                        }
-                    }
-                }
-                _ => {}
-            }
-            all
-        };
+        let trimmed_transactions = collect_phase_transactions(&classic_phase, &soroban_phase);
 
         let gen_tx_set = GeneralizedTransactionSet::V1(stellar_xdr::curr::TransactionSetV1 {
             previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
@@ -554,6 +491,74 @@ impl TransactionQueue {
 }
 
 /// Build the classic transaction phase with lane-based fee components.
+/// Build the Soroban phase, using the parallel builder when configured.
+fn build_soroban_phase(
+    soroban_txs: Vec<TransactionEnvelope>,
+    soroban_base_fee: Option<i64>,
+    config: &super::TxQueueConfig,
+) -> stellar_xdr::curr::TransactionPhase {
+    use stellar_xdr::curr::{
+        DependentTxCluster, ParallelTxExecutionStage, ParallelTxsComponent, TransactionPhase, VecM,
+    };
+
+    if soroban_txs.is_empty() {
+        return TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: soroban_base_fee,
+            execution_stages: VecM::default(),
+        });
+    }
+
+    let use_parallel = config.ledger_max_instructions > 0
+        && config.ledger_max_dependent_tx_clusters > 0
+        && config.soroban_phase_max_stage_count > 0;
+
+    if use_parallel {
+        let stages = crate::parallel_tx_set_builder::build_parallel_soroban_phase(
+            &soroban_txs,
+            config.network_id,
+            config.ledger_max_instructions,
+            config.ledger_max_dependent_tx_clusters,
+            config.soroban_phase_min_stage_count,
+            config.soroban_phase_max_stage_count,
+        );
+        crate::parallel_tx_set_builder::stages_to_xdr_phase(stages, soroban_base_fee)
+    } else {
+        let cluster = DependentTxCluster(soroban_txs.try_into().unwrap_or_default());
+        let stage = ParallelTxExecutionStage(vec![cluster].try_into().unwrap_or_default());
+        TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: soroban_base_fee,
+            execution_stages: vec![stage].try_into().unwrap_or_default(),
+        })
+    }
+}
+
+/// Collect all transaction envelopes from classic and soroban phases.
+fn collect_phase_transactions(
+    classic_phase: &stellar_xdr::curr::TransactionPhase,
+    soroban_phase: &stellar_xdr::curr::TransactionPhase,
+) -> Vec<TransactionEnvelope> {
+    use stellar_xdr::curr::TransactionPhase;
+
+    let mut all = Vec::new();
+    if let TransactionPhase::V0(components) = classic_phase {
+        for comp in components.iter() {
+            match comp {
+                stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
+                    all.extend(c.txs.iter().cloned());
+                }
+            }
+        }
+    }
+    if let TransactionPhase::V1(component) = soroban_phase {
+        for stage in component.execution_stages.iter() {
+            for cluster in stage.0.iter() {
+                all.extend(cluster.0.iter().cloned());
+            }
+        }
+    }
+    all
+}
+
 fn build_classic_phase(
     classic_txs: Vec<TransactionEnvelope>,
     classic_limited: bool,
