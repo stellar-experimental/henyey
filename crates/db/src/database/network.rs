@@ -142,63 +142,17 @@ impl Database {
     ///
     /// Filters by maximum failures, next attempt time, and optionally peer type.
     /// Results are randomized to distribute connection attempts.
-    pub fn load_random_peers(
-        &self,
-        limit: usize,
-        max_failures: u32,
-        now: i64,
-        peer_type: Option<henyey_common::StoredPeerType>,
-    ) -> Result<Vec<(String, u16, queries::PeerRecord)>> {
-        self.with_connection(|conn| {
-            use queries::PeerQueries;
-            conn.load_random_peers(limit, max_failures, now, peer_type)
-        })
-    }
-
-    /// Loads random outbound peers (excludes the specified inbound type).
+    /// Loads random peers matching the specified filter criteria.
     ///
-    /// Filters by maximum failures and next attempt time.
-    pub fn load_random_peers_any_outbound(
+    /// Results are randomized to distribute connection attempts.
+    pub fn query_random_peers(
         &self,
         limit: usize,
-        max_failures: u32,
-        now: i64,
-        inbound_type: henyey_common::StoredPeerType,
+        filter: &queries::PeerFilter,
     ) -> Result<Vec<(String, u16, queries::PeerRecord)>> {
         self.with_connection(|conn| {
             use queries::PeerQueries;
-            conn.load_random_peers_any_outbound(limit, max_failures, now, inbound_type)
-        })
-    }
-
-    /// Loads random outbound peers by failure count only.
-    ///
-    /// Similar to [`Self::load_random_peers_any_outbound`] but ignores the next
-    /// attempt time, useful for aggressive peer discovery.
-    pub fn load_random_peers_any_outbound_max_failures(
-        &self,
-        limit: usize,
-        max_failures: u32,
-        inbound_type: henyey_common::StoredPeerType,
-    ) -> Result<Vec<(String, u16, queries::PeerRecord)>> {
-        self.with_connection(|conn| {
-            use queries::PeerQueries;
-            conn.load_random_peers_any_outbound_max_failures(limit, max_failures, inbound_type)
-        })
-    }
-
-    /// Loads random peers of a specific type by failure count only.
-    ///
-    /// Ignores next attempt time, useful for targeted peer type queries.
-    pub fn load_random_peers_by_type_max_failures(
-        &self,
-        limit: usize,
-        max_failures: u32,
-        peer_type: henyey_common::StoredPeerType,
-    ) -> Result<Vec<(String, u16, queries::PeerRecord)>> {
-        self.with_connection(|conn| {
-            use queries::PeerQueries;
-            conn.load_random_peers_by_type_max_failures(limit, max_failures, peer_type)
+            conn.query_random_peers(limit, filter)
         })
     }
 }

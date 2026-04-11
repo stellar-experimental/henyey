@@ -48,7 +48,7 @@ pub use events::{EventQueries, EventQueryParams, EventRecord};
 pub use history::{HistoryQueries, StoreTxParams, TxRecord, TxStatus};
 pub use ledger::LedgerQueries;
 pub use ledger_close_meta::LedgerCloseMetaQueries;
-pub use peers::{PeerQueries, PeerRecord};
+pub use peers::{PeerFilter, PeerQueries, PeerRecord, PeerTypeFilter};
 pub use publish_queue::PublishQueueQueries;
 pub use scp::{ScpQueries, ScpStatePersistenceQueries};
 pub use state::StateQueries;

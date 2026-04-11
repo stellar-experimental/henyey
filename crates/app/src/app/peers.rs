@@ -361,12 +361,14 @@ impl App {
 
     pub(super) fn load_persisted_peers(&self) -> anyhow::Result<Vec<PeerAddress>> {
         let now = current_epoch_seconds();
-        let peers = self.db.load_random_peers(
-            1000,
-            self.config.overlay.peer_max_failures,
-            now,
-            Some(StoredPeerType::Outbound),
-        )?;
+        let filter = henyey_db::queries::PeerFilter {
+            max_failures: self.config.overlay.peer_max_failures,
+            before_time: Some(now),
+            type_filter: Some(henyey_db::queries::PeerTypeFilter::Equals(
+                StoredPeerType::Outbound,
+            )),
+        };
+        let peers = self.db.query_random_peers(1000, &filter)?;
         let mut addrs = Vec::new();
         for (host, port, _) in peers {
             addrs.push(PeerAddress::new(host, port));
@@ -391,11 +393,14 @@ impl App {
     }
 
     fn load_advertised_outbound_peers(&self) -> anyhow::Result<Vec<PeerAddress>> {
-        let peers = self.db.load_random_peers_any_outbound_max_failures(
-            1000,
-            PEER_MAX_FAILURES_TO_SEND,
-            StoredPeerType::Inbound,
-        )?;
+        let filter = henyey_db::queries::PeerFilter {
+            max_failures: PEER_MAX_FAILURES_TO_SEND,
+            type_filter: Some(henyey_db::queries::PeerTypeFilter::NotEquals(
+                StoredPeerType::Inbound,
+            )),
+            ..Default::default()
+        };
+        let peers = self.db.query_random_peers(1000, &filter)?;
         let mut addrs = Vec::new();
         for (host, port, _) in peers {
             addrs.push(PeerAddress::new(host, port));
@@ -404,11 +409,14 @@ impl App {
     }
 
     fn load_advertised_inbound_peers(&self) -> anyhow::Result<Vec<PeerAddress>> {
-        let peers = self.db.load_random_peers_by_type_max_failures(
-            1000,
-            PEER_MAX_FAILURES_TO_SEND,
-            StoredPeerType::Inbound,
-        )?;
+        let filter = henyey_db::queries::PeerFilter {
+            max_failures: PEER_MAX_FAILURES_TO_SEND,
+            type_filter: Some(henyey_db::queries::PeerTypeFilter::Equals(
+                StoredPeerType::Inbound,
+            )),
+            ..Default::default()
+        };
+        let peers = self.db.query_random_peers(1000, &filter)?;
         let mut addrs = Vec::new();
         for (host, port, _) in peers {
             addrs.push(PeerAddress::new(host, port));

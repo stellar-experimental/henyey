@@ -53,6 +53,29 @@ impl PeerRecord {
     }
 }
 
+/// Filter criteria for random peer queries.
+///
+/// Composes optional predicates into a single SQL query.
+/// All specified conditions are ANDed together.
+#[derive(Debug, Clone, Default)]
+pub struct PeerFilter {
+    /// Maximum allowed failure count (always applied).
+    pub max_failures: u32,
+    /// If set, only return peers with `next_attempt <= now`.
+    pub before_time: Option<i64>,
+    /// Type filter for the query.
+    pub type_filter: Option<PeerTypeFilter>,
+}
+
+/// How to filter peers by type.
+#[derive(Debug, Clone, Copy)]
+pub enum PeerTypeFilter {
+    /// Only return peers matching this type (`type = ?`).
+    Equals(StoredPeerType),
+    /// Exclude peers of this type (`type != ?`).
+    NotEquals(StoredPeerType),
+}
+
 /// Query trait for peer management operations.
 ///
 /// Provides methods for CRUD operations on the `peers` table, as well as
@@ -71,49 +94,13 @@ pub trait PeerQueries {
     /// Loads peer records, optionally limited to a maximum count.
     fn load_peers(&self, limit: Option<usize>) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
 
-    /// Loads random peers matching the specified constraints.
-    ///
-    /// Filters by:
-    /// - `max_failures`: Maximum allowed failure count
-    /// - `now`: Current timestamp (only peers with `next_attempt <= now`)
-    /// - `peer_type`: Optional specific peer type to match
+    /// Loads random peers matching the specified filter criteria.
     ///
     /// Results are randomized to distribute connection attempts.
-    fn load_random_peers(
+    fn query_random_peers(
         &self,
         limit: usize,
-        max_failures: u32,
-        now: i64,
-        peer_type: Option<StoredPeerType>,
-    ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
-
-    /// Loads random outbound peers (excludes the specified inbound type).
-    ///
-    /// Respects both failure count and next attempt time constraints.
-    fn load_random_peers_any_outbound(
-        &self,
-        limit: usize,
-        max_failures: u32,
-        now: i64,
-        inbound_type: StoredPeerType,
-    ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
-
-    /// Loads random outbound peers, ignoring next attempt time.
-    ///
-    /// Useful for aggressive peer discovery when the peer table is sparse.
-    fn load_random_peers_any_outbound_max_failures(
-        &self,
-        limit: usize,
-        max_failures: u32,
-        inbound_type: StoredPeerType,
-    ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
-
-    /// Loads random peers of a specific type, ignoring next attempt time.
-    fn load_random_peers_by_type_max_failures(
-        &self,
-        limit: usize,
-        max_failures: u32,
-        peer_type: StoredPeerType,
+        filter: &PeerFilter,
     ) -> Result<Vec<(String, u16, PeerRecord)>, DbError>;
 
     /// Removes peers that have exceeded the failure threshold.
@@ -177,86 +164,59 @@ impl PeerQueries for Connection {
             .map_err(DbError::from)
     }
 
-    fn load_random_peers(
+    fn query_random_peers(
         &self,
         limit: usize,
-        max_failures: u32,
-        now: i64,
-        peer_type: Option<StoredPeerType>,
+        filter: &PeerFilter,
     ) -> Result<Vec<(String, u16, PeerRecord)>, DbError> {
-        if let Some(peer_type) = peer_type {
-            let sql = "SELECT ip, port, nextattempt, numfailures, type FROM peers \
-                       WHERE numfailures <= ?1 AND nextattempt <= ?2 AND type = ?3 \
-                       ORDER BY RANDOM() LIMIT ?4";
-            let mut stmt = self.prepare(sql)?;
-            let rows = stmt.query_map(
-                params![max_failures as i64, now, peer_type as i32, limit as i64],
-                peer_row,
-            )?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(DbError::from)
+        let mut sql = String::from(
+            "SELECT ip, port, nextattempt, numfailures, type FROM peers WHERE numfailures <= ?1",
+        );
+        let mut param_idx = 2;
+
+        // Build dynamic SQL based on filter
+        let time_val;
+        let type_val;
+
+        if let Some(now) = filter.before_time {
+            sql.push_str(&format!(" AND nextattempt <= ?{param_idx}"));
+            time_val = Some(now);
+            param_idx += 1;
         } else {
-            let sql = "SELECT ip, port, nextattempt, numfailures, type FROM peers \
-                       WHERE numfailures <= ?1 AND nextattempt <= ?2 \
-                       ORDER BY RANDOM() LIMIT ?3";
-            let mut stmt = self.prepare(sql)?;
-            let rows = stmt.query_map(params![max_failures as i64, now, limit as i64], peer_row)?;
-            rows.collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(DbError::from)
+            time_val = None;
         }
-    }
 
-    fn load_random_peers_any_outbound(
-        &self,
-        limit: usize,
-        max_failures: u32,
-        now: i64,
-        inbound_type: StoredPeerType,
-    ) -> Result<Vec<(String, u16, PeerRecord)>, DbError> {
-        let sql = "SELECT ip, port, nextattempt, numfailures, type FROM peers \
-                   WHERE numfailures <= ?1 AND nextattempt <= ?2 AND type != ?3 \
-                   ORDER BY RANDOM() LIMIT ?4";
-        let mut stmt = self.prepare(sql)?;
-        let rows = stmt.query_map(
-            params![max_failures as i64, now, inbound_type as i32, limit as i64],
-            peer_row,
-        )?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(DbError::from)
-    }
+        if let Some(ref tf) = filter.type_filter {
+            let op = match tf {
+                PeerTypeFilter::Equals(_) => "=",
+                PeerTypeFilter::NotEquals(_) => "!=",
+            };
+            sql.push_str(&format!(" AND type {op} ?{param_idx}"));
+            type_val = Some(match tf {
+                PeerTypeFilter::Equals(t) | PeerTypeFilter::NotEquals(t) => *t as i32,
+            });
+            param_idx += 1;
+        } else {
+            type_val = None;
+        }
 
-    fn load_random_peers_any_outbound_max_failures(
-        &self,
-        limit: usize,
-        max_failures: u32,
-        inbound_type: StoredPeerType,
-    ) -> Result<Vec<(String, u16, PeerRecord)>, DbError> {
-        let sql = "SELECT ip, port, nextattempt, numfailures, type FROM peers \
-                   WHERE numfailures <= ?1 AND type != ?2 \
-                   ORDER BY RANDOM() LIMIT ?3";
-        let mut stmt = self.prepare(sql)?;
-        let rows = stmt.query_map(
-            params![max_failures as i64, inbound_type as i32, limit as i64],
-            peer_row,
-        )?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(DbError::from)
-    }
+        sql.push_str(&format!(" ORDER BY RANDOM() LIMIT ?{param_idx}"));
 
-    fn load_random_peers_by_type_max_failures(
-        &self,
-        limit: usize,
-        max_failures: u32,
-        peer_type: StoredPeerType,
-    ) -> Result<Vec<(String, u16, PeerRecord)>, DbError> {
-        let sql = "SELECT ip, port, nextattempt, numfailures, type FROM peers \
-                   WHERE numfailures <= ?1 AND type = ?2 \
-                   ORDER BY RANDOM() LIMIT ?3";
-        let mut stmt = self.prepare(sql)?;
-        let rows = stmt.query_map(
-            params![max_failures as i64, peer_type as i32, limit as i64],
-            peer_row,
-        )?;
+        // Execute with dynamic params
+        let mut stmt = self.prepare(&sql)?;
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params_vec.push(Box::new(filter.max_failures as i64));
+        if let Some(t) = time_val {
+            params_vec.push(Box::new(t));
+        }
+        if let Some(t) = type_val {
+            params_vec.push(Box::new(t));
+        }
+        params_vec.push(Box::new(limit as i64));
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), peer_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(DbError::from)
     }
@@ -308,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn test_load_random_peers_any_outbound_max_failures() {
+    fn test_query_random_peers_not_equals_type() {
         let conn = setup_db();
         conn.store_peer("1.2.3.4", 1, PeerRecord::new(1, 0, Outbound))
             .unwrap();
@@ -319,15 +279,18 @@ mod tests {
         conn.store_peer("1.2.3.7", 4, PeerRecord::new(1, 11, Preferred))
             .unwrap();
 
-        let peers = conn
-            .load_random_peers_any_outbound_max_failures(10, 10, Inbound)
-            .unwrap();
+        let filter = PeerFilter {
+            max_failures: 10,
+            type_filter: Some(PeerTypeFilter::NotEquals(Inbound)),
+            ..Default::default()
+        };
+        let peers = conn.query_random_peers(10, &filter).unwrap();
         assert!(peers.iter().all(|(_, _, rec)| rec.peer_type != Inbound));
         assert!(peers.iter().all(|(_, _, rec)| rec.num_failures <= 10));
     }
 
     #[test]
-    fn test_load_random_peers_by_type_max_failures() {
+    fn test_query_random_peers_equals_type() {
         let conn = setup_db();
         conn.store_peer("1.2.3.4", 1, PeerRecord::new(1, 0, Outbound))
             .unwrap();
@@ -338,9 +301,12 @@ mod tests {
         conn.store_peer("1.2.3.7", 4, PeerRecord::new(1, 11, Preferred))
             .unwrap();
 
-        let peers = conn
-            .load_random_peers_by_type_max_failures(10, 10, Preferred)
-            .unwrap();
+        let filter = PeerFilter {
+            max_failures: 10,
+            type_filter: Some(PeerTypeFilter::Equals(Preferred)),
+            ..Default::default()
+        };
+        let peers = conn.query_random_peers(10, &filter).unwrap();
         assert!(peers.iter().all(|(_, _, rec)| rec.peer_type == Preferred));
         assert!(peers.iter().all(|(_, _, rec)| rec.num_failures <= 10));
     }
@@ -359,14 +325,19 @@ mod tests {
     }
 
     #[test]
-    fn test_load_random_peers() {
+    fn test_query_random_peers_with_time() {
         let conn = setup_db();
         conn.store_peer("1.2.3.4", 1, PeerRecord::new(1, 0, Outbound))
             .unwrap();
         conn.store_peer("1.2.3.5", 2, PeerRecord::new(2, 0, Preferred))
             .unwrap();
 
-        let peers = conn.load_random_peers(1, 10, 10, Some(Outbound)).unwrap();
+        let filter = PeerFilter {
+            max_failures: 10,
+            before_time: Some(10),
+            type_filter: Some(PeerTypeFilter::Equals(Outbound)),
+        };
+        let peers = conn.query_random_peers(1, &filter).unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].0, "1.2.3.4");
     }
