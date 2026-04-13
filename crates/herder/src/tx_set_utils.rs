@@ -60,13 +60,17 @@ pub(crate) fn envelope_inclusion_fee(env: &TransactionEnvelope) -> i64 {
 
 /// Get the number of operations from a transaction envelope.
 ///
-/// For fee-bump transactions, returns the inner transaction's operation count.
+/// For fee-bump transactions, returns the inner transaction's operation count
+/// plus 1 for the fee-bump wrapper itself, matching stellar-core's
+/// `FeeBumpTransactionFrame::getNumOperations()`.
 pub(crate) fn envelope_num_ops(env: &TransactionEnvelope) -> usize {
     match env {
         TransactionEnvelope::TxV0(e) => e.tx.operations.len(),
         TransactionEnvelope::Tx(e) => e.tx.operations.len(),
         TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.operations.len(),
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
+                inner.tx.operations.len() + 1
+            }
         },
     }
 }
@@ -2190,5 +2194,91 @@ mod tests {
 
         let invalid = get_invalid_tx_list(&[envelope], &ctx, &bounds, None);
         assert_eq!(invalid.len(), 1, "Inflation tx should be rejected at p21");
+    }
+
+    /// Helper to build a multi-op V1 transaction envelope.
+    fn make_multi_op_envelope(num_ops: usize, fee: u32) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+        let ops: Vec<Operation> = (0..num_ops).map(|_| op.clone()).collect();
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: ops.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        })
+    }
+
+    /// Helper to wrap a V1 envelope in a fee-bump.
+    fn make_fee_bump_envelope(inner: TransactionEnvelope, bumped_fee: i64) -> TransactionEnvelope {
+        let inner_v1 = match inner {
+            TransactionEnvelope::Tx(e) => e,
+            _ => panic!("expected V1 envelope"),
+        };
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([9u8; 32])),
+                fee: bumped_fee,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        })
+    }
+
+    /// Regression test for #1497: fee-bump op count must include +1 for wrapper.
+    #[test]
+    fn test_envelope_num_ops_v1() {
+        let env = make_multi_op_envelope(3, 300);
+        assert_eq!(envelope_num_ops(&env), 3);
+    }
+
+    #[test]
+    fn test_envelope_num_ops_fee_bump_includes_wrapper() {
+        let inner = make_multi_op_envelope(3, 300);
+        let fee_bump = make_fee_bump_envelope(inner, 600);
+        // stellar-core: FeeBumpTransactionFrame::getNumOperations() = inner ops + 1
+        assert_eq!(envelope_num_ops(&fee_bump), 4);
+    }
+
+    #[test]
+    fn test_envelope_num_ops_fee_bump_single_op() {
+        let inner = make_multi_op_envelope(1, 100);
+        let fee_bump = make_fee_bump_envelope(inner, 200);
+        assert_eq!(envelope_num_ops(&fee_bump), 2);
+    }
+
+    #[test]
+    fn test_envelope_fee_bump_returns_outer_fee() {
+        let inner = make_multi_op_envelope(2, 200);
+        let fee_bump = make_fee_bump_envelope(inner, 500);
+        assert_eq!(envelope_fee(&fee_bump), 500);
+    }
+
+    #[test]
+    fn test_envelope_inclusion_fee_fee_bump_classic() {
+        // Classic fee-bump: no resource_fee, so inclusion_fee = full fee
+        let inner = make_multi_op_envelope(2, 200);
+        let fee_bump = make_fee_bump_envelope(inner, 500);
+        assert_eq!(envelope_inclusion_fee(&fee_bump), 500);
     }
 }

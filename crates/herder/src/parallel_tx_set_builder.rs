@@ -565,7 +565,10 @@ const MAX_INCLUSION_FEE_TOLERANCE: f64 = 0.999;
 ///
 /// # Returns
 ///
-/// Stages of clusters of transaction envelopes: `stages[i][j]` = cluster j of stage i.
+/// A tuple of:
+/// - Stages of clusters of transaction envelopes: `stages[i][j]` = cluster j of stage i.
+/// - Whether any transactions were dropped (didn't fit any stage/cluster).
+///   Matches stellar-core's `hadTxNotFittingLane` feedback.
 pub fn build_parallel_soroban_phase(
     soroban_txs: &[TransactionEnvelope],
     network_id: NetworkId,
@@ -573,14 +576,14 @@ pub fn build_parallel_soroban_phase(
     ledger_max_dependent_tx_clusters: u32,
     min_stage_count: u32,
     max_stage_count: u32,
-) -> Vec<Vec<Vec<TransactionEnvelope>>> {
+) -> (Vec<Vec<Vec<TransactionEnvelope>>>, bool) {
     if soroban_txs.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     // If clusters_per_stage is 0, fall back to single cluster.
     if ledger_max_dependent_tx_clusters == 0 {
-        return vec![vec![soroban_txs.to_vec()]];
+        return (vec![vec![soroban_txs.to_vec()]], false);
     }
 
     // Try each stage count and collect (stages, fee) pairs.
@@ -615,7 +618,10 @@ pub fn build_parallel_soroban_phase(
         }
     }
 
-    best.unwrap_or_default()
+    let stages = best.unwrap_or_default();
+    let surviving_count: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
+    let had_tx_not_fitting = surviving_count < soroban_txs.len();
+    (stages, had_tx_not_fitting)
 }
 
 /// Convert parallel phase stages into a TransactionPhase::V1 XDR structure.
@@ -961,7 +967,8 @@ mod tests {
             8,       // clusters per stage
             1,
             1,
-        );
+        )
+        .0;
 
         // All three TXs should be in one cluster
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
@@ -980,7 +987,7 @@ mod tests {
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key2], 1000);
 
         let stages =
-            build_parallel_soroban_phase(&[tx_a, tx_b], test_network_id(), 100_000, 8, 1, 1);
+            build_parallel_soroban_phase(&[tx_a, tx_b], test_network_id(), 100_000, 8, 1, 1).0;
 
         // No conflicts: should be 2 separate clusters in 1 stage
         assert_eq!(stages.len(), 1);
@@ -1006,7 +1013,8 @@ mod tests {
             1, // only 1 cluster per stage
             1,
             1,
-        );
+        )
+        .0;
 
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 1);
@@ -1015,7 +1023,7 @@ mod tests {
         // Each TX is 60k > 50k, so neither fits. Use higher ledger max instead.
         // ledger_max=120k, 2 stages, 1 cluster each: cluster limit = 60k, stage limit = 60k.
         let stages =
-            build_parallel_soroban_phase(&[tx_a, tx_b], test_network_id(), 120_000, 1, 2, 2);
+            build_parallel_soroban_phase(&[tx_a, tx_b], test_network_id(), 120_000, 1, 2, 2).0;
 
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 2);
@@ -1109,8 +1117,10 @@ mod tests {
 
     #[test]
     fn test_empty_input() {
-        let stages = build_parallel_soroban_phase(&[], test_network_id(), 100_000, 8, 1, 4);
+        let (stages, had_drop) =
+            build_parallel_soroban_phase(&[], test_network_id(), 100_000, 8, 1, 4);
         assert!(stages.is_empty());
+        assert!(!had_drop);
     }
 
     #[test]
@@ -1124,7 +1134,7 @@ mod tests {
             })
             .collect();
 
-        let stages = build_parallel_soroban_phase(&txs, test_network_id(), 1_000_000, 8, 1, 4);
+        let stages = build_parallel_soroban_phase(&txs, test_network_id(), 1_000_000, 8, 1, 4).0;
 
         // Should use 1 stage since all fit
         assert_eq!(stages.len(), 1);
@@ -1148,6 +1158,52 @@ mod tests {
             }
             _ => panic!("Expected V1 phase"),
         }
+    }
+
+    /// Regression test for #1477/#1494: had_tx_not_fitting must be true when
+    /// the builder drops transactions that don't fit stage/cluster limits.
+    #[test]
+    fn test_had_tx_not_fitting_when_tx_dropped() {
+        let key1 = contract_key(1);
+        let key2 = contract_key(2);
+        // Two txs with 60k instructions each, but ledger max is 100k with 1 cluster.
+        let tx_a = make_soroban_tx(1, 1, vec![], vec![key1], 60_000);
+        let tx_b = make_soroban_tx(2, 1, vec![], vec![key2], 60_000);
+
+        let (stages, had_tx_not_fitting) = build_parallel_soroban_phase(
+            &[tx_a, tx_b],
+            test_network_id(),
+            100_000,
+            1, // 1 cluster per stage
+            1,
+            1,
+        );
+
+        // Only 1 tx fits (60k < 100k, but 120k > 100k)
+        let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
+        assert_eq!(total_txs, 1);
+        assert!(
+            had_tx_not_fitting,
+            "should report tx not fitting when builder drops txs"
+        );
+    }
+
+    #[test]
+    fn test_had_tx_not_fitting_false_when_all_fit() {
+        let key1 = contract_key(1);
+        let key2 = contract_key(2);
+        let tx_a = make_soroban_tx(1, 1, vec![], vec![key1], 1_000);
+        let tx_b = make_soroban_tx(2, 1, vec![], vec![key2], 1_000);
+
+        let (stages, had_tx_not_fitting) =
+            build_parallel_soroban_phase(&[tx_a, tx_b], test_network_id(), 1_000_000, 8, 1, 1);
+
+        let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
+        assert_eq!(total_txs, 2);
+        assert!(
+            !had_tx_not_fitting,
+            "should not report tx not fitting when all txs included"
+        );
     }
 }
 

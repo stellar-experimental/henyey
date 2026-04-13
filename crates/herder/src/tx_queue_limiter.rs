@@ -54,9 +54,9 @@ fn compute_better_fee(evicted_fee: i64, evicted_ops: u32, new_fee: i64, new_ops:
         return 0;
     }
 
-    // Check if new transaction already beats the evicted one
+    // Check if new transaction already beats the evicted one (strictly)
     if fee_rate_cmp(evicted_fee as u64, evicted_ops, new_fee as u64, new_ops)
-        != std::cmp::Ordering::Greater
+        == std::cmp::Ordering::Less
     {
         return 0;
     }
@@ -593,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_compute_better_fee() {
-        // New tx is already better - no fee needed
+        // New tx is strictly better - no fee needed
         assert_eq!(compute_better_fee(100, 10, 200, 10), 0);
 
         // Evicted has better rate - need higher fee
@@ -602,5 +602,27 @@ mod tests {
 
         // Edge case: zero ops in evicted
         assert_eq!(compute_better_fee(100, 0, 50, 10), 0);
+    }
+
+    /// Regression test for #1496: equal fee rates must NOT return 0.
+    /// stellar-core requires strictly higher fees; equal-rate should be rejected.
+    #[test]
+    fn test_compute_better_fee_rejects_equal_rate() {
+        // tx1: fee=200, ops=2 → rate=100
+        // tx2: fee=300, ops=3 → rate=100 (equal)
+        // Before fix: returned 0 (admitted). After fix: returns positive fee.
+        let min_fee = compute_better_fee(200, 2, 300, 3);
+        assert!(
+            min_fee > 0,
+            "Equal fee rates must require a higher fee, got {}",
+            min_fee
+        );
+    }
+
+    #[test]
+    fn test_compute_better_fee_accepts_strictly_higher_rate() {
+        // tx1: fee=200, ops=2 → rate=100
+        // tx2: fee=301, ops=3 → rate=100.33 (strictly better)
+        assert_eq!(compute_better_fee(200, 2, 301, 3), 0);
     }
 }

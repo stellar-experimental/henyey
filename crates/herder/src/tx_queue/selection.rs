@@ -161,19 +161,12 @@ impl TransactionQueue {
             self.config.network_id,
         );
 
-        let soroban_base_fee = if soroban_limited {
-            soroban_txs
-                .iter()
-                .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
-                .min()
-                .or(Some(base_fee))
-        } else if soroban_txs.is_empty() {
-            None
-        } else {
-            Some(base_fee)
-        };
-
-        let soroban_phase = build_soroban_phase(soroban_txs, soroban_base_fee, &self.config);
+        // Build Soroban phase first, then compute base fee from survivors.
+        // This fixes #1477 (stale base fee after trim) and #1494 (missing
+        // hadTxNotFittingLane feedback). stellar-core computes base fee after
+        // building the parallel phase using computeLaneBaseFee().
+        let (soroban_phase, _soroban_base_fee) =
+            build_soroban_phase_with_base_fee(soroban_txs, soroban_limited, base_fee, &self.config);
 
         let trimmed_transactions = collect_phase_transactions(&classic_phase, &soroban_phase);
 
@@ -490,22 +483,36 @@ impl TransactionQueue {
     }
 }
 
-/// Build the classic transaction phase with lane-based fee components.
-/// Build the Soroban phase, using the parallel builder when configured.
-fn build_soroban_phase(
+/// Build the Soroban phase and compute base fee from surviving transactions.
+///
+/// Matches stellar-core's approach: build the parallel phase first, then derive
+/// the base fee from the transactions that actually fit. This prevents stale
+/// base fees from transactions dropped during stage packing.
+///
+/// Returns (phase, base_fee_used) — the base_fee_used is also embedded in the phase.
+fn build_soroban_phase_with_base_fee(
     soroban_txs: Vec<TransactionEnvelope>,
-    soroban_base_fee: Option<i64>,
+    soroban_limited: bool,
+    ledger_base_fee: i64,
     config: &super::TxQueueConfig,
-) -> stellar_xdr::curr::TransactionPhase {
+) -> (stellar_xdr::curr::TransactionPhase, Option<i64>) {
     use stellar_xdr::curr::{
         DependentTxCluster, ParallelTxExecutionStage, ParallelTxsComponent, TransactionPhase, VecM,
     };
 
     if soroban_txs.is_empty() {
-        return TransactionPhase::V1(ParallelTxsComponent {
-            base_fee: soroban_base_fee,
-            execution_stages: VecM::default(),
-        });
+        let base_fee = if soroban_limited {
+            Some(ledger_base_fee)
+        } else {
+            None
+        };
+        return (
+            TransactionPhase::V1(ParallelTxsComponent {
+                base_fee,
+                execution_stages: VecM::default(),
+            }),
+            base_fee,
+        );
     }
 
     let use_parallel = config.ledger_max_instructions > 0
@@ -513,22 +520,80 @@ fn build_soroban_phase(
         && config.soroban_phase_max_stage_count > 0;
 
     if use_parallel {
-        let stages = crate::parallel_tx_set_builder::build_parallel_soroban_phase(
-            &soroban_txs,
-            config.network_id,
-            config.ledger_max_instructions,
-            config.ledger_max_dependent_tx_clusters,
-            config.soroban_phase_min_stage_count,
-            config.soroban_phase_max_stage_count,
+        let (stages, had_tx_not_fitting) =
+            crate::parallel_tx_set_builder::build_parallel_soroban_phase(
+                &soroban_txs,
+                config.network_id,
+                config.ledger_max_instructions,
+                config.ledger_max_dependent_tx_clusters,
+                config.soroban_phase_min_stage_count,
+                config.soroban_phase_max_stage_count,
+            );
+
+        // Compute base fee from surviving txs (post-build), not candidates.
+        // stellar-core: computeLaneBaseFee uses hadTxNotFittingLane + lowest
+        // fee of surviving txs.
+        let soroban_base_fee = compute_soroban_base_fee(
+            &stages,
+            soroban_limited,
+            had_tx_not_fitting,
+            ledger_base_fee,
         );
-        crate::parallel_tx_set_builder::stages_to_xdr_phase(stages, soroban_base_fee)
+
+        let phase = crate::parallel_tx_set_builder::stages_to_xdr_phase(stages, soroban_base_fee);
+        (phase, soroban_base_fee)
     } else {
+        // Non-parallel: all txs included, no drops possible.
+        let soroban_base_fee = if soroban_limited {
+            soroban_txs
+                .iter()
+                .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
+                .min()
+                .or(Some(ledger_base_fee))
+        } else {
+            Some(ledger_base_fee)
+        };
+
         let cluster = DependentTxCluster(soroban_txs.try_into().unwrap_or_default());
         let stage = ParallelTxExecutionStage(vec![cluster].try_into().unwrap_or_default());
-        TransactionPhase::V1(ParallelTxsComponent {
+        let phase = TransactionPhase::V1(ParallelTxsComponent {
             base_fee: soroban_base_fee,
             execution_stages: vec![stage].try_into().unwrap_or_default(),
-        })
+        });
+        (phase, soroban_base_fee)
+    }
+}
+
+/// Compute Soroban base fee from surviving transactions after parallel build.
+///
+/// Matches stellar-core's `computeLaneBaseFee` logic:
+/// - If surge-priced (limited) or txs were dropped: use min fee-per-op of survivors
+/// - Otherwise: use ledger base fee
+fn compute_soroban_base_fee(
+    stages: &[Vec<Vec<TransactionEnvelope>>],
+    soroban_limited: bool,
+    had_tx_not_fitting: bool,
+    ledger_base_fee: i64,
+) -> Option<i64> {
+    if stages.is_empty() {
+        return if soroban_limited || had_tx_not_fitting {
+            Some(ledger_base_fee)
+        } else {
+            None
+        };
+    }
+
+    if soroban_limited || had_tx_not_fitting {
+        // Compute min fee-per-op from surviving txs
+        let min_fee = stages
+            .iter()
+            .flat_map(|stage| stage.iter())
+            .flat_map(|cluster| cluster.iter())
+            .filter_map(|tx| envelope_fee_per_op(tx).map(|(per_op, _, _)| per_op as i64))
+            .min();
+        min_fee.or(Some(ledger_base_fee))
+    } else {
+        Some(ledger_base_fee)
     }
 }
 
