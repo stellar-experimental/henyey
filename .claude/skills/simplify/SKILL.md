@@ -38,6 +38,21 @@ would make it harder to verify parity. Signs of parity-driven structure:
 This filter applies most often to: LARGE MODULE, GOD FUNCTION, DEEP NESTING,
 LONG PARAMETER LIST, DUPLICATION, and MAGIC NUMBERS.
 
+### Strengthened parity rules
+
+These specific patterns should **always be suppressed**:
+
+- **1:1 module mapping**: If a `.rs` file maps directly to a stellar-core `.cpp`
+  file (e.g., `bucket_list.rs` ↔ `BucketList.cpp`), do NOT flag it as LARGE
+  MODULE. The module's size reflects the upstream structure.
+- **Orchestration methods**: Methods on structs that mirror stellar-core classes
+  (e.g., `App`, `LedgerManager`, `Herder`) that coordinate multiple subsystems
+  are exempt from GOD FUNCTION. These methods require broad field access; extraction
+  would introduce parameter bloat or artificial state structs.
+- **Protocol-version functions**: Functions with version suffixes (`_p24`, `_p25`,
+  `_p26`) are exempt from GOD FUNCTION and DUPLICATION. Each version has
+  intentional subtle differences that are safer to keep explicit than to abstract.
+
 **Exception**: The Idiom categories (C-STYLE MUTATION, C-STYLE OUTPUT PARAMETER,
 C-STYLE OPTION HANDLING) are exempt — always report them regardless of parity.
 
@@ -50,12 +65,20 @@ For each finding, classify it into exactly one category:
     Suggest reduction via extraction, deduplication, or dead-code removal.
     Only recommend a directory module (`foo/mod.rs`) when 3+ separable concerns
     each exceed ~200 lines. Never split solely to extract tests.
- 2. **GOD FUNCTION** — any function over 150 lines or with cyclomatic complexity
+    **Suppress if**: the module is a cohesive unit — well-named functions with
+    clear internal structure but no obvious separation boundary. Being large
+    alone is not a finding; the module must have identifiable separable concerns.
+ 2. **GOD FUNCTION** — any function over 200 lines or with cyclomatic complexity
     that makes it hard to follow. Suggest extraction points and names.
+    **Suppress if**: the function is a sequential pipeline (≤2 nesting levels)
+    with clearly labeled phases (setup → process → cleanup), or a flat mapping
+    function (e.g., config translation). High line count with low nesting and
+    linear flow is not complexity.
  3. **DEEP NESTING** — blocks indented 4+ levels. Suggest early returns, guard
     clauses, or extraction to flatten.
  4. **LONG PARAMETER LIST** — functions taking 7+ parameters. Suggest grouping
-    into a context/config struct.
+    into a context/config struct. **Reinforce parity check**: if the parameter
+    list mirrors the corresponding stellar-core function, suppress.
 
 ### Redundancy
  5. **DEAD CODE** — functions, fields, methods, or branches that are never used
@@ -65,11 +88,18 @@ For each finding, classify it into exactly one category:
  7. **DUPLICATE STATE** — the same truth tracked in 2+ places that must be kept
     in sync manually. Suggest which copy to remove.
  8. **SCATTERED CONCERN** — a single logical operation performed in multiple call
-    sites instead of one function.
+    sites instead of one function. **Only report** when consolidation would be a
+    net improvement (fewer total lines, clearer intent). Do not report when the
+    duplication is incidental or the call sites have meaningful differences.
  9. **UNNECESSARY CLONING** — values cloned where a borrow or move would suffice.
+    **Skip** when the cloned type is small (≤64 bytes), implements or could
+    implement `Copy`, or the clone is in a cold path — the performance cost is
+    negligible and removing it adds no clarity.
 10. **TRIVIAL WRAPPER** — one-liner functions that only delegate with no added
     logic. Inline and remove, unless the wrapper provides meaningful abstraction
-    (e.g., a public API shielding an internal signature).
+    (e.g., a public API shielding an internal signature, semantic naming that
+    improves call-site readability, or API stability for a frequently-changing
+    internal function).
 
 ### Naming & Constants
 11. **MISLEADING NAMES** — identifiers whose name does not match their actual
@@ -108,6 +138,8 @@ idiomatically Rust, not a transliteration of C++.
     instead of `if !func(...) { return error; }` chains.
     *Example*: `add_account_balance(account: &mut AccountEntry, delta: i64) -> bool`
     → `fn add_account_balance(account: &mut AccountEntry, delta: i64) -> Result<(), BalanceError>`.
+    **Skip**: In-place slice sorting (`sort_by`, `sort_unstable_by`) and mutable
+    slice operations are idiomatic Rust, not C-isms.
 18. **C-STYLE OUTPUT PARAMETER** — functions that take `&mut Vec<T>` (or similar
     containers) as output parameters instead of returning a collection. The Rust
     idiom is to return the collected value, letting the caller decide how to
