@@ -10,7 +10,7 @@ use henyey_tx::validation::check_valid_pre_seq_num;
 use henyey_tx::{validate_operation, TransactionFrame};
 use stellar_xdr::curr::{
     AccountId, AlphaNum4, Asset, AssetCode4, ClawbackOp, ContractDataDurability, ContractId,
-    ContractIdPreimage, CreateContractArgsV2, ExtendFootprintTtlOp, FeeBumpTransaction,
+    ContractIdPreimage, CreateContractArgs, ExtendFootprintTtlOp, FeeBumpTransaction,
     FeeBumpTransactionEnvelope, FeeBumpTransactionExt, FeeBumpTransactionInnerTx, Hash,
     HostFunction, InvokeHostFunctionOp, LedgerFootprint, LedgerKey, LedgerKeyAccount,
     LedgerKeyContractCode, LedgerKeyContractData, Memo, MuxedAccount, MuxedAccountMed25519,
@@ -330,9 +330,8 @@ fn test_reject_clawback_muxed_from_not_self_clawback() {
 // lines 1300-1310
 // ============================================================================
 
-/// CreateContract FROM_ASSET with invalid asset code should be rejected.
+/// Regression test for #1486 — CreateContract fromAsset with invalid asset code.
 #[test]
-#[ignore] // Blocked on #1486
 fn test_reject_create_contract_from_invalid_asset() {
     use stellar_xdr::curr::ContractExecutable;
 
@@ -343,10 +342,9 @@ fn test_reject_create_contract_from_invalid_asset() {
     });
 
     let op_body = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
-        host_function: HostFunction::CreateContractV2(CreateContractArgsV2 {
+        host_function: HostFunction::CreateContract(CreateContractArgs {
             contract_id_preimage: ContractIdPreimage::Asset(invalid_asset),
             executable: ContractExecutable::StellarAsset,
-            constructor_args: VecM::default(),
         }),
         auth: VecM::default(),
     });

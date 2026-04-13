@@ -212,7 +212,9 @@ pub fn validate_operation(
         }
         OperationBody::LiquidityPoolDeposit(inner) => validate_liquidity_pool_deposit(inner),
         OperationBody::LiquidityPoolWithdraw(inner) => validate_liquidity_pool_withdraw(inner),
-        OperationBody::InvokeHostFunction(inner) => validate_invoke_host_function(inner),
+        OperationBody::InvokeHostFunction(inner) => {
+            validate_invoke_host_function(inner, protocol_version)
+        }
         OperationBody::ExtendFootprintTtl(inner) => validate_extend_footprint_ttl(inner),
         OperationBody::RestoreFootprint(inner) => validate_restore_footprint(inner),
     }
@@ -945,10 +947,22 @@ fn validate_liquidity_pool_withdraw(
 }
 
 /// Validate InvokeHostFunction operation.
+/// stellar-core: InvokeHostFunctionOpFrame::doCheckValidForSoroban (lines 1283-1313)
 fn validate_invoke_host_function(
-    _op: &InvokeHostFunctionOp,
+    op: &InvokeHostFunctionOp,
+    protocol_version: u32,
 ) -> std::result::Result<(), OperationValidationError> {
-    // Soroban validation is complex, trust XDR for basic structure
+    // CreateContract with fromAsset: validate the asset.
+    // stellar-core: InvokeHostFunctionOpFrame.cpp:1301-1309
+    if let stellar_xdr::curr::HostFunction::CreateContract(args) = &op.host_function {
+        if let stellar_xdr::curr::ContractIdPreimage::Asset(asset) = &args.contract_id_preimage {
+            if !is_asset_valid(asset, protocol_version) {
+                return Err(OperationValidationError::InvalidAsset(
+                    "invalid asset in CreateContract fromAsset".into(),
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
