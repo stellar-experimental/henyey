@@ -229,9 +229,8 @@ fn test_reject_extend_footprint_ttl_non_soroban_key() {
 // Mirrors: stellar-core FeeBumpTransactionFrame resource fee validation
 // ============================================================================
 
-/// Fee-bump wrapping Soroban tx where resource_fee makes inclusion fee negative.
+/// Regression test for #1492 — Fee-bump Soroban resource_fee overflow.
 #[test]
-#[ignore] // Blocked on #1492
 fn test_reject_fee_bump_soroban_resource_fee_overflow() {
     let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
 

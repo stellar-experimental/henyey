@@ -382,6 +382,16 @@ pub fn validate_fee_bump(
         }
     }
 
+    // Validate Soroban resource_fee upper bound (XDRProvidesValidFee).
+    // stellar-core: TransactionFrame.cpp:1773, MAX_RESOURCE_FEE = 1<<50
+    if frame.inner_frame().is_soroban() {
+        const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
+        let resource_fee = frame.inner_frame().declared_soroban_resource_fee();
+        if resource_fee < 0 || resource_fee > MAX_RESOURCE_FEE {
+            return Err(FeeBumpError::InvalidInnerTxType);
+        }
+    }
+
     // Validate inner transaction operation count
     if frame.operation_count() == 0 {
         return Err(FeeBumpError::TooManyOperations(0));

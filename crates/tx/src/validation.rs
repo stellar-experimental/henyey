@@ -958,6 +958,18 @@ pub fn check_valid_pre_seq_num(
         ));
     }
 
+    // 1b. XDRProvidesValidFee: Soroban txs must have resource_fee in [0, MAX_RESOURCE_FEE].
+    // stellar-core: TransactionFrame.cpp:1763-1779, MAX_RESOURCE_FEE = 1<<50
+    if frame.is_soroban() {
+        const MAX_RESOURCE_FEE: i64 = 1i64 << 50;
+        let resource_fee = frame.declared_soroban_resource_fee();
+        if resource_fee < 0 || resource_fee > MAX_RESOURCE_FEE {
+            return Err(PreSeqNumError::Malformed(
+                "Soroban resource fee out of valid range".to_string(),
+            ));
+        }
+    }
+
     // 2. Extra signer structural checks (stellar-core commonValidPreSeqNum:1305-1324)
     //    - Duplicate extra signers
     //    - Empty ed25519 signed payload
