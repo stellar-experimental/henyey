@@ -1020,21 +1020,44 @@ mod tests {
 
     /// Regression test for #1483: max_entry_ttl must come from live config, not hardcoded.
     /// With a small max_entry_ttl, extend_to values that would pass with the historical
-    /// 6_312_000 must be rejected.
+    /// hardcoded 6_312_000 must be rejected.
     #[test]
     fn test_extend_footprint_ttl_uses_live_max_entry_ttl() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
         let context = create_test_context();
         let source = create_test_account_id(0);
 
+        // Provide valid soroban_data with empty footprint so the function
+        // exercises the TTL check rather than returning Malformed for missing data.
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        // With max_entry_ttl = 100, extend_to = 200 must be Malformed (TTL check).
+        // Before the fix, the hardcoded 6_312_000 would have let this pass.
         let op_200 = ExtendFootprintTtlOp {
             ext: ExtensionPoint::V0,
             extend_to: 200,
         };
-
-        // With max_entry_ttl = 100, extend_to = 200 must be Malformed
         let result = execute_extend_footprint_ttl(
-            &op_200, &source, &mut state, &context, None, None, None, 100,
+            &op_200,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+            None,
+            100,
         );
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1048,35 +1071,8 @@ mod tests {
             _ => panic!("Unexpected result type"),
         }
 
-        // Boundary: extend_to = max_entry_ttl - 1 is the highest valid value (not TTL-malformed)
-        let op_boundary = ExtendFootprintTtlOp {
-            ext: ExtensionPoint::V0,
-            extend_to: 99,
-        };
-        let result = execute_extend_footprint_ttl(
-            &op_boundary,
-            &source,
-            &mut state,
-            &context,
-            None,
-            None,
-            None,
-            100,
-        );
-        assert!(result.is_ok());
-        match result.unwrap() {
-            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
-                // extend_to=99 passes the TTL check; returns Malformed only due to missing soroban_data
-                assert!(
-                    matches!(r, ExtendFootprintTtlResult::Malformed),
-                    "got {:?}",
-                    r
-                );
-            }
-            _ => panic!("Unexpected result type"),
-        }
-
-        // Boundary: extend_to = max_entry_ttl should be Malformed (TTL check)
+        // Boundary: extend_to = max_entry_ttl (100) should also be Malformed
+        // because the check is extend_to > max_entry_ttl - 1.
         let op_at_limit = ExtendFootprintTtlOp {
             ext: ExtensionPoint::V0,
             extend_to: 100,
@@ -1086,7 +1082,7 @@ mod tests {
             &source,
             &mut state,
             &context,
-            None,
+            Some(&soroban_data),
             None,
             None,
             100,
@@ -1097,6 +1093,34 @@ mod tests {
                 assert!(
                     matches!(r, ExtendFootprintTtlResult::Malformed),
                     "extend_to=100 with max_entry_ttl=100 should be Malformed, got {:?}",
+                    r
+                );
+            }
+            _ => panic!("Unexpected result type"),
+        }
+
+        // Boundary: extend_to = max_entry_ttl - 1 (99) is the highest valid value.
+        // With valid soroban_data and empty footprint, this should succeed as a no-op.
+        let op_boundary = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 99,
+        };
+        let result = execute_extend_footprint_ttl(
+            &op_boundary,
+            &source,
+            &mut state,
+            &context,
+            Some(&soroban_data),
+            None,
+            None,
+            100,
+        );
+        assert!(result.is_ok());
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::ExtendFootprintTtl(r)) => {
+                assert!(
+                    matches!(r, ExtendFootprintTtlResult::Success),
+                    "extend_to=99 with max_entry_ttl=100 should succeed (no-op), got {:?}",
                     r
                 );
             }

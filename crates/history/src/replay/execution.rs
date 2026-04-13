@@ -741,7 +741,7 @@ pub fn replay_ledger_with_execution(
             header.ledger_seq,
             bucket_list,
             state_size,
-            None,
+            Some(&eviction_settings),
         ) {
             // Remove any existing window entry (e.g. from a config upgrade resize)
             all_live_entries.retain(|e| {
