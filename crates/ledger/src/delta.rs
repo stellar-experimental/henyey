@@ -34,6 +34,34 @@ use stellar_xdr::curr::{
     LedgerKeyAccount, VecM,
 };
 
+/// For TTL entries, take the max `live_until_ledger_seq`.
+/// For all other entries, take the incoming value (last-writer-wins).
+///
+/// Mirrors stellar-core's `maybeMergeRoTTLBumps`: when parallel execution
+/// produces two Updates for the same TTL key, the correct result is
+/// `max(existing, incoming)` rather than last-writer-wins.
+fn merge_ttl_current(
+    key: &LedgerKey,
+    existing_current: &LedgerEntry,
+    incoming_current: &LedgerEntry,
+) -> std::result::Result<LedgerEntry, LedgerError> {
+    if !matches!(key, LedgerKey::Ttl(_)) {
+        return Ok(incoming_current.clone());
+    }
+    match (&existing_current.data, &incoming_current.data) {
+        (LedgerEntryData::Ttl(existing_ttl), LedgerEntryData::Ttl(incoming_ttl)) => {
+            if incoming_ttl.live_until_ledger_seq > existing_ttl.live_until_ledger_seq {
+                Ok(incoming_current.clone())
+            } else {
+                Ok(existing_current.clone())
+            }
+        }
+        _ => Err(LedgerError::Internal(
+            "merge_ttl_current: TTL key with non-TTL entry data".to_string(),
+        )),
+    }
+}
+
 /// Represents a single change to a ledger entry.
 ///
 /// Each change captures enough information to:
@@ -248,13 +276,20 @@ impl LedgerDelta {
                     // If we created and then updated, just record as created with new value
                     self.changes.insert(key, EntryChange::Created(current));
                 }
-                EntryChange::Updated { previous: orig, .. } => {
-                    // Update the current value, keep original previous
+                EntryChange::Updated {
+                    previous: orig,
+                    current: existing_current,
+                } => {
+                    // For TTL entries, take max(live_until_ledger_seq) instead
+                    // of last-writer-wins. This is critical for correctness when
+                    // multiple RO TTL bumps for the same key are coalesced.
+                    // Parity: stellar-core maybeMergeRoTTLBumps.
+                    let merged = merge_ttl_current(&key, existing_current, &current)?;
                     self.changes.insert(
                         key,
                         EntryChange::Updated {
                             previous: orig.clone(),
-                            current: Box::new(current),
+                            current: Box::new(merged),
                         },
                     );
                 }
@@ -759,12 +794,22 @@ impl LedgerDelta {
                                         EntryChange::Created(current.as_ref().clone()),
                                     );
                                 }
-                                EntryChange::Updated { previous: orig, .. } => {
+                                EntryChange::Updated {
+                                    previous: orig,
+                                    current: existing_current,
+                                } => {
+                                    // For TTL entries, take max(live_until_ledger_seq)
+                                    // instead of last-writer-wins. Critical for
+                                    // cross-cluster parallel Soroban execution where
+                                    // multiple clusters may RO-bump the same TTL.
+                                    // Parity: stellar-core maybeMergeRoTTLBumps.
+                                    let merged =
+                                        merge_ttl_current(&key, existing_current, current)?;
                                     self.changes.insert(
                                         key,
                                         EntryChange::Updated {
                                             previous: orig.clone(),
-                                            current: current.clone(),
+                                            current: Box::new(merged),
                                         },
                                     );
                                 }
@@ -1942,5 +1987,352 @@ mod tests {
             .apply_refund_to_account(&nonexistent_id, 1000)
             .unwrap();
         assert!(!applied, "refund must fail for account not in delta");
+    }
+
+    // --- TTL max-merge tests (parity: stellar-core maybeMergeRoTTLBumps) ---
+
+    fn create_test_ttl_entry(seed: u8, live_until: u32) -> LedgerEntry {
+        let mut key_hash = [0u8; 32];
+        key_hash[0] = seed;
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {
+                key_hash: stellar_xdr::curr::Hash(key_hash),
+                live_until_ledger_seq: live_until,
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    #[test]
+    fn test_merge_ttl_updated_updated_takes_max() {
+        let original = create_test_ttl_entry(1, 100);
+        let higher = create_test_ttl_entry(1, 200);
+        let lower = create_test_ttl_entry(1, 150);
+
+        let mut delta1 = LedgerDelta::new(1);
+        delta1
+            .record_update(original.clone(), higher.clone())
+            .unwrap();
+
+        let mut delta2 = LedgerDelta::new(1);
+        delta2.record_update(original.clone(), lower).unwrap();
+
+        delta1.merge(delta2).unwrap();
+
+        let changes: Vec<_> = delta1.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Updated { current, .. } = &changes[0] {
+            if let LedgerEntryData::Ttl(ttl) = &current.data {
+                assert_eq!(ttl.live_until_ledger_seq, 200, "should take max TTL");
+            } else {
+                panic!("expected TTL entry data");
+            }
+        } else {
+            panic!("expected Updated change");
+        }
+    }
+
+    #[test]
+    fn test_merge_ttl_updated_updated_incoming_higher() {
+        let original = create_test_ttl_entry(1, 100);
+        let lower = create_test_ttl_entry(1, 150);
+        let higher = create_test_ttl_entry(1, 300);
+
+        let mut delta1 = LedgerDelta::new(1);
+        delta1.record_update(original.clone(), lower).unwrap();
+
+        let mut delta2 = LedgerDelta::new(1);
+        delta2
+            .record_update(original.clone(), higher.clone())
+            .unwrap();
+
+        delta1.merge(delta2).unwrap();
+
+        let changes: Vec<_> = delta1.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Updated { current, .. } = &changes[0] {
+            if let LedgerEntryData::Ttl(ttl) = &current.data {
+                assert_eq!(ttl.live_until_ledger_seq, 300, "should take max TTL");
+            } else {
+                panic!("expected TTL entry data");
+            }
+        } else {
+            panic!("expected Updated change");
+        }
+    }
+
+    #[test]
+    fn test_record_update_ttl_takes_max() {
+        let original = create_test_ttl_entry(1, 100);
+        let higher = create_test_ttl_entry(1, 200);
+        let lower = create_test_ttl_entry(1, 150);
+
+        let mut delta = LedgerDelta::new(1);
+        delta
+            .record_update(original.clone(), higher.clone())
+            .unwrap();
+        delta.record_update(original.clone(), lower).unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Updated {
+            current, previous, ..
+        } = &changes[0]
+        {
+            if let LedgerEntryData::Ttl(ttl) = &current.data {
+                assert_eq!(ttl.live_until_ledger_seq, 200, "should take max TTL");
+            } else {
+                panic!("expected TTL entry data");
+            }
+            // Previous should be the original
+            if let LedgerEntryData::Ttl(ttl) = &previous.data {
+                assert_eq!(ttl.live_until_ledger_seq, 100);
+            }
+        } else {
+            panic!("expected Updated change");
+        }
+    }
+
+    #[test]
+    fn test_record_update_ttl_incoming_higher() {
+        let original = create_test_ttl_entry(1, 100);
+        let lower = create_test_ttl_entry(1, 150);
+        let higher = create_test_ttl_entry(1, 300);
+
+        let mut delta = LedgerDelta::new(1);
+        delta.record_update(original.clone(), lower).unwrap();
+        delta
+            .record_update(original.clone(), higher.clone())
+            .unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Updated { current, .. } = &changes[0] {
+            if let LedgerEntryData::Ttl(ttl) = &current.data {
+                assert_eq!(ttl.live_until_ledger_seq, 300, "should take max TTL");
+            } else {
+                panic!("expected TTL entry data");
+            }
+        } else {
+            panic!("expected Updated change");
+        }
+    }
+
+    #[test]
+    fn test_merge_non_ttl_still_last_writer_wins() {
+        let original = create_test_account(1);
+        let mut v1 = original.clone();
+        if let LedgerEntryData::Account(ref mut acc) = v1.data {
+            acc.balance = 2000;
+        }
+        let mut v2 = original.clone();
+        if let LedgerEntryData::Account(ref mut acc) = v2.data {
+            acc.balance = 1500;
+        }
+
+        let mut delta1 = LedgerDelta::new(1);
+        delta1.record_update(original.clone(), v1).unwrap();
+
+        let mut delta2 = LedgerDelta::new(1);
+        delta2.record_update(original.clone(), v2.clone()).unwrap();
+
+        delta1.merge(delta2).unwrap();
+
+        let changes: Vec<_> = delta1.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Updated { current, .. } = &changes[0] {
+            if let LedgerEntryData::Account(acc) = &current.data {
+                assert_eq!(acc.balance, 1500, "non-TTL should use last-writer-wins");
+            } else {
+                panic!("expected Account entry data");
+            }
+        } else {
+            panic!("expected Updated change");
+        }
+    }
+
+    #[test]
+    fn test_record_update_non_ttl_still_last_writer_wins() {
+        let original = create_test_account(1);
+        let mut v1 = original.clone();
+        if let LedgerEntryData::Account(ref mut acc) = v1.data {
+            acc.balance = 2000;
+        }
+        let mut v2 = original.clone();
+        if let LedgerEntryData::Account(ref mut acc) = v2.data {
+            acc.balance = 1500;
+        }
+
+        let mut delta = LedgerDelta::new(1);
+        delta.record_update(original.clone(), v1).unwrap();
+        delta.record_update(original.clone(), v2.clone()).unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Updated { current, .. } = &changes[0] {
+            if let LedgerEntryData::Account(acc) = &current.data {
+                assert_eq!(acc.balance, 1500, "non-TTL should use last-writer-wins");
+            } else {
+                panic!("expected Account entry data");
+            }
+        } else {
+            panic!("expected Updated change");
+        }
+    }
+
+    #[test]
+    fn test_merge_ttl_created_updated_not_max_merged() {
+        // Created+Updated for TTL should NOT max-merge (parity with stellar-core
+        // which only max-merges existing TTL entries, not creates).
+        let created = create_test_ttl_entry(1, 200);
+        let original = create_test_ttl_entry(1, 100);
+        let updated = create_test_ttl_entry(1, 150);
+
+        let mut delta1 = LedgerDelta::new(1);
+        delta1.record_create(created).unwrap();
+
+        let mut delta2 = LedgerDelta::new(1);
+        delta2.record_update(original, updated.clone()).unwrap();
+
+        // Merging Update on top of Created → Created with incoming current value
+        delta1.merge(delta2).unwrap();
+
+        let changes: Vec<_> = delta1.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Created(entry) = &changes[0] {
+            if let LedgerEntryData::Ttl(ttl) = &entry.data {
+                assert_eq!(
+                    ttl.live_until_ledger_seq, 150,
+                    "Created+Updated should take incoming, not max"
+                );
+            } else {
+                panic!("expected TTL entry data");
+            }
+        } else {
+            panic!("expected Created change");
+        }
+    }
+
+    // --- Pipeline-level scenario tests ---
+
+    /// Simulates the intra-cluster pipeline: two TXs in the same cluster both
+    /// RO-bump the same TTL key via `record_ro_ttl_bump_for_meta`, which appends
+    /// to the tx-crate delta. `apply_to_delta()` replays both into the ledger
+    /// delta, triggering Updated→Updated coalescing. The higher value (TX1=200)
+    /// must survive even though the lower value (TX2=150) is replayed second.
+    #[test]
+    fn test_intra_cluster_ro_ttl_pipeline_takes_max() {
+        let original = create_test_ttl_entry(1, 100);
+        // TX1 bumps to 200 (RO), TX2 bumps to 150 (RO) — both see same pre_state
+        let tx1_bump = create_test_ttl_entry(1, 200);
+        let tx2_bump = create_test_ttl_entry(1, 150);
+
+        let mut delta = LedgerDelta::new(1);
+        // apply_to_delta replays changes in order: TX1's update first, TX2's second
+        delta.record_update(original.clone(), tx1_bump).unwrap();
+        delta.record_update(original.clone(), tx2_bump).unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Updated { current, previous } = &changes[0] {
+            if let LedgerEntryData::Ttl(ttl) = &current.data {
+                assert_eq!(
+                    ttl.live_until_ledger_seq, 200,
+                    "intra-cluster: must take max TTL, not last writer"
+                );
+            } else {
+                panic!("expected TTL entry data");
+            }
+            if let LedgerEntryData::Ttl(ttl) = &previous.data {
+                assert_eq!(
+                    ttl.live_until_ledger_seq, 100,
+                    "previous should be original"
+                );
+            }
+        } else {
+            panic!("expected Updated change");
+        }
+    }
+
+    /// Simulates cross-cluster parallel execution: two independent clusters each
+    /// produce a LedgerDelta with an RO TTL bump for the same key. When merged
+    /// via `delta.merge(cluster_delta)`, the result must be max().
+    #[test]
+    fn test_cross_cluster_ttl_merge_takes_max() {
+        let original = create_test_ttl_entry(1, 100);
+        let cluster_a_bump = create_test_ttl_entry(1, 200);
+        let cluster_b_bump = create_test_ttl_entry(1, 150);
+
+        // Cluster A delta
+        let mut main_delta = LedgerDelta::new(1);
+        main_delta
+            .record_update(original.clone(), cluster_a_bump)
+            .unwrap();
+
+        // Cluster B delta
+        let mut cluster_b_delta = LedgerDelta::new(1);
+        cluster_b_delta
+            .record_update(original.clone(), cluster_b_bump)
+            .unwrap();
+
+        // Merge B into A (mirrors tx_set.rs:1366)
+        main_delta.merge(cluster_b_delta).unwrap();
+
+        let changes: Vec<_> = main_delta.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Updated { current, .. } = &changes[0] {
+            if let LedgerEntryData::Ttl(ttl) = &current.data {
+                assert_eq!(
+                    ttl.live_until_ledger_seq, 200,
+                    "cross-cluster: must take max TTL, not last writer"
+                );
+            } else {
+                panic!("expected TTL entry data");
+            }
+        } else {
+            panic!("expected Updated change");
+        }
+    }
+
+    /// Simulates RW TTL update after an RO bump within the same cluster.
+    /// After flush_ro_ttl_bumps_for_write_footprint, the RW TX sees the bumped
+    /// state and extends further. The RW value (300) > RO value (200), so max()
+    /// correctly picks the RW value.
+    #[test]
+    fn test_intra_cluster_rw_after_ro_ttl_bump() {
+        let original = create_test_ttl_entry(1, 100);
+        let ro_bump = create_test_ttl_entry(1, 200);
+        // After flush, RW TX sees bumped state (200) and extends to 300
+        let flushed_state = create_test_ttl_entry(1, 200);
+        let rw_extend = create_test_ttl_entry(1, 300);
+
+        let mut delta = LedgerDelta::new(1);
+        // RO bump recorded to delta
+        delta.record_update(original.clone(), ro_bump).unwrap();
+        // RW extend recorded after flush (different pre_state)
+        delta.record_update(flushed_state, rw_extend).unwrap();
+
+        let changes: Vec<_> = delta.changes().collect();
+        assert_eq!(changes.len(), 1);
+        if let EntryChange::Updated { current, previous } = &changes[0] {
+            if let LedgerEntryData::Ttl(ttl) = &current.data {
+                assert_eq!(
+                    ttl.live_until_ledger_seq, 300,
+                    "RW extend should win (higher value)"
+                );
+            } else {
+                panic!("expected TTL entry data");
+            }
+            // Previous should be the original from the first record_update
+            if let LedgerEntryData::Ttl(ttl) = &previous.data {
+                assert_eq!(
+                    ttl.live_until_ledger_seq, 100,
+                    "previous should be original"
+                );
+            }
+        } else {
+            panic!("expected Updated change");
+        }
     }
 }
