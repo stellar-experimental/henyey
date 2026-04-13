@@ -2335,4 +2335,22 @@ mod tests {
             panic!("expected Updated change");
         }
     }
+
+    #[test]
+    fn test_merge_ttl_key_with_non_ttl_data_errors() {
+        // TTL key but Account data is an invariant violation — must error.
+        let ttl_key_hash = [42u8; 32];
+        let ttl_key = LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+            key_hash: stellar_xdr::curr::Hash(ttl_key_hash),
+        });
+
+        // Build a bogus entry: TTL key but Account data
+        let account_entry = create_test_account(42);
+
+        let result = merge_ttl_current(&ttl_key, &account_entry, &account_entry);
+        assert!(
+            result.is_err(),
+            "TTL key with non-TTL data must be an error"
+        );
+    }
 }
