@@ -896,6 +896,7 @@ pub fn execute_operation_with_soroban(
                         max_contract_data_entry_size_bytes: config
                             .max_contract_data_entry_size_bytes,
                     }),
+                    config.max_entry_ttl,
                 )?;
                 let mut exec = OperationExecutionResult::new(result);
                 if matches!(
