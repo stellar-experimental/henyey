@@ -463,17 +463,18 @@ impl Slot {
         self.sync_composite_candidate();
 
         let ctx = slot_ctx!(self, driver);
-        let result = self.ballot.process_envelope(envelope, &ctx);
+        // Pass validation level so ballot can clear fully_validated before
+        // advance_slot, mirroring stellar-core BallotProtocol.cpp:208-211.
+        let result = self.ballot.process_envelope(envelope, &ctx, validation);
 
-        // Only clear fully_validated AFTER the staleness check inside
-        // process_envelope succeeds. Mirrors stellar-core where
-        // BallotProtocol::processEnvelope rejects stale envelopes before
-        // the MaybeValid branch can clear mFullyValidated.
+        // Also clear slot-level fully_validated (propagates to nomination)
+        // to match Slot::set_fully_validated behavior.
         if result != EnvelopeState::Invalid
             && validation == crate::ValidationLevel::MaybeValid
             && self.externalized_value.is_none()
         {
-            self.set_fully_validated(false);
+            self.fully_validated = false;
+            self.nomination.set_fully_validated(false);
         }
 
         // Check if set_confirm_commit signaled that nomination should stop

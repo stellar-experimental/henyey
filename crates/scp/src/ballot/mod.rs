@@ -529,6 +529,7 @@ impl BallotProtocol {
         &mut self,
         envelope: &ScpEnvelope,
         ctx: &SlotContext<'_, D>,
+        validation: crate::ValidationLevel,
     ) -> EnvelopeState {
         let node_id = &envelope.statement.node_id;
 
@@ -550,6 +551,13 @@ impl BallotProtocol {
                 return EnvelopeState::Valid;
             }
             return EnvelopeState::Invalid;
+        }
+
+        // Parity: stellar-core BallotProtocol.cpp:208-211 clears
+        // mFullyValidated here, before advanceSlot, so that any
+        // send_latest_envelope during advance_slot sees the correct state.
+        if validation == crate::ValidationLevel::MaybeValid {
+            self.fully_validated = false;
         }
 
         // Store the envelope
@@ -1010,7 +1018,11 @@ mod tests {
         let mut ballot = BallotProtocol::new();
 
         let env = make_nomination_envelope(make_node_id(2), 1, &quorum_set);
-        let state = ballot.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 1));
+        let state = ballot.process_envelope(
+            &env,
+            &ctx!(&node, &quorum_set, &driver, 1),
+            crate::ValidationLevel::FullyValidated,
+        );
         assert_eq!(state, EnvelopeState::Invalid);
     }
 
@@ -1034,8 +1046,16 @@ mod tests {
         let env_b = make_prepare_envelope(node_b, 1, &quorum_set, current.clone());
         let env_c = make_prepare_envelope(node_c, 1, &quorum_set, current);
 
-        ballot.process_envelope(&env_b, &ctx!(&node_a, &quorum_set, &driver, 1));
-        ballot.process_envelope(&env_c, &ctx!(&node_a, &quorum_set, &driver, 1));
+        ballot.process_envelope(
+            &env_b,
+            &ctx!(&node_a, &quorum_set, &driver, 1),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &env_c,
+            &ctx!(&node_a, &quorum_set, &driver, 1),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert_eq!(driver.heard_from_quorum.load(Ordering::SeqCst), 1);
     }
@@ -1052,9 +1072,21 @@ mod tests {
         let prepare = make_prepare_envelope(make_node_id(2), 2, &quorum_set, ballot_value.clone());
         let confirm = make_confirm_envelope(make_node_id(2), 2, &quorum_set, ballot_value.clone());
 
-        let first = ballot.process_envelope(&prepare, &ctx!(&node, &quorum_set, &driver, 2));
-        let second = ballot.process_envelope(&confirm, &ctx!(&node, &quorum_set, &driver, 2));
-        let third = ballot.process_envelope(&prepare, &ctx!(&node, &quorum_set, &driver, 2));
+        let first = ballot.process_envelope(
+            &prepare,
+            &ctx!(&node, &quorum_set, &driver, 2),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let second = ballot.process_envelope(
+            &confirm,
+            &ctx!(&node, &quorum_set, &driver, 2),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let third = ballot.process_envelope(
+            &prepare,
+            &ctx!(&node, &quorum_set, &driver, 2),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(matches!(
             first,
@@ -1097,9 +1129,21 @@ mod tests {
             1,
         );
 
-        let first = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 4));
-        let second = ballot.process_envelope(&newer, &ctx!(&node, &quorum_set, &driver, 4));
-        let third = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 4));
+        let first = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 4),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let second = ballot.process_envelope(
+            &newer,
+            &ctx!(&node, &quorum_set, &driver, 4),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let third = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 4),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(matches!(
             first,
@@ -1152,9 +1196,21 @@ mod tests {
             },
         );
 
-        let first = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 5));
-        let second = ballot.process_envelope(&newer, &ctx!(&node, &quorum_set, &driver, 5));
-        let third = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 5));
+        let first = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 5),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let second = ballot.process_envelope(
+            &newer,
+            &ctx!(&node, &quorum_set, &driver, 5),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let third = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 5),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(matches!(
             first,
@@ -1209,9 +1265,21 @@ mod tests {
             },
         );
 
-        let first = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 6));
-        let second = ballot.process_envelope(&newer, &ctx!(&node, &quorum_set, &driver, 6));
-        let third = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 6));
+        let first = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 6),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let second = ballot.process_envelope(
+            &newer,
+            &ctx!(&node, &quorum_set, &driver, 6),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let third = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 6),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(matches!(
             first,
@@ -1272,9 +1340,21 @@ mod tests {
             },
         );
 
-        let first = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 7));
-        let second = ballot.process_envelope(&newer, &ctx!(&node, &quorum_set, &driver, 7));
-        let third = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 7));
+        let first = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 7),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let second = ballot.process_envelope(
+            &newer,
+            &ctx!(&node, &quorum_set, &driver, 7),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let third = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 7),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(matches!(
             first,
@@ -1317,9 +1397,21 @@ mod tests {
             2,
         );
 
-        let first = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 8));
-        let second = ballot.process_envelope(&newer, &ctx!(&node, &quorum_set, &driver, 8));
-        let third = ballot.process_envelope(&older, &ctx!(&node, &quorum_set, &driver, 8));
+        let first = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 8),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let second = ballot.process_envelope(
+            &newer,
+            &ctx!(&node, &quorum_set, &driver, 8),
+            crate::ValidationLevel::FullyValidated,
+        );
+        let third = ballot.process_envelope(
+            &older,
+            &ctx!(&node, &quorum_set, &driver, 8),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(matches!(
             first,
@@ -1367,8 +1459,16 @@ mod tests {
         let env_local = make_prepare_envelope(local.clone(), 13, &quorum_set, ballot_local);
         let env_remote = make_prepare_envelope(remote.clone(), 13, &quorum_set, ballot_remote);
 
-        ballot.process_envelope(&env_local, &ctx!(&local, &quorum_set, &driver, 13));
-        ballot.process_envelope(&env_remote, &ctx!(&local, &quorum_set, &driver, 13));
+        ballot.process_envelope(
+            &env_local,
+            &ctx!(&local, &quorum_set, &driver, 13),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &env_remote,
+            &ctx!(&local, &quorum_set, &driver, 13),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         let mut seen = Vec::new();
         ballot.process_current_state(
@@ -1397,7 +1497,11 @@ mod tests {
             value: make_value(&[3]),
         };
         let env_local = make_prepare_envelope(local.clone(), 14, &quorum_set, ballot_local);
-        ballot.process_envelope(&env_local, &ctx!(&local, &quorum_set, &driver, 14));
+        ballot.process_envelope(
+            &env_local,
+            &ctx!(&local, &quorum_set, &driver, 14),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         let mut seen = Vec::new();
         ballot.process_current_state(
@@ -1465,9 +1569,21 @@ mod tests {
             current.counter,
         );
 
-        ballot.process_envelope(&env2, &ctx!(&node, &quorum_set, &driver, 15));
-        ballot.process_envelope(&env3, &ctx!(&node, &quorum_set, &driver, 15));
-        ballot.process_envelope(&env4, &ctx!(&node, &quorum_set, &driver, 15));
+        ballot.process_envelope(
+            &env2,
+            &ctx!(&node, &quorum_set, &driver, 15),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &env3,
+            &ctx!(&node, &quorum_set, &driver, 15),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &env4,
+            &ctx!(&node, &quorum_set, &driver, 15),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(ballot.is_externalized());
         let externalized_value = ballot.get_externalized_value().expect("value").clone();
@@ -1502,15 +1618,27 @@ mod tests {
         );
 
         assert_eq!(
-            ballot.process_envelope(&bump_env2, &ctx!(&node, &quorum_set, &driver, 15)),
+            ballot.process_envelope(
+                &bump_env2,
+                &ctx!(&node, &quorum_set, &driver, 15),
+                crate::ValidationLevel::FullyValidated
+            ),
             EnvelopeState::Invalid
         );
         assert_eq!(
-            ballot.process_envelope(&bump_env3, &ctx!(&node, &quorum_set, &driver, 15)),
+            ballot.process_envelope(
+                &bump_env3,
+                &ctx!(&node, &quorum_set, &driver, 15),
+                crate::ValidationLevel::FullyValidated
+            ),
             EnvelopeState::Invalid
         );
         assert_eq!(
-            ballot.process_envelope(&bump_env4, &ctx!(&node, &quorum_set, &driver, 15)),
+            ballot.process_envelope(
+                &bump_env4,
+                &ctx!(&node, &quorum_set, &driver, 15),
+                crate::ValidationLevel::FullyValidated
+            ),
             EnvelopeState::Invalid
         );
 
@@ -1549,10 +1677,26 @@ mod tests {
         let prep4 = make_prepare_envelope(node4.clone(), 16, &quorum_set, current.clone());
         let prep5 = make_prepare_envelope(node5.clone(), 16, &quorum_set, current.clone());
 
-        ballot.process_envelope(&prep2, &ctx!(&node, &quorum_set, &driver, 16));
-        ballot.process_envelope(&prep3, &ctx!(&node, &quorum_set, &driver, 16));
-        ballot.process_envelope(&prep4, &ctx!(&node, &quorum_set, &driver, 16));
-        ballot.process_envelope(&prep5, &ctx!(&node, &quorum_set, &driver, 16));
+        ballot.process_envelope(
+            &prep2,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &prep3,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &prep4,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &prep5,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         let prepared2 = make_prepare_envelope_with_counters(
             node2.clone(),
@@ -1603,10 +1747,26 @@ mod tests {
             },
         );
 
-        ballot.process_envelope(&prepared2, &ctx!(&node, &quorum_set, &driver, 16));
-        ballot.process_envelope(&prepared3, &ctx!(&node, &quorum_set, &driver, 16));
-        ballot.process_envelope(&prepared4, &ctx!(&node, &quorum_set, &driver, 16));
-        ballot.process_envelope(&prepared5, &ctx!(&node, &quorum_set, &driver, 16));
+        ballot.process_envelope(
+            &prepared2,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &prepared3,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &prepared4,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &prepared5,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(matches!(ballot.phase(), BallotPhase::Confirm));
         assert_eq!(ballot.commit().map(|b| b.counter), Some(1));
@@ -1648,12 +1808,24 @@ mod tests {
             6,
         );
 
-        ballot.process_envelope(&confirm1, &ctx!(&node, &quorum_set, &driver, 16));
-        ballot.process_envelope(&confirm2, &ctx!(&node, &quorum_set, &driver, 16));
+        ballot.process_envelope(
+            &confirm1,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
+        ballot.process_envelope(
+            &confirm2,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(!ballot.is_externalized());
 
-        ballot.process_envelope(&confirm4, &ctx!(&node, &quorum_set, &driver, 16));
+        ballot.process_envelope(
+            &confirm4,
+            &ctx!(&node, &quorum_set, &driver, 16),
+            crate::ValidationLevel::FullyValidated,
+        );
 
         assert!(ballot.is_externalized());
         assert_eq!(ballot.get_externalized_value(), Some(&value));
