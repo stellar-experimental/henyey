@@ -1079,12 +1079,10 @@ pub fn check_valid_pre_seq_num_with_config(
             ));
         }
 
-        // 4b. Host function pairing
-        if !frame.validate_host_fn() {
-            return Err(PreSeqNumError::SorobanInvalid(
-                "invalid host function pairing".to_string(),
-            ));
-        }
+        // 4b. Host function pairing validation is intentionally NOT here.
+        // stellar-core only enforces validateHostFn() during queue admission,
+        // not in the checkValid() path used for tx-set validation. Putting it
+        // here causes over-rejection of peer-supplied tx sets.
 
         // 4c. Resource fee bound (non-fee-bump only)
         // stellar-core commonValidPreSeqNum:1376-1393

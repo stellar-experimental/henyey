@@ -846,6 +846,12 @@ impl TransactionQueue {
         )
         .map_err(|e| e.to_tx_result_code())?;
 
+        // Queue admission only: validate host function pairing.
+        // stellar-core enforces this at queue admission but not tx-set checkValid.
+        if frame.is_soroban() && !frame.validate_host_fn() {
+            return Err(stellar_xdr::curr::TransactionResultCode::TxSorobanInvalid);
+        }
+
         // Build ledger context once for time-bound and signature validation.
         let ledger_ctx = LedgerContext::new(
             ctx.ledger_seq,
