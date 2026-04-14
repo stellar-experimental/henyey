@@ -978,7 +978,6 @@ fn validate_restore_footprint(
 // access it via `henyey_tx::ThresholdLevel`.
 pub use henyey_common::ThresholdLevel;
 
-#[cfg(test)]
 /// Get the threshold level required for an operation.
 ///
 /// This determines how much signer weight is needed to authorize the operation,

@@ -122,7 +122,9 @@ impl TransactionQueue {
         // individually validated at queue admission; the cross-phase trim catches the case
         // where cumulative fees across both phases exceed a source's balance.
         let fee_provider = self.get_fee_balance_provider();
-        let (classic_txs, mut soroban_txs) = if fee_provider.is_some() {
+        let account_provider = self.get_account_provider();
+        let (classic_txs, mut soroban_txs) = if fee_provider.is_some() || account_provider.is_some()
+        {
             let ctx = {
                 let vc = self.validation_context.read();
                 crate::tx_set_utils::TxSetValidationContext {
@@ -146,6 +148,7 @@ impl TransactionQueue {
                 &ctx,
                 &close_time_bounds,
                 fee_provider.as_deref(),
+                account_provider.as_deref(),
             )
         } else {
             (classic_txs, soroban_txs)

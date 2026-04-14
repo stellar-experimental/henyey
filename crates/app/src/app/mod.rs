@@ -853,6 +853,11 @@ impl App {
             .set_fee_balance_provider(Arc::new(types::LedgerFeeBalanceProvider {
                 ledger_manager: ledger_manager.clone(),
             }));
+        herder
+            .tx_queue()
+            .set_account_provider(Arc::new(types::LedgerAccountProvider {
+                ledger_manager: ledger_manager.clone(),
+            }));
 
         if let Some(qs) = herder.local_quorum_set() {
             let hash = hash_quorum_set(&qs);

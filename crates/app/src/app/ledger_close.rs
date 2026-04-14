@@ -1850,11 +1850,13 @@ impl App {
                         .map(|info| info.max_contract_size),
                 };
                 let fee_provider = self.herder.tx_queue().get_fee_balance_provider();
+                let account_provider = self.herder.tx_queue().get_account_provider();
                 let invalid = get_invalid_tx_list(
                     &pending_envs,
                     &ctx,
                     &CloseTimeBounds::with_offsets(0, upper_bound_offset),
                     fee_provider.as_deref(),
+                    account_provider.as_deref(),
                 );
                 if !invalid.is_empty() {
                     let invalid_hashes: Vec<Hash256> = invalid

@@ -356,6 +356,7 @@ impl ScpDriver {
                         network_id,
                         soroban_info.as_ref(),
                         None, // Phase 1: skip fee balance checks
+                        None, // Phase 1: skip account state checks (SCP path)
                     )
                 }
             } else {

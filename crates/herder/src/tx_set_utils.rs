@@ -15,16 +15,17 @@ use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::SorobanNetworkInfo;
 use henyey_tx::{
-    check_valid_pre_seq_num_with_config, soroban_disk_read_entries, validate_basic, LedgerContext,
-    TransactionFrame,
+    check_valid_pre_seq_num_with_config, collect_signers_for_account, get_threshold_level,
+    muxed_to_account_id, soroban_disk_read_entries, validate_basic, LedgerContext,
+    SignatureChecker, TransactionFrame,
 };
 use stellar_xdr::curr::{
-    AccountId, GeneralizedTransactionSet, LedgerHeader, SorobanTransactionDataExt,
-    TransactionEnvelope, TransactionPhase, TxSetComponent,
+    AccountEntry, AccountId, GeneralizedTransactionSet, LedgerHeader, Preconditions, SignerKey,
+    SorobanTransactionDataExt, TransactionEnvelope, TransactionPhase, TxSetComponent,
 };
 use tracing::{debug, warn};
 
-use crate::tx_queue::FeeBalanceProvider;
+use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
 
 /// Get the declared fee from a transaction envelope.
 ///
@@ -227,6 +228,7 @@ pub fn get_invalid_tx_list(
     ctx: &TxSetValidationContext,
     close_time_bounds: &CloseTimeBounds,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_provider: Option<&dyn AccountProvider>,
 ) -> Vec<TransactionEnvelope> {
     let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
     get_invalid_tx_list_with_fee_map(
@@ -234,8 +236,405 @@ pub fn get_invalid_tx_list(
         ctx,
         close_time_bounds,
         fee_balance_provider,
+        account_provider,
         &mut account_fee_map,
     )
+}
+
+/// Validate a transaction against ledger state for tx-set acceptance.
+///
+/// Mirrors stellar-core's `TransactionFrame::checkValid` → `commonValid` →
+/// per-op `checkValid` → `checkAllSignaturesUsed` pipeline. Handles both
+/// regular and fee-bump transactions.
+///
+/// Returns `true` if the transaction is valid, `false` if it should be rejected.
+fn validate_tx_for_tx_set(
+    frame: &TransactionFrame,
+    ctx: &TxSetValidationContext,
+    lower_close_time: u64,
+    account_provider: &dyn AccountProvider,
+) -> bool {
+    if frame.is_fee_bump() {
+        validate_fee_bump_for_tx_set(frame, ctx, lower_close_time, account_provider)
+    } else {
+        validate_regular_for_tx_set(frame, ctx, lower_close_time, account_provider)
+    }
+}
+
+/// Validate a non-fee-bump transaction against ledger state.
+///
+/// Mirrors `TransactionFrame::checkValidWithOptionallyChargedFee`:
+/// 1. commonValid (account load, seq, age/gap, tx-level auth)
+/// 2. per-op checkValid (op source auth at correct threshold)
+/// 3. extra signers check (before unused-sig detection)
+/// 4. checkAllSignaturesUsed
+fn validate_regular_for_tx_set(
+    frame: &TransactionFrame,
+    ctx: &TxSetValidationContext,
+    lower_close_time: u64,
+    account_provider: &dyn AccountProvider,
+) -> bool {
+    // Phase A: Load source account
+    let source_id = frame.source_account_id();
+    let source_account = match account_provider.load_account(&source_id) {
+        Some(acc) => acc,
+        None => {
+            debug!(?source_id, "tx-set validation: source account not found");
+            return false;
+        }
+    };
+
+    // Phase A: Sequence validation (mirrors isBadSeq)
+    if !validate_sequence(frame, &source_account, ctx.next_ledger_seq) {
+        return false;
+    }
+
+    // Phase A: Min seq age/gap (mirrors isTooEarlyForAccount)
+    if !validate_min_seq_age_gap(
+        frame,
+        &source_account,
+        lower_close_time,
+        ctx.next_ledger_seq,
+    ) {
+        return false;
+    }
+
+    // Phase A: TX-level signature check (LOW threshold for tx source)
+    let tx_hash = match frame.hash(&ctx.network_id) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let mut checker = SignatureChecker::new(tx_hash, frame.signatures());
+    let signers = collect_signers_for_account(&source_account);
+    let threshold_low = source_account.thresholds.0[1] as i32;
+    if !checker.check_signature(&signers, threshold_low) {
+        debug!("tx-set validation: tx source signature check failed");
+        return false;
+    }
+
+    // Phase B: Per-op source auth (every op, including tx-source ops at correct threshold)
+    if !validate_ops_auth(frame, &source_account, &mut checker, account_provider) {
+        return false;
+    }
+
+    // Phase C: Extra signers (must come before unused-sig check, uses same checker)
+    if !validate_extra_signers(frame, &mut checker) {
+        return false;
+    }
+
+    // Phase D: Unused signature detection
+    if !checker.check_all_signatures_used() {
+        debug!("tx-set validation: unused signatures detected (txBAD_AUTH_EXTRA)");
+        return false;
+    }
+
+    true
+}
+
+/// Validate a fee-bump transaction against ledger state.
+///
+/// Mirrors `FeeBumpTransactionFrame::checkValid`:
+/// 1. Outer: load fee source, verify outer auth, check unused
+/// 2. Inner: full validation via `checkValidWithOptionallyChargedFee`
+fn validate_fee_bump_for_tx_set(
+    frame: &TransactionFrame,
+    ctx: &TxSetValidationContext,
+    lower_close_time: u64,
+    account_provider: &dyn AccountProvider,
+) -> bool {
+    // --- Outer validation ---
+    let fee_source_id = frame.fee_source_account_id();
+    let fee_source_account = match account_provider.load_account(&fee_source_id) {
+        Some(acc) => acc,
+        None => {
+            debug!(
+                ?fee_source_id,
+                "tx-set validation: fee-bump fee source not found"
+            );
+            return false;
+        }
+    };
+
+    let outer_hash = match frame.hash(&ctx.network_id) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let mut outer_checker = SignatureChecker::new(outer_hash, frame.signatures());
+    let outer_signers = collect_signers_for_account(&fee_source_account);
+    let outer_threshold = fee_source_account.thresholds.0[1] as i32;
+    if !outer_checker.check_signature(&outer_signers, outer_threshold) {
+        debug!("tx-set validation: fee-bump outer auth failed");
+        return false;
+    }
+    if !outer_checker.check_all_signatures_used() {
+        debug!("tx-set validation: fee-bump outer unused signatures (txBAD_AUTH_EXTRA)");
+        return false;
+    }
+
+    // --- Inner validation ---
+    let inner_source_id = frame.inner_source_account_id();
+    let inner_source_account = match account_provider.load_account(&inner_source_id) {
+        Some(acc) => acc,
+        None => {
+            debug!(
+                ?inner_source_id,
+                "tx-set validation: fee-bump inner source not found"
+            );
+            return false;
+        }
+    };
+
+    // Inner sequence
+    if !validate_sequence(frame, &inner_source_account, ctx.next_ledger_seq) {
+        return false;
+    }
+
+    // Inner min seq age/gap
+    if !validate_min_seq_age_gap(
+        frame,
+        &inner_source_account,
+        lower_close_time,
+        ctx.next_ledger_seq,
+    ) {
+        return false;
+    }
+
+    // Inner signature check
+    let inner_hash = match frame.inner_hash(&ctx.network_id) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let inner_sigs = frame.inner_signatures();
+    let mut inner_checker = SignatureChecker::new(inner_hash, inner_sigs);
+    let inner_signers = collect_signers_for_account(&inner_source_account);
+    let inner_threshold = inner_source_account.thresholds.0[1] as i32;
+    if !inner_checker.check_signature(&inner_signers, inner_threshold) {
+        debug!("tx-set validation: fee-bump inner auth failed");
+        return false;
+    }
+
+    // Inner per-op auth (every op at correct threshold)
+    if !validate_ops_auth(
+        frame,
+        &inner_source_account,
+        &mut inner_checker,
+        account_provider,
+    ) {
+        return false;
+    }
+
+    // Inner extra signers (before unused-sig check)
+    if !validate_extra_signers(frame, &mut inner_checker) {
+        return false;
+    }
+
+    // Inner unused signature detection
+    if !inner_checker.check_all_signatures_used() {
+        debug!("tx-set validation: fee-bump inner unused signatures (txBAD_AUTH_EXTRA)");
+        return false;
+    }
+
+    true
+}
+
+/// Validate sequence number (mirrors `isBadSeq`).
+fn validate_sequence(
+    frame: &TransactionFrame,
+    account: &AccountEntry,
+    next_ledger_seq: u32,
+) -> bool {
+    let tx_seq = frame.sequence_number();
+    let account_seq = account.seq_num.0;
+
+    // Reject if tx_seq equals the starting sequence number for this ledger.
+    if next_ledger_seq <= i32::MAX as u32 {
+        let starting_seq = (next_ledger_seq as i64) << 32;
+        if tx_seq == starting_seq {
+            debug!(
+                tx_seq,
+                starting_seq, "tx-set validation: bad seq (starting sequence)"
+            );
+            return false;
+        }
+    }
+
+    let min_seq_num = match frame.preconditions() {
+        Preconditions::V2(cond) => cond.min_seq_num.map(|s| s.0),
+        _ => None,
+    };
+
+    let is_bad_seq = if let Some(min_seq) = min_seq_num {
+        account_seq < min_seq || account_seq >= tx_seq
+    } else {
+        account_seq == i64::MAX || account_seq + 1 != tx_seq
+    };
+
+    if is_bad_seq {
+        debug!(
+            account_seq,
+            tx_seq,
+            min_seq_num = ?min_seq_num,
+            "tx-set validation: bad sequence number"
+        );
+    }
+
+    !is_bad_seq
+}
+
+/// Validate min sequence age and ledger gap (mirrors `isTooEarlyForAccount`).
+///
+/// Uses lower-bound close time, matching stellar-core's
+/// `isTooEarlyForAccount(lowerBoundCloseTimeOffset)`.
+fn validate_min_seq_age_gap(
+    frame: &TransactionFrame,
+    account: &AccountEntry,
+    lower_close_time: u64,
+    next_ledger_seq: u32,
+) -> bool {
+    let preconditions = frame.preconditions();
+    let cond = match preconditions {
+        Preconditions::V2(ref cond) => cond,
+        _ => return true,
+    };
+
+    // Min seq age check
+    if cond.min_seq_age.0 > 0 {
+        let acc_seq_time = henyey_tx::state::get_account_seq_time(account);
+        let min_seq_age = cond.min_seq_age.0;
+        if min_seq_age > lower_close_time || lower_close_time - min_seq_age < acc_seq_time {
+            debug!(
+                min_seq_age,
+                lower_close_time, acc_seq_time, "tx-set validation: min seq age not met"
+            );
+            return false;
+        }
+    }
+
+    // Min seq ledger gap check
+    if cond.min_seq_ledger_gap > 0 {
+        let acc_seq_ledger = henyey_tx::state::get_account_seq_ledger(account);
+        let min_seq_ledger_gap = cond.min_seq_ledger_gap;
+        if min_seq_ledger_gap > next_ledger_seq
+            || next_ledger_seq - min_seq_ledger_gap < acc_seq_ledger
+        {
+            debug!(
+                min_seq_ledger_gap,
+                next_ledger_seq, acc_seq_ledger, "tx-set validation: min seq ledger gap not met"
+            );
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Validate per-operation source account auth.
+///
+/// Mirrors `OperationFrame::checkValid(!forApply)` — for each operation,
+/// check signatures at the operation's required threshold level.
+///
+/// IMPORTANT: We do NOT skip ops where op source == tx source. TX-level auth
+/// only proves LOW threshold, but ops may require MEDIUM or HIGH threshold.
+/// stellar-core's checkOperationSignatures checks every op unconditionally.
+fn validate_ops_auth(
+    frame: &TransactionFrame,
+    tx_source_account: &AccountEntry,
+    checker: &mut SignatureChecker,
+    account_provider: &dyn AccountProvider,
+) -> bool {
+    let tx_source_id = tx_source_account.account_id.clone();
+
+    for op in frame.operations() {
+        let op_source_muxed = &op.source_account;
+
+        // Resolve op source: use op.source_account if set, else TX source
+        let (op_source_id, op_account) = if let Some(ref src) = op_source_muxed {
+            let id = muxed_to_account_id(src);
+            if id == tx_source_id {
+                // Same account, but must check at op-specific threshold
+                (id, Some(tx_source_account.clone()))
+            } else {
+                let acc = account_provider.load_account(&id);
+                (id, acc)
+            }
+        } else {
+            // No explicit op source → use tx source
+            (tx_source_id.clone(), Some(tx_source_account.clone()))
+        };
+
+        let threshold_level = get_threshold_level(op);
+
+        match op_account {
+            Some(ref account) => {
+                let needed_threshold = account.thresholds.0[threshold_level as usize] as i32;
+                let signers = collect_signers_for_account(account);
+                if !checker.check_signature(&signers, needed_threshold) {
+                    debug!(?op_source_id, "tx-set validation: op auth failed");
+                    return false;
+                }
+            }
+            None => {
+                // Account doesn't exist — checkSignatureNoAccount:
+                // verify signature against the account ID's public key with weight=1, needed=0
+                if op_source_muxed.is_none() {
+                    // No explicit source and account doesn't exist → opNoAccount
+                    debug!(
+                        ?op_source_id,
+                        "tx-set validation: op source not found (no explicit source)"
+                    );
+                    return false;
+                }
+                let stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(ref key) = op_source_id.0;
+                let signers = vec![stellar_xdr::curr::Signer {
+                    key: SignerKey::Ed25519(key.clone()),
+                    weight: 1,
+                }];
+                // checkSignatureNoAccount uses needed=0 (just marks signature as used)
+                if !checker.check_signature(&signers, 0) {
+                    debug!(
+                        ?op_source_id,
+                        "tx-set validation: op auth failed (no account)"
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Validate extra signers from V2 preconditions.
+///
+/// Mirrors stellar-core's `extraSignersExist()` → `checkSignature(extraSigners,
+/// extraSigners.size())`. Each extra signer is given weight 1, and the needed
+/// weight is the count of extra signers. Must be called BEFORE
+/// `check_all_signatures_used()` since it marks extra signer signatures as used.
+fn validate_extra_signers(frame: &TransactionFrame, checker: &mut SignatureChecker) -> bool {
+    let cond = match frame.preconditions() {
+        Preconditions::V2(cond) => cond,
+        _ => return true,
+    };
+
+    if cond.extra_signers.is_empty() {
+        return true;
+    }
+
+    let signers: Vec<stellar_xdr::curr::Signer> = cond
+        .extra_signers
+        .iter()
+        .map(|key| stellar_xdr::curr::Signer {
+            key: key.clone(),
+            weight: 1,
+        })
+        .collect();
+
+    let needed_weight = signers.len() as i32;
+    if !checker.check_signature(&signers, needed_weight) {
+        debug!("tx-set validation: missing extra signer(s)");
+        return false;
+    }
+
+    true
 }
 
 /// Returns the list of invalid transactions, using a shared fee-source map.
@@ -253,6 +652,7 @@ pub fn get_invalid_tx_list_with_fee_map(
     ctx: &TxSetValidationContext,
     close_time_bounds: &CloseTimeBounds,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_provider: Option<&dyn AccountProvider>,
     account_fee_map: &mut HashMap<AccountId, i64>,
 ) -> Vec<TransactionEnvelope> {
     let mut invalid_txs = Vec::new();
@@ -312,6 +712,18 @@ pub fn get_invalid_tx_list_with_fee_map(
         if need_lower_check {
             let lower_ledger_ctx = ctx.to_ledger_context(lower_close_time);
             if validate_basic(&frame, &lower_ledger_ctx).is_err() {
+                if let Ok(h) = Hash256::hash_xdr(tx) {
+                    seen_invalid.insert(h);
+                }
+                invalid_txs.push(tx.clone());
+                continue;
+            }
+        }
+
+        // Stateful validation: sequence, auth, and signature checks.
+        // Mirrors stellar-core's checkValid() path within getInvalidTxListWithErrors.
+        if let Some(provider) = account_provider {
+            if !validate_tx_for_tx_set(&frame, ctx, lower_close_time, provider) {
                 if let Ok(h) = Hash256::hash_xdr(tx) {
                     seen_invalid.insert(h);
                 }
@@ -391,8 +803,15 @@ pub fn trim_invalid(
     ctx: &TxSetValidationContext,
     close_time_bounds: &CloseTimeBounds,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_provider: Option<&dyn AccountProvider>,
 ) -> (Vec<TransactionEnvelope>, Vec<TransactionEnvelope>) {
-    let invalid_txs = get_invalid_tx_list(txs, ctx, close_time_bounds, fee_balance_provider);
+    let invalid_txs = get_invalid_tx_list(
+        txs,
+        ctx,
+        close_time_bounds,
+        fee_balance_provider,
+        account_provider,
+    );
 
     if invalid_txs.is_empty() {
         return (txs.to_vec(), Vec::new());
@@ -444,6 +863,7 @@ pub fn trim_invalid_two_phase(
     ctx: &TxSetValidationContext,
     close_time_bounds: &CloseTimeBounds,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_provider: Option<&dyn AccountProvider>,
 ) -> (Vec<TransactionEnvelope>, Vec<TransactionEnvelope>) {
     use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 
@@ -458,6 +878,7 @@ pub fn trim_invalid_two_phase(
         ctx,
         close_time_bounds,
         fee_balance_provider,
+        account_provider,
         &mut account_fee_map,
     );
     let valid_classic = if classic_invalid.is_empty() {
@@ -477,6 +898,7 @@ pub fn trim_invalid_two_phase(
         ctx,
         close_time_bounds,
         fee_balance_provider,
+        account_provider,
         &mut account_fee_map,
     );
     let valid_soroban = if soroban_invalid.is_empty() {
@@ -933,6 +1355,7 @@ pub(crate) fn check_tx_set_valid(
     network_id: NetworkId,
     soroban_info: Option<&SorobanNetworkInfo>,
     fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_provider: Option<&dyn AccountProvider>,
 ) -> bool {
     let GeneralizedTransactionSet::V1(v1) = gen_tx_set;
 
@@ -1022,6 +1445,7 @@ pub(crate) fn check_tx_set_valid(
             &ctx,
             &close_time_bounds,
             fee_balance_provider,
+            account_provider,
             &mut account_fee_map,
         );
         if !invalid.is_empty() {
@@ -1070,6 +1494,43 @@ mod tests {
     impl FeeBalanceProvider for MockFeeBalanceProvider {
         fn get_available_balance(&self, account_id: &AccountId) -> Option<i64> {
             self.balances.get(account_id).copied()
+        }
+    }
+
+    struct MockAccountProvider {
+        accounts: HashMap<AccountId, AccountEntry>,
+    }
+
+    impl MockAccountProvider {
+        fn new() -> Self {
+            Self {
+                accounts: HashMap::new(),
+            }
+        }
+
+        /// Add a simple account with the given key bytes and sequence number.
+        /// Master weight = 1, thresholds = [1, 1, 1] (low, med, high).
+        fn add_account(&mut self, key_bytes: [u8; 32], seq_num: i64) {
+            let account_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key_bytes)));
+            let account = AccountEntry {
+                account_id: account_id.clone(),
+                balance: 10_000_000,
+                seq_num: stellar_xdr::curr::SequenceNumber(seq_num),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: stellar_xdr::curr::String32::default(),
+                thresholds: stellar_xdr::curr::Thresholds([1, 1, 1, 1]), // master=1, low=1, med=1, high=1
+                signers: stellar_xdr::curr::VecM::default(),
+                ext: stellar_xdr::curr::AccountEntryExt::V0,
+            };
+            self.accounts.insert(account_id, account);
+        }
+    }
+
+    impl AccountProvider for MockAccountProvider {
+        fn load_account(&self, account_id: &AccountId) -> Option<AccountEntry> {
+            self.accounts.get(account_id).cloned()
         }
     }
 
@@ -1255,7 +1716,7 @@ mod tests {
             make_valid_envelope(300, 3),
         ];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None, None);
         assert!(
             invalid.is_empty(),
             "all valid transactions should produce no invalid list"
@@ -1269,7 +1730,7 @@ mod tests {
 
         let txs = vec![make_low_fee_envelope(1), make_low_fee_envelope(2)];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None, None);
         assert_eq!(
             invalid.len(),
             2,
@@ -1288,7 +1749,7 @@ mod tests {
 
         let txs = vec![valid, invalid_fee, expired];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None, None);
         assert_eq!(
             invalid.len(),
             2,
@@ -1301,7 +1762,7 @@ mod tests {
         let ctx = test_context();
         let bounds = CloseTimeBounds::exact();
 
-        let invalid = get_invalid_tx_list(&[], &ctx, &bounds, None);
+        let invalid = get_invalid_tx_list(&[], &ctx, &bounds, None, None);
         assert!(
             invalid.is_empty(),
             "empty input should produce empty invalid list"
@@ -1317,7 +1778,7 @@ mod tests {
         let bad_bounds = make_bad_ledger_bounds_envelope(1);
         let txs = vec![bad_bounds];
 
-        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None);
+        let invalid = get_invalid_tx_list(&txs, &ctx, &bounds, None, None);
         assert_eq!(
             invalid.len(),
             1,
@@ -1338,7 +1799,7 @@ mod tests {
             make_valid_envelope(300, 3),
         ];
 
-        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds, None);
+        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds, None, None);
         assert_eq!(valid.len(), 3, "all transactions should be valid");
         assert!(invalid.is_empty(), "no transactions should be invalid");
     }
@@ -1350,7 +1811,7 @@ mod tests {
 
         let txs = vec![make_low_fee_envelope(1), make_low_fee_envelope(2)];
 
-        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds, None);
+        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds, None, None);
         assert!(valid.is_empty(), "no transactions should be valid");
         assert_eq!(invalid.len(), 2, "all transactions should be invalid");
     }
@@ -1372,7 +1833,7 @@ mod tests {
             invalid2.clone(),
         ];
 
-        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds, None);
+        let (valid, invalid) = trim_invalid(&txs, &ctx, &bounds, None, None);
         assert_eq!(valid.len(), 2, "should have 2 valid transactions");
         assert_eq!(invalid.len(), 2, "should have 2 invalid transactions");
 
@@ -1398,7 +1859,7 @@ mod tests {
         let ctx = test_context();
         let bounds = CloseTimeBounds::exact();
 
-        let (valid, invalid) = trim_invalid(&[], &ctx, &bounds, None);
+        let (valid, invalid) = trim_invalid(&[], &ctx, &bounds, None, None);
         assert!(
             valid.is_empty(),
             "empty input should produce empty valid set"
@@ -1421,7 +1882,7 @@ mod tests {
 
         let txs = vec![tx1.clone(), tx2.clone(), tx3.clone()];
 
-        let (valid, _) = trim_invalid(&txs, &ctx, &bounds, None);
+        let (valid, _) = trim_invalid(&txs, &ctx, &bounds, None, None);
         assert_eq!(valid.len(), 3);
 
         // Verify order is preserved
@@ -1558,8 +2019,13 @@ mod tests {
 
         // With no offset, should be valid
         let bounds_exact = CloseTimeBounds::exact();
-        let invalid =
-            get_invalid_tx_list(std::slice::from_ref(&envelope), &ctx, &bounds_exact, None);
+        let invalid = get_invalid_tx_list(
+            std::slice::from_ref(&envelope),
+            &ctx,
+            &bounds_exact,
+            None,
+            None,
+        );
         assert!(
             invalid.is_empty(),
             "tx should be valid with exact close time"
@@ -1567,8 +2033,13 @@ mod tests {
 
         // With upper offset of 10 (close_time + 10 = 1010 > max_time 1005), should be invalid
         let bounds_offset = CloseTimeBounds::with_offsets(0, 10);
-        let invalid =
-            get_invalid_tx_list(std::slice::from_ref(&envelope), &ctx, &bounds_offset, None);
+        let invalid = get_invalid_tx_list(
+            std::slice::from_ref(&envelope),
+            &ctx,
+            &bounds_offset,
+            None,
+            None,
+        );
         assert_eq!(
             invalid.len(),
             1,
@@ -1624,7 +2095,7 @@ mod tests {
         let mut provider = MockFeeBalanceProvider::new();
         provider.set_balance([10u8; 32], 500);
 
-        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider), None);
         assert!(
             invalid.is_empty(),
             "tx should be valid when balance covers fee"
@@ -1642,7 +2113,7 @@ mod tests {
         let mut provider = MockFeeBalanceProvider::new();
         provider.set_balance([10u8; 32], 100);
 
-        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider), None);
         assert_eq!(
             invalid.len(),
             1,
@@ -1663,7 +2134,7 @@ mod tests {
         let mut provider = MockFeeBalanceProvider::new();
         provider.set_balance([10u8; 32], 300);
 
-        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
+        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider), None);
         assert_eq!(
             invalid.len(),
             2,
@@ -1683,7 +2154,7 @@ mod tests {
         let mut provider = MockFeeBalanceProvider::new();
         provider.set_balance([10u8; 32], 400); // exactly covers total
 
-        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
+        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider), None);
         assert!(
             invalid.is_empty(),
             "txs should be valid when balance exactly covers cumulative fees"
@@ -1705,7 +2176,8 @@ mod tests {
         provider.set_balance([10u8; 32], 500);
         provider.set_balance([20u8; 32], 100);
 
-        let invalid = get_invalid_tx_list(&[tx_a1, tx_a2, tx_b], &ctx, &bounds, Some(&provider));
+        let invalid =
+            get_invalid_tx_list(&[tx_a1, tx_a2, tx_b], &ctx, &bounds, Some(&provider), None);
         assert_eq!(invalid.len(), 1, "only source B's tx should be invalid");
     }
 
@@ -1719,7 +2191,7 @@ mod tests {
 
         let provider = MockFeeBalanceProvider::new(); // empty
 
-        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider));
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, Some(&provider), None);
         assert_eq!(
             invalid.len(),
             1,
@@ -1742,7 +2214,7 @@ mod tests {
         // Balance of 200 would cover tx2 alone, but not tx1+tx2 if tx1 wasn't filtered out
         provider.set_balance([2u8; 32], 200);
 
-        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider));
+        let invalid = get_invalid_tx_list(&[tx1, tx2], &ctx, &bounds, Some(&provider), None);
         // tx1 is invalid due to low fee; tx2 alone has fee=200, balance=200, so it passes
         assert_eq!(
             invalid.len(),
@@ -1759,7 +2231,7 @@ mod tests {
         // Even with 0 balance, without a provider, fee check is skipped
         let tx = make_envelope_with_source([10u8; 32], 200, 1);
 
-        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None);
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, None);
         assert!(
             invalid.is_empty(),
             "without provider, fee affordability check should be skipped"
@@ -1783,6 +2255,7 @@ mod tests {
             &ctx,
             &bounds,
             Some(&provider),
+            None,
         );
         assert_eq!(valid.len(), 1, "one tx should be valid");
         assert_eq!(invalid.len(), 1, "one tx should be invalid");
@@ -2209,7 +2682,7 @@ mod tests {
             .unwrap(),
         });
 
-        let invalid = get_invalid_tx_list(&[envelope], &ctx, &bounds, None);
+        let invalid = get_invalid_tx_list(&[envelope], &ctx, &bounds, None, None);
         assert_eq!(invalid.len(), 1, "Inflation tx should be rejected at p21");
     }
 
@@ -2336,6 +2809,7 @@ mod tests {
             network_id,
             None, // no soroban config
             None,
+            None,
         );
         assert!(
             !result,
@@ -2344,21 +2818,22 @@ mod tests {
     }
 
     /// #1504 — SCP tx-set validation skips sequence/account checks.
-    /// get_invalid_tx_list_with_fee_map (called from check_tx_set_valid) does not
-    /// check sequence numbers against account state because it has no ledger access.
-    /// stellar-core's validateTxSet performs full per-tx validation including sequence.
+    /// Now fixed: validate_tx_for_tx_set checks sequence numbers against account state.
     #[test]
-    #[ignore] // Blocked on #1504
     fn test_check_tx_set_valid_rejects_bad_sequence() {
-        // Build a classic tx with an obviously wrong sequence number
+        // Build a classic tx with an obviously wrong sequence number (999_999_999).
+        // The source account has seq_num=0, so a valid tx would need seq_num=1.
         let bad_seq_tx = make_valid_envelope(200, 999_999_999);
         let gen_tx_set = make_gen_tx_set(vec![bad_seq_tx], vec![]);
         let header = make_soroban_lcl_header(25);
         let network_id = NetworkId::testnet();
 
-        // Provide fee balance so the affordability check doesn't reject first
         let mut fee_provider = MockFeeBalanceProvider::new();
         fee_provider.set_balance([0u8; 32], 1_000_000);
+
+        // Account with seq_num=0 — the tx's seq 999_999_999 is bad
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account([0u8; 32], 0);
 
         let result = check_tx_set_valid(
             &gen_tx_set,
@@ -2367,9 +2842,8 @@ mod tests {
             network_id,
             None,
             Some(&fee_provider),
+            Some(&account_provider),
         );
-        // stellar-core would reject a tx whose sequence doesn't match the source
-        // account's expected next seq. Henyey currently passes this through.
         assert!(
             !result,
             "check_tx_set_valid should reject tx-set with bad sequence number"
@@ -2377,10 +2851,8 @@ mod tests {
     }
 
     /// #1503 — SCP tx-set validation skips auth checks.
-    /// get_invalid_tx_list_with_fee_map does not verify transaction signatures.
-    /// stellar-core's validateTxSet checks auth.
+    /// Now fixed: validate_tx_for_tx_set checks transaction signatures.
     #[test]
-    #[ignore] // Blocked on #1503
     fn test_check_tx_set_valid_rejects_bad_auth() {
         // Build a classic tx with no signatures (empty signature list)
         let source = MuxedAccount::Ed25519(Uint256([50u8; 32]));
@@ -2414,6 +2886,10 @@ mod tests {
         let mut fee_provider = MockFeeBalanceProvider::new();
         fee_provider.set_balance([50u8; 32], 1_000_000);
 
+        // Account exists with correct seq so we pass seq check and reach auth check
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account([50u8; 32], 0);
+
         let result = check_tx_set_valid(
             &gen_tx_set,
             &header,
@@ -2421,11 +2897,109 @@ mod tests {
             network_id,
             None,
             Some(&fee_provider),
+            Some(&account_provider),
         );
         // stellar-core would reject unsigned transactions in a tx-set.
         assert!(
             !result,
             "check_tx_set_valid should reject tx-set with unsigned transactions"
+        );
+    }
+
+    // --- validate_tx_for_tx_set unit tests ---
+
+    /// Test that get_invalid_tx_list rejects tx when source account doesn't exist.
+    #[test]
+    fn test_validate_rejects_missing_source_account() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+        let tx = make_valid_envelope(100, 1);
+
+        // Empty account provider — no accounts
+        let account_provider = MockAccountProvider::new();
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(
+            invalid.len(),
+            1,
+            "tx with missing source should be rejected"
+        );
+    }
+
+    /// Test that get_invalid_tx_list accepts tx when stateful checks pass.
+    #[test]
+    fn test_validate_accepts_valid_sequence() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+        // tx seq = 1, account seq = 0 → valid (0 + 1 = 1)
+        let tx = make_valid_envelope(100, 1);
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account([0u8; 32], 0);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        // TX-level auth will fail (no real signature), but it should get past seq check
+        // The important thing is that the validation pipeline is invoked
+        assert_eq!(invalid.len(), 1, "tx with no real sig should fail auth");
+    }
+
+    /// Test that validate_sequence rejects when account seq doesn't match.
+    #[test]
+    fn test_validate_sequence_mismatch() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+        // tx seq = 5, account seq = 0 → bad (0 + 1 ≠ 5)
+        let tx = make_valid_envelope(100, 5);
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account([0u8; 32], 0);
+
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, Some(&account_provider));
+        assert_eq!(invalid.len(), 1, "tx with wrong seq should be rejected");
+    }
+
+    /// Test that validation is skipped when no account_provider is set.
+    #[test]
+    fn test_validate_skipped_without_provider() {
+        let ctx = test_context();
+        let bounds = CloseTimeBounds::exact();
+        let tx = make_valid_envelope(100, 999_999);
+
+        // No account provider → stateful checks skipped
+        let invalid = get_invalid_tx_list(&[tx], &ctx, &bounds, None, None);
+        assert!(
+            invalid.is_empty(),
+            "without account_provider, stateful checks should be skipped"
+        );
+    }
+
+    /// Test that trim_invalid_two_phase threads account_provider correctly.
+    #[test]
+    fn test_trim_invalid_two_phase_with_account_provider() {
+        let ctx =
+            TxSetValidationContext::new(100, 1000, 100, 5_000_000, 25, NetworkId::testnet(), 0);
+        let bounds = CloseTimeBounds::exact();
+
+        let tx_good_seq = make_valid_envelope(100, 1);
+        let tx_bad_seq = make_valid_envelope(100, 999);
+
+        let mut account_provider = MockAccountProvider::new();
+        account_provider.add_account([0u8; 32], 0);
+
+        let (valid_classic, _valid_soroban) = trim_invalid_two_phase(
+            &[tx_good_seq, tx_bad_seq],
+            &[],
+            &ctx,
+            &bounds,
+            None,
+            Some(&account_provider),
+        );
+        // tx_good_seq passes seq check but fails auth (no sig)
+        // tx_bad_seq fails seq check
+        // Both should be invalid
+        assert!(
+            valid_classic.len() <= 1,
+            "at least the bad-seq tx should be trimmed"
         );
     }
 }

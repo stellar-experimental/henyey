@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use henyey_common::Hash256;
-use henyey_herder::{FeeBalanceProvider, Herder};
+use henyey_herder::{AccountProvider, FeeBalanceProvider, Herder};
 use henyey_ledger::{LedgerManager, TransactionSetVariant};
 use henyey_overlay::{PeerId, ScpQueueCallback};
 use stellar_xdr::curr::{
@@ -672,6 +672,25 @@ impl FeeBalanceProvider for LedgerFeeBalanceProvider {
         } else {
             None
         }
+    }
+}
+
+/// Account provider backed by a fresh ledger snapshot.
+///
+/// Used by tx-set validation to verify account existence, sequence numbers,
+/// and signatures. Each call to `load_account` creates a fresh snapshot to
+/// ensure consistency with the latest committed ledger state.
+pub(super) struct LedgerAccountProvider {
+    pub ledger_manager: Arc<LedgerManager>,
+}
+
+impl AccountProvider for LedgerAccountProvider {
+    fn load_account(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+    ) -> Option<stellar_xdr::curr::AccountEntry> {
+        let snapshot = self.ledger_manager.create_snapshot().ok()?;
+        snapshot.get_account(account_id).ok()?
     }
 }
 

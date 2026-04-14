@@ -54,8 +54,9 @@ use henyey_common::{
 use henyey_crypto::Sha256Hasher;
 use stellar_xdr::curr::WriteXdr;
 use stellar_xdr::curr::{
-    AccountId, DecoratedSignature, FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Limits,
-    OperationType, Preconditions, SignerKey, TransactionEnvelope, TransactionPhase, TxSetComponent,
+    AccountEntry, AccountId, DecoratedSignature, FeeBumpTransactionInnerTx,
+    GeneralizedTransactionSet, Limits, OperationType, Preconditions, SignerKey,
+    TransactionEnvelope, TransactionPhase, TxSetComponent,
 };
 
 use crate::error::HerderError;
@@ -127,6 +128,19 @@ pub trait FeeBalanceProvider: Send + Sync {
     /// Returns the native asset balance minus any reserves or holds,
     /// or None if the account doesn't exist.
     fn get_available_balance(&self, account_id: &AccountId) -> Option<i64>;
+}
+
+/// Trait for providing account data to tx-set validation.
+///
+/// This mirrors the `FeeBalanceProvider` pattern. Implementations should look up
+/// accounts from a ledger snapshot so that tx-set validation can verify sequence
+/// numbers, signatures, and account existence — matching stellar-core's
+/// `getInvalidTxListWithErrors` which calls `tx->checkValid(app, ls, ...)`.
+pub trait AccountProvider: Send + Sync {
+    /// Load an account entry by account ID.
+    ///
+    /// Returns `None` if the account does not exist in the ledger.
+    fn load_account(&self, account_id: &AccountId) -> Option<AccountEntry>;
 }
 
 /// Configuration for the transaction queue.
@@ -607,6 +621,10 @@ pub struct TransactionQueue {
     /// When set, transactions are validated to ensure the fee-source has
     /// sufficient balance to cover all pending fees plus the new transaction fee.
     fee_balance_provider: RwLock<Option<Arc<dyn FeeBalanceProvider>>>,
+    /// Optional account provider for tx-set validation (sequence + auth checks).
+    /// When set, tx-set validation verifies account existence, sequence numbers,
+    /// and signatures — matching stellar-core's `getInvalidTxListWithErrors`.
+    account_provider: RwLock<Option<Arc<dyn AccountProvider>>>,
     /// Test-only: when true, skip fee balance validation in try_add.
     /// Matches stellar-core's `isLoadgenTx` bypass in TransactionQueue::canAdd()
     /// which skips both tx validation and fee balance checks for loadgen txs
@@ -666,6 +684,7 @@ impl TransactionQueue {
             account_states: RwLock::new(HashMap::new()),
             pending_depth,
             fee_balance_provider: RwLock::new(None),
+            account_provider: RwLock::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             skip_fee_balance_check: std::sync::atomic::AtomicBool::new(false),
             dynamic_queue_soroban_resources: RwLock::new(None),
@@ -689,6 +708,16 @@ impl TransactionQueue {
     /// Get the fee balance provider (for post-close invalidation).
     pub fn get_fee_balance_provider(&self) -> Option<Arc<dyn FeeBalanceProvider>> {
         self.fee_balance_provider.read().clone()
+    }
+
+    /// Set the account provider for tx-set validation.
+    pub fn set_account_provider(&self, provider: Arc<dyn AccountProvider>) {
+        *self.account_provider.write() = Some(provider);
+    }
+
+    /// Get the account provider (for tx-set building).
+    pub fn get_account_provider(&self) -> Option<Arc<dyn AccountProvider>> {
+        self.account_provider.read().clone()
     }
 
     /// Return all queued transaction envelopes (for post-close invalidation).
