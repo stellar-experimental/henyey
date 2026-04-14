@@ -160,10 +160,6 @@ impl<'a> SignatureChecker<'a> {
         F: Fn(&DecoratedSignature, &Signer) -> bool,
     {
         for (sig_idx, sig) in self.signatures.iter().enumerate() {
-            if self.used_signatures[sig_idx] {
-                continue; // Already used
-            }
-
             let mut found_idx = None;
             for (signer_idx, signer) in signers.iter().enumerate() {
                 if verify(sig, signer) {
@@ -181,7 +177,7 @@ impl<'a> SignatureChecker<'a> {
                     return true;
                 }
 
-                // Remove the signer so it can't be used again
+                // Remove the signer so it can't be used again within this call
                 signers.remove(signer_idx);
             }
         }
