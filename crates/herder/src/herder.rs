@@ -1185,6 +1185,9 @@ impl Herder {
             for hash in &tx_set_hashes {
                 self.fetching_envelopes.tx_set_available(*hash, slot);
             }
+            // Drain any OTHER envelopes that tx_set_available() just made
+            // ready (they were waiting only on this tx_set).
+            self.process_ready_fetching_envelopes();
 
             let envelope_clone = envelope.clone();
             let result = self.fetching_envelopes.recv_envelope(envelope);
@@ -1632,7 +1635,9 @@ impl Herder {
             tx_count = tx_set.len(),
             "Proposing transaction set"
         );
-        self.scp_driver.cache_tx_set(tx_set.clone());
+        // Use herder-level cache_tx_set which also notifies FetchingEnvelopes
+        // and drains any envelopes that were waiting for this tx_set.
+        self.cache_tx_set(tx_set.clone());
 
         // 4. Upgrades: config + runtime, filtered against current state.
         // Use lcl_close_time (not candidate close_time) for upgrade parameter
