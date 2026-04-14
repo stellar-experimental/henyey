@@ -1413,6 +1413,8 @@ impl TransactionQueue {
         // Commit pending evictions now that all validation has passed.
         // This is deferred from check_and_collect_evictions to match stellar-core's
         // tryAdd which only calls evictTransactions after canAdd succeeds.
+        // Parity: stellar-core TransactionQueue.cpp:733-739 bans each evicted
+        // victim so it cannot be re-submitted immediately.
         for evicted in &pending_eviction_list {
             by_hash.remove(&evicted.hash);
         }
@@ -1422,6 +1424,13 @@ impl TransactionQueue {
             for evicted in &pending_eviction_list {
                 seen.remove(&evicted.hash);
                 Self::drop_transaction(&mut account_states, evicted);
+            }
+            // Ban evicted hashes so they cannot be re-submitted immediately.
+            let mut banned = self.banned_transactions.write();
+            if let Some(newest) = banned.back_mut() {
+                for evicted in &pending_eviction_list {
+                    newest.insert(evicted.hash);
+                }
             }
         }
 
@@ -5917,6 +5926,44 @@ mod tests {
             queue.account_states.read().len(),
             1,
             "evicted tx's account state should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn test_evicted_transactions_are_banned() {
+        // Regression test for AUDIT-120: evicted transactions must be banned
+        // so they cannot be immediately re-submitted after shift().
+        // Parity: stellar-core TransactionQueue.cpp:733-739.
+        let config = TxQueueConfig {
+            max_queue_ops: Some(1),
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx_low = make_test_envelope(100, 1);
+        let mut tx_high = make_test_envelope(400, 1);
+        set_source(&mut tx_low, 91);
+        set_source(&mut tx_high, 92);
+
+        let low_hash = full_hash(&tx_low);
+
+        // Add low-fee tx, then high-fee tx evicts it.
+        assert_eq!(queue.try_add(tx_low.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_high.clone()), TxQueueResult::Added);
+        assert!(!queue.contains(&low_hash));
+
+        // Evicted tx must be banned.
+        assert!(
+            queue.is_banned(&low_hash),
+            "Evicted tx should be banned to prevent immediate re-submission"
+        );
+
+        // Even after shift() resets thresholds, re-submission should be rejected.
+        queue.shift();
+        assert!(
+            queue.is_banned(&low_hash),
+            "Evicted tx should remain banned after one shift()"
         );
     }
 }
