@@ -590,6 +590,21 @@ fn validate_soroban_resources(
             .iter()
             .chain(footprint.read_write.iter())
         {
+            // Reject unsupported footprint key types (stellar-core TransactionFrame.cpp:916-950).
+            // Valid: Account, Trustline, ContractData, ContractCode.
+            // Invalid: Offer, Data, ClaimableBalance, LiquidityPool, ConfigSetting, Ttl.
+            match key {
+                stellar_xdr::curr::LedgerKey::Account(_)
+                | stellar_xdr::curr::LedgerKey::Trustline(_)
+                | stellar_xdr::curr::LedgerKey::ContractData(_)
+                | stellar_xdr::curr::LedgerKey::ContractCode(_) => {}
+                _ => {
+                    return Err(ValidationError::InvalidStructure(
+                        "unsupported ledger key type in Soroban footprint".to_string(),
+                    ));
+                }
+            }
+
             if !seen.insert(key) {
                 return Err(ValidationError::InvalidStructure(
                     "duplicate key in Soroban footprint".to_string(),
