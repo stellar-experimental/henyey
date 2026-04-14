@@ -75,7 +75,7 @@ fn ttl_already_created_in_delta(
 ///
 /// This matches stellar-core's `validateContractLedgerEntry()` in TransactionUtils.cpp.
 /// Returns false (invalid) if the entry exceeds the configured limits.
-fn validate_contract_ledger_entry(
+pub(crate) fn validate_contract_ledger_entry(
     key: &LedgerKey,
     entry_size: usize,
     max_contract_size_bytes: u32,
@@ -223,6 +223,106 @@ fn validate_footprint_entry(
     true
 }
 
+/// Validate archived entries marked for autorestore against network config size limits.
+///
+/// Matches stellar-core's `handleArchivedEntry()` in `InvokeHostFunctionOpFrame.cpp`
+/// which calls `validateContractLedgerEntry()` for each archived entry being restored.
+/// `validate_footprint_entry` skips expired entries (treating them as size 0), so this
+/// function separately validates entries that will be restored from the hot archive.
+fn validate_archived_entry_sizes(
+    state: &LedgerStateManager,
+    soroban_data: &SorobanTransactionData,
+    soroban_config: &SorobanConfig,
+    current_ledger: u32,
+    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
+) -> bool {
+    let restored_indices: std::collections::HashSet<u32> = match &soroban_data.ext {
+        SorobanTransactionDataExt::V1(ext) => {
+            ext.archived_soroban_entries.iter().copied().collect()
+        }
+        SorobanTransactionDataExt::V0 => return true,
+    };
+    if restored_indices.is_empty() {
+        return true;
+    }
+
+    let max_contract_size = soroban_config.max_contract_size_bytes;
+    let max_data_entry_size = soroban_config.max_contract_data_entry_size_bytes;
+
+    for (idx, key) in soroban_data
+        .resources
+        .footprint
+        .read_write
+        .iter()
+        .enumerate()
+    {
+        if !restored_indices.contains(&(idx as u32)) {
+            continue;
+        }
+        // Only CONTRACT_CODE and CONTRACT_DATA can fail size validation
+        if !matches!(key, LedgerKey::ContractCode(_) | LedgerKey::ContractData(_)) {
+            continue;
+        }
+
+        // Check if this entry is actually expired (archived)
+        let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
+        let is_live = match state.get_ttl(&key_hash) {
+            Some(ttl) => ttl.live_until_ledger_seq >= current_ledger,
+            None => false,
+        };
+        if is_live {
+            // Live entries are validated by validate_footprint_entry_sizes
+            continue;
+        }
+
+        // Entry is expired and marked for restore — look it up from the state
+        // (it may have been loaded) or from the hot archive.
+        let entry: Option<LedgerEntry> = match key {
+            LedgerKey::ContractData(cd_key) => state
+                .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+                .map(|cd| LedgerEntry {
+                    last_modified_ledger_seq: 0,
+                    data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
+                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                }),
+            LedgerKey::ContractCode(cc_key) => {
+                state.get_contract_code(&cc_key.hash).map(|cc| LedgerEntry {
+                    last_modified_ledger_seq: 0,
+                    data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
+                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
+                })
+            }
+            _ => None,
+        }
+        .or_else(|| {
+            // Not in state (expired and evicted) — try hot archive
+            hot_archive.and_then(|ha| ha.get(key).ok().flatten())
+        });
+
+        if let Some(entry) = entry {
+            let entry_size = xdr_encoded_len(&entry);
+            if !validate_contract_ledger_entry(
+                key,
+                entry_size,
+                max_contract_size,
+                max_data_entry_size,
+            ) {
+                tracing::warn!(
+                    entry_size,
+                    max_contract_size,
+                    max_data_entry_size,
+                    key_type = ?std::mem::discriminant(key),
+                    idx,
+                    "Archived entry marked for restore exceeds size limit"
+                );
+                return false;
+            }
+        }
+    }
+    true
+}
+
 use super::{OperationExecutionResult, SorobanOperationMeta};
 use crate::soroban::{PersistentModuleCache, SorobanConfig, SorobanContext};
 use crate::state::LedgerStateManager;
@@ -352,6 +452,23 @@ fn execute_contract_invocation(
         soroban_data,
         soroban_config,
         context.sequence,
+        ttl_key_cache,
+    ) {
+        return Ok(OperationExecutionResult::new(make_result(
+            InvokeHostFunctionResultCode::ResourceLimitExceeded,
+            Hash([0u8; 32]),
+        )));
+    }
+
+    // Validate archived entries marked for autorestore against size limits.
+    // This matches stellar-core's handleArchivedEntry() → validateContractLedgerEntry()
+    // which validates restored entries separately from the addReads() path above.
+    if !validate_archived_entry_sizes(
+        state,
+        soroban_data,
+        soroban_config,
+        context.sequence,
+        hot_archive,
         ttl_key_cache,
     ) {
         return Ok(OperationExecutionResult::new(make_result(
@@ -3043,6 +3160,154 @@ mod tests {
         assert!(
             validate_footprint_entry_sizes(&state, &soroban_data, &config, context.sequence, None),
             "VE-14: validate_footprint_entry_sizes should pass for normal-sized live entry"
+        );
+    }
+
+    /// Regression test for #1474: oversized archived entry marked for autorestore
+    /// should be rejected with ResourceLimitExceeded, not allowed through to host.
+    #[test]
+    fn test_validate_archived_entry_sizes_rejects_oversized_restore() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xAAu8; 32])));
+        let contract_key = ScVal::U32(99);
+        let durability = ContractDataDurability::Persistent;
+
+        // Create oversized entry (> 64KB limit)
+        let large_val: Vec<u8> = vec![0xBB; 70000];
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+            val: ScVal::Bytes(large_val.try_into().unwrap()),
+        };
+        state.create_contract_data(cd_entry);
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id,
+            key: contract_key,
+            durability,
+        });
+
+        // Give the entry an EXPIRED TTL (archived)
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence - 1,
+        });
+
+        // Mark entry at index 0 in read_write for autorestore
+        let footprint = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: vec![key].try_into().unwrap(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0u32].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        let config = SorobanConfig {
+            max_contract_size_bytes: 65536,
+            max_contract_data_entry_size_bytes: 65536,
+            ..SorobanConfig::default()
+        };
+
+        // validate_footprint_entry_sizes passes (skips expired entries)
+        assert!(
+            validate_footprint_entry_sizes(&state, &soroban_data, &config, context.sequence, None),
+            "footprint entry validation passes for dead entry (by design)"
+        );
+
+        // But validate_archived_entry_sizes should REJECT the oversized restore
+        assert!(
+            !validate_archived_entry_sizes(
+                &state,
+                &soroban_data,
+                &config,
+                context.sequence,
+                None,
+                None,
+            ),
+            "archived entry validation must reject oversized entry marked for restore"
+        );
+    }
+
+    /// Regression test for #1474: normal-sized archived entry marked for autorestore
+    /// should be allowed through.
+    #[test]
+    fn test_validate_archived_entry_sizes_passes_for_normal_restore() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xCCu8; 32])));
+        let contract_key = ScVal::U32(77);
+        let durability = ContractDataDurability::Persistent;
+
+        // Create small entry within limits
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+            val: ScVal::I32(42),
+        };
+        state.create_contract_data(cd_entry);
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id,
+            key: contract_key,
+            durability,
+        });
+
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence - 1,
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: vec![key].try_into().unwrap(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0u32].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        let config = SorobanConfig {
+            max_contract_size_bytes: 65536,
+            max_contract_data_entry_size_bytes: 65536,
+            ..SorobanConfig::default()
+        };
+
+        assert!(
+            validate_archived_entry_sizes(
+                &state,
+                &soroban_data,
+                &config,
+                context.sequence,
+                None,
+                None,
+            ),
+            "archived entry validation should pass for normal-sized restore"
         );
     }
 }
