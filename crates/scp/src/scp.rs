@@ -203,15 +203,8 @@ impl<D: SCPDriver> SCP<D> {
     /// The state of the envelope after processing.
     // SECURITY: future-slot spam filtered by herder slot-range check before reaching SCP
     pub fn receive_envelope(&self, envelope: ScpEnvelope) -> EnvelopeState {
-        // Verify signature
-        if !self.driver.verify_envelope(&envelope) {
-            tracing::warn!(
-                node_id = ?envelope.statement.node_id,
-                slot = envelope.statement.slot_index,
-                "Invalid envelope signature"
-            );
-            return EnvelopeState::Invalid;
-        }
+        // Signature already verified by Herder before reaching SCP.
+        // Do NOT re-verify here to avoid double CPU cost for replayed envelopes.
 
         let slot_index = envelope.statement.slot_index;
 
