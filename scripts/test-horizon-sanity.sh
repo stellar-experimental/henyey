@@ -109,6 +109,25 @@ echo "Horizon URL: $HORIZON_URL"
 echo "RPC URL:     $RPC_URL"
 echo ""
 
+# ── 0. Wait for Horizon ingestion ───────────────────────────────────────────
+echo "── Waiting for Horizon to start ingesting (up to 120s) ────────────"
+INGEST_TIMEOUT=120
+INGEST_ELAPSED=0
+while [[ $INGEST_ELAPSED -lt $INGEST_TIMEOUT ]]; do
+  if resp=$(horizon_get "/ledgers?order=desc&limit=1") && \
+     echo "$resp" | jq -e '._embedded.records[0].sequence' &>/dev/null; then
+    INGEST_SEQ=$(echo "$resp" | jq -r '._embedded.records[0].sequence')
+    echo "Horizon ingesting (latest ledger=$INGEST_SEQ, waited ${INGEST_ELAPSED}s)"
+    break
+  fi
+  sleep 2
+  INGEST_ELAPSED=$((INGEST_ELAPSED + 2))
+done
+if [[ $INGEST_ELAPSED -ge $INGEST_TIMEOUT ]]; then
+  echo "WARNING: Horizon not ingesting after ${INGEST_TIMEOUT}s, continuing anyway"
+fi
+echo ""
+
 # ── 1. Horizon health checks ────────────────────────────────────────────────
 echo "── Horizon health checks ────────────────────────────────────────────"
 
@@ -153,14 +172,29 @@ BOB_ADDR=$(stellar keys address "$BOB_KEY")
 echo "Alice: $ALICE_ADDR"
 echo "Bob:   $BOB_ADDR"
 
-# Fund via friendbot
-if resp=$(curl -sf "$HORIZON_URL/friendbot?addr=$ALICE_ADDR"); then
+# Fund via friendbot (retry up to 60s — friendbot may need time to become ready)
+friendbot_fund() {
+  local addr="$1"
+  local timeout=60
+  local elapsed=0
+  while [[ $elapsed -lt $timeout ]]; do
+    if resp=$(curl -sf "$HORIZON_URL/friendbot?addr=$addr" 2>/dev/null); then
+      echo "$resp"
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  return 1
+}
+
+if resp=$(friendbot_fund "$ALICE_ADDR"); then
   pass "friendbot fund alice"
 else
   fail "friendbot fund alice" "friendbot request failed"
 fi
 
-if resp=$(curl -sf "$HORIZON_URL/friendbot?addr=$BOB_ADDR"); then
+if resp=$(friendbot_fund "$BOB_ADDR"); then
   pass "friendbot fund bob"
 else
   fail "friendbot fund bob" "friendbot request failed"
