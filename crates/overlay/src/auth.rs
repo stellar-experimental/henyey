@@ -643,9 +643,10 @@ impl AuthContext {
                             self.recv_sequence, v0.sequence
                         )));
                     }
-                    self.recv_sequence += 1;
 
-                    // Verify MAC
+                    // Verify MAC before advancing sequence counter.
+                    // Parity: stellar-core Hmac.cpp:60 increments mRecvMacSeq
+                    // only after hmacSha256Verify succeeds.
                     let recv_key = self.recv_mac_key.as_ref().ok_or_else(|| {
                         OverlayError::AuthenticationFailed("recv key not established".to_string())
                     })?;
@@ -662,6 +663,9 @@ impl AuthContext {
                     if !constant_time_eq(&expected_mac.mac, &v0.mac.mac) {
                         return Err(OverlayError::MacVerificationFailed);
                     }
+
+                    // Advance sequence only after MAC passes.
+                    self.recv_sequence += 1;
                 }
 
                 Ok(v0.message)
@@ -1013,6 +1017,64 @@ mod tests {
         assert!(
             result.is_err(),
             "MAC verification must not be bypassed by clearing the wire auth flag"
+        );
+    }
+
+    #[test]
+    fn test_bad_mac_does_not_advance_recv_sequence() {
+        // Regression test for AUDIT-148: a frame with the correct sequence but
+        // an invalid MAC must NOT advance recv_sequence, otherwise the next
+        // legitimate frame would be rejected as a sequence mismatch.
+        let (mut ctx_a, mut ctx_b) = complete_handshake();
+
+        // Wrap a legitimate message (seq=1).
+        let msg = StellarMessage::Peers(xdr::VecM::default());
+        let wrapped = ctx_a.wrap_message(msg).unwrap();
+
+        // Tamper with the MAC.
+        let tampered = match wrapped {
+            AuthenticatedMessage::V0(mut v0) => {
+                v0.mac.mac[0] ^= 0xff;
+                AuthenticatedMessage::V0(v0)
+            }
+        };
+
+        // Unwrap the tampered frame — should fail.
+        let result = ctx_b.unwrap_message(tampered);
+        assert!(matches!(result, Err(OverlayError::MacVerificationFailed)));
+
+        // Now wrap another legitimate message (also seq=1, since ctx_a already
+        // incremented its send counter, wrap a fresh one from ctx_a which will
+        // be seq=2). Instead, re-wrap the same message at seq=1 manually.
+        // The key test: ctx_b should still expect seq=1 (not 2).
+        let msg2 = StellarMessage::Peers(xdr::VecM::default());
+        let wrapped2 = ctx_a.wrap_message(msg2).unwrap();
+        // ctx_a's second wrap produces seq=2 — but ctx_b still expects seq=1.
+        // So we need to test with a frame at seq=1. Build one manually.
+        let recv_key = ctx_b.recv_mac_key.as_ref().unwrap().clone();
+        let msg3 = StellarMessage::Peers(xdr::VecM::default());
+        let mac = ctx_b.compute_mac(&recv_key, 1, &msg3).unwrap();
+        let legit_frame = AuthenticatedMessage::V0(AuthenticatedMessageV0 {
+            sequence: 1,
+            message: msg3,
+            mac,
+        });
+
+        // This should succeed because recv_sequence was NOT advanced by the bad MAC.
+        let result = ctx_b.unwrap_message(legit_frame);
+        assert!(
+            result.is_ok(),
+            "Legitimate frame at seq=1 should succeed after bad-MAC rejection: {:?}",
+            result.err()
+        );
+
+        // After success, recv_sequence should now be 2.
+        // Verify by unwrapping ctx_a's second message (seq=2).
+        let result2 = ctx_b.unwrap_message(wrapped2);
+        assert!(
+            result2.is_ok(),
+            "seq=2 frame should succeed after seq=1 was processed: {:?}",
+            result2.err()
         );
     }
 
