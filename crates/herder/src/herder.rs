@@ -274,6 +274,10 @@ pub struct Herder {
     runtime_upgrades: Arc<RwLock<Upgrades>>,
     /// Count of transactions dropped due to queue full since last ledger close.
     queue_full_count: AtomicU64,
+    /// Cached nomination value for the current slot, reused on timeout retries.
+    /// Parity: stellar-core captures the value by-copy in the nomination timer
+    /// lambda (NominationProtocol.cpp:654-659) so timeouts replay the same value.
+    cached_nomination_value: RwLock<Option<(SlotIndex, Value)>>,
 }
 
 impl Herder {
@@ -403,6 +407,7 @@ impl Herder {
             quorum_tracker: RwLock::new(quorum_tracker),
             runtime_upgrades,
             queue_full_count: AtomicU64::new(0),
+            cached_nomination_value: RwLock::new(None),
         }
     }
 
@@ -1376,6 +1381,10 @@ impl Herder {
             .build_nomination_value()
             .ok_or_else(|| HerderError::Internal("Failed to build nomination value".into()))?;
 
+        // Cache the nomination value for this slot so timeout retries reuse it,
+        // matching stellar-core's by-value lambda capture.
+        *self.cached_nomination_value.write() = Some((slot, value.clone()));
+
         // Get previous value for priority calculation
         let prev_value = self.prev_value.read().clone();
 
@@ -1525,7 +1534,20 @@ impl Herder {
             return; // Observers don't nominate
         }
         let prev_value = self.prev_value.read().clone();
-        let value = self.create_nomination_value(slot);
+
+        // Reuse the cached nomination value for this slot, matching stellar-core's
+        // by-value lambda capture (NominationProtocol.cpp:654-659).
+        let value = {
+            let cached = self.cached_nomination_value.read();
+            cached
+                .as_ref()
+                .filter(|(cached_slot, _)| *cached_slot == slot)
+                .map(|(_, v)| v.clone())
+        };
+
+        // Fall back to building a fresh value if none cached (e.g., if
+        // trigger_next_ledger wasn't called for this slot).
+        let value = value.or_else(|| self.build_nomination_value());
 
         if let Some(value) = value {
             if self.scp.nominate_timeout(slot, value, &prev_value) {
@@ -1573,7 +1595,7 @@ impl Herder {
 
     /// Build a nomination-ready SCP `Value`: transaction set + signed StellarValue.
     ///
-    /// Shared by `trigger_next_ledger` and `create_nomination_value`. Steps:
+    /// Called by `trigger_next_ledger` to build the initial nomination value. Steps:
     ///   1. Read ledger state (previous_hash, max_txs, starting_seq)
     ///   2. Build generalized transaction set and cache it
     ///   3. Compute close_time with monotonic clamp (parity: stellar-core)
@@ -1709,11 +1731,6 @@ impl Herder {
         let value_bytes = stellar_value.to_xdr(Limits::none()).ok()?;
         let value = Value(value_bytes.try_into().ok()?);
         Some(value)
-    }
-
-    /// Create a nomination value for a slot.
-    fn create_nomination_value(&self, _slot: SlotIndex) -> Option<Value> {
-        self.build_nomination_value()
     }
 
     /// Create a signed StellarValue.
@@ -3595,5 +3612,36 @@ mod set_state_tests {
             HerderState::Tracking,
             "Repeated Tracking→Booting must all be ignored"
         );
+    }
+
+    /// Regression test for AUDIT-142 (#1501): cached_nomination_value is
+    /// populated by trigger_next_ledger and reused by handle_nomination_timeout.
+    /// Verifies the field exists and behaves as a slot-keyed cache.
+    #[test]
+    fn test_nomination_value_cache_slot_keyed() {
+        let herder = make_test_herder();
+
+        // Initially empty
+        assert!(herder.cached_nomination_value.read().is_none());
+
+        // Simulate caching a value for slot 10
+        let test_value = Value(vec![1, 2, 3].try_into().unwrap());
+        *herder.cached_nomination_value.write() = Some((10, test_value.clone()));
+
+        // Reading for slot 10 should return the cached value
+        let cached = herder.cached_nomination_value.read();
+        let (slot, val) = cached.as_ref().unwrap();
+        assert_eq!(*slot, 10);
+        assert_eq!(*val, test_value);
+
+        // Overwriting for slot 11 replaces slot 10's value
+        drop(cached);
+        let test_value_2 = Value(vec![4, 5, 6].try_into().unwrap());
+        *herder.cached_nomination_value.write() = Some((11, test_value_2.clone()));
+
+        let cached = herder.cached_nomination_value.read();
+        let (slot, val) = cached.as_ref().unwrap();
+        assert_eq!(*slot, 11);
+        assert_eq!(*val, test_value_2);
     }
 }

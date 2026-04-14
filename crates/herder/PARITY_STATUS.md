@@ -82,6 +82,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `isNewerNominationOrBallotSt()` | _(not implemented)_ | None |
 | `getMostRecentCheckpointSeq()` | `get_most_recent_checkpoint_seq()` | Full |
 | `triggerNextLedger()` | `trigger_next_ledger()` | Full |
+| Nomination value caching (timer lambda capture) | `cached_nomination_value` field + `handle_nomination_timeout()` | Full |
 | `setInSyncAndTriggerNextLedger()` | `trigger_next_ledger()` | Full |
 | `resolveNodeID()` | _(not implemented)_ | None |
 | `setUpgrades()` | _(not implemented)_ | None |
