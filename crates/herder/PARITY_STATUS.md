@@ -236,7 +236,7 @@ Corresponds to: `PendingEnvelopes.h`
 | `recvTxSet()` | `FetchingEnvelopes::recv_tx_set()` | Full |
 | `peerDoesntHave()` | `FetchingEnvelopes::peer_doesnt_have()` | Full |
 | `pop()` | `FetchingEnvelopes::pop()` | Full |
-| `eraseBelow()` | `FetchingEnvelopes::erase_below()` | Full |
+| `eraseBelow()` | `FetchingEnvelopes::erase_below()` + `QuorumSetTracker::evict_pending_below()` | Full |
 | `forceRebuildQuorum()` | _(not implemented)_ | None |
 | `readySlots()` | `FetchingEnvelopes::ready_slots()` | Full |
 | `getJsonInfo()` | _(not implemented)_ | None |

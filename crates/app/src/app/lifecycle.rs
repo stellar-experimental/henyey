@@ -902,7 +902,10 @@ impl App {
                     envelope_result,
                     EnvelopeState::Valid | EnvelopeState::Pending | EnvelopeState::Fetching
                 ) {
-                    if self.herder.request_quorum_set(hash256, sender_node_id) {
+                    if self
+                        .herder
+                        .request_quorum_set(hash256, sender_node_id, slot)
+                    {
                         // New pending request - need to fetch from network
                         let peer = msg.from_peer.clone();
                         if let Some(overlay) = self.overlay().await {

@@ -178,6 +178,8 @@ pub struct PendingQuorumSet {
     pub request_count: u32,
     /// Node IDs that use this quorum set (envelope senders).
     pub node_ids: HashSet<NodeId>,
+    /// Slot index when this request was first seen (for age-based eviction).
+    pub first_seen_slot: u64,
 }
 
 /// Cache sizes for diagnostics.
@@ -416,13 +418,18 @@ impl ScpDriver {
     /// Register a pending quorum set request.
     /// Returns true if this is a new request, false if already pending or known.
     /// The node_id is the envelope sender that uses this quorum set.
-    pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId) -> bool {
-        self.qset_tracker.request(hash, node_id)
+    pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId, slot: u64) -> bool {
+        self.qset_tracker.request(hash, node_id, slot)
     }
 
     /// Clear a quorum set request once it has been satisfied.
     pub fn clear_quorum_set_request(&self, hash: &Hash256) {
         self.qset_tracker.clear_pending(hash);
+    }
+
+    /// Evict pending quorum set requests older than `min_slot`.
+    pub fn evict_pending_qsets_below(&self, min_slot: u64) {
+        self.qset_tracker.evict_pending_below(min_slot);
     }
 
     /// Get the node IDs that are waiting for a quorum set with the given hash.
@@ -1973,11 +1980,11 @@ mod cache_tests {
             ));
 
         let known_hash = hash_quorum_set(&quorum_set);
-        assert!(!driver.request_quorum_set(known_hash, sender_node_id.clone()));
+        assert!(!driver.request_quorum_set(known_hash, sender_node_id.clone(), 100));
 
         let unknown_hash = Hash256::from_bytes([42u8; 32]);
-        assert!(driver.request_quorum_set(unknown_hash, sender_node_id.clone()));
-        assert!(!driver.request_quorum_set(unknown_hash, sender_node_id.clone()));
+        assert!(driver.request_quorum_set(unknown_hash, sender_node_id.clone(), 100));
+        assert!(!driver.request_quorum_set(unknown_hash, sender_node_id.clone(), 100));
 
         // Verify the node_id was tracked
         let pending_ids = driver.get_pending_quorum_set_node_ids(&unknown_hash);
