@@ -436,6 +436,7 @@ fn execute_contract_invocation(
         soroban_data,
         context.protocol_version,
         context.sequence,
+        hot_archive,
         ttl_key_cache,
     ) {
         return Ok(OperationExecutionResult::new(make_result(
@@ -650,6 +651,7 @@ fn disk_read_bytes_exceeded(
     soroban_data: &SorobanTransactionData,
     protocol_version: u32,
     current_ledger: u32,
+    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
 ) -> bool {
     let mut total_read_bytes = 0u32;
@@ -675,6 +677,10 @@ fn disk_read_bytes_exceeded(
                 }
                 _ => None,
             }
+            // Fallback to hot archive for fully-evicted entries.
+            // Matches stellar-core handleArchivedEntry() which meters disk reads
+            // for entries retrieved from both live bucket list and hot archive.
+            .or_else(|| hot_archive.and_then(|ha| ha.get(key).ok().flatten()))
         } else {
             state.get_entry(key)
         };
@@ -1929,6 +1935,7 @@ mod tests {
             context.protocol_version,
             context.sequence,
             None,
+            None,
         );
         assert!(
             !exceeded,
@@ -1950,10 +1957,118 @@ mod tests {
             context.protocol_version,
             context.sequence,
             None,
+            None,
         );
         assert!(
             exceeded,
             "disk_read_bytes SHOULD be exceeded when archived entry has expired TTL"
+        );
+    }
+
+    /// Regression test for #1465: fully-evicted hot-archive entry must be metered
+    /// for disk read bytes. Previously, entries only in the hot archive (not in live
+    /// state) contributed 0 bytes to the disk read count.
+    #[test]
+    fn test_disk_read_bytes_counts_hot_archive_entries() {
+        use crate::soroban::HotArchiveLookup;
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context_p23();
+        let source = create_test_account_id(0);
+
+        // Source account (classic entry in read_only)
+        state.create_account(create_test_account(source.clone(), 100_000_000));
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xD1u8; 32])));
+        let contract_key = ScVal::U32(88);
+        let durability = ContractDataDurability::Persistent;
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+
+        // Entry is NOT in live state — only in hot archive.
+        // Create the entry that the hot archive will return.
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id,
+            key: contract_key,
+            durability,
+            val: ScVal::Bytes(vec![0xAA; 500].try_into().unwrap()),
+        };
+        let hot_entry = LedgerEntry {
+            last_modified_ledger_seq: 50,
+            data: stellar_xdr::curr::LedgerEntryData::ContractData(cd_entry),
+            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+        };
+        let hot_entry_size = xdr_encoded_len(&hot_entry) as u32;
+
+        struct TestHotArchive(LedgerKey, LedgerEntry);
+        impl HotArchiveLookup for TestHotArchive {
+            fn get(
+                &self,
+                key: &LedgerKey,
+            ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                if *key == self.0 {
+                    Ok(Some(self.1.clone()))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+        let hot_archive = TestHotArchive(key.clone(), hot_entry);
+
+        let account_key =
+            LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount { account_id: source });
+
+        let footprint = LedgerFootprint {
+            read_only: vec![account_key].try_into().unwrap(),
+            read_write: vec![key].try_into().unwrap(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0u32].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                // Set disk_read_bytes to less than the hot archive entry size
+                // so the check should fail
+                disk_read_bytes: hot_entry_size - 1,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        // Without hot archive: entry not found, 0 bytes metered — passes
+        let exceeded_without = disk_read_bytes_exceeded(
+            &state,
+            &soroban_data,
+            context.protocol_version,
+            context.sequence,
+            None,
+            None,
+        );
+        assert!(
+            !exceeded_without,
+            "Without hot archive, evicted entry should not be metered (pre-fix behavior)"
+        );
+
+        // With hot archive: entry found, its bytes should be metered — exceeds limit
+        let exceeded_with = disk_read_bytes_exceeded(
+            &state,
+            &soroban_data,
+            context.protocol_version,
+            context.sequence,
+            Some(&hot_archive),
+            None,
+        );
+        assert!(
+            exceeded_with,
+            "With hot archive, evicted entry MUST be metered for disk read bytes"
         );
     }
 
