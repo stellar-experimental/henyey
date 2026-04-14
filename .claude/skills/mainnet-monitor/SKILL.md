@@ -54,6 +54,13 @@ doesn't change when it should — you MUST investigate. Specifically:
 - **Fix or file.** If investigation reveals a bug, follow the Bug Fix
   Workflow. If it reveals a missing feature or config issue, fix the config
   or report it clearly with the code-level explanation.
+- **Sync deadline is 15 minutes.** A mainnet validator must complete catchup
+  and begin closing ledgers in real-time within 15 minutes of startup. If the
+  node is still catching up, stuck at checkpoint boundaries, or showing RPC
+  "unhealthy" after 15 minutes, this is a bug — not a normal startup delay.
+  Do not report it as a WARNING and wait. Investigate the catchup path, the
+  buffered-catchup code, and the checkpoint download logic to find and fix
+  the root cause.
 
 ## Startup
 
@@ -132,7 +139,7 @@ Check the henyey mainnet monitor log at ~/data/<session-id>/logs/monitor.log.
 
 HEALTH CHECKS:
 (1) Log scan — run: tail -n 500 ~/data/<session-id>/logs/monitor.log. Scan for: hash mismatches ("hash mismatch", "HashMismatch", differing expected/actual hashes), panics/crashes ("panic", "thread.*panicked", "SIGABRT", "SIGSEGV"), ERROR-level log lines, assertion failures ("assertion failed").
-(2) Ledger progression — from the last 2+ Heartbeat lines, verify the ledger number is advancing. If the same ledger appears for 10+ minutes, flag as STUCK.
+(2) Ledger progression & sync deadline — from the last 2+ Heartbeat lines, verify the ledger number is advancing. If the same ledger appears for 10+ minutes, flag as STUCK. Additionally, check node uptime: run ps -o etime= -p $(pgrep -f 'henyey.*run' | head -1). If uptime > 15 minutes, the node MUST be closing ledgers in real-time. Check the latest Heartbeat for the gap between `ledger` and `latest_ext`: if gap > 5, or if RPC status is "unhealthy", or if `heard_from_quorum=false`, the node has NOT synced. Flag as SYNC FAILURE — this is a bug, not a transient condition. Do NOT report it as a WARNING and wait for it to resolve. Immediately investigate the catchup path using the Bug Fix Workflow: check for checkpoint-boundary stalls ("failed to download header"), hash mismatches, or event loop freezes in the log. The 15-minute deadline is firm — if the node can't sync in 15 minutes, something is broken in the code.
 (3) Process alive — run: pgrep -af 'henyey.*run'. If not running, restart: RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey --mainnet run <RUN_FLAGS> -c <CONFIG> > ~/data/<session-id>/logs/monitor.log 2>&1 &
 (4) Memory — run: ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1) and convert to MB. If RSS > 12 GB, flag HIGH MEMORY. If RSS > 16 GB or free memory < 4 GB, restart the node.
 (5) Disk — run: df -h ~/data | tail -1. If usage > 85%, flag LOW DISK.
@@ -145,7 +152,7 @@ REMOTE SYNC & REDEPLOY:
 (10) Remote sync — run: git fetch origin main. If in detached HEAD state (git symbolic-ref HEAD fails), run git checkout main first. Then compare: git rev-parse HEAD vs git rev-parse origin/main. If they differ (origin/main is ahead): (a) check CI status on origin/main — run: gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'. If any recent run has conclusion "failure", do NOT deploy — instead, immediately investigate and fix the CI failure using the CI FIX WORKFLOW below (check 11). After pushing the fix, wait for the next loop iteration to deploy. (b) If all conclusions are "success" (ignore "" for in-progress and "cancelled"): git pull --rebase, (c) CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey, (d) if build succeeds: kill the node (kill <PID>, wait 5s, kill -9 if needed), restart with same command from check (3), report: DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>, (e) if build fails: report BUILD FAILED, do NOT restart — the old binary is still running. Investigate the build error. If HEAD == origin/main: no action (already up to date).
 
 DEPLOY REGRESSION POLICY:
-If the node fails to catch up or close ledgers after a deploy (e.g. event loop frozen for >5 min, no heartbeat progression for >10 min), this is a regression introduced by the new commits. Do NOT roll back. Instead: (a) identify which commit range was deployed, (b) bisect or inspect the diff to find the offending change, (c) fix the regression on main, (d) rebuild and redeploy the fix. The node may be down during investigation — that is acceptable. Rolling back masks bugs and delays fixes.
+If the node fails to catch up or close ledgers after a deploy (e.g. event loop frozen for >5 min, no heartbeat progression for >10 min, or node not synced within 15 minutes), this is a regression introduced by the new commits. Do NOT roll back. Instead: (a) identify which commit range was deployed, (b) bisect or inspect the diff to find the offending change, (c) fix the regression on main, (d) rebuild and redeploy the fix. The node may be down during investigation — that is acceptable. Rolling back masks bugs and delays fixes.
 
 CI FIX WORKFLOW:
 (11) CI check — TWO levels of detection are required:
@@ -160,6 +167,7 @@ BUG FIX WORKFLOW: If a hash mismatch, error, or crash is found: (1) identify fai
 OUTPUT: Print a multiline status report:
 MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   node:   mode=<MODE> session=<session-id> pid=<PID>
+  sync:   <synced | CATCHING UP (gap=N, uptime=Xm) | SYNC FAILURE (gap=N, uptime=Xm — investigating)>
   mem:    <RSS_MB>MB rss | alloc=<alloc>MB resident=<resident>MB frag=<pct>%
           heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB
   disk:   <used>/<total> (<pct>%) | session+data=<size>
@@ -167,7 +175,7 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   obsrvr: validating=<Y/N> val24h=<pct>% lag=<N>
   deploy: <up-to-date | pulled N commits (old..new) | SKIPPED (reason)>
   ci:     <all green | WORKFLOW failed — investigating | WORKFLOW jobs failed (continue-on-error) — investigating>
-Use WARNING for threshold breaches. Use ACTION when a corrective action was taken (restart, deploy, fix).
+Use WARNING for threshold breaches. Use ACTION when a corrective action was taken (restart, deploy, fix). Use SYNC FAILURE (not WARNING) when the node has been running > 15 minutes but is not closing ledgers in real-time — this is a bug that requires immediate investigation.
 ```
 
 ## Bug Fix Workflow
