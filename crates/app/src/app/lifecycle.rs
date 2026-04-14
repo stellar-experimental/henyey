@@ -307,23 +307,24 @@ impl App {
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx done");
                 }
 
-                // Process fetch response messages from dedicated never-drop channel.
-                // GeneralizedTxSet, TxSet, DontHave, and ScpQuorumset are routed here
-                // to ensure they are never lost when the broadcast channel overflows.
+                // Process fetch messages from dedicated never-drop channel.
+                // Includes both responses (GeneralizedTxSet, TxSet, DontHave, ScpQuorumset)
+                // and requests (GetScpState, GetScpQuorumset, GetTxSet) to ensure they
+                // are never lost when the broadcast channel overflows.
                 Some(fetch_msg) = fetch_response_rx.recv() => {
                     self.set_phase(2); // 2 = fetch_response
                     tracing::trace!(select_iteration, "BRANCH: fetch_response_rx");
                     tracing::debug!(
                         latency_ms = fetch_msg.received_at.elapsed().as_millis(),
-                        "Received fetch response via dedicated channel"
+                        "Received fetch message via dedicated channel"
                     );
                     self.handle_overlay_message(fetch_msg).await;
                     tracing::trace!(select_iteration, "BRANCH: fetch_response_rx done");
                 }
 
                 // Process non-critical overlay messages (TX floods, etc.).
-                // SCP and fetch-response messages no longer arrive here — they are
-                // routed exclusively to dedicated channels at the overlay layer.
+                // SCP, fetch-response, and fetch-request messages no longer arrive here —
+                // they are routed exclusively to dedicated channels at the overlay layer.
                 // The skip guards below are kept as defensive fallbacks.
                 msg = message_rx.recv() => {
                     self.set_phase(3); // 3 = broadcast

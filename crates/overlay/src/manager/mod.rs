@@ -291,7 +291,17 @@ impl SharedPeerState {
                 | StellarMessage::DontHave(_)
                 | StellarMessage::ScpQuorumset(_)
         );
-        let is_dedicated = is_scp || is_fetch_response;
+        // Fetch-request messages (GetScpState, GetScpQuorumset, GetTxSet) must also
+        // use the dedicated fetch channel so they are not silently dropped by the
+        // lossy broadcast ring when the app loop lags. stellar-core services these
+        // directly on the peer thread without a lossy intermediary.
+        let is_fetch_request = matches!(
+            msg.message,
+            StellarMessage::GetScpState(_)
+                | StellarMessage::GetScpQuorumset(_)
+                | StellarMessage::GetTxSet(_)
+        );
+        let is_dedicated = is_scp || is_fetch_response || is_fetch_request;
 
         if is_scp {
             if let Err(e) = self.scp_message_tx.send(msg.clone()) {
@@ -299,10 +309,10 @@ impl SharedPeerState {
             }
         }
 
-        if is_fetch_response {
+        if is_fetch_response || is_fetch_request {
             if let Err(e) = self.fetch_response_tx.try_send(msg.clone()) {
                 error!(
-                    "Fetch response channel send FAILED for peer {}: {}",
+                    "Fetch channel send FAILED for peer {}: {}",
                     msg.from_peer, e
                 );
             }
@@ -1683,6 +1693,80 @@ mod tests {
         assert!(
             matches!(msg, OutboundMessage::Send(_)),
             "GetScpState should use direct Send path"
+        );
+    }
+
+    /// Regression test for AUDIT-105: GetScpState, GetScpQuorumset, and GetTxSet
+    /// must be routed through the dedicated fetch channel, not the lossy broadcast.
+    #[tokio::test]
+    async fn test_fetch_requests_routed_to_dedicated_channel() {
+        let (message_tx, _) = tokio::sync::broadcast::channel(64);
+        let mut broadcast_rx = message_tx.subscribe();
+        let (scp_message_tx, _scp_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (fetch_response_tx, mut fetch_rx) = tokio::sync::mpsc::channel(64);
+
+        let shared = SharedPeerState {
+            peers: Arc::new(DashMap::new()),
+            flood_gate: Arc::new(FloodGate::new()),
+            running: Arc::new(AtomicBool::new(true)),
+            message_tx,
+            scp_message_tx,
+            fetch_response_tx,
+            peer_handles: Arc::new(RwLock::new(Vec::new())),
+            advertised_outbound_peers: Arc::new(RwLock::new(Vec::new())),
+            advertised_inbound_peers: Arc::new(RwLock::new(Vec::new())),
+            added_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dropped_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            banned_peers: Arc::new(RwLock::new(HashSet::new())),
+            peer_info_cache: Arc::new(DashMap::new()),
+            last_closed_ledger: Arc::new(AtomicU32::new(0)),
+            scp_callback: None,
+            is_validator: false,
+            peer_event_tx: None,
+            extra_subscribers: Arc::new(RwLock::new(Vec::new())),
+            is_tracking: Arc::new(AtomicBool::new(true)),
+            pending_connections: PendingConnections::new(),
+            preferred_peers: Arc::new(Vec::new()),
+        };
+
+        let peer_id = PeerId::from_bytes([42u8; 32]);
+
+        let request_msgs = vec![
+            StellarMessage::GetScpState(100),
+            StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256([1u8; 32])),
+            StellarMessage::GetTxSet(stellar_xdr::curr::Uint256([2u8; 32])),
+        ];
+
+        for msg in &request_msgs {
+            let overlay_msg = OverlayMessage {
+                from_peer: peer_id.clone(),
+                message: msg.clone(),
+                received_at: std::time::Instant::now(),
+            };
+            shared.route_to_subscribers(overlay_msg);
+        }
+
+        // All three should arrive on the dedicated fetch channel.
+        for _ in 0..3 {
+            let received = fetch_rx
+                .try_recv()
+                .expect("fetch-request should arrive on dedicated channel");
+            assert!(
+                matches!(
+                    received.message,
+                    StellarMessage::GetScpState(_)
+                        | StellarMessage::GetScpQuorumset(_)
+                        | StellarMessage::GetTxSet(_)
+                ),
+                "unexpected message type on fetch channel"
+            );
+        }
+
+        // None should arrive on the broadcast channel.
+        let broadcast_result = broadcast_rx.try_recv();
+        assert!(
+            broadcast_result.is_err(),
+            "fetch-request messages must NOT appear on the lossy broadcast channel"
         );
     }
 }
