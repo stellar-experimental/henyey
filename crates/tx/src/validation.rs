@@ -993,6 +993,19 @@ pub fn check_valid_pre_seq_num_with_config(
     if frame.operations().is_empty() {
         return Err(PreSeqNumError::MissingOperation);
     }
+
+    // Reject legacy TxV0 envelopes at protocol >= 13
+    // (stellar-core: TransactionFrame.cpp commonValidPreSeqNum rejects
+    // ENVELOPE_TYPE_TX_V0 with txNOT_SUPPORTED for protocol >= 13)
+    if protocol_version >= 13 {
+        if matches!(
+            frame.envelope(),
+            stellar_xdr::curr::TransactionEnvelope::TxV0(_)
+        ) {
+            return Err(PreSeqNumError::OpNotSupported);
+        }
+    }
+
     if !frame.is_valid_structure() {
         return Err(PreSeqNumError::Malformed(
             "invalid transaction structure".to_string(),
