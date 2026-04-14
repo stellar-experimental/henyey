@@ -2547,6 +2547,78 @@ impl LedgerCloseContext<'_> {
     }
 
     /// Create the initial Soroban configuration entries for protocol v20.
+    /// Apply version upgrade side effects (create config entries, cost types, etc.).
+    ///
+    /// Returns whether memory cost params were changed. Extracted as a helper
+    /// so that the caller can wrap it in an error boundary matching stellar-core's
+    /// per-upgrade try/catch (LedgerManagerImpl.cpp:1666-1690).
+    fn apply_version_upgrade_side_effects(
+        &mut self,
+        prev_version: u32,
+        protocol_version: u32,
+    ) -> Result<bool> {
+        let mut memory_cost_changed = false;
+
+        // Parity: Upgrades.cpp:1189-1212
+        if needs_upgrade_to_version(ProtocolVersion::V20, prev_version, protocol_version) {
+            self.create_ledger_entries_for_v20()?;
+            memory_cost_changed = true;
+        }
+
+        // Parity: Upgrades.cpp:1213-1217
+        if needs_upgrade_to_version(ProtocolVersion::V21, prev_version, protocol_version) {
+            self.create_cost_types_for_v21()?;
+            memory_cost_changed = true;
+        }
+
+        // Parity: Upgrades.cpp:1219-1223
+        if needs_upgrade_to_version(ProtocolVersion::V22, prev_version, protocol_version) {
+            self.create_cost_types_for_v22()?;
+            memory_cost_changed = true;
+        }
+
+        // Parity: Upgrades.cpp:1225-1229
+        if needs_upgrade_to_version(ProtocolVersion::V23, prev_version, protocol_version) {
+            self.create_and_update_ledger_entries_for_v23()?;
+            memory_cost_changed = true;
+        }
+
+        // Parity: Upgrades.cpp:1229-1233
+        if needs_upgrade_to_version(ProtocolVersion::V25, prev_version, protocol_version) {
+            self.create_cost_types_for_v25()?;
+            memory_cost_changed = true;
+        }
+
+        // Parity: NetworkConfig.cpp updateCostTypesForV26 + createLedgerEntriesForV26
+        if needs_upgrade_to_version(ProtocolVersion::V26, prev_version, protocol_version) {
+            self.update_cost_types_for_v26()?;
+            self.create_ledger_entries_for_v26()?;
+            memory_cost_changed = true;
+        }
+
+        // Parity: Upgrades.cpp:1189-1193
+        // needUpgradeToVersion(V_10, prev, new) → prepareLiabilities
+        // NOTE: Henyey supports protocol 24+ only, so prev_version < 10
+        // should never be true in production. Included for completeness.
+        if needs_upgrade_to_version(ProtocolVersion::V10, prev_version, protocol_version) {
+            crate::prepare_liabilities::prepare_liabilities(
+                &mut self.ltx,
+                protocol_version,
+                self.prev_header.base_reserve,
+                self.close_data.ledger_seq,
+            )?;
+        }
+
+        // Parity: Upgrades.cpp:1244-1251
+        // prevVersion==V_23 && newVersion==V_24 && gIsProductionNetwork
+        if prev_version == 23 && protocol_version == 24 && self.manager.network_id().is_mainnet() {
+            self.ltx.record_fee_pool_delta(31_879_035);
+            tracing::info!("Applied V24 mainnet fee pool correction: +31879035 stroops");
+        }
+
+        Ok(memory_cost_changed)
+    }
+
     ///
     /// Parity: NetworkConfig.cpp:1388-1430 `createLedgerEntriesForV20`
     /// Creates 14 CONFIG_SETTING ledger entries with initial values for Soroban.
@@ -3879,82 +3951,28 @@ impl LedgerCloseContext<'_> {
         // Version upgrades may create/modify config setting entries in the
         // ledger (e.g. new cost types for V25, state size window for V23+).
         // These must be applied to the delta before bucket list extraction.
+        //
+        // Parity: stellar-core wraps each upgrade in a per-upgrade try/catch
+        // (LedgerManagerImpl.cpp:1666-1690) that logs errors and continues.
+        // We mirror that: errors are logged and skipped rather than aborting
+        // the ledger close.
         let mut version_upgrade_memory_cost_changed = false;
 
         // Capture changes from version upgrade side effects (cost types for V25).
         let version_changes = if prev_version != protocol_version {
             let cp = self.ltx.change_checkpoint();
-            // Parity: Upgrades.cpp:1189-1212
-            // needUpgradeToVersion(V_20, prev, new) → createLedgerEntriesForV20
-            if needs_upgrade_to_version(ProtocolVersion::V20, prev_version, protocol_version) {
-                self.create_ledger_entries_for_v20()?;
-                version_upgrade_memory_cost_changed = true;
-            }
-
-            // Parity: Upgrades.cpp:1213-1217
-            // needUpgradeToVersion(V_21, prev, new) → createCostTypesForV21
-            if needs_upgrade_to_version(ProtocolVersion::V21, prev_version, protocol_version) {
-                self.create_cost_types_for_v21()?;
-                version_upgrade_memory_cost_changed = true;
-            }
-
-            // Parity: Upgrades.cpp:1219-1223
-            // needUpgradeToVersion(V_22, prev, new) → createCostTypesForV22
-            if needs_upgrade_to_version(ProtocolVersion::V22, prev_version, protocol_version) {
-                self.create_cost_types_for_v22()?;
-                version_upgrade_memory_cost_changed = true;
-            }
-
-            // Parity: Upgrades.cpp:1225-1229
-            // needUpgradeToVersion(V_23, prev, new) → createAndUpdateLedgerEntriesForV23
-            if needs_upgrade_to_version(ProtocolVersion::V23, prev_version, protocol_version) {
-                self.create_and_update_ledger_entries_for_v23()?;
-                version_upgrade_memory_cost_changed = true;
-            }
-
-            // Parity: Upgrades.cpp:1229-1233
-            // needUpgradeToVersion(V_25, prev, new) → createCostTypesForV25
-            if needs_upgrade_to_version(ProtocolVersion::V25, prev_version, protocol_version) {
-                self.create_cost_types_for_v25()?;
-                version_upgrade_memory_cost_changed = true;
-            }
-
-            // Parity: NetworkConfig.cpp updateCostTypesForV26 + createLedgerEntriesForV26
-            // needUpgradeToVersion(V_26, prev, new) → update cost params + create frozen key entries
-            if needs_upgrade_to_version(ProtocolVersion::V26, prev_version, protocol_version) {
-                self.update_cost_types_for_v26()?;
-                self.create_ledger_entries_for_v26()?;
-                version_upgrade_memory_cost_changed = true;
-            }
-
-            // Parity: Upgrades.cpp:1189-1193
-            // needUpgradeToVersion(V_10, prev, new) → prepareLiabilities
-            // In stellar-core, the version upgrade runs prepareLiabilities with
-            // the OLD base_reserve (the header hasn't been updated for reserve
-            // yet). If there's also a reserve increase, applyReserveUpgrade
-            // will run prepareLiabilities a second time with the new reserve.
-            //
-            // NOTE: Henyey supports protocol 24+ only, so prev_version < 10
-            // should never be true in production. This is included for
-            // completeness.
-            if needs_upgrade_to_version(ProtocolVersion::V10, prev_version, protocol_version) {
-                crate::prepare_liabilities::prepare_liabilities(
-                    &mut self.ltx,
-                    protocol_version,
-                    self.prev_header.base_reserve,
-                    self.close_data.ledger_seq,
-                )?;
-            }
-
-            // Parity: Upgrades.cpp:1244-1251
-            // prevVersion==V_23 && newVersion==V_24 && gIsProductionNetwork
-            // Correct for 3.1879035 XLM fee burn that occurred during protocol 23 on mainnet.
-            if prev_version == 23
-                && protocol_version == 24
-                && self.manager.network_id().is_mainnet()
-            {
-                self.ltx.record_fee_pool_delta(31_879_035);
-                tracing::info!("Applied V24 mainnet fee pool correction: +31879035 stroops");
+            match self.apply_version_upgrade_side_effects(prev_version, protocol_version) {
+                Ok(memory_cost_changed) => {
+                    version_upgrade_memory_cost_changed = memory_cost_changed;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        prev_version,
+                        protocol_version,
+                        error = %e,
+                        "Exception during version upgrade side effects — skipping"
+                    );
+                }
             }
             // Extract changes made during version upgrade side effects
             self.ltx.entry_changes_since(cp)
@@ -3978,13 +3996,22 @@ impl LedgerCloseContext<'_> {
                 && did_reserve_increase
             {
                 let cp = self.ltx.change_checkpoint();
-                crate::prepare_liabilities::prepare_liabilities(
+                match crate::prepare_liabilities::prepare_liabilities(
                     &mut self.ltx,
                     protocol_version,
                     new_reserve,
                     self.close_data.ledger_seq,
-                )?;
-                self.ltx.entry_changes_since(cp)
+                ) {
+                    Ok(()) => self.ltx.entry_changes_since(cp),
+                    Err(e) => {
+                        tracing::error!(
+                            new_reserve,
+                            error = %e,
+                            "Exception during reserve upgrade (prepareLiabilities) — skipping"
+                        );
+                        LedgerEntryChanges(VecM::default())
+                    }
+                }
             } else {
                 LedgerEntryChanges(VecM::default())
             }
@@ -4001,29 +4028,50 @@ impl LedgerCloseContext<'_> {
         let mut per_config_changes: HashMap<Vec<u8>, LedgerEntryChanges> = HashMap::new();
         let delta_count_before_upgrades = self.ltx.num_changes();
         if self.upgrade_ctx.has_config_upgrades() {
-            let result = self.upgrade_ctx.apply_config_upgrades(
+            match self.upgrade_ctx.apply_config_upgrades(
                 &mut self.ltx,
                 self.close_data.ledger_seq,
                 protocol_version,
-            )?;
-            config_state_archival_changed = result.state_archival_changed;
-            config_memory_cost_params_changed = result.memory_cost_params_changed;
-            per_config_changes = result.per_upgrade_changes;
-            tracing::info!(
-                ledger_seq = self.close_data.ledger_seq,
-                delta_before = delta_count_before_upgrades,
-                delta_after = self.ltx.num_changes(),
-                archival_changed = config_state_archival_changed,
-                memory_cost_changed = config_memory_cost_params_changed,
-                "Delta entry count after config upgrades"
-            );
+            ) {
+                Ok(result) => {
+                    config_state_archival_changed = result.state_archival_changed;
+                    config_memory_cost_params_changed = result.memory_cost_params_changed;
+                    per_config_changes = result.per_upgrade_changes;
+                    tracing::info!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        delta_before = delta_count_before_upgrades,
+                        delta_after = self.ltx.num_changes(),
+                        archival_changed = config_state_archival_changed,
+                        memory_cost_changed = config_memory_cost_params_changed,
+                        "Delta entry count after config upgrades"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        ledger_seq = self.close_data.ledger_seq,
+                        error = %e,
+                        "Exception during config upgrade — skipping"
+                    );
+                }
+            }
         }
 
         // Apply MaxSorobanTxSetSize upgrade through CloseLedgerState (modifies CONFIG_SETTING entry).
         // Parity: Upgrades.cpp upgradeMaxSorobanTxSetSize()
         let max_soroban_changes = if self.upgrade_ctx.max_soroban_tx_set_size_upgrade().is_some() {
-            self.upgrade_ctx
-                .apply_max_soroban_tx_set_size(&mut self.ltx, self.close_data.ledger_seq)?
+            match self
+                .upgrade_ctx
+                .apply_max_soroban_tx_set_size(&mut self.ltx, self.close_data.ledger_seq)
+            {
+                Ok(changes) => changes,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "Exception during MaxSorobanTxSetSize upgrade — skipping"
+                    );
+                    LedgerEntryChanges(VecM::default())
+                }
+            }
         } else {
             LedgerEntryChanges(VecM::default())
         };

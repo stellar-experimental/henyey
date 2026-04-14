@@ -19,7 +19,7 @@
 | Fee / Reserve Calculations | Full | Liabilities, sponsorship |
 | Offer Sorting / Comparison | Full | OfferDescriptor, AssetPair |
 | In-Memory Soroban State | Full | Contract data/code with TTL |
-| Config Upgrade Handling | Full | Validation, apply, protocol upgrade synthesis |
+| Config Upgrade Handling | Full | Validation, apply, protocol upgrade synthesis, per-upgrade error boundaries (#1493) |
 | CloseLedgerState (merged reads) | Full | `CloseLedgerState` flat wrapper with checkpoint API; `EntryReader` trait for generic reads. stellar-core's nested `LedgerTxn` child/commit/rollback not replicated — intentionally simplified to flat delta. |
 | Parallel Apply / Threading | Partial | Parallel cluster execution via tokio; no ApplyState phase machine |
 | Soroban Metrics | None | No metrics collection |

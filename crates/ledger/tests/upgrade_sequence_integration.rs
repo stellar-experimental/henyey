@@ -758,4 +758,43 @@ async fn test_sequential_upgrades_across_ledgers() {
     assert_eq!(r3.header.base_reserve, 200);
 }
 
+// ===========================================================================
+// Regression test: AUDIT-134 (#1493) — Failed config upgrade must not abort
+// ledger close. Parity: stellar-core wraps each upgrade in a try/catch
+// (LedgerManagerImpl.cpp:1666-1690) that logs errors and continues.
+// ===========================================================================
+
+/// A failing config upgrade (nonexistent key) combined with a valid BaseFee
+/// upgrade must not prevent the ledger from closing. The BaseFee upgrade
+/// should still be applied.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_failed_config_upgrade_does_not_abort_ledger_close() {
+    let ledger = init_ledger_manager(25);
+
+    // Combine a valid BaseFee upgrade with a bogus config upgrade that will fail.
+    let bogus_key = ConfigUpgradeSetKey {
+        contract_id: ContractId(Hash([0xFF; 32])),
+        content_hash: Hash([0xEE; 32]),
+    };
+    let close_data = empty_close_data(&ledger, 1, 100).with_upgrades(vec![
+        LedgerUpgrade::BaseFee(300),
+        LedgerUpgrade::Config(bogus_key),
+    ]);
+
+    let handle = tokio::runtime::Handle::current();
+    // Before the fix, this would return Err (UpgradeError) and halt the node.
+    let result = ledger.close_ledger(close_data, Some(handle));
+    assert!(
+        result.is_ok(),
+        "Ledger close must not abort on a failed config upgrade: {:?}",
+        result.err()
+    );
+
+    let r = result.unwrap();
+    assert_eq!(
+        r.header.base_fee, 300,
+        "Valid BaseFee upgrade should be applied despite failed config upgrade"
+    );
+}
+
 use stellar_xdr::curr::LedgerCloseMeta;
