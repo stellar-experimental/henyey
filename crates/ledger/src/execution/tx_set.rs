@@ -242,7 +242,14 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
 
     // Protocol 23+: Apply Soroban fee refunds after ALL transactions
     if has_pre_charged {
-        apply_soroban_fee_refunds(executor, transactions, &results, ledger_seq);
+        let post_fee_changes_list =
+            apply_soroban_fee_refunds(executor, transactions, &results, ledger_seq);
+        // Patch post_tx_apply_fee_processing in the per-tx metas
+        for (tx_idx, changes) in post_fee_changes_list {
+            if tx_idx < tx_result_metas.len() {
+                tx_result_metas[tx_idx].post_tx_apply_fee_processing = changes;
+            }
+        }
     }
 
     // Flush deferred read-only TTL bumps to the delta before applying to bucket list.
@@ -335,22 +342,50 @@ fn compute_max_seq_num_to_apply(executor: &mut TransactionExecutor, transactions
 }
 
 /// Apply Soroban fee refunds after all transactions (protocol 23+).
+/// Apply fee refunds and return per-tx post_fee_changes for meta emission.
+///
+/// Returns a Vec of (tx_index, LedgerEntryChanges) for transactions that had
+/// non-zero refunds successfully applied. Matches stellar-core's
+/// processPostTxSetApply which captures ltxInner.getChanges() for each refund.
 fn apply_soroban_fee_refunds(
     executor: &mut TransactionExecutor,
     transactions: &[TxWithFee],
     results: &[TransactionExecutionResult],
     ledger_seq: u32,
-) {
+) -> Vec<(usize, stellar_xdr::curr::LedgerEntryChanges)> {
+    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges, LedgerKeyAccount};
+
     let mut total_refunds = 0i64;
+    let mut per_tx_changes = Vec::new();
+
     for (idx, (tx, _)) in transactions.iter().enumerate() {
         let refund = results[idx].fee_refund;
         if refund > 0 {
             let frame = TransactionFrame::with_network(Arc::clone(tx), executor.network_id);
             let fee_source_id = henyey_tx::muxed_to_account_id(&frame.fee_source_account());
 
+            // Snapshot pre-refund entry for meta emission
+            let account_key = LedgerKey::Account(LedgerKeyAccount {
+                account_id: fee_source_id.clone(),
+            });
+            let pre_entry = executor.state.get_entry(&account_key);
+
             if executor.state.apply_refund_to_delta(&fee_source_id, refund) {
                 executor.state.delta_mut().add_fee(-refund);
                 total_refunds += refund;
+
+                // Build STATE/UPDATED changes from pre/post entries
+                if let Some(pre) = pre_entry {
+                    if let Some(post) = executor.state.get_entry(&account_key) {
+                        let changes: LedgerEntryChanges = vec![
+                            LedgerEntryChange::State(pre),
+                            LedgerEntryChange::Updated(post),
+                        ]
+                        .try_into()
+                        .unwrap_or_default();
+                        per_tx_changes.push((idx, changes));
+                    }
+                }
 
                 tracing::debug!(
                     ledger_seq = ledger_seq,
@@ -378,6 +413,7 @@ fn apply_soroban_fee_refunds(
             "P23+ Soroban fee refunds applied"
         );
     }
+    per_tx_changes
 }
 
 /// Result of a per-TX global pre-parallel-apply pass.
@@ -723,13 +759,33 @@ pub fn execute_soroban_parallel_phase(
     // processRefund() which applies refund to both the account balance
     // (via LedgerTxn) and the fee pool (feePool -= refund).
     // Only adjust fee pool if the refund was actually credited.
+    // Also capture STATE/UPDATED changes for post_tx_apply_fee_processing meta.
+    use stellar_xdr::curr::{LedgerEntryChange, LedgerEntryChanges};
     let mut total_refunds = 0i64;
     for (idx, result) in all_results.iter().enumerate() {
         let refund = result.fee_refund;
         if refund > 0 && idx < flat_txs.len() {
             let source = fee_source_account_id(flat_txs[idx]);
+            let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+                account_id: source.clone(),
+            });
+            let pre_entry = delta.get_current_entry(&account_key);
             if delta.apply_refund_to_account(&source, refund)? {
                 total_refunds += refund;
+                // Build STATE/UPDATED meta for this refund
+                if let Some(pre) = pre_entry {
+                    if let Some(post) = delta.get_current_entry(&account_key) {
+                        let changes: LedgerEntryChanges = vec![
+                            LedgerEntryChange::State(pre),
+                            LedgerEntryChange::Updated(post),
+                        ]
+                        .try_into()
+                        .unwrap_or_default();
+                        if idx < all_tx_result_metas.len() {
+                            all_tx_result_metas[idx].post_tx_apply_fee_processing = changes;
+                        }
+                    }
+                }
             }
         }
     }
