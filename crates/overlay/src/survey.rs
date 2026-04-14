@@ -282,11 +282,15 @@ impl SurveyMessageLimiter {
     }
 
     /// Check if a ledger number is valid (within acceptable range).
+    /// Parity: stellar-core SurveyMessageLimiter.cpp:195-200 accepts
+    /// `[current - numLedgersBeforeIgnore, current + max(numLedgersBeforeIgnore, 1)]`.
     fn ledger_num_valid(&self, ledger_num: u32, current_ledger: u32) -> bool {
-        if ledger_num > current_ledger {
+        let tolerance = self.config.num_ledgers_before_ignore;
+        let future_tolerance = tolerance.max(1);
+        if ledger_num > current_ledger + future_tolerance {
             return false;
         }
-        current_ledger - ledger_num <= self.config.num_ledgers_before_ignore
+        current_ledger.saturating_sub(ledger_num) <= tolerance
     }
 
     /// Add and validate a survey request.
@@ -1150,6 +1154,44 @@ mod tests {
         assert_eq!(
             SURVEY_THROTTLE_TIMEOUT_MULT, 3,
             "OVERLAY_SPEC §8.3: SURVEY_THROTTLE_TIMEOUT_MULT must be 3"
+        );
+    }
+
+    #[test]
+    fn test_ledger_num_valid_accepts_near_future() {
+        // Regression test for AUDIT-149: near-future ledgers should be
+        // accepted, matching stellar-core's symmetric window.
+        let config = SurveyConfig::default();
+        let limiter = SurveyMessageLimiter::new(config);
+        let current = 100u32;
+
+        // Past boundary
+        assert!(
+            !limiter.ledger_num_valid(93, current),
+            "current-7 should be rejected"
+        );
+        assert!(
+            limiter.ledger_num_valid(94, current),
+            "current-6 should be accepted"
+        );
+
+        // Current
+        assert!(limiter.ledger_num_valid(100, current), "current accepted");
+
+        // Near future (the bug: these were rejected before the fix)
+        assert!(
+            limiter.ledger_num_valid(101, current),
+            "current+1 should be accepted"
+        );
+        assert!(
+            limiter.ledger_num_valid(106, current),
+            "current+6 should be accepted"
+        );
+
+        // Far future
+        assert!(
+            !limiter.ledger_num_valid(107, current),
+            "current+7 should be rejected"
         );
     }
 }
