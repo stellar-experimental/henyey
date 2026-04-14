@@ -3370,6 +3370,167 @@ mod tests {
         assert_eq!(result, ValueValidation::Valid);
     }
 
+    /// Regression test for #1476 — SCP tx-set validation must reject
+    /// generalized tx sets containing transactions whose source accounts
+    /// are not in the ledger snapshot.
+    ///
+    /// Before the fix, `check_and_cache_tx_set_valid` passed `None` for both
+    /// providers, so fee/account validation was skipped entirely. This test
+    /// verifies the wiring through `validate_value_against_local_state` →
+    /// `check_and_cache_tx_set_valid` → `check_tx_set_valid` with real
+    /// snapshot-backed providers.
+    #[test]
+    fn test_scp_rejects_tx_set_with_unknown_source_account() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Asset, DecoratedSignature, GeneralizedTransactionSet, Hash, LedgerHeader,
+            LedgerHeaderExt, Memo, MuxedAccount, Operation, OperationBody, PaymentOp,
+            Preconditions, SequenceNumber, Signature as XdrSignature, SignatureHint,
+            StellarValueExt, TimePoint, Transaction, TransactionEnvelope, TransactionExt,
+            TransactionSetV1, TransactionV1Envelope, TxSetComponent,
+            TxSetComponentTxsMaybeDiscountedFee, Uint256, VecM,
+        };
+
+        // 1. Build a LedgerManager with protocol 25.
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 1,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            BucketList::new(),
+            HotArchiveBucketList::new(),
+            header.clone(),
+            header_hash,
+        )
+        .expect("init");
+
+        // 2. Wire driver with the LedgerManager.
+        let (driver, _secret_key) = make_test_driver_with_key();
+        driver.set_ledger_manager(Arc::new(lm));
+
+        // 3. Build a classic tx with a source account that does NOT exist in
+        //    the (empty) ledger snapshot.
+        let source = MuxedAccount::Ed25519(Uint256([42u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([43u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: dest,
+                    asset: Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([42u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        // 4. Wrap in a generalized tx set whose previous_ledger_hash matches
+        //    the LCL hash from the LedgerManager.
+        let classic_phase = stellar_xdr::curr::TransactionPhase::V0(
+            vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                TxSetComponentTxsMaybeDiscountedFee {
+                    base_fee: Some(100),
+                    txs: vec![envelope.clone()].try_into().unwrap(),
+                },
+            )]
+            .try_into()
+            .unwrap(),
+        );
+        let soroban_phase = stellar_xdr::curr::TransactionPhase::V0(
+            vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                TxSetComponentTxsMaybeDiscountedFee {
+                    base_fee: Some(100),
+                    txs: vec![].try_into().unwrap(),
+                },
+            )]
+            .try_into()
+            .unwrap(),
+        );
+        let gen_tx_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash(header_hash.0),
+            phases: vec![classic_phase, soroban_phase].try_into().unwrap(),
+        });
+        let gen_hash = Hash256::hash(
+            &gen_tx_set
+                .to_xdr(stellar_xdr::curr::Limits::none())
+                .unwrap(),
+        );
+
+        // 5. Cache the tx set in the driver.
+        let tx_set =
+            TransactionSet::with_generalized(header_hash, gen_hash, vec![envelope], gen_tx_set);
+        driver.cache_tx_set(tx_set);
+
+        // 6. Build a StellarValue referencing this tx set.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let sv = StellarValue {
+            tx_set_hash: Hash(gen_hash.0),
+            close_time: TimePoint(now),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+
+        // 7. slot 2 == lcl_seq(1) + 1 → current-ledger path.
+        //    Before the fix, this returned Valid because providers were None.
+        //    After the fix, the snapshot-backed provider rejects the unknown
+        //    source account.
+        let result = driver.validate_value_against_local_state(2, &sv, true);
+        assert_eq!(
+            result,
+            ValueValidation::Invalid,
+            "SCP must reject tx-set with unknown source account via snapshot providers"
+        );
+    }
+
     // =========================================================================
     // Phase 2A: is_tx_set_well_formed tests
     // =========================================================================

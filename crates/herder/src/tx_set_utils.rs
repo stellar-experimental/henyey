@@ -3514,8 +3514,13 @@ mod tests {
         account_provider.add_account([10u8; 32], 10);
 
         // With account provider: bad sequence → rejected
-        let invalid =
-            get_invalid_tx_list(&[tx.clone()], &ctx, &bounds, None, Some(&account_provider));
+        let invalid = get_invalid_tx_list(
+            std::slice::from_ref(&tx),
+            &ctx,
+            &bounds,
+            None,
+            Some(&account_provider),
+        );
         assert_eq!(
             invalid.len(),
             1,

@@ -3017,7 +3017,7 @@ mod tests {
         let public = secret.public_key();
         let config = HerderConfig {
             is_validator: true,
-            node_public_key: public.clone(),
+            node_public_key: public,
             local_quorum_set: Some(stellar_xdr::curr::ScpQuorumSet {
                 threshold: 1,
                 validators: vec![stellar_xdr::curr::NodeId(
