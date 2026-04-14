@@ -721,43 +721,49 @@ impl App {
 
         let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
 
-        let archive_has_checkpoint = match self.get_cached_archive_checkpoint().await {
-            Ok(archive_latest) => archive_latest >= next_cp,
-            Err(_) => false,
+        let archive_latest = match self.get_cached_archive_checkpoint().await {
+            Ok(latest) if latest >= next_cp => latest,
+            Ok(_) | Err(_) => {
+                tracing::info!(
+                    current_ledger,
+                    next_checkpoint = next_cp,
+                    "Recovery catchup skipped: archive hasn't published checkpoint yet \
+                     — requesting SCP state from peers as fallback"
+                );
+
+                // While waiting for the archive, actively request SCP state
+                // from peers. Some peers may still have tx_sets cached for
+                // the missing slots, especially if they are slightly behind
+                // the network tip. Without this, the node sits idle for 1-5
+                // minutes until the next checkpoint publishes.
+                if let Some(overlay) = self.overlay().await {
+                    let overlay_clone = std::sync::Arc::clone(&overlay);
+                    let ledger = current_ledger;
+                    tokio::spawn(async move {
+                        if let Err(e) = overlay_clone.request_scp_state(ledger).await {
+                            tracing::debug!(
+                                error = %e,
+                                "Failed to request SCP state during inter-checkpoint recovery"
+                            );
+                        }
+                    });
+                }
+
+                // Do NOT re-arm sync_recovery_pending here. Let the
+                // SyncRecoveryManager's 10-second timer drive the next
+                // attempt. Re-arming caused a 1-second spin loop because
+                // the main event loop checks the flag every tick.
+                return None;
+            }
         };
 
-        if !archive_has_checkpoint {
-            tracing::info!(
-                current_ledger,
-                next_checkpoint = next_cp,
-                "Recovery catchup skipped: archive hasn't published checkpoint yet \
-                 — requesting SCP state from peers as fallback"
-            );
-
-            // While waiting for the archive, actively request SCP state
-            // from peers. Some peers may still have tx_sets cached for
-            // the missing slots, especially if they are slightly behind
-            // the network tip. Without this, the node sits idle for 1-5
-            // minutes until the next checkpoint publishes.
-            if let Some(overlay) = self.overlay().await {
-                let overlay_clone = std::sync::Arc::clone(&overlay);
-                let ledger = current_ledger;
-                tokio::spawn(async move {
-                    if let Err(e) = overlay_clone.request_scp_state(ledger).await {
-                        tracing::debug!(
-                            error = %e,
-                            "Failed to request SCP state during inter-checkpoint recovery"
-                        );
-                    }
-                });
-            }
-
-            // Do NOT re-arm sync_recovery_pending here. Let the
-            // SyncRecoveryManager's 10-second timer drive the next
-            // attempt. Re-arming caused a 1-second spin loop because
-            // the main event loop checks the flag every tick.
-            return None;
-        }
+        // Target the archive's latest checkpoint, not just the next one.
+        // When the node is far behind (e.g., captive core bootstrapped
+        // at ledger 80 while the validator is at 400+), catching up to
+        // just the next checkpoint (87) leaves a huge gap where SCP
+        // rejects all far-future EXTERNALIZE messages as Invalid because
+        // tracking_index < slot_index.
+        let target_cp = archive_latest;
 
         // Archive has the checkpoint — clear stale state NOW, right
         // before we actually start catchup. Previously this was done
@@ -784,11 +790,12 @@ impl App {
         tracing::info!(
             current_ledger,
             next_checkpoint = next_cp,
-            "Targeting next checkpoint for recovery catchup"
+            archive_latest = target_cp,
+            "Targeting latest archive checkpoint for recovery catchup"
         );
 
         self.spawn_catchup(
-            CatchupTarget::Ledger(next_cp),
+            CatchupTarget::Ledger(target_cp),
             "RecoveryEscalation",
             true, // reset_stuck_state
             true, // re_arm_recovery
