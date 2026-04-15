@@ -639,35 +639,30 @@ impl SurveyManager {
         }
     }
 
-    /// Get the finalized node data (reporting phase only).
-    pub fn get_node_data(&self) -> Option<TimeSlicedNodeData> {
-        let state = self.state.read();
-        state.as_ref().and_then(|s| {
-            if s.phase == SurveyPhase::Reporting {
-                s.final_node_data.clone()
-            } else {
-                None
-            }
-        })
-    }
-
-    /// Get the finalized inbound peer data (reporting phase only).
-    pub fn get_inbound_peer_data(&self) -> Vec<TimeSlicedPeerData> {
+    /// Access a field from the survey state, but only during the reporting phase.
+    fn get_reporting_field<T>(&self, f: impl FnOnce(&SurveyState) -> T) -> Option<T> {
         let state = self.state.read();
         state
             .as_ref()
             .filter(|s| s.phase == SurveyPhase::Reporting)
-            .map(|s| s.final_inbound_peer_data.clone())
+            .map(f)
+    }
+
+    /// Get the finalized node data (reporting phase only).
+    pub fn get_node_data(&self) -> Option<TimeSlicedNodeData> {
+        self.get_reporting_field(|s| s.final_node_data.clone())
+            .flatten()
+    }
+
+    /// Get the finalized inbound peer data (reporting phase only).
+    pub fn get_inbound_peer_data(&self) -> Vec<TimeSlicedPeerData> {
+        self.get_reporting_field(|s| s.final_inbound_peer_data.clone())
             .unwrap_or_default()
     }
 
     /// Get the finalized outbound peer data (reporting phase only).
     pub fn get_outbound_peer_data(&self) -> Vec<TimeSlicedPeerData> {
-        let state = self.state.read();
-        state
-            .as_ref()
-            .filter(|s| s.phase == SurveyPhase::Reporting)
-            .map(|s| s.final_outbound_peer_data.clone())
+        self.get_reporting_field(|s| s.final_outbound_peer_data.clone())
             .unwrap_or_default()
     }
 

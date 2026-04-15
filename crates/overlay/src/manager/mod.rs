@@ -627,12 +627,14 @@ impl OverlayManager {
             .iter()
             .filter_map(|entry| {
                 let peer_id = entry.key();
-                if let Some(ref forward) = forward_peers {
-                    if !forward.contains(peer_id) {
-                        return None;
-                    }
+                if forward_peers
+                    .as_ref()
+                    .map_or(true, |fwd| fwd.contains(peer_id))
+                {
+                    Some(peer_id.clone())
+                } else {
+                    None
                 }
-                Some(peer_id.clone())
             })
             .collect();
 

@@ -345,7 +345,9 @@ impl FloodGateStats {
 /// This matches stellar-core's `xdrBlake2()` used in `Floodgate::broadcast()`.
 pub fn compute_message_hash(message: &StellarMessage) -> Hash256 {
     use stellar_xdr::curr::{Limits, WriteXdr};
-    let bytes = message.to_xdr(Limits::none()).unwrap_or_default();
+    let bytes = message
+        .to_xdr(Limits::none())
+        .expect("XDR serialization of StellarMessage must not fail");
     henyey_crypto::blake2(&bytes)
 }
 
