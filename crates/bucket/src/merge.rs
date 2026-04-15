@@ -196,13 +196,12 @@ fn two_pointer_merge(
         }
 
         // Both sides have entries — compare keys.
-        // We need to check for errors before comparing.
         // If either side has an Err, propagate it immediately.
         if old_iter.peek().unwrap().is_err() {
-            return Err(old_iter.next().unwrap().unwrap_err());
+            old_iter.next().unwrap()?;
         }
         if new_iter.peek().unwrap().is_err() {
-            return Err(new_iter.next().unwrap().unwrap_err());
+            new_iter.next().unwrap()?;
         }
 
         let old_key = old_iter.peek().unwrap().as_ref().unwrap().key();
