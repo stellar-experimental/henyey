@@ -100,6 +100,15 @@ Evaluate this proposal thoroughly:
 5. **Scope**: Is the scope appropriate? Too broad? Too narrow?
 6. **Stellar-core parity**: Will the proposed changes maintain or improve
    parity with stellar-core?
+7. **Structural ambition**: Does the proposal go far enough? Could a
+   bigger refactor — changing public APIs, restructuring types, using
+   Arc/Cow/lifetimes, redesigning enums — eliminate the root cause
+   rather than patching symptoms? Prefer structural solutions that make
+   the problem impossible over minimal fixes that address one instance.
+8. **Rust idiom quality**: Does the proposal move the code toward
+   idiomatic Rust? Ownership instead of cloning, references instead of
+   copies, iterators instead of index loops, enums instead of booleans,
+   newtypes for type safety?
 
 ## Output Format
 
@@ -168,6 +177,12 @@ If `--dry-run` is set, print the proposal to stdout instead of posting and
 
 Implement the converged proposal in full. This is the core implementation
 phase — you (the orchestrator) do the actual coding work.
+
+**Prefer structural solutions over minimal patches.** If the proposal calls
+for a large refactor — changing public API signatures, restructuring types,
+introducing Arc/Cow/lifetimes, redesigning enums, or modifying cross-crate
+interfaces — do it. The goal is clean, idiomatic, scalable Rust code, not
+the smallest possible diff.
 
 ### 3a: Plan the Implementation
 
@@ -357,3 +372,17 @@ Final verdict:      SOUND
   one commit addressing all feedback from that round.
 - **Parity is non-negotiable.** For any change touching protocol, consensus,
   or ledger logic, verify against stellar-core.
+- **Big swings are expected.** Large refactors, public API modifications,
+  struct redesigns, and design-level changes are not only permitted — they
+  are preferred when the result is cleaner, more idiomatic Rust, and more
+  scalable. Do not artificially constrain scope to minimal patches.
+  Examples of encouraged changes:
+  - Changing function signatures to accept `&T` or `Arc<T>` instead of
+    requiring callers to clone
+  - Restructuring types (adding Cow, newtype wrappers, splitting enums)
+  - Moving fields between structs to improve ownership semantics
+  - Cross-crate API changes when a pattern spans module boundaries
+  - Replacing C-style output parameters with return values
+  - Introducing trait bounds or generics to eliminate repetition
+  The bar is: does the code end up clearer, cleaner, and more maintainable?
+  If yes, the refactor is worth it regardless of diff size.
