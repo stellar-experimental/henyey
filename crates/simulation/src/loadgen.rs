@@ -1253,12 +1253,11 @@ impl LoadGenerator {
                 let instance = self
                     .contract_instances
                     .get(&source_account_id)
-                    .expect("contract instance must be assigned for SorobanInvoke")
-                    .clone();
+                    .expect("contract instance must be assigned for SorobanInvoke");
                 self.tx_generator.invoke_soroban_load_transaction(
                     ledger_num,
                     source_account_id,
-                    &instance,
+                    instance,
                     config.max_fee_rate,
                 )
             }
@@ -1310,12 +1309,11 @@ impl LoadGenerator {
             let instance = self
                 .contract_instances
                 .get(&source_account_id)
-                .expect("contract instance must be assigned for mixed invoke")
-                .clone();
+                .expect("contract instance must be assigned for mixed invoke");
             self.tx_generator.invoke_soroban_load_transaction(
                 ledger_num,
                 source_account_id,
-                &instance,
+                instance,
                 config.max_fee_rate,
             )
         }

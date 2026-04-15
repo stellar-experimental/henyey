@@ -52,7 +52,7 @@ pub(super) fn build_invoke_response(
     // Estimate the transaction size for fee computation
     let op = OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
         host_function: ctx.host_fn.clone(),
-        auth: ws_auth.clone().try_into().unwrap_or_default(),
+        auth: ws_auth[..].try_into().unwrap_or_default(),
     });
     let tx_size = estimate_tx_size_for_op(&op, &adjusted_resources);
 
