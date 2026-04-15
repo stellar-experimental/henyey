@@ -218,15 +218,15 @@ pub(super) fn compute_invoke_resource_fee(
     }
     disk_read_entries += restored_entry_count;
 
-    compute_resource_fee_core(
+    compute_resource_fee_core(&ResourceFeeParams {
         resources,
         disk_read_entries,
         rent_changes,
         soroban_info,
         current_ledger_seq,
-        contract_events_and_return_value_size,
+        contract_events_size_bytes: contract_events_and_return_value_size,
         tx_size,
-    )
+    })
 }
 
 /// Compute resource fee for ExtendTTL/Restore operations (rent-dominant).
@@ -244,48 +244,51 @@ pub(super) fn compute_resource_fee_with_rent(
     let disk_read_entries =
         resources.footprint.read_only.len() as u32 + resources.footprint.read_write.len() as u32;
 
-    compute_resource_fee_core(
+    compute_resource_fee_core(&ResourceFeeParams {
         resources,
         disk_read_entries,
         rent_changes,
         soroban_info,
         current_ledger_seq,
-        contract_events_size,
+        contract_events_size_bytes: contract_events_size,
         tx_size,
-    )
+    })
 }
 
-/// Shared fee assembly: build resources → compute tx fee → compute rent → adjust.
-fn compute_resource_fee_core(
-    resources: &SorobanResources,
+/// Parameters for resource fee computation.
+struct ResourceFeeParams<'a> {
+    resources: &'a SorobanResources,
     disk_read_entries: u32,
-    rent_changes: &[soroban_host::fees::LedgerEntryRentChange],
-    soroban_info: &henyey_ledger::SorobanNetworkInfo,
+    rent_changes: &'a [soroban_host::fees::LedgerEntryRentChange],
+    soroban_info: &'a henyey_ledger::SorobanNetworkInfo,
     current_ledger_seq: u32,
     contract_events_size_bytes: u32,
     tx_size: u32,
-) -> i64 {
+}
+
+/// Shared fee assembly: build resources → compute tx fee → compute rent → adjust.
+fn compute_resource_fee_core(params: &ResourceFeeParams<'_>) -> i64 {
     use soroban_host::fees::{
         compute_rent_fee, compute_transaction_resource_fee, TransactionResources,
     };
 
     let tx_resources = TransactionResources {
-        instructions: resources.instructions,
-        disk_read_entries,
-        write_entries: resources.footprint.read_write.len() as u32,
-        disk_read_bytes: resources.disk_read_bytes,
-        write_bytes: resources.write_bytes,
-        contract_events_size_bytes,
-        transaction_size_bytes: tx_size,
+        instructions: params.resources.instructions,
+        disk_read_entries: params.disk_read_entries,
+        write_entries: params.resources.footprint.read_write.len() as u32,
+        disk_read_bytes: params.resources.disk_read_bytes,
+        write_bytes: params.resources.write_bytes,
+        contract_events_size_bytes: params.contract_events_size_bytes,
+        transaction_size_bytes: params.tx_size,
     };
 
-    let fee_config = build_fee_config(soroban_info);
+    let fee_config = build_fee_config(params.soroban_info);
     let (non_refundable, refundable) = compute_transaction_resource_fee(&tx_resources, &fee_config);
 
     let rent_fee = compute_rent_fee(
-        rent_changes,
-        &build_rent_fee_config(soroban_info),
-        current_ledger_seq,
+        params.rent_changes,
+        &build_rent_fee_config(params.soroban_info),
+        params.current_ledger_seq,
     );
 
     let total_refundable = refundable.saturating_add(rent_fee);
