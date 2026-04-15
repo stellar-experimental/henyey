@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{BufReader, Read as _, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use stellar_xdr::curr::{
     BucketListType, BucketMetadata, BucketMetadataExt, HotArchiveBucketEntry, LedgerEntry,
     LedgerKey, Limits, ReadXdr, WriteXdr,
@@ -770,9 +770,9 @@ impl Default for HotArchiveBucket {
 #[derive(Clone, Debug)]
 pub struct HotArchiveBucketLevel {
     /// The current bucket.
-    pub(crate) curr: HotArchiveBucket,
+    pub(crate) curr: Arc<HotArchiveBucket>,
     /// The snapshot bucket.
-    pub(crate) snap: HotArchiveBucket,
+    pub(crate) snap: Arc<HotArchiveBucket>,
     /// Staged merge result.
     next: Option<HotArchiveBucket>,
     /// Level number (stored for debugging).
@@ -783,8 +783,8 @@ impl HotArchiveBucketLevel {
     /// Create a new empty level.
     pub fn new(level: usize) -> Self {
         Self {
-            curr: HotArchiveBucket::empty(),
-            snap: HotArchiveBucket::empty(),
+            curr: Arc::new(HotArchiveBucket::empty()),
+            snap: Arc::new(HotArchiveBucket::empty()),
             next: None,
             _level: level,
         }
@@ -795,9 +795,19 @@ impl HotArchiveBucketLevel {
         &self.curr
     }
 
+    /// Get an Arc clone of the current bucket (cheap).
+    pub fn curr_arc(&self) -> Arc<HotArchiveBucket> {
+        Arc::clone(&self.curr)
+    }
+
     /// Get a reference to the snapshot bucket.
     pub fn snap_bucket(&self) -> &HotArchiveBucket {
         &self.snap
+    }
+
+    /// Get an Arc clone of the snapshot bucket (cheap).
+    pub fn snap_arc(&self) -> Arc<HotArchiveBucket> {
+        Arc::clone(&self.snap)
     }
 
     /// Get the hash of this level.
@@ -835,14 +845,14 @@ impl HotArchiveBucketLevel {
     /// Commit the staged merge.
     fn commit(&mut self) {
         if let Some(next) = self.next.take() {
-            self.curr = next;
+            self.curr = Arc::new(next);
         }
     }
 
     /// Snap curr to snap and return the new snap (matches stellar-core BucketLevel::snap).
-    fn snap(&mut self) -> HotArchiveBucket {
-        self.snap = std::mem::take(&mut self.curr);
-        self.snap.clone()
+    fn snap(&mut self) -> Arc<HotArchiveBucket> {
+        self.snap = std::mem::replace(&mut self.curr, Arc::new(HotArchiveBucket::empty()));
+        Arc::clone(&self.snap)
     }
 
     /// Prepare a merge with an incoming bucket.
@@ -852,7 +862,7 @@ impl HotArchiveBucketLevel {
     fn prepare(
         &mut self,
         protocol_version: u32,
-        incoming: HotArchiveBucket,
+        incoming: &HotArchiveBucket,
         keep_tombstones: bool,
         use_empty_curr: bool,
     ) -> Result<()> {
@@ -863,18 +873,16 @@ impl HotArchiveBucketLevel {
         }
 
         // Choose curr or empty based on shouldMergeWithEmptyCurr
-        let curr_for_merge = if use_empty_curr {
-            HotArchiveBucket::empty()
+        let empty;
+        let curr_for_merge: &HotArchiveBucket = if use_empty_curr {
+            empty = HotArchiveBucket::empty();
+            &empty
         } else {
-            self.curr.clone()
+            &self.curr
         };
 
-        let merged = merge_hot_archive_buckets(
-            &curr_for_merge,
-            &incoming,
-            protocol_version,
-            keep_tombstones,
-        )?;
+        let merged =
+            merge_hot_archive_buckets(curr_for_merge, incoming, protocol_version, keep_tombstones)?;
         self.next = Some(merged);
         Ok(())
     }
@@ -1114,7 +1122,7 @@ impl HotArchiveBucketList {
                 let use_empty_curr = Self::should_merge_with_empty_curr(ledger_seq, i);
                 self.levels[i].prepare(
                     protocol_version,
-                    spilling_snap,
+                    &spilling_snap,
                     keep_tombstones,
                     use_empty_curr,
                 )?;
@@ -1125,7 +1133,7 @@ impl HotArchiveBucketList {
         // Level 0 never uses empty curr (shouldMergeWithEmptyCurr returns false for level 0)
         let keep_tombstones_0 = Self::keep_tombstone_entries(0);
 
-        self.levels[0].prepare(protocol_version, new_bucket, keep_tombstones_0, false)?;
+        self.levels[0].prepare(protocol_version, &new_bucket, keep_tombstones_0, false)?;
         self.levels[0].commit();
 
         Ok(())
@@ -1333,8 +1341,8 @@ impl HotArchiveBucketList {
                         };
 
                         let mut level = HotArchiveBucketLevel::new(i);
-                        level.curr = curr;
-                        level.snap = snap;
+                        level.curr = Arc::new(curr);
+                        level.snap = Arc::new(snap);
                         level.next = next;
                         Ok(level)
                     })
@@ -1423,8 +1431,8 @@ impl HotArchiveBucketList {
             };
 
             let mut level = HotArchiveBucketLevel::new(i);
-            level.curr = curr;
-            level.snap = snap;
+            level.curr = Arc::new(curr);
+            level.snap = Arc::new(snap);
             level.next = next;
             levels.push(level);
         }
@@ -1604,7 +1612,7 @@ impl HotArchiveBucketList {
             // Start the merge with the previous level's snap
             self.levels[i].prepare(
                 merge_protocol_version,
-                prev_snap,
+                &prev_snap,
                 keep_tombstones,
                 use_empty_curr,
             )?;

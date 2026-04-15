@@ -304,10 +304,12 @@ pub struct HotArchiveBucketLevelSnapshot {
 
 impl HotArchiveBucketLevelSnapshot {
     /// Creates a new level snapshot from a hot archive bucket level.
+    ///
+    /// Uses Arc cloning for cheap snapshot creation without deep copying.
     pub fn from_level(level: &HotArchiveBucketLevel) -> Self {
         Self {
-            curr: HotArchiveBucketSnapshot::from_ref(level.curr()),
-            snap: HotArchiveBucketSnapshot::from_ref(level.snap_bucket()),
+            curr: HotArchiveBucketSnapshot::new(level.curr_arc()),
+            snap: HotArchiveBucketSnapshot::new(level.snap_arc()),
         }
     }
 }
