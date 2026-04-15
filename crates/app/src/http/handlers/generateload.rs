@@ -41,6 +41,25 @@ pub struct LoadGenRequest {
     pub wasms: u32,
 }
 
+impl From<GenerateLoadParams> for LoadGenRequest {
+    fn from(p: GenerateLoadParams) -> Self {
+        Self {
+            mode: p.mode,
+            accounts: p.accounts,
+            txs: p.txs,
+            tx_rate: p.txrate,
+            offset: p.offset,
+            spike_interval: p.spikeinterval,
+            spike_size: p.spikesize,
+            max_fee_rate: p.maxfeerate,
+            skip_low_fee_txs: p.skiplowfeetxs,
+            min_percent_success: p.minpercentsuccess,
+            instances: p.instances,
+            wasms: p.wasms,
+        }
+    }
+}
+
 /// Trait for the load generation backend.
 ///
 /// Implemented by `henyey-simulation` and injected into the HTTP server state
@@ -124,28 +143,16 @@ pub(crate) async fn generateload_handler(
         });
     }
 
-    let request = LoadGenRequest {
-        mode: params.mode.clone(),
-        accounts: params.accounts,
-        txs: params.txs,
-        tx_rate: params.txrate,
-        offset: params.offset,
-        spike_interval: params.spikeinterval,
-        spike_size: params.spikesize,
-        max_fee_rate: params.maxfeerate,
-        skip_low_fee_txs: params.skiplowfeetxs,
-        min_percent_success: params.minpercentsuccess,
-        instances: params.instances,
-        wasms: params.wasms,
-    };
+    let summary = format!(
+        "Started {} load generation: accounts={}, txs={}, txrate={}",
+        params.mode, params.accounts, params.txs, params.txrate,
+    );
+    let request: LoadGenRequest = params.into();
 
     match loadgen_state.runner.start_load(request) {
         Ok(()) => Json(GenerateLoadResponse {
             status: "ok".to_string(),
-            info: Some(format!(
-                "Started {} load generation: accounts={}, txs={}, txrate={}",
-                params.mode, params.accounts, params.txs, params.txrate,
-            )),
+            info: Some(summary),
         }),
         Err(e) => Json(GenerateLoadResponse {
             status: "error".to_string(),

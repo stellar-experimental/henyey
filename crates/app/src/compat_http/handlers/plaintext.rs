@@ -617,28 +617,16 @@ pub(crate) async fn compat_generateload_handler(
         }));
     }
 
-    let request = LoadGenRequest {
-        mode: params.mode.clone(),
-        accounts: params.accounts,
-        txs: params.txs,
-        tx_rate: params.txrate,
-        offset: params.offset,
-        spike_interval: params.spikeinterval,
-        spike_size: params.spikesize,
-        max_fee_rate: params.maxfeerate,
-        skip_low_fee_txs: params.skiplowfeetxs,
-        min_percent_success: params.minpercentsuccess,
-        instances: params.instances,
-        wasms: params.wasms,
-    };
+    let summary = format!(
+        "Started {} load generation: accounts={}, txs={}, txrate={}",
+        params.mode, params.accounts, params.txs, params.txrate,
+    );
+    let request: LoadGenRequest = params.into();
 
     match loadgen_state.runner.start_load(request) {
         Ok(()) => Json(serde_json::json!({
             "status": "ok",
-            "info": format!(
-                "Started {} load generation: accounts={}, txs={}, txrate={}",
-                params.mode, params.accounts, params.txs, params.txrate,
-            ),
+            "info": summary,
         })),
         Err(e) => Json(serde_json::json!({
             "exception": e
