@@ -54,7 +54,7 @@ impl App {
         };
 
         // Don't publish a checkpoint that's still being closed
-        let current_ledger = *self.current_ledger.read().await;
+        let current_ledger = self.current_ledger_seq();
         if checkpoint > current_ledger {
             return;
         }

@@ -131,7 +131,7 @@ impl App {
         use henyey_ledger::compute_header_hash;
 
         // Read LCL header from DB
-        let (lcl_seq, header) = self.db.with_connection(|conn| {
+        let (_lcl_seq, header) = self.db.with_connection(|conn| {
             let lcl_seq = conn
                 .get_last_closed_ledger()?
                 .ok_or_else(|| henyey_db::DbError::Integrity("No LCL in DB".to_string()))?;
@@ -166,7 +166,6 @@ impl App {
         );
 
         self.set_state(super::AppState::Synced).await;
-        self.set_current_ledger(lcl_seq).await;
 
         // Seed validation context so tx queue rejects invalid Soroban txs immediately.
         self.seed_validation_context();

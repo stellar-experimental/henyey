@@ -18,7 +18,7 @@ impl App {
 
         // Check if we should start a new round
         if self.herder.is_tracking() {
-            let current_ledger = *self.current_ledger.read().await;
+            let current_ledger = self.current_ledger_seq();
 
             // Don't propose if our LCL is not synced with the tracking slot.
             // stellar-core's isSynced() checks: lastClosedLedger + 1 == trackingConsensusLedgerIndex.
@@ -642,7 +642,7 @@ impl App {
         if !self.herder.state().can_receive_scp() {
             return;
         }
-        let current_ledger = *self.current_ledger.read().await as u64;
+        let current_ledger = self.current_ledger_seq() as u64;
         let slot = self.herder.tracking_slot().max(current_ledger + 1);
         let now = self.clock.now();
         let mut timeouts = self.scp_timeouts.write().await;

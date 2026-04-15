@@ -255,9 +255,6 @@ pub struct App {
     /// Herder for consensus coordination.
     herder: Arc<Herder>,
 
-    /// Current ledger sequence.
-    current_ledger: RwLock<u32>,
-
     /// Whether running as validator.
     is_validator: bool,
 
@@ -620,7 +617,6 @@ impl App {
             ledger_manager,
             overlay: RwLock::new(None),
             herder,
-            current_ledger: RwLock::new(0),
             shutdown_tx,
             _shutdown_rx: shutdown_rx,
             scp_envelope_tx,
@@ -989,11 +985,6 @@ impl App {
             }
         }
         Ok(())
-    }
-
-    /// Set the tracked current ledger sequence.
-    pub(crate) async fn set_current_ledger(&self, seq: u32) {
-        *self.current_ledger.write().await = seq;
     }
 
     /// Check if the force-scp flag is set in the database.
@@ -2626,10 +2617,7 @@ mod tests {
 
         let app = App::new(config).await.unwrap();
 
-        // Set current_ledger to 99 so entries at 100+ are above current_ledger
-        *app.current_ledger.write().await = 99;
-
-        // Add entries: some with tx_set, some without (starting from current_ledger+1)
+        // Add entries: some with tx_set, some without (starting from ledger 100+)
         {
             let mut buffer = app.syncing_ledgers.write().await;
             // Entry WITHOUT tx_set at current_ledger+1 (should be evicted when exhausted)

@@ -1709,7 +1709,6 @@ impl App {
                     if reset_stuck_state {
                         *self.consensus_stuck_state.write().await = None;
                     }
-                    *self.current_ledger.write().await = result.ledger_seq;
                     *self.last_processed_slot.write().await = result.ledger_seq as u64;
                     self.clear_tx_advert_history(result.ledger_seq).await;
                     self.herder.bootstrap(result.ledger_seq);
@@ -1777,7 +1776,7 @@ impl App {
                     //  - If gap <= TX_SET_REQUEST_WINDOW: fetches tx_sets from
                     //    peers (recent enough to still be cached)
                     {
-                        let current_ledger = *self.current_ledger.read().await;
+                        let current_ledger = self.current_ledger_seq();
                         let latest_ext = self
                             .herder
                             .latest_externalized_slot()
@@ -1805,7 +1804,7 @@ impl App {
                     // try_start_ledger_close immediately for any buffered
                     // ledgers that are already ready.
                     if let Some(overlay) = self.overlay().await {
-                        let current_ledger = *self.current_ledger.read().await;
+                        let current_ledger = self.current_ledger_seq();
                         tokio::spawn(async move {
                             let _ = overlay.request_scp_state(current_ledger).await;
                         });

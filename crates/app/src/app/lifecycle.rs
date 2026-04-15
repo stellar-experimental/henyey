@@ -29,15 +29,11 @@ impl App {
         if current_ledger == 0 {
             // This shouldn't happen if run_cmd did catchup, but handle it just in case
             tracing::info!("No ledger state, running catchup first");
-            let result = self.catchup(CatchupTarget::Current).await?;
-            *self.current_ledger.write().await = result.ledger_seq;
-        } else {
-            // Ledger manager was already initialized (e.g., catchup ran before run())
-            *self.current_ledger.write().await = current_ledger;
+            self.catchup(CatchupTarget::Current).await?;
         }
 
         // Bootstrap herder with current ledger
-        let ledger_seq = *self.current_ledger.read().await;
+        let ledger_seq = self.current_ledger_seq();
         *self.last_processed_slot.write().await = ledger_seq as u64;
         self.herder.start_syncing();
         self.herder.bootstrap(ledger_seq);
@@ -145,7 +141,7 @@ impl App {
         // EXTERNALIZE messages arriving via the dedicated SCP channel will create
         // new entries with current tx_set hashes that peers actually have.
         {
-            let current_ledger = *self.current_ledger.read().await;
+            let current_ledger = self.current_ledger_seq();
             self.herder.clear_pending_tx_sets();
             // Also clear syncing_ledgers entries that have no tx_set — these are
             // unfulfillable entries created from stale EXTERNALIZE messages.
@@ -265,7 +261,7 @@ impl App {
                         // If no more buffered ledgers to close, we just finished a rapid
                         // close cycle.
                         if pending_close.is_none() {
-                            let current_ledger = *self.current_ledger.read().await;
+                            let current_ledger = self.current_ledger_seq();
 
                             // Reset last_externalized_at so the heartbeat stall detector
                             // doesn't fire prematurely based on the timestamp of the
@@ -586,7 +582,7 @@ impl App {
                         // the data cached (~60s window). Without this, the node waits
                         // for SyncRecoveryManager (35s timeout) which is too late.
                         if pending_close.is_none() && self.herder.state().can_receive_scp() {
-                            let cl = *self.current_ledger.read().await;
+                            let cl = self.current_ledger_seq();
                             let latest = self.herder.latest_externalized_slot().unwrap_or(0);
                             let next = cl as u64 + 1;
                             if latest > next
@@ -710,7 +706,7 @@ impl App {
                 _ = heartbeat_interval.tick() => {
                     self.set_phase(16); // 16 = heartbeat
                     let tracking_slot = self.herder.tracking_slot();
-                    let ledger = *self.current_ledger.read().await;
+                    let ledger = self.current_ledger_seq();
                     let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
                     let peers = self.overlay().await.map(|o| o.peer_count()).unwrap_or(0);
 
@@ -761,7 +757,7 @@ impl App {
                         if now.duration_since(last_ext) > Duration::from_secs(20)
                             && now.duration_since(last_request) > Duration::from_secs(10)
                         {
-                            let current_ledger = *self.current_ledger.read().await;
+                            let current_ledger = self.current_ledger_seq();
                             let gap = latest_ext.saturating_sub(current_ledger as u64);
 
                             // Check if the very next slot's EXTERNALIZE is missing.
@@ -1068,7 +1064,7 @@ impl App {
                             // Then, immediately request any pending tx sets
                             self.request_pending_tx_sets().await;
 
-                            let current_ledger = *self.current_ledger.read().await as u64;
+                            let current_ledger = self.current_ledger_seq() as u64;
                             if slot > current_ledger + 1 {
                                 self.sync_recovery_pending.store(true, Ordering::SeqCst);
                                 // If the gap is large, fast-track to catchup
@@ -1093,7 +1089,7 @@ impl App {
                         // and fast-tracking would destroy the buffer via
                         // trigger_recovery_catchup → buffer.clear(), preventing convergence.
                         if is_externalize {
-                            let current_ledger = *self.current_ledger.read().await as u64;
+                            let current_ledger = self.current_ledger_seq() as u64;
                             if slot > current_ledger + 2 {
                                 let next_slot = current_ledger as u32 + 1;
                                 let have_next = self
@@ -1403,7 +1399,7 @@ impl App {
     /// Log current stats.
     async fn log_stats(&self) {
         let stats = self.herder.stats();
-        let ledger = *self.current_ledger.read().await;
+        let ledger = self.current_ledger_seq();
 
         // Get overlay stats if available
         let (peer_count, flood_stats) = {

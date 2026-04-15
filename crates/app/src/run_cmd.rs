@@ -372,7 +372,6 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
                     "Restored state from disk, skipping full catchup"
                 );
                 app.set_state(AppState::Synced).await;
-                app.set_current_ledger(info.ledger_seq).await;
             }
             Ok(false) => {
                 tracing::debug!("No persisted state available, will check catchup");

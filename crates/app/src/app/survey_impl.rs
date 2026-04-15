@@ -757,7 +757,7 @@ impl App {
     async fn survey_local_ledger(&self) -> u32 {
         let tracking = self.herder.tracking_slot() as u32;
         if tracking == 0 {
-            *self.current_ledger.read().await
+            self.current_ledger_seq()
         } else {
             tracking
         }
@@ -936,7 +936,7 @@ impl App {
                     return;
                 }
 
-                let ledger_num = *self.current_ledger.read().await;
+                let ledger_num = self.current_ledger_seq();
                 let nonce = {
                     let mut nonce = self.survey_nonce.write().await;
                     let current = *nonce;
@@ -1002,7 +1002,7 @@ impl App {
         let mut survey_data = self.survey_data.write().await;
         survey_data.update_phase(&inbound, &outbound, added, dropped, lost_sync);
 
-        let last_closed = *self.current_ledger.read().await;
+        let last_closed = self.current_ledger_seq();
         let mut limiter = self.survey_limiter.write().await;
         limiter.clear_old_ledgers(last_closed);
     }

@@ -1105,7 +1105,7 @@ impl App {
             let mut advance_to;
             let mut skipped_stale = 0u64;
             {
-                let current_ledger = *self.current_ledger.read().await;
+                let current_ledger = self.current_ledger_seq();
                 let mut buffer = self.syncing_ledgers.write().await;
 
                 // Only iterate slots that peers are likely to still have
@@ -1221,7 +1221,7 @@ impl App {
             // EXTERNALIZE creates an entry (buffered_count == 1) even though
             // current_ledger is 40+ slots behind.  Check the gap regardless.
             {
-                let current_ledger = *self.current_ledger.read().await;
+                let current_ledger = self.current_ledger_seq();
                 let gap = latest_externalized.saturating_sub(current_ledger as u64);
                 if buffered_count == 0 || gap > TX_SET_REQUEST_WINDOW {
                     self.set_phase(11); // 11 = externalized_catchup
@@ -1875,7 +1875,6 @@ impl App {
         }
 
         // Update current ledger tracking.
-        *self.current_ledger.write().await = pending.ledger_seq;
         *self.last_processed_slot.write().await = pending.ledger_seq as u64;
         self.clear_tx_advert_history(pending.ledger_seq).await;
 
