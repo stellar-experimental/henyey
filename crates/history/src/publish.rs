@@ -51,11 +51,9 @@ use crate::{
 };
 use henyey_bucket::{BucketList, PendingMergeState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
 use henyey_common::Hash256;
-use henyey_ledger::TransactionSetVariant;
 use std::path::{Path, PathBuf};
 use stellar_xdr::curr::{
-    LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
-    TransactionHistoryResultEntry, WriteXdr,
+    LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
 use tracing::{debug, info};
 
@@ -267,14 +265,7 @@ impl PublishManager {
                 continue;
             }
 
-            let tx_set = match &entry.ext {
-                TransactionHistoryEntryExt::V0 => {
-                    TransactionSetVariant::Classic(entry.tx_set.clone())
-                }
-                TransactionHistoryEntryExt::V1(set) => {
-                    TransactionSetVariant::Generalized(set.clone())
-                }
-            };
+            let tx_set = crate::catchup::tx_set_from_history_entry(entry);
             verify::verify_tx_set(header, &tx_set)?;
 
             let result_entry = tx_result_map.get(&header.ledger_seq).ok_or_else(|| {

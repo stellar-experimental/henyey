@@ -75,6 +75,15 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info};
 
+/// Extract a `TransactionSetVariant` from a `TransactionHistoryEntry`.
+pub(crate) fn tx_set_from_history_entry(entry: &TransactionHistoryEntry) -> TransactionSetVariant {
+    use stellar_xdr::curr::TransactionHistoryEntryExt;
+    match &entry.ext {
+        TransactionHistoryEntryExt::V0 => TransactionSetVariant::Classic(entry.tx_set.clone()),
+        TransactionHistoryEntryExt::V1(set) => TransactionSetVariant::Generalized(set.clone()),
+    }
+}
+
 /// Current status of a catchup operation.
 ///
 /// This enum represents the discrete phases of the catchup process,

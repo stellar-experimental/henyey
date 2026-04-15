@@ -4,7 +4,7 @@ use crate::{verify, HistoryError, Result};
 use henyey_common::Hash256;
 use std::sync::Arc;
 
-use henyey_ledger::{LedgerCloseData, LedgerManager, TransactionSetVariant};
+use henyey_ledger::{LedgerCloseData, LedgerManager};
 use stellar_xdr::curr::{LedgerHeader, LedgerUpgrade, Limits, ReadXdr, WriteXdr};
 use tracing::{debug, info, warn};
 
@@ -74,14 +74,7 @@ impl CatchupManager {
         // Verify transaction sets match header hashes
         for data in ledger_data {
             if let Some(entry) = data.tx_history_entry.as_ref() {
-                let tx_set = match &entry.ext {
-                    stellar_xdr::curr::TransactionHistoryEntryExt::V0 => {
-                        TransactionSetVariant::Classic(entry.tx_set.clone())
-                    }
-                    stellar_xdr::curr::TransactionHistoryEntryExt::V1(set) => {
-                        TransactionSetVariant::Generalized(set.clone())
-                    }
-                };
+                let tx_set = super::tx_set_from_history_entry(entry);
                 verify::verify_tx_set(&data.header, &tx_set)?;
             }
             if let Some(entry) = data.tx_result_entry.as_ref() {

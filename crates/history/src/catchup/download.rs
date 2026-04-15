@@ -12,8 +12,7 @@ use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
 use henyey_ledger::TransactionSetVariant;
 use stellar_xdr::curr::{
     GeneralizedTransactionSet, LedgerHeader, LedgerHeaderHistoryEntry, ScpHistoryEntry,
-    TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
-    TransactionSet, TransactionSetV1,
+    TransactionHistoryEntry, TransactionHistoryResultEntry, TransactionSet, TransactionSetV1,
 };
 use tracing::{debug, info, warn};
 
@@ -327,14 +326,7 @@ impl CatchupManager {
                 .cloned();
             let tx_set = tx_history_entry
                 .as_ref()
-                .map(|entry| match &entry.ext {
-                    TransactionHistoryEntryExt::V0 => {
-                        TransactionSetVariant::Classic(entry.tx_set.clone())
-                    }
-                    TransactionHistoryEntryExt::V1(set) => {
-                        TransactionSetVariant::Generalized(set.clone())
-                    }
-                })
+                .map(|entry| super::tx_set_from_history_entry(entry))
                 .unwrap_or_else(|| {
                     // For protocol 20+, use GeneralizedTransactionSet format
                     // For earlier protocols, use Classic TransactionSet
