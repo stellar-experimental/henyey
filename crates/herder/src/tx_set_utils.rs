@@ -1303,45 +1303,52 @@ pub(crate) fn check_valid_soroban(
 
     // RW conflict detection between clusters within each stage
     for stage in parallel.execution_stages.iter() {
-        let mut stage_read_only_keys: HashSet<Vec<u8>> = HashSet::new();
-        let mut stage_read_write_keys: HashSet<Vec<u8>> = HashSet::new();
-
-        for cluster in stage.iter() {
-            let mut cluster_read_only_keys: Vec<Vec<u8>> = Vec::new();
-            let mut cluster_read_write_keys: Vec<Vec<u8>> = Vec::new();
-
-            for tx in cluster.iter() {
-                if let Some(resources) = envelope_soroban_resources(tx) {
-                    for key in resources.footprint.read_only.iter() {
-                        let key_bytes = key_to_bytes(key);
-                        if stage_read_write_keys.contains(&key_bytes) {
-                            debug!(
-                                "Got bad txSet: cluster footprint conflicts with another cluster within stage"
-                            );
-                            return false;
-                        }
-                        cluster_read_only_keys.push(key_bytes);
-                    }
-                    for key in resources.footprint.read_write.iter() {
-                        let key_bytes = key_to_bytes(key);
-                        if stage_read_only_keys.contains(&key_bytes)
-                            || stage_read_write_keys.contains(&key_bytes)
-                        {
-                            debug!(
-                                "Got bad txSet: cluster footprint conflicts with another cluster within stage"
-                            );
-                            return false;
-                        }
-                        cluster_read_write_keys.push(key_bytes);
-                    }
-                }
-            }
-
-            stage_read_only_keys.extend(cluster_read_only_keys);
-            stage_read_write_keys.extend(cluster_read_write_keys);
+        if !check_stage_footprint_conflicts(stage) {
+            return false;
         }
     }
 
+    true
+}
+
+/// Check that no cluster's footprint conflicts with another cluster within the same stage.
+///
+/// A read-only key in one cluster must not appear as read-write in another cluster,
+/// and a read-write key in one cluster must not appear in any other cluster's footprint.
+fn check_stage_footprint_conflicts(stage: &stellar_xdr::curr::ParallelTxExecutionStage) -> bool {
+    let mut stage_read_only_keys: HashSet<Vec<u8>> = HashSet::new();
+    let mut stage_read_write_keys: HashSet<Vec<u8>> = HashSet::new();
+
+    for cluster in stage.iter() {
+        let mut cluster_read_only_keys: Vec<Vec<u8>> = Vec::new();
+        let mut cluster_read_write_keys: Vec<Vec<u8>> = Vec::new();
+
+        for tx in cluster.iter() {
+            if let Some(resources) = envelope_soroban_resources(tx) {
+                for key in resources.footprint.read_only.iter() {
+                    let key_bytes = key_to_bytes(key);
+                    if stage_read_write_keys.contains(&key_bytes) {
+                        debug!("Got bad txSet: cluster footprint conflicts with another cluster within stage");
+                        return false;
+                    }
+                    cluster_read_only_keys.push(key_bytes);
+                }
+                for key in resources.footprint.read_write.iter() {
+                    let key_bytes = key_to_bytes(key);
+                    if stage_read_only_keys.contains(&key_bytes)
+                        || stage_read_write_keys.contains(&key_bytes)
+                    {
+                        debug!("Got bad txSet: cluster footprint conflicts with another cluster within stage");
+                        return false;
+                    }
+                    cluster_read_write_keys.push(key_bytes);
+                }
+            }
+        }
+
+        stage_read_only_keys.extend(cluster_read_only_keys);
+        stage_read_write_keys.extend(cluster_read_write_keys);
+    }
     true
 }
 
