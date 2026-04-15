@@ -80,7 +80,7 @@ pub struct Slot {
     local_node_id: NodeId,
 
     /// The local node's quorum set configuration.
-    local_quorum_set: ScpQuorumSet,
+    local_quorum_set: Arc<ScpQuorumSet>,
 
     /// Whether this node is a validator (actively participates in consensus).
     is_validator: bool,
@@ -118,7 +118,7 @@ impl Slot {
     pub fn new(
         slot_index: u64,
         local_node_id: NodeId,
-        local_quorum_set: ScpQuorumSet,
+        local_quorum_set: Arc<ScpQuorumSet>,
         is_validator: bool,
     ) -> Self {
         let mut nomination = NominationProtocol::new();
@@ -882,12 +882,12 @@ mod tests {
     use super::*;
     use crate::test_utils::{make_node_id, MockDriver};
 
-    fn make_quorum_set() -> ScpQuorumSet {
-        ScpQuorumSet {
+    fn make_quorum_set() -> Arc<ScpQuorumSet> {
+        Arc::new(ScpQuorumSet {
             threshold: 1,
             validators: vec![].try_into().unwrap(),
             inner_sets: vec![].try_into().unwrap(),
-        }
+        })
     }
 
     #[test]
@@ -1104,13 +1104,13 @@ mod tests {
         let node1 = make_node_id(1);
         let node2 = make_node_id(2);
         let node3 = make_node_id(3);
-        let quorum_set = ScpQuorumSet {
+        let quorum_set = Arc::new(ScpQuorumSet {
             threshold: 2,
             validators: vec![node1.clone(), node2.clone(), node3.clone()]
                 .try_into()
                 .unwrap(),
             inner_sets: vec![].try_into().unwrap(),
-        };
+        });
         let slot = Slot::new(42, node1.clone(), quorum_set.clone(), true);
 
         let info = slot.get_quorum_info();
@@ -1233,13 +1233,13 @@ mod tests {
         // A v-blocking set is any set that intersects every quorum slice.
         // With threshold=2, validators={n1,n2,n3}, v-blocking needs at least 2 nodes
         // (since removing 2 nodes leaves 1, which doesn't meet threshold 2).
-        let quorum_set = ScpQuorumSet {
+        let quorum_set = Arc::new(ScpQuorumSet {
             threshold: 2,
             validators: vec![node1.clone(), node2.clone(), node3.clone()]
                 .try_into()
                 .unwrap(),
             inner_sets: vec![].try_into().unwrap(),
-        };
+        });
         let mut slot = Slot::new(1, node1.clone(), quorum_set.clone(), true);
 
         // Initially not v-blocking

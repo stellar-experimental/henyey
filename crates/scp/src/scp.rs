@@ -87,7 +87,7 @@ pub struct SCP<D: SCPDriver> {
     is_validator: bool,
 
     /// Local quorum set configuration defining trusted validators.
-    local_quorum_set: ScpQuorumSet,
+    local_quorum_set: Arc<ScpQuorumSet>,
 
     /// Per-slot consensus state, keyed by slot index.
     slots: RwLock<HashMap<u64, Slot>>,
@@ -116,7 +116,7 @@ impl<D: SCPDriver> SCP<D> {
         Self {
             local_node_id: node_id,
             is_validator,
-            local_quorum_set: quorum_set,
+            local_quorum_set: Arc::new(quorum_set),
             slots: RwLock::new(HashMap::new()),
             driver,
             max_slots: DEFAULT_MAX_SLOTS,
@@ -140,7 +140,7 @@ impl<D: SCPDriver> SCP<D> {
 
     /// Update the local quorum set.
     pub fn set_local_quorum_set(&mut self, quorum_set: ScpQuorumSet) {
-        self.local_quorum_set = quorum_set;
+        self.local_quorum_set = Arc::new(quorum_set);
     }
 
     /// Get a reference to the SCP driver.
@@ -164,7 +164,7 @@ impl<D: SCPDriver> SCP<D> {
             Slot::new(
                 slot_index,
                 self.local_node_id.clone(),
-                self.local_quorum_set.clone(),
+                Arc::clone(&self.local_quorum_set),
                 self.is_validator,
             )
         })
