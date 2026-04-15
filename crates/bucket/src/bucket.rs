@@ -217,10 +217,9 @@ impl Bucket {
         // Single pass: serialize each entry once, use for both index and hash
         for (idx, entry) in entries.iter().enumerate() {
             // Serialize entry to XDR
-            let xdr_entry = entry.clone();
             let mut entry_bytes = Vec::new();
             let mut limited = Limited::new(&mut entry_bytes, Limits::none());
-            xdr_entry.write_xdr(&mut limited).map_err(|e| {
+            entry.write_xdr(&mut limited).map_err(|e| {
                 BucketError::Serialization(format!("Failed to serialize entry: {}", e))
             })?;
 
@@ -542,12 +541,10 @@ impl Bucket {
         let mut bytes = Vec::new();
 
         for entry in entries {
-            let xdr_entry = entry.clone();
-
             // First serialize the entry to get its size
             let mut entry_bytes = Vec::new();
             let mut limited = Limited::new(&mut entry_bytes, Limits::none());
-            xdr_entry.write_xdr(&mut limited).map_err(|e| {
+            entry.write_xdr(&mut limited).map_err(|e| {
                 BucketError::Serialization(format!("Failed to serialize entry: {}", e))
             })?;
 
@@ -986,10 +983,9 @@ impl Bucket {
         // Single pass: serialize each entry for hash and build key index
         for (idx, entry) in entries.iter().enumerate() {
             // Serialize entry to XDR for hash
-            let xdr_entry = entry.clone();
             let mut entry_bytes = Vec::new();
             let mut limited = Limited::new(&mut entry_bytes, Limits::none());
-            xdr_entry.write_xdr(&mut limited).map_err(|e| {
+            entry.write_xdr(&mut limited).map_err(|e| {
                 BucketError::Serialization(format!("Failed to serialize entry: {}", e))
             })?;
 

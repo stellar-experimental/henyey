@@ -322,12 +322,10 @@ impl DiskBucket {
         );
 
         let index = OnceLock::new();
-        index
-            .set(Box::new(live_index))
-            .unwrap_or_else(|_| unreachable!());
+        index.set(Box::new(live_index)).expect("just initialized");
         let mmap = OnceLock::new();
         mmap.set(Self::create_mmap(path)?)
-            .unwrap_or_else(|_| unreachable!());
+            .expect("just initialized");
 
         Ok(Self {
             hash,
@@ -363,10 +361,10 @@ impl DiskBucket {
         let index = OnceLock::new();
         index
             .set(Box::new(prebuilt_index))
-            .unwrap_or_else(|_| unreachable!());
+            .expect("just initialized");
         let mmap = OnceLock::new();
         mmap.set(Self::create_mmap(path)?)
-            .unwrap_or_else(|_| unreachable!());
+            .expect("just initialized");
 
         Ok(Self {
             hash,

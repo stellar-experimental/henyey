@@ -2,13 +2,20 @@
 
 use stellar_xdr::curr::{NodeId, ScpBallot, ScpEnvelope, ScpStatementPledges, Value};
 
+/// Number of bytes to display for node IDs (8 hex chars).
+const NODE_ID_PREFIX_BYTES: usize = 4;
+/// Number of bytes to display for ballot values (8 hex chars).
+const VALUE_SHORT_BYTES: usize = 4;
+/// Number of bytes to display for full values (16 hex chars).
+const VALUE_PREFIX_BYTES: usize = 8;
+
 /// Format a NodeId for display as a short string.
 ///
 /// Returns the first 8 hex characters of the public key.
 pub fn node_id_to_short_string(node_id: &NodeId) -> String {
     match &node_id.0 {
         stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(bytes)) => {
-            hex::encode(&bytes[..4])
+            hex::encode(&bytes[..NODE_ID_PREFIX_BYTES])
         }
     }
 }
@@ -18,13 +25,13 @@ pub fn ballot_to_str(ballot: &ScpBallot) -> String {
     format!(
         "({},{})",
         ballot.counter,
-        hex::encode(&ballot.value.as_slice()[..4.min(ballot.value.len())])
+        hex::encode(&ballot.value.as_slice()[..VALUE_SHORT_BYTES.min(ballot.value.len())])
     )
 }
 
 /// Format a Value for display.
 pub fn value_to_str(value: &Value) -> String {
-    hex::encode(&value.as_slice()[..8.min(value.len())])
+    hex::encode(&value.as_slice()[..VALUE_PREFIX_BYTES.min(value.len())])
 }
 
 /// Format an envelope for display.
