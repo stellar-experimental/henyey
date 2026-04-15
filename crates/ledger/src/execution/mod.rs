@@ -114,7 +114,6 @@ pub struct TransactionExecutionRequest {
     pub base_fee: u32,
     pub soroban_prng_seed: Option<[u8; 32]>,
     pub deduct_fee: bool,
-    pub fee_source_pre_state: Option<LedgerEntry>,
     pub should_apply: bool,
 }
 
@@ -124,7 +123,6 @@ impl TransactionExecutionRequest {
         base_fee: u32,
         soroban_prng_seed: Option<[u8; 32]>,
         deduct_fee: bool,
-        fee_source_pre_state: Option<LedgerEntry>,
         should_apply: bool,
     ) -> Self {
         Self {
@@ -132,7 +130,6 @@ impl TransactionExecutionRequest {
             base_fee,
             soroban_prng_seed,
             deduct_fee,
-            fee_source_pre_state,
             should_apply,
         }
     }
@@ -1785,10 +1782,6 @@ impl TransactionExecutor {
     /// When `deduct_fee` is false, fee validation still occurs but no fee
     /// processing changes are applied to the state or delta.
     ///
-    /// For fee bump transactions in two-phase mode, `fee_source_pre_state` can be provided
-    /// to use as the STATE entry in tx_changes_before. This is needed because the current
-    /// state may already be post-fee-processing (synced with CDP's fee_meta), but we need
-    /// to emit the pre-fee state for the STATE entry to match stellar-core behavior.
     pub fn execute_transaction_with_fee_mode(
         &mut self,
         snapshot: &SnapshotHandle,
@@ -1804,7 +1797,6 @@ impl TransactionExecutor {
                 base_fee,
                 soroban_prng_seed,
                 deduct_fee,
-                None,
                 true, // should_apply: always execute body in sequential path
             ),
         )
@@ -1827,7 +1819,6 @@ impl TransactionExecutor {
         base_fee: u32,
         soroban_prng_seed: Option<[u8; 32]>,
         deduct_fee: bool,
-        _fee_source_pre_state: Option<LedgerEntry>,
     ) -> Result<std::result::Result<PreApplyResult, TransactionExecutionResult>> {
         let tx_timing_start = std::time::Instant::now();
 
@@ -2301,7 +2292,6 @@ impl TransactionExecutor {
             base_fee,
             soroban_prng_seed,
             deduct_fee,
-            fee_source_pre_state,
             should_apply,
         } = request;
 
@@ -2312,7 +2302,6 @@ impl TransactionExecutor {
             base_fee,
             soroban_prng_seed,
             deduct_fee,
-            fee_source_pre_state,
         )? {
             Ok(pre) => pre,
             Err(early_result) => return Ok(early_result),

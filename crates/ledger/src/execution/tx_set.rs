@@ -177,7 +177,6 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
                 base_fee: tx_fee,
                 soroban_prng_seed: Some(tx_prng_seed),
                 deduct_fee: false,
-                fee_source_pre_state: None,
                 should_apply,
             },
         )?;
@@ -517,7 +516,6 @@ fn pre_parallel_apply(
                     tx_fee,
                     Some(tx_prng_seed),
                     false, // deduct_fee=false — fees already on delta
-                    None,  // no fee_source_pre_state
                 )?;
 
                 match pre_result {
@@ -1087,7 +1085,6 @@ pub(super) fn execute_single_cluster(
                     base_fee: tx_fee,
                     soroban_prng_seed: Some(tx_prng_seed),
                     deduct_fee: false,
-                    fee_source_pre_state: None,
                     should_apply: pre.should_apply,
                 },
             )?

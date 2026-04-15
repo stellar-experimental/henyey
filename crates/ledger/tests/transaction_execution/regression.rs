@@ -3568,7 +3568,6 @@ fn test_should_apply_false_skips_operation_body() {
                 100,
                 Some([0u8; 32]), // soroban_prng_seed
                 false,           // deduct_fee=false (fees pre-deducted in parallel path)
-                None,            // no fee_source_pre_state
                 false,           // should_apply=false — this is what we're testing
             ),
         )
