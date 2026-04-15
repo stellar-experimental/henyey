@@ -1,7 +1,7 @@
 ---
 name: propose-execute-loop
 description: Iterate over all open GitHub issues, AI-triage each for readiness, and call /propose-execute on actionable ones
-argument-hint: "[--label <label>] [--model <model>] [--max-proposal-rounds N] [--max-review-rounds N] [--dry-run]"
+argument-hint: "[--label <label>] [--model <model>] [--batch-size N] [--max-proposal-rounds N] [--max-review-rounds N] [--dry-run]"
 ---
 
 Parse `$ARGUMENTS`:
@@ -9,38 +9,84 @@ Parse `$ARGUMENTS`:
   If omitted, all open issues are considered.
 - `--model <model>`: Model for triage, critic, and review agents
   (default: `"gpt-5.4"`). Passed through to `/propose-execute`.
+- `--batch-size N`: Number of issues to fetch per batch (default: 20).
+  Each batch is fetched, triaged, and executed before the next batch is
+  fetched.
 - `--max-proposal-rounds N`: Passed through to `/propose-execute` (default: 5).
 - `--max-review-rounds N`: Passed through to `/propose-execute` (default: 3).
 - `--dry-run`: Print the triaged queue only; do not execute anything.
 
 # Propose-Execute Loop
 
-Iterate over all open GitHub issues, use an AI triage agent to determine which
-are well-defined and ready for implementation, then call `/propose-execute` on
-each actionable issue sequentially.
+Iterate over open GitHub issues in batches. For each batch: fetch a page of
+issues, use AI triage agents to determine which are actionable, then call
+`/propose-execute` on each actionable issue sequentially. Repeat until no
+more issues remain.
 
 The orchestrator (you) manages the queue, spawns triage agents, invokes
 `/propose-execute`, handles failures, and tracks progress.
 
 ---
 
-## Step 1: Query Open Issues
+## Pre-flight: Ensure Labels Exist
 
-Fetch all open issues:
+Ensure the `propose-execute-failed` label exists (create it if not):
+```bash
+gh label create propose-execute-failed --description "propose-execute-loop attempted and failed" --color D93F0B 2>/dev/null || true
+```
+
+Initialize cumulative counters:
+- `total_triaged = 0`
+- `total_actionable = 0`
+- `total_skipped = 0`
+- `total_completed = 0`
+- `total_failed = 0`
+- `batch_number = 0`
+- `pagination_cursor = ""` (empty string = start from beginning)
+- `all_commits = []`
+
+---
+
+## Batch Loop
+
+Repeat the following steps until a batch returns zero issues:
+
+### Step 1: Fetch Next Batch of Issues
+
+Increment `batch_number`.
+
+Build the fetch command with search-based pagination:
 
 ```bash
-gh issue list --state open --json number,title,body,labels,assignees --limit 500
+# Base command
+gh issue list --state open --json number,title,body,labels,assignees,createdAt --limit $BATCH_SIZE --search "sort:created-asc"
 ```
 
 If `$LABEL` is set, add it to the filter:
 ```bash
-gh issue list --state open --label $LABEL --json number,title,body,labels,assignees --limit 500
+gh issue list --state open --label $LABEL --json number,title,body,labels,assignees,createdAt --limit $BATCH_SIZE --search "sort:created-asc"
 ```
 
-### Queue Ordering
+If `pagination_cursor` is not empty (i.e., not the first batch), append a
+date filter to skip already-seen issues:
+```bash
+# Append to --search: created:>$PAGINATION_CURSOR
+gh issue list --state open --json number,title,body,labels,assignees,createdAt --limit $BATCH_SIZE --search "sort:created-asc created:>$PAGINATION_CURSOR"
+```
 
-Parse the `labels` array for each issue to determine priority. Sort the full
-list in this order:
+**Pagination cursor update:** After fetching, set `pagination_cursor` to the
+`createdAt` value of the **last issue** in the returned batch. This becomes
+the lower bound for the next fetch.
+
+**Exit condition:** If the fetch returns zero issues, exit the batch loop
+and proceed to the Completion Summary.
+
+#### Filtering and Sorting
+
+From the fetched batch, exclude:
+- Issues that already have the `propose-execute-failed` label.
+
+Sort the remaining issues by priority within this batch:
 
 1. **critical** — issues with the `critical` label
 2. **high** — issues with the `high` label
@@ -52,24 +98,14 @@ list in this order:
 Within the same priority tier, sort by issue number ascending (lowest number
 first = oldest first).
 
-Exclude issues that already have the `propose-execute-failed` label (these
-were previously attempted and failed).
-
-Ensure the `propose-execute-failed` label exists (create it if not):
-```bash
-gh label create propose-execute-failed --description "propose-execute-loop attempted and failed" --color D93F0B 2>/dev/null || true
-```
-
-Store the sorted list as the **queue**.
-
 ---
 
-## Step 2: Print the Queue
+### Step 2: Print Batch Queue
 
-Print the queue as a table:
+Print the batch queue as a table:
 
 ```
-═══ PROPOSE-EXECUTE QUEUE ═══
+═══ BATCH $BATCH_NUMBER ═══
 N issues to triage
 
   #  | Issue | Priority | Title
@@ -78,25 +114,21 @@ N issues to triage
   2  | #55   | MEDIUM   | Add missing validation for...
   3  | #12   | —        | Refactor overlay flow control
  ...
-══════════════════════════════
+════════════════════════════
 ```
-
-If `--dry-run` is set, proceed to triage (Step 3) to evaluate which issues
-are actionable, then **stop before execution** (Step 4). This lets you see
-the full triaged queue without making any changes to the codebase or issues.
 
 ---
 
-## Step 3: Triage Each Issue
+### Step 3: Triage Batch
 
-For each issue in the queue, spawn triage agents to determine if the issue
+For each issue in the batch, spawn triage agents to determine if the issue
 is well-defined and ready for implementation.
 
 Process triage in batches of up to **10 issues at a time** to avoid
-overwhelming the system. Wait for each batch to complete before launching
-the next.
+overwhelming the system. Wait for each triage sub-batch to complete before
+launching the next.
 
-### 3a: Spawn Triage Agent
+#### 3a: Spawn Triage Agent
 
 Launch an agent using the Task tool:
 - **agent_type**: `"explore"`
@@ -153,12 +185,12 @@ Examples of SKIP reasons:
 - "Duplicate of #N"
 ```
 
-### 3b: Process Triage Result
+#### 3b: Process Triage Result
 
 Read the agent result. Extract the verdict.
 
 **If `VERDICT: ACTIONABLE`**:
-- Add the issue to the **execution queue**.
+- Add the issue to the batch's **execution queue**.
 
 **If `VERDICT: SKIP`**:
 - Record the skip reason.
@@ -167,13 +199,13 @@ Read the agent result. Extract the verdict.
 **If verdict unclear** (agent error):
 - Treat as `SKIP — triage agent did not produce a clear verdict`.
 
-### 3c: Print Triage Summary
+#### 3c: Print Batch Triage Summary
 
-After all issues are triaged:
+After all issues in this batch are triaged:
 
 ```
-═══ TRIAGE COMPLETE ═══
-Total issues:    N
+═══ BATCH $BATCH_NUMBER TRIAGE COMPLETE ═══
+Batch issues:    N
 Actionable:      A
 Skipped:         S
 
@@ -181,18 +213,23 @@ Execution order:
   1. #42 — Implement bucket merge optimization
   2. #55 — Add missing validation for...
  ...
-════════════════════════
+════════════════════════════════════════════
 ```
 
-If `--dry-run` is set, **stop here**. Do not execute.
+Update cumulative counters:
+- `total_triaged += N`
+- `total_actionable += A`
+- `total_skipped += S`
+
+If `--dry-run` is set, **skip Step 4** and continue to the next batch.
 
 ---
 
-## Step 4: Execute Loop
+### Step 4: Execute Batch
 
-Process each actionable issue sequentially.
+Process each actionable issue from this batch sequentially.
 
-### 4a: Pre-flight Check
+#### 4a: Pre-flight Check
 
 Before each issue:
 1. Ensure the working tree is clean: `git status --porcelain`
@@ -216,7 +253,7 @@ Before each issue:
    gh issue edit <number> --add-assignee @me
    ```
 
-### 4b: Invoke /propose-execute
+#### 4b: Invoke /propose-execute
 
 Call the `propose-execute` skill with the issue number and all pass-through
 flags:
@@ -229,19 +266,21 @@ This means: follow the full `propose-execute` skill protocol — fetch the
 issue, run proposal convergence, implement, run review-fix loop, and post
 completion comment.
 
-### 4c: Handle Success
+#### 4c: Handle Success
 
 If `/propose-execute` completes successfully:
 - Record the issue as completed.
+- Increment `total_completed`.
+- Collect any new commits into `all_commits`.
 - Print: `  ✓ #<number> — completed`
 
-### 4c′: Timeout Guidance
+#### 4c′: Timeout Guidance
 
 If `/propose-execute` has been running for an unreasonably long time (e.g.,
 more than 60 minutes on a single issue with no progress), treat it as a
 failure and follow Step 4d.
 
-### 4d: Handle Failure
+#### 4d: Handle Failure
 
 If `/propose-execute` fails (build breaks, tests fail, review loop exhausted,
 or any other error):
@@ -270,55 +309,39 @@ or any other error):
    ---
    *Automated by the \`propose-execute-loop\` skill.*"
    ```
-4. Record the issue as failed.
+4. Increment `total_failed`.
 5. Print: `  ✗ #<number> — failed: <reason>`
 6. Continue to the next issue.
 
-### 4e: Re-query Before Next Iteration
+#### 4e: Progress Update
 
-Before picking the next issue, re-query open issues to refresh the queue:
-
-```bash
-gh issue list --state open --json number,title,body,labels,assignees --limit 500
-```
-
-(Include `$LABEL` filter if set.)
-
-This is necessary because:
-- The `/propose-execute` commit may close related issues via `Closes #N`.
-- Other agents or humans may have closed, assigned, or labeled issues during
-  execution.
-- Issues labeled `propose-execute-failed` must be excluded.
-
-Re-sort by priority, then issue number. Filter out closed, assigned (by
-others), and `propose-execute-failed` issues. Intersect with the original
-actionable set from triage — do not process issues that were triaged as SKIP.
-
-If the re-queried actionable list is empty, exit the loop.
-
-### 4f: Progress Update
-
-After each issue, print a progress summary:
+After each issue in the batch, print a progress summary:
 
 ```
-Progress: <processed>/<total_actionable> (<completed> completed, <failed> failed, <skipped> skipped) — <remaining> remaining
+Batch $BATCH_NUMBER progress: <batch_processed>/<batch_actionable>
+Cumulative: <total_completed> completed, <total_failed> failed, <total_skipped> skipped
 ```
 
 ---
 
-## Step 5: Completion Summary
+*End of batch loop — go back to Step 1 to fetch the next batch.*
 
-After the loop exits:
+---
+
+## Completion Summary
+
+After the batch loop exits (no more issues to fetch):
 
 ```
 ═══ PROPOSE-EXECUTE LOOP COMPLETE ═══
-Total issues triaged:  N
-  Actionable:          A
-  Skipped:             S
+Batches processed:       B
+Total issues triaged:    N
+  Actionable:            A
+  Skipped:               S
 
 Actionable issues processed:  A
-  Completed:           C
-  Failed:              F
+  Completed:             C
+  Failed:                F
 
 Commits:
   <hash1> — <message>
@@ -343,25 +366,33 @@ Failed issues (labeled propose-execute-failed):
   `/propose-execute` may modify the codebase in ways that affect subsequent
   issues.
 - **Triage can be parallel.** Triage agents are read-only, so multiple triage
-  agents may run concurrently for efficiency.
+  agents may run concurrently for efficiency (up to 10 at a time).
 - **Clean state between issues.** Always ensure a clean working tree before
   starting the next issue. Revert any uncommitted changes from failures.
 - **Pull between issues.** Run `git pull --rebase` before each issue to
   incorporate changes from the previous issue's push.
 - **Label failures, don't retry.** If an issue fails, label it and move on.
   A human or future run (after removing the label) can retry.
-- **Respect priority ordering.** Always process the highest-priority
-  remaining issue next.
-- **Re-query after each issue.** The queue is dynamic; implementations may
-  close related issues. Always re-query before picking the next issue.
+- **Per-batch priority ordering.** Issues are sorted by priority within each
+  batch. Batches are fetched in chronological order (oldest issues first).
+  This means the oldest issues get processed first, with priority ordering
+  within each batch.
+- **Batch size controls resource usage.** The `--batch-size` flag controls
+  how many issues are fetched and triaged at a time. Smaller batches reduce
+  upfront triage cost and keep triage results fresh.
 - **Self-assign before starting.** Assign yourself to the issue before
   invoking `/propose-execute` to prevent concurrent agents from picking
   the same issue.
-- **Triage in batches.** Spawn at most 10 triage agents concurrently.
-  Wait for each batch before launching the next.
+- **Triage in sub-batches.** Within each fetched batch, triage at most 10
+  issues concurrently. Wait for each triage sub-batch before launching the
+  next.
 - **Pass through flags.** All `--model`, `--max-proposal-rounds`, and
   `--max-review-rounds` flags are passed to each `/propose-execute`
   invocation.
 - **The triage agent is the gatekeeper.** Only issues the triage agent
   deems ACTIONABLE get processed. This prevents wasting time on
   under-specified or discussion-only issues.
+- **Pagination is date-based.** The loop paginates using
+  `created:>LAST_DATE` in the GitHub search query, advancing through
+  issues in chronological order. This avoids re-fetching already-processed
+  issues.
