@@ -183,6 +183,13 @@ fn should_delete_offer(
     }
 }
 
+/// Mutable and immutable liability maps used by `update_offer`.
+struct OfferLiabilityContext<'a> {
+    new: &'a mut BTreeMap<Asset, Liabilities>,
+    initial_buying: &'a BTreeMap<Asset, Option<i64>>,
+    initial_selling: &'a BTreeMap<Asset, Option<i64>>,
+}
+
 /// Update a single offer, determining whether it should be kept, adjusted, or erased.
 ///
 /// Parity: Upgrades.cpp:817-892 `updateOffer`
@@ -190,9 +197,7 @@ fn update_offer(
     offer: &mut OfferEntry,
     balance: i64,
     balance_above_reserve: i64,
-    liabilities: &mut BTreeMap<Asset, Liabilities>,
-    initial_buying_liabilities: &BTreeMap<Asset, Option<i64>>,
-    initial_selling_liabilities: &BTreeMap<Asset, Option<i64>>,
+    liab: &mut OfferLiabilityContext<'_>,
     ltx: &CloseLedgerState,
 ) -> Result<UpdateOfferResult> {
     let seller_id = offer.seller_id.clone();
@@ -201,7 +206,7 @@ fn update_offer(
     let erase_sell = should_delete_offer(
         &offer.selling,
         balance_above_reserve,
-        initial_selling_liabilities,
+        liab.initial_selling,
         |asset, eff_bal| {
             get_available_balance_excluding_liabilities(&seller_id, asset, eff_bal, ltx)
         },
@@ -211,7 +216,7 @@ fn update_offer(
     let erase_buy = should_delete_offer(
         &offer.buying,
         balance,
-        initial_buying_liabilities,
+        liab.initial_buying,
         |asset, eff_bal| get_available_limit_excluding_liabilities(&seller_id, asset, eff_bal, ltx),
     )?;
 
@@ -249,12 +254,10 @@ fn update_offer(
         // Accumulate new liabilities for surviving offers.
         if matches!(offer.buying, Asset::Native) || !is_issuer(&seller_id, &offer.buying) {
             let buying_liab = get_offer_buying_liabilities(offer)?;
-            let entry = liabilities
-                .entry(offer.buying.clone())
-                .or_insert(Liabilities {
-                    buying: 0,
-                    selling: 0,
-                });
+            let entry = liab.new.entry(offer.buying.clone()).or_insert(Liabilities {
+                buying: 0,
+                selling: 0,
+            });
             entry.buying = add_balance(entry.buying, buying_liab, i64::MAX).ok_or_else(|| {
                 LedgerError::Internal("could not add buying liabilities".to_string())
             })?;
@@ -262,7 +265,8 @@ fn update_offer(
 
         if matches!(offer.selling, Asset::Native) || !is_issuer(&seller_id, &offer.selling) {
             let selling_liab = get_offer_selling_liabilities(offer)?;
-            let entry = liabilities
+            let entry = liab
+                .new
                 .entry(offer.selling.clone())
                 .or_insert(Liabilities {
                     buying: 0,
@@ -591,9 +595,11 @@ pub fn prepare_liabilities(
                 &mut offer_copy,
                 balance,
                 balance_above_reserve,
-                &mut new_liabilities,
-                &initial_buying_liabilities,
-                &initial_selling_liabilities,
+                &mut OfferLiabilityContext {
+                    new: &mut new_liabilities,
+                    initial_buying: &initial_buying_liabilities,
+                    initial_selling: &initial_selling_liabilities,
+                },
                 ltx,
             )?;
 
