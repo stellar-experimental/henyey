@@ -229,16 +229,9 @@ impl BucketApplicator {
         level: u32,
         chunk_size: usize,
     ) -> Self {
-        Self {
-            bucket,
-            max_protocol_version,
-            level,
-            seen_keys: HashSet::new(),
-            current_offset: 0,
-            chunk_size,
-            apply_dead_entries: true,
-            cached_entries: None,
-        }
+        let mut applicator = Self::new(bucket, max_protocol_version, level);
+        applicator.chunk_size = chunk_size;
+        applicator
     }
 
     /// Sets whether to apply dead entries (deletes).
