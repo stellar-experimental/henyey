@@ -374,12 +374,7 @@ fn sign_tx(
     let pub_key_bytes = pub_key.as_bytes();
 
     // Hint is the last 4 bytes of the public key
-    let hint = SignatureHint([
-        pub_key_bytes[28],
-        pub_key_bytes[29],
-        pub_key_bytes[30],
-        pub_key_bytes[31],
-    ]);
+    let hint = SignatureHint(pub_key_bytes[28..32].try_into().unwrap());
 
     let decorated = DecoratedSignature {
         hint,

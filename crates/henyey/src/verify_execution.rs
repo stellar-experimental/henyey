@@ -32,8 +32,7 @@ pub(crate) struct VerifyContext {
     archive: henyey_history::HistoryArchive,
     cdp: CachedCdpDataLake,
     ledger_manager: LedgerManager,
-    #[allow(dead_code)]
-    bucket_manager: Arc<BucketManager>,
+    _bucket_manager: Arc<BucketManager>,
     // TempDir guards — dropping these would delete the temp directories.
     _cdp_dir_holder: Option<tempfile::TempDir>,
     _bucket_dir_holder: Option<tempfile::TempDir>,
@@ -789,7 +788,7 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
         archive,
         cdp,
         ledger_manager,
-        bucket_manager,
+        _bucket_manager: bucket_manager,
         _cdp_dir_holder,
         _bucket_dir_holder,
         start_ledger,

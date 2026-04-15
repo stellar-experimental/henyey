@@ -464,7 +464,9 @@ fn write_scp_history_file(
 
     for entry in entries {
         let xdr = entry.to_xdr(Limits::none())?;
-        let marked_len = (xdr.len() as u32) | 0x8000_0000;
+        /// XDR record mark: high bit indicates last/only fragment.
+        const XDR_RECORD_MARK: u32 = 0x8000_0000;
+        let marked_len = (xdr.len() as u32) | XDR_RECORD_MARK;
         encoder.write_all(&marked_len.to_be_bytes())?;
         encoder.write_all(&xdr)?;
     }
