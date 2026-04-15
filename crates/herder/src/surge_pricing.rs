@@ -377,13 +377,13 @@ impl SurgePricingPriorityQueue {
     ) {
         let frame = TransactionFrame::from_owned_with_network(tx.envelope.clone(), *network_id);
         let lane = self.lane_config.get_lane(&frame);
+        let resources = self.lane_config.tx_resources(&frame, ledger_version);
         let inserted = self
             .lanes
             .get_mut(lane)
             .expect("lane")
-            .insert(QueueEntry::new(tx.clone(), self.seed));
+            .insert(QueueEntry::new(tx, self.seed));
         if inserted {
-            let resources = self.lane_config.tx_resources(&frame, ledger_version);
             self.lane_current_count[lane] += resources;
         }
     }

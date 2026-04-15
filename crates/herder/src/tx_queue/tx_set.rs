@@ -7,16 +7,7 @@
 use super::*;
 
 pub(super) fn sort_txs_by_hash(txs: &mut [TransactionEnvelope]) {
-    // Schwartzian transform: compute each hash once (O(N)), sort by cached
-    // hashes (O(N log N)), then reorder the slice to match.
-    let mut keyed: Vec<(Hash256, TransactionEnvelope)> = txs
-        .iter()
-        .map(|tx| (Hash256::hash_xdr(tx).unwrap_or_default(), tx.clone()))
-        .collect();
-    keyed.sort_by(|(ha, _), (hb, _)| ha.0.cmp(&hb.0));
-    for (i, (_, tx)) in keyed.into_iter().enumerate() {
-        txs[i] = tx;
-    }
+    txs.sort_by_cached_key(|tx| Hash256::hash_xdr(tx).unwrap_or_default().0);
 }
 
 /// A set of transactions for a ledger.

@@ -386,6 +386,23 @@ fn ledger_key_bytes(key: &LedgerKey) -> Vec<u8> {
         .expect("LedgerKey XDR serialization should never fail")
 }
 
+/// Extract SorobanTransactionData from an envelope without constructing a TransactionFrame.
+fn soroban_data_from_envelope(
+    env: &TransactionEnvelope,
+) -> Option<&stellar_xdr::curr::SorobanTransactionData> {
+    let tx = match env {
+        TransactionEnvelope::TxV0(_) => return None,
+        TransactionEnvelope::Tx(e) => &e.tx,
+        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
+            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx,
+        },
+    };
+    match &tx.ext {
+        stellar_xdr::curr::TransactionExt::V0 => None,
+        stellar_xdr::curr::TransactionExt::V1(data) => Some(data),
+    }
+}
+
 /// Detect footprint conflicts between Soroban transactions.
 ///
 /// Two transactions conflict if:
@@ -393,7 +410,7 @@ fn ledger_key_bytes(key: &LedgerKey) -> Vec<u8> {
 /// - One reads and the other writes the same key (RO-RW conflict)
 ///
 /// RO-RO does NOT create a conflict.
-fn detect_conflicts(txs: &[TransactionEnvelope], network_id: NetworkId) -> Vec<BitSet> {
+fn detect_conflicts(txs: &[TransactionEnvelope]) -> Vec<BitSet> {
     let n = txs.len();
     let mut conflicts: Vec<BitSet> = (0..n).map(|_| BitSet::with_capacity(n)).collect();
 
@@ -404,8 +421,7 @@ fn detect_conflicts(txs: &[TransactionEnvelope], network_id: NetworkId) -> Vec<B
         std::collections::HashMap::new();
 
     for (tx_id, tx) in txs.iter().enumerate() {
-        let frame = TransactionFrame::from_owned_with_network(tx.clone(), network_id);
-        if let Some(data) = frame.soroban_data() {
+        if let Some(data) = soroban_data_from_envelope(tx) {
             for key in data.resources.footprint.read_only.iter() {
                 let kb = ledger_key_bytes(key);
                 ro_key_txs.entry(kb).or_default().push(tx_id);
@@ -466,7 +482,7 @@ fn build_with_stage_count(
     ledger_max_dependent_tx_clusters: u32,
     stage_count: u32,
 ) -> (Vec<Vec<Vec<TransactionEnvelope>>>, i64) {
-    let conflicts = detect_conflicts(txs, network_id);
+    let conflicts = detect_conflicts(txs);
     let n = txs.len();
 
     // Build BuilderTx representations.
@@ -914,7 +930,7 @@ mod tests {
         let key_b = contract_key(2);
         let tx_a = make_soroban_tx(1, 1, vec![], vec![key_a], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key_b], 1000);
-        let conflicts = detect_conflicts(&[tx_a, tx_b], test_network_id());
+        let conflicts = detect_conflicts(&[tx_a, tx_b]);
         assert!(!conflicts[0].get(1));
         assert!(!conflicts[1].get(0));
     }
@@ -924,7 +940,7 @@ mod tests {
         let key = contract_key(1);
         let tx_a = make_soroban_tx(1, 1, vec![], vec![key.clone()], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key], 1000);
-        let conflicts = detect_conflicts(&[tx_a, tx_b], test_network_id());
+        let conflicts = detect_conflicts(&[tx_a, tx_b]);
         assert!(conflicts[0].get(1));
         assert!(conflicts[1].get(0));
     }
@@ -934,7 +950,7 @@ mod tests {
         let key = contract_key(1);
         let tx_a = make_soroban_tx(1, 1, vec![key.clone()], vec![], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key], 1000);
-        let conflicts = detect_conflicts(&[tx_a, tx_b], test_network_id());
+        let conflicts = detect_conflicts(&[tx_a, tx_b]);
         assert!(conflicts[0].get(1));
         assert!(conflicts[1].get(0));
     }
@@ -944,7 +960,7 @@ mod tests {
         let key = contract_key(1);
         let tx_a = make_soroban_tx(1, 1, vec![key.clone()], vec![], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![key], vec![], 1000);
-        let conflicts = detect_conflicts(&[tx_a, tx_b], test_network_id());
+        let conflicts = detect_conflicts(&[tx_a, tx_b]);
         assert!(!conflicts[0].get(1));
         assert!(!conflicts[1].get(0));
     }
