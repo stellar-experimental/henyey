@@ -225,8 +225,8 @@ impl App {
                         )
                     })?;
 
-                // Only include hot archive in HAS when protocol >= 23
-                let hot_archive_for_has = if final_header.ledger_version >= 23 {
+                // Only include hot archive in HAS when protocol supports it
+                let hot_archive_for_has = if hot_archive_supported(final_header.ledger_version) {
                     Some(hot_archive_ref)
                 } else {
                     None

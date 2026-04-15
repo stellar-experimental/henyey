@@ -57,7 +57,9 @@ use henyey_bucket::{
     HotArchiveBucketListSnapshot,
 };
 use henyey_clock::{Clock, RealClock};
-use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+use henyey_common::protocol::{
+    hot_archive_supported, protocol_version_starts_from, ProtocolVersion,
+};
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::queries::StateQueries;
 use henyey_db::schema::state_keys;

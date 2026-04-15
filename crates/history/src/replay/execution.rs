@@ -7,7 +7,8 @@
 use crate::{is_checkpoint_ledger, verify, HistoryError, Result};
 use henyey_bucket::{EvictionIterator, EvictionIteratorExt};
 use henyey_common::protocol::{
-    protocol_version_is_before, protocol_version_starts_from, ProtocolVersion,
+    hot_archive_supported, protocol_version_is_before, protocol_version_starts_from,
+    ProtocolVersion,
 };
 use henyey_common::Hash256;
 use henyey_ledger::{
@@ -466,12 +467,12 @@ fn combined_bucket_list_hash(
     protocol_version: u32,
 ) -> Hash256 {
     let live_hash = live_bucket_list.hash();
-    if protocol_version_starts_from(protocol_version, ProtocolVersion::V23) {
+    if hot_archive_supported(protocol_version) {
         let hot_hash = hot_archive_bucket_list.hash();
         tracing::info!(
             live_hash = %live_hash,
             hot_archive_hash = %hot_hash,
-            "Computing combined bucket list hash (protocol >= 23)"
+            "Computing combined bucket list hash (hot archive supported)"
         );
         let mut hasher = Sha256::new();
         hasher.update(live_hash.as_bytes());
@@ -483,7 +484,7 @@ fn combined_bucket_list_hash(
     } else {
         tracing::info!(
             live_hash = %live_hash,
-            "Using live bucket list hash only (protocol < 23)"
+            "Using live bucket list hash only (hot archive not supported)"
         );
         live_hash
     }

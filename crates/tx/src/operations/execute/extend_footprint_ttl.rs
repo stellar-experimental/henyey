@@ -3,6 +3,9 @@
 //! This module implements the execution logic for the ExtendFootprintTtl operation,
 //! which extends the time-to-live for Soroban contract data entries.
 
+use henyey_common::protocol::{
+    protocol_version_is_before, PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
+};
 use stellar_xdr::curr::{
     AccountId, ExtendFootprintTtlOp, ExtendFootprintTtlResult, ExtendFootprintTtlResultCode,
     OperationResult, OperationResultTr, SorobanTransactionData, WriteXdr,
@@ -125,7 +128,10 @@ pub(crate) fn execute_extend_footprint_ttl(
         // ExtendFootprintTTLParallelApplyHelper::checkReadBytesResourceLimit() always
         // returns true — it skips the disk_read_bytes check entirely. The resource
         // accounting is handled at the cluster level instead.
-        if context.protocol_version < 23 {
+        if protocol_version_is_before(
+            context.protocol_version,
+            PARALLEL_SOROBAN_PHASE_PROTOCOL_VERSION,
+        ) {
             let entry_size = entry
                 .to_xdr(stellar_xdr::curr::Limits::none())
                 .ok()

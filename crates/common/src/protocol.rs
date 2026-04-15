@@ -117,6 +117,12 @@ pub const REUSABLE_SOROBAN_MODULE_CACHE_PROTOCOL_VERSION: ProtocolVersion = Prot
 /// The protocol version when frozen ledger keys (CAP-77) were introduced.
 pub const FROZEN_LEDGER_KEYS_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V26;
 
+/// The protocol version when hot archive bucket list was introduced.
+///
+/// From this version onward, the HAS includes hot archive bucket hashes and
+/// the combined bucket list hash incorporates the hot archive hash.
+pub const HOT_ARCHIVE_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::V23;
+
 /// The minimum supported ledger protocol version.
 ///
 /// This implementation only supports protocol versions 24 and above.
@@ -215,6 +221,22 @@ pub fn needs_upgrade_to_version(
 #[inline]
 pub fn soroban_supported(protocol_version: u32) -> bool {
     protocol_version_starts_from(protocol_version, SOROBAN_PROTOCOL_VERSION)
+}
+
+/// Returns `true` if the hot archive bucket list is active at the given protocol version.
+///
+/// # Example
+///
+/// ```rust
+/// use henyey_common::protocol::hot_archive_supported;
+///
+/// assert!(!hot_archive_supported(22));
+/// assert!(hot_archive_supported(23));
+/// assert!(hot_archive_supported(25));
+/// ```
+#[inline]
+pub fn hot_archive_supported(protocol_version: u32) -> bool {
+    protocol_version_starts_from(protocol_version, HOT_ARCHIVE_PROTOCOL_VERSION)
 }
 
 #[cfg(test)]

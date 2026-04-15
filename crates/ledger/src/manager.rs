@@ -47,7 +47,7 @@ use henyey_bucket::{
     EvictionIteratorExt, EvictionResult, HotArchiveBucketList,
 };
 use henyey_common::protocol::{
-    needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
+    hot_archive_supported, needs_upgrade_to_version, protocol_version_starts_from, ProtocolVersion,
 };
 use henyey_common::{BucketListDbConfig, Hash256, NetworkId};
 use henyey_tx::soroban::PersistentModuleCache;
@@ -1528,23 +1528,22 @@ impl LedgerManager {
         }
 
         // Compute bucket list hash for verification.
-        // For protocol >= 23, the hash is SHA256(live_hash || hot_archive_hash).
+        // When hot archive is supported, the hash is SHA256(live_hash || hot_archive_hash).
         // For earlier protocols, the hash is just the live bucket list hash.
         let live_hash = bucket_list.hash();
-        let computed_hash =
-            if protocol_version_starts_from(header.ledger_version, ProtocolVersion::V23) {
-                use sha2::{Digest, Sha256};
-                let hot_hash = hot_archive_bucket_list.hash();
-                let mut hasher = Sha256::new();
-                hasher.update(live_hash.as_bytes());
-                hasher.update(hot_hash.as_bytes());
-                let result = hasher.finalize();
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(&result);
-                Hash256::from_bytes(bytes)
-            } else {
-                live_hash
-            };
+        let computed_hash = if hot_archive_supported(header.ledger_version) {
+            use sha2::{Digest, Sha256};
+            let hot_hash = hot_archive_bucket_list.hash();
+            let mut hasher = Sha256::new();
+            hasher.update(live_hash.as_bytes());
+            hasher.update(hot_hash.as_bytes());
+            let result = hasher.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&result);
+            Hash256::from_bytes(bytes)
+        } else {
+            live_hash
+        };
 
         let expected_hash = Hash256::from(header.bucket_list_hash.0);
 
@@ -2083,31 +2082,30 @@ impl LedgerManager {
             let live_hash = bucket_list.hash();
 
             // Compute bucket list hash based on protocol version.
-            // For protocol >= 23, the hash is SHA256(live_hash || hot_archive_hash).
+            // When hot archive is supported, the hash is SHA256(live_hash || hot_archive_hash).
             // For earlier protocols, the hash is just the live bucket list hash.
-            let computed =
-                if protocol_version_starts_from(new_header.ledger_version, ProtocolVersion::V23) {
-                    let hot_archive_guard = self.hot_archive_bucket_list.read();
-                    if let Some(ref hot_archive) = *hot_archive_guard {
-                        use sha2::{Digest, Sha256};
-                        let hot_hash = hot_archive.hash();
-                        let mut hasher = Sha256::new();
-                        hasher.update(live_hash.as_bytes());
-                        hasher.update(hot_hash.as_bytes());
-                        let result = hasher.finalize();
-                        let mut bytes = [0u8; 32];
-                        bytes.copy_from_slice(&result);
-                        Hash256::from_bytes(bytes)
-                    } else {
-                        tracing::warn!(
-                            "Protocol >= 23 but no hot archive bucket list present, \
-                         using live hash only - this WILL cause hash mismatch!"
-                        );
-                        live_hash
-                    }
+            let computed = if hot_archive_supported(new_header.ledger_version) {
+                let hot_archive_guard = self.hot_archive_bucket_list.read();
+                if let Some(ref hot_archive) = *hot_archive_guard {
+                    use sha2::{Digest, Sha256};
+                    let hot_hash = hot_archive.hash();
+                    let mut hasher = Sha256::new();
+                    hasher.update(live_hash.as_bytes());
+                    hasher.update(hot_hash.as_bytes());
+                    let result = hasher.finalize();
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&result);
+                    Hash256::from_bytes(bytes)
                 } else {
+                    tracing::warn!(
+                        "Protocol >= 23 but no hot archive bucket list present, \
+                         using live hash only - this WILL cause hash mismatch!"
+                    );
                     live_hash
-                };
+                }
+            } else {
+                live_hash
+            };
 
             let expected = Hash256::from(new_header.bucket_list_hash.0);
             if computed != expected {

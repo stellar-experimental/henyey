@@ -141,11 +141,11 @@ impl App {
                 true
             };
 
-            // Only include hot archive in HAS when protocol >= 23, matching
-            // stellar-core. At earlier protocols the header's bucket_list_hash
-            // is live-only, so including hot archive would cause Horizon to
-            // compute a combined hash that doesn't match the header.
-            let hot_archive_for_has = if header.ledger_version >= 23 {
+            // Only include hot archive in HAS when protocol supports it,
+            // matching stellar-core. At earlier protocols the header's
+            // bucket_list_hash is live-only, so including hot archive would
+            // cause Horizon to compute a combined hash that doesn't match.
+            let hot_archive_for_has = if hot_archive_supported(header.ledger_version) {
                 hot_archive_ref
             } else {
                 None
