@@ -244,31 +244,27 @@ impl HotArchiveBucketSnapshot {
         keys: &mut Vec<LedgerKey>,
         result: &mut Vec<HotArchiveBucketEntry>,
     ) -> crate::Result<()> {
-        let mut error = None;
-        keys.retain(|key| {
-            if error.is_some() {
-                return true; // stop processing, keep remaining
-            }
-            match self.bucket.get(key) {
-                Ok(Some(entry)) => match &entry {
+        let mut i = 0;
+        while i < keys.len() {
+            match self.bucket.get(&keys[i])? {
+                Some(entry) => match &entry {
                     HotArchiveBucketEntry::Archived(_) => {
                         result.push(entry);
-                        false
+                        keys.swap_remove(i);
                     }
-                    HotArchiveBucketEntry::Live(_) => false,
-                    HotArchiveBucketEntry::Metaentry(_) => true,
+                    HotArchiveBucketEntry::Live(_) => {
+                        keys.swap_remove(i);
+                    }
+                    HotArchiveBucketEntry::Metaentry(_) => {
+                        i += 1;
+                    }
                 },
-                Ok(None) => true,
-                Err(e) => {
-                    error = Some(e);
-                    true
+                None => {
+                    i += 1;
                 }
             }
-        });
-        match error {
-            Some(e) => Err(e),
-            None => Ok(()),
         }
+        Ok(())
     }
 }
 
