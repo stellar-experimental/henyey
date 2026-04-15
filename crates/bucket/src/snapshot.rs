@@ -314,8 +314,8 @@ impl HotArchiveBucketLevelSnapshot {
     /// Creates a new level snapshot from a hot archive bucket level.
     pub fn from_level(level: &HotArchiveBucketLevel) -> Self {
         Self {
-            curr: HotArchiveBucketSnapshot::from_ref(&level.curr),
-            snap: HotArchiveBucketSnapshot::from_ref(&level.snap),
+            curr: HotArchiveBucketSnapshot::from_ref(level.curr()),
+            snap: HotArchiveBucketSnapshot::from_ref(level.snap_bucket()),
         }
     }
 }

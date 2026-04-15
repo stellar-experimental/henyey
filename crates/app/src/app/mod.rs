@@ -966,7 +966,7 @@ impl App {
         let bucket_dir = self.bucket_manager.bucket_dir();
         for level in habl.levels() {
             let mut buckets_to_check: Vec<&henyey_bucket::HotArchiveBucket> =
-                vec![&level.curr, &level.snap];
+                vec![level.curr(), level.snap_bucket()];
             if let Some(next) = level.next() {
                 buckets_to_check.push(next);
             }

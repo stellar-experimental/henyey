@@ -463,8 +463,8 @@ impl CatchupManager {
                 info!(
                     "Hot archive restored level {}: curr={}, snap={}",
                     level_idx,
-                    level.curr.hash().to_hex(),
-                    level.snap.hash().to_hex()
+                    level.curr().hash().to_hex(),
+                    level.snap_bucket().hash().to_hex()
                 );
             }
 

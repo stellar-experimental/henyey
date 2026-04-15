@@ -175,8 +175,8 @@ pub fn build_history_archive_state(
                     None => HASBucketNext::default(),
                 };
                 HASBucketLevel {
-                    curr: level.curr.hash().to_hex(),
-                    snap: level.snap.hash().to_hex(),
+                    curr: level.curr().hash().to_hex(),
+                    snap: level.snap_bucket().hash().to_hex(),
                     next,
                 }
             })

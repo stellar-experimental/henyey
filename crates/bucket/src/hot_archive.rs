@@ -776,9 +776,9 @@ impl Default for HotArchiveBucket {
 #[derive(Clone, Debug)]
 pub struct HotArchiveBucketLevel {
     /// The current bucket.
-    pub curr: HotArchiveBucket,
+    pub(crate) curr: HotArchiveBucket,
     /// The snapshot bucket.
-    pub snap: HotArchiveBucket,
+    pub(crate) snap: HotArchiveBucket,
     /// Staged merge result.
     next: Option<HotArchiveBucket>,
     /// Level number (stored for debugging).
@@ -794,6 +794,16 @@ impl HotArchiveBucketLevel {
             next: None,
             _level: level,
         }
+    }
+
+    /// Get a reference to the current bucket.
+    pub fn curr(&self) -> &HotArchiveBucket {
+        &self.curr
+    }
+
+    /// Get a reference to the snapshot bucket.
+    pub fn snap_bucket(&self) -> &HotArchiveBucket {
+        &self.snap
     }
 
     /// Get the hash of this level.
