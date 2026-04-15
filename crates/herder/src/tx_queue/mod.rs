@@ -509,6 +509,14 @@ pub(super) struct SelectedTxs {
     pub(super) classic_limited: bool,
 }
 
+/// Bundled properties of a transaction being evaluated for queue admission.
+struct EvictionCandidate<'a> {
+    queued: &'a QueuedTransaction,
+    is_soroban: bool,
+    frame: &'a henyey_tx::TransactionFrame,
+    ledger_version: u32,
+}
+
 struct EvictionScan<'a, F> {
     by_hash: &'a HashMap<Hash256, QueuedTransaction>,
     queued: &'a QueuedTransaction,
@@ -1172,34 +1180,38 @@ impl TransactionQueue {
     /// Check lane-based eviction fees and collect evictions for all applicable lanes.
     ///
     /// Returns the list of transactions to evict, or an early rejection result.
-    #[allow(clippy::too_many_arguments)]
     fn check_and_collect_evictions(
         &self,
         by_hash: &HashMap<Hash256, QueuedTransaction>,
-        queued: &QueuedTransaction,
-        queued_is_soroban: bool,
-        queued_frame: &henyey_tx::TransactionFrame,
-        ledger_version: u32,
+        candidate: &EvictionCandidate,
         seed: u64,
         replaced_tx: Option<&QueuedTransaction>,
     ) -> std::result::Result<Vec<QueuedTransaction>, TxQueueResult> {
         // Phase 1: Check minimum inclusion fee for each lane (cheap, read-only)
-        if !queued_is_soroban {
+        if !candidate.is_soroban {
             if let Some(lane_config) = self.build_classic_lane_config() {
                 let mut lane_fees = self.classic_lane_evicted_inclusion_fee.write();
-                if self.fee_below_lane_threshold(&lane_config, &mut lane_fees, queued_frame, queued)
-                {
+                if self.fee_below_lane_threshold(
+                    &lane_config,
+                    &mut lane_fees,
+                    candidate.frame,
+                    candidate.queued,
+                ) {
                     return Err(TxQueueResult::FeeTooLow);
                 }
             }
         }
 
-        if queued_is_soroban {
+        if candidate.is_soroban {
             if let Some(limit) = self.effective_queue_soroban_resources() {
                 let lane_config = SorobanGenericLaneConfig::new(limit);
                 let mut lane_fees = self.soroban_lane_evicted_inclusion_fee.write();
-                if self.fee_below_lane_threshold(&lane_config, &mut lane_fees, queued_frame, queued)
-                {
+                if self.fee_below_lane_threshold(
+                    &lane_config,
+                    &mut lane_fees,
+                    candidate.frame,
+                    candidate.queued,
+                ) {
                     return Err(TxQueueResult::FeeTooLow);
                 }
             }
@@ -1207,7 +1219,7 @@ impl TransactionQueue {
 
         if self.config.max_queue_ops.is_some() {
             let global_fee = *self.global_evicted_inclusion_fee.read();
-            if min_inclusion_fee_to_beat(global_fee, queued) > 0 {
+            if min_inclusion_fee_to_beat(global_fee, candidate.queued) > 0 {
                 return Err(TxQueueResult::FeeTooLow);
             }
         }
@@ -1223,7 +1235,7 @@ impl TransactionQueue {
             pending_evictions.insert(old_tx.hash);
         }
 
-        if !queued_is_soroban {
+        if !candidate.is_soroban {
             if let Some(lane_config) = self.build_classic_lane_config() {
                 let filter = |tx: &QueuedTransaction| {
                     let frame = henyey_tx::TransactionFrame::from_owned_with_network(
@@ -1234,9 +1246,9 @@ impl TransactionQueue {
                 };
                 let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
                     by_hash,
-                    queued,
+                    queued: candidate.queued,
                     lane_config: Box::new(lane_config.clone()),
-                    ledger_version,
+                    ledger_version: candidate.ledger_version,
                     exclude: &pending_evictions,
                     filter,
                     seed,
@@ -1253,7 +1265,7 @@ impl TransactionQueue {
             }
         }
 
-        if queued_is_soroban {
+        if candidate.is_soroban {
             if let Some(limit) = self.effective_queue_soroban_resources() {
                 let lane_config = SorobanGenericLaneConfig::new(limit.clone());
                 let filter = |tx: &QueuedTransaction| {
@@ -1265,9 +1277,9 @@ impl TransactionQueue {
                 };
                 let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
                     by_hash,
-                    queued,
+                    queued: candidate.queued,
                     lane_config: Box::new(lane_config),
-                    ledger_version,
+                    ledger_version: candidate.ledger_version,
                     exclude: &pending_evictions,
                     filter,
                     seed,
@@ -1290,9 +1302,9 @@ impl TransactionQueue {
             let filter = |_tx: &QueuedTransaction| true;
             let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
                 by_hash,
-                queued,
+                queued: candidate.queued,
                 lane_config: Box::new(lane_config),
-                ledger_version,
+                ledger_version: candidate.ledger_version,
                 exclude: &pending_evictions,
                 filter,
                 seed,
@@ -1392,12 +1404,16 @@ impl TransactionQueue {
             rand::thread_rng().gen()
         };
 
+        let candidate = EvictionCandidate {
+            queued: &queued,
+            is_soroban: queued_is_soroban,
+            frame: &queued_frame,
+            ledger_version,
+        };
+
         let pending_eviction_list = match self.check_and_collect_evictions(
             &by_hash,
-            &queued,
-            queued_is_soroban,
-            &queued_frame,
-            ledger_version,
+            &candidate,
             seed,
             replaced_tx.as_ref(),
         ) {
