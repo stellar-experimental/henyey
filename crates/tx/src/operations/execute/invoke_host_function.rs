@@ -71,44 +71,6 @@ fn ttl_already_created_in_delta(
     false
 }
 
-/// Validate CONTRACT_CODE and CONTRACT_DATA entry sizes against network config limits.
-///
-/// This matches stellar-core's `validateContractLedgerEntry()` in TransactionUtils.cpp.
-/// Returns false (invalid) if the entry exceeds the configured limits.
-pub(crate) fn validate_contract_ledger_entry(
-    key: &LedgerKey,
-    entry_size: usize,
-    max_contract_size_bytes: u32,
-    max_contract_data_entry_size_bytes: u32,
-) -> bool {
-    match key {
-        LedgerKey::ContractCode(_) => {
-            // Check contract code size limit
-            if entry_size > max_contract_size_bytes as usize {
-                tracing::warn!(
-                    entry_size,
-                    limit = max_contract_size_bytes,
-                    "CONTRACT_CODE size exceeds maxContractSizeBytes"
-                );
-                return false;
-            }
-        }
-        LedgerKey::ContractData(_) => {
-            // Check contract data entry size limit
-            if entry_size > max_contract_data_entry_size_bytes as usize {
-                tracing::warn!(
-                    entry_size,
-                    limit = max_contract_data_entry_size_bytes,
-                    "CONTRACT_DATA size exceeds maxContractDataEntrySizeBytes"
-                );
-                return false;
-            }
-        }
-        _ => {}
-    }
-    true
-}
-
 /// Validate all footprint entries against network config size limits.
 ///
 /// This matches stellar-core's `addReads()` in `InvokeHostFunctionOpFrame.cpp` lines 475-482,
@@ -204,12 +166,11 @@ fn validate_footprint_entry(
 
     if let Some(entry) = entry {
         let entry_size = xdr_encoded_len(&entry);
-        if !validate_contract_ledger_entry(
-            key,
-            entry_size,
+        let limits = super::ContractSizeLimits {
             max_contract_size_bytes,
             max_contract_data_entry_size_bytes,
-        ) {
+        };
+        if !super::validate_contract_ledger_entry(key, entry_size, &limits) {
             tracing::warn!(
                 entry_size,
                 max_contract_size_bytes,
@@ -302,12 +263,11 @@ fn validate_archived_entry_sizes(
 
         if let Some(entry) = entry {
             let entry_size = xdr_encoded_len(&entry);
-            if !validate_contract_ledger_entry(
-                key,
-                entry_size,
-                max_contract_size,
-                max_data_entry_size,
-            ) {
+            let limits = super::ContractSizeLimits {
+                max_contract_size_bytes: max_contract_size,
+                max_contract_data_entry_size_bytes: max_data_entry_size,
+            };
+            if !super::validate_contract_ledger_entry(key, entry_size, &limits) {
                 tracing::warn!(
                     entry_size,
                     max_contract_size,
@@ -509,8 +469,11 @@ fn execute_contract_invocation(
             // network config limits (validateContractLedgerEntry).
             match validate_and_compute_write_bytes(
                 &result.storage_changes,
-                soroban_config.max_contract_size_bytes,
-                soroban_config.max_contract_data_entry_size_bytes,
+                &super::ContractSizeLimits {
+                    max_contract_size_bytes: soroban_config.max_contract_size_bytes,
+                    max_contract_data_entry_size_bytes: soroban_config
+                        .max_contract_data_entry_size_bytes,
+                },
             ) {
                 StorageChangeValidation::EntrySizeExceeded => {
                     return Ok(OperationExecutionResult::new(make_result(
@@ -615,8 +578,7 @@ enum StorageChangeValidation {
 /// out of refundableFee, already accounted for by the host.
 fn validate_and_compute_write_bytes(
     storage_changes: &[crate::soroban::StorageChange],
-    max_contract_size_bytes: u32,
-    max_contract_data_entry_size_bytes: u32,
+    limits: &super::ContractSizeLimits,
 ) -> StorageChangeValidation {
     let mut total: u32 = 0;
     for change in storage_changes {
@@ -629,12 +591,7 @@ fn validate_and_compute_write_bytes(
             let entry_size = xdr_encoded_len(entry);
 
             // Validate entry size against network config limits (stellar-core validateContractLedgerEntry)
-            if !validate_contract_ledger_entry(
-                &change.key,
-                entry_size,
-                max_contract_size_bytes,
-                max_contract_data_entry_size_bytes,
-            ) {
+            if !super::validate_contract_ledger_entry(&change.key, entry_size, limits) {
                 return StorageChangeValidation::EntrySizeExceeded;
             }
 
@@ -2428,20 +2385,18 @@ mod tests {
         let small_size = 1000;
         let max_data_size = 65536; // 64 KB
         let max_code_size = 65536;
-        assert!(validate_contract_ledger_entry(
-            &key,
-            small_size,
-            max_code_size,
-            max_data_size
+        let limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: max_code_size,
+            max_contract_data_entry_size_bytes: max_data_size,
+        };
+        assert!(super::super::validate_contract_ledger_entry(
+            &key, small_size, &limits,
         ));
 
         // Entry size over limit should be invalid
         let large_size = 66000; // > 64 KB
-        assert!(!validate_contract_ledger_entry(
-            &key,
-            large_size,
-            max_code_size,
-            max_data_size
+        assert!(!super::super::validate_contract_ledger_entry(
+            &key, large_size, &limits,
         ));
     }
 
@@ -2454,21 +2409,19 @@ mod tests {
 
         let max_code_size = 65536; // 64 KB
         let max_data_size = 65536;
+        let limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: max_code_size,
+            max_contract_data_entry_size_bytes: max_data_size,
+        };
 
         // Entry size under limit should be valid
-        assert!(validate_contract_ledger_entry(
-            &key,
-            1000,
-            max_code_size,
-            max_data_size
+        assert!(super::super::validate_contract_ledger_entry(
+            &key, 1000, &limits,
         ));
 
         // Entry size over limit should be invalid
-        assert!(!validate_contract_ledger_entry(
-            &key,
-            66000,
-            max_code_size,
-            max_data_size
+        assert!(!super::super::validate_contract_ledger_entry(
+            &key, 66000, &limits,
         ));
     }
 
@@ -2513,9 +2466,13 @@ mod tests {
         let changes = vec![change];
         let max_code_size = 65536;
         let max_data_size = 65536;
+        let limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: max_code_size,
+            max_contract_data_entry_size_bytes: max_data_size,
+        };
 
         // Should return EntrySizeExceeded because the entry is > 64 KB
-        let result = validate_and_compute_write_bytes(&changes, max_code_size, max_data_size);
+        let result = validate_and_compute_write_bytes(&changes, &limits);
         assert!(matches!(result, StorageChangeValidation::EntrySizeExceeded));
     }
 
@@ -2558,9 +2515,13 @@ mod tests {
         let changes = vec![change];
         let max_code_size = 65536;
         let max_data_size = 65536;
+        let limits = super::super::ContractSizeLimits {
+            max_contract_size_bytes: max_code_size,
+            max_contract_data_entry_size_bytes: max_data_size,
+        };
 
         // Should return Valid with non-zero write bytes
-        let result = validate_and_compute_write_bytes(&changes, max_code_size, max_data_size);
+        let result = validate_and_compute_write_bytes(&changes, &limits);
         match result {
             StorageChangeValidation::Valid { total_write_bytes } => {
                 assert!(total_write_bytes > 0);

@@ -40,10 +40,10 @@ use soroban_env_host_p25 as soroban_env_host25;
 use soroban_env_host_p26 as soroban_env_host26;
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1, AccountEntryExtensionV1Ext, AccountId,
-    Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, Liabilities, Operation,
-    OperationBody, OperationResult, OperationResultTr, RestoreFootprintResult, TrustLineEntry,
-    TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1,
-    TrustLineEntryV1Ext, TrustLineFlags, WriteXdr,
+    Asset, ContractEvent, DiagnosticEvent, ExtendFootprintTtlResult, LedgerKey, Liabilities,
+    Operation, OperationBody, OperationResult, OperationResultTr, RestoreFootprintResult,
+    TrustLineEntry, TrustLineEntryExt, TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext,
+    TrustLineEntryV1, TrustLineEntryV1Ext, TrustLineFlags, WriteXdr,
 };
 
 use crate::frame::muxed_to_account_id;
@@ -196,6 +196,47 @@ pub(super) fn ensure_trustline_ext_v2(
         },
         TrustLineEntryExt::V0 => unreachable!("trustline v1 ext was not initialized"),
     }
+}
+
+/// Contract size limits from SorobanConfig for `validate_contract_ledger_entry`.
+pub(super) struct ContractSizeLimits {
+    pub max_contract_size_bytes: u32,
+    pub max_contract_data_entry_size_bytes: u32,
+}
+
+/// Validate CONTRACT_CODE and CONTRACT_DATA entry sizes against network config limits.
+///
+/// Matches stellar-core `validateContractLedgerEntry()` in TransactionUtils.cpp.
+/// Returns false if the entry exceeds the configured limits.
+pub(super) fn validate_contract_ledger_entry(
+    key: &LedgerKey,
+    entry_size: usize,
+    limits: &ContractSizeLimits,
+) -> bool {
+    match key {
+        LedgerKey::ContractCode(_) => {
+            if entry_size > limits.max_contract_size_bytes as usize {
+                tracing::warn!(
+                    entry_size,
+                    limit = limits.max_contract_size_bytes,
+                    "CONTRACT_CODE size exceeds maxContractSizeBytes"
+                );
+                return false;
+            }
+        }
+        LedgerKey::ContractData(_) => {
+            if entry_size > limits.max_contract_data_entry_size_bytes as usize {
+                tracing::warn!(
+                    entry_size,
+                    limit = limits.max_contract_data_entry_size_bytes,
+                    "CONTRACT_DATA size exceeds maxContractDataEntrySizeBytes"
+                );
+                return false;
+            }
+        }
+        _ => {}
+    }
+    true
 }
 
 /// Apply a balance delta (positive or negative) to an account or trustline.
@@ -933,7 +974,7 @@ pub fn execute_operation_with_soroban(
                     context,
                     soroban.soroban_data,
                     soroban.ttl_key_cache,
-                    Some(&extend_footprint_ttl::ContractSizeLimits {
+                    Some(&ContractSizeLimits {
                         max_contract_size_bytes: config.max_contract_size_bytes,
                         max_contract_data_entry_size_bytes: config
                             .max_contract_data_entry_size_bytes,
@@ -1073,7 +1114,7 @@ pub fn execute_operation_with_soroban(
                         min_persistent_entry_ttl: config.min_persistent_entry_ttl,
                         hot_archive_restores: &ha_restore_entries,
                         ttl_key_cache: soroban.ttl_key_cache,
-                        size_limits: Some(extend_footprint_ttl::ContractSizeLimits {
+                        size_limits: Some(ContractSizeLimits {
                             max_contract_size_bytes: config.max_contract_size_bytes,
                             max_contract_data_entry_size_bytes: config
                                 .max_contract_data_entry_size_bytes,

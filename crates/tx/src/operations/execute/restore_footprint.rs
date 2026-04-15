@@ -32,7 +32,7 @@ pub struct RestoreFootprintResources<'a> {
     /// Optional TTL key cache for hashing restored entries.
     pub ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
     /// Contract size limits from SorobanConfig.
-    pub size_limits: Option<super::extend_footprint_ttl::ContractSizeLimits>,
+    pub size_limits: Option<super::ContractSizeLimits>,
 }
 
 /// Execute a RestoreFootprint operation.
@@ -112,11 +112,7 @@ pub(crate) fn execute_restore_footprint(
         // Validate contract entry size against config limits before restoring.
         // Matches stellar-core validateContractLedgerEntry() in RestoreFootprintOpFrame.
         if let Some(ref limits) = resources.size_limits {
-            if !super::extend_footprint_ttl::validate_contract_ledger_entry(
-                &restore.key,
-                &restore.entry,
-                limits,
-            ) {
+            if !super::validate_contract_ledger_entry(&restore.key, entry_size as usize, limits) {
                 return Ok(make_result(
                     RestoreFootprintResultCode::ResourceLimitExceeded,
                 ));
@@ -217,7 +213,7 @@ fn restore_entry(
     accumulated_write_bytes: &mut u32,
     disk_read_bytes_limit: u32,
     write_bytes_limit: u32,
-    size_limits: Option<&super::extend_footprint_ttl::ContractSizeLimits>,
+    size_limits: Option<&super::ContractSizeLimits>,
 ) -> std::result::Result<(), ()> {
     // Only contract data and contract code can be restored
     match key {
@@ -257,8 +253,7 @@ fn restore_entry(
 
             // Validate contract entry size against config limits.
             if let Some(limits) = size_limits {
-                if !super::extend_footprint_ttl::validate_contract_ledger_entry(key, &entry, limits)
-                {
+                if !super::validate_contract_ledger_entry(key, entry_size as usize, limits) {
                     return Err(());
                 }
             }

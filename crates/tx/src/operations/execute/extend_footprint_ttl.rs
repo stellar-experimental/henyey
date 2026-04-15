@@ -5,61 +5,12 @@
 
 use stellar_xdr::curr::{
     AccountId, ExtendFootprintTtlOp, ExtendFootprintTtlResult, ExtendFootprintTtlResultCode,
-    LedgerKey, OperationResult, OperationResultTr, SorobanTransactionData, WriteXdr,
+    OperationResult, OperationResultTr, SorobanTransactionData, WriteXdr,
 };
 
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
-
-/// Contract size limits passed from SorobanConfig for `validateContractLedgerEntry`.
-pub(crate) struct ContractSizeLimits {
-    pub max_contract_size_bytes: u32,
-    pub max_contract_data_entry_size_bytes: u32,
-}
-
-/// Validate that a contract ledger entry's serialized size does not exceed
-/// the network config limits.
-///
-/// Matches stellar-core `validateContractLedgerEntry()` in TransactionUtils.cpp:
-/// - CONTRACT_CODE: checked against maxContractSizeBytes
-/// - CONTRACT_DATA: checked against maxContractDataEntrySizeBytes
-pub(crate) fn validate_contract_ledger_entry(
-    key: &LedgerKey,
-    entry: &stellar_xdr::curr::LedgerEntry,
-    limits: &ContractSizeLimits,
-) -> bool {
-    let entry_size = entry
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .ok()
-        .map(|bytes| bytes.len() as u32)
-        .unwrap_or(0);
-
-    match key {
-        LedgerKey::ContractCode(_) => {
-            if limits.max_contract_size_bytes < entry_size {
-                tracing::warn!(
-                    entry_size,
-                    limit = limits.max_contract_size_bytes,
-                    "Contract code size exceeds network config maximum"
-                );
-                return false;
-            }
-        }
-        LedgerKey::ContractData(_) => {
-            if limits.max_contract_data_entry_size_bytes < entry_size {
-                tracing::warn!(
-                    entry_size,
-                    limit = limits.max_contract_data_entry_size_bytes,
-                    "Contract data size exceeds network config maximum"
-                );
-                return false;
-            }
-        }
-        _ => {}
-    }
-    true
-}
 
 /// Execute an ExtendFootprintTtl operation.
 ///
@@ -80,7 +31,7 @@ pub(crate) fn execute_extend_footprint_ttl(
     context: &LedgerContext,
     soroban_data: Option<&SorobanTransactionData>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-    size_limits: Option<&ContractSizeLimits>,
+    size_limits: Option<&super::ContractSizeLimits>,
     max_entry_ttl: u32,
 ) -> Result<OperationResult> {
     // stellar-core only rejects extend_to > MAX_ENTRY_TTL - 1;
@@ -155,7 +106,8 @@ pub(crate) fn execute_extend_footprint_ttl(
         // Matches stellar-core validateContractLedgerEntry() which rejects
         // CONTRACT_CODE > maxContractSizeBytes and CONTRACT_DATA > maxContractDataEntrySizeBytes.
         if let Some(limits) = size_limits {
-            if !validate_contract_ledger_entry(key, &entry, limits) {
+            let entry_size = henyey_common::xdr_encoded_len(&entry);
+            if !super::validate_contract_ledger_entry(key, entry_size, limits) {
                 return Ok(make_result(
                     ExtendFootprintTtlResultCode::ResourceLimitExceeded,
                 ));
@@ -963,7 +915,7 @@ mod tests {
         };
 
         // With a size limit below the entry size, should be rejected
-        let small_limits = ContractSizeLimits {
+        let small_limits = crate::operations::execute::ContractSizeLimits {
             max_contract_size_bytes: 64 * 1024,
             max_contract_data_entry_size_bytes: 100, // Way below actual entry size
         };
@@ -991,7 +943,7 @@ mod tests {
         }
 
         // With adequate limits, should succeed
-        let big_limits = ContractSizeLimits {
+        let big_limits = crate::operations::execute::ContractSizeLimits {
             max_contract_size_bytes: 64 * 1024,
             max_contract_data_entry_size_bytes: 64 * 1024,
         };
