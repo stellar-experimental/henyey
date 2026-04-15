@@ -2,14 +2,14 @@
 
 use stellar_xdr::curr::{
     AccountFlags, AccountId, Asset, ChangeTrustAsset, ChangeTrustOp, ChangeTrustResult,
-    ChangeTrustResultCode, LedgerKey, LedgerKeyTrustLine, Liabilities, LiquidityPoolEntry,
+    ChangeTrustResultCode, LedgerKey, LedgerKeyTrustLine, LiquidityPoolEntry,
     LiquidityPoolEntryBody, LiquidityPoolEntryConstantProduct, LiquidityPoolParameters,
     OperationResult, OperationResultTr, TrustLineAsset, TrustLineEntry, TrustLineEntryExt,
-    TrustLineEntryExtensionV2, TrustLineEntryExtensionV2Ext, TrustLineEntryV1, TrustLineEntryV1Ext,
+    TrustLineEntryV1Ext,
 };
 
 use super::{
-    account_balance_after_liabilities, dec_sub_entries, inc_sub_entries,
+    account_balance_after_liabilities, dec_sub_entries, ensure_trustline_ext_v2, inc_sub_entries,
     is_authorized_to_maintain_liabilities, require_source_account, trustline_liabilities,
     ACCOUNT_SUBENTRY_LIMIT, AUTHORIZED_FLAG, TRUSTLINE_CLAWBACK_ENABLED_FLAG,
 };
@@ -432,42 +432,6 @@ fn liquidity_pool_use_count(trustline: &TrustLineEntry) -> i32 {
             TrustLineEntryV1Ext::V0 => 0,
             TrustLineEntryV1Ext::V2(v2) => v2.liquidity_pool_use_count,
         },
-    }
-}
-
-fn ensure_trustline_ext_v2(trustline: &mut TrustLineEntry) -> &mut TrustLineEntryExtensionV2 {
-    match &mut trustline.ext {
-        TrustLineEntryExt::V0 => {
-            trustline.ext = TrustLineEntryExt::V1(TrustLineEntryV1 {
-                liabilities: Liabilities {
-                    buying: 0,
-                    selling: 0,
-                },
-                ext: TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
-                    liquidity_pool_use_count: 0,
-                    ext: TrustLineEntryExtensionV2Ext::V0,
-                }),
-            });
-        }
-        TrustLineEntryExt::V1(v1) => match v1.ext {
-            TrustLineEntryV1Ext::V0 => {
-                v1.ext = TrustLineEntryV1Ext::V2(TrustLineEntryExtensionV2 {
-                    liquidity_pool_use_count: 0,
-                    ext: TrustLineEntryExtensionV2Ext::V0,
-                });
-            }
-            TrustLineEntryV1Ext::V2(_) => {}
-        },
-    }
-
-    match &mut trustline.ext {
-        TrustLineEntryExt::V1(v1) => match &mut v1.ext {
-            TrustLineEntryV1Ext::V2(v2) => v2,
-            TrustLineEntryV1Ext::V0 => {
-                unreachable!("trustline v2 ext was not initialized")
-            }
-        },
-        TrustLineEntryExt::V0 => unreachable!("trustline v1 ext was not initialized"),
     }
 }
 
