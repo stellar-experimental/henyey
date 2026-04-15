@@ -29,6 +29,17 @@ use stellar_xdr::curr::{
 
 use henyey_crypto::{sha256, SecretKey};
 
+// Resource fee and total fee budgets for the 4 settings upgrade transactions.
+// These match the values used in stellar-core's SettingsUpgradeUtils.cpp.
+const RESTORE_RESOURCE_FEE: i64 = 55_000_000;
+const RESTORE_TOTAL_FEE: i64 = 100_000_000;
+const UPLOAD_RESOURCE_FEE: i64 = 55_000_000;
+const UPLOAD_TOTAL_FEE: i64 = 100_000_000;
+const CREATE_RESOURCE_FEE: i64 = 15_000_000;
+const CREATE_TOTAL_FEE: i64 = 25_000_000;
+const INVOKE_RESOURCE_FEE: i64 = 95_000_000;
+const INVOKE_TOTAL_FEE: i64 = 100_000_000;
+
 /// The pre-compiled `write_upgrade_bytes` WASM contract.
 /// This is the same binary embedded in stellar-core via `soroban_test_wasms::WRITE_BYTES`.
 const WRITE_BYTES_WASM: &[u8] = include_bytes!("../wasm/soroban_write_upgrade_bytes_contract.wasm");
@@ -103,8 +114,8 @@ fn get_wasm_restore_tx(
         write_bytes: 2000,
     };
 
-    let resource_fee = 55_000_000 + add_resource_fee;
-    let fee = 100_000_000 + resource_fee;
+    let resource_fee = RESTORE_RESOURCE_FEE + add_resource_fee;
+    let fee = RESTORE_TOTAL_FEE + resource_fee;
 
     let envelope = build_soroban_envelope(
         public_key,
@@ -139,8 +150,8 @@ fn get_upload_tx(public_key: &Uint256, seq_num: i64) -> (TransactionEnvelope, Le
     };
 
     // Note: stellar-core passes 0 for addResourceFee to getUploadTx
-    let resource_fee: i64 = 55_000_000;
-    let fee = 100_000_000 + resource_fee;
+    let resource_fee: i64 = UPLOAD_RESOURCE_FEE;
+    let fee = UPLOAD_TOTAL_FEE + resource_fee;
 
     let envelope = build_soroban_envelope(
         public_key,
@@ -197,20 +208,17 @@ fn get_create_tx(
         .unwrap();
     let contract_id = Hash(sha256(&full_preimage_bytes).0);
 
-    // Build create contract operation
+    // Build create contract operation and auth entry (both need id_preimage + executable)
+    let executable = ContractExecutable::Wasm(wasm_hash);
     let create_args = CreateContractArgs {
-        contract_id_preimage: id_preimage.clone(),
-        executable: ContractExecutable::Wasm(wasm_hash.clone()),
+        contract_id_preimage: id_preimage,
+        executable,
     };
 
-    // Build auth entry
     let auth = SorobanAuthorizationEntry {
         credentials: SorobanCredentials::SourceAccount,
         root_invocation: SorobanAuthorizedInvocation {
-            function: SorobanAuthorizedFunction::CreateContractHostFn(CreateContractArgs {
-                contract_id_preimage: id_preimage,
-                executable: ContractExecutable::Wasm(wasm_hash),
-            }),
+            function: SorobanAuthorizedFunction::CreateContractHostFn(create_args.clone()),
             sub_invocations: VecM::default(),
         },
     };
@@ -232,8 +240,8 @@ fn get_create_tx(
         write_bytes: 120,
     };
 
-    let resource_fee = 15_000_000 + add_resource_fee;
-    let fee = 25_000_000 + resource_fee;
+    let resource_fee = CREATE_RESOURCE_FEE + add_resource_fee;
+    let fee = CREATE_TOTAL_FEE + resource_fee;
 
     let envelope = build_soroban_envelope(
         public_key,
@@ -317,8 +325,8 @@ fn get_invoke_tx(
         write_bytes: (upgrade_set_bytes.len() as u32) + 200,
     };
 
-    let resource_fee = 95_000_000 + add_resource_fee;
-    let fee = 100_000_000 + resource_fee;
+    let resource_fee = INVOKE_RESOURCE_FEE + add_resource_fee;
+    let fee = INVOKE_TOTAL_FEE + resource_fee;
 
     let envelope = build_soroban_envelope(
         public_key,
