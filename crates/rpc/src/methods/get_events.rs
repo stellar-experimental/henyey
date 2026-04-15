@@ -186,35 +186,46 @@ fn parse_event_filters(
         // Topics is an array of arrays: [["topic1_a", "topic1_b"], ["*"], ...]
         // Each inner array is OR alternatives for that position.
         if let Some(topics_arr) = filter.get("topics").and_then(|v| v.as_array()) {
-            if topics_arr.len() > MAX_TOPICS_PER_FILTER {
-                return Err(JsonRpcError::invalid_params(format!(
-                    "too many topics per filter: max {} allowed",
-                    MAX_TOPICS_PER_FILTER
-                )));
-            }
-            for topic_set in topics_arr {
-                if let Some(alternatives) = topic_set.as_array() {
-                    if alternatives.len() > MAX_TOPIC_SEGMENTS {
-                        return Err(JsonRpcError::invalid_params(format!(
-                            "too many alternatives per topic segment: max {} allowed",
-                            MAX_TOPIC_SEGMENTS
-                        )));
-                    }
-                    let alt_strings: Vec<String> = alternatives
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect();
-                    // ** means "match all remaining positions" — stop adding further filters
-                    if alt_strings.iter().any(|s| s == "**") {
-                        break;
-                    }
-                    topic_filters.push(alt_strings);
-                }
-            }
+            parse_topic_filters(topics_arr, &mut topic_filters)?;
         }
     }
 
     Ok((event_type, contract_ids, topic_filters))
+}
+
+/// Parse a topics array into a list of topic filter alternatives.
+///
+/// Each element of `topics_arr` is an array of OR alternatives for that position.
+/// `**` means "match all remaining positions" — stop adding further filters.
+fn parse_topic_filters(
+    topics_arr: &[serde_json::Value],
+    topic_filters: &mut Vec<Vec<String>>,
+) -> Result<(), JsonRpcError> {
+    if topics_arr.len() > MAX_TOPICS_PER_FILTER {
+        return Err(JsonRpcError::invalid_params(format!(
+            "too many topics per filter: max {} allowed",
+            MAX_TOPICS_PER_FILTER
+        )));
+    }
+    for topic_set in topics_arr {
+        if let Some(alternatives) = topic_set.as_array() {
+            if alternatives.len() > MAX_TOPIC_SEGMENTS {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "too many alternatives per topic segment: max {} allowed",
+                    MAX_TOPIC_SEGMENTS
+                )));
+            }
+            let alt_strings: Vec<String> = alternatives
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            if alt_strings.iter().any(|s| s == "**") {
+                break;
+            }
+            topic_filters.push(alt_strings);
+        }
+    }
+    Ok(())
 }
 
 /// Insert event value and topic fields into the JSON object, format-aware.
