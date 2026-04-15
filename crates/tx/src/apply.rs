@@ -405,14 +405,14 @@ impl TxChangeLog {
     ///
     /// Each call starts with a fresh `pending_state`, so STATE entries cannot
     /// leak across separate invocations.
-    fn extend_from_changes(&mut self, changes: &LedgerEntryChanges) -> Result<()> {
+    fn extend_from_changes(&mut self, changes: LedgerEntryChanges) -> Result<()> {
         let mut pending_state: Option<LedgerEntry> = None;
 
-        for change in changes.iter() {
+        for change in changes.0.into_vec().into_iter() {
             match change {
                 LedgerEntryChange::Created(entry) => {
                     pending_state = None;
-                    self.record_create(entry.clone());
+                    self.record_create(entry);
                 }
                 LedgerEntryChange::Updated(entry) => {
                     let pre_state = match pending_state.take() {
@@ -424,7 +424,7 @@ impl TxChangeLog {
                             ));
                         }
                     };
-                    self.record_update(pre_state, entry.clone());
+                    self.record_update(pre_state, entry);
                 }
                 LedgerEntryChange::Removed(key) => {
                     let pre_state = match pending_state.take() {
@@ -436,14 +436,14 @@ impl TxChangeLog {
                             ));
                         }
                     };
-                    self.record_delete(key.clone(), pre_state);
+                    self.record_delete(key, pre_state);
                 }
                 LedgerEntryChange::State(entry) => {
-                    pending_state = Some(entry.clone());
+                    pending_state = Some(entry);
                 }
                 LedgerEntryChange::Restored(entry) => {
                     pending_state = None;
-                    self.record_create(entry.clone());
+                    self.record_create(entry);
                 }
             }
         }
@@ -460,7 +460,7 @@ impl TxChangeLog {
 pub fn apply_from_history(
     _frame: &TransactionFrame,
     result: &TransactionResult,
-    meta: &TransactionMeta,
+    meta: TransactionMeta,
     delta: &mut TxChangeLog,
 ) -> Result<TxApplyResult> {
     // Add fee to delta
@@ -481,40 +481,40 @@ pub fn apply_from_history(
 }
 
 /// Apply state changes from transaction meta.
-fn apply_meta_changes(meta: &TransactionMeta, delta: &mut TxChangeLog) -> Result<()> {
+fn apply_meta_changes(meta: TransactionMeta, delta: &mut TxChangeLog) -> Result<()> {
     match meta {
         TransactionMeta::V0(changes) => {
-            for op_meta in changes.iter() {
-                delta.extend_from_changes(&op_meta.changes)?;
+            for op_meta in changes.into_vec().into_iter() {
+                delta.extend_from_changes(op_meta.changes)?;
             }
         }
         TransactionMeta::V1(v1) => {
-            delta.extend_from_changes(&v1.tx_changes)?;
-            for op_meta in v1.operations.iter() {
-                delta.extend_from_changes(&op_meta.changes)?;
+            delta.extend_from_changes(v1.tx_changes)?;
+            for op_meta in v1.operations.into_vec().into_iter() {
+                delta.extend_from_changes(op_meta.changes)?;
             }
         }
         TransactionMeta::V2(v2) => {
             apply_before_ops_after(
-                &v2.tx_changes_before,
-                v2.operations.iter().map(|op| &op.changes),
-                &v2.tx_changes_after,
+                v2.tx_changes_before,
+                v2.operations.into_vec().into_iter().map(|op| op.changes),
+                v2.tx_changes_after,
                 delta,
             )?;
         }
         TransactionMeta::V3(v3) => {
             apply_before_ops_after(
-                &v3.tx_changes_before,
-                v3.operations.iter().map(|op| &op.changes),
-                &v3.tx_changes_after,
+                v3.tx_changes_before,
+                v3.operations.into_vec().into_iter().map(|op| op.changes),
+                v3.tx_changes_after,
                 delta,
             )?;
         }
         TransactionMeta::V4(v4) => {
             apply_before_ops_after(
-                &v4.tx_changes_before,
-                v4.operations.iter().map(|op| &op.changes),
-                &v4.tx_changes_after,
+                v4.tx_changes_before,
+                v4.operations.into_vec().into_iter().map(|op| op.changes),
+                v4.tx_changes_after,
                 delta,
             )?;
         }
@@ -523,10 +523,10 @@ fn apply_meta_changes(meta: &TransactionMeta, delta: &mut TxChangeLog) -> Result
     Ok(())
 }
 
-fn apply_before_ops_after<'a>(
-    before: &LedgerEntryChanges,
-    op_changes: impl Iterator<Item = &'a LedgerEntryChanges>,
-    after: &LedgerEntryChanges,
+fn apply_before_ops_after(
+    before: LedgerEntryChanges,
+    op_changes: impl Iterator<Item = LedgerEntryChanges>,
+    after: LedgerEntryChanges,
     delta: &mut TxChangeLog,
 ) -> Result<()> {
     delta.extend_from_changes(before)?;
@@ -550,13 +550,13 @@ pub fn apply_fee_only(
 
 /// Batch apply multiple transactions from history.
 pub fn apply_transaction_set_from_history(
-    transactions: &[(TransactionFrame, TransactionResult, TransactionMeta)],
+    transactions: Vec<(TransactionFrame, TransactionResult, TransactionMeta)>,
     delta: &mut TxChangeLog,
 ) -> Result<Vec<TxApplyResult>> {
     let mut results = Vec::with_capacity(transactions.len());
 
     for (frame, result, meta) in transactions {
-        let apply_result = apply_from_history(frame, result, meta, delta)?;
+        let apply_result = apply_from_history(&frame, &result, meta, delta)?;
         results.push(apply_result);
     }
 
@@ -1332,7 +1332,7 @@ mod tests {
             .try_into()
             .unwrap();
 
-        delta.extend_from_changes(&changes).unwrap();
+        delta.extend_from_changes(changes).unwrap();
 
         assert_eq!(delta.created_entries().len(), 1);
         assert_eq!(delta.change_count(), 1);
@@ -1351,7 +1351,7 @@ mod tests {
         .try_into()
         .unwrap();
 
-        delta.extend_from_changes(&changes).unwrap();
+        delta.extend_from_changes(changes).unwrap();
 
         assert_eq!(delta.updated_entries().len(), 1);
         assert_eq!(delta.update_states().len(), 1);
@@ -1381,7 +1381,7 @@ mod tests {
         .try_into()
         .unwrap();
 
-        delta.extend_from_changes(&changes).unwrap();
+        delta.extend_from_changes(changes).unwrap();
 
         assert_eq!(delta.deleted_keys().len(), 1);
         assert_eq!(delta.delete_states().len(), 1);
@@ -1400,7 +1400,7 @@ mod tests {
             .try_into()
             .unwrap();
 
-        delta.extend_from_changes(&changes).unwrap();
+        delta.extend_from_changes(changes).unwrap();
 
         // Restored is treated as Created
         assert_eq!(delta.created_entries().len(), 1);
@@ -1417,14 +1417,14 @@ mod tests {
             vec![LedgerEntryChange::State(make_account_entry(1_000_000))]
                 .try_into()
                 .unwrap();
-        delta.extend_from_changes(&changes1).unwrap();
+        delta.extend_from_changes(changes1).unwrap();
 
         // Second call: UPDATED without STATE should fail (not use leaked state)
         let changes2: LedgerEntryChanges =
             vec![LedgerEntryChange::Updated(make_account_entry(2_000_000))]
                 .try_into()
                 .unwrap();
-        let result = delta.extend_from_changes(&changes2);
+        let result = delta.extend_from_changes(changes2);
         assert!(result.is_err(), "STATE must not leak across calls");
     }
 
@@ -1436,7 +1436,7 @@ mod tests {
                 .try_into()
                 .unwrap();
 
-        let result = delta.extend_from_changes(&changes);
+        let result = delta.extend_from_changes(changes);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("UPDATED"),
@@ -1451,7 +1451,7 @@ mod tests {
             .try_into()
             .unwrap();
 
-        let result = delta.extend_from_changes(&changes);
+        let result = delta.extend_from_changes(changes);
         assert!(result.is_err());
         assert!(
             result.unwrap_err().to_string().contains("REMOVED"),
