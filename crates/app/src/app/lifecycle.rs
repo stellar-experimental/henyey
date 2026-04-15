@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// Maximum number of ledger slots used for per-peer rate-limit windows.
+/// Matches stellar-core's `Config::MAX_SLOTS_TO_REMEMBER` (default 12).
+const MAX_SLOTS_TO_REMEMBER: u64 = 12;
+
 impl App {
     /// Run the main event loop.
     ///
@@ -1290,7 +1294,7 @@ impl App {
                 // MAX_SLOTS_TO_REMEMBER = checkpoint_frequency * 2
                 // (matches herder_config.max_externalized_slots / freq computation).
                 // stellar-core uses config.MAX_SLOTS_TO_REMEMBER which defaults to 12.
-                let max_slots: u64 = 12;
+                let max_slots = MAX_SLOTS_TO_REMEMBER;
                 let window = Duration::from_secs(close_time_secs * max_slots);
                 let allowed = {
                     let mut map = self.scp_state_query_info.write().await;
@@ -1316,7 +1320,7 @@ impl App {
                 // Rate-limit GET_SCP_QUORUMSET requests per peer.
                 // Matches stellar-core's Peer::process(mQSetQueryInfo).
                 let close_time_secs = self.herder.ledger_close_time() as u64;
-                let max_slots: u64 = 12;
+                let max_slots = MAX_SLOTS_TO_REMEMBER;
                 let window = Duration::from_secs(close_time_secs * max_slots);
                 let max_rate = (window.as_secs() as u32) * QUERY_RESPONSE_MULTIPLIER;
                 let allowed = {
@@ -1405,7 +1409,7 @@ impl App {
                 // Rate-limit GET_TX_SET requests per peer.
                 // Matches stellar-core's Peer::process(mTxSetQueryInfo).
                 let close_time_secs = self.herder.ledger_close_time() as u64;
-                let max_slots: u64 = 12;
+                let max_slots = MAX_SLOTS_TO_REMEMBER;
                 let window = Duration::from_secs(close_time_secs * max_slots);
                 let max_rate = (window.as_secs() as u32) * QUERY_RESPONSE_MULTIPLIER;
                 let allowed = {

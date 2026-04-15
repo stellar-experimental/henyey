@@ -470,13 +470,13 @@ impl PeerTxAdverts {
 
     pub fn queue_incoming(&mut self, hashes: &[Hash], ledger_seq: u32, max_ops: usize) {
         for hash in hashes {
-            let hash256 = Hash256::from(hash.clone());
+            let hash256 = Hash256(hash.0);
             self.remember(hash256, ledger_seq);
         }
 
         let start = hashes.len().saturating_sub(max_ops);
         for hash in hashes.iter().skip(start) {
-            self.incoming.push_back(Hash256::from(hash.clone()));
+            self.incoming.push_back(Hash256(hash.0));
         }
 
         while self.size() > max_ops {

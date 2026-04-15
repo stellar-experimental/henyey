@@ -14,6 +14,10 @@ use stellar_xdr::curr::{
 };
 use tracing::debug;
 
+/// Threshold in microseconds above which a classic transaction is logged as slow.
+/// Soroban transactions are always logged regardless of duration.
+const SLOW_TX_LOG_THRESHOLD_US: u64 = 5000;
+
 use henyey_tx::{operations::OperationTypeExt, LedgerContext, OpEventManager, TransactionFrame};
 
 use crate::snapshot::SnapshotHandle;
@@ -679,7 +683,7 @@ impl TransactionExecutor {
         let total_us = tx_timing_start.elapsed().as_micros() as u64;
         let meta_us = total_us - validation_us - fee_seq_us - footprint_us - ops_us;
 
-        if total_us > 5000 || frame.is_soroban() {
+        if total_us > SLOW_TX_LOG_THRESHOLD_US || frame.is_soroban() {
             // Build a compact string of per-op-type timings sorted by time desc
             let mut op_timing_vec: Vec<_> = op_type_timings.iter().collect();
             op_timing_vec.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));

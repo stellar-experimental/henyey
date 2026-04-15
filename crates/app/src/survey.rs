@@ -49,9 +49,17 @@ use stellar_xdr::curr::{
     TopologyResponseBodyV2,
 };
 
+/// Maximum duration for the collecting phase of a time-sliced survey.
+/// Matches stellar-core `SurveyManager.cpp` `COLLECTING_PHASE_MAX_DURATION`.
 const COLLECTING_PHASE_MAX_DURATION: Duration = Duration::from_secs(30 * 60);
+/// Maximum duration for the reporting phase of a time-sliced survey.
+/// Matches stellar-core `SurveyManager.cpp` `REPORTING_PHASE_MAX_DURATION`.
 const REPORTING_PHASE_MAX_DURATION: Duration = Duration::from_secs(3 * 60 * 60);
+/// Default number of histogram samples for latency measurements.
+/// Matches stellar-core `SurveyManager::NUM_HISTOGRAM_SAMPLES`.
 const DEFAULT_HISTOGRAM_SAMPLES: usize = 1024;
+/// Maximum number of peers included in a time-sliced survey response.
+/// Matches stellar-core `SurveyManager::NUM_SURVEYED_PEERS`.
 const TIME_SLICED_PEERS_MAX: usize = 25;
 
 /// Current phase of a time-sliced survey.

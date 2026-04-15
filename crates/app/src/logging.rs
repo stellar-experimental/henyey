@@ -251,10 +251,7 @@ impl LogLevelHandle {
         global_level: &str,
         partition_override: Option<(&str, &str)>,
     ) -> anyhow::Result<EnvFilter> {
-        let mut filter = EnvFilter::new(global_level)
-            .add_directive("hyper=warn".parse()?)
-            .add_directive("reqwest=warn".parse()?)
-            .add_directive("h2=warn".parse()?);
+        let mut filter = base_env_filter(global_level)?;
 
         if let Some((target, level)) = partition_override {
             let directive = format!("{}={}", target, level);
@@ -269,10 +266,7 @@ impl LogLevelHandle {
         let global = self.global_level.read().unwrap().clone();
         let levels = self.levels.read().unwrap();
 
-        let mut filter = EnvFilter::new(&global)
-            .add_directive("hyper=warn".parse()?)
-            .add_directive("reqwest=warn".parse()?)
-            .add_directive("h2=warn".parse()?);
+        let mut filter = base_env_filter(&global)?;
 
         for (partition, level) in levels.iter() {
             if level != &global {
@@ -301,6 +295,14 @@ fn normalize_level(level: &str) -> anyhow::Result<String> {
     }
 }
 
+/// Build an EnvFilter with the standard base directives (hyper, reqwest, h2 at warn).
+fn base_env_filter(level: &str) -> anyhow::Result<EnvFilter> {
+    Ok(EnvFilter::new(level)
+        .add_directive("hyper=warn".parse()?)
+        .add_directive("reqwest=warn".parse()?)
+        .add_directive("h2=warn".parse()?))
+}
+
 /// Map a partition name to its Rust module target.
 fn partition_to_target(partition: &str) -> Option<&'static str> {
     LOG_PARTITIONS
@@ -323,12 +325,8 @@ pub fn init(config: &LogConfig) -> anyhow::Result<()> {
 /// This should be called once at application startup. The returned handle can be
 /// used to modify log levels at runtime via the `/ll` HTTP endpoint.
 pub fn init_with_handle(config: &LogConfig) -> anyhow::Result<LogLevelHandle> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(config.level.as_str())
-            .add_directive("hyper=warn".parse().unwrap())
-            .add_directive("reqwest=warn".parse().unwrap())
-            .add_directive("h2=warn".parse().unwrap())
-    });
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| base_env_filter(config.level.as_str()).unwrap());
 
     let initial_level = config.level.as_str().to_lowercase();
 

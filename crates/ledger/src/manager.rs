@@ -66,6 +66,13 @@ use stellar_xdr::curr::{
 };
 use tracing::{debug, info};
 
+/// Standard Linux memory page size in bytes.
+const PAGE_SIZE: u64 = 4096;
+
+/// Heuristic multiplier for estimating compiled module size from WASM byte size.
+/// Compiled modules are approximately 4× their raw WASM size.
+const WASM_COMPILED_SIZE_MULTIPLIER: u64 = 4;
+
 /// Read current RSS (Resident Set Size) in bytes from /proc/self/statm.
 /// Returns 0 on non-Linux or on error.
 fn get_rss_bytes() -> u64 {
@@ -73,7 +80,7 @@ fn get_rss_bytes() -> u64 {
     {
         if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
             // Format: size resident shared text lib data dt (all in pages)
-            let page_size = 4096u64; // standard Linux page size
+            let page_size = PAGE_SIZE;
             if let Some(rss_pages) = statm.split_whitespace().nth(1) {
                 if let Ok(pages) = rss_pages.parse::<u64>() {
                     return pages * page_size;
@@ -2254,7 +2261,7 @@ impl LedgerManager {
             let soroban = self.soroban_state.read();
             let wasm_bytes = soroban.contract_code_state_size().max(0) as u64;
             let code_count = soroban.contract_code_count() as u64;
-            let estimated_compiled = wasm_bytes * 4;
+            let estimated_compiled = wasm_bytes * WASM_COMPILED_SIZE_MULTIPLIER;
             components.push(ComponentMemory::new(
                 "module_cache",
                 estimated_compiled,
