@@ -207,25 +207,7 @@ pub use henyey_common::Hash256;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{PublicKey, Uint256};
-
-    fn make_node_id(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
-    }
-
-    fn make_value(data: &[u8]) -> Value {
-        data.to_vec().try_into().unwrap()
-    }
-
-    fn make_quorum_set(nodes: Vec<NodeId>, threshold: u32) -> ScpQuorumSet {
-        ScpQuorumSet {
-            threshold,
-            validators: nodes.try_into().unwrap(),
-            inner_sets: vec![].try_into().unwrap(),
-        }
-    }
+    use crate::test_utils::{make_node_id, make_quorum_set, make_value};
 
     #[test]
     fn test_envelope_state() {

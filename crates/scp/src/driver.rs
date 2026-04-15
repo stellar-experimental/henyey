@@ -447,21 +447,7 @@ pub(crate) fn base_get_node_weight(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{PublicKey as XdrPublicKey, Uint256};
-
-    fn make_node_id(id: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = id;
-        NodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
-    }
-
-    fn make_quorum_set(validators: Vec<NodeId>, threshold: u32) -> ScpQuorumSet {
-        ScpQuorumSet {
-            threshold,
-            validators: validators.try_into().unwrap(),
-            inner_sets: Vec::new().try_into().unwrap(),
-        }
-    }
+    use crate::test_utils::{make_node_id, make_quorum_set};
 
     fn is_near_weight(weight: u64, target: f64) -> bool {
         let ratio = weight as f64 / u64::MAX as f64;

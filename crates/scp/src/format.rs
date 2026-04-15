@@ -86,17 +86,8 @@ pub fn envelope_to_str(envelope: &ScpEnvelope) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{PublicKey, ScpNomination, ScpQuorumSet, ScpStatement, Uint256};
-
-    fn make_node_id(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
-    }
-
-    fn make_value(data: &[u8]) -> Value {
-        data.to_vec().try_into().unwrap()
-    }
+    use crate::test_utils::{make_node_id, make_value};
+    use stellar_xdr::curr::{ScpNomination, ScpQuorumSet, ScpStatement};
 
     #[test]
     fn test_node_id_to_short_string() {

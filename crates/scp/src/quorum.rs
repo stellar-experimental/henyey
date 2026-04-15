@@ -574,13 +574,8 @@ impl SingletonQuorumSetCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::make_node_id;
     use stellar_xdr::curr::{PublicKey, Uint256};
-
-    fn make_node_id(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
-    }
 
     fn make_simple_quorum_set(threshold: u32, node_ids: &[NodeId]) -> ScpQuorumSet {
         simple_quorum_set(threshold, node_ids.to_vec())

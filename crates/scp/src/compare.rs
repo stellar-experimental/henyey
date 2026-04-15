@@ -96,27 +96,8 @@ pub(crate) fn is_newer_confirm(old: &ScpStatementConfirm, new: &ScpStatementConf
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{
-        NodeId, PublicKey, ScpBallot, ScpNomination, ScpQuorumSet, Uint256, Value,
-    };
-
-    fn make_node_id(seed: u8) -> NodeId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = seed;
-        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))
-    }
-
-    fn make_value(data: &[u8]) -> Value {
-        data.to_vec().try_into().unwrap()
-    }
-
-    fn make_quorum_set(nodes: Vec<NodeId>, threshold: u32) -> ScpQuorumSet {
-        ScpQuorumSet {
-            threshold,
-            validators: nodes.try_into().unwrap(),
-            inner_sets: vec![].try_into().unwrap(),
-        }
-    }
+    use crate::test_utils::{make_node_id, make_quorum_set, make_value};
+    use stellar_xdr::curr::{ScpBallot, ScpNomination};
 
     #[test]
     fn test_is_newer_nomination() {
