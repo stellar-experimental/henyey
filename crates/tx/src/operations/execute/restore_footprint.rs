@@ -86,10 +86,10 @@ pub(crate) fn execute_restore_footprint(
 
     // Resource limit tracking (stellar-core: RestoreFootprintApplyHelper::apply)
     let soroban_data = resources.soroban_data.unwrap(); // safe: checked above
-    let disk_read_bytes_limit = soroban_data.resources.disk_read_bytes;
-    let write_bytes_limit = soroban_data.resources.write_bytes;
-    let mut accumulated_read_bytes: u32 = 0;
-    let mut accumulated_write_bytes: u32 = 0;
+    let mut accumulator = ResourceAccumulator::new(
+        soroban_data.resources.disk_read_bytes,
+        soroban_data.resources.write_bytes,
+    );
 
     // First, restore hot archive entries to state.
     // These entries don't exist in the live bucket list, so we need to add them.
@@ -101,16 +101,14 @@ pub(crate) fn execute_restore_footprint(
             "RestoreFootprint: restoring entry from hot archive to state"
         );
 
-        // Track resource limits for hot archive entries
-        let entry_size = restore
-            .entry
-            .to_xdr(Limits::none())
-            .ok()
-            .map(|bytes| bytes.len() as u32)
-            .unwrap_or(0);
+        let entry_size = xdr_entry_size(&restore.entry);
 
-        // Validate contract entry size against config limits before restoring.
-        // Matches stellar-core validateContractLedgerEntry() in RestoreFootprintOpFrame.
+        // stellar-core ordering: read_bytes → validate_contract → write_bytes
+        if accumulator.add_read(entry_size).is_err() {
+            return Ok(make_result(
+                RestoreFootprintResultCode::ResourceLimitExceeded,
+            ));
+        }
         if let Some(ref limits) = resources.size_limits {
             if !super::validate_contract_ledger_entry(&restore.key, entry_size as usize, limits) {
                 return Ok(make_result(
@@ -118,15 +116,7 @@ pub(crate) fn execute_restore_footprint(
                 ));
             }
         }
-
-        accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
-        if accumulated_read_bytes > disk_read_bytes_limit {
-            return Ok(make_result(
-                RestoreFootprintResultCode::ResourceLimitExceeded,
-            ));
-        }
-        accumulated_write_bytes = accumulated_write_bytes.saturating_add(entry_size);
-        if accumulated_write_bytes > write_bytes_limit {
+        if accumulator.add_write(entry_size).is_err() {
             return Ok(make_result(
                 RestoreFootprintResultCode::ResourceLimitExceeded,
             ));
@@ -165,8 +155,6 @@ pub(crate) fn execute_restore_footprint(
         new_ttl,
         current_ledger,
         ttl_key_cache: resources.ttl_key_cache,
-        disk_read_bytes_limit,
-        write_bytes_limit,
         size_limits: resources.size_limits.as_ref(),
     };
     for key in footprint.read_write.iter() {
@@ -175,22 +163,10 @@ pub(crate) fn execute_restore_footprint(
             continue;
         }
 
-        match restore_entry(
-            key,
-            state,
-            &restore_ctx,
-            accumulated_read_bytes,
-            accumulated_write_bytes,
-        ) {
-            Ok(usage) => {
-                accumulated_read_bytes = accumulated_read_bytes.saturating_add(usage.read_bytes);
-                accumulated_write_bytes = accumulated_write_bytes.saturating_add(usage.write_bytes);
-            }
-            Err(()) => {
-                return Ok(make_result(
-                    RestoreFootprintResultCode::ResourceLimitExceeded,
-                ));
-            }
+        if restore_entry(key, state, &restore_ctx, &mut accumulator).is_err() {
+            return Ok(make_result(
+                RestoreFootprintResultCode::ResourceLimitExceeded,
+            ));
         }
     }
 
@@ -208,41 +184,81 @@ fn is_persistent_entry(key: &LedgerKey) -> bool {
     }
 }
 
-/// Resource bytes consumed by a single restore_entry call.
-struct ResourceUsage {
-    read_bytes: u32,
-    write_bytes: u32,
+/// Compute XDR-serialized size of a ledger entry.
+///
+/// Returns 0 if serialization fails (entry will effectively pass limit checks
+/// with zero cost, matching stellar-core's `xdr_size` which never fails on
+/// well-formed entries).
+fn xdr_entry_size(entry: &LedgerEntry) -> u32 {
+    entry
+        .to_xdr(Limits::none())
+        .ok()
+        .map(|bytes| bytes.len() as u32)
+        .unwrap_or(0)
 }
 
-/// Context for restoring entries, bundling limits and caches.
+/// Tracks accumulated read and write bytes against declared resource limits.
+///
+/// Mirrors stellar-core's `mMetrics.mLedgerReadByte` / `mMetrics.mLedgerWriteByte`
+/// tracking in `RestoreFootprintApplyHelper::apply`.
+struct ResourceAccumulator {
+    read_bytes: u32,
+    write_bytes: u32,
+    read_limit: u32,
+    write_limit: u32,
+}
+
+impl ResourceAccumulator {
+    fn new(read_limit: u32, write_limit: u32) -> Self {
+        Self {
+            read_bytes: 0,
+            write_bytes: 0,
+            read_limit,
+            write_limit,
+        }
+    }
+
+    /// Add to read byte accumulator. Returns Err(()) if limit exceeded.
+    fn add_read(&mut self, size: u32) -> std::result::Result<(), ()> {
+        self.read_bytes = self.read_bytes.saturating_add(size);
+        if self.read_bytes > self.read_limit {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Add to write byte accumulator. Returns Err(()) if limit exceeded.
+    fn add_write(&mut self, size: u32) -> std::result::Result<(), ()> {
+        self.write_bytes = self.write_bytes.saturating_add(size);
+        if self.write_bytes > self.write_limit {
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
+/// Context for restoring entries, bundling TTL and validation config.
 struct RestoreContext<'a> {
     new_ttl: u32,
     current_ledger: u32,
     ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
-    disk_read_bytes_limit: u32,
-    write_bytes_limit: u32,
     size_limits: Option<&'a super::ContractSizeLimits>,
 }
 
 /// Restore a single ledger entry.
 ///
-/// Returns the resource bytes consumed, or `Err(())` if validation fails.
+/// Checks resource limits via the accumulator and restores the TTL.
+/// Returns `Err(())` if any resource limit is exceeded.
 fn restore_entry(
     key: &LedgerKey,
     state: &mut LedgerStateManager,
     ctx: &RestoreContext,
-    accumulated_read_bytes: u32,
-    accumulated_write_bytes: u32,
-) -> std::result::Result<ResourceUsage, ()> {
+    accumulator: &mut ResourceAccumulator,
+) -> std::result::Result<(), ()> {
     // Only contract data and contract code can be restored
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {}
-        _ => {
-            return Ok(ResourceUsage {
-                read_bytes: 0,
-                write_bytes: 0,
-            })
-        }
+        _ => return Ok(()),
     }
 
     // Compute the key hash for TTL lookup
@@ -254,48 +270,24 @@ fn restore_entry(
     match current_ttl {
         Some(ttl) if ttl >= ctx.current_ledger => {
             // Entry is still live, no restoration needed.
-            Ok(ResourceUsage {
-                read_bytes: 0,
-                write_bytes: 0,
-            })
+            Ok(())
         }
         Some(_) | None => {
-            // Entry is archived or has no TTL entry
-            // We need to check if the entry itself exists in state
-            let entry = state.get_entry(key);
-            let entry = match entry {
-                None => {
-                    // Neither live nor archived entry exists; skip per stellar-core behavior.
-                    return Ok(ResourceUsage {
-                        read_bytes: 0,
-                        write_bytes: 0,
-                    });
-                }
+            let entry = match state.get_entry(key) {
+                None => return Ok(()),
                 Some(e) => e,
             };
 
-            // Track resource limits (stellar-core: checkResourceLimits)
-            let entry_size = entry
-                .to_xdr(Limits::none())
-                .ok()
-                .map(|bytes| bytes.len() as u32)
-                .unwrap_or(0);
+            let entry_size = xdr_entry_size(&entry);
 
-            // Validate contract entry size against config limits.
+            // stellar-core ordering: read_bytes → validate_contract → write_bytes
+            accumulator.add_read(entry_size)?;
             if let Some(limits) = ctx.size_limits {
                 if !super::validate_contract_ledger_entry(key, entry_size as usize, limits) {
                     return Err(());
                 }
             }
-
-            let new_read = accumulated_read_bytes.saturating_add(entry_size);
-            if new_read > ctx.disk_read_bytes_limit {
-                return Err(());
-            }
-            let new_write = accumulated_write_bytes.saturating_add(entry_size);
-            if new_write > ctx.write_bytes_limit {
-                return Err(());
-            }
+            accumulator.add_write(entry_size)?;
 
             // Create or update the TTL entry to restore the entry
             let ttl_entry = TtlEntry {
@@ -309,10 +301,7 @@ fn restore_entry(
                 state.create_ttl(ttl_entry);
             }
 
-            Ok(ResourceUsage {
-                read_bytes: entry_size,
-                write_bytes: entry_size,
-            })
+            Ok(())
         }
     }
 }
@@ -849,5 +838,199 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    fn make_contract_code_entry(hash: Hash) -> LedgerEntry {
+        LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractCode(ContractCodeEntry {
+                ext: ContractCodeEntryExt::V0,
+                hash: hash.clone(),
+                code: vec![0u8; 100].try_into().unwrap(),
+            }),
+            ext: LedgerEntryExt::V0,
+        }
+    }
+
+    fn assert_restore_result(
+        result: crate::Result<OperationResult>,
+        expected: RestoreFootprintResult,
+    ) {
+        match result.unwrap() {
+            OperationResult::OpInner(OperationResultTr::RestoreFootprint(r)) => {
+                assert_eq!(r, expected, "Unexpected restore result");
+            }
+            other => panic!("Unexpected result type: {:?}", other),
+        }
+    }
+
+    /// Test hot archive entry restoration with sufficient resource limits.
+    #[test]
+    fn test_restore_footprint_hot_archive_success() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let hash = Hash([50u8; 32]);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
+        let entry = make_contract_code_entry(hash);
+
+        let hot_restores = vec![HotArchiveRestoreEntry {
+            key: key.clone(),
+            entry,
+        }];
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 10_000,
+                write_bytes: 10_000,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &hot_restores,
+                ttl_key_cache: None,
+                size_limits: None,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::Success);
+    }
+
+    /// Test hot archive entry exceeds read_bytes limit.
+    #[test]
+    fn test_restore_footprint_hot_archive_read_limit_exceeded() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let hash = Hash([51u8; 32]);
+        let key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
+        let entry = make_contract_code_entry(hash);
+
+        let hot_restores = vec![HotArchiveRestoreEntry {
+            key: key.clone(),
+            entry,
+        }];
+
+        // disk_read_bytes = 0 means any entry exceeds it
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 0,
+                write_bytes: 10_000,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &hot_restores,
+                ttl_key_cache: None,
+                size_limits: None,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::ResourceLimitExceeded);
+    }
+
+    /// Test combined hot archive + live entry accumulation crosses the write limit.
+    #[test]
+    fn test_restore_footprint_combined_hot_and_live_write_limit() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        // Hot archive entry
+        let hot_hash = Hash([60u8; 32]);
+        let hot_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: hot_hash.clone(),
+        });
+        let hot_entry = make_contract_code_entry(hot_hash);
+        let hot_entry_size = hot_entry.to_xdr(Limits::none()).unwrap().len() as u32;
+
+        let hot_restores = vec![HotArchiveRestoreEntry {
+            key: hot_key.clone(),
+            entry: hot_entry,
+        }];
+
+        // Live entry with expired TTL
+        let live_hash = Hash([61u8; 32]);
+        let live_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: live_hash.clone(),
+        });
+        let live_entry = ContractCodeEntry {
+            ext: ContractCodeEntryExt::V0,
+            hash: live_hash.clone(),
+            code: vec![0u8; 100].try_into().unwrap(),
+        };
+        state.create_contract_code(live_entry);
+        let live_key_hash = crate::soroban::compute_key_hash(&live_key);
+        state.create_ttl(TtlEntry {
+            key_hash: live_key_hash,
+            live_until_ledger_seq: context.sequence - 1, // expired
+        });
+
+        // Set write_bytes just enough for the hot entry but not both
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![hot_key, live_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 100_000,
+                write_bytes: hot_entry_size, // just enough for first, not second
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &hot_restores,
+                ttl_key_cache: None,
+                size_limits: None,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::ResourceLimitExceeded);
     }
 }
