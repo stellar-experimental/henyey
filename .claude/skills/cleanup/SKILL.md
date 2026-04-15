@@ -1,5 +1,5 @@
 ---
-name: simplify
+name: cleanup
 description: Review or apply code simplifications to a crate
 argument-hint: <crate-path> [--apply]
 ---
@@ -235,5 +235,5 @@ When `$MODE = apply`:
 - If a change breaks tests or introduces warnings, revert it and move on.
 - Stop and report if a change would alter observable behavior.
 - **Commit strategy**: Commit after each logical group of related changes.
-  Use message format: `"Simplify <crate>: <what changed>"`. Include
+  Use message format: `"Clean up <crate>: <what changed>"`. Include
   `Co-authored-by` trailers per AGENTS.md. Push after all changes are complete.

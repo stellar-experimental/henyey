@@ -134,7 +134,7 @@ After every bug-fix commit from Task 1 or Task 2:
 ### Task 4: Code Maintenance (daily)
 
 Run at least once per day, or after completing a sweep range:
-- `/simplify --apply` for all crates that had changes.
+- `/cleanup --apply` for all crates that had changes.
 - `/document` for all crates that had changes.
 - `/parity-check --apply` for all crates that had changes.
 
