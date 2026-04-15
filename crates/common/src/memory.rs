@@ -37,17 +37,18 @@ pub trait MemoryEstimate {
 #[derive(Debug, Clone)]
 pub struct ComponentMemory {
     pub name: &'static str,
-    pub heap_bytes: u64,
+    /// Size in bytes (heap-allocated or file-backed depending on `is_heap`).
+    pub bytes: u64,
     pub entry_count: u64,
     /// Whether this component is heap-allocated (true) or file-backed/mmap (false).
     pub is_heap: bool,
 }
 
 impl ComponentMemory {
-    pub fn new(name: &'static str, heap_bytes: u64, entry_count: u64) -> Self {
+    pub fn new(name: &'static str, bytes: u64, entry_count: u64) -> Self {
         Self {
             name,
-            heap_bytes,
+            bytes,
             entry_count,
             is_heap: true,
         }
@@ -57,14 +58,14 @@ impl ComponentMemory {
     pub fn new_non_heap(name: &'static str, bytes: u64, entry_count: u64) -> Self {
         Self {
             name,
-            heap_bytes: bytes,
+            bytes,
             entry_count,
             is_heap: false,
         }
     }
 
     pub fn heap_mb(&self) -> f64 {
-        self.heap_bytes as f64 / (1024.0 * 1024.0)
+        self.bytes as f64 / (1024.0 * 1024.0)
     }
 }
 

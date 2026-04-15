@@ -313,7 +313,6 @@ impl From<Signature> for stellar_xdr::curr::Signature {
         // the XDR Signature's BytesM::<64> limit.
         stellar_xdr::curr::Signature(
             sig.0
-                .to_vec()
                 .try_into()
                 .expect("64-byte signature always fits in BytesM::<64>"),
         )

@@ -141,7 +141,7 @@ impl MemoryReport {
         self.components
             .iter()
             .filter(|c| c.is_heap)
-            .map(|c| c.heap_bytes)
+            .map(|c| c.bytes)
             .sum()
     }
 
@@ -150,7 +150,7 @@ impl MemoryReport {
         self.components
             .iter()
             .filter(|c| !c.is_heap)
-            .map(|c| c.heap_bytes)
+            .map(|c| c.bytes)
             .sum()
     }
 
