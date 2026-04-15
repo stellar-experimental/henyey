@@ -161,27 +161,36 @@ pub(crate) fn execute_restore_footprint(
 
     // Restore all entries in the read-write footprint that exist in live state
     // (these have expired TTLs but the entry still exists)
+    let restore_ctx = RestoreContext {
+        new_ttl,
+        current_ledger,
+        ttl_key_cache: resources.ttl_key_cache,
+        disk_read_bytes_limit,
+        write_bytes_limit,
+        size_limits: resources.size_limits.as_ref(),
+    };
     for key in footprint.read_write.iter() {
         // Skip entries that were restored from hot archive - they're already handled
         if resources.hot_archive_restores.iter().any(|r| &r.key == key) {
             continue;
         }
 
-        if let Err(()) = restore_entry(
+        match restore_entry(
             key,
-            new_ttl,
             state,
-            current_ledger,
-            resources.ttl_key_cache,
-            &mut accumulated_read_bytes,
-            &mut accumulated_write_bytes,
-            disk_read_bytes_limit,
-            write_bytes_limit,
-            resources.size_limits.as_ref(),
+            &restore_ctx,
+            accumulated_read_bytes,
+            accumulated_write_bytes,
         ) {
-            return Ok(make_result(
-                RestoreFootprintResultCode::ResourceLimitExceeded,
-            ));
+            Ok(usage) => {
+                accumulated_read_bytes = accumulated_read_bytes.saturating_add(usage.read_bytes);
+                accumulated_write_bytes = accumulated_write_bytes.saturating_add(usage.write_bytes);
+            }
+            Err(()) => {
+                return Ok(make_result(
+                    RestoreFootprintResultCode::ResourceLimitExceeded,
+                ));
+            }
         }
     }
 
@@ -199,38 +208,56 @@ fn is_persistent_entry(key: &LedgerKey) -> bool {
     }
 }
 
-/// Restore a single ledger entry.
-///
-/// Returns `Err(())` if the resource limits would be exceeded.
-#[allow(clippy::too_many_arguments)]
-fn restore_entry(
-    key: &LedgerKey,
+/// Resource bytes consumed by a single restore_entry call.
+struct ResourceUsage {
+    read_bytes: u32,
+    write_bytes: u32,
+}
+
+/// Context for restoring entries, bundling limits and caches.
+struct RestoreContext<'a> {
     new_ttl: u32,
-    state: &mut LedgerStateManager,
     current_ledger: u32,
-    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-    accumulated_read_bytes: &mut u32,
-    accumulated_write_bytes: &mut u32,
+    ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
     disk_read_bytes_limit: u32,
     write_bytes_limit: u32,
-    size_limits: Option<&super::ContractSizeLimits>,
-) -> std::result::Result<(), ()> {
+    size_limits: Option<&'a super::ContractSizeLimits>,
+}
+
+/// Restore a single ledger entry.
+///
+/// Returns the resource bytes consumed, or `Err(())` if validation fails.
+fn restore_entry(
+    key: &LedgerKey,
+    state: &mut LedgerStateManager,
+    ctx: &RestoreContext,
+    accumulated_read_bytes: u32,
+    accumulated_write_bytes: u32,
+) -> std::result::Result<ResourceUsage, ()> {
     // Only contract data and contract code can be restored
     match key {
         LedgerKey::ContractData(_) | LedgerKey::ContractCode(_) => {}
-        _ => return Ok(()), // Non-contract entries don't need restoration
+        _ => {
+            return Ok(ResourceUsage {
+                read_bytes: 0,
+                write_bytes: 0,
+            })
+        }
     }
 
     // Compute the key hash for TTL lookup
-    let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
+    let key_hash = crate::soroban::get_or_compute_key_hash(ctx.ttl_key_cache, key);
 
     // Check the current TTL status
     let current_ttl = state.get_ttl(&key_hash).map(|t| t.live_until_ledger_seq);
 
     match current_ttl {
-        Some(ttl) if ttl >= current_ledger => {
+        Some(ttl) if ttl >= ctx.current_ledger => {
             // Entry is still live, no restoration needed.
-            Ok(())
+            Ok(ResourceUsage {
+                read_bytes: 0,
+                write_bytes: 0,
+            })
         }
         Some(_) | None => {
             // Entry is archived or has no TTL entry
@@ -239,7 +266,10 @@ fn restore_entry(
             let entry = match entry {
                 None => {
                     // Neither live nor archived entry exists; skip per stellar-core behavior.
-                    return Ok(());
+                    return Ok(ResourceUsage {
+                        read_bytes: 0,
+                        write_bytes: 0,
+                    });
                 }
                 Some(e) => e,
             };
@@ -252,25 +282,25 @@ fn restore_entry(
                 .unwrap_or(0);
 
             // Validate contract entry size against config limits.
-            if let Some(limits) = size_limits {
+            if let Some(limits) = ctx.size_limits {
                 if !super::validate_contract_ledger_entry(key, entry_size as usize, limits) {
                     return Err(());
                 }
             }
 
-            *accumulated_read_bytes = accumulated_read_bytes.saturating_add(entry_size);
-            if *accumulated_read_bytes > disk_read_bytes_limit {
+            let new_read = accumulated_read_bytes.saturating_add(entry_size);
+            if new_read > ctx.disk_read_bytes_limit {
                 return Err(());
             }
-            *accumulated_write_bytes = accumulated_write_bytes.saturating_add(entry_size);
-            if *accumulated_write_bytes > write_bytes_limit {
+            let new_write = accumulated_write_bytes.saturating_add(entry_size);
+            if new_write > ctx.write_bytes_limit {
                 return Err(());
             }
 
             // Create or update the TTL entry to restore the entry
             let ttl_entry = TtlEntry {
                 key_hash: key_hash.clone(),
-                live_until_ledger_seq: new_ttl,
+                live_until_ledger_seq: ctx.new_ttl,
             };
 
             if state.get_ttl(&key_hash).is_some() {
@@ -279,7 +309,10 @@ fn restore_entry(
                 state.create_ttl(ttl_entry);
             }
 
-            Ok(())
+            Ok(ResourceUsage {
+                read_bytes: entry_size,
+                write_bytes: entry_size,
+            })
         }
     }
 }

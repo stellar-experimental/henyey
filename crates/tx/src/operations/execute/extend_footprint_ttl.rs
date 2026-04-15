@@ -12,6 +12,14 @@ use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::Result;
 
+/// Configuration for Soroban TTL extension operations.
+pub(crate) struct SorobanExtendConfig<'a> {
+    pub soroban_data: Option<&'a SorobanTransactionData>,
+    pub ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
+    pub size_limits: Option<&'a super::ContractSizeLimits>,
+    pub max_entry_ttl: u32,
+}
+
 /// Execute an ExtendFootprintTtl operation.
 ///
 /// This operation extends the TTL of all entries in the transaction's footprint
@@ -23,25 +31,21 @@ use crate::Result;
 /// - Skips entries whose TTL already meets or exceeds the target
 /// - Tracks accumulated read bytes and fails with ResourceLimitExceeded
 ///   if disk_read_bytes limit is exceeded
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_extend_footprint_ttl(
     op: &ExtendFootprintTtlOp,
     _source: &AccountId,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
-    soroban_data: Option<&SorobanTransactionData>,
-    ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-    size_limits: Option<&super::ContractSizeLimits>,
-    max_entry_ttl: u32,
+    config: &SorobanExtendConfig,
 ) -> Result<OperationResult> {
     // stellar-core only rejects extend_to > MAX_ENTRY_TTL - 1;
     // extend_to=0 is valid and results in a no-op (target TTL <= any live entry's TTL).
-    if op.extend_to > max_entry_ttl.saturating_sub(1) {
+    if op.extend_to > config.max_entry_ttl.saturating_sub(1) {
         return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
     }
 
     // Get the footprint from Soroban transaction data
-    let soroban_data = match soroban_data {
+    let soroban_data = match config.soroban_data {
         Some(data) => data,
         None => {
             return Ok(make_result(ExtendFootprintTtlResultCode::Malformed));
@@ -72,7 +76,7 @@ pub(crate) fn execute_extend_footprint_ttl(
     // - Skip entries whose TTL already meets target
     // - Check read bytes resource limit
     for key in footprint.read_only.iter() {
-        let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, key);
+        let key_hash = crate::soroban::get_or_compute_key_hash(config.ttl_key_cache, key);
 
         // Look up the TTL entry for this key
         let ttl_entry = state.get_ttl(&key_hash).cloned();
@@ -105,7 +109,7 @@ pub(crate) fn execute_extend_footprint_ttl(
         // Validate contract entry size against config limits.
         // Matches stellar-core validateContractLedgerEntry() which rejects
         // CONTRACT_CODE > maxContractSizeBytes and CONTRACT_DATA > maxContractDataEntrySizeBytes.
-        if let Some(limits) = size_limits {
+        if let Some(limits) = config.size_limits {
             let entry_size = henyey_common::xdr_encoded_len(&entry);
             if !super::validate_contract_ledger_entry(key, entry_size, limits) {
                 return Ok(make_result(
@@ -202,10 +206,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -238,10 +244,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            None,
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: None,
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -287,10 +295,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -336,10 +346,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -381,10 +393,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -430,10 +444,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -483,10 +499,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -542,10 +560,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -602,10 +622,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -683,10 +705,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -758,10 +782,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -834,10 +860,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
 
@@ -925,10 +953,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            Some(&small_limits),
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: Some(&small_limits),
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
         match result.unwrap() {
@@ -952,10 +982,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            Some(&big_limits),
-            TEST_MAX_ENTRY_TTL,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: Some(&big_limits),
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
         );
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1006,10 +1038,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            100,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: 100,
+            },
         );
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1034,10 +1068,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            100,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: 100,
+            },
         );
         assert!(result.is_ok());
         match result.unwrap() {
@@ -1062,10 +1098,12 @@ mod tests {
             &source,
             &mut state,
             &context,
-            Some(&soroban_data),
-            None,
-            None,
-            100,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: 100,
+            },
         );
         assert!(result.is_ok());
         match result.unwrap() {

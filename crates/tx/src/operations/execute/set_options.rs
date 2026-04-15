@@ -20,6 +20,14 @@ use crate::{Result, TxError};
 
 const MAX_SIGNERS: usize = 20;
 
+/// Sponsor information for a signer update, containing the sponsor's identity
+/// and computed balance/reserve data.
+struct SponsorInfo {
+    sponsor_id: AccountId,
+    available_balance: i64,
+    min_balance: i64,
+}
+
 /// Execute a SetOptions operation.
 ///
 /// This operation modifies account settings including:
@@ -163,7 +171,11 @@ pub(crate) fn execute_set_options(
             0,
         )?;
         let available = account_balance_after_liabilities(sponsor_account);
-        Some((sponsor_id, available, min_balance))
+        Some(SponsorInfo {
+            sponsor_id,
+            available_balance: available,
+            min_balance,
+        })
     } else {
         None
     };
@@ -216,11 +228,13 @@ pub(crate) fn execute_set_options(
             source,
             source_account_mut,
             sponsor_info.as_ref(),
-            current_signer_count,
-            current_num_sub_entries,
-            current_num_sponsoring,
-            current_num_sponsored,
-            base_reserve,
+            &AccountSnapshot {
+                signer_count: current_signer_count,
+                num_sub_entries: current_num_sub_entries,
+                num_sponsoring: current_num_sponsoring,
+                num_sponsored: current_num_sponsored,
+                base_reserve,
+            },
         ) {
             Ok(delta) => delta,
             Err(SignerUpdateError::OpResult(result)) => return Ok(*result),
@@ -289,19 +303,23 @@ enum SignerUpdateError {
     Internal(TxError),
 }
 
+/// Current account state for signer updates — avoids passing many individual params.
+struct AccountSnapshot {
+    signer_count: usize,
+    num_sub_entries: u32,
+    num_sponsoring: i64,
+    num_sponsored: i64,
+    base_reserve: i64,
+}
+
 /// Apply a signer update (add, remove, or change weight) to the source account.
 /// Returns the sponsor delta to apply, or an error.
-#[allow(clippy::too_many_arguments)]
 fn apply_signer_update(
     signer: &stellar_xdr::curr::Signer,
     source: &AccountId,
     source_account: &mut AccountEntry,
-    sponsor_info: Option<&(AccountId, i64, i64)>,
-    current_signer_count: usize,
-    current_num_sub_entries: u32,
-    current_num_sponsoring: i64,
-    current_num_sponsored: i64,
-    base_reserve: i64,
+    sponsor_info: Option<&SponsorInfo>,
+    snapshot: &AccountSnapshot,
 ) -> std::result::Result<Option<(AccountId, i64)>, SignerUpdateError> {
     let signer_key = &signer.key;
     let weight = signer.weight;
@@ -335,7 +353,7 @@ fn apply_signer_update(
         }
     }
 
-    let sponsor = sponsor_info.map(|info| info.0.clone());
+    let sponsor = sponsor_info.map(|info| info.sponsor_id.clone());
     let mut signers_vec: Vec<Signer> = source_account.signers.iter().cloned().collect();
     let has_v2 = matches!(
         source_account.ext,
@@ -389,14 +407,14 @@ fn apply_signer_update(
         signers_vec[pos].weight = weight;
         signers_changed = true;
     } else {
-        if current_signer_count >= MAX_SIGNERS {
+        if snapshot.signer_count >= MAX_SIGNERS {
             return Err(SignerUpdateError::OpResult(Box::new(make_result(
                 SetOptionsResultCode::TooManySigners,
             ))));
         }
 
-        if current_num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT
-            || current_num_sub_entries.saturating_add(1) > ACCOUNT_SUBENTRY_LIMIT
+        if snapshot.num_sub_entries >= ACCOUNT_SUBENTRY_LIMIT
+            || snapshot.num_sub_entries.saturating_add(1) > ACCOUNT_SUBENTRY_LIMIT
         {
             return Err(SignerUpdateError::OpResult(Box::new(
                 OperationResult::OpTooManySubentries,
@@ -404,29 +422,29 @@ fn apply_signer_update(
         }
         // Protocol 18+ combined-cap: num_sub_entries + num_sponsoring + 1 must fit u32.
         // Mirrors stellar-core isSponsoringSubentrySumIncreaseValid().
-        let total = current_num_sub_entries as u64 + current_num_sponsoring as u64 + 1;
+        let total = snapshot.num_sub_entries as u64 + snapshot.num_sponsoring as u64 + 1;
         if total > u32::MAX as u64 {
             return Err(SignerUpdateError::OpResult(Box::new(
                 OperationResult::OpTooManySubentries,
             )));
         }
 
-        if let Some((_, sponsor_balance, sponsor_min_balance)) = sponsor_info {
-            if *sponsor_balance < *sponsor_min_balance {
+        if let Some(info) = sponsor_info {
+            if info.available_balance < info.min_balance {
                 return Err(SignerUpdateError::OpResult(Box::new(make_result(
                     SetOptionsResultCode::LowReserve,
                 ))));
             }
         } else {
-            let num_sub_entries = current_num_sub_entries as i64 + 1;
+            let num_sub_entries = snapshot.num_sub_entries as i64 + 1;
             let effective_entries =
-                2 + num_sub_entries + current_num_sponsoring - current_num_sponsored;
+                2 + num_sub_entries + snapshot.num_sponsoring - snapshot.num_sponsored;
             if effective_entries < 0 {
                 return Err(SignerUpdateError::Internal(TxError::Internal(
                     "unexpected account state while computing minimum balance".to_string(),
                 )));
             }
-            let new_min_balance = effective_entries * base_reserve;
+            let new_min_balance = effective_entries * snapshot.base_reserve;
             let available = account_balance_after_liabilities(source_account);
             if available < new_min_balance {
                 return Err(SignerUpdateError::OpResult(Box::new(make_result(

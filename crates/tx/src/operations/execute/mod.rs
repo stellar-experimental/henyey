@@ -972,14 +972,16 @@ pub fn execute_operation_with_soroban(
                     &op_source,
                     state,
                     context,
-                    soroban.soroban_data,
-                    soroban.ttl_key_cache,
-                    Some(&ContractSizeLimits {
-                        max_contract_size_bytes: config.max_contract_size_bytes,
-                        max_contract_data_entry_size_bytes: config
-                            .max_contract_data_entry_size_bytes,
-                    }),
-                    config.max_entry_ttl,
+                    &extend_footprint_ttl::SorobanExtendConfig {
+                        soroban_data: soroban.soroban_data,
+                        ttl_key_cache: soroban.ttl_key_cache,
+                        size_limits: Some(&ContractSizeLimits {
+                            max_contract_size_bytes: config.max_contract_size_bytes,
+                            max_contract_data_entry_size_bytes: config
+                                .max_contract_data_entry_size_bytes,
+                        }),
+                        max_entry_ttl: config.max_entry_ttl,
+                    },
                 )?;
                 let mut exec = OperationExecutionResult::new(result);
                 if matches!(

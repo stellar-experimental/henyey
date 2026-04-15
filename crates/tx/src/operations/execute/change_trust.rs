@@ -101,13 +101,15 @@ pub(crate) fn execute_change_trust(
     } else {
         // Creating new trustline
         if let Some(result) = create_trustline(
-            source,
-            &tl_asset,
-            op.limit,
-            is_pool_share,
-            pool_params,
-            maybe_asset.as_ref(),
-            multiplier,
+            &NewTrustlineParams {
+                source,
+                tl_asset: &tl_asset,
+                limit: op.limit,
+                is_pool_share,
+                pool_params,
+                maybe_asset: maybe_asset.as_ref(),
+                multiplier,
+            },
             state,
             context,
         )? {
@@ -172,28 +174,32 @@ fn remove_trustline(
     Ok(None)
 }
 
-/// Create a new trustline. Returns `Ok(Some(result))` on early error, `Ok(None)` on success.
-#[allow(clippy::too_many_arguments)]
-fn create_trustline(
-    source: &AccountId,
-    tl_asset: &TrustLineAsset,
+/// Parameters for creating a new trustline.
+struct NewTrustlineParams<'a> {
+    source: &'a AccountId,
+    tl_asset: &'a TrustLineAsset,
     limit: i64,
     is_pool_share: bool,
-    pool_params: Option<&LiquidityPoolParameters>,
-    maybe_asset: Option<&Asset>,
+    pool_params: Option<&'a LiquidityPoolParameters>,
+    maybe_asset: Option<&'a Asset>,
     multiplier: i64,
+}
+
+/// Create a new trustline. Returns `Ok(Some(result))` on early error, `Ok(None)` on success.
+fn create_trustline(
+    params: &NewTrustlineParams,
     state: &mut LedgerStateManager,
     context: &LedgerContext,
 ) -> Result<Option<OperationResult>> {
     // Check issuer exists before subentry limit (matches stellar-core ordering)
-    if is_pool_share {
-        let params = pool_params.expect("pool params must exist");
-        if let Err(code) = validate_pool_share_trustlines(source, params, state) {
+    if params.is_pool_share {
+        let pool = params.pool_params.expect("pool params must exist");
+        if let Err(code) = validate_pool_share_trustlines(params.source, pool, state) {
             return Ok(Some(make_result(code)));
         }
-        increment_pool_use_counts(state, source, params)?;
+        increment_pool_use_counts(state, params.source, pool)?;
     } else {
-        let asset = maybe_asset.expect("asset must exist");
+        let asset = params.maybe_asset.expect("asset must exist");
         let issuer = get_asset_issuer(asset);
         if let Some(issuer_id) = issuer {
             if state.get_account(&issuer_id).is_none() {
@@ -203,22 +209,23 @@ fn create_trustline(
     }
 
     // Check subentries limit
-    let source_account = require_source_account(state, source)?;
-    if source_account.num_sub_entries + multiplier as u32 > ACCOUNT_SUBENTRY_LIMIT {
+    let source_account = require_source_account(state, params.source)?;
+    if source_account.num_sub_entries + params.multiplier as u32 > ACCOUNT_SUBENTRY_LIMIT {
         return Ok(Some(OperationResult::OpTooManySubentries));
     }
     // Protocol 18+ combined-cap: num_sub_entries + num_sponsoring + mult must fit u32.
     // Mirrors stellar-core isSponsoringSubentrySumIncreaseValid().
     let (num_sponsoring, _) = state
-        .sponsorship_counts_for_account(source)
+        .sponsorship_counts_for_account(params.source)
         .unwrap_or((0, 0));
-    let total = source_account.num_sub_entries as u64 + num_sponsoring as u64 + multiplier as u64;
+    let total =
+        source_account.num_sub_entries as u64 + num_sponsoring as u64 + params.multiplier as u64;
     if total > u32::MAX as u64 {
         return Ok(Some(OperationResult::OpTooManySubentries));
     }
 
     // Check source can afford new sub-entry
-    let sponsor = state.active_sponsor_for(source);
+    let sponsor = state.active_sponsor_for(params.source);
     if let Some(sponsor) = &sponsor {
         let sponsor_account = state
             .get_account(sponsor)
@@ -227,7 +234,7 @@ fn create_trustline(
             sponsor_account,
             context.protocol_version,
             0,
-            multiplier,
+            params.multiplier,
             0,
         )?;
         let available = account_balance_after_liabilities(sponsor_account);
@@ -235,11 +242,11 @@ fn create_trustline(
             return Ok(Some(make_result(ChangeTrustResultCode::LowReserve)));
         }
     } else {
-        let source_account = require_source_account(state, source)?;
+        let source_account = require_source_account(state, params.source)?;
         let new_min_balance = state.minimum_balance_for_account(
             source_account,
             context.protocol_version,
-            multiplier,
+            params.multiplier,
         )?;
         let available = account_balance_after_liabilities(source_account);
         if available < new_min_balance {
@@ -248,30 +255,30 @@ fn create_trustline(
     }
 
     let trustline = TrustLineEntry {
-        account_id: source.clone(),
-        asset: tl_asset.clone(),
+        account_id: params.source.clone(),
+        asset: params.tl_asset.clone(),
         balance: 0,
-        limit,
-        flags: build_trustline_flags(maybe_asset, state),
+        limit: params.limit,
+        flags: build_trustline_flags(params.maybe_asset, state),
         ext: TrustLineEntryExt::V0,
     };
 
     if sponsor.is_some() {
         let ledger_key = LedgerKey::Trustline(LedgerKeyTrustLine {
-            account_id: source.clone(),
-            asset: tl_asset.clone(),
+            account_id: params.source.clone(),
+            asset: params.tl_asset.clone(),
         });
-        state.apply_entry_sponsorship(ledger_key, source, multiplier)?;
+        state.apply_entry_sponsorship(ledger_key, params.source, params.multiplier)?;
     }
     state.create_trustline(trustline);
 
-    if is_pool_share {
-        let params = pool_params.expect("pool params must exist");
-        manage_pool_on_new_trustline(state, tl_asset, params);
+    if params.is_pool_share {
+        let pool = params.pool_params.expect("pool params must exist");
+        manage_pool_on_new_trustline(state, params.tl_asset, pool);
     }
 
-    if let Some(account) = state.get_account_mut(source) {
-        inc_sub_entries(account, multiplier as u32);
+    if let Some(account) = state.get_account_mut(params.source) {
+        inc_sub_entries(account, params.multiplier as u32);
     }
     Ok(None)
 }
