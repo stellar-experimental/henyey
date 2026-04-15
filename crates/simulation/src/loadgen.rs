@@ -66,6 +66,17 @@ const HOST_CYCLES_PER_INSTRUCTION: u64 = 5030;
 /// Base disk-read bytes for contract invocations (before adding entry sizes).
 const INVOKE_BASE_READ_BYTES: u32 = 5_000;
 
+/// Bit shift for encoding ledger sequence into initial sequence numbers.
+/// Upper 32 bits hold the ledger number, lower 32 bits hold the tx counter.
+/// Matches stellar-core's `getAccount()`/`TestAccount` convention.
+const INITIAL_SEQ_LEDGER_SHIFT: u32 = 32;
+
+/// Bit shifts for extracting pseudo-random parameters from `deterministic_rand`.
+/// Each shift isolates an independent portion of the 64-bit random value.
+const RAND_HOST_FRACTION_SHIFT: u32 = 16;
+const RAND_ENTRY_COUNT_SHIFT: u32 = 32;
+const RAND_ENTRY_SIZE_SHIFT: u32 = 40;
+
 // ---------------------------------------------------------------------------
 // ContractInstance (Soroban)
 // ---------------------------------------------------------------------------
@@ -356,7 +367,7 @@ impl TxGenerator {
                 let seq = self
                     .app
                     .load_account_sequence(&aid)
-                    .unwrap_or((ledger_num as i64) << 32);
+                    .unwrap_or((ledger_num as i64) << INITIAL_SEQ_LEDGER_SHIFT);
                 TestAccount {
                     secret_key: sk,
                     account_id: aid,
@@ -620,14 +631,14 @@ impl TxGenerator {
             INVOKE_BASE_INSTRUCTIONS + (rand_val % INVOKE_INSTRUCTIONS_RANGE) as u32;
 
         // Split between guest and host cycles (matching stellar-core ratios)
-        let host_fraction = (rand_val >> 16) % 100;
+        let host_fraction = (rand_val >> RAND_HOST_FRACTION_SHIFT) % 100;
         let host_instructions = (target_instructions as u64 * host_fraction) / 100;
         let guest_instructions = target_instructions as u64 - host_instructions;
         let host_cycles = host_instructions / HOST_CYCLES_PER_INSTRUCTION;
         let guest_cycles = guest_instructions / GUEST_CYCLES_PER_INSTRUCTION;
 
-        let n_entries = 1 + (rand_val >> 32) % 4; // 1-4 entries
-        let kb_per_entry = 1 + (rand_val >> 40) % 4; // 1-4 KB
+        let n_entries = 1 + (rand_val >> RAND_ENTRY_COUNT_SHIFT) % 4; // 1-4 entries
+        let kb_per_entry = 1 + (rand_val >> RAND_ENTRY_SIZE_SHIFT) % 4; // 1-4 KB
 
         let args = vec![
             ScVal::U64(guest_cycles),
