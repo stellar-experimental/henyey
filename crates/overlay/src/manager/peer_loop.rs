@@ -1071,14 +1071,15 @@ impl OverlayManager {
         let mut sent_by_priority: Vec<Vec<StellarMessage>> =
             vec![Vec::new(); MessagePriority::COUNT];
 
-        for queued in &batch {
+        for queued in batch {
+            let priority = MessagePriority::from_message(&queued.message);
             if let Err(e) = peer.send(queued.message.clone()).await {
                 // Send failed — process what we've sent so far, then propagate error
                 flow_control.process_sent_messages(&sent_by_priority);
                 return Err(e);
             }
-            if let Some(priority) = MessagePriority::from_message(&queued.message) {
-                sent_by_priority[priority as usize].push(queued.message.clone());
+            if let Some(p) = priority {
+                sent_by_priority[p as usize].push(queued.message);
             }
         }
 
