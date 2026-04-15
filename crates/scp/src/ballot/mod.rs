@@ -140,9 +140,6 @@ pub struct BallotProtocol {
     /// Latest ballot envelope from each node.
     latest_envelopes: HashMap<NodeId, ScpEnvelope>,
 
-    /// The consensus value (from the current or commit ballot).
-    value: Option<Value>,
-
     /// Override value set when confirming prepared/commit.
     ///
     /// Used to ensure we commit the correct value when switching ballots.
@@ -187,7 +184,6 @@ impl BallotProtocol {
             commit: None,
             phase: BallotPhase::Prepare,
             latest_envelopes: HashMap::new(),
-            value: None,
             value_override: None,
             composite_candidate: None,
             heard_from_quorum: false,
@@ -279,7 +275,7 @@ impl BallotProtocol {
     /// Get the externalized value if we've reached consensus.
     pub fn get_externalized_value(&self) -> Option<&Value> {
         if self.phase == BallotPhase::Externalize {
-            self.value.as_ref()
+            self.current_ballot.as_ref().map(|b| &b.value)
         } else {
             None
         }
@@ -298,7 +294,6 @@ impl BallotProtocol {
         self.commit = Some(ballot.clone());
         self.high_ballot = Some(ballot.clone());
         self.current_ballot = Some(ballot);
-        self.value = Some(value);
         self.phase = BallotPhase::Externalize;
     }
 
@@ -352,7 +347,7 @@ impl BallotProtocol {
 
     /// Get the current consensus value.
     pub fn value(&self) -> Option<&Value> {
-        self.value.as_ref()
+        self.current_ballot.as_ref().map(|b| &b.value)
     }
 
     /// Check protocol invariants for debugging.
@@ -647,7 +642,6 @@ impl BallotProtocol {
                         value: value.clone(),
                     });
                 }
-                self.value = Some(value);
                 self.phase = BallotPhase::Prepare;
                 true
             }
@@ -667,7 +661,6 @@ impl BallotProtocol {
                     counter: conf.n_h,
                     value: value.clone(),
                 });
-                self.value = Some(value);
                 self.phase = BallotPhase::Confirm;
                 true
             }
@@ -686,7 +679,6 @@ impl BallotProtocol {
                     counter: u32::MAX,
                     value: value.clone(),
                 });
-                self.value = Some(value);
                 self.phase = BallotPhase::Externalize;
                 true
             }
@@ -2621,7 +2613,6 @@ mod tests {
             counter: 1,
             value: value_a.clone(),
         });
-        bp.value = Some(value_a.clone());
 
         // Bump to a ballot with incompatible value
         let new_ballot = ScpBallot {
@@ -2661,7 +2652,6 @@ mod tests {
             counter: 1,
             value: value_a.clone(),
         });
-        bp.value = Some(value_a.clone());
 
         // Bump to higher counter with same value (compatible)
         let new_ballot = ScpBallot {
@@ -2806,7 +2796,6 @@ mod tests {
             counter: 1,
             value: value_current.clone(),
         });
-        bp.value = Some(value_current.clone());
 
         // Set composite candidate (simulating nomination output)
         bp.set_composite_candidate(Some(value_composite.clone()));
@@ -2835,7 +2824,6 @@ mod tests {
             counter: 1,
             value: value_current.clone(),
         });
-        bp.value = Some(value_current.clone());
 
         // No composite candidate set
         assert!(bp.abandon_ballot(0, &ctx!(&node, &quorum_set, &driver, 1)));
@@ -2860,7 +2848,6 @@ mod tests {
             counter: 1,
             value: value_current.clone(),
         });
-        bp.value = Some(value_current.clone());
 
         // Abandon with specific counter
         assert!(bp.abandon_ballot(10, &ctx!(&node, &quorum_set, &driver, 1)));
@@ -2889,7 +2876,6 @@ mod tests {
             counter: 1,
             value: value.clone(),
         });
-        bp.value = Some(value.clone());
 
         let c = ScpBallot {
             counter: 1,
@@ -2930,7 +2916,6 @@ mod tests {
             counter: 1,
             value: value.clone(),
         });
-        bp.value = Some(value.clone());
 
         let c = ScpBallot {
             counter: 1,
@@ -2971,7 +2956,6 @@ mod tests {
 
         // Start with a ballot
         bp.current_ballot = Some(ballot.clone());
-        bp.value = Some(value.clone());
         bp.heard_from_quorum = false;
 
         // Add envelopes from both nodes (need quorum)
@@ -3013,7 +2997,6 @@ mod tests {
         };
 
         bp.current_ballot = Some(ballot.clone());
-        bp.value = Some(value.clone());
         bp.heard_from_quorum = true; // Was previously true
 
         // Only local envelope (not a quorum for threshold=2)
@@ -3052,7 +3035,6 @@ mod tests {
         };
 
         bp.current_ballot = Some(ballot.clone());
-        bp.value = Some(value.clone());
         bp.phase = BallotPhase::Externalize;
         bp.heard_from_quorum = false; // Will transition to true
 

@@ -545,7 +545,6 @@ impl BallotProtocol {
         };
 
         self.current_ballot = Some(ballot.clone());
-        self.value = Some(ballot.value.clone());
 
         // invariant: h.value = b.value
         if let Some(high) = &self.high_ballot {
