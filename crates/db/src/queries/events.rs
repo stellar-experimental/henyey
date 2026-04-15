@@ -123,7 +123,7 @@ impl EventQueries for Connection {
 
         // Contract ID filter
         if !params.contract_ids.is_empty() {
-            let placeholders = vec!["?"; params.contract_ids.len()].join(",");
+            let placeholders = super::sql_placeholder_list(params.contract_ids.len());
             sql.push_str(&format!(" AND contract_id IN ({placeholders})"));
             for cid in params.contract_ids {
                 param_values.push(Box::new(cid.clone()));
@@ -154,9 +154,8 @@ impl EventQueries for Connection {
                 if non_wildcard.is_empty() {
                     continue; // all wildcards, no filter needed
                 }
-                let placeholders: Vec<String> =
-                    non_wildcard.iter().map(|_| "?".to_string()).collect();
-                sql.push_str(&format!(" AND {} IN ({})", col, placeholders.join(",")));
+                let placeholders = super::sql_placeholder_list(non_wildcard.len());
+                sql.push_str(&format!(" AND {} IN ({})", col, placeholders));
                 for t in non_wildcard {
                     param_values.push(Box::new(t.clone()));
                 }

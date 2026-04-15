@@ -52,3 +52,8 @@ pub use peers::{PeerFilter, PeerQueries, PeerRecord, PeerTypeFilter};
 pub use publish_queue::PublishQueueQueries;
 pub use scp::{ScpQueries, ScpStatePersistenceQueries};
 pub use state::StateQueries;
+
+/// Build a SQL `IN` placeholder list: `"?,?,?"` for the given count.
+pub(crate) fn sql_placeholder_list(count: usize) -> String {
+    vec!["?"; count].join(",")
+}

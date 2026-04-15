@@ -391,7 +391,7 @@ impl ScpStatePersistenceQueries for Connection {
             return Ok(());
         }
 
-        let placeholders = vec!["?"; keys_to_delete.len()].join(",");
+        let placeholders = super::sql_placeholder_list(keys_to_delete.len());
         let sql = format!("DELETE FROM storestate WHERE statename IN ({placeholders})");
         let params: Vec<&dyn rusqlite::types::ToSql> = keys_to_delete
             .iter()
