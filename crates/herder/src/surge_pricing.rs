@@ -540,19 +540,19 @@ impl SurgePricingPriorityQueue {
         let mut needed_lane = subtract_non_negative(&new_lane, &self.lane_limits[lane]);
 
         #[derive(Clone)]
-        struct LaneCursor {
+        struct LaneCursor<'a> {
             lane: usize,
-            entries: Vec<QueueEntry>,
+            entries: Vec<&'a QueueEntry>,
             index: usize,
             active: bool,
         }
 
-        impl LaneCursor {
+        impl<'a> LaneCursor<'a> {
             fn current(&self) -> Option<&QueueEntry> {
                 if !self.active {
                     return None;
                 }
-                self.entries.get(self.index)
+                self.entries.get(self.index).copied()
             }
 
             fn advance(&mut self) {
@@ -573,7 +573,7 @@ impl SurgePricingPriorityQueue {
             .enumerate()
             .map(|(lane, set)| LaneCursor {
                 lane,
-                entries: set.iter().cloned().collect(),
+                entries: set.iter().collect(),
                 index: 0,
                 active: !set.is_empty(),
             })

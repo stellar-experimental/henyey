@@ -586,25 +586,27 @@ fn validate_ops_auth(
     for op in frame.operations() {
         let op_source_muxed = &op.source_account;
 
-        // Resolve op source: use op.source_account if set, else TX source
+        // Resolve op source: use op.source_account if set, else TX source.
+        // Keep any loaded account alive so we can borrow it.
+        let loaded_account;
         let (op_source_id, op_account) = if let Some(ref src) = op_source_muxed {
             let id = muxed_to_account_id(src);
             if id == tx_source_id {
                 // Same account, but must check at op-specific threshold
-                (id, Some(tx_source_account.clone()))
+                (id, Some(tx_source_account))
             } else {
-                let acc = account_provider.load_account(&id);
-                (id, acc)
+                loaded_account = account_provider.load_account(&id);
+                (id, loaded_account.as_ref())
             }
         } else {
             // No explicit op source → use tx source
-            (tx_source_id.clone(), Some(tx_source_account.clone()))
+            (tx_source_id.clone(), Some(tx_source_account))
         };
 
         let threshold_level = get_threshold_level(op);
 
         match op_account {
-            Some(ref account) => {
+            Some(account) => {
                 let needed_threshold = account.thresholds.0[threshold_level as usize] as i32;
                 let signers = collect_signers_for_account(account);
                 if !checker.check_signature(&signers, needed_threshold) {

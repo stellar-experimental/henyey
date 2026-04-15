@@ -533,8 +533,10 @@ impl Herder {
             .unwrap_or_else(|| self.tracking_slot().min(u32::MAX as u64) as u32);
         let mut low = lcl.saturating_add(1);
         let max_slots = self.config.max_externalized_slots.max(1) as u32;
-        let extra = 3u32;
-        let window = max_slots.min(extra);
+        // Number of extra ledgers to keep beyond max_externalized_slots, matching
+        // stellar-core's LEDGER_VALIDITY_BRACKET lookback cushion.
+        const PEER_LEDGER_WINDOW: u32 = 3;
+        let window = max_slots.min(PEER_LEDGER_WINDOW);
         if low > window {
             low = low.saturating_sub(window);
         } else {
