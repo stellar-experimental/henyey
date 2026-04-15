@@ -152,27 +152,32 @@ implementation.
 
 ## Your Task
 
-Evaluate whether this issue is **actionable** — meaning a developer could
-start implementing it right now with the information provided. Assess:
+Evaluate whether this issue is **actionable** — meaning it is concrete,
+well-scoped, and has a clear benefit. Specifically:
 
-1. **Problem clarity**: Is the problem or desired behavior clearly stated?
-   Would a developer know exactly what "done" looks like?
-2. **Scope**: Is the scope concrete and bounded? A vague "improve X" is not
-   actionable; "add validation for Y in file Z" is.
-3. **Technical detail**: Is there enough technical context (file paths, code
-   references, expected behavior, edge cases) to implement without extensive
-   further research?
-4. **Not a question/discussion**: Issues that are open-ended questions,
-   discussion threads, or brainstorming are not actionable.
-5. **Not blocked**: The issue should not depend on unresolved prerequisites
-   or external decisions.
+1. **Concrete**: The issue describes a specific code change with file paths,
+   function names, or code references. A developer would know exactly what
+   to change.
+2. **Well-scoped**: The scope is bounded. "Refactor X to use struct Y" is
+   well-scoped; "improve the overlay layer" is not.
+3. **Clear benefit**: The change has an obvious payoff — reduced duplication,
+   better readability, fewer parameters, stronger types, etc.
+
+That's it. Do NOT skip issues because:
+- They touch parity-sensitive or consensus-critical code
+- They seem large or time-consuming
+- They require cross-crate changes
+- They involve complex refactors
+- The code is "good enough" as-is
+
+The bar is: concrete + well-scoped + clear benefit = ACTIONABLE.
 
 ## Output
 
 You MUST end your response with exactly one of:
 
 VERDICT: ACTIONABLE
-(The issue is well-defined, scoped, and ready for implementation.)
+(The issue is concrete, well-scoped, and has a clear benefit.)
 
 VERDICT: SKIP — <one-line reason>
 (The issue is not ready. State the specific reason after the dash.)
@@ -183,6 +188,7 @@ Examples of SKIP reasons:
 - "Blocked on decision about X"
 - "Already implemented (should be closed)"
 - "Duplicate of #N"
+- "False positive — the code is correct as described"
 ```
 
 #### 3b: Process Triage Result
@@ -392,6 +398,11 @@ Failed issues (labeled propose-execute-failed):
 - **The triage agent is the gatekeeper.** Only issues the triage agent
   deems ACTIONABLE get processed. This prevents wasting time on
   under-specified or discussion-only issues.
+- **Do not over-filter.** The triage criteria are intentionally minimal:
+  concrete, well-scoped, and clear benefit. Do not add extra criteria
+  like time estimates, safety concerns, or complexity limits. Large
+  refactors, parity-sensitive changes, and cross-crate API modifications
+  are all fair game if they meet the three criteria.
 - **Pagination is date-based.** The loop paginates using
   `created:>LAST_DATE` in the GitHub search query, advancing through
   issues in chronological order. This avoids re-fetching already-processed
