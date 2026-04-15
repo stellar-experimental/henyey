@@ -403,64 +403,11 @@ impl OpEventManager {
         if !self.enabled || self.finalized {
             return;
         }
-        if !self.backfill_to_protocol23 {
-            self.events = events;
-            return;
-        }
-
-        for event in events.iter_mut() {
-            let Some(asset) = get_asset_from_event(event, &self.network_id) else {
-                continue;
-            };
-
-            let ContractEventBody::V0(body) = &mut event.body;
-            let topics = body.topics.clone();
-            if topics.is_empty() {
-                continue;
-            }
-            let Some(name) = scval_symbol_bytes(&topics[0]) else {
-                continue;
-            };
-
-            match name.as_slice() {
-                b"transfer" => {
-                    if topics.len() != 4 {
-                        continue;
-                    }
-                    let from = match &topics[1] {
-                        ScVal::Address(addr) => addr,
-                        _ => continue,
-                    };
-                    let to = match &topics[2] {
-                        ScVal::Address(addr) => addr,
-                        _ => continue,
-                    };
-                    let from_is_issuer = is_issuer(from, &asset);
-                    let to_is_issuer = is_issuer(to, &asset);
-                    if (from_is_issuer && to_is_issuer) || (!from_is_issuer && !to_is_issuer) {
-                        continue;
-                    }
-                    let mut topics_vec: Vec<ScVal> = Vec::from(topics);
-                    if from_is_issuer {
-                        topics_vec[0] = make_symbol_scval("mint");
-                        topics_vec.remove(1);
-                    } else {
-                        topics_vec[0] = make_symbol_scval("burn");
-                        topics_vec.remove(2);
-                    }
-                    body.topics = topics_vec.try_into().unwrap_or_default();
-                }
-                b"mint" | b"clawback" | b"set_authorized" => {
-                    if topics.len() == 4 {
-                        let mut topics_vec: Vec<ScVal> = Vec::from(topics);
-                        topics_vec.remove(1);
-                        body.topics = topics_vec.try_into().unwrap_or_default();
-                    }
-                }
-                _ => {}
+        if self.backfill_to_protocol23 {
+            for event in events.iter_mut() {
+                backfill_event(event, &self.network_id);
             }
         }
-
         self.events = events;
     }
 
@@ -970,6 +917,63 @@ fn get_asset_from_event(event: &ContractEvent, network_id: &NetworkId) -> Option
         return None;
     }
     Some(asset)
+}
+
+/// Backfill a single contract event to protocol-23 format.
+///
+/// Transforms transfer events involving an asset issuer into mint/burn events
+/// and strips the admin topic from mint/clawback/set_authorized events.
+fn backfill_event(event: &mut ContractEvent, network_id: &NetworkId) {
+    let Some(asset) = get_asset_from_event(event, network_id) else {
+        return;
+    };
+
+    let ContractEventBody::V0(body) = &mut event.body;
+    let topics = body.topics.clone();
+    if topics.is_empty() {
+        return;
+    }
+    let Some(name) = scval_symbol_bytes(&topics[0]) else {
+        return;
+    };
+
+    match name.as_slice() {
+        b"transfer" => {
+            if topics.len() != 4 {
+                return;
+            }
+            let from = match &topics[1] {
+                ScVal::Address(addr) => addr,
+                _ => return,
+            };
+            let to = match &topics[2] {
+                ScVal::Address(addr) => addr,
+                _ => return,
+            };
+            let from_is_issuer = is_issuer(from, &asset);
+            let to_is_issuer = is_issuer(to, &asset);
+            if (from_is_issuer && to_is_issuer) || (!from_is_issuer && !to_is_issuer) {
+                return;
+            }
+            let mut topics_vec: Vec<ScVal> = Vec::from(topics);
+            if from_is_issuer {
+                topics_vec[0] = make_symbol_scval("mint");
+                topics_vec.remove(1);
+            } else {
+                topics_vec[0] = make_symbol_scval("burn");
+                topics_vec.remove(2);
+            }
+            body.topics = topics_vec.try_into().unwrap_or_default();
+        }
+        b"mint" | b"clawback" | b"set_authorized" => {
+            if topics.len() == 4 {
+                let mut topics_vec: Vec<ScVal> = Vec::from(topics);
+                topics_vec.remove(1);
+                body.topics = topics_vec.try_into().unwrap_or_default();
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
