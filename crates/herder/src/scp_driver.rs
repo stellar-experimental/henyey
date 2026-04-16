@@ -25,6 +25,7 @@
 //! - [`PendingTxSet`]: Tracks transaction sets we need but haven't received yet
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -235,6 +236,14 @@ pub struct ScpDriver {
     upgrades: OnceLock<Arc<RwLock<Upgrades>>>,
     /// Shared tracking consensus state (owned by Herder, read by ScpDriver).
     tracking_state: Arc<RwLock<SharedTrackingState>>,
+    /// Optional wall-clock override for `check_close_time`. When zero, the
+    /// real `SystemTime::now()` is used. Shared with [`Herder`] via
+    /// [`Herder::test_clock`] so both close-time sites (here and
+    /// `Herder::check_envelope_close_time`) see the same fake time.
+    ///
+    /// Only written by tests (via `Herder::set_test_clock_seconds`); in
+    /// production this atomic is allocated once and read-but-never-written.
+    test_clock: Arc<AtomicU64>,
 }
 
 impl ScpDriver {
@@ -261,7 +270,32 @@ impl ScpDriver {
             ledger_manager: OnceLock::new(),
             upgrades: OnceLock::new(),
             tracking_state,
+            test_clock: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Current wall-clock seconds since UNIX epoch, honoring a test-only
+    /// override. When the shared `test_clock` atomic is non-zero, its value
+    /// is returned instead of `SystemTime::now()`. Used by
+    /// [`Self::check_close_time`] so tests can make that gate deterministic.
+    pub(crate) fn now_seconds(&self) -> u64 {
+        let fake = self.test_clock.load(Ordering::Relaxed);
+        if fake != 0 {
+            return fake;
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before UNIX epoch")
+            .as_secs()
+    }
+
+    /// Test-only access to the shared clock handle. Used by
+    /// `Herder::set_test_clock_seconds` to poke the wall-clock override that
+    /// backs [`Self::check_close_time`].
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn test_clock_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.test_clock)
     }
 
     /// Create a new SCP driver with a secret key for signing.
@@ -538,10 +572,7 @@ impl ScpDriver {
         }
 
         // Check closeTime (not too far in future)
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
+        let now = self.now_seconds();
         if close_time > now + self.config.max_time_drift {
             trace!(
                 "Close time {} too far in future (now: {}, max_slip: {})",

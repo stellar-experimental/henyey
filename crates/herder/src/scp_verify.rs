@@ -120,6 +120,79 @@ pub struct VerifiedEnvelope {
     pub verdict: Verdict,
 }
 
+/// Attribution for a post-verify-stage gate outcome.
+///
+/// Returned alongside [`crate::EnvelopeState`] by the test-only
+/// `Herder::process_verified_detailed` so integration tests can assert WHICH
+/// gate in `process_verified` fired. The ordering of variants mirrors the
+/// in-code gate evaluation order:
+///
+/// 1. Drift recheck (pre-filter rerun) → `GateDrift*`
+/// 2. Self-message skip                → `SelfMessage`
+/// 3. Non-quorum reject                → `NonQuorum`
+/// 4. `pending_envelopes.add` outcomes → `PendingAdd*`
+/// 5. Accepted (reached SCP / processed directly) → `Accepted`
+/// 6. Verdict-driven short-circuits    → `InvalidSignature`, `PanicVerdict`
+///
+/// The enum itself is always compiled (the internal `process_verified_inner`
+/// always computes it) but only made accessible to external callers via the
+/// `test-support` feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostVerifyReason {
+    InvalidSignature,
+    PanicVerdict,
+    GateDriftRange,
+    GateDriftCloseTime,
+    GateDriftCannotReceive,
+    SelfMessage,
+    NonQuorum,
+    PendingAddBuffered,
+    PendingAddDuplicate,
+    PendingAddTooFar,
+    PendingAddBufferFull,
+    PendingAddProcessedDirectly,
+    Accepted,
+}
+
+/// Test-only synchronous equivalent of the worker's verify step.
+///
+/// Takes the `network_id` explicitly since [`PreFilter`] does not carry it
+/// (the production path gets it from [`crate::scp_driver::ScpDriver::build_signed_bytes`]
+/// via the worker's `Arc<Herder>`). Returns the resulting
+/// [`VerifiedEnvelope`] (which may carry a [`Verdict::InvalidSignature`]
+/// outcome) or an error if the pre-filter rejected the envelope before
+/// verification.
+///
+/// Used by the Phase B parity tests under `crates/herder/tests/` — not
+/// part of the production event-loop pipeline.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn verify_envelope_sync(
+    network_id: &Hash256,
+    pf: PreFilter,
+) -> Result<VerifiedEnvelope, PreFilterRejectReason> {
+    use crate::scp_driver::ScpDriver;
+    match pf {
+        PreFilter::Reject(reason) => Err(reason),
+        PreFilter::Accept(intake) => {
+            let verdict = match ScpDriver::build_signed_bytes(network_id, &intake.envelope) {
+                Ok(signed_bytes) => {
+                    match ScpDriver::verify_signed_bytes(
+                        &signed_bytes,
+                        &intake.envelope.statement.node_id,
+                        &intake.envelope.signature,
+                    ) {
+                        Ok(()) => Verdict::Ok,
+                        Err(_) => Verdict::InvalidSignature,
+                    }
+                }
+                Err(_) => Verdict::InvalidSignature,
+            };
+            Ok(VerifiedEnvelope { intake, verdict })
+        }
+    }
+}
+
 /// Shared handle used by the event loop to enqueue envelopes and by the
 /// watchdog to monitor liveness.
 #[derive(Clone)]

@@ -41,6 +41,10 @@ stellar-strkey.workspace = true
 
 [features]
 test-utils = []
+# Exposes doc-hidden test hooks (`scp_verify::verify_envelope_sync`,
+# `Herder::process_verified_detailed`, `PostVerifyReason`) used by the
+# Phase B SCP verify-pipeline parity tests under `tests/`.
+test-support = []
 
 [dev-dependencies]
 tempfile.workspace = true
