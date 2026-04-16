@@ -223,7 +223,7 @@ impl Resource {
 
 impl AddAssign for Resource {
     fn add_assign(&mut self, other: Self) {
-        for (a, b) in self.values.iter_mut().zip(other.values.into_iter()) {
+        for (a, b) in self.values.iter_mut().zip(other.values) {
             *a += b;
         }
     }
@@ -231,7 +231,7 @@ impl AddAssign for Resource {
 
 impl SubAssign for Resource {
     fn sub_assign(&mut self, other: Self) {
-        for (a, b) in self.values.iter_mut().zip(other.values.into_iter()) {
+        for (a, b) in self.values.iter_mut().zip(other.values) {
             *a -= b;
         }
     }
