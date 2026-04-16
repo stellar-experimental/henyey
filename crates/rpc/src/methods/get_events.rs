@@ -270,9 +270,8 @@ fn insert_event_fields(
             for t in topics {
                 let bytes = BASE64.decode(t).unwrap_or_default();
                 if let Ok(scval) = ScVal::from_xdr(&bytes, Limits::none()) {
-                    let jv = serde_json::to_value(&scval).map_err(|e| {
-                        JsonRpcError::internal_logged("serialization error", &e)
-                    })?;
+                    let jv = serde_json::to_value(&scval)
+                        .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
                     topic_json.push(jv);
                 }
             }

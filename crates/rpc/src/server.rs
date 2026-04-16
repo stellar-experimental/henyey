@@ -282,8 +282,7 @@ async fn rpc_handler(
     let is_write_method = request.method == "sendTransaction";
 
     if is_write_method {
-        let resp =
-            dispatch::dispatch(&ctx, &request.method, request.id, request.params).await;
+        let resp = dispatch::dispatch(&ctx, &request.method, request.id, request.params).await;
         ok_json_response(resp)
     } else {
         match tokio::time::timeout(

@@ -1569,9 +1569,7 @@ impl AppConfig {
 
         // Validate RPC config
         if self.rpc.enabled {
-            self.rpc
-                .validate()
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            self.rpc.validate().map_err(|e| anyhow::anyhow!("{}", e))?;
         }
 
         Ok(())

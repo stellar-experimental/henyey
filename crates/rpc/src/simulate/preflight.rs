@@ -168,17 +168,15 @@ fn resolve_entry(
 
     let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25_result(key, "LedgerKey")?;
 
-    let durability = get_key_durability(&p25_key).ok_or_else(|| {
-        "only contract data/code entries have TTL".to_string()
-    })?;
+    let durability = get_key_durability(&p25_key)
+        .ok_or_else(|| "only contract data/code entries have TTL".to_string())?;
 
     let Some((entry, live_until)) = snapshot.get_unfiltered(key) else {
         return Ok(None);
     };
 
-    let current_live_until = live_until.ok_or_else(|| {
-        "missing TTL for key that must have TTL".to_string()
-    })?;
+    let current_live_until =
+        live_until.ok_or_else(|| "missing TTL for key that must have TTL".to_string())?;
 
     let entry_xdr_size = entry
         .to_xdr(Limits::none())
@@ -187,11 +185,10 @@ fn resolve_entry(
 
     let p25_entry: soroban_host::xdr::LedgerEntry =
         super::convert::ws_to_p25_result(&entry, "LedgerEntry")?;
-    let entry_rent_size = entry_size_for_rent(budget, &p25_entry, entry_xdr_size)
-        .map_err(|e| {
-            tracing::warn!(error = ?e, "entry_size_for_rent failed");
-            "entry_size_for_rent failed".to_string()
-        })?;
+    let entry_rent_size = entry_size_for_rent(budget, &p25_entry, entry_xdr_size).map_err(|e| {
+        tracing::warn!(error = ?e, "entry_size_for_rent failed");
+        "entry_size_for_rent failed".to_string()
+    })?;
 
     Ok(Some(ResolvedEntry {
         durability,
