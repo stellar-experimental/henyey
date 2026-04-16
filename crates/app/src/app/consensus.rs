@@ -569,12 +569,19 @@ impl App {
             return;
         }
 
-        if let Err(err) = self.db.store_scp_quorum_set(
-            &hash,
-            self.ledger_manager.current_ledger_seq(),
-            &quorum_set,
-        ) {
-            tracing::warn!(error = %err, "Failed to store quorum set");
+        // Store quorum set to DB on spawn_blocking to avoid blocking
+        // the event loop with synchronous SQLite I/O.
+        {
+            let db = self.db.clone();
+            let h = hash;
+            let seq = self.ledger_manager.current_ledger_seq();
+            let qs = quorum_set.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(err) = db.store_scp_quorum_set(&h, seq, &qs) {
+                    tracing::warn!(error = %err, "Failed to store quorum set");
+                }
+            })
+            .await;
         }
 
         for node_id in &node_ids {

@@ -252,19 +252,41 @@ impl App {
                 // Read locks (bucket_list, hot_archive_guard) drop here
             };
 
-            // Flush pending bucket persistence before writing HAS/LCL.
-            // Safe to acquire write lock now that read guards are dropped.
-            self.ledger_manager
-                .bucket_list_mut()
-                .flush_pending_persist()
-                .map_err(|e| anyhow::anyhow!("Failed to flush pending bucket persist: {}", e))?;
+            // Flush pending bucket persistence and write HAS/LCL to DB.
+            // Both operations use spawn_blocking to avoid blocking the
+            // tokio worker thread (this runs inside a tokio::spawn task).
+            // The flush uses take_pending_persist to avoid holding the
+            // bucket list write lock during the thread join (#1713).
+            {
+                let pending_handle = self.ledger_manager.bucket_list_mut().take_pending_persist();
+                if let Some(handle) = pending_handle {
+                    tokio::task::spawn_blocking(move || {
+                        handle
+                            .join()
+                            .expect("bucket persist thread panicked")
+                            .map_err(|e| anyhow::anyhow!("flush_pending_persist: {}", e))
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("flush task panicked: {}", e))??;
+                }
+            }
 
-            self.db.transaction(|conn| {
-                conn.store_ledger_header(&final_header, &header_xdr)?;
-                conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-                conn.set_last_closed_ledger(final_header.ledger_seq)?;
-                Ok(())
-            })?;
+            {
+                let db = self.db.clone();
+                let header = final_header.clone();
+                let hdr_xdr = header_xdr.clone();
+                let has = has_json.clone();
+                tokio::task::spawn_blocking(move || {
+                    db.transaction(|conn| {
+                        conn.store_ledger_header(&header, &hdr_xdr)?;
+                        conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has)?;
+                        conn.set_last_closed_ledger(header.ledger_seq)?;
+                        Ok(())
+                    })
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("persist task panicked: {}", e))??;
+            }
 
             tracing::info!(
                 ledger_seq = final_header.ledger_seq,
