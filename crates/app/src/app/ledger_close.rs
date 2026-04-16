@@ -2,6 +2,109 @@
 
 use super::*;
 
+/// All data needed to persist a ledger close to SQLite.
+/// Prepared on the event loop (CPU work), written on a blocking thread.
+struct LedgerPersistData {
+    header: stellar_xdr::curr::LedgerHeader,
+    header_xdr: Vec<u8>,
+    tx_history_entry: TransactionHistoryEntry,
+    tx_result_entry: TransactionHistoryResultEntry,
+    ordered_txs: Vec<std::sync::Arc<TransactionEnvelope>>,
+    tx_results: Vec<TransactionResultPair>,
+    tx_metas: Option<Vec<TransactionMeta>>,
+    tx_count: usize,
+    network_id: NetworkId,
+    scp_envelopes: Vec<stellar_xdr::curr::ScpEnvelope>,
+    scp_quorum_sets: Vec<(Hash256, stellar_xdr::curr::ScpQuorumSet)>,
+    has_json: String,
+    hot_archive_persisted: bool,
+    bucket_list_levels: Option<Vec<(Hash256, Hash256)>>,
+    is_validator: bool,
+}
+
+impl LedgerPersistData {
+    fn write_to_db(&self, db: &henyey_db::Database) -> anyhow::Result<()> {
+        use henyey_db::queries::*;
+        db.transaction(|conn| {
+            conn.store_ledger_header(&self.header, &self.header_xdr)?;
+            conn.store_tx_history_entry(self.header.ledger_seq, &self.tx_history_entry)?;
+            conn.store_tx_result_entry(self.header.ledger_seq, &self.tx_result_entry)?;
+            if is_checkpoint_ledger(self.header.ledger_seq) {
+                if let Some(ref levels) = self.bucket_list_levels {
+                    conn.store_bucket_list(self.header.ledger_seq, levels)?;
+                }
+                if self.is_validator && self.hot_archive_persisted {
+                    conn.enqueue_publish(self.header.ledger_seq, &self.has_json)?;
+                }
+            }
+            for index in 0..self.tx_count {
+                let tx = &self.ordered_txs[index];
+                let tx_result = &self.tx_results[index];
+                let tx_meta = self.tx_metas.as_ref().and_then(|metas| metas.get(index));
+
+                let frame = TransactionFrame::with_network(tx.clone(), self.network_id);
+                let tx_hash = frame
+                    .hash(&self.network_id)
+                    .map_err(|e| henyey_db::DbError::Integrity(e.to_string()))?;
+                let tx_id = tx_hash.to_hex();
+
+                let tx_body = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
+                let tx_result_xdr = tx_result.to_xdr(stellar_xdr::curr::Limits::none())?;
+                let tx_meta_xdr = match tx_meta {
+                    Some(meta) => Some(meta.to_xdr(stellar_xdr::curr::Limits::none())?),
+                    None => None,
+                };
+
+                let status = {
+                    use stellar_xdr::curr::TransactionResultCode;
+                    let code = tx_result.result.result.discriminant();
+                    if code == TransactionResultCode::TxSuccess
+                        || code == TransactionResultCode::TxFeeBumpInnerSuccess
+                    {
+                        henyey_db::TxStatus::Success
+                    } else {
+                        henyey_db::TxStatus::Failed
+                    }
+                };
+
+                conn.store_transaction(&henyey_db::StoreTxParams {
+                    ledger_seq: self.header.ledger_seq,
+                    tx_index: index as u32,
+                    tx_id: &tx_id,
+                    body: &tx_body,
+                    result: &tx_result_xdr,
+                    meta: tx_meta_xdr.as_deref(),
+                    status,
+                })?;
+            }
+
+            if let Some(ref metas) = self.tx_metas {
+                let events = App::extract_contract_events(
+                    self.header.ledger_seq,
+                    &self.ordered_txs,
+                    &self.tx_results,
+                    metas,
+                    self.network_id,
+                );
+                if !events.is_empty() {
+                    conn.store_events(&events)?;
+                }
+            }
+
+            conn.store_scp_history(self.header.ledger_seq, &self.scp_envelopes)?;
+            for (hash, qset) in &self.scp_quorum_sets {
+                conn.store_scp_quorum_set(hash, self.header.ledger_seq, qset)?;
+            }
+
+            conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &self.has_json)?;
+            conn.set_last_closed_ledger(self.header.ledger_seq)?;
+
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
 impl App {
     pub(crate) fn externalized_iteration_window(
         last_processed: u64,
@@ -40,13 +143,16 @@ impl App {
         }
     }
 
-    fn persist_ledger_close(
+    /// Prepare all data needed for the persist transaction (CPU work only,
+    /// no SQLite I/O). This runs on the event loop; the returned data is
+    /// then moved to a spawn_blocking task for the actual DB write.
+    fn prepare_persist_data(
         &self,
         header: &stellar_xdr::curr::LedgerHeader,
         tx_set_variant: &TransactionSetVariant,
         tx_results: &[TransactionResultPair],
         tx_metas: Option<&[TransactionMeta]>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<LedgerPersistData> {
         let header_xdr = header.to_xdr(stellar_xdr::curr::Limits::none())?;
         let network_id = NetworkId::from_passphrase(&self.config.network.passphrase);
         let ordered_txs: Vec<std::sync::Arc<TransactionEnvelope>> = tx_set_variant
@@ -55,7 +161,7 @@ impl App {
             .map(|(tx, _)| tx)
             .collect();
         let tx_count = ordered_txs.len().min(tx_results.len());
-        let meta_count = tx_metas.map(|metas| metas.len()).unwrap_or(0);
+
         let scp_envelopes = self.herder.get_scp_envelopes(header.ledger_seq as u64);
         let mut scp_quorum_sets = Vec::new();
         for envelope in &scp_envelopes {
@@ -68,26 +174,6 @@ impl App {
             }
         }
 
-        if tx_results.len() != ordered_txs.len() {
-            tracing::warn!(
-                tx_count = ordered_txs.len(),
-                result_count = tx_results.len(),
-                "Transaction count mismatch while persisting history"
-            );
-        }
-        if tx_metas.is_some() && meta_count < tx_count {
-            tracing::warn!(
-                tx_count,
-                meta_count,
-                "Transaction meta count mismatch while persisting history"
-            );
-        }
-
-        // For generalized tx sets (protocol 20+), the legacy `txSet` field
-        // uses a zeroed-out `previous_ledger_hash` with empty txs, matching
-        // stellar-core behavior. The actual generalized tx set is stored in
-        // the `ext` field (V1). stellar-core's `writeGeneralizedTxSetToStream`
-        // leaves `hist.txSet` default-initialized (all zeros).
         let tx_set_entry = match tx_set_variant {
             TransactionSetVariant::Classic(set) => set.clone(),
             TransactionSetVariant::Generalized(_) => TransactionSet {
@@ -114,18 +200,12 @@ impl App {
             ext: TransactionHistoryResultEntryExt::default(),
         };
 
-        // Build HAS from current bucket list state for restart recovery.
-        // This captures pending merge outputs so a restarted node can
-        // reconstruct the bucket list without re-downloading from archives.
+        // Build HAS and do bucket persistence (file I/O, not SQLite)
         let (has_json, hot_archive_persisted) = {
             let bucket_list = self.ledger_manager.bucket_list();
             let hot_archive_guard = self.ledger_manager.hot_archive_bucket_list();
             let hot_archive_ref = hot_archive_guard.as_ref();
 
-            // Ensure hot archive buckets are persisted to disk for restart recovery.
-            // Hot archive merges are all in-memory, so after each close the curr/snap
-            // buckets may have no backing file.
-            // If persist fails, we skip publish for this checkpoint but don't abort.
             let hot_archive_persisted = if let Some(habl) = hot_archive_ref {
                 if let Err(e) = self.persist_hot_archive_buckets(habl) {
                     tracing::error!(
@@ -141,10 +221,6 @@ impl App {
                 true
             };
 
-            // Only include hot archive in HAS when protocol supports it,
-            // matching stellar-core. At earlier protocols the header's
-            // bucket_list_hash is live-only, so including hot archive would
-            // cause Horizon to compute a combined hash that doesn't match.
             let hot_archive_for_has = if hot_archive_supported(header.ledger_version) {
                 hot_archive_ref
             } else {
@@ -159,9 +235,6 @@ impl App {
             )
             .map_err(|e| anyhow::anyhow!("Failed to build HAS: {}", e))?;
 
-            // Diagnostic: verify that the Go SDK hash from this HAS matches
-            // the header's bucket_list_hash. If these differ, Horizon will
-            // reject the archive.
             let expected_hash = henyey_common::Hash256::from_bytes(header.bucket_list_hash.0);
             match has.compute_bucket_list_hash() {
                 Ok(go_sdk_hash) => {
@@ -171,11 +244,7 @@ impl App {
                             has_version = has.version,
                             go_sdk_hash = %go_sdk_hash.to_hex(),
                             header_hash = %expected_hash.to_hex(),
-                            has_hot_archive = has.hot_archive_buckets.is_some(),
-                            hot_archive_levels = has.hot_archive_buckets.as_ref().map(|v| v.len()).unwrap_or(0),
-                            current_bucket_levels = has.current_buckets.len(),
-                            "DIAGNOSTIC: HAS bucket_list_hash does NOT match header! \
-                             Horizon will reject this archive."
+                            "DIAGNOSTIC: HAS bucket_list_hash does NOT match header!"
                         );
                     }
                 }
@@ -194,93 +263,34 @@ impl App {
             (json, hot_archive_persisted)
         };
 
-        // Flush any pending background bucket persistence BEFORE writing state
-        // that references those bucket files (HAS, LCL, publish queue).
         self.ledger_manager
             .bucket_list_mut()
             .flush_pending_persist()
             .map_err(|e| anyhow::anyhow!("Failed to flush pending bucket persist: {}", e))?;
 
-        self.db.transaction(|conn| {
-            conn.store_ledger_header(header, &header_xdr)?;
-            conn.store_tx_history_entry(header.ledger_seq, &tx_history_entry)?;
-            conn.store_tx_result_entry(header.ledger_seq, &tx_result_entry)?;
-            if is_checkpoint_ledger(header.ledger_seq) {
-                let levels = self.ledger_manager.bucket_list_levels();
-                conn.store_bucket_list(header.ledger_seq, &levels)?;
-                if self.is_validator && hot_archive_persisted {
-                    conn.enqueue_publish(header.ledger_seq, &has_json)?;
-                }
-            }
-            for index in 0..tx_count {
-                let tx = &ordered_txs[index];
-                let tx_result = &tx_results[index];
-                let tx_meta = tx_metas.and_then(|metas| metas.get(index));
+        let bucket_list_levels = if is_checkpoint_ledger(header.ledger_seq) {
+            Some(self.ledger_manager.bucket_list_levels())
+        } else {
+            None
+        };
 
-                let frame = TransactionFrame::with_network(tx.clone(), network_id);
-                let tx_hash = frame
-                    .hash(&network_id)
-                    .map_err(|e| henyey_db::DbError::Integrity(e.to_string()))?;
-                let tx_id = tx_hash.to_hex();
-
-                let tx_body = tx.to_xdr(stellar_xdr::curr::Limits::none())?;
-                let tx_result_xdr = tx_result.to_xdr(stellar_xdr::curr::Limits::none())?;
-                let tx_meta_xdr = match tx_meta {
-                    Some(meta) => Some(meta.to_xdr(stellar_xdr::curr::Limits::none())?),
-                    None => None,
-                };
-
-                // Compute status from the transaction result code
-                let status = {
-                    use stellar_xdr::curr::TransactionResultCode;
-                    let code = tx_result.result.result.discriminant();
-                    if code == TransactionResultCode::TxSuccess
-                        || code == TransactionResultCode::TxFeeBumpInnerSuccess
-                    {
-                        henyey_db::TxStatus::Success
-                    } else {
-                        henyey_db::TxStatus::Failed
-                    }
-                };
-
-                conn.store_transaction(&henyey_db::StoreTxParams {
-                    ledger_seq: header.ledger_seq,
-                    tx_index: index as u32,
-                    tx_id: &tx_id,
-                    body: &tx_body,
-                    result: &tx_result_xdr,
-                    meta: tx_meta_xdr.as_deref(),
-                    status,
-                })?;
-            }
-
-            // Extract and store contract events from transaction metadata
-            if let Some(metas) = tx_metas {
-                let events = Self::extract_contract_events(
-                    header.ledger_seq,
-                    &ordered_txs,
-                    tx_results,
-                    metas,
-                    network_id,
-                );
-                if !events.is_empty() {
-                    conn.store_events(&events)?;
-                }
-            }
-
-            conn.store_scp_history(header.ledger_seq, &scp_envelopes)?;
-            for (hash, qset) in &scp_quorum_sets {
-                conn.store_scp_quorum_set(hash, header.ledger_seq, qset)?;
-            }
-
-            // Persist HAS and LCL for restart recovery
-            conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-            conn.set_last_closed_ledger(header.ledger_seq)?;
-
-            Ok(())
-        })?;
-
-        Ok(())
+        Ok(LedgerPersistData {
+            header: header.clone(),
+            header_xdr,
+            tx_history_entry,
+            tx_result_entry,
+            ordered_txs,
+            tx_results: tx_results.to_vec(),
+            tx_metas: tx_metas.map(|m| m.to_vec()),
+            tx_count,
+            network_id,
+            scp_envelopes,
+            scp_quorum_sets,
+            has_json,
+            hot_archive_persisted,
+            bucket_list_levels,
+            is_validator: self.is_validator,
+        })
     }
 
     /// Extract contract events from transaction metadata for indexing.
@@ -1652,44 +1662,54 @@ impl App {
             }
         }
 
-        // Persist ledger close data.
+        // Persist ledger close data off the async event loop. These SQLite
+        // writes (with `synchronous = FULL`) can block for hundreds of ms per
+        // ledger due to XDR serialization + fsync + r2d2 connection pool
+        // contention. Running them directly on the event loop was the primary
+        // cause of the sync oscillation pattern (#1713/#1518).
+        //
+        // We prepare all the data the DB transaction needs on the event loop
+        // (CPU-only work), then move just the DB handle and prepared data
+        // into a spawn_blocking task for the actual SQLite writes.
         let tx_metas = result.meta.as_ref().map(Self::extract_tx_metas);
-        if let Err(err) = self.persist_ledger_close(
+        let persist_data = self.prepare_persist_data(
             &result.header,
             &pending.tx_set_variant,
             &result.tx_results,
             tx_metas.as_deref(),
-        ) {
-            // Fatal: stellar-core crashes on DB failure during ledger close
-            // (uncaught SOCI exception). We must abort to prevent split-brain
-            // between in-memory state and the database.
-            tracing::error!(error = %err, "Fatal: failed to persist ledger close data");
-            std::process::abort();
-        }
-
-        // Persist full LedgerCloseMeta for RPC serving (getTransactions, getLedgers).
-        if let Some(ref meta) = result.meta {
-            match meta.to_xdr(stellar_xdr::curr::Limits::none()) {
-                Ok(meta_xdr) => {
-                    if let Err(err) = self
-                        .db
-                        .store_ledger_close_meta(pending.ledger_seq, &meta_xdr)
-                    {
-                        tracing::warn!(
-                            error = %err,
-                            ledger_seq = pending.ledger_seq,
-                            "Failed to persist LedgerCloseMeta"
-                        );
+        );
+        let meta_xdr = result
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.to_xdr(stellar_xdr::curr::Limits::none()).ok());
+        let persist_db = self.db.clone();
+        let persist_seq = pending.ledger_seq;
+        let persist_handle = tokio::task::spawn_blocking(move || {
+            match persist_data {
+                Ok(data) => {
+                    if let Err(err) = data.write_to_db(&persist_db) {
+                        tracing::error!(error = %err, "Fatal: failed to persist ledger close data");
+                        std::process::abort();
                     }
                 }
                 Err(err) => {
+                    tracing::error!(error = %err, "Fatal: failed to prepare ledger close data");
+                    std::process::abort();
+                }
+            }
+            if let Some(meta_xdr) = meta_xdr {
+                if let Err(err) = persist_db.store_ledger_close_meta(persist_seq, &meta_xdr) {
                     tracing::warn!(
                         error = %err,
-                        ledger_seq = pending.ledger_seq,
-                        "Failed to serialize LedgerCloseMeta"
+                        ledger_seq = persist_seq,
+                        "Failed to persist LedgerCloseMeta"
                     );
                 }
             }
+        });
+        if let Err(e) = persist_handle.await {
+            tracing::error!(error = %e, "Persist ledger close task panicked");
+            std::process::abort();
         }
 
         // Build (envelope, seq_num) pairs for all txs (applied + failed) so
