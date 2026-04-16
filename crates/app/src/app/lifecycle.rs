@@ -273,20 +273,7 @@ impl App {
                         // If no close is pending AND no persist is pending,
                         // we just finished a rapid close cycle.
                         if pending_close.is_none() && pending_persist.is_none() {
-                            let current_ledger = self.current_ledger_seq();
-                            *self.last_externalized_at.write().await = self.clock.now();
-                            self.reset_tx_set_tracking().await;
-                            *self.consensus_stuck_state.write().await = None;
-                            let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
-                            tracing::info!(
-                                current_ledger,
-                                latest_ext,
-                                "Rapid close cycle ended; requesting SCP state from peers"
-                            );
-                            if let Some(overlay) = self.overlay().await {
-                                let _ = overlay.request_scp_state(current_ledger).await;
-                            }
-                            *self.last_scp_state_request_at.write().await = self.clock.now();
+                            self.finish_rapid_close_cycle().await;
                         }
                     }
                 }
@@ -334,30 +321,11 @@ impl App {
                                 let lm = self.ledger_manager.clone();
                                 let seq = persist_data.header.ledger_seq;
                                 let persist_handle = tokio::spawn(async move {
-                                    // Flush bucket persist (take-then-join)
-                                    let pending_handle =
-                                        lm.bucket_list_mut().take_pending_persist();
-                                    if let Some(handle) = pending_handle {
-                                        tokio::task::spawn_blocking(move || {
-                                            handle
-                                                .join()
-                                                .expect("bucket persist panicked")
-                                                .map_err(|e| format!("flush: {e}"))
-                                        })
-                                        .await
-                                        .unwrap_or_else(|e| {
-                                            Err(format!("flush task panicked: {e}"))
-                                        })
-                                        .map_err(|e| {
-                                            tracing::error!(error = %e, "Fatal: flush failed");
-                                            std::process::abort();
-                                        })
-                                        .ok();
-                                    }
+                                    super::persist::flush_bucket_persist(&lm).await;
 
-                                    // DB transaction
+                                    // Catchup DB transaction (header + HAS + LCL).
                                     let db2 = db.clone();
-                                    tokio::task::spawn_blocking(move || {
+                                    if let Err(e) = tokio::task::spawn_blocking(move || {
                                         use henyey_db::queries::*;
                                         db2.transaction(|conn| {
                                             conn.store_ledger_header(
@@ -376,13 +344,14 @@ impl App {
                                     })
                                     .await
                                     .unwrap_or_else(|e| {
-                                        tracing::error!(error = %e, "Catchup persist panicked");
                                         Err(henyey_db::DbError::Integrity(e.to_string()))
                                     })
-                                    .unwrap_or_else(|e| {
-                                        tracing::error!(error = %e, "Fatal: catchup persist failed");
-                                        std::process::abort();
-                                    });
+                                    {
+                                        super::persist::fatal_persist_error(
+                                            "catchup DB write",
+                                            &e,
+                                        );
+                                    }
 
                                     tracing::info!(
                                         ledger_seq = seq,
@@ -461,20 +430,7 @@ impl App {
 
                         // If no more closes ready, rapid close cycle ended.
                         if pending_close.is_none() {
-                            let current_ledger = self.current_ledger_seq();
-                            *self.last_externalized_at.write().await = self.clock.now();
-                            self.reset_tx_set_tracking().await;
-                            *self.consensus_stuck_state.write().await = None;
-                            let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
-                            tracing::info!(
-                                current_ledger,
-                                latest_ext,
-                                "Rapid close cycle ended (post-persist); requesting SCP state"
-                            );
-                            if let Some(overlay) = self.overlay().await {
-                                let _ = overlay.request_scp_state(current_ledger).await;
-                            }
-                            *self.last_scp_state_request_at.write().await = self.clock.now();
+                            self.finish_rapid_close_cycle().await;
                         }
                     }
                 }
@@ -936,6 +892,28 @@ impl App {
         self.shutdown_internal().await?;
 
         Ok(())
+    }
+
+    /// Reset state after a rapid close cycle ends (no more closes or persists pending).
+    ///
+    /// Called when we've finished draining all buffered closes and the DB is
+    /// fully up to date. Requests fresh SCP state from peers to resume normal
+    /// consensus participation.
+    async fn finish_rapid_close_cycle(&self) {
+        let current_ledger = self.current_ledger_seq();
+        *self.last_externalized_at.write().await = self.clock.now();
+        self.reset_tx_set_tracking().await;
+        *self.consensus_stuck_state.write().await = None;
+        let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+        tracing::info!(
+            current_ledger,
+            latest_ext,
+            "Rapid close cycle ended; requesting SCP state from peers"
+        );
+        if let Some(overlay) = self.overlay().await {
+            let _ = overlay.request_scp_state(current_ledger).await;
+        }
+        *self.last_scp_state_request_at.write().await = self.clock.now();
     }
 
     /// Start the overlay network.

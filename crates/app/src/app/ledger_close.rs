@@ -1901,59 +1901,8 @@ impl App {
                     // Persist hot archive buckets to disk (file I/O) and
                     // flush pending bucket persist (thread join) — both
                     // on spawn_blocking to avoid stalling the event loop.
-                    let lm = ledger_manager.clone();
-                    let bd = bucket_dir.clone();
-                    if let Err(e) = tokio::task::spawn_blocking(move || {
-                        // Persist hot archive buckets to disk.
-                        let habl_guard = lm.hot_archive_bucket_list();
-                        if let Some(habl) = habl_guard.as_ref() {
-                            for level in habl.levels() {
-                                let mut buckets: Vec<&henyey_bucket::HotArchiveBucket> =
-                                    vec![level.curr(), level.snap_bucket()];
-                                if let Some(next) = level.next() {
-                                    buckets.push(next);
-                                }
-                                for bucket in buckets {
-                                    if bucket.backing_file_path().is_none()
-                                        && !bucket.hash().is_zero()
-                                    {
-                                        let path =
-                                            bd.join(henyey_bucket::canonical_bucket_filename(
-                                                &bucket.hash(),
-                                            ));
-                                        if !path.exists() {
-                                            if let Err(e) = bucket.save_to_xdr_file(&path) {
-                                                tracing::error!(
-                                                    error = %e,
-                                                    "Failed to persist hot archive bucket"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        drop(habl_guard);
-
-                        // Take the pending persist handle with a brief write
-                        // lock, then join WITHOUT holding the lock. This
-                        // prevents blocking concurrent bucket_list() reads
-                        // from prepare_persist_data on the event loop.
-                        let pending_handle = lm.bucket_list_mut().take_pending_persist();
-                        if let Some(handle) = pending_handle {
-                            handle
-                                .join()
-                                .expect("bucket persist thread panicked")
-                                .map_err(|e| format!("flush_pending_persist: {}", e))?;
-                        }
-                        Ok(())
-                    })
-                    .await
-                    .unwrap_or_else(|e| Err(format!("flush task panicked: {}", e)))
-                    {
-                        tracing::error!(error = %e, "Fatal: failed to flush bucket persist");
-                        std::process::abort();
-                    }
+                    super::persist::flush_hot_archive_and_buckets(&ledger_manager, bucket_dir)
+                        .await;
 
                     // SQLite transaction with all ledger close data.
                     let db2 = db.clone();
@@ -1961,8 +1910,7 @@ impl App {
                         .await
                         .unwrap_or_else(|e| Err(anyhow::anyhow!("persist task panicked: {}", e)))
                     {
-                        tracing::error!(error = %e, "Fatal: failed to persist ledger close data");
-                        std::process::abort();
+                        super::persist::fatal_persist_error("ledger close DB write", &e);
                     }
 
                     // LedgerCloseMeta for RPC (non-fatal).
@@ -1986,8 +1934,7 @@ impl App {
                 })
             }
             Err(err) => {
-                tracing::error!(error = %err, "Fatal: failed to prepare ledger persist data");
-                std::process::abort();
+                super::persist::fatal_persist_error("prepare ledger persist data", &err);
             }
         };
 

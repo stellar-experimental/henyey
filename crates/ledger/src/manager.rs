@@ -67,6 +67,7 @@ use stellar_xdr::curr::{
 use tracing::{debug, info};
 
 /// Standard Linux memory page size in bytes.
+#[allow(dead_code)]
 const PAGE_SIZE: u64 = 4096;
 
 /// Heuristic multiplier for estimating compiled module size from WASM byte size.

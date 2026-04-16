@@ -174,6 +174,7 @@ mod consensus;
 mod ledger_close;
 mod lifecycle;
 mod peers;
+mod persist;
 mod publish;
 mod survey_impl;
 mod tx_flooding;

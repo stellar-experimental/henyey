@@ -547,7 +547,7 @@ impl SurgePricingPriorityQueue {
             active: bool,
         }
 
-        impl<'a> LaneCursor<'a> {
+        impl LaneCursor<'_> {
             fn current(&self) -> Option<&QueueEntry> {
                 if !self.active {
                     return None;
