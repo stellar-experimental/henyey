@@ -228,8 +228,14 @@ impl EventQueries for Connection {
     }
 
     fn delete_old_events(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
+        // Use DISTINCT ledgerseq to ensure we never split a single ledger's
+        // events across GC boundaries. `count` limits distinct ledgers deleted.
         let deleted = self.execute(
-            "DELETE FROM events WHERE rowid IN (SELECT rowid FROM events WHERE ledgerseq <= ?1 LIMIT ?2)",
+            "DELETE FROM events WHERE ledgerseq IN (\
+                SELECT DISTINCT ledgerseq FROM events \
+                WHERE ledgerseq <= ?1 \
+                ORDER BY ledgerseq ASC LIMIT ?2\
+            )",
             params![max_ledger, count],
         )?;
         Ok(deleted as u32)
@@ -330,6 +336,36 @@ mod tests {
         let deleted = conn.delete_old_events(50, 1000).unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(count_events(&conn), 6);
+    }
+
+    #[test]
+    fn test_delete_old_events_no_partial_ledger() {
+        // Regression for #1724: GC must never split a single ledger's events.
+        let conn = setup_db();
+        // Insert multiple events per ledger
+        let mut events = Vec::new();
+        for i in 0..3 {
+            events.push(make_event(10, i)); // 3 events at ledger 10
+        }
+        for i in 0..2 {
+            events.push(make_event(11, i)); // 2 events at ledger 11
+        }
+        for i in 0..4 {
+            events.push(make_event(12, i)); // 4 events at ledger 12
+        }
+        conn.store_events(&events).unwrap();
+        assert_eq!(count_events(&conn), 9);
+
+        // Delete with count=1 (1 distinct ledger). Oldest ledger (10) should be
+        // fully removed — all 3 events — with no partial remnants.
+        let deleted = conn.delete_old_events(12, 1).unwrap();
+        assert_eq!(deleted, 3); // all 3 events from ledger 10
+        assert_eq!(count_events(&conn), 6); // ledgers 11 + 12 intact
+
+        // Delete another ledger
+        let deleted = conn.delete_old_events(12, 1).unwrap();
+        assert_eq!(deleted, 2); // all 2 events from ledger 11
+        assert_eq!(count_events(&conn), 4); // ledger 12 intact
     }
 
     #[test]

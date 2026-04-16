@@ -408,17 +408,19 @@ impl HistoryQueries for Connection {
     fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
         let mut total = 0u32;
 
-        // Delete from txhistory
+        // Delete from txhistory — multi-row per ledger, use DISTINCT ledgerseq
+        // to ensure we never split a single ledger's transactions.
         let deleted = self.execute(
-            "DELETE FROM txhistory WHERE rowid IN (\
-                SELECT rowid FROM txhistory WHERE ledgerseq <= ?1 \
+            "DELETE FROM txhistory WHERE ledgerseq IN (\
+                SELECT DISTINCT ledgerseq FROM txhistory \
+                WHERE ledgerseq <= ?1 \
                 ORDER BY ledgerseq ASC LIMIT ?2\
             )",
             params![max_ledger, count],
         )?;
         total += deleted as u32;
 
-        // Delete from txsets
+        // Delete from txsets (one-row-per-ledger, PK on ledgerseq — can't split)
         let deleted = self.execute(
             "DELETE FROM txsets WHERE ledgerseq IN (\
                 SELECT ledgerseq FROM txsets WHERE ledgerseq <= ?1 \
@@ -428,7 +430,7 @@ impl HistoryQueries for Connection {
         )?;
         total += deleted as u32;
 
-        // Delete from txresults
+        // Delete from txresults (one-row-per-ledger, PK on ledgerseq — can't split)
         let deleted = self.execute(
             "DELETE FROM txresults WHERE ledgerseq IN (\
                 SELECT ledgerseq FROM txresults WHERE ledgerseq <= ?1 \
@@ -843,5 +845,74 @@ mod tests {
         .unwrap();
         let result = conn.load_transaction("bad_tx");
         assert!(result.is_err(), "should reject invalid tx status");
+    }
+
+    fn count_txhistory(conn: &Connection, ledger: u32) -> u32 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM txhistory WHERE ledgerseq = ?1",
+            params![ledger],
+            |r| r.get::<_, u32>(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_delete_old_tx_history_no_partial_ledger() {
+        // Regression for #1721: GC must never split a single ledger's transactions.
+        let conn = setup_db();
+
+        // Insert multiple txns per ledger
+        for i in 0..3 {
+            conn.store_transaction(&StoreTxParams {
+                ledger_seq: 10,
+                tx_index: i,
+                tx_id: &format!("tx-10-{i}"),
+                body: b"body",
+                result: b"result",
+                meta: None,
+                status: TxStatus::Success,
+            })
+            .unwrap();
+        }
+        for i in 0..2 {
+            conn.store_transaction(&StoreTxParams {
+                ledger_seq: 11,
+                tx_index: i,
+                tx_id: &format!("tx-11-{i}"),
+                body: b"body",
+                result: b"result",
+                meta: None,
+                status: TxStatus::Success,
+            })
+            .unwrap();
+        }
+        conn.store_transaction(&StoreTxParams {
+            ledger_seq: 12,
+            tx_index: 0,
+            tx_id: "tx-12-0",
+            body: b"body",
+            result: b"result",
+            meta: None,
+            status: TxStatus::Success,
+        })
+        .unwrap();
+
+        assert_eq!(count_txhistory(&conn, 10), 3);
+        assert_eq!(count_txhistory(&conn, 11), 2);
+        assert_eq!(count_txhistory(&conn, 12), 1);
+
+        // Delete with count=1 (1 distinct ledger). Oldest ledger (10) should be
+        // fully removed — all 3 txns — with no partial remnants.
+        let deleted = conn.delete_old_tx_history(12, 1).unwrap();
+        assert_eq!(deleted, 3); // all 3 txns from ledger 10
+        assert_eq!(count_txhistory(&conn, 10), 0);
+        assert_eq!(count_txhistory(&conn, 11), 2); // untouched
+        assert_eq!(count_txhistory(&conn, 12), 1); // untouched
+
+        // Delete another ledger
+        let deleted = conn.delete_old_tx_history(12, 1).unwrap();
+        assert_eq!(deleted, 2); // all 2 txns from ledger 11
+        assert_eq!(count_txhistory(&conn, 11), 0);
+        assert_eq!(count_txhistory(&conn, 12), 1); // untouched
     }
 }
