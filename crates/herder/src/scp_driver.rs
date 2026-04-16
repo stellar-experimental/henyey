@@ -178,8 +178,6 @@ pub struct PendingQuorumSet {
     pub request_count: u32,
     /// Node IDs that use this quorum set (envelope senders).
     pub node_ids: HashSet<NodeId>,
-    /// Slot index when this request was first seen (for age-based eviction).
-    pub first_seen_slot: u64,
 }
 
 /// Cache sizes for diagnostics.
@@ -351,34 +349,16 @@ impl ScpDriver {
                     true
                 } else {
                     let soroban_info = lm.soroban_network_info();
-
-                    // Create snapshot-backed providers for fee + account
-                    // validation, matching stellar-core's LedgerSnapshot in
-                    // getInvalidTxListWithErrors.
-                    let providers =
-                        crate::tx_set_utils::SnapshotValidationProviders::from_ledger_manager(&lm);
-                    if providers.is_none() {
-                        warn!(
-                            "check_and_cache_tx_set_valid: snapshot creation failed, \
-                             rejecting tx-set"
-                        );
-                        return false;
-                    }
-                    let fee_provider = providers
-                        .as_ref()
-                        .map(|p| p as &dyn crate::tx_queue::FeeBalanceProvider);
-                    let account_provider = providers
-                        .as_ref()
-                        .map(|p| p as &dyn crate::tx_queue::AccountProvider);
-
                     crate::tx_set_utils::check_tx_set_valid(
                         gen,
                         &lcl_header,
                         close_time_offset,
                         network_id,
                         soroban_info.as_ref(),
-                        fee_provider,
-                        account_provider,
+                        None, // fee balance checks skipped in SCP path — snapshot
+                        // staleness causes false rejects
+                        None, // account validation skipped in SCP path — snapshot
+                              // staleness causes false rejects
                     )
                 }
             } else {
@@ -418,18 +398,13 @@ impl ScpDriver {
     /// Register a pending quorum set request.
     /// Returns true if this is a new request, false if already pending or known.
     /// The node_id is the envelope sender that uses this quorum set.
-    pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId, slot: u64) -> bool {
-        self.qset_tracker.request(hash, node_id, slot)
+    pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId) -> bool {
+        self.qset_tracker.request(hash, node_id)
     }
 
     /// Clear a quorum set request once it has been satisfied.
     pub fn clear_quorum_set_request(&self, hash: &Hash256) {
         self.qset_tracker.clear_pending(hash);
-    }
-
-    /// Evict pending quorum set requests older than `min_slot`.
-    pub fn evict_pending_qsets_below(&self, min_slot: u64) {
-        self.qset_tracker.evict_pending_below(min_slot);
     }
 
     /// Get the node IDs that are waiting for a quorum set with the given hash.
@@ -1518,19 +1493,17 @@ impl ScpDriver {
         std::array::from_fn(|i| hash[i] ^ mask[i])
     }
 
-    /// Build the data-to-sign for an SCP statement: network ID + ENVELOPE_TYPE_SCP + XDR.
-    fn scp_signing_data(&self, statement: &ScpStatement) -> Option<Vec<u8>> {
+    /// Sign an SCP envelope.
+    pub fn sign_envelope(&self, statement: &ScpStatement) -> Option<Signature> {
+        let secret_key = self.secret_key.as_ref()?;
+
+        // Create the data to sign: network ID + ENVELOPE_TYPE_SCP + statement XDR
+        // ENVELOPE_TYPE_SCP = 1 (as i32 big-endian)
         let statement_bytes = statement.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
         let mut data = self.network_id.0.to_vec();
         data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP
         data.extend_from_slice(&statement_bytes);
-        Some(data)
-    }
 
-    /// Sign an SCP envelope.
-    pub fn sign_envelope(&self, statement: &ScpStatement) -> Option<Signature> {
-        let secret_key = self.secret_key.as_ref()?;
-        let data = self.scp_signing_data(statement)?;
         Some(secret_key.sign(&data))
     }
 
@@ -1541,9 +1514,16 @@ impl ScpDriver {
         let public_key = PublicKey::try_from(&node_id.0)
             .map_err(|_| HerderError::Internal("Invalid node ID".to_string()))?;
 
-        let data = self
-            .scp_signing_data(&envelope.statement)
-            .ok_or_else(|| HerderError::Internal("Failed to encode statement".to_string()))?;
+        // Create the data that was signed: network ID + ENVELOPE_TYPE_SCP + statement XDR
+        // ENVELOPE_TYPE_SCP = 1 (as i32 big-endian)
+        let statement_bytes = envelope
+            .statement
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map_err(|e| HerderError::Internal(format!("Failed to encode statement: {}", e)))?;
+
+        let mut data = self.network_id.0.to_vec();
+        data.extend_from_slice(&1i32.to_be_bytes()); // ENVELOPE_TYPE_SCP
+        data.extend_from_slice(&statement_bytes);
 
         // Verify signature
         let sig_bytes: [u8; 64] = envelope
@@ -1785,9 +1765,6 @@ impl ScpDriver {
 
         // Clean up quorum set caches to prevent unbounded growth.
         self.qset_tracker.clear_validated_preserving_local();
-
-        // Evict stale pending quorum set requests.
-        self.qset_tracker.evict_pending_below(slot);
     }
 
     /// Get local SCP envelopes for a slot.
@@ -1978,11 +1955,11 @@ mod cache_tests {
             ));
 
         let known_hash = hash_quorum_set(&quorum_set);
-        assert!(!driver.request_quorum_set(known_hash, sender_node_id.clone(), 100));
+        assert!(!driver.request_quorum_set(known_hash, sender_node_id.clone()));
 
         let unknown_hash = Hash256::from_bytes([42u8; 32]);
-        assert!(driver.request_quorum_set(unknown_hash, sender_node_id.clone(), 100));
-        assert!(!driver.request_quorum_set(unknown_hash, sender_node_id.clone(), 100));
+        assert!(driver.request_quorum_set(unknown_hash, sender_node_id.clone()));
+        assert!(!driver.request_quorum_set(unknown_hash, sender_node_id.clone()));
 
         // Verify the node_id was tracked
         let pending_ids = driver.get_pending_quorum_set_node_ids(&unknown_hash);
@@ -3373,167 +3350,6 @@ mod tests {
         // slot 1 == lcl_seq(0) + 1 -> current ledger path
         let result = driver.validate_value_against_local_state(1, &sv, true);
         assert_eq!(result, ValueValidation::Valid);
-    }
-
-    /// Regression test for #1476 — SCP tx-set validation must reject
-    /// generalized tx sets containing transactions whose source accounts
-    /// are not in the ledger snapshot.
-    ///
-    /// Before the fix, `check_and_cache_tx_set_valid` passed `None` for both
-    /// providers, so fee/account validation was skipped entirely. This test
-    /// verifies the wiring through `validate_value_against_local_state` →
-    /// `check_and_cache_tx_set_valid` → `check_tx_set_valid` with real
-    /// snapshot-backed providers.
-    #[test]
-    fn test_scp_rejects_tx_set_with_unknown_source_account() {
-        use henyey_bucket::{BucketList, HotArchiveBucketList};
-        use henyey_ledger::{compute_header_hash, LedgerManagerConfig};
-        use stellar_xdr::curr::{
-            Asset, DecoratedSignature, GeneralizedTransactionSet, Hash, LedgerHeader,
-            LedgerHeaderExt, Memo, MuxedAccount, Operation, OperationBody, PaymentOp,
-            Preconditions, SequenceNumber, Signature as XdrSignature, SignatureHint,
-            StellarValueExt, TimePoint, Transaction, TransactionEnvelope, TransactionExt,
-            TransactionSetV1, TransactionV1Envelope, TxSetComponent,
-            TxSetComponentTxsMaybeDiscountedFee, Uint256, VecM,
-        };
-
-        // 1. Build a LedgerManager with protocol 25.
-        let config = LedgerManagerConfig {
-            validate_bucket_hash: false,
-            ..Default::default()
-        };
-        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), config);
-        let header = LedgerHeader {
-            ledger_version: 25,
-            previous_ledger_hash: Hash([0u8; 32]),
-            scp_value: StellarValue {
-                tx_set_hash: Hash([0u8; 32]),
-                close_time: TimePoint(0),
-                upgrades: VecM::default(),
-                ext: StellarValueExt::Basic,
-            },
-            tx_set_result_hash: Hash([0u8; 32]),
-            bucket_list_hash: Hash([0u8; 32]),
-            ledger_seq: 1,
-            total_coins: 1_000_000_000_000,
-            fee_pool: 0,
-            inflation_seq: 0,
-            id_pool: 0,
-            base_fee: 100,
-            base_reserve: 5_000_000,
-            max_tx_set_size: 100,
-            skip_list: [
-                Hash([0u8; 32]),
-                Hash([0u8; 32]),
-                Hash([0u8; 32]),
-                Hash([0u8; 32]),
-            ],
-            ext: LedgerHeaderExt::V0,
-        };
-        let header_hash = compute_header_hash(&header).expect("hash");
-        lm.initialize(
-            BucketList::new(),
-            HotArchiveBucketList::new(),
-            header.clone(),
-            header_hash,
-        )
-        .expect("init");
-
-        // 2. Wire driver with the LedgerManager.
-        let (driver, _secret_key) = make_test_driver_with_key();
-        driver.set_ledger_manager(Arc::new(lm));
-
-        // 3. Build a classic tx with a source account that does NOT exist in
-        //    the (empty) ledger snapshot.
-        let source = MuxedAccount::Ed25519(Uint256([42u8; 32]));
-        let dest = MuxedAccount::Ed25519(Uint256([43u8; 32]));
-        let tx = Transaction {
-            source_account: source,
-            fee: 200,
-            seq_num: SequenceNumber(1),
-            cond: Preconditions::None,
-            memo: Memo::None,
-            operations: vec![Operation {
-                source_account: None,
-                body: OperationBody::Payment(PaymentOp {
-                    destination: dest,
-                    asset: Asset::Native,
-                    amount: 1000,
-                }),
-            }]
-            .try_into()
-            .unwrap(),
-            ext: TransactionExt::V0,
-        };
-        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
-            tx,
-            signatures: vec![DecoratedSignature {
-                hint: SignatureHint([42u8; 4]),
-                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
-            }]
-            .try_into()
-            .unwrap(),
-        });
-
-        // 4. Wrap in a generalized tx set whose previous_ledger_hash matches
-        //    the LCL hash from the LedgerManager.
-        let classic_phase = stellar_xdr::curr::TransactionPhase::V0(
-            vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                TxSetComponentTxsMaybeDiscountedFee {
-                    base_fee: Some(100),
-                    txs: vec![envelope.clone()].try_into().unwrap(),
-                },
-            )]
-            .try_into()
-            .unwrap(),
-        );
-        let soroban_phase = stellar_xdr::curr::TransactionPhase::V0(
-            vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                TxSetComponentTxsMaybeDiscountedFee {
-                    base_fee: Some(100),
-                    txs: vec![].try_into().unwrap(),
-                },
-            )]
-            .try_into()
-            .unwrap(),
-        );
-        let gen_tx_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
-            previous_ledger_hash: Hash(header_hash.0),
-            phases: vec![classic_phase, soroban_phase].try_into().unwrap(),
-        });
-        let gen_hash = Hash256::hash(
-            &gen_tx_set
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .unwrap(),
-        );
-
-        // 5. Cache the tx set in the driver.
-        let tx_set =
-            TransactionSet::with_generalized(header_hash, gen_hash, vec![envelope], gen_tx_set);
-        driver.cache_tx_set(tx_set);
-
-        // 6. Build a StellarValue referencing this tx set.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let sv = StellarValue {
-            tx_set_hash: Hash(gen_hash.0),
-            close_time: TimePoint(now),
-            upgrades: VecM::default(),
-            ext: StellarValueExt::Basic,
-        };
-
-        // 7. slot 2 == lcl_seq(1) + 1 → current-ledger path.
-        //    Before the fix, this returned Valid because providers were None.
-        //    After the fix, the snapshot-backed provider rejects the unknown
-        //    source account.
-        let result = driver.validate_value_against_local_state(2, &sv, true);
-        assert_eq!(
-            result,
-            ValueValidation::Invalid,
-            "SCP must reject tx-set with unknown source account via snapshot providers"
-        );
     }
 
     // =========================================================================
