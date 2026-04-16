@@ -230,10 +230,13 @@ pub struct ScpVerifyMetrics {
     pub prefilter_reject_range: u64,
     /// Drops after verification (gate drift, self-message, non-quorum, invalid).
     pub post_verify_drops: u64,
-    /// Currently used slots in the verifier input channel.
-    pub verifier_queue_len: u64,
-    /// Currently queued verified envelopes awaiting the event loop.
-    pub verified_backlog: u64,
+    /// Currently used slots in the verifier input channel (event-loop sampled).
+    pub verify_input_backlog: u64,
+    /// Sampled depth of the verified-output channel (envelopes awaiting the
+    /// event loop). Captured by the event loop itself — unlike
+    /// `verify_input_backlog` which is also sampled by the verifier worker
+    /// as `handle.backlog()`, this is the true output-side queue depth.
+    pub verify_output_backlog: u64,
     /// Worker thread state (0=Running, 1=Stopping, 2=Dead).
     pub verifier_thread_state: u64,
     /// Cumulative enqueue→post-verify latency microseconds (sum).

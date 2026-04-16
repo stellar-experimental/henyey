@@ -214,6 +214,13 @@ pub(crate) fn scp_verify_worker(
         backlog.store(rx.len(), Ordering::Relaxed);
 
         let verdict = match catch_unwind(AssertUnwindSafe(|| {
+            // Test-only deterministic panic trigger. Used by
+            // `test_worker_panics_marks_dead` to assert the catch_unwind +
+            // Dead-state path without relying on real undefined behavior.
+            #[cfg(test)]
+            if intake.slot == u64::MAX - 1 {
+                panic!("test panic trigger");
+            }
             let signed_bytes = ScpDriver::build_signed_bytes(&network_id, &intake.envelope)?;
             ScpDriver::verify_signed_bytes(
                 &signed_bytes,

@@ -72,12 +72,12 @@ pub(crate) async fn metrics_handler(State(state): State<Arc<ServerState>>) -> im
          # HELP henyey_scp_post_verify_drops_total Envelopes dropped after verification (gate drift, self-message, non-quorum, invalid)\n\
          # TYPE henyey_scp_post_verify_drops_total counter\n\
          henyey_scp_post_verify_drops_total {}\n\
-         # HELP henyey_scp_verifier_queue_len Current depth of the SCP signature-verify input channel\n\
-         # TYPE henyey_scp_verifier_queue_len gauge\n\
-         henyey_scp_verifier_queue_len {}\n\
-         # HELP henyey_scp_verified_backlog Current depth of the verified-envelope output channel\n\
-         # TYPE henyey_scp_verified_backlog gauge\n\
-         henyey_scp_verified_backlog {}\n\
+         # HELP henyey_scp_verify_input_backlog Current depth of the SCP signature-verify input channel (event-loop sampled)\n\
+         # TYPE henyey_scp_verify_input_backlog gauge\n\
+         henyey_scp_verify_input_backlog {}\n\
+         # HELP henyey_scp_verify_output_backlog Current depth of the verified-envelope output channel (envelopes awaiting the event loop)\n\
+         # TYPE henyey_scp_verify_output_backlog gauge\n\
+         henyey_scp_verify_output_backlog {}\n\
          # HELP henyey_scp_verifier_thread_state Worker thread state (0=Running, 1=Stopping, 2=Dead)\n\
          # TYPE henyey_scp_verifier_thread_state gauge\n\
          henyey_scp_verifier_thread_state {}\n\
@@ -89,8 +89,8 @@ pub(crate) async fn metrics_handler(State(state): State<Arc<ServerState>>) -> im
         sv.prefilter_reject_close_time,
         sv.prefilter_reject_range,
         sv.post_verify_drops,
-        sv.verifier_queue_len,
-        sv.verified_backlog,
+        sv.verify_input_backlog,
+        sv.verify_output_backlog,
         sv.verifier_thread_state,
         sv.verify_latency_us_sum,
         sv.verify_latency_count,

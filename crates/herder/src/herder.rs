@@ -4034,17 +4034,25 @@ mod scp_pipeline_tests {
 
     #[test]
     fn test_process_verified_post_verify_gate_drift_too_old() {
-        // Pre-filter accepts while Syncing, but by the time process_verified
-        // runs the herder has slipped to a state that rejects via Range.
-        // We simulate this by placing the slot far below effective_min.
+        // Simulate gate drift: build an envelope whose signed close_time
+        // is current (so pre_filter's close-time gate passes), but by the
+        // time process_verified runs, the herder has advanced its current
+        // slot so far that the envelope's slot falls below `effective_min`
+        // — the Range gate must now reject it as `EnvelopeState::TooOld`.
         let herder = make_test_herder();
         herder.start_syncing();
+        // Set tracking_slot high so pre_filter's Range gate (keyed on
+        // tracking_slot — not pending_envelopes.current_slot) rejects slot=100.
+        herder.tracking_state.write().consensus_index = 10_000;
         herder.pending_envelopes.set_current_slot(10_000);
 
-        let env = make_unsigned_envelope(1, 1); // slot 1, current_slot 10_000
+        let secret = SecretKey::from_seed(&[7u8; 32]);
+        // Build a Nominate envelope with a fresh, signed StellarValue so
+        // close-time passes; slot=100 is far below effective_min.
+        let env = make_signed_test_envelope_outer(100, &herder, &secret);
         let intake = PipelinedIntake {
             envelope: env,
-            slot: 1,
+            slot: 100,
             is_externalize: false,
             peer_id: None,
             enqueue_at: std::time::Instant::now(),
@@ -4053,20 +4061,17 @@ mod scp_pipeline_tests {
             intake,
             verdict: Verdict::Ok,
         });
-        // Either TooOld (range reject) or Invalid (close-time reject) is
-        // acceptable — both paths represent gate-drift rejection; the exact
-        // reason depends on which gate in the pre-filter trips first.
-        assert!(
-            matches!(result, EnvelopeState::TooOld | EnvelopeState::Invalid),
-            "expected post-verify drift rejection, got {:?}",
-            result
+        assert_eq!(
+            result,
+            EnvelopeState::TooOld,
+            "post-verify Range gate should reject drifted slot as TooOld"
         );
     }
 
     // -------- scp_verify::worker tests --------
 
     #[test]
-    fn test_verifier_worker_dead_state_is_observable() {
+    fn test_worker_dead_on_channel_close() {
         let spawned = spawn_scp_verifier(Hash256::from_bytes([4u8; 32]), 8).expect("spawn");
         let state = spawned.handle.state.clone();
         let tx = spawned.handle.tx.clone();
@@ -4098,11 +4103,78 @@ mod scp_pipeline_tests {
     }
 
     #[test]
+    fn test_worker_panics_marks_dead() {
+        // The worker has a cfg(test) sentinel: slot == u64::MAX - 1 panics
+        // inside catch_unwind. The worker must emit a Panic verdict AND
+        // transition state to Dead, even if the input channel stays open.
+        let spawned = spawn_scp_verifier(Hash256::from_bytes([11u8; 32]), 8).expect("spawn");
+        let h = spawned.handle.clone();
+        let mut verified_rx = spawned.verified_rx;
+
+        let intake = PipelinedIntake {
+            envelope: make_unsigned_envelope(1, 1),
+            slot: u64::MAX - 1,
+            is_externalize: false,
+            peer_id: None,
+            enqueue_at: std::time::Instant::now(),
+        };
+        h.tx.blocking_send(intake).expect("send");
+
+        let ve = verified_rx
+            .blocking_recv()
+            .expect("worker should emit Panic verdict before exiting");
+        assert!(
+            matches!(ve.verdict, Verdict::Panic),
+            "expected Panic verdict, got {:?}",
+            ve.verdict
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && h.state() != VerifierState::Dead {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            h.state(),
+            VerifierState::Dead,
+            "worker must transition to Dead after a caught panic"
+        );
+    }
+
+    #[test]
     fn test_verifier_handle_queue_len_reports_used_slots() {
-        let spawned = spawn_scp_verifier(Hash256::from_bytes([9u8; 32]), 4).expect("spawn");
-        // The worker will drain as it receives; queue_len is best-effort.
-        // Immediately after construction, no items are queued.
-        assert!(spawned.handle.queue_len() <= 4);
-        assert!(matches!(spawned.handle.state(), VerifierState::Running));
+        // Construct a SignatureVerifierHandle directly (no spawned worker)
+        // so the channel isn't being drained. This tests only the queue
+        // arithmetic: `max_capacity() - capacity()` == number of enqueued
+        // items.
+        use crate::scp_verify::SignatureVerifierHandle;
+        use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize};
+        use std::sync::Arc;
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<PipelinedIntake>(8);
+        let handle = SignatureVerifierHandle {
+            tx: tx.clone(),
+            state: Arc::new(AtomicU8::new(VerifierState::Running as u8)),
+            heartbeat: Arc::new(AtomicU64::new(0)),
+            backlog: Arc::new(AtomicUsize::new(0)),
+        };
+
+        assert_eq!(handle.queue_len(), 0, "empty channel reports 0 used slots");
+
+        for i in 0..3 {
+            tx.blocking_send(PipelinedIntake {
+                envelope: make_unsigned_envelope(i as u64, 1),
+                slot: i as u64,
+                is_externalize: false,
+                peer_id: None,
+                enqueue_at: std::time::Instant::now(),
+            })
+            .expect("send");
+        }
+
+        assert_eq!(
+            handle.queue_len(),
+            3,
+            "three enqueued items must report queue_len == 3"
+        );
     }
 }

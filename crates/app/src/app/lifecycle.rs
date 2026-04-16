@@ -425,6 +425,8 @@ impl App {
                     self.set_phase(32); // 32 = scp_verified
                     tracing::trace!(select_iteration, "BRANCH: verified_rx");
                     self.process_verified(ve).await;
+                    self.scp_verify_output_backlog
+                        .store(verified_rx.len() as u64, Ordering::Relaxed);
                     if pending_close.is_none() && pending_catchup.is_none() {
                         pending_close = self.try_start_ledger_close().await;
                     }
@@ -1453,6 +1455,41 @@ impl App {
     /// from other channels stay responsive under verified-backlog bursts).
     const VERIFIED_DRAIN_BUDGET: usize = 32;
 
+    /// Pure helper: drain up to `budget` already-queued envelopes from an
+    /// unbounded verified-output channel via non-blocking `try_recv`, calling
+    /// `f` on each. Returns the number of envelopes drained.
+    ///
+    /// This helper does NOT await incoming envelopes; it only consumes what
+    /// is immediately available. The real `pump_scp_intake` uses a biased
+    /// `select!` that additionally awaits `verified_rx.recv()` while it
+    /// waits for verifier-channel capacity — which `drain_verified_bounded`
+    /// does not model. The helper exists to make the "stop at budget"
+    /// invariant unit-testable without spinning up an App.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) async fn drain_verified_bounded<F, Fut>(
+        verified_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
+            henyey_herder::scp_verify::VerifiedEnvelope,
+        >,
+        budget: usize,
+        mut f: F,
+    ) -> usize
+    where
+        F: FnMut(henyey_herder::scp_verify::VerifiedEnvelope) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let mut drained = 0;
+        while drained < budget {
+            match verified_rx.try_recv() {
+                Ok(ve) => {
+                    f(ve).await;
+                    drained += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        drained
+    }
+
     /// Drain one new SCP message into the dedicated verifier worker while
     /// opportunistically draining already-verified envelopes from the
     /// worker's output channel.
@@ -1485,6 +1522,8 @@ impl App {
         // this to distinguish "stuck waiting for the verify worker" from
         // "stuck inside select!".
         self.set_phase(31); // 31 = scp_verifier
+        self.scp_verify_output_backlog
+            .store(verified_rx.len() as u64, Ordering::Relaxed);
 
         let envelope = match scp_msg.message {
             StellarMessage::ScpMessage(e) => e,
@@ -1505,6 +1544,12 @@ impl App {
                 Some(ve) = verified_rx.recv(), if drained < Self::VERIFIED_DRAIN_BUDGET => {
                     self.process_verified(ve).await;
                     drained += 1;
+                    // `process_verified` set phase=32; restore the pump's
+                    // phase so the watchdog sees us back in "waiting on
+                    // verifier reserve" while we loop.
+                    self.set_phase(31);
+                    self.scp_verify_output_backlog
+                        .store(verified_rx.len() as u64, Ordering::Relaxed);
                 }
 
                 permit_res = verifier.tx.reserve() => {
@@ -1780,5 +1825,89 @@ impl App {
                 self.request_pending_tx_sets().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pump_tests {
+    use super::App;
+    use henyey_herder::scp_verify::{PipelinedIntake, Verdict, VerifiedEnvelope};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+    use stellar_xdr::curr::{
+        NodeId, PublicKey as XdrPublicKey, ScpBallot, ScpEnvelope, ScpStatement,
+        ScpStatementPledges, ScpStatementPrepare, Signature, Uint256, Value,
+    };
+
+    fn ve(slot: u64) -> VerifiedEnvelope {
+        let node_id = NodeId(XdrPublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let value = Value(vec![].try_into().unwrap());
+        let pledges = ScpStatementPledges::Prepare(ScpStatementPrepare {
+            quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+            ballot: ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        });
+        let statement = ScpStatement {
+            node_id,
+            slot_index: slot,
+            pledges,
+        };
+        VerifiedEnvelope {
+            intake: PipelinedIntake {
+                envelope: ScpEnvelope {
+                    statement,
+                    signature: Signature(vec![0u8; 64].try_into().unwrap()),
+                },
+                slot,
+                is_externalize: false,
+                peer_id: None,
+                enqueue_at: Instant::now(),
+            },
+            verdict: Verdict::Ok,
+        }
+    }
+
+    /// Seed the channel with 100 envelopes and call `drain_verified_bounded`
+    /// with budget 32. Exactly 32 must be drained; 68 must remain.
+    #[tokio::test]
+    async fn test_pump_bounded_drain() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<VerifiedEnvelope>();
+        for i in 0..100 {
+            tx.send(ve(i)).unwrap();
+        }
+
+        let seen = Arc::new(AtomicUsize::new(0));
+        let seen_clone = Arc::clone(&seen);
+        let drained = App::drain_verified_bounded(&mut rx, 32, |_ve| {
+            let s = Arc::clone(&seen_clone);
+            async move {
+                s.fetch_add(1, Ordering::SeqCst);
+            }
+        })
+        .await;
+
+        assert_eq!(drained, 32, "must stop at budget");
+        assert_eq!(seen.load(Ordering::SeqCst), 32, "callback ran 32 times");
+        assert_eq!(rx.len(), 68, "68 envelopes must remain queued");
+    }
+
+    /// When fewer than `budget` envelopes are queued, drain all of them and
+    /// return without blocking.
+    #[tokio::test]
+    async fn test_pump_drain_stops_on_empty() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<VerifiedEnvelope>();
+        for i in 0..5 {
+            tx.send(ve(i)).unwrap();
+        }
+        let drained = App::drain_verified_bounded(&mut rx, 32, |_ve| async {}).await;
+        assert_eq!(drained, 5);
+        assert_eq!(rx.len(), 0);
     }
 }

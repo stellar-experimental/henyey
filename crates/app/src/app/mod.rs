@@ -313,6 +313,10 @@ pub struct App {
     /// Poor-man's histogram for verify latency (enqueue → post-verify dispatch).
     scp_verify_latency_us_sum: AtomicU64,
     scp_verify_latency_count: AtomicU64,
+    /// Sampled depth of the verified-output channel (verified_rx.len()).
+    /// Updated by the event loop each time it touches `verified_rx`, so
+    /// `/metrics` reflects the true output-side backlog.
+    pub(crate) scp_verify_output_backlog: AtomicU64,
     /// Number of attempts to trigger the next consensus round.
     consensus_trigger_attempts: AtomicU64,
     /// Number of successful trigger_next_ledger calls.
@@ -651,6 +655,7 @@ impl App {
             scp_post_verify_drops: AtomicU64::new(0),
             scp_verify_latency_us_sum: AtomicU64::new(0),
             scp_verify_latency_count: AtomicU64::new(0),
+            scp_verify_output_backlog: AtomicU64::new(0),
             consensus_trigger_attempts: AtomicU64::new(0),
             consensus_trigger_successes: AtomicU64::new(0),
             consensus_trigger_failures: AtomicU64::new(0),
@@ -1597,8 +1602,8 @@ impl App {
                 post_verify_drops: self.scp_post_verify_drops.load(Ordering::Relaxed),
                 // Sample live from the verifier handle so the gauge reflects
                 // the current moment instead of the last `pump_scp_intake` tick.
-                verifier_queue_len: self.herder.scp_verifier_handle().queue_len() as u64,
-                verified_backlog: self.herder.scp_verifier_handle().backlog() as u64,
+                verify_input_backlog: self.herder.scp_verifier_handle().queue_len() as u64,
+                verify_output_backlog: self.scp_verify_output_backlog.load(Ordering::Relaxed),
                 verifier_thread_state: self.herder.scp_verifier_handle().state() as u64,
                 verify_latency_us_sum: self.scp_verify_latency_us_sum.load(Ordering::Relaxed),
                 verify_latency_count: self.scp_verify_latency_count.load(Ordering::Relaxed),
