@@ -30,42 +30,6 @@ use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
 /// Unified account + fee-balance provider backed by a single ledger snapshot.
 ///
 /// Creates one snapshot at construction time and reuses it for all lookups,
-/// ensuring consistency across both account-state and fee-balance reads
-/// during a single tx-set validation pass. Mirrors stellar-core's use of
-/// one `LedgerSnapshot` per `getInvalidTxListWithErrors` call.
-pub struct SnapshotValidationProviders {
-    snapshot: henyey_ledger::SnapshotHandle,
-}
-
-impl SnapshotValidationProviders {
-    /// Create a new provider pair from a ledger manager.
-    /// Returns `None` if the snapshot cannot be created.
-    pub fn from_ledger_manager(ledger_manager: &henyey_ledger::LedgerManager) -> Option<Self> {
-        let snapshot = ledger_manager.create_snapshot().ok()?;
-        Some(Self { snapshot })
-    }
-}
-
-impl AccountProvider for SnapshotValidationProviders {
-    fn load_account(
-        &self,
-        account_id: &stellar_xdr::curr::AccountId,
-    ) -> Option<stellar_xdr::curr::AccountEntry> {
-        self.snapshot.get_account(account_id).ok()?
-    }
-}
-
-impl FeeBalanceProvider for SnapshotValidationProviders {
-    fn get_available_balance(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
-        let acc = self.snapshot.get_account(account_id).ok()??;
-        let base_reserve = self.snapshot.header().base_reserve;
-        Some(henyey_ledger::reserves::available_to_send(
-            &acc,
-            base_reserve,
-        ))
-    }
-}
-
 /// Get the declared fee from a transaction envelope.
 ///
 /// For fee-bump transactions, returns the outer (bumped) fee.

@@ -629,8 +629,8 @@ impl Herder {
 
     /// Register a quorum set request if needed.
     /// The node_id is the envelope sender that uses this quorum set.
-    pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId, slot: u64) -> bool {
-        self.scp_driver.request_quorum_set(hash, node_id, slot)
+    pub fn request_quorum_set(&self, hash: Hash256, node_id: NodeId) -> bool {
+        self.scp_driver.request_quorum_set(hash, node_id)
     }
 
     /// Clear a quorum set request.
@@ -700,10 +700,6 @@ impl Herder {
 
             self.fetching_envelopes
                 .erase_below(purge_slot, last_checkpoint);
-
-            // Evict pending quorum set requests for old slots.
-            // Parity: stellar-core ItemFetcher::stopFetchingOutsideRange.
-            self.scp_driver.evict_pending_qsets_below(purge_slot);
 
             // Clear slot quorum tracker entries below purge_slot
             self.slot_quorum_tracker
@@ -1537,9 +1533,6 @@ impl Herder {
         let keep_slot = slot.saturating_sub(2);
         self.fetching_envelopes.erase_below(slot, keep_slot);
 
-        // Evict pending quorum set requests for old slots.
-        self.scp_driver.evict_pending_qsets_below(slot);
-
         // Clean up old data
         self.cleanup();
     }
@@ -2163,7 +2156,6 @@ impl Herder {
     pub fn erase_fetching_below(&self, slot_index: u64, slot_to_keep: u64) {
         self.fetching_envelopes
             .erase_below(slot_index, slot_to_keep);
-        self.scp_driver.evict_pending_qsets_below(slot_index);
     }
 
     /// Check if we have a cached TxSet in the fetching envelopes cache.

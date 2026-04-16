@@ -92,7 +92,7 @@ impl QuorumSetTracker {
     /// - If known by hash: associates with node immediately, returns false.
     /// - If already pending: adds node_id to the waiting set, returns false.
     /// - If new: creates a PendingQuorumSet entry, returns true.
-    pub fn request(&self, hash: Hash256, node_id: NodeId, slot: u64) -> bool {
+    pub fn request(&self, hash: Hash256, node_id: NodeId) -> bool {
         // If we already have this qset, store the node→qset association.
         let existing = self.by_hash.get(&hash).map(|qs| qs.clone());
         if let Some(qs) = existing {
@@ -104,11 +104,6 @@ impl QuorumSetTracker {
         // If already pending, add this node_id to the waiting set.
         if let Some(mut entry) = self.pending.get_mut(&hash) {
             entry.request_count += 1;
-            // Track the latest slot that needs this qset, so eviction
-            // doesn't prematurely remove entries still in active use.
-            if slot > entry.first_seen_slot {
-                entry.first_seen_slot = slot;
-            }
             // Cap per-entry node_ids to prevent unbounded growth
             if entry.node_ids.len() < MAX_PENDING_NODE_IDS {
                 entry.node_ids.insert(node_id);
@@ -133,7 +128,6 @@ impl QuorumSetTracker {
             PendingQuorumSet {
                 request_count: 1,
                 node_ids,
-                first_seen_slot: slot,
             },
         );
         info!(%hash, "Registered pending quorum set request");
@@ -220,24 +214,6 @@ impl QuorumSetTracker {
         }
     }
 
-    /// Evict pending requests whose first_seen_slot is below `min_slot`.
-    /// Mirrors stellar-core's `ItemFetcher::stopFetchingOutsideRange` which
-    /// removes trackers for envelopes outside the active slot window.
-    pub fn evict_pending_below(&self, min_slot: u64) {
-        let before = self.pending.len();
-        self.pending
-            .retain(|_hash, entry| entry.first_seen_slot >= min_slot);
-        let evicted = before.saturating_sub(self.pending.len());
-        if evicted > 0 {
-            debug!(
-                evicted,
-                remaining = self.pending.len(),
-                min_slot,
-                "Evicted stale pending quorum set requests"
-            );
-        }
-    }
-
     // --- Diagnostics ---
 
     pub fn sizes(&self) -> QuorumSetTrackerSizes {
@@ -288,7 +264,7 @@ mod tests {
         let hash = Hash256::from_bytes([1; 32]);
         let node = make_node_id(10);
 
-        assert!(tracker.request(hash, node.clone(), 100));
+        assert!(tracker.request(hash, node.clone()));
         assert_eq!(tracker.pending_count(), 1);
 
         let ids = tracker.pending_node_ids(&hash);
@@ -308,7 +284,7 @@ mod tests {
 
         // Now request for a different node
         let node_b = make_node_id(20);
-        assert!(!tracker.request(hash, node_b.clone(), 100));
+        assert!(!tracker.request(hash, node_b.clone()));
 
         // node_b should now have the qset
         assert!(tracker.get_by_node(&node_b).is_some());
@@ -321,9 +297,9 @@ mod tests {
         let tracker = QuorumSetTracker::new(node_key(0), None);
         let hash = Hash256::from_bytes([1; 32]);
 
-        assert!(tracker.request(hash, make_node_id(10), 100));
-        assert!(!tracker.request(hash, make_node_id(20), 100));
-        assert!(!tracker.request(hash, make_node_id(30), 100));
+        assert!(tracker.request(hash, make_node_id(10)));
+        assert!(!tracker.request(hash, make_node_id(20)));
+        assert!(!tracker.request(hash, make_node_id(30)));
 
         let ids = tracker.pending_node_ids(&hash);
         assert_eq!(ids.len(), 3);
@@ -349,7 +325,6 @@ mod tests {
             PendingQuorumSet {
                 request_count: 1,
                 node_ids: HashSet::new(),
-                first_seen_slot: 100,
             },
         );
 
@@ -367,9 +342,9 @@ mod tests {
         let hash = hash_quorum_set(&qs);
 
         // Simulate 3 nodes requesting the same qset
-        tracker.request(hash, make_node_id(10), 100);
-        tracker.request(hash, make_node_id(20), 100);
-        tracker.request(hash, make_node_id(30), 100);
+        tracker.request(hash, make_node_id(10));
+        tracker.request(hash, make_node_id(20));
+        tracker.request(hash, make_node_id(30));
         assert_eq!(tracker.pending_count(), 1);
 
         // Store for first node clears pending
@@ -390,7 +365,7 @@ mod tests {
         let tracker = QuorumSetTracker::new(node_key(0), None);
         let hash = Hash256::from_bytes([1; 32]);
 
-        tracker.request(hash, make_node_id(10), 100);
+        tracker.request(hash, make_node_id(10));
         assert_eq!(tracker.pending_count(), 1);
 
         tracker.clear_pending(&hash);
@@ -406,7 +381,7 @@ mod tests {
         tracker.store(&make_node_id(10), make_qset(2));
         tracker.store(&make_node_id(20), make_qset(3));
         // Add a pending entry
-        tracker.request(Hash256::from_bytes([99; 32]), make_node_id(30), 100);
+        tracker.request(Hash256::from_bytes([99; 32]), make_node_id(30));
 
         assert!(tracker.by_node_count() >= 3);
         assert_eq!(tracker.pending_count(), 1);
@@ -438,7 +413,7 @@ mod tests {
         let hash = hash_quorum_set(&qs);
 
         // Create pending for this hash
-        tracker.request(hash, make_node_id(10), 100);
+        tracker.request(hash, make_node_id(10));
         assert_eq!(tracker.pending_count(), 1);
 
         tracker.set_local(qs.clone());
@@ -481,13 +456,13 @@ mod tests {
             bytes[0] = (i & 0xFF) as u8;
             bytes[1] = ((i >> 8) & 0xFF) as u8;
             let hash = Hash256::from_bytes(bytes);
-            assert!(tracker.request(hash, make_node_id(1), 100));
+            assert!(tracker.request(hash, make_node_id(1)));
         }
         assert_eq!(tracker.pending_count(), MAX_PENDING_QSET_REQUESTS);
 
         // Next request should be rejected
         let overflow_hash = Hash256::from_bytes([0xFF; 32]);
-        assert!(!tracker.request(overflow_hash, make_node_id(2), 100));
+        assert!(!tracker.request(overflow_hash, make_node_id(2)));
         assert_eq!(tracker.pending_count(), MAX_PENDING_QSET_REQUESTS);
     }
 
@@ -498,11 +473,11 @@ mod tests {
         let hash = Hash256::from_bytes([42; 32]);
 
         // First request creates the entry
-        assert!(tracker.request(hash, make_node_id(1), 100));
+        assert!(tracker.request(hash, make_node_id(1)));
 
         // Add up to the cap
         for i in 2..=(MAX_PENDING_NODE_IDS as u8) {
-            assert!(!tracker.request(hash, make_node_id(i), 100));
+            assert!(!tracker.request(hash, make_node_id(i)));
         }
 
         // Verify node_ids are capped
@@ -510,84 +485,8 @@ mod tests {
         assert_eq!(node_ids.len(), MAX_PENDING_NODE_IDS);
 
         // Adding more doesn't grow beyond cap
-        assert!(!tracker.request(hash, make_node_id(200), 100));
+        assert!(!tracker.request(hash, make_node_id(200)));
         let node_ids = tracker.pending_node_ids(&hash);
         assert_eq!(node_ids.len(), MAX_PENDING_NODE_IDS);
-    }
-
-    #[test]
-    fn test_evict_pending_below_removes_old_slots() {
-        let tracker = QuorumSetTracker::new(node_key(0), None);
-
-        // Insert pending entries at different slots.
-        let hash_old = Hash256::from_bytes([1; 32]);
-        let hash_mid = Hash256::from_bytes([2; 32]);
-        let hash_new = Hash256::from_bytes([3; 32]);
-
-        assert!(tracker.request(hash_old, make_node_id(1), 50));
-        assert!(tracker.request(hash_mid, make_node_id(2), 100));
-        assert!(tracker.request(hash_new, make_node_id(3), 150));
-        assert_eq!(tracker.pending_count(), 3);
-
-        // Evict entries with first_seen_slot < 100.
-        tracker.evict_pending_below(100);
-        assert_eq!(tracker.pending_count(), 2);
-        assert!(tracker.pending_node_ids(&hash_old).is_empty());
-        assert!(!tracker.pending_node_ids(&hash_mid).is_empty());
-        assert!(!tracker.pending_node_ids(&hash_new).is_empty());
-    }
-
-    #[test]
-    fn test_evict_pending_unblocks_new_requests() {
-        let tracker = QuorumSetTracker::new(node_key(0), None);
-
-        // Fill to cap with old-slot entries.
-        for i in 0..MAX_PENDING_QSET_REQUESTS {
-            let mut bytes = [0u8; 32];
-            bytes[0] = (i & 0xFF) as u8;
-            bytes[1] = ((i >> 8) & 0xFF) as u8;
-            let hash = Hash256::from_bytes(bytes);
-            assert!(tracker.request(hash, make_node_id(1), 10));
-        }
-        assert_eq!(tracker.pending_count(), MAX_PENDING_QSET_REQUESTS);
-
-        // New request rejected at cap.
-        let fresh_hash = Hash256::from_bytes([0xFF; 32]);
-        assert!(!tracker.request(fresh_hash, make_node_id(2), 200));
-
-        // Evict all old entries.
-        tracker.evict_pending_below(100);
-        assert_eq!(tracker.pending_count(), 0);
-
-        // Now the fresh request succeeds.
-        assert!(tracker.request(fresh_hash, make_node_id(2), 200));
-        assert_eq!(tracker.pending_count(), 1);
-    }
-
-    #[test]
-    fn test_repeated_request_updates_slot_preventing_premature_eviction() {
-        let tracker = QuorumSetTracker::new(node_key(0), None);
-        let hash = Hash256::from_bytes([1; 32]);
-
-        // First seen at slot 50.
-        assert!(tracker.request(hash, make_node_id(1), 50));
-        assert_eq!(tracker.pending_count(), 1);
-
-        // Same hash requested again at slot 150 (different node).
-        assert!(!tracker.request(hash, make_node_id(2), 150));
-
-        // Evict entries below slot 100 — should NOT evict because
-        // the entry was refreshed to slot 150.
-        tracker.evict_pending_below(100);
-        assert_eq!(
-            tracker.pending_count(),
-            1,
-            "Entry refreshed to slot 150 should survive eviction below 100"
-        );
-        assert!(!tracker.pending_node_ids(&hash).is_empty());
-
-        // Evict below 200 — now it should be evicted.
-        tracker.evict_pending_below(200);
-        assert_eq!(tracker.pending_count(), 0);
     }
 }
