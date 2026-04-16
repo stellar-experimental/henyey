@@ -272,6 +272,13 @@ async fn rpc_handler(
 
     // Per-method timeout: sendTransaction is side-effectful — timing out after
     // tx submission would mislead the client into thinking it failed.
+    //
+    // NOTE: When timeout fires, any spawn_blocking work (DB queries, bucket reads,
+    // simulations) continues to completion on the blocking threadpool. The request
+    // permit is freed so new requests can be admitted. This is an inherent limitation
+    // of spawn_blocking — blocking work cannot be cancelled. Concurrent blocking work
+    // is still bounded by the DB semaphore, simulation semaphore, and the Tokio
+    // blocking thread pool limit.
     let is_write_method = request.method == "sendTransaction";
 
     if is_write_method {
