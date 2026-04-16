@@ -686,7 +686,7 @@ impl TransactionExecutor {
         if total_us > SLOW_TX_LOG_THRESHOLD_US || frame.is_soroban() {
             // Build a compact string of per-op-type timings sorted by time desc
             let mut op_timing_vec: Vec<_> = op_type_timings.iter().collect();
-            op_timing_vec.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            op_timing_vec.sort_by_key(|a| std::cmp::Reverse(a.1 .0));
             let op_timing_str: String = op_timing_vec
                 .iter()
                 .map(|(op, (us, count))| format!("{:?}:{}us×{}", op, us, count))

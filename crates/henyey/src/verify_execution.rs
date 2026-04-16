@@ -1120,7 +1120,7 @@ fn print_summary(stats: &mut VerifyStats, elapsed: Duration) {
         );
 
         // Top 10 slowest transactions overall
-        stats.slowest_txs.sort_by(|a, b| b.2.cmp(&a.2));
+        stats.slowest_txs.sort_by_key(|a| std::cmp::Reverse(a.2));
         println!();
         println!("  Top 10 slowest transactions:");
         for (i, (ledger, hash, us)) in stats.slowest_txs.iter().take(10).enumerate() {

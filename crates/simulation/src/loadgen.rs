@@ -1041,9 +1041,9 @@ impl LoadGenerator {
         let mut target = elapsed_ms * config.tx_rate as i64 / 1000;
 
         // Add spike contribution
-        if config.spike_interval > 0 {
+        {
             let elapsed_secs = (elapsed_ms / 1000) as u64;
-            let spikes = elapsed_secs / config.spike_interval;
+            let spikes = elapsed_secs.checked_div(config.spike_interval).unwrap_or(0);
             target += (spikes * config.spike_size as u64) as i64;
         }
 

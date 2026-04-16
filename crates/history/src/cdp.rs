@@ -483,7 +483,7 @@ impl CachedCdpDataLake {
             );
 
             let downloaded = std::sync::atomic::AtomicU32::new(0);
-            let _: Vec<Result<()>> = stream::iter(uncached.into_iter())
+            let _: Vec<Result<()>> = stream::iter(uncached)
                 .map(|seq| {
                     let downloaded = &downloaded;
                     async move {

@@ -204,7 +204,7 @@ impl CatchupManager {
         let downloaded = std::sync::atomic::AtomicU32::new(0);
 
         // Download buckets in parallel, saving directly to disk
-        let results: Vec<Result<()>> = stream::iter(to_download.into_iter())
+        let results: Vec<Result<()>> = stream::iter(to_download)
             .map(|hash| {
                 let archives = archives.clone();
                 let bucket_dir = bucket_dir.clone();

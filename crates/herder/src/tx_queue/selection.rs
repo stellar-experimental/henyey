@@ -682,7 +682,7 @@ fn build_classic_phase(
         }
 
         let mut components_by_fee: BTreeMap<i64, Vec<TransactionEnvelope>> = BTreeMap::new();
-        for (tx, lane) in classic_txs.into_iter().zip(lane_for_tx.into_iter()) {
+        for (tx, lane) in classic_txs.into_iter().zip(lane_for_tx) {
             let fee = lane_base_fee[lane];
             components_by_fee.entry(fee).or_default().push(tx);
         }

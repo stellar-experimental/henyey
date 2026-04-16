@@ -791,7 +791,7 @@ fn find_pool_share_trustlines_for_asset(
     //
     // Since all entries share the same account_id and are PoolShare type,
     // the effective canonical sort order is by pool ID bytes.
-    result.sort_by(|a, b| a.0 .0 .0.cmp(&b.0 .0 .0));
+    result.sort_by_key(|a| a.0 .0 .0);
 
     result
 }

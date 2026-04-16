@@ -2539,7 +2539,7 @@ async fn download_buckets_parallel(
             cached_count, download_count
         );
 
-        let results: Vec<anyhow::Result<()>> = stream::iter(to_download.into_iter())
+        let results: Vec<anyhow::Result<()>> = stream::iter(to_download)
             .map(|hash| {
                 let downloaded = &downloaded;
                 let bm = &bucket_manager;
@@ -2575,7 +2575,7 @@ async fn download_buckets_parallel(
     let unique_hashes_vec: Vec<henyey_common::Hash256> = unique_hashes.into_iter().collect();
     let load_count = unique_hashes_vec.len();
 
-    let load_results: Vec<anyhow::Result<()>> = stream::iter(unique_hashes_vec.into_iter())
+    let load_results: Vec<anyhow::Result<()>> = stream::iter(unique_hashes_vec)
         .map(|hash| {
             let bm = bucket_manager.clone();
             async move {

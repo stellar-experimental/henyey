@@ -171,7 +171,7 @@ impl Work for DownloadBucketsWork {
             let downloaded_count = std::sync::atomic::AtomicU32::new(0);
             let total_to_download = to_download.len();
 
-            let results: Vec<Result<(), String>> = stream::iter(to_download.into_iter())
+            let results: Vec<Result<(), String>> = stream::iter(to_download)
                 .map(|hash| {
                     let archive = archive.clone();
                     let bucket_dir = bucket_dir.clone();

@@ -959,7 +959,7 @@ impl SearchableBucketListSnapshot {
             .collect();
 
         // Sort by votes descending
-        winners.sort_by(|a, b| b.votes.cmp(&a.votes));
+        winners.sort_by_key(|w| std::cmp::Reverse(w.votes));
 
         // Truncate to max_winners
         winners.truncate(max_winners);

@@ -362,7 +362,7 @@ impl HistoryArchiveState {
     /// This is useful when you want to avoid downloading the same bucket twice.
     pub fn unique_bucket_hashes(&self) -> Vec<Hash256> {
         let mut hashes = self.all_bucket_hashes();
-        hashes.sort_by(|a, b| a.0.cmp(&b.0));
+        hashes.sort_by_key(|a| a.0);
         hashes.dedup();
         hashes
     }

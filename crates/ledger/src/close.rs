@@ -603,7 +603,7 @@ fn sorted_for_apply_sequential(txs: Vec<TxWithFee>, set_hash: Hash256) -> Vec<Tx
     let mut queues: Vec<std::collections::VecDeque<TxWithHash>> = by_account
         .into_values()
         .map(|mut txs| {
-            txs.sort_by(|a, b| tx_sequence_number(&a.0).cmp(&tx_sequence_number(&b.0)));
+            txs.sort_by_key(|a| tx_sequence_number(&a.0));
             txs.into_iter()
                 .map(|(tx, fee)| {
                     let h = tx_hash(&tx);

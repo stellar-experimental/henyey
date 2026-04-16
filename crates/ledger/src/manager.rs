@@ -3894,7 +3894,7 @@ impl LedgerCloseContext<'_> {
 
         // Build per-op-type timing summary sorted by time desc
         let mut op_timing_vec: Vec<_> = agg_op_type_timings.iter().collect();
-        op_timing_vec.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        op_timing_vec.sort_by_key(|a| std::cmp::Reverse(a.1 .0));
         let op_timing_str: String = op_timing_vec
             .iter()
             .map(|(op, (us, count))| format!("{:?}:{}us×{}", op, us, count))
@@ -5283,7 +5283,7 @@ impl LedgerCloseContext<'_> {
 
         // Sort tx_perf by exec_us descending (worst offenders first)
         let mut tx_timings = self.tx_perf;
-        tx_timings.sort_by(|a, b| b.exec_us.cmp(&a.exec_us));
+        tx_timings.sort_by_key(|a| std::cmp::Reverse(a.exec_us));
 
         let perf = crate::close::LedgerClosePerf {
             begin_close_us: self.timing_begin_close_us,
