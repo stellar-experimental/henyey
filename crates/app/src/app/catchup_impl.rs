@@ -15,7 +15,10 @@ impl App {
     ///
     /// This downloads history from archives and applies it to bring the
     /// node up to date with the network. Uses Minimal mode by default.
-    pub async fn catchup(&self, target: CatchupTarget) -> anyhow::Result<CatchupResult> {
+    pub async fn catchup(
+        &self,
+        target: CatchupTarget,
+    ) -> anyhow::Result<(CatchupResult, Option<CatchupPersistData>)> {
         self.catchup_with_mode(target, CatchupMode::Minimal).await
     }
 
@@ -29,7 +32,9 @@ impl App {
         &self,
         target: CatchupTarget,
         mode: CatchupMode,
-    ) -> anyhow::Result<CatchupResult> {
+    ) -> anyhow::Result<(CatchupResult, Option<CatchupPersistData>)> {
+        #[allow(unused_assignments)]
+        let mut catchup_persist_data: Option<CatchupPersistData> = None;
         // Fatal-failure guard (spec §13.3): a previous catchup detected a
         // verification/integrity failure.  Further attempts are futile and
         // must be blocked until the operator intervenes.
@@ -95,12 +100,15 @@ impl App {
             // Record skip time for cooldown to prevent repeated catchup attempts.
             // We need to wait for the next checkpoint to become available.
             *self.last_catchup_completed_at.write().await = Some(self.clock.now());
-            return Ok(CatchupResult {
-                ledger_seq: current,
-                ledger_hash: Hash256::default(),
-                buckets_applied: 0,
-                ledgers_replayed: 0,
-            });
+            return Ok((
+                CatchupResult {
+                    ledger_seq: current,
+                    ledger_hash: Hash256::default(),
+                    buckets_applied: 0,
+                    ledgers_replayed: 0,
+                },
+                None,
+            ));
         }
 
         // For replay-only catchup (Case 1: LCL >= genesis), we need the bucket
@@ -252,23 +260,20 @@ impl App {
                 // Read locks (bucket_list, hot_archive_guard) drop here
             };
 
-            // Flush pending bucket persistence before writing HAS/LCL.
-            // Safe to acquire write lock now that read guards are dropped.
-            self.ledger_manager
-                .bucket_list_mut()
-                .flush_pending_persist()
-                .map_err(|e| anyhow::anyhow!("Failed to flush pending bucket persist: {}", e))?;
-
-            self.db.transaction(|conn| {
-                conn.store_ledger_header(&final_header, &header_xdr)?;
-                conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
-                conn.set_last_closed_ledger(final_header.ledger_seq)?;
-                Ok(())
-            })?;
+            // Defer the flush + DB persist to the event loop. The catchup
+            // task runs inside tokio::spawn, and calling spawn_blocking
+            // here deadlocks when the blocking pool is saturated (#1713).
+            // Instead, return the persist data so the event loop can
+            // spawn the persist as a PendingPersist task.
+            catchup_persist_data = Some(CatchupPersistData {
+                header: final_header.clone(),
+                header_xdr,
+                has_json,
+            });
 
             tracing::info!(
                 ledger_seq = final_header.ledger_seq,
-                "Persisted HAS and LCL to DB after catchup"
+                "Catchup complete, persist data prepared (deferred to event loop)"
             );
         }
 
@@ -501,12 +506,15 @@ impl App {
         *self.last_catchup_completed_at.write().await = Some(self.clock.now());
 
         let final_ledger = self.get_current_ledger().await.unwrap_or(output.ledger_seq);
-        Ok(CatchupResult {
-            ledger_seq: final_ledger,
-            ledger_hash: output.ledger_hash,
-            buckets_applied: output.buckets_downloaded,
-            ledgers_replayed: output.ledgers_applied,
-        })
+        Ok((
+            CatchupResult {
+                ledger_seq: final_ledger,
+                ledger_hash: output.ledger_hash,
+                buckets_applied: output.buckets_downloaded,
+                ledgers_replayed: output.ledgers_applied,
+            },
+            catchup_persist_data,
+        ))
     }
 
     /// Get the latest checkpoint from history archives, using a cache to avoid repeated network calls.

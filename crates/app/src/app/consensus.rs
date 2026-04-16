@@ -861,14 +861,15 @@ impl App {
 
             let catchup_result = app.catchup(target).await;
 
-            let made_progress = catchup_result
-                .as_ref()
-                .map(|r| r.ledgers_replayed > 0 || r.buckets_applied > 0)
-                .unwrap_or(false);
+            let (made_progress, persist_data) = match &catchup_result {
+                Ok((r, pd)) => (r.ledgers_replayed > 0 || r.buckets_applied > 0, pd.clone()),
+                Err(_) => (false, None),
+            };
 
             let _ = result_tx.send(PendingCatchupResult {
-                result: catchup_result,
+                result: catchup_result.map(|(r, _)| r),
                 made_progress,
+                persist_data,
             });
         });
 

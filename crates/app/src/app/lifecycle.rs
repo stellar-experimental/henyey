@@ -29,7 +29,7 @@ impl App {
         if current_ledger == 0 {
             // This shouldn't happen if run_cmd did catchup, but handle it just in case
             tracing::info!("No ledger state, running catchup first");
-            self.catchup(CatchupTarget::Current).await?;
+            let (_result, _persist) = self.catchup(CatchupTarget::Current).await?;
         }
 
         // Bootstrap herder with current ledger
@@ -320,11 +320,79 @@ impl App {
                             .await;
 
                             if result.made_progress && pending.re_arm_recovery {
-                                // Pre-arm recovery so the main event loop checks
-                                // again on the next tick instead of waiting 35s.
                                 self.recovery_attempts_without_progress
                                     .store(1, Ordering::SeqCst);
                                 self.sync_recovery_pending.store(true, Ordering::SeqCst);
+                            }
+
+                            // Spawn catchup persist task if there's data to write.
+                            // This runs the flush + DB write on spawn_blocking from
+                            // the EVENT LOOP (not from inside the catchup task),
+                            // avoiding the spawn_blocking pool deadlock (#1713).
+                            if let Some(persist_data) = result.persist_data {
+                                let db = self.db.clone();
+                                let lm = self.ledger_manager.clone();
+                                let seq = persist_data.header.ledger_seq;
+                                let persist_handle = tokio::spawn(async move {
+                                    // Flush bucket persist (take-then-join)
+                                    let pending_handle =
+                                        lm.bucket_list_mut().take_pending_persist();
+                                    if let Some(handle) = pending_handle {
+                                        tokio::task::spawn_blocking(move || {
+                                            handle
+                                                .join()
+                                                .expect("bucket persist panicked")
+                                                .map_err(|e| format!("flush: {e}"))
+                                        })
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            Err(format!("flush task panicked: {e}"))
+                                        })
+                                        .map_err(|e| {
+                                            tracing::error!(error = %e, "Fatal: flush failed");
+                                            std::process::abort();
+                                        })
+                                        .ok();
+                                    }
+
+                                    // DB transaction
+                                    let db2 = db.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        use henyey_db::queries::*;
+                                        db2.transaction(|conn| {
+                                            conn.store_ledger_header(
+                                                &persist_data.header,
+                                                &persist_data.header_xdr,
+                                            )?;
+                                            conn.set_state(
+                                                henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE,
+                                                &persist_data.has_json,
+                                            )?;
+                                            conn.set_last_closed_ledger(
+                                                persist_data.header.ledger_seq,
+                                            )?;
+                                            Ok(())
+                                        })
+                                    })
+                                    .await
+                                    .unwrap_or_else(|e| {
+                                        tracing::error!(error = %e, "Catchup persist panicked");
+                                        Err(henyey_db::DbError::Integrity(e.to_string()))
+                                    })
+                                    .unwrap_or_else(|e| {
+                                        tracing::error!(error = %e, "Fatal: catchup persist failed");
+                                        std::process::abort();
+                                    });
+
+                                    tracing::info!(
+                                        ledger_seq = seq,
+                                        "Catchup persist completed"
+                                    );
+                                });
+                                pending_persist = Some(PendingPersist {
+                                    handle: persist_handle,
+                                    ledger_seq: seq,
+                                });
                             }
                         }
                         Err(_) => {
@@ -357,9 +425,9 @@ impl App {
                         }
                     }
 
-                    // Kick off first buffered close so the pending_close chain
-                    // starts immediately rather than waiting for the next tick.
-                    if pending_close.is_none() {
+                    // Kick off first buffered close — but only if no persist
+                    // is pending (it will start close when persist completes).
+                    if pending_close.is_none() && pending_persist.is_none() {
                         pending_close = self.try_start_ledger_close().await;
                     }
                 }

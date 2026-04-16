@@ -296,11 +296,24 @@ pub(super) struct PendingCatchup {
 }
 
 /// Result payload sent from the spawned catchup task to the event loop.
+/// Data needed to persist catchup state to SQLite after catchup completes.
+/// Prepared inside catchup_with_mode, persisted on the event loop as a
+/// PendingPersist task to avoid blocking inside tokio::spawn.
+#[derive(Clone)]
+pub struct CatchupPersistData {
+    pub header: stellar_xdr::curr::LedgerHeader,
+    pub header_xdr: Vec<u8>,
+    pub has_json: String,
+}
+
 pub(super) struct PendingCatchupResult {
     /// The catchup result (success or failure).
     pub result: anyhow::Result<CatchupResult>,
     /// Whether catchup actually advanced the ledger.
     pub made_progress: bool,
+    /// Persist data to be written after catchup completes.
+    /// None if catchup failed or didn't do work.
+    pub persist_data: Option<CatchupPersistData>,
 }
 
 /// State for a ledger close running on a background thread.

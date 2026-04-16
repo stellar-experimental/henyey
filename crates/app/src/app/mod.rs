@@ -63,7 +63,6 @@ use henyey_common::protocol::{
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::queries::StateQueries;
 use henyey_db::schema::state_keys;
-use henyey_db::LedgerQueries;
 use henyey_herder::{
     drift_tracker::CloseTimeDriftTracker,
     flow_control::compute_max_tx_size,

@@ -248,7 +248,8 @@ pub async fn run_catchup(
     print_catchup_info(&options, &target, effective_mode);
 
     // Run catchup with mode
-    let result = app.catchup_with_mode(target, effective_mode).await?;
+    let (result, _persist_data) = app.catchup_with_mode(target, effective_mode).await?;
+    // In CLI mode, persist data is ignored (the process exits after catchup).
 
     // Print result
     print_catchup_result(&result);

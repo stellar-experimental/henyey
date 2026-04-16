@@ -417,7 +417,8 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
             // Run catchup using mode from config
             let catchup_mode = app.config().catchup.to_mode();
             tracing::info!(?catchup_mode, "Starting catchup with configured mode");
-            app.catchup_with_mode(CatchupTarget::Current, catchup_mode)
+            let (_result, _persist) = app
+                .catchup_with_mode(CatchupTarget::Current, catchup_mode)
                 .await?;
 
             // Wait for SCP state request to complete
