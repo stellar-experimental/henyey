@@ -1207,6 +1207,63 @@ impl App {
         );
     }
 
+    /// Decide what action to take in the post-catchup (recently-caught-up)
+    /// branch of the consensus-stuck state machine.
+    ///
+    /// Pure function; extracted from `maybe_start_buffered_catchup` for unit
+    /// testing. See issue #1753 for the bug this fixes: without the
+    /// `archive_behind` gate, the node re-triggers a catchup that will
+    /// immediately be skipped ("target checkpoint not yet published"), and
+    /// since the skip path used to refresh the post-catchup window, the node
+    /// would spin. With this helper:
+    ///
+    /// - When `archive_behind == true`, `TriggerCatchup` is never returned;
+    ///   peer-SCP `AttemptRecovery` continues on schedule.
+    /// - When `catchup_triggered == true` (a catchup is actually in flight),
+    ///   only `AttemptRecovery` is permitted, so peer-SCP recovery still
+    ///   runs while the catchup does its work; we never re-spawn catchup.
+    ///
+    /// See `crates/app/src/app/catchup_impl.rs` tests at the bottom of the
+    /// file for the full decision table.
+    fn decide_post_catchup_action(
+        catchup_triggered: bool,
+        recovery_attempts: u32,
+        since_recovery: u64,
+        archive_behind: bool,
+    ) -> ConsensusStuckAction {
+        let schedule_due = since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS;
+        let recovery_exhausted = recovery_attempts >= MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
+
+        if catchup_triggered {
+            // A catchup is in flight. Don't re-trigger. Keep peer-SCP
+            // recovery running on schedule so we can still bridge small
+            // gaps while the catchup does its work.
+            if schedule_due {
+                ConsensusStuckAction::AttemptRecovery
+            } else {
+                ConsensusStuckAction::Wait
+            }
+        } else if recovery_exhausted {
+            // Recovery has run MAX times without progress. Ordinarily
+            // this escalates to catchup, but if the archive is known
+            // behind the target checkpoint, catchup would immediately
+            // skip — keep doing recovery on schedule instead.
+            if archive_behind {
+                if schedule_due {
+                    ConsensusStuckAction::AttemptRecovery
+                } else {
+                    ConsensusStuckAction::Wait
+                }
+            } else {
+                ConsensusStuckAction::TriggerCatchup
+            }
+        } else if schedule_due {
+            ConsensusStuckAction::AttemptRecovery
+        } else {
+            ConsensusStuckAction::Wait
+        }
+    }
+
     pub(super) async fn maybe_start_buffered_catchup(&self) -> Option<PendingCatchup> {
         // Fatal-failure guard (spec §13.3): block further catchup after a
         // verification/integrity failure.
@@ -1445,6 +1502,19 @@ impl App {
                                     t.elapsed().as_secs() < POST_CATCHUP_RECOVERY_WINDOW_SECS
                                 });
 
+                            // Is the archive known to be behind the target
+                            // checkpoint? A prior tick (in consensus.rs or the
+                            // validate_* paths below) may have armed this
+                            // backoff. When true, suppress TriggerCatchup in
+                            // the post-catchup branch — spawning catchup would
+                            // only hit the skip path and spin. Peer-SCP
+                            // recovery still runs on its normal cadence.
+                            let archive_behind = self
+                                .archive_behind_until
+                                .read()
+                                .await
+                                .is_some_and(|deadline| self.clock.now() < deadline);
+
                             // When recently caught up, prefer recovery over catchup.
                             // The next checkpoint won't be published to archives for
                             // ~5 min, so archive-based catchup will fail trying to
@@ -1452,47 +1522,59 @@ impl App {
                             // recovery has been attempted multiple times without
                             // progress, the missing slots have likely been evicted
                             // from peers' caches and recovery will never succeed.
-                            // In that case, fall through to catchup.
+                            // In that case, fall through to catchup — unless the
+                            // archive is also known to be behind the target
+                            // checkpoint, in which case keep running recovery on
+                            // schedule instead of spinning on a catchup that is
+                            // guaranteed to be skipped.
                             if recently_caught_up {
-                                if state.recovery_attempts >= MAX_POST_CATCHUP_RECOVERY_ATTEMPTS {
-                                    // Recovery is futile — same gap persists after
-                                    // multiple attempts. Peers don't have the missing
-                                    // EXTERNALIZE messages (they only cache ~12 recent
-                                    // slots). Trigger catchup instead of waiting the
-                                    // full POST_CATCHUP_RECOVERY_WINDOW.
-                                    tracing::warn!(
-                                        current_ledger,
-                                        first_buffered,
-                                        last_buffered,
-                                        elapsed_secs = elapsed,
-                                        recovery_attempts = state.recovery_attempts,
-                                        "Post-catchup recovery exhausted; \
-                                         missing slots unrecoverable via SCP. \
-                                         Triggering catchup."
-                                    );
-                                    state.catchup_triggered = true;
-                                    ConsensusStuckAction::TriggerCatchup
-                                } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
-                                    state.last_recovery_attempt = now;
-                                    state.recovery_attempts += 1;
-                                    tracing::info!(
-                                        current_ledger,
-                                        first_buffered,
-                                        elapsed_secs = elapsed,
-                                        recovery_attempts = state.recovery_attempts,
-                                        max_recovery_attempts = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS,
-                                        "Attempting out-of-sync recovery (post-catchup gap)"
-                                    );
-                                    ConsensusStuckAction::AttemptRecovery
-                                } else {
-                                    tracing::debug!(
-                                        current_ledger,
-                                        first_buffered,
-                                        elapsed_secs = elapsed,
-                                        "Waiting for SCP to fill post-catchup gap"
-                                    );
-                                    ConsensusStuckAction::Wait
+                                let decision = Self::decide_post_catchup_action(
+                                    state.catchup_triggered,
+                                    state.recovery_attempts,
+                                    since_recovery,
+                                    archive_behind,
+                                );
+                                match decision {
+                                    ConsensusStuckAction::TriggerCatchup => {
+                                        tracing::warn!(
+                                            current_ledger,
+                                            first_buffered,
+                                            last_buffered,
+                                            elapsed_secs = elapsed,
+                                            recovery_attempts = state.recovery_attempts,
+                                            "Post-catchup recovery exhausted; \
+                                             missing slots unrecoverable via SCP. \
+                                             Triggering catchup."
+                                        );
+                                        state.catchup_triggered = true;
+                                    }
+                                    ConsensusStuckAction::AttemptRecovery => {
+                                        state.last_recovery_attempt = now;
+                                        state.recovery_attempts += 1;
+                                        tracing::info!(
+                                            current_ledger,
+                                            first_buffered,
+                                            elapsed_secs = elapsed,
+                                            recovery_attempts = state.recovery_attempts,
+                                            max_recovery_attempts =
+                                                MAX_POST_CATCHUP_RECOVERY_ATTEMPTS,
+                                            archive_behind,
+                                            "Attempting out-of-sync recovery \
+                                             (post-catchup gap)"
+                                        );
+                                    }
+                                    ConsensusStuckAction::Wait => {
+                                        tracing::debug!(
+                                            current_ledger,
+                                            first_buffered,
+                                            elapsed_secs = elapsed,
+                                            catchup_triggered = state.catchup_triggered,
+                                            archive_behind,
+                                            "Waiting for SCP to fill post-catchup gap"
+                                        );
+                                    }
                                 }
+                                decision
                             } else {
                                 // Not recently caught up — use stuck timeout logic.
                                 let use_fast_timeout =
@@ -1677,6 +1759,14 @@ impl App {
 
     /// Check that the target's checkpoint has been published to the archive.
     /// Returns `true` if valid (or unknown), `false` if not yet published.
+    ///
+    /// On skip, arms the `archive_behind_until` backoff and clears
+    /// `catchup_triggered` in the consensus-stuck state — a catchup that was
+    /// requested but immediately skipped is not "in flight" and must not
+    /// block future retriggering. Critically, we do **not** stamp
+    /// `last_catchup_completed_at` here: that field feeds the post-catchup
+    /// recovery window, and refreshing it on skip would keep the node
+    /// trapped in the "recently caught up" decision branch (see #1753).
     async fn validate_target_checkpoint_published(&self, current_ledger: u32, target: u32) -> bool {
         let target_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
         match self.get_cached_archive_checkpoint().await {
@@ -1689,7 +1779,7 @@ impl App {
                         archive_latest,
                         "Buffered catchup skipped: target checkpoint not yet published"
                     );
-                    *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                    self.arm_archive_behind_backoff().await;
                     return false;
                 }
                 true
@@ -1703,6 +1793,10 @@ impl App {
 
     /// Check that the archive has a checkpoint newer than current_ledger.
     /// Returns `true` if valid, `false` if archive is behind or unreachable.
+    ///
+    /// On skip, arms the `archive_behind_until` backoff and clears
+    /// `catchup_triggered` — see `validate_target_checkpoint_published` for
+    /// the rationale for not stamping `last_catchup_completed_at`.
     async fn validate_archive_has_newer_checkpoint(
         &self,
         current_ledger: u32,
@@ -1717,7 +1811,7 @@ impl App {
                         first_buffered,
                         "Skipping catchup: archive has no newer checkpoint"
                     );
-                    *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                    self.arm_archive_behind_backoff().await;
                     return false;
                 }
                 tracing::info!(
@@ -1734,9 +1828,25 @@ impl App {
                     error = %e,
                     "Failed to query archive for latest checkpoint, skipping catchup"
                 );
-                *self.last_catchup_completed_at.write().await = Some(self.clock.now());
+                self.arm_archive_behind_backoff().await;
                 false
             }
+        }
+    }
+
+    /// Arm the `archive_behind_until` backoff and clear `catchup_triggered`.
+    ///
+    /// Called from the catchup skip paths. The backoff suppresses redundant
+    /// archive queries and suppresses `TriggerCatchup` in the post-catchup
+    /// decision helper for `ARCHIVE_BEHIND_BACKOFF_SECS`. Clearing
+    /// `catchup_triggered` keeps the stuck-state semantics consistent: a
+    /// skipped catchup is not "in flight", so a future catchup (once the
+    /// archive catches up) must be allowed to trigger.
+    async fn arm_archive_behind_backoff(&self) {
+        let deadline = self.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
+        *self.archive_behind_until.write().await = Some(deadline);
+        if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
+            state.catchup_triggered = false;
         }
     }
 
@@ -2158,5 +2268,79 @@ impl App {
                 "Reset tx_set tracking after catchup"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAX: u32 = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
+    const TIMER: u64 = OUT_OF_SYNC_RECOVERY_TIMER_SECS;
+
+    #[test]
+    fn test_decide_post_catchup_action_catchup_in_flight_waits_when_not_due() {
+        // Regression for #1753: when a catchup is already in flight, never
+        // re-trigger. Wait if peer-SCP recovery isn't due yet.
+        let action = App::decide_post_catchup_action(true, 0, TIMER - 1, false);
+        assert_eq!(action, ConsensusStuckAction::Wait);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_catchup_in_flight_recovers_when_due() {
+        // Even with catchup in flight, peer-SCP recovery runs on schedule.
+        let action = App::decide_post_catchup_action(true, 0, TIMER, false);
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_catchup_in_flight_never_retriggers_even_after_max() {
+        // If a catchup is in flight, we must not trigger another one even if
+        // recovery_attempts has already saturated.
+        let action = App::decide_post_catchup_action(true, MAX + 5, TIMER, false);
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+
+        let action = App::decide_post_catchup_action(true, MAX + 5, 0, false);
+        assert_eq!(action, ConsensusStuckAction::Wait);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_triggers_catchup_when_recovery_exhausted() {
+        // After MAX recovery attempts with no catchup in flight and no
+        // archive-behind signal, escalate to catchup.
+        let action = App::decide_post_catchup_action(false, MAX, TIMER, false);
+        assert_eq!(action, ConsensusStuckAction::TriggerCatchup);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_archive_behind_prevents_trigger() {
+        // Regression for #1753: when recovery is exhausted AND the archive is
+        // known behind, do NOT trigger catchup (which would just be skipped).
+        // Instead, keep peer-SCP recovery running on schedule.
+        let action = App::decide_post_catchup_action(false, MAX, TIMER, true);
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+
+        let action = App::decide_post_catchup_action(false, MAX + 10, TIMER, true);
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_archive_behind_waits_when_not_due() {
+        // Archive behind + recovery exhausted + peer-SCP not due => wait.
+        let action = App::decide_post_catchup_action(false, MAX, TIMER - 1, true);
+        assert_eq!(action, ConsensusStuckAction::Wait);
+    }
+
+    #[test]
+    fn test_decide_post_catchup_action_normal_recovery_on_schedule() {
+        // Before recovery is exhausted, just run recovery on its schedule.
+        let action = App::decide_post_catchup_action(false, 0, TIMER, false);
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+
+        let action = App::decide_post_catchup_action(false, 0, TIMER - 1, false);
+        assert_eq!(action, ConsensusStuckAction::Wait);
+
+        let action = App::decide_post_catchup_action(false, MAX - 1, TIMER, false);
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
 }

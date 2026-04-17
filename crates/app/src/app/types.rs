@@ -451,7 +451,7 @@ pub(super) struct ConsensusStuckState {
 }
 
 /// Actions to take when consensus is stuck.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConsensusStuckAction {
     /// Wait for tx set to arrive.
     Wait,
