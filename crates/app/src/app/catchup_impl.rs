@@ -2414,9 +2414,7 @@ mod tests {
         );
 
         // Drive the skip path.
-        let ok = app
-            .validate_target_checkpoint_published(50, target)
-            .await;
+        let ok = app.validate_target_checkpoint_published(50, target).await;
         assert!(!ok, "skip path must return false");
 
         // Post-conditions — the core #1753 regression guard:
