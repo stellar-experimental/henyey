@@ -1797,6 +1797,14 @@ impl App {
             });
     }
 
+    /// Test-only: rewind the last-event-loop-tick timestamp to a specific
+    /// millisecond value. Used by the watchdog regression test to
+    /// synthesize a freeze without actually stalling the tokio runtime.
+    #[cfg(test)]
+    pub(crate) fn set_last_event_loop_tick_for_test(&self, ms: u64) {
+        self.last_event_loop_tick_ms.store(ms, Ordering::Relaxed);
+    }
+
     /// Record a new event loop tick (for watchdog freshness tracking).
     #[inline]
     fn tick_event_loop(&self) {
@@ -1897,6 +1905,24 @@ impl App {
                                 );
                             }
                         }
+
+                        // Operator hint for #1759 diagnostics: name the exact
+                        // shell commands needed to capture the blocked
+                        // tokio frames while the freeze is live. The first
+                        // reporter of #1759 explicitly asked for this kind
+                        // of stack dump — surfacing the command in the
+                        // error log means the next recurrence is
+                        // self-diagnostic rather than requiring tribal
+                        // knowledge.
+                        tracing::error!(
+                            pid,
+                            "WATCHDOG: To capture blocked frames while the event loop is frozen, \
+                             run: py-spy dump --pid {}  \
+                             (or: sudo gcore {} && gdb -ex 'thread apply all bt' -ex quit core.{})",
+                            pid,
+                            pid,
+                            pid
+                        );
                     } else if stale_secs >= 15 {
                         tracing::warn!(
                             stale_secs,
@@ -1938,6 +1964,35 @@ impl App {
             .expect("Failed to spawn watchdog thread");
 
         tracing::info!("Event loop watchdog started");
+    }
+}
+
+/// Slow-op threshold: hotspots that exceed this wall-clock elapsed value
+/// in the event-loop task emit a single `WARN` log line naming the
+/// operation and its duration. Diagnostic only — helps narrow down
+/// which inline step is stalling the loop when issue #1759 recurs.
+pub(crate) const SLOW_OP_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Emit a `WARN`-level log line if `elapsed` exceeds `SLOW_OP_THRESHOLD`.
+///
+/// Intended use at event-loop hotspots where an occasional >500 ms stall
+/// is the actual bug we are diagnosing (see #1759). No-op in the fast
+/// path; zero cost beyond the `Duration` comparison.
+///
+/// The `op` label identifies the hotspot in logs; `count` is an
+/// op-specific counter (e.g. number of items drained) that helps
+/// distinguish "one slow item" from "many fast items that summed up".
+/// Pass `0` when not applicable.
+#[inline]
+pub(crate) fn warn_if_slow(elapsed: std::time::Duration, op: &'static str, count: u64) {
+    if elapsed >= SLOW_OP_THRESHOLD {
+        tracing::warn!(
+            op,
+            count,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "Slow event-loop operation (>= {}ms) — possible #1759 contributor",
+            SLOW_OP_THRESHOLD.as_millis()
+        );
     }
 }
 
@@ -3837,6 +3892,163 @@ mod tests {
             ARCHIVE_BEHIND_BACKOFF_SECS,
             OUT_OF_SYNC_RECOVERY_TIMER_SECS,
             ticks_per_window,
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // #1759 diagnostics regression tests
+    // -------------------------------------------------------------------
+
+    /// A minimal `tracing::Subscriber` that records events into a shared
+    /// `Vec<String>` so tests can assert on emitted fields without
+    /// pulling in `tracing_test` (not a workspace dependency).
+    #[derive(Clone, Default)]
+    struct CapturingSubscriber {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visit(String);
+            impl tracing::field::Visit for Visit {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!(" {}={:?}", field.name(), value));
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.0.push_str(&format!(" {}={}", field.name(), value));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push_str(&format!(" {}={}", field.name(), value));
+                }
+            }
+            let mut v = Visit(String::new());
+            event.record(&mut v);
+            let line = format!("{}{}", event.metadata().target(), v.0);
+            self.events.lock().unwrap().push(line);
+        }
+
+        fn enter(&self, _span: &tracing::Id) {}
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    /// `warn_if_slow(elapsed >= threshold, ...)` must emit exactly one
+    /// `WARN` event with the expected `op`, `count`, and
+    /// `elapsed_ms` fields.
+    #[test]
+    fn warn_if_slow_emits_on_slow_path() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+        tracing::subscriber::with_default(sub, || {
+            super::warn_if_slow(std::time::Duration::from_millis(600), "test_op", 42);
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one warn event expected");
+        let ev = &events[0];
+        assert!(ev.contains("op=test_op"), "op field missing: {}", ev);
+        assert!(ev.contains("count=42"), "count field missing: {}", ev);
+        assert!(
+            ev.contains("elapsed_ms=600"),
+            "elapsed_ms field missing or wrong: {}",
+            ev
+        );
+        assert!(
+            ev.contains("#1759"),
+            "log message should reference #1759: {}",
+            ev
+        );
+    }
+
+    /// `warn_if_slow(elapsed < threshold, ...)` must emit **no** events.
+    /// Guarantees zero log noise during normal operation.
+    #[test]
+    fn warn_if_slow_silent_on_fast_path() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+        tracing::subscriber::with_default(sub, || {
+            super::warn_if_slow(std::time::Duration::from_millis(100), "test_op", 0);
+        });
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "no events expected in the fast path"
+        );
+    }
+
+    /// `warn_if_slow` must emit exactly at the threshold boundary
+    /// (`elapsed == SLOW_OP_THRESHOLD`) — the `>=` comparison is
+    /// load-bearing for predictable behavior.
+    #[test]
+    fn warn_if_slow_boundary_inclusive() {
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+        tracing::subscriber::with_default(sub, || {
+            super::warn_if_slow(super::SLOW_OP_THRESHOLD, "boundary", 1);
+        });
+        assert_eq!(
+            events.lock().unwrap().len(),
+            1,
+            "threshold-equal elapsed must emit (>= comparison)"
+        );
+    }
+
+    /// Regression test for the #1759 watchdog operator-hint line.
+    ///
+    /// Synthesize a freeze by rewinding `last_event_loop_tick_ms` to 60 s
+    /// in the past. Start the watchdog thread. After one watchdog tick
+    /// (~10 s), the captured log must contain the `py-spy dump --pid`
+    /// operator instruction. Without this line, the next recurrence of
+    /// #1759 has no machine-readable breadcrumb pointing the operator
+    /// at the stack-dump command.
+    ///
+    /// This test is `#[ignore]`d by default because it has to wait for
+    /// the 10-second watchdog poll interval. Run with
+    /// `cargo test -p henyey-app -- --ignored watchdog_hint`.
+    #[tokio::test]
+    #[ignore = "waits for 10s watchdog interval; run with --ignored"]
+    async fn test_watchdog_emits_pyspy_hint_on_freeze() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        // Rewind the tick so the watchdog sees a 60 s freeze.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        app.set_last_event_loop_tick_for_test(now_ms.saturating_sub(60_000));
+        app.start_event_loop_watchdog();
+
+        // Wait slightly longer than one watchdog poll interval.
+        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+
+        let events = events.lock().unwrap();
+        let hint = events.iter().find(|e| e.contains("py-spy dump --pid"));
+        assert!(
+            hint.is_some(),
+            "watchdog must emit the py-spy hint line when stale_secs >= 30; \
+             captured events: {:?}",
+            *events
         );
     }
 }

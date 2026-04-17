@@ -1103,6 +1103,12 @@ impl App {
             let mut buffered_count = 0usize;
             let mut advance_to;
             let mut skipped_stale = 0u64;
+            // Time the `syncing_ledgers.write()`-held critical section
+            // plus the slot iteration it guards (#1759 diagnostics). Long
+            // iterations here block every other `syncing_ledgers`
+            // acquirer, including `try_start_ledger_close`.
+            let pes_critical_start = std::time::Instant::now();
+            let mut pes_iterated: u64 = 0;
             {
                 let current_ledger = self.current_ledger_seq();
                 let mut buffer = self.syncing_ledgers.write().await;
@@ -1138,6 +1144,7 @@ impl App {
                 advance_to = next_advance_to;
 
                 for slot in iter_start..=latest_externalized {
+                    pes_iterated += 1;
                     // Skip slots that have already been closed. Stale
                     // EXTERNALIZE messages (e.g., from SCP state responses)
                     // can set latest_externalized to old slots whose tx_sets
@@ -1201,6 +1208,11 @@ impl App {
                     }
                 }
             }
+            super::warn_if_slow(
+                pes_critical_start.elapsed(),
+                "process_externalized_slots_critical_section",
+                pes_iterated,
+            );
             if skipped_stale > 0 {
                 tracing::debug!(
                     skipped_stale,
@@ -1585,6 +1597,29 @@ impl App {
     /// performed inline before returning, so the node can continue
     /// processing SCP messages and consensus while the persist runs.
     pub(super) async fn handle_close_complete(
+        &self,
+        pending: PendingLedgerClose,
+        join_result: Result<std::result::Result<LedgerCloseResult, String>, tokio::task::JoinError>,
+        finalize: super::persist::LedgerCloseFinalizer,
+    ) -> bool {
+        // Time the full close-complete body (#1759 diagnostics).
+        // Phase=6 freezes are observed inside this arm; timing the
+        // whole function identifies when the post-close serialization
+        // / metadata / overlay bookkeeping exceeds SLOW_OP_THRESHOLD.
+        let close_complete_start = std::time::Instant::now();
+        let ledger_seq = pending.ledger_seq;
+        let result = self
+            .handle_close_complete_inner(pending, join_result, finalize)
+            .await;
+        super::warn_if_slow(
+            close_complete_start.elapsed(),
+            "handle_close_complete",
+            ledger_seq as u64,
+        );
+        result
+    }
+
+    async fn handle_close_complete_inner(
         &self,
         pending: PendingLedgerClose,
         join_result: Result<std::result::Result<LedgerCloseResult, String>, tokio::task::JoinError>,

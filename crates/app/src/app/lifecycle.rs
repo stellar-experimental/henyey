@@ -301,21 +301,42 @@ impl App {
                         }
 
                         // Drain SCP + fetch response channels.
+                        // Timed (#1759 diagnostics): if either drain takes
+                        // >= SLOW_OP_THRESHOLD, emit a WARN naming the arm
+                        // and the number of items handled.
+                        let scp_drain_start = std::time::Instant::now();
+                        let mut scp_drained: u64 = 0;
                         for _ in 0..MAX_DRAIN_PER_TICK {
                             match scp_message_rx.try_recv() {
-                                Ok(scp_msg) => self.pump_scp_intake(scp_msg, &mut verified_rx).await,
+                                Ok(scp_msg) => {
+                                    self.pump_scp_intake(scp_msg, &mut verified_rx).await;
+                                    scp_drained += 1;
+                                }
                                 Err(_) => break,
                             }
                         }
+                        super::warn_if_slow(
+                            scp_drain_start.elapsed(),
+                            "post_close_scp_drain",
+                            scp_drained,
+                        );
+                        let fetch_drain_start = std::time::Instant::now();
+                        let mut fetch_drained: u64 = 0;
                         for _ in 0..MAX_DRAIN_PER_TICK {
                             match fetch_response_rx.try_recv() {
                                 Ok(fetch_msg) => {
                                     self.decrement_fetch_channel_depth();
                                     self.handle_overlay_message(fetch_msg).await;
+                                    fetch_drained += 1;
                                 }
                                 Err(_) => break,
                             }
                         }
+                        super::warn_if_slow(
+                            fetch_drain_start.elapsed(),
+                            "post_close_fetch_drain",
+                            fetch_drained,
+                        );
                         if pending_catchup.is_none() {
                             if let Some(pc) = self.process_externalized_slots().await {
                                 pending_catchup = Some(pc);
@@ -635,24 +656,44 @@ impl App {
                     // arrived since the last tick are processed before we decide
                     // whether to trigger catchup or consensus.
 
-                    // Drain dedicated SCP channel first (highest priority)
+                    // Drain dedicated SCP channel first (highest priority).
+                    // Timed (#1759 diagnostics).
+                    let scp_drain_start = std::time::Instant::now();
+                    let mut scp_drained: u64 = 0;
                     for _ in 0..MAX_DRAIN_PER_TICK {
                         match scp_message_rx.try_recv() {
-                            Ok(scp_msg) => self.pump_scp_intake(scp_msg, &mut verified_rx).await,
+                            Ok(scp_msg) => {
+                                self.pump_scp_intake(scp_msg, &mut verified_rx).await;
+                                scp_drained += 1;
+                            }
                             Err(_) => break,
                         }
                     }
+                    super::warn_if_slow(
+                        scp_drain_start.elapsed(),
+                        "consensus_tick_scp_drain",
+                        scp_drained,
+                    );
 
-                    // Drain dedicated fetch response channel (tx_sets, dont_have, etc.)
+                    // Drain dedicated fetch response channel (tx_sets, dont_have, etc.).
+                    // Timed (#1759 diagnostics).
+                    let fetch_drain_start = std::time::Instant::now();
+                    let mut fetch_drained: u64 = 0;
                     for _ in 0..MAX_DRAIN_PER_TICK {
                         match fetch_response_rx.try_recv() {
                             Ok(fetch_msg) => {
                                 self.decrement_fetch_channel_depth();
                                 self.handle_overlay_message(fetch_msg).await;
+                                fetch_drained += 1;
                             }
                             Err(_) => break,
                         }
                     }
+                    super::warn_if_slow(
+                        fetch_drain_start.elapsed(),
+                        "consensus_tick_fetch_drain",
+                        fetch_drained,
+                    );
 
                     // Check if SyncRecoveryManager requested recovery
                     if pending_catchup.is_none()

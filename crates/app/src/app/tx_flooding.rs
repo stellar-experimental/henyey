@@ -511,6 +511,20 @@ impl App {
         &self,
         gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet,
     ) {
+        // Time the full body (#1759 diagnostics): this runs inline on
+        // the event loop for every GeneralizedTxSet, including the
+        // bulk-drain paths in the post-close and consensus-tick arms,
+        // so sustained slow calls here can drive phase=2/6 freezes.
+        let hgts_start = std::time::Instant::now();
+        let result = self.handle_generalized_tx_set_inner(gen_tx_set).await;
+        super::warn_if_slow(hgts_start.elapsed(), "handle_generalized_tx_set", 0);
+        result
+    }
+
+    async fn handle_generalized_tx_set_inner(
+        &self,
+        gen_tx_set: stellar_xdr::curr::GeneralizedTransactionSet,
+    ) {
         use henyey_herder::TransactionSet;
         use stellar_xdr::curr::{
             GeneralizedTransactionSet, TransactionPhase, TxSetComponent, WriteXdr,
