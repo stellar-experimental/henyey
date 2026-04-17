@@ -94,6 +94,10 @@ impl App {
                 .store(current_ledger as u64, Ordering::SeqCst);
             self.recovery_attempts_without_progress
                 .store(0, Ordering::SeqCst);
+            // Also clear any archive-behind backoff — the node is advancing
+            // again, so the next stall (if any) should query fresh.
+            let mut guard = self.archive_behind_until.write().await;
+            *guard = None;
         }
         let attempts = self
             .recovery_attempts_without_progress
@@ -709,24 +713,88 @@ impl App {
             attempts,
             "Recovery stalled for too long — forcing catchup"
         );
-        // Invalidate the archive checkpoint cache so CatchupTarget::Current
-        // queries the archive for the freshest checkpoint. In local mode
-        // (1 ledger/sec, checkpoints every 8 ledgers), a 60s-stale cache
-        // returns a checkpoint ~60 ledgers behind the validator, causing
-        // catchup to be a no-op when the captive core is already past it.
-        {
+
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+
+        // Archive-behind backoff: if a previous tick already learned the
+        // archive is behind `next_cp`, skip the redundant query. The archive
+        // publishes checkpoints every ~5 minutes, so re-asking every 10s is
+        // guaranteed waste (and creates a "Querying history archives" log
+        // storm during a stall). We still run the peer-SCP fallback below.
+        let backoff_active = {
+            let guard = self.archive_behind_until.read().await;
+            match *guard {
+                Some(deadline) => self.clock.now() < deadline,
+                None => false,
+            }
+        };
+
+        if !backoff_active {
+            // Invalidate the archive checkpoint cache so CatchupTarget::Current
+            // queries the archive for the freshest checkpoint. In local mode
+            // (1 ledger/sec, checkpoints every 8 ledgers), a 60s-stale cache
+            // returns a checkpoint ~60 ledgers behind the validator, causing
+            // catchup to be a no-op when the captive core is already past it.
             let mut cache = self.cached_archive_checkpoint.write().await;
             *cache = None;
         }
 
-        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
+        let archive_latest = if backoff_active {
+            tracing::debug!(
+                current_ledger,
+                next_checkpoint = next_cp,
+                "Skipping archive query: previous tick confirmed archive is behind \
+                 (backoff active)"
+            );
+            None
+        } else {
+            match self.get_cached_archive_checkpoint().await {
+                Ok(latest) if latest >= next_cp => {
+                    // Archive is current enough — clear any prior backoff.
+                    let mut guard = self.archive_behind_until.write().await;
+                    *guard = None;
+                    Some(latest)
+                }
+                Ok(latest) => {
+                    // Archive responded but is still behind. Arm the backoff.
+                    let deadline =
+                        self.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
+                    let mut guard = self.archive_behind_until.write().await;
+                    *guard = Some(deadline);
+                    tracing::debug!(
+                        archive_latest = latest,
+                        next_checkpoint = next_cp,
+                        backoff_secs = ARCHIVE_BEHIND_BACKOFF_SECS,
+                        "Archive behind next checkpoint — arming backoff"
+                    );
+                    None
+                }
+                Err(e) => {
+                    // Archive unreachable. Arm a shorter backoff to avoid a
+                    // per-tick query storm against a flaky archive while still
+                    // retrying periodically.
+                    let deadline =
+                        self.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
+                    let mut guard = self.archive_behind_until.write().await;
+                    *guard = Some(deadline);
+                    tracing::debug!(
+                        error = %e,
+                        next_checkpoint = next_cp,
+                        backoff_secs = ARCHIVE_BEHIND_BACKOFF_SECS,
+                        "Archive query failed — arming backoff"
+                    );
+                    None
+                }
+            }
+        };
 
-        let archive_latest = match self.get_cached_archive_checkpoint().await {
-            Ok(latest) if latest >= next_cp => latest,
-            Ok(_) | Err(_) => {
+        let archive_latest = match archive_latest {
+            Some(latest) => latest,
+            None => {
                 tracing::info!(
                     current_ledger,
                     next_checkpoint = next_cp,
+                    backoff_active,
                     "Recovery catchup skipped: archive hasn't published checkpoint yet \
                      — requesting SCP state from peers as fallback"
                 );

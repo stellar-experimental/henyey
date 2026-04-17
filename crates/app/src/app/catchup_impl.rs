@@ -432,6 +432,14 @@ impl App {
             *cache = Some((output.ledger_seq, self.clock.now()));
         }
 
+        // Clear archive-behind backoff — a successful catchup proves the
+        // archive is now publishing, so the next recovery cycle (if any)
+        // should query freshly.
+        {
+            let mut guard = self.archive_behind_until.write().await;
+            *guard = None;
+        }
+
         // Populate syncing_ledgers from externalized cache before returning.
         // During catchup, the message caching task records EXTERNALIZE +
         // tx_sets in the scp_driver caches.  But syncing_ledgers (which

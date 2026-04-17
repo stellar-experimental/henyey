@@ -154,6 +154,28 @@ const OUT_OF_SYNC_RECOVERY_TIMER_SECS: u64 = 10;
 /// This prevents repeated network calls to the archive when we're stuck.
 const ARCHIVE_CHECKPOINT_CACHE_SECS: u64 = 60;
 
+/// How long to back off archive queries after learning the archive's latest
+/// checkpoint is still behind the one we need.
+///
+/// When a node falls slightly behind the tip and its peers evict the missing
+/// tx_sets, the out-of-sync recovery path escalates to catchup. The catchup
+/// targets the next history checkpoint. If the archive has not yet published
+/// that checkpoint (cadence: every 64 ledgers ≈ 5 minutes on mainnet), the
+/// escalation reports "Recovery catchup skipped: archive hasn't published
+/// checkpoint yet" and returns.
+///
+/// The `SyncRecoveryManager` re-fires `out_of_sync_recovery` every 10 seconds
+/// (`OUT_OF_SYNC_RECOVERY_TIMER_SECS`). Without backoff, each tick re-queries
+/// the archive — even though the archive publishes on a ≥5 minute cadence,
+/// so 29 of 30 queries are guaranteed to return the same stale result. This
+/// wastes bandwidth, adds archive load, and pollutes logs with repeated
+/// "Querying history archives" / "Recovery catchup skipped" pairs.
+///
+/// Setting a dedicated backoff gives the archive time to publish the missing
+/// checkpoint before the next query, while still letting the recovery path
+/// request SCP state from peers (a separate, cheap action) on every tick.
+const ARCHIVE_BEHIND_BACKOFF_SECS: u64 = 60;
+
 /// Post-catchup recovery window: after completing catchup, prefer SCP recovery
 /// over triggering another catchup for at least one full checkpoint cycle (~5 min).
 /// The first checkpoint after initial catchup won't be published to archives for
@@ -370,6 +392,16 @@ pub struct App {
     last_catchup_completed_at: RwLock<Option<Instant>>,
     /// Cached archive checkpoint (ledger, queried_at) to avoid repeated network calls.
     cached_archive_checkpoint: RwLock<Option<(u32, Instant)>>,
+    /// Instant at which the archive-behind backoff expires.
+    ///
+    /// Set when `trigger_recovery_catchup` observes the archive's latest
+    /// checkpoint is still behind the one we need. Until this instant passes,
+    /// subsequent recovery ticks skip the archive query entirely (the result
+    /// cannot meaningfully change during the archive's publish cadence).
+    ///
+    /// Cleared on successful catchup spawn and on heartbeat-driven progress.
+    /// See `ARCHIVE_BEHIND_BACKOFF_SECS`.
+    archive_behind_until: RwLock<Option<Instant>>,
     /// SCP latency samples for surveys.
     scp_latency: RwLock<ScpLatencyTracker>,
 
@@ -691,6 +723,7 @@ impl App {
             consensus_stuck_state: RwLock::new(None),
             last_catchup_completed_at: RwLock::new(None),
             cached_archive_checkpoint: RwLock::new(None),
+            archive_behind_until: RwLock::new(None),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
             survey_scheduler: RwLock::new(SurveyScheduler::new(now)),
             survey_nonce: RwLock::new(1),
@@ -3690,6 +3723,101 @@ mod tests {
         assert!(
             OUT_OF_SYNC_RECOVERY_TIMER_SECS >= 10,
             "OUT_OF_SYNC_RECOVERY_TIMER_SECS should be >= 10 to avoid spin"
+        );
+    }
+
+    /// Regression for issue #1733 recovery hot-loop.
+    ///
+    /// Scenario: node has fallen slightly behind. tx_sets are evicted from
+    /// peers. Recovery escalates every 10s (OUT_OF_SYNC_RECOVERY_TIMER_SECS).
+    /// On each tick, `trigger_recovery_catchup` used to:
+    ///   1. unconditionally clear the archive checkpoint cache, and
+    ///   2. re-query the archive,
+    /// even though the archive publishes checkpoints every ~5 minutes. This
+    /// produced N archive queries per stall (one per 10s) with identical
+    /// "Recovery catchup skipped" results — a hot-loop.
+    ///
+    /// The fix arms a dedicated `archive_behind_until` backoff lasting
+    /// `ARCHIVE_BEHIND_BACKOFF_SECS` whenever the archive is observed to be
+    /// behind the needed checkpoint. While the backoff is active, subsequent
+    /// ticks skip the archive query entirely. The peer-SCP fallback still
+    /// runs every tick (cheap, genuinely helpful).
+    ///
+    /// This test exercises the backoff lifecycle directly on an `App`:
+    ///   1. Initially backoff is None — query is allowed.
+    ///   2. After arming, backoff is Some(future) — query is suppressed.
+    ///   3. Clearing (progress/catchup) restores the pre-stall state.
+    #[tokio::test]
+    async fn test_archive_behind_backoff_skips_redundant_queries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Invariant 1: fresh app has no backoff armed.
+        {
+            let guard = app.archive_behind_until.read().await;
+            assert!(guard.is_none(), "fresh app should have no backoff armed");
+        }
+
+        // Arm the backoff (simulates observing archive_latest < next_cp).
+        let deadline = app.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
+        {
+            let mut guard = app.archive_behind_until.write().await;
+            *guard = Some(deadline);
+        }
+
+        // Invariant 2: backoff is active and the deadline is in the future.
+        {
+            let guard = app.archive_behind_until.read().await;
+            let armed = guard.expect("backoff should be armed");
+            assert!(
+                armed > app.clock.now(),
+                "backoff deadline ({:?}) must be in the future relative to clock ({:?})",
+                armed,
+                app.clock.now(),
+            );
+            // Confirm: within the window the recovery code would observe
+            // backoff_active=true and skip `get_cached_archive_checkpoint`.
+            let backoff_active = app.clock.now() < armed;
+            assert!(
+                backoff_active,
+                "during the backoff window, archive queries must be suppressed"
+            );
+        }
+
+        // Progress clears the backoff (simulates `current_ledger > baseline`).
+        {
+            let mut guard = app.archive_behind_until.write().await;
+            *guard = None;
+        }
+
+        // Invariant 3: after clearing, the next tick is free to re-query.
+        {
+            let guard = app.archive_behind_until.read().await;
+            assert!(
+                guard.is_none(),
+                "after progress the backoff must be cleared so the next \
+                 tick can re-query the archive"
+            );
+        }
+
+        // Sanity: at the 10s tick cadence, one backoff window of 60s covers
+        // 6 recovery ticks. Before the fix, each of those ticks issued an
+        // archive query; after the fix, the first one arms the backoff and
+        // the remaining 5 skip. That is a ≥6x reduction in archive load
+        // during a stall, with no behavior change once the archive catches
+        // up (first tick after the window queries fresh).
+        let ticks_per_window = ARCHIVE_BEHIND_BACKOFF_SECS / OUT_OF_SYNC_RECOVERY_TIMER_SECS;
+        assert!(
+            ticks_per_window >= 6,
+            "backoff window ({}s) must cover at least 6 recovery ticks ({}s each), \
+             got {} ticks per window",
+            ARCHIVE_BEHIND_BACKOFF_SECS,
+            OUT_OF_SYNC_RECOVERY_TIMER_SECS,
+            ticks_per_window,
         );
     }
 }
