@@ -15,11 +15,17 @@ impl App {
     ///
     /// This downloads history from archives and applies it to bring the
     /// node up to date with the network. Uses Minimal mode by default.
+    ///
+    /// `finalize` specifies how post-catchup state (final header, HAS,
+    /// last_closed_ledger) is persisted — see [`CatchupFinalizer`]. It is
+    /// a required argument; there is no way to skip persistence.
     pub async fn catchup(
         &self,
         target: CatchupTarget,
-    ) -> anyhow::Result<(CatchupResult, Option<CatchupPersistData>)> {
-        self.catchup_with_mode(target, CatchupMode::Minimal).await
+        finalize: CatchupFinalizer,
+    ) -> anyhow::Result<CatchupResult> {
+        self.catchup_with_mode(target, CatchupMode::Minimal, finalize)
+            .await
     }
 
     /// Run catchup to a target ledger with a specific mode.
@@ -28,11 +34,17 @@ impl App {
     /// - Minimal: Only download bucket state at latest checkpoint
     /// - Recent(N): Download and replay the last N ledgers
     /// - Complete: Download complete history from genesis
+    ///
+    /// `finalize` specifies how post-catchup state (final header, HAS,
+    /// last_closed_ledger) is persisted. The finalizer is consumed before
+    /// this function returns (Inline) or at caller's discretion via the
+    /// oneshot (Deferred). See [`CatchupFinalizer`].
     pub async fn catchup_with_mode(
         &self,
         target: CatchupTarget,
         mode: CatchupMode,
-    ) -> anyhow::Result<(CatchupResult, Option<CatchupPersistData>)> {
+        finalize: CatchupFinalizer,
+    ) -> anyhow::Result<CatchupResult> {
         #[allow(unused_assignments)]
         let mut catchup_persist_data: Option<CatchupPersistData> = None;
         // Fatal-failure guard (spec §13.3): a previous catchup detected a
@@ -100,15 +112,16 @@ impl App {
             // Record skip time for cooldown to prevent repeated catchup attempts.
             // We need to wait for the next checkpoint to become available.
             *self.last_catchup_completed_at.write().await = Some(self.clock.now());
-            return Ok((
-                CatchupResult {
-                    ledger_seq: current,
-                    ledger_hash: Hash256::default(),
-                    buckets_applied: 0,
-                    ledgers_replayed: 0,
-                },
-                None,
-            ));
+            // Drop finalize — no work was done, nothing to persist. For a
+            // Deferred finalizer this drops the Sender, which the receiver
+            // observes as a closed channel (treated as "no persist data").
+            drop(finalize);
+            return Ok(CatchupResult {
+                ledger_seq: current,
+                ledger_hash: Hash256::default(),
+                buckets_applied: 0,
+                ledgers_replayed: 0,
+            });
         }
 
         // For replay-only catchup (Case 1: LCL >= genesis), we need the bucket
@@ -514,15 +527,34 @@ impl App {
         *self.last_catchup_completed_at.write().await = Some(self.clock.now());
 
         let final_ledger = self.get_current_ledger().await.unwrap_or(output.ledger_seq);
-        Ok((
-            CatchupResult {
-                ledger_seq: final_ledger,
-                ledger_hash: output.ledger_hash,
-                buckets_applied: output.buckets_downloaded,
-                ledgers_replayed: output.ledgers_applied,
-            },
-            catchup_persist_data,
-        ))
+        let catchup_result = CatchupResult {
+            ledger_seq: final_ledger,
+            ledger_hash: output.ledger_hash,
+            buckets_applied: output.buckets_downloaded,
+            ledgers_replayed: output.ledgers_applied,
+        };
+
+        // Consume the finalizer. If catchup prepared persist data (i.e.
+        // it actually did work), apply or forward it; otherwise drop the
+        // finalizer silently — nothing to persist.
+        if let Some(persist_data) = catchup_persist_data {
+            match finalize.0 {
+                super::persist::CatchupFinalizerInner::Inline { db, ledger_manager } => {
+                    persist_data.apply(db, ledger_manager).await;
+                    tracing::info!(
+                        ledger_seq = catchup_result.ledger_seq,
+                        "Catchup persist completed (inline)"
+                    );
+                }
+                super::persist::CatchupFinalizerInner::Deferred(tx) => {
+                    // Receiver may have been dropped if the spawning task was
+                    // cancelled — that's fine, nothing to do.
+                    let _ = tx.send(persist_data);
+                }
+            }
+        }
+
+        Ok(catchup_result)
     }
 
     /// Get the latest checkpoint from history archives, using a cache to avoid repeated network calls.

@@ -27,9 +27,38 @@ impl App {
         let current_ledger = self.get_current_ledger().await?;
 
         if current_ledger == 0 {
-            // This shouldn't happen if run_cmd did catchup, but handle it just in case
+            // This shouldn't happen if run_cmd did catchup, but handle it just
+            // in case (RunMode::Watcher skips startup catchup, so we can
+            // legitimately reach here with no persisted state).
             tracing::info!("No ledger state, running catchup first");
-            let (_result, _persist) = self.catchup(CatchupTarget::Current).await?;
+
+            // We're inside `App::run()` which is itself called from a
+            // `tokio::spawn` task (see run_cmd::run_node). Calling
+            // spawn_blocking here risks the deadlock class from #1713 if the
+            // blocking pool is saturated. Use the Deferred finalizer pattern
+            // exactly as the event-loop recovery path does: collect persist
+            // data via a oneshot, then drive the PersistJob::Catchup task to
+            // completion.
+            let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
+            let finalize = super::persist::CatchupFinalizer::deferred(persist_tx);
+            let _result = self.catchup(CatchupTarget::Current, finalize).await?;
+            if let Ok(persist_data) = persist_rx.try_recv() {
+                let seq = persist_data.header.ledger_seq;
+                let pending = super::persist::spawn_persist_task(
+                    super::persist::PersistJob::Catchup {
+                        data: Box::new(persist_data),
+                        db: self.db.clone(),
+                        ledger_manager: self.ledger_manager.clone(),
+                    },
+                    seq,
+                );
+                // Drive the persist task to completion before continuing.
+                // The persist task aborts the process on failure, so we only
+                // observe success here.
+                if let Err(e) = pending.handle.await {
+                    anyhow::bail!("startup catchup persist task failed: {e}");
+                }
+            }
         }
 
         // Bootstrap herder with current ledger

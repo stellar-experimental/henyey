@@ -38,7 +38,7 @@
 //! with built-in implementations for logging ([`TracingProgressCallback`]) and
 //! console output ([`ConsoleProgressCallback`]).
 
-use crate::app::{App, CatchupResult, CatchupTarget};
+use crate::app::{App, CatchupFinalizer, CatchupResult, CatchupTarget};
 use crate::config::AppConfig;
 pub use henyey_history::CatchupMode;
 
@@ -247,9 +247,16 @@ pub async fn run_catchup(
     // Print catchup info
     print_catchup_info(&options, &target, effective_mode);
 
-    // Run catchup with mode
-    let (result, _persist_data) = app.catchup_with_mode(target, effective_mode).await?;
-    // In CLI mode, persist data is ignored (the process exits after catchup).
+    // Run catchup with mode. Use an Inline finalizer so that the final
+    // header / HAS / LCL are persisted to the DB *before* `run_catchup`
+    // returns — the CLI process exits immediately after, and any deferred
+    // work on the event loop would be lost (#1749). This is safe here:
+    // we're on the top-level runtime with no watchdog and no concurrent
+    // blocking-pool pressure.
+    let finalize = CatchupFinalizer::inline(app.database().clone(), app.ledger_manager().clone());
+    let result = app
+        .catchup_with_mode(target, effective_mode, finalize)
+        .await?;
 
     // Print result
     print_catchup_result(&result);

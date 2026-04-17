@@ -203,6 +203,7 @@ mod tx_flooding;
 mod types;
 mod upgrades;
 
+pub use persist::CatchupFinalizer;
 pub(crate) use persist::CatchupPersistData;
 use types::*;
 pub use types::{

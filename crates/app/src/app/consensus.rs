@@ -927,15 +927,23 @@ impl App {
             tracing::info!(label = label_owned, "Spawned catchup task starting");
             app.set_phase(14); // 14 = catchup_running
 
-            let catchup_result = app.catchup(target).await;
+            // Oneshot used only inside this task to capture persist data
+            // from `catchup_with_mode`'s Deferred finalizer, so we can
+            // forward it to the event loop alongside the CatchupResult.
+            let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
+            let finalize = super::persist::CatchupFinalizer::deferred(persist_tx);
+            let catchup_result = app.catchup(target, finalize).await;
 
             let (made_progress, persist_data) = match &catchup_result {
-                Ok((r, pd)) => (r.ledgers_replayed > 0 || r.buckets_applied > 0, pd.clone()),
+                Ok(r) => {
+                    let pd = persist_rx.try_recv().ok();
+                    (r.ledgers_replayed > 0 || r.buckets_applied > 0, pd)
+                }
                 Err(_) => (false, None),
             };
 
             let _ = result_tx.send(PendingCatchupResult {
-                result: catchup_result.map(|(r, _)| r),
+                result: catchup_result,
                 made_progress,
                 persist_data,
             });

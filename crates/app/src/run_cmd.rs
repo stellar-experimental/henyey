@@ -414,11 +414,20 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
                 })
             };
 
-            // Run catchup using mode from config
+            // Run catchup using mode from config.
+            // We use an Inline finalizer so final header / HAS / LCL are
+            // persisted before returning. This is safe here: we're on the
+            // top-level runtime, and `app.run()` (which owns the watchdog
+            // and the blocking-pool-sensitive event loop) has not yet been
+            // spawned (see line below). See #1749.
             let catchup_mode = app.config().catchup.to_mode();
             tracing::info!(?catchup_mode, "Starting catchup with configured mode");
-            let (_result, _persist) = app
-                .catchup_with_mode(CatchupTarget::Current, catchup_mode)
+            let finalize = crate::app::CatchupFinalizer::inline(
+                app.database().clone(),
+                app.ledger_manager().clone(),
+            );
+            let _result = app
+                .catchup_with_mode(CatchupTarget::Current, catchup_mode, finalize)
                 .await?;
 
             // Wait for SCP state request to complete

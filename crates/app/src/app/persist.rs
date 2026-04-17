@@ -44,6 +44,66 @@ impl CatchupPersistData {
             Ok(())
         })
     }
+
+    /// Finalize catchup state: flush bucket persist handles, then write
+    /// header/HAS/LCL to the database.
+    ///
+    /// This is the single source of truth for post-catchup persistence.
+    /// It is called synchronously by the `Inline` finalizer variant and
+    /// by the deferred [`PersistJob::Catchup`] event-loop task. Any
+    /// failure aborts the process — persist failures are unrecoverable
+    /// because on-disk state would diverge from in-memory state.
+    pub(crate) async fn apply(self, db: Database, ledger_manager: Arc<LedgerManager>) {
+        flush_bucket_persist(&ledger_manager).await;
+
+        let db2 = db.clone();
+        let data = self;
+        if let Err(e) = tokio::task::spawn_blocking(move || data.write_to_db(&db2))
+            .await
+            .unwrap_or_else(|e| Err(henyey_db::DbError::Integrity(e.to_string())))
+        {
+            fatal_persist_error("catchup DB write", &e);
+        }
+    }
+}
+
+/// How [`App::catchup_with_mode`] finalizes state after catchup completes.
+///
+/// This is a required argument — there is no "drop on the floor" option.
+/// Construction is through [`CatchupFinalizer::inline`] (for top-level /
+/// pre-event-loop callers) or the crate-private [`CatchupFinalizer::deferred`]
+/// (for the runtime event-loop path that must not block inside `tokio::spawn`).
+pub struct CatchupFinalizer(pub(super) CatchupFinalizerInner);
+
+pub(super) enum CatchupFinalizerInner {
+    /// Block on bucket flush + DB write before `catchup_with_mode` returns.
+    /// Safe when not inside a `tokio::spawn` with a saturated blocking pool
+    /// (e.g. CLI, `run_cmd::run_node` before `app.run()` is spawned).
+    Inline {
+        db: Database,
+        ledger_manager: Arc<LedgerManager>,
+    },
+    /// Send persist data to the caller over a oneshot. The caller is
+    /// responsible for driving the finalize on its own timeline (typically
+    /// as a [`PersistJob::Catchup`] task in the event loop).
+    Deferred(tokio::sync::oneshot::Sender<CatchupPersistData>),
+}
+
+impl CatchupFinalizer {
+    /// Finalize catchup synchronously before returning.
+    ///
+    /// The caller must not be running inside a `tokio::spawn` context
+    /// where calling `spawn_blocking` could deadlock (see #1713).
+    pub fn inline(db: Database, ledger_manager: Arc<LedgerManager>) -> Self {
+        Self(CatchupFinalizerInner::Inline { db, ledger_manager })
+    }
+
+    /// Hand persist data off to the caller via a oneshot. The caller
+    /// drives the actual persist on its own (e.g. via
+    /// [`spawn_persist_task`] + [`PersistJob::Catchup`]).
+    pub(crate) fn deferred(tx: tokio::sync::oneshot::Sender<CatchupPersistData>) -> Self {
+        Self(CatchupFinalizerInner::Deferred(tx))
+    }
 }
 
 /// Type alias for the boxed persist write function.
@@ -87,15 +147,7 @@ pub(super) fn spawn_persist_task(job: PersistJob, ledger_seq: u32) -> PendingPer
                 db,
                 ledger_manager,
             } => {
-                flush_bucket_persist(&ledger_manager).await;
-
-                let db2 = db.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || data.write_to_db(&db2))
-                    .await
-                    .unwrap_or_else(|e| Err(henyey_db::DbError::Integrity(e.to_string())))
-                {
-                    fatal_persist_error("catchup DB write", &e);
-                }
+                (*data).apply(db, ledger_manager).await;
 
                 tracing::info!(ledger_seq, "Catchup persist completed");
             }
@@ -232,4 +284,70 @@ fn persist_hot_archive_to_dir(
 pub(super) fn fatal_persist_error(context: &str, error: &dyn std::fmt::Display) -> ! {
     tracing::error!(context, error = %error, "Fatal persist failure, aborting");
     std::process::abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use henyey_db::queries::StateQueries;
+    use stellar_xdr::curr::{Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt};
+
+    fn make_header(seq: u32) -> (LedgerHeader, Vec<u8>) {
+        use stellar_xdr::curr::{LedgerHeaderExtensionV1, Limits, WriteXdr};
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0; 32]),
+                close_time: stellar_xdr::curr::TimePoint(0),
+                upgrades: vec![].try_into().unwrap(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0; 32]),
+            bucket_list_hash: Hash([0; 32]),
+            ledger_seq: seq,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 1000,
+            skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+            ext: LedgerHeaderExt::V1(LedgerHeaderExtensionV1 {
+                flags: 0,
+                ext: stellar_xdr::curr::LedgerHeaderExtensionV1Ext::V0,
+            }),
+        };
+        let xdr = header.to_xdr(Limits::none()).unwrap();
+        (header, xdr)
+    }
+
+    /// Regression for #1749: `CatchupPersistData::write_to_db` must persist
+    /// the header, HAS, and last_closed_ledger so that a fresh DB reopen
+    /// (the horizon captive-core scenario: catchup → exit → run) observes
+    /// the catchup's terminal state.
+    #[test]
+    fn write_to_db_persists_header_has_and_lcl() {
+        let db = Database::open_in_memory().unwrap();
+        let (header, header_xdr) = make_header(42);
+        let persist = CatchupPersistData {
+            header,
+            header_xdr,
+            has_json: "{\"version\":1}".to_string(),
+        };
+
+        persist.write_to_db(&db).unwrap();
+
+        let lcl: u32 = db
+            .with_connection(|c| c.get_last_closed_ledger())
+            .unwrap()
+            .unwrap();
+        assert_eq!(lcl, 42, "LCL must be persisted to the DB");
+
+        let has: Option<String> = db
+            .with_connection(|c| c.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE))
+            .unwrap();
+        assert_eq!(has.as_deref(), Some("{\"version\":1}"));
+    }
 }
