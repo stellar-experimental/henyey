@@ -102,6 +102,21 @@ Repeat until `VERDICT: APPROVED` or `proposal_round >= max_proposal_rounds`:
 
 Increment `proposal_round`.
 
+**Post the proposal draft to the issue** (unless `--dry-run`):
+
+```bash
+gh issue comment $ISSUE --body "$(cat <<'DRAFT_EOF'
+## 📝 Proposal Draft (Round {proposal_round}/{max_proposal_rounds})
+
+{current_proposal}
+
+---
+
+*Submitting to adversarial critic for review…*
+DRAFT_EOF
+)"
+```
+
 Launch a background agent using the Task tool:
 - **agent_type**: `"general-purpose"`
 - **model**: `$MODEL`
@@ -183,6 +198,26 @@ case where X is None at file.rs:123" is actionable.
 ### 2b: Process Critic Result
 
 Read the agent result. Extract the verdict line.
+
+**Post the critic response to the issue** (unless `--dry-run`):
+
+```bash
+gh issue comment $ISSUE --body "$(cat <<'CRITIC_EOF'
+## 🔍 Critic Response (Round {proposal_round}/{max_proposal_rounds})
+
+<details>
+<summary>Full critique (click to expand)</summary>
+
+{critic_full_response}
+
+</details>
+
+**Verdict: {APPROVED|REVISE}**
+
+{if REVISE, include the numbered feedback items here outside the details block}
+CRITIC_EOF
+)"
+```
 
 **If `VERDICT: APPROVED`**:
 - The proposal has converged. Proceed to Step 3.
@@ -333,6 +368,26 @@ Follow the review-fix skill instructions below exactly. Mode is review
 
 Read the agent result. Extract the verdict from the Fix Analysis section.
 
+**Post the review result to the issue**:
+
+```bash
+gh issue comment $ISSUE --body "$(cat <<'REVIEW_EOF'
+## 🔬 Review-Fix Report (Round {review_round}/{max_review_rounds})
+
+<details>
+<summary>Full review report (click to expand)</summary>
+
+{review_fix_full_response}
+
+</details>
+
+**Verdict: {SOUND|CONCERNS|INCOMPLETE|WRONG}**
+
+{if not SOUND, include the key issues here outside the details block}
+REVIEW_EOF
+)"
+```
+
 **If `SOUND`**:
 - The implementation is clean. Proceed to Step 5.
 
@@ -453,8 +508,14 @@ Final verdict:      SOUND
 - **The orchestrator implements; agents review.** You write code and make
   changes. Sub-agents only analyze and critique. This separation ensures
   reviews are independent.
-- **Post everything to the issue.** The GitHub issue is the audit trail.
-  Every proposal revision and review result should be visible there.
+- **Post everything to the issue.** The GitHub issue is the complete audit
+  trail. Every step is posted as a comment so anyone following the issue
+  sees the full reasoning chain:
+  - Each proposal draft (before critic review)
+  - Each critic response (with verdict)
+  - The converged proposal (delimiter between planning and execution)
+  - Each review-fix report (with verdict)
+  - The completion summary (with commits, deferred work, and issue links)
 - **Respect max rounds.** If proposal convergence or review-fix hits the max,
   post whatever you have and note the remaining concerns. Do not loop forever.
 - **Be honest about feedback.** If a critic's feedback is wrong, explain why
