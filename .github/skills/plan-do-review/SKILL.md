@@ -198,7 +198,9 @@ case where X is None at file.rs:123" is actionable.
 
 Read the agent result. Extract the verdict line.
 
-**Post the critic response to the issue**:
+**You MUST post the critic response to the issue before processing the
+verdict.** This is not optional — the issue comment trail is the audit log.
+Do not skip this step, even if the verdict is APPROVED.
 
 ```bash
 gh issue comment $ISSUE --body "$(cat <<'CRITIC_EOF'
@@ -508,11 +510,13 @@ Final verdict:      SOUND
 - **The orchestrator implements; agents review.** You write code and make
   changes. Sub-agents only analyze and critique. This separation ensures
   reviews are independent.
-- **Post everything to the issue.** The GitHub issue is the complete audit
-  trail. Every step is posted as a comment so anyone following the issue
-  sees the full reasoning chain:
+- **Post everything to the issue — no exceptions.** The GitHub issue is the
+  complete audit trail. Skipping any comment is a skill violation. Every
+  step below MUST appear as an issue comment:
   - Each proposal draft (before critic review)
-  - Each critic response (with verdict)
+  - **Each critic response (with verdict)** — this is the most commonly
+    skipped step. Post it immediately after the critic agent returns,
+    before processing the verdict or rewriting the proposal.
   - The converged proposal (delimiter between planning and execution)
   - Each review-fix report (with verdict)
   - The completion summary (with commits, deferred work, and issue links)
