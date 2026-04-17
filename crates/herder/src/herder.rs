@@ -1751,9 +1751,20 @@ impl Herder {
     pub fn receive_transaction(&self, tx: TransactionEnvelope) -> TxQueueResult {
         let state = self.state();
 
+        // If the herder hasn't reached Tracking yet (e.g., still Booting or
+        // Syncing), defer submission by asking the client to retry. Returning
+        // `Invalid(None)` here would map to `txINTERNAL_ERROR` in the compat
+        // `/tx` handler and cause well-behaved clients (e.g., friendbot) to
+        // abort instead of retrying. stellar-core does not gate reception on
+        // tracking state (HerderImpl::recvTransaction always forwards to the
+        // queue); `TryAgainLater` is the closest non-terminal signal we can
+        // give while we're still coming up.
         if !state.can_receive_transactions() {
-            debug!("Ignoring transaction in {:?} state", state);
-            return TxQueueResult::Invalid(None);
+            debug!(
+                "Deferring transaction in {:?} state (try again later)",
+                state
+            );
+            return TxQueueResult::TryAgainLater;
         }
 
         // Add to transaction queue
@@ -3115,6 +3126,41 @@ mod tests {
             herder.state(),
             HerderState::Tracking,
             "Externalization should transition herder from Syncing to Tracking"
+        );
+    }
+
+    fn make_minimal_tx_envelope() -> TransactionEnvelope {
+        use stellar_xdr::curr::{Memo, TransactionV0, TransactionV0Envelope, TransactionV0Ext};
+        TransactionEnvelope::TxV0(TransactionV0Envelope {
+            tx: TransactionV0 {
+                source_account_ed25519: stellar_xdr::curr::Uint256([0u8; 32]),
+                fee: 100,
+                seq_num: stellar_xdr::curr::SequenceNumber(1),
+                time_bounds: None,
+                memo: Memo::None,
+                operations: vec![].try_into().unwrap(),
+                ext: TransactionV0Ext::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        })
+    }
+
+    /// Regression: when the herder has not yet reached Tracking (e.g., fresh
+    /// boot or manual-close mode before the first externalization), submitting
+    /// a transaction must return `TryAgainLater` rather than `Invalid(None)`.
+    /// The latter maps to `txINTERNAL_ERROR` in the compat `/tx` handler and
+    /// causes well-behaved clients (e.g., friendbot) to abort with a fatal
+    /// error instead of retrying.
+    #[test]
+    fn test_receive_transaction_before_tracking_returns_try_again_later() {
+        let herder = make_test_herder();
+        assert!(!herder.state().can_receive_transactions());
+
+        let result = herder.receive_transaction(make_minimal_tx_envelope());
+        assert!(
+            matches!(result, TxQueueResult::TryAgainLater),
+            "expected TryAgainLater when not tracking, got {:?}",
+            result
         );
     }
 
