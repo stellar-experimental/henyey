@@ -96,7 +96,7 @@ Corresponds to: `get_ledger_entries.go`, `get_transaction.go`, `get_transactions
 | TTL lookup for contract entries | `ttl_key_for_entry()`, `ttl_key_for_ledger_key()` | Full |
 | Max 200 key enforcement | `get_ledger_entries::handle()` | Full |
 | Transaction lookup by hash | `get_transaction::handle()` | Full |
-| Transaction status derivation | `determine_tx_status()` | Full |
+| Transaction status derivation | `tx_status_str()` (from `TxRecord.status`) | Full |
 | Result/result-meta/diagnostic event extraction | `extract_result_xdr()`, `insert_diagnostic_events()` | Full |
 | Fee-bump detection | `is_fee_bump_envelope()` | Full |
 | Transaction-range query | `get_transactions::handle()` | Full |

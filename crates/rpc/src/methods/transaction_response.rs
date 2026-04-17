@@ -12,8 +12,8 @@ pub(super) fn build_transaction_object(
     format: XdrFormat,
     include_tx_hash: bool,
 ) -> Result<serde_json::Map<String, serde_json::Value>, JsonRpcError> {
-    let status = util::determine_tx_status(&record.result);
-    let fee_bump = util::is_fee_bump_envelope(&record.body);
+    let status = util::tx_status_str(record.status);
+    let fee_bump = util::is_fee_bump_envelope(&record.body)?;
     let application_order = record.tx_index + 1;
 
     let mut obj = serde_json::Map::new();
@@ -38,8 +38,7 @@ fn insert_transaction_xdr_fields(
 ) -> Result<(), JsonRpcError> {
     util::insert_raw_xdr_field::<TransactionEnvelope>(obj, "envelope", &record.body, format)?;
 
-    let result_bytes =
-        util::extract_result_xdr(&record.result).unwrap_or_else(|| record.result.clone());
+    let result_bytes = util::extract_result_xdr(&record.result)?;
     util::insert_raw_xdr_field::<TransactionResult>(obj, "result", &result_bytes, format)?;
 
     if let Some(ref meta_bytes) = record.meta {

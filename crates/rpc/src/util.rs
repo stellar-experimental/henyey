@@ -4,11 +4,56 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Serialize;
 use stellar_xdr::curr::{
     DiagnosticEvent, LedgerCloseMeta, LedgerHeaderHistoryEntry, LedgerKey, Limits, ReadXdr,
-    TransactionMeta, TransactionResultCode, TransactionResultPair, WriteXdr,
+    TransactionMeta, TransactionResultPair, WriteXdr,
 };
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
+
+// ---------------------------------------------------------------------------
+// XDR / Base64 parse error type for RPC helpers
+// ---------------------------------------------------------------------------
+
+/// Typed error for XDR parse, XDR serialize, and base64 decode failures
+/// in RPC read-path helpers. Distinct from `simulate::ConversionError`
+/// (cross-version p25↔workspace conversion).
+#[derive(Debug)]
+pub(crate) enum RpcXdrError {
+    /// XDR deserialization failed.
+    XdrParse {
+        type_name: &'static str,
+        cause: String,
+    },
+    /// XDR serialization failed.
+    XdrSerialize {
+        type_name: &'static str,
+        cause: String,
+    },
+    /// Base64 decoding failed.
+    Base64Decode { cause: String },
+}
+
+impl std::fmt::Display for RpcXdrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RpcXdrError::XdrParse { type_name, cause } => {
+                write!(f, "XDR parse of {type_name} failed: {cause}")
+            }
+            RpcXdrError::XdrSerialize { type_name, cause } => {
+                write!(f, "XDR serialize of {type_name} failed: {cause}")
+            }
+            RpcXdrError::Base64Decode { cause } => {
+                write!(f, "base64 decode failed: {cause}")
+            }
+        }
+    }
+}
+
+impl From<RpcXdrError> for JsonRpcError {
+    fn from(e: RpcXdrError) -> Self {
+        JsonRpcError::internal_logged("XDR data integrity error", &e)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Async DB access
@@ -342,27 +387,31 @@ pub(crate) fn validate_pagination(
 // Transaction helpers (shared by getTransaction and getTransactions)
 // ---------------------------------------------------------------------------
 
-/// Determine the transaction status ("SUCCESS" or "FAILED") from a `TransactionResultPair` blob.
-pub(crate) fn determine_tx_status(result_bytes: &[u8]) -> &'static str {
-    match TransactionResultPair::from_xdr(result_bytes, Limits::none()) {
-        Ok(pair) => {
-            let code = pair.result.result.discriminant();
-            if code == TransactionResultCode::TxSuccess
-                || code == TransactionResultCode::TxFeeBumpInnerSuccess
-            {
-                "SUCCESS"
-            } else {
-                "FAILED"
-            }
-        }
-        Err(_) => "FAILED",
+/// Derive the transaction status string from `TxStatus`.
+pub(crate) fn tx_status_str(status: henyey_db::TxStatus) -> &'static str {
+    match status {
+        henyey_db::TxStatus::Success => "SUCCESS",
+        henyey_db::TxStatus::Failed => "FAILED",
     }
 }
 
 /// Extract just the `TransactionResult` XDR bytes from a stored `TransactionResultPair` blob.
-pub(crate) fn extract_result_xdr(result_pair_bytes: &[u8]) -> Option<Vec<u8>> {
-    let pair = TransactionResultPair::from_xdr(result_pair_bytes, Limits::none()).ok()?;
-    pair.result.to_xdr(Limits::none()).ok()
+///
+/// Returns an error if the stored bytes are corrupt (cannot parse as
+/// `TransactionResultPair` or cannot re-serialize the inner `TransactionResult`).
+pub(crate) fn extract_result_xdr(result_pair_bytes: &[u8]) -> Result<Vec<u8>, RpcXdrError> {
+    let pair = TransactionResultPair::from_xdr(result_pair_bytes, Limits::none()).map_err(|e| {
+        RpcXdrError::XdrParse {
+            type_name: "TransactionResultPair",
+            cause: e.to_string(),
+        }
+    })?;
+    pair.result
+        .to_xdr(Limits::none())
+        .map_err(|e| RpcXdrError::XdrSerialize {
+            type_name: "TransactionResult",
+            cause: e.to_string(),
+        })
 }
 
 /// Common ledger context fields included in most RPC responses.
@@ -422,19 +471,33 @@ impl LedgerContext {
 
 /// Check if XDR-encoded transaction envelope bytes represent a fee bump transaction.
 // SECURITY: XDR input pre-bounded by HTTP body size limit; Limits::none() is safe
-pub(crate) fn is_fee_bump_envelope(envelope_bytes: &[u8]) -> bool {
+pub(crate) fn is_fee_bump_envelope(envelope_bytes: &[u8]) -> Result<bool, RpcXdrError> {
     use stellar_xdr::curr::TransactionEnvelope;
-    TransactionEnvelope::from_xdr(envelope_bytes, Limits::none())
-        .map(|env| matches!(env, TransactionEnvelope::TxFeeBump(_)))
-        .unwrap_or(false)
+    let env = TransactionEnvelope::from_xdr(envelope_bytes, Limits::none()).map_err(|e| {
+        RpcXdrError::XdrParse {
+            type_name: "TransactionEnvelope",
+            cause: e.to_string(),
+        }
+    })?;
+    Ok(matches!(env, TransactionEnvelope::TxFeeBump(_)))
 }
 
 /// Extract diagnostic events from `TransactionMeta` bytes.
 ///
-/// Returns `None` if no diagnostic events are present or the meta cannot be parsed.
-/// V3 meta has events in `soroban_meta.diagnostic_events`, V4 has them directly.
-pub(crate) fn extract_diagnostic_events(meta_bytes: &[u8]) -> Option<Vec<DiagnosticEvent>> {
-    let meta = TransactionMeta::from_xdr(meta_bytes, Limits::none()).ok()?;
+/// Returns:
+/// - `Ok(None)` if no diagnostic events are present (non-Soroban meta V0/V1/V2,
+///   V3 with no `soroban_meta`, or V3/V4 with empty diagnostic events).
+/// - `Ok(Some(...))` if V3/V4 meta contains non-empty diagnostic events.
+/// - `Err` if the meta bytes cannot be parsed as `TransactionMeta`.
+pub(crate) fn extract_diagnostic_events(
+    meta_bytes: &[u8],
+) -> Result<Option<Vec<DiagnosticEvent>>, RpcXdrError> {
+    let meta = TransactionMeta::from_xdr(meta_bytes, Limits::none()).map_err(|e| {
+        RpcXdrError::XdrParse {
+            type_name: "TransactionMeta",
+            cause: e.to_string(),
+        }
+    })?;
 
     let events: &[DiagnosticEvent] = match &meta {
         TransactionMeta::V3(v3) => v3
@@ -443,13 +506,13 @@ pub(crate) fn extract_diagnostic_events(meta_bytes: &[u8]) -> Option<Vec<Diagnos
             .map(|sm| sm.diagnostic_events.as_slice())
             .unwrap_or(&[]),
         TransactionMeta::V4(v4) => v4.diagnostic_events.as_slice(),
-        _ => return None,
+        _ => return Ok(None),
     };
 
     if events.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(events.to_vec())
+        Ok(Some(events.to_vec()))
     }
 }
 
@@ -462,7 +525,7 @@ pub(crate) fn insert_diagnostic_events(
     meta_bytes: &[u8],
     format: XdrFormat,
 ) -> Result<(), JsonRpcError> {
-    if let Some(events) = extract_diagnostic_events(meta_bytes) {
+    if let Some(events) = extract_diagnostic_events(meta_bytes)? {
         insert_xdr_array_field(obj, "diagnosticEvents", &events, format)?;
     }
     Ok(())
@@ -684,8 +747,8 @@ mod tests {
     }
 
     #[test]
-    fn test_determine_tx_status_invalid() {
-        assert_eq!(determine_tx_status(&[0, 1, 2]), "FAILED");
+    fn test_extract_result_xdr_invalid() {
+        assert!(extract_result_xdr(&[0, 1, 2]).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -712,10 +775,18 @@ mod tests {
         assert!(parse_format(&params).is_err());
     }
 
-    // C4-C7: determine_tx_status tests
+    // C4: tx_status_str tests
 
     #[test]
-    fn test_determine_tx_status_success() {
+    fn test_tx_status_str() {
+        assert_eq!(tx_status_str(henyey_db::TxStatus::Success), "SUCCESS");
+        assert_eq!(tx_status_str(henyey_db::TxStatus::Failed), "FAILED");
+    }
+
+    // C5-C8: extract_result_xdr tests
+
+    #[test]
+    fn test_extract_result_xdr_success() {
         use stellar_xdr::curr::{
             TransactionResult, TransactionResultExt, TransactionResultResult, WriteXdr,
         };
@@ -726,84 +797,80 @@ mod tests {
         };
         let pair = TransactionResultPair {
             transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            result,
+            result: result.clone(),
         };
         let bytes = pair.to_xdr(Limits::none()).unwrap();
-        assert_eq!(determine_tx_status(&bytes), "SUCCESS");
+        let extracted = extract_result_xdr(&bytes).unwrap();
+        // Round-trip: the extracted bytes should parse as TransactionResult
+        let parsed =
+            stellar_xdr::curr::TransactionResult::from_xdr(&extracted, Limits::none()).unwrap();
+        assert_eq!(parsed.fee_charged, 100);
     }
 
     #[test]
-    fn test_determine_tx_status_failed() {
+    fn test_extract_result_xdr_corrupt_bytes() {
+        let result = extract_result_xdr(&[0xff, 0xfe, 0xfd]);
+        assert!(result.is_err());
+    }
+
+    // C9-C11: is_fee_bump_envelope tests
+
+    #[test]
+    fn test_is_fee_bump_envelope_non_fee_bump() {
         use stellar_xdr::curr::{
-            TransactionResult, TransactionResultExt, TransactionResultResult, WriteXdr,
+            Transaction, TransactionEnvelope, TransactionV1Envelope, WriteXdr,
         };
-        let result = TransactionResult {
-            fee_charged: 100,
-            result: TransactionResultResult::TxFailed(Default::default()),
-            ext: TransactionResultExt::V0,
+        let tx = Transaction {
+            source_account: stellar_xdr::curr::MuxedAccount::Ed25519(stellar_xdr::curr::Uint256(
+                [0u8; 32],
+            )),
+            fee: 100,
+            seq_num: stellar_xdr::curr::SequenceNumber(1),
+            cond: stellar_xdr::curr::Preconditions::None,
+            memo: stellar_xdr::curr::Memo::None,
+            operations: vec![].try_into().unwrap(),
+            ext: stellar_xdr::curr::TransactionExt::V0,
         };
-        let pair = TransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            result,
-        };
-        let bytes = pair.to_xdr(Limits::none()).unwrap();
-        assert_eq!(determine_tx_status(&bytes), "FAILED");
+        let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let bytes = env.to_xdr(Limits::none()).unwrap();
+        assert_eq!(is_fee_bump_envelope(&bytes).unwrap(), false);
     }
 
     #[test]
-    fn test_determine_tx_status_fee_bump_success() {
-        use stellar_xdr::curr::{
-            InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
-            InnerTransactionResultResult, TransactionResult, TransactionResultExt,
-            TransactionResultResult, WriteXdr,
-        };
-        let inner_result = InnerTransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            result: InnerTransactionResult {
-                fee_charged: 50,
-                result: InnerTransactionResultResult::TxSuccess(Default::default()),
-                ext: InnerTransactionResultExt::V0,
-            },
-        };
-        let result = TransactionResult {
-            fee_charged: 100,
-            result: TransactionResultResult::TxFeeBumpInnerSuccess(inner_result),
-            ext: TransactionResultExt::V0,
-        };
-        let pair = TransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            result,
-        };
-        let bytes = pair.to_xdr(Limits::none()).unwrap();
-        assert_eq!(determine_tx_status(&bytes), "SUCCESS");
+    fn test_is_fee_bump_envelope_corrupt_bytes() {
+        assert!(is_fee_bump_envelope(&[0xff, 0xfe]).is_err());
+    }
+
+    // C12-C16: extract_diagnostic_events tests
+
+    #[test]
+    fn test_extract_diagnostic_events_corrupt_bytes() {
+        assert!(extract_diagnostic_events(&[0xff, 0xfe, 0xfd]).is_err());
     }
 
     #[test]
-    fn test_determine_tx_status_fee_bump_failed() {
-        use stellar_xdr::curr::{
-            InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
-            InnerTransactionResultResult, TransactionResult, TransactionResultExt,
-            TransactionResultResult, WriteXdr,
-        };
-        let inner_result = InnerTransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            result: InnerTransactionResult {
-                fee_charged: 50,
-                result: InnerTransactionResultResult::TxFailed(Default::default()),
-                ext: InnerTransactionResultExt::V0,
-            },
-        };
-        let result = TransactionResult {
-            fee_charged: 100,
-            result: TransactionResultResult::TxFeeBumpInnerFailed(inner_result),
-            ext: TransactionResultExt::V0,
-        };
-        let pair = TransactionResultPair {
-            transaction_hash: stellar_xdr::curr::Hash([0u8; 32]),
-            result,
-        };
-        let bytes = pair.to_xdr(Limits::none()).unwrap();
-        assert_eq!(determine_tx_status(&bytes), "FAILED");
+    fn test_extract_diagnostic_events_v0_meta() {
+        use stellar_xdr::curr::{TransactionMeta, WriteXdr};
+        let meta = TransactionMeta::V0(Default::default());
+        let bytes = meta.to_xdr(Limits::none()).unwrap();
+        assert!(extract_diagnostic_events(&bytes).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_extract_diagnostic_events_v3_no_soroban() {
+        use stellar_xdr::curr::{TransactionMeta, TransactionMetaV3, WriteXdr};
+        let meta = TransactionMeta::V3(TransactionMetaV3 {
+            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            tx_changes_before: Default::default(),
+            operations: Default::default(),
+            tx_changes_after: Default::default(),
+            soroban_meta: None,
+        });
+        let bytes = meta.to_xdr(Limits::none()).unwrap();
+        assert!(extract_diagnostic_events(&bytes).unwrap().is_none());
     }
 
     // C8-C10: format_unix_timestamp_utc tests

@@ -10,7 +10,7 @@ use stellar_xdr::curr::{
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
-use crate::util::{self, format_unix_timestamp_utc, XdrFormat};
+use crate::util::{self, format_unix_timestamp_utc, RpcXdrError, XdrFormat};
 
 /// Default number of events returned per query.
 const DEFAULT_EVENTS_LIMIT: u64 = 100;
@@ -118,8 +118,20 @@ pub async fn handle(
             None => obj.insert("contractId".into(), json!("")),
         };
 
-        // Extract value and topic from the ContractEvent XDR, format-aware
-        insert_event_fields(&mut obj, &event.event_xdr, &event.topics, format)?;
+        // Extract value and topic from the ContractEvent XDR, format-aware.
+        // Warn and skip corrupt events rather than failing the entire response.
+        match insert_event_fields(&mut obj, &event.event_xdr, &event.topics, format) {
+            Ok(()) => {}
+            Err(e) => {
+                tracing::warn!(
+                    event_id = %event.id,
+                    ledger_seq = event.ledger_seq,
+                    error = ?e,
+                    "skipping corrupt event in getEvents response"
+                );
+                continue;
+            }
+        }
 
         event_json.push(serde_json::Value::Object(obj));
     }
@@ -250,30 +262,40 @@ fn insert_event_fields(
     match format {
         XdrFormat::Base64 => {
             // value: base64 of the ScVal data from the event body
-            let value = extract_event_value(event_xdr_b64)
-                .and_then(|v| v.to_xdr(Limits::none()).ok())
-                .map(|b| BASE64.encode(&b))
-                .unwrap_or_default();
-            obj.insert("value".into(), json!(value));
+            let val = extract_event_value(event_xdr_b64)?;
+            let xdr_bytes = val.to_xdr(Limits::none()).map_err(|e| {
+                JsonRpcError::from(RpcXdrError::XdrSerialize {
+                    type_name: "ScVal",
+                    cause: e.to_string(),
+                })
+            })?;
+            obj.insert("value".into(), json!(BASE64.encode(&xdr_bytes)));
             // topic: array of base64-encoded topic ScVals (already stored as base64)
             obj.insert("topic".into(), json!(topics));
         }
         XdrFormat::Json => {
             // value: JSON representation of the ScVal
-            if let Some(val) = extract_event_value(event_xdr_b64) {
-                let json_val = serde_json::to_value(&val)
-                    .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
-                obj.insert("valueJson".into(), json_val);
-            }
+            let val = extract_event_value(event_xdr_b64)?;
+            let json_val = serde_json::to_value(&val)
+                .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
+            obj.insert("valueJson".into(), json_val);
             // topic: array of JSON ScVals
             let mut topic_json = Vec::with_capacity(topics.len());
             for t in topics {
-                let bytes = BASE64.decode(t).unwrap_or_default();
-                if let Ok(scval) = ScVal::from_xdr(&bytes, Limits::none()) {
-                    let jv = serde_json::to_value(&scval)
-                        .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
-                    topic_json.push(jv);
-                }
+                let bytes = BASE64.decode(t).map_err(|e| {
+                    JsonRpcError::from(RpcXdrError::Base64Decode {
+                        cause: e.to_string(),
+                    })
+                })?;
+                let scval = ScVal::from_xdr(&bytes, Limits::none()).map_err(|e| {
+                    JsonRpcError::from(RpcXdrError::XdrParse {
+                        type_name: "ScVal (topic)",
+                        cause: e.to_string(),
+                    })
+                })?;
+                let jv = serde_json::to_value(&scval)
+                    .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
+                topic_json.push(jv);
             }
             obj.insert("topicJson".into(), json!(topic_json));
         }
@@ -282,11 +304,20 @@ fn insert_event_fields(
 }
 
 /// Extract the value ScVal from a ContractEvent's body.
-fn extract_event_value(event_xdr_b64: &str) -> Option<ScVal> {
-    let bytes = BASE64.decode(event_xdr_b64).ok()?;
-    let event = ContractEvent::from_xdr(&bytes, Limits::none()).ok()?;
+fn extract_event_value(event_xdr_b64: &str) -> Result<ScVal, JsonRpcError> {
+    let bytes = BASE64.decode(event_xdr_b64).map_err(|e| {
+        JsonRpcError::from(RpcXdrError::Base64Decode {
+            cause: e.to_string(),
+        })
+    })?;
+    let event = ContractEvent::from_xdr(&bytes, Limits::none()).map_err(|e| {
+        JsonRpcError::from(RpcXdrError::XdrParse {
+            type_name: "ContractEvent",
+            cause: e.to_string(),
+        })
+    })?;
     match event.body {
-        ContractEventBody::V0(body) => Some(body.data),
+        ContractEventBody::V0(body) => Ok(body.data),
     }
 }
 
@@ -367,6 +398,92 @@ mod tests {
         let filters = json!([{"type": "diagnostic"}]);
         let arr = make_filters(filters).unwrap();
         let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_event_value_invalid_base64() {
+        let result = extract_event_value("not-valid-base64!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_event_value_invalid_xdr() {
+        // Valid base64 but invalid XDR
+        let garbage = BASE64.encode(&[0xff, 0xfe, 0xfd]);
+        let result = extract_event_value(&garbage);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_event_value_valid() {
+        use stellar_xdr::curr::{ContractEvent, ContractEventBody, ContractEventV0, WriteXdr};
+        let event = ContractEvent {
+            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            contract_id: None,
+            type_: ContractEventType::Contract,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![].try_into().unwrap(),
+                data: ScVal::U32(42),
+            }),
+        };
+        let bytes = event.to_xdr(Limits::none()).unwrap();
+        let b64 = BASE64.encode(&bytes);
+        let val = extract_event_value(&b64).unwrap();
+        assert_eq!(val, ScVal::U32(42));
+    }
+
+    #[test]
+    fn test_insert_event_fields_base64_valid() {
+        use stellar_xdr::curr::{ContractEvent, ContractEventBody, ContractEventV0, WriteXdr};
+        let event = ContractEvent {
+            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            contract_id: None,
+            type_: ContractEventType::Contract,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![].try_into().unwrap(),
+                data: ScVal::U32(42),
+            }),
+        };
+        let bytes = event.to_xdr(Limits::none()).unwrap();
+        let b64 = BASE64.encode(&bytes);
+        let mut obj = serde_json::Map::new();
+        insert_event_fields(&mut obj, &b64, &[], XdrFormat::Base64).unwrap();
+        assert!(obj.contains_key("value"));
+        // value should be non-empty base64
+        let val_str = obj["value"].as_str().unwrap();
+        assert!(!val_str.is_empty());
+    }
+
+    #[test]
+    fn test_insert_event_fields_corrupt_event_errors() {
+        let mut obj = serde_json::Map::new();
+        let result = insert_event_fields(&mut obj, "not-valid!!!", &[], XdrFormat::Base64);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_insert_event_fields_json_corrupt_topic_errors() {
+        use stellar_xdr::curr::{ContractEvent, ContractEventBody, ContractEventV0, WriteXdr};
+        let event = ContractEvent {
+            ext: stellar_xdr::curr::ExtensionPoint::V0,
+            contract_id: None,
+            type_: ContractEventType::Contract,
+            body: ContractEventBody::V0(ContractEventV0 {
+                topics: vec![].try_into().unwrap(),
+                data: ScVal::U32(42),
+            }),
+        };
+        let bytes = event.to_xdr(Limits::none()).unwrap();
+        let b64 = BASE64.encode(&bytes);
+        // Valid event but corrupt topic base64
+        let mut obj = serde_json::Map::new();
+        let result = insert_event_fields(
+            &mut obj,
+            &b64,
+            &["not-valid-base64!!!".to_string()],
+            XdrFormat::Json,
+        );
         assert!(result.is_err());
     }
 }

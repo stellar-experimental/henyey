@@ -120,6 +120,7 @@ pub struct SorobanExecutionResult {
 /// Error from Soroban execution that includes consumed resources.
 /// This is needed to properly determine TRAPPED vs RESOURCE_LIMIT_EXCEEDED
 /// based on whether actual consumption exceeded specified limits.
+#[derive(Debug)]
 pub struct SorobanExecutionError {
     /// The underlying host error.
     pub host_error: HostErrorP25,
@@ -943,52 +944,58 @@ fn decode_contract_events(
 
 /// Map protocol-neutral ledger changes into `StorageChange` values.
 ///
-/// This is the shared mapping logic between P24 and P25. Both protocol versions'
-/// `LedgerEntryChange` types have identical fields; callers normalize them into
-/// `NormalizedLedgerChange` before calling this function.
+/// This is the shared mapping logic between P24, P25, and P26. All protocol
+/// versions' `LedgerEntryChange` types have identical fields; callers normalize
+/// them into `NormalizedLedgerChange` before calling this function.
+///
+/// XDR parse failures on `encoded_key` or `encoded_new_value` are hard errors
+/// (matching stellar-core's `xdr_from_opaque` which throws on failure). The
+/// intentional filtering for non-mutating entries (no modification, deletion,
+/// or TTL extension) is preserved.
 fn map_storage_changes(
     changes: Vec<NormalizedLedgerChange>,
     state: &LedgerStateManager,
     ttl_key_cache: Option<&super::TtlKeyCache>,
-) -> Vec<StorageChange> {
-    changes
-        .into_iter()
-        .filter_map(|change| {
-            let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none()).ok()?;
-            let is_deletion = !change.read_only && change.encoded_new_value.is_none();
-            let is_modification = change.encoded_new_value.is_some();
-            let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
+    make_error: &dyn Fn(&str) -> SorobanExecutionError,
+) -> Result<Vec<StorageChange>, SorobanExecutionError> {
+    let mut result = Vec::new();
+    for change in changes {
+        let key = LedgerKey::from_xdr(&change.encoded_key, Limits::none())
+            .map_err(|_| make_error("failed to decode LedgerKey from storage change"))?;
+        let is_deletion = !change.read_only && change.encoded_new_value.is_none();
+        let is_modification = change.encoded_new_value.is_some();
+        let is_rent_related = change.old_entry_size_bytes_for_rent > 0;
 
-            let ttl_extended = change
-                .ttl_new_live_until_ledger
-                .map(|new_live_until| {
-                    let key_hash = super::get_or_compute_key_hash(ttl_key_cache, &key);
-                    let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
-                    new_live_until > ledger_start_ttl
-                })
-                .unwrap_or(false);
+        let ttl_extended = change
+            .ttl_new_live_until_ledger
+            .map(|new_live_until| {
+                let key_hash = super::get_or_compute_key_hash(ttl_key_cache, &key);
+                let ledger_start_ttl = state.get_ttl_at_ledger_start(&key_hash).unwrap_or(0);
+                new_live_until > ledger_start_ttl
+            })
+            .unwrap_or(false);
 
-            let is_read_only_ttl_bump = change.read_only && !is_modification && ttl_extended;
+        let is_read_only_ttl_bump = change.read_only && !is_modification && ttl_extended;
 
-            if is_modification || is_deletion || ttl_extended {
-                let new_entry = change
-                    .encoded_new_value
-                    .as_ref()
-                    .and_then(|bytes| LedgerEntry::from_xdr(bytes, Limits::none()).ok());
-                let live_until = change.ttl_new_live_until_ledger;
-                Some(StorageChange {
-                    key,
-                    new_entry,
-                    live_until,
-                    ttl_extended,
-                    is_rent_related,
-                    is_read_only_ttl_bump,
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
+        if is_modification || is_deletion || ttl_extended {
+            let new_entry = change
+                .encoded_new_value
+                .as_ref()
+                .map(|bytes| LedgerEntry::from_xdr(bytes, Limits::none()))
+                .transpose()
+                .map_err(|_| make_error("failed to decode LedgerEntry from storage change"))?;
+            let live_until = change.ttl_new_live_until_ledger;
+            result.push(StorageChange {
+                key,
+                new_entry,
+                live_until,
+                ttl_extended,
+                is_rent_related,
+                is_read_only_ttl_bump,
+            });
+        }
+    }
+    Ok(result)
 }
 
 fn execute_host_function_p24(
@@ -1196,7 +1203,8 @@ fn execute_host_function_p24(
             ttl_new_live_until_ledger: c.ttl_change.map(|t| t.new_live_until_ledger),
         })
         .collect();
-    let storage_changes = map_storage_changes(normalized_changes, state, ttl_key_cache);
+    let storage_changes =
+        map_storage_changes(normalized_changes, state, ttl_key_cache, &make_budget_error)?;
 
     // Get budget consumption
     let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
@@ -1450,7 +1458,8 @@ fn execute_host_function_p25(
             ttl_new_live_until_ledger: c.ttl_change.map(|t| t.new_live_until_ledger),
         })
         .collect();
-    let storage_changes = map_storage_changes(normalized_changes, state, ttl_key_cache);
+    let storage_changes =
+        map_storage_changes(normalized_changes, state, ttl_key_cache, &make_budget_error)?;
 
     let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
     let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
@@ -1474,33 +1483,68 @@ fn execute_host_function_p25(
     })
 }
 
+/// Convert diagnostic events from a protocol-specific XDR type to workspace types.
+///
+/// Diagnostic events are non-consensus-critical informational traces. Conversion
+/// failures are logged and skipped rather than treated as hard errors.
+fn convert_diagnostic_events_cross_version<W>(
+    events: Vec<W>,
+    protocol_label: &str,
+    serialize: impl Fn(&W) -> Result<Vec<u8>, String>,
+) -> Vec<DiagnosticEvent> {
+    let total = events.len();
+    events
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            let bytes = match serialize(&event) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(
+                        protocol = %protocol_label,
+                        index,
+                        total,
+                        error = %e,
+                        "diagnostic event serialization failed, skipping"
+                    );
+                    return None;
+                }
+            };
+            match DiagnosticEvent::from_xdr(&bytes, Limits::none()) {
+                Ok(evt) => Some(evt),
+                Err(e) => {
+                    tracing::warn!(
+                        protocol = %protocol_label,
+                        index,
+                        total,
+                        error = %e,
+                        "diagnostic event deserialization failed, skipping"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 fn convert_diagnostic_events_p25(
     events: Vec<soroban_env_host25::xdr::DiagnosticEvent>,
 ) -> Vec<DiagnosticEvent> {
-    events
-        .into_iter()
-        .filter_map(|event| {
-            use soroban_env_host25::xdr::WriteXdr as WriteXdrP25;
-            let bytes = event.to_xdr(soroban_env_host25::xdr::Limits::none()).ok()?;
-            DiagnosticEvent::from_xdr(&bytes, Limits::none()).ok()
-        })
-        .collect()
+    convert_diagnostic_events_cross_version(events, "P25", |event| {
+        use soroban_env_host25::xdr::WriteXdr as WriteXdrP25;
+        event
+            .to_xdr(soroban_env_host25::xdr::Limits::none())
+            .map_err(|e| e.to_string())
+    })
 }
 
 fn convert_diagnostic_events_p24(
     events: Vec<soroban_env_host24::xdr::DiagnosticEvent>,
 ) -> Vec<DiagnosticEvent> {
-    events
-        .into_iter()
-        .filter_map(|event| {
-            let bytes = soroban_env_host24::xdr::WriteXdr::to_xdr(
-                &event,
-                soroban_env_host24::xdr::Limits::none(),
-            )
-            .ok()?;
-            DiagnosticEvent::from_xdr(&bytes, Limits::none()).ok()
-        })
-        .collect()
+    convert_diagnostic_events_cross_version(events, "P24", |event| {
+        soroban_env_host24::xdr::WriteXdr::to_xdr(event, soroban_env_host24::xdr::Limits::none())
+            .map_err(|e| e.to_string())
+    })
 }
 
 fn rent_fee_config_p25_to_p24(
@@ -1764,7 +1808,8 @@ fn execute_host_function_p26(
             ttl_new_live_until_ledger: c.ttl_change.map(|t| t.new_live_until_ledger),
         })
         .collect();
-    let storage_changes = map_storage_changes(normalized_changes, state, ttl_key_cache);
+    let storage_changes =
+        map_storage_changes(normalized_changes, state, ttl_key_cache, &make_budget_error)?;
 
     let cpu_insns = budget.get_cpu_insns_consumed().unwrap_or(0);
     let mem_bytes = budget.get_mem_bytes_consumed().unwrap_or(0);
@@ -1985,5 +2030,119 @@ mod tests {
         assert!(change.new_entry.is_none());
         assert!(change.live_until.is_none());
         assert!(matches!(change.key, LedgerKey::ContractCode(_)));
+    }
+
+    /// Test map_storage_changes with invalid encoded_key bytes returns error.
+    #[test]
+    fn test_map_storage_changes_invalid_key_errors() {
+        use crate::soroban::LedgerStateManager;
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let make_error = |_desc: &str| -> SorobanExecutionError {
+            SorobanExecutionError {
+                host_error: HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                    soroban_env_host25::xdr::ScErrorType::Context,
+                    soroban_env_host25::xdr::ScErrorCode::InternalError,
+                )),
+                cpu_insns_consumed: 0,
+                mem_bytes_consumed: 0,
+            }
+        };
+        let changes = vec![NormalizedLedgerChange {
+            encoded_key: vec![0xff, 0xfe, 0xfd], // invalid XDR
+            read_only: false,
+            encoded_new_value: Some(vec![1, 2, 3]),
+            old_entry_size_bytes_for_rent: 0,
+            ttl_new_live_until_ledger: None,
+        }];
+        let result = map_storage_changes(changes, &state, None, &make_error);
+        assert!(result.is_err());
+    }
+
+    /// Test map_storage_changes with invalid encoded_new_value bytes returns error.
+    #[test]
+    fn test_map_storage_changes_invalid_new_value_errors() {
+        use crate::soroban::LedgerStateManager;
+        use stellar_xdr::curr::WriteXdr;
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let make_error = |_desc: &str| -> SorobanExecutionError {
+            SorobanExecutionError {
+                host_error: HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                    soroban_env_host25::xdr::ScErrorType::Context,
+                    soroban_env_host25::xdr::ScErrorCode::InternalError,
+                )),
+                cpu_insns_consumed: 0,
+                mem_bytes_consumed: 0,
+            }
+        };
+        // Valid key, invalid new_value
+        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+        let encoded_key = key.to_xdr(Limits::none()).unwrap();
+        let changes = vec![NormalizedLedgerChange {
+            encoded_key,
+            read_only: false,
+            encoded_new_value: Some(vec![0xff, 0xfe, 0xfd]), // invalid XDR
+            old_entry_size_bytes_for_rent: 0,
+            ttl_new_live_until_ledger: None,
+        }];
+        let result = map_storage_changes(changes, &state, None, &make_error);
+        assert!(result.is_err());
+    }
+
+    /// Test map_storage_changes with valid data produces correct StorageChange values.
+    #[test]
+    fn test_map_storage_changes_valid_data() {
+        use crate::soroban::LedgerStateManager;
+        use stellar_xdr::curr::WriteXdr;
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let make_error = |_desc: &str| -> SorobanExecutionError {
+            SorobanExecutionError {
+                host_error: HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
+                    soroban_env_host25::xdr::ScErrorType::Context,
+                    soroban_env_host25::xdr::ScErrorCode::InternalError,
+                )),
+                cpu_insns_consumed: 0,
+                mem_bytes_consumed: 0,
+            }
+        };
+        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 100,
+            data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
+                ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                hash: Hash([1u8; 32]),
+                code: vec![0xDE, 0xAD].try_into().unwrap(),
+            }),
+            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+        };
+        let encoded_key = key.to_xdr(Limits::none()).unwrap();
+        let encoded_value = entry.to_xdr(Limits::none()).unwrap();
+
+        // Modification (has new value)
+        let changes = vec![NormalizedLedgerChange {
+            encoded_key: encoded_key.clone(),
+            read_only: false,
+            encoded_new_value: Some(encoded_value),
+            old_entry_size_bytes_for_rent: 0,
+            ttl_new_live_until_ledger: None,
+        }];
+        let result = map_storage_changes(changes, &state, None, &make_error).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].new_entry.is_some());
+
+        // Deletion (no new value, not read_only)
+        let changes = vec![NormalizedLedgerChange {
+            encoded_key,
+            read_only: false,
+            encoded_new_value: None,
+            old_entry_size_bytes_for_rent: 0,
+            ttl_new_live_until_ledger: None,
+        }];
+        let result = map_storage_changes(changes, &state, None, &make_error).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].new_entry.is_none());
     }
 }
