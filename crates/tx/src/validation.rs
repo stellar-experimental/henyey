@@ -2650,7 +2650,7 @@ mod tests {
 
         // Should match: sha256("hello") == key
         assert!(
-            has_hashx_signature(&[sig.clone()], &key),
+            has_hashx_signature(std::slice::from_ref(&sig), &key),
             "5-byte HashX preimage should be accepted"
         );
 

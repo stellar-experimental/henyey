@@ -23,32 +23,53 @@ pub struct RpcServer {
     app: Arc<App>,
 }
 
+/// A bound but not-yet-serving RPC server.
+///
+/// Returned by [`RpcServer::bind`] so callers (e.g., integration tests) can
+/// observe the kernel-assigned port when binding to port 0. Call
+/// [`RpcServerRunning::serve`] to run the server to completion.
+pub struct RpcServerRunning {
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+}
+
+impl RpcServerRunning {
+    /// Run the server until the shutdown signal fires or an error occurs.
+    pub async fn serve(self) -> anyhow::Result<()> {
+        let Self {
+            listener,
+            router,
+            mut shutdown_rx,
+        } = self;
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.recv().await;
+            })
+            .await?;
+
+        tracing::info!("JSON-RPC server stopped");
+        Ok(())
+    }
+}
+
 impl RpcServer {
     /// Create a new RPC server on the given port.
     pub fn new(port: u16, app: Arc<App>) -> Self {
         Self { port, app }
     }
 
-    /// Start the RPC server.
-    pub async fn start(self) -> anyhow::Result<()> {
-        let rpc_config = &self.app.config().rpc;
-        let retention = rpc_config.retention_window;
-        let max_sims = rpc_config.max_concurrent_simulations.max(1) as usize;
-        let max_requests = rpc_config.max_concurrent_requests.max(1);
-        let db_concurrency = rpc_config.rpc_db_concurrency.max(1);
-        let request_timeout = std::time::Duration::from_secs(rpc_config.request_timeout_secs);
+    /// Bind the TCP listener, construct the router, and spawn the fee-window
+    /// poller. Returns the bound server plus its [`SocketAddr`] so callers
+    /// can discover the kernel-assigned port when `port == 0`.
+    ///
+    /// The router is ready to serve requests; call
+    /// [`RpcServerRunning::serve`] to drive the event loop.
+    pub async fn bind(self) -> anyhow::Result<(RpcServerRunning, SocketAddr)> {
+        let retention = self.app.config().rpc.retention_window;
         let fee_windows = Arc::new(FeeWindows::new(retention));
 
-        let ctx = Arc::new(RpcContext {
-            app: self.app.clone(),
-            fee_windows: fee_windows.clone(),
-            simulation_semaphore: Arc::new(tokio::sync::Semaphore::new(max_sims)),
-            request_semaphore: Arc::new(tokio::sync::Semaphore::new(max_requests)),
-            db_semaphore: Arc::new(tokio::sync::Semaphore::new(db_concurrency)),
-            request_timeout,
-        });
-
-        let mut shutdown_rx = self.app.subscribe_shutdown();
+        let ctx = RpcContext::new(self.app.clone(), fee_windows.clone());
 
         // Spawn background task to populate fee windows from DB
         let poller_app = self.app.clone();
@@ -67,14 +88,24 @@ impl RpcServer {
         tracing::info!(port = self.port, "Starting JSON-RPC server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.recv().await;
-            })
-            .await?;
+        let bound = listener.local_addr()?;
+        let shutdown_rx = self.app.subscribe_shutdown();
 
-        tracing::info!("JSON-RPC server stopped");
-        Ok(())
+        Ok((
+            RpcServerRunning {
+                listener,
+                router,
+                shutdown_rx,
+            },
+            bound,
+        ))
+    }
+
+    /// Bind and serve. Convenience wrapper equivalent to
+    /// `self.bind().await?.0.serve().await`.
+    pub async fn start(self) -> anyhow::Result<()> {
+        let (running, _addr) = self.bind().await?;
+        running.serve().await
     }
 }
 

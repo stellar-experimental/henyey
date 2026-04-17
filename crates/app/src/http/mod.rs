@@ -238,6 +238,14 @@ impl StatusServer {
         tracing::info!(%addr, "Starting HTTP status server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
+        // Emit the kernel-assigned port on stdout in a deterministic
+        // machine-readable form. Integration tests that launch the node as
+        // a subprocess with `http.port = 0` parse this line to discover
+        // the ephemeral port. The prefix is stable and plain `println!` so
+        // it bypasses any tracing subscriber filtering.
+        let bound_port = listener.local_addr()?.port();
+        println!("{ADMIN_PORT_LOG_PREFIX}{bound_port}");
+
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.recv().await;
@@ -248,6 +256,14 @@ impl StatusServer {
         Ok(())
     }
 }
+
+/// Boot-log prefix used to surface the kernel-assigned admin HTTP port when
+/// `http.port = 0`. Tests that launch `henyey` as a subprocess parse stdout
+/// for this prefix to discover which port to send requests to.
+///
+/// Changing this string is a breaking change for integration tests — keep it
+/// stable.
+pub const ADMIN_PORT_LOG_PREFIX: &str = "HTTP_ADMIN_PORT=";
 
 /// Format the current UTC time as ISO 8601 (e.g. "2026-01-15T12:34:56Z").
 pub(crate) fn format_utc_now() -> String {

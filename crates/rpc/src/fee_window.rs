@@ -262,14 +262,14 @@ impl FeeWindow {
 ///
 /// Thread-safe: each window uses an internal `RwLock`. Multiple readers can
 /// query distributions concurrently while a single writer ingests new ledgers.
-pub(crate) struct FeeWindows {
+pub struct FeeWindows {
     classic: FeeWindow,
     soroban: FeeWindow,
 }
 
 impl FeeWindows {
     /// Create new fee windows with the given retention (number of ledgers).
-    pub(crate) fn new(retention: u32) -> Self {
+    pub fn new(retention: u32) -> Self {
         Self {
             classic: FeeWindow::new(retention),
             soroban: FeeWindow::new(retention),

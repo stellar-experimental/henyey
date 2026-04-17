@@ -46,6 +46,18 @@ tempfile.workspace = true
 sha2.workspace = true
 parking_lot.workspace = true
 
+# Optional — only used by the `test-utils` feature for building in-process
+# history-archive fixtures that integration tests in other crates can consume.
+axum = { workspace = true, optional = true }
+
+[features]
+# Exposes reusable in-process history-archive fixtures (file:// tree + axum
+# server + helper builders) under `henyey_history::test_utils`. Consumed by
+# integration tests in `crates/henyey` and elsewhere. Also enabled
+# automatically for this crate's own `tests/` via dev-dependencies below.
+test-utils = ["dep:axum"]
+
 [dev-dependencies]
 tempfile.workspace = true
 axum.workspace = true
+henyey-history = { path = ".", features = ["test-utils"] }

@@ -1,5 +1,29 @@
 name: Quickstart
 
+# Coverage note (#1755):
+#
+# Two guarantees have no equivalent in-repo test and are the reason this
+# workflow still runs:
+#   * Horizon ingest pipeline — a real horizon process consumes
+#     LedgerCloseMeta from a henyey validator end-to-end (pubnet shard).
+#   * Multi-service orchestration — docker startup order, port binding, and
+#     inter-service pipes when core/rpc/horizon run together.
+#
+# Three other guarantees that previously only ran here now have fast
+# deterministic in-repo tests:
+#   * Two-process catchup → run handoff:
+#     crates/henyey/tests/catchup_to_run_handoff.rs
+#   * LedgerCloseMeta record-mark framing on fd:3: covered by the same
+#     subprocess test reading via `XdrInputStream` (wire-compat-tested
+#     against stellar-core at crates/common/src/xdr_stream.rs).
+#   * JSON-RPC HTTP surface: crates/rpc/tests/http_dispatch.rs.
+#
+# Reusable-workflow behaviour: stellar/quickstart injects an implicit
+# matrix of network=["local"] × enable=["core","rpc","core,rpc,horizon",
+# "galexie"] for every image. Those default shards repeatedly flake on
+# upstream friendbot/spawn errors unrelated to henyey. The image-level
+# `tests.continue-on-error: true` below ensures they do not block merges.
+
 on:
   pull_request:
   push:

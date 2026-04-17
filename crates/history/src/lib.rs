@@ -122,6 +122,12 @@ pub mod remote_archive;
 // Error handling
 pub mod error;
 
+/// Reusable in-process history-archive fixtures for integration tests.
+/// Gated behind the `test-utils` feature so production builds don't pull
+/// in the axum dependency.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
 // Re-export main types at crate root
 pub use archive::HistoryArchive;
 pub use archive_state::HistoryArchiveState;

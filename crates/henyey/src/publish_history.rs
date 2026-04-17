@@ -597,7 +597,7 @@ mod tests {
             },
         });
 
-        write_scp_history_file(tmp.path(), 63, &[entry.clone()]).unwrap();
+        write_scp_history_file(tmp.path(), 63, std::slice::from_ref(&entry)).unwrap();
 
         let path = tmp.path().join(checkpoint_path("scp", 63, "xdr.gz"));
         let file = std::fs::File::open(path).unwrap();

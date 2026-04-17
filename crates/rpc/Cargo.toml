@@ -52,3 +52,6 @@ anyhow.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+henyey-simulation.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
