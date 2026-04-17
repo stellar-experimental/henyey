@@ -134,9 +134,26 @@ Repeat until `VERDICT: APPROVED` or `proposal_round >= max_proposal_rounds`:
 
 Increment `proposal_round`.
 
-**Post the proposal draft to the issue**:
+**Post the proposal draft to the issue.**
+
+> **CRITICAL — read before posting.** The pattern `gh issue comment ... --body "$(cat <<'EOF' ... EOF)"` is a template. The `{placeholder}` tokens must be replaced with **literal text** before the bash command runs. Do NOT substitute a placeholder with a shell expression like `$(cat /tmp/foo.md)` — the heredoc is single-quoted, so no shell expansion happens, and the literal string `$(cat /tmp/foo.md)` ends up in the GitHub comment body. To avoid this class of bug, use `--body-file` to point `gh` at a file on disk, which bypasses shell interpolation entirely. Write the full comment body (header + content + footer) to a temporary file, then post it as one unit.
 
 ```bash
+# Preferred pattern — write to a file, then post via --body-file.
+tmpfile=$(mktemp)
+{
+  printf '## 📝 Proposal Draft (Round %s/%s)\n\n' "$proposal_round" "$max_proposal_rounds"
+  cat /tmp/pdr-$ISSUE/proposal_r$proposal_round.md
+  printf '\n\n---\n\n*Submitting to adversarial critic for review…*\n'
+} > "$tmpfile"
+gh issue comment $ISSUE --body-file "$tmpfile"
+rm -f "$tmpfile"
+```
+
+**Do NOT use this legacy heredoc pattern** — it is a footgun when sub-agents do the textual substitution, as evidenced by the 16-comment incident on #1759/#1768:
+
+```bash
+# ❌ DO NOT USE — substituting {current_proposal} with `$(cat ...)` leaves the literal string in the comment.
 gh issue comment $ISSUE --body "$(cat <<'DRAFT_EOF'
 ## 📝 Proposal Draft (Round {proposal_round}/{max_proposal_rounds})
 
@@ -236,21 +253,19 @@ verdict.** This is not optional — the issue comment trail is the audit log.
 Do not skip this step, even if the verdict is APPROVED.
 
 ```bash
-gh issue comment $ISSUE --body "$(cat <<'CRITIC_EOF'
-## 🔍 Critic Response (Round {proposal_round}/{max_proposal_rounds})
-
-<details>
-<summary>Full critique (click to expand)</summary>
-
-{critic_full_response}
-
-</details>
-
-**Verdict: {APPROVED|REVISE}**
-
-{if REVISE, include the numbered feedback items here outside the details block}
-CRITIC_EOF
-)"
+# Use --body-file (see the CRITICAL note in Step 2a).
+tmpfile=$(mktemp)
+{
+  printf '## 🔍 Critic Response (Round %s/%s)\n\n' "$proposal_round" "$max_proposal_rounds"
+  printf '<details>\n<summary>Full critique (click to expand)</summary>\n\n'
+  cat /tmp/pdr-$ISSUE/critic_r$proposal_round.md
+  printf '\n\n</details>\n\n'
+  printf '**Verdict: %s**\n\n' "$verdict"
+  # If REVISE, append the numbered feedback items outside the <details> block
+  # here (either inline printf lines or cat a second file).
+} > "$tmpfile"
+gh issue comment $ISSUE --body-file "$tmpfile"
+rm -f "$tmpfile"
 ```
 
 **If `VERDICT: APPROVED`**:
@@ -275,17 +290,15 @@ After convergence (or max rounds), post the final proposal as a GitHub issue
 comment:
 
 ```bash
-gh issue comment $ISSUE --body "$(cat <<'PROPOSAL_EOF'
-## Converged Proposal (Round {proposal_round}/{max_proposal_rounds})
-
-{current_proposal}
-
----
-
-*This proposal was refined through {proposal_round} round(s) of adversarial
-review using the `plan-do-review` skill.*
-PROPOSAL_EOF
-)"
+# Use --body-file (see the CRITICAL note in Step 2a).
+tmpfile=$(mktemp)
+{
+  printf '## Converged Proposal (Round %s/%s)\n\n' "$proposal_round" "$max_proposal_rounds"
+  cat /tmp/pdr-$ISSUE/proposal_final.md
+  printf '\n\n---\n\n*This proposal was refined through %s round(s) of adversarial review using the `plan-do-review` skill.*\n' "$proposal_round"
+} > "$tmpfile"
+gh issue comment $ISSUE --body-file "$tmpfile"
+rm -f "$tmpfile"
 ```
 
 ---
@@ -481,21 +494,18 @@ Read the agent result. Extract the verdict from the Fix Analysis section.
 **Post the review result to the issue**:
 
 ```bash
-gh issue comment $ISSUE --body "$(cat <<'REVIEW_EOF'
-## 🔬 Review-Fix Report (Round {review_round}/{max_review_rounds})
-
-<details>
-<summary>Full review report (click to expand)</summary>
-
-{review_fix_full_response}
-
-</details>
-
-**Verdict: {SOUND|CONCERNS|INCOMPLETE|WRONG}**
-
-{if not SOUND, include the key issues here outside the details block}
-REVIEW_EOF
-)"
+# Use --body-file (see the CRITICAL note in Step 2a).
+tmpfile=$(mktemp)
+{
+  printf '## 🔬 Review-Fix Report (Round %s/%s)\n\n' "$review_round" "$max_review_rounds"
+  printf '<details>\n<summary>Full review report (click to expand)</summary>\n\n'
+  cat /tmp/pdr-$ISSUE/review_r$review_round.md
+  printf '\n\n</details>\n\n'
+  printf '**Verdict: %s**\n\n' "$verdict"
+  # If not SOUND, append the key issues outside the <details> block.
+} > "$tmpfile"
+gh issue comment $ISSUE --body-file "$tmpfile"
+rm -f "$tmpfile"
 ```
 
 **If `SOUND`**:
@@ -543,30 +553,26 @@ gh issue edit $ISSUE --remove-assignee @me
 ```
 
 ```bash
-gh issue comment $ISSUE --body "$(cat <<'DONE_EOF'
-## Implementation Complete
-
-Implemented in commit(s):
-{list of commit hashes with one-line descriptions}
-
-### Summary
-{brief description of what was implemented}
-
-### Review Status
-Passed review-fix in {review_round} round(s).
-Final verdict: **SOUND**
-
-### What was done
-{bullet list of changes}
+# Use --body-file (see the CRITICAL note in Step 2a).
+tmpfile=$(mktemp)
+# Compose the completion comment by writing each section in turn. Any
+# variable-length sections (commit list, What-was-done, etc.) should be
+# either printed inline with printf or cat'd from a pre-written file —
+# never embedded as `$(cat ...)` inside a quoted heredoc.
+{
+  printf '## Implementation Complete\n\n'
+  printf 'Implemented in commit(s):\n%s\n\n' "$commit_list"  # or cat a prebuilt file
+  printf '### Summary\n%s\n\n' "$brief_summary"
+  printf '### Review Status\nPassed review-fix in %s round(s).\nFinal verdict: **SOUND**\n\n' "$review_round"
+  printf '### What was done\n%s\n\n' "$what_was_done"
 
 ### What was deferred (if any)
 {bullet list of follow-up items with issue links}
 
----
-
-*Implemented and reviewed using the `plan-do-review` skill.*
-DONE_EOF
-)"
+  printf -- '---\n\n*Implemented and reviewed using the `plan-do-review` skill.*\n'
+} > "$tmpfile"
+gh issue comment $ISSUE --body-file "$tmpfile"
+rm -f "$tmpfile"
 ```
 
 ### 5b: File Issues for Deferred Work
