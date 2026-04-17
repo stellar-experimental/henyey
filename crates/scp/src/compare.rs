@@ -10,36 +10,68 @@ use crate::ballot::{ballot_compare, cmp_opt_ballot};
 
 /// Compare two nominations or ballot statements for ordering.
 ///
-/// Returns true if `new_st` is newer than `old_st` for the same node.
-/// This is used to determine if a statement should replace an existing one.
+/// Returns true if `new_st` is newer than `old_st`. Mirrors the three-level
+/// check in stellar-core:
+/// 1. Identity: node_id + slot_index must match (SCP.cpp:420-423)
+/// 2. Phase: nomination ↔ ballot never replaces (Slot.cpp:118-121)
+/// 3. Ballot ordering: delegates to [`is_newer_ballot_st`] (BallotProtocol.cpp:55-90)
+///
+/// Note: stellar-core's slot-existence check (`getSlot`) depends on runtime
+/// state and is not replicated in this free function.
 pub fn is_newer_nomination_or_ballot_st(old_st: &ScpStatement, new_st: &ScpStatement) -> bool {
-    use ScpStatementPledges::*;
+    // Identity check: must be same node and slot (SCP.cpp:420-423).
+    if old_st.node_id != new_st.node_id || old_st.slot_index != new_st.slot_index {
+        return false;
+    }
 
-    let type_rank = |pledges: &ScpStatementPledges| -> u8 {
-        match pledges {
-            Nominate(_) => 0,
-            Prepare(_) => 1,
-            Confirm(_) => 2,
-            Externalize(_) => 3,
-        }
-    };
+    let is_nomination = |p: &ScpStatementPledges| matches!(p, ScpStatementPledges::Nominate(_));
 
-    let old_rank = type_rank(&old_st.pledges);
-    let new_rank = type_rank(&new_st.pledges);
-
-    // Cross-phase replacement is not allowed: a ballot statement never
-    // replaces a nomination and vice-versa.  Matches stellar-core
-    // Slot.cpp:isNewerNominationOrBallotSt which returns false when the
-    // statement types belong to different phases.
-    if old_rank != new_rank {
+    // Cross-phase: nomination ↔ ballot never replaces (Slot.cpp:118-121).
+    if is_nomination(&old_st.pledges) != is_nomination(&new_st.pledges) {
         return false;
     }
 
     match (&old_st.pledges, &new_st.pledges) {
-        (Nominate(old), Nominate(new)) => is_newer_nominate(old, new),
-        (Prepare(old), Prepare(new)) => is_newer_prepare(old, new),
-        (Confirm(old), Confirm(new)) => is_newer_confirm(old, new),
-        (Externalize(_), Externalize(_)) => false,
+        (ScpStatementPledges::Nominate(old), ScpStatementPledges::Nominate(new)) => {
+            is_newer_nominate(old, new)
+        }
+        _ => is_newer_ballot_st(old_st, new_st),
+    }
+}
+
+/// Compare two ballot statements for ordering (PREPARE < CONFIRM < EXTERNALIZE).
+///
+/// Mirrors stellar-core `BallotProtocol::isNewerStatement` (BallotProtocol.cpp:55-90).
+/// Cross-type upgrades return `old_rank < new_rank`; same-type delegates to
+/// per-type comparison. Must only be called with ballot (non-nomination) statements.
+pub(crate) fn is_newer_ballot_st(old_st: &ScpStatement, new_st: &ScpStatement) -> bool {
+    fn ballot_rank(p: &ScpStatementPledges) -> u8 {
+        match p {
+            ScpStatementPledges::Prepare(_) => 0,
+            ScpStatementPledges::Confirm(_) => 1,
+            ScpStatementPledges::Externalize(_) => 2,
+            ScpStatementPledges::Nominate(_) => {
+                debug_assert!(false, "is_newer_ballot_st called with nomination statement");
+                0
+            }
+        }
+    }
+
+    let old_rank = ballot_rank(&old_st.pledges);
+    let new_rank = ballot_rank(&new_st.pledges);
+
+    if old_rank != new_rank {
+        return old_rank < new_rank;
+    }
+
+    match (&old_st.pledges, &new_st.pledges) {
+        (ScpStatementPledges::Prepare(old), ScpStatementPledges::Prepare(new)) => {
+            is_newer_prepare(old, new)
+        }
+        (ScpStatementPledges::Confirm(old), ScpStatementPledges::Confirm(new)) => {
+            is_newer_confirm(old, new)
+        }
+        (ScpStatementPledges::Externalize(_), ScpStatementPledges::Externalize(_)) => false,
         _ => false,
     }
 }
@@ -197,11 +229,11 @@ mod tests {
         assert!(!is_newer_confirm(&conf_a, &conf_a));
     }
 
-    /// Regression test for AUDIT-070: cross-phase statements must never replace
-    /// each other.  A ballot/externalize must not replace a nomination and
-    /// vice-versa.
+    /// Regression test for AUDIT-070: nomination ↔ ballot cross-phase statements
+    /// must never replace each other. Within-ballot cross-type upgrades
+    /// (PREPARE→EXTERNALIZE) are allowed per stellar-core BallotProtocol.cpp:64-66.
     #[test]
-    fn test_audit_070_cross_phase_never_replaces() {
+    fn test_nomination_ballot_cross_phase_never_replaces() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let value = make_value(&[1]);
@@ -253,14 +285,242 @@ mod tests {
             &nominate_st
         ));
 
-        // Cross-phase within ballot: different ballot types must NOT replace each other
-        assert!(!is_newer_nomination_or_ballot_st(
+        // Within-ballot cross-type: upgrade is allowed, downgrade is not
+        assert!(is_newer_nomination_or_ballot_st(
             &prepare_st,
             &externalize_st
         ));
         assert!(!is_newer_nomination_or_ballot_st(
             &externalize_st,
             &prepare_st
+        ));
+    }
+
+    /// Test all 6 directed within-ballot cross-type pairs.
+    /// Upgrades (PREPARE→CONFIRM, PREPARE→EXTERNALIZE, CONFIRM→EXTERNALIZE)
+    /// return true; downgrades return false.
+    /// Matches stellar-core BallotProtocol.cpp:64-66: old_type < new_type.
+    #[test]
+    fn test_cross_type_ballot_upgrades() {
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let qs_hash = crate::quorum::hash_quorum_set(&qs);
+
+        let prepare_st = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: qs_hash.into(),
+                ballot: make_ballot(1, &[1]),
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+
+        let confirm_st = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
+                ballot: make_ballot(1, &[1]),
+                n_prepared: 1,
+                n_commit: 1,
+                n_h: 1,
+                quorum_set_hash: qs_hash.into(),
+            }),
+        };
+
+        let externalize_st = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Externalize(stellar_xdr::curr::ScpStatementExternalize {
+                commit: make_ballot(1, &[1]),
+                n_h: 1,
+                commit_quorum_set_hash: qs_hash.into(),
+            }),
+        };
+
+        // Upgrades: true
+        assert!(is_newer_nomination_or_ballot_st(&prepare_st, &confirm_st));
+        assert!(is_newer_nomination_or_ballot_st(
+            &prepare_st,
+            &externalize_st
+        ));
+        assert!(is_newer_nomination_or_ballot_st(
+            &confirm_st,
+            &externalize_st
+        ));
+
+        // Downgrades: false
+        assert!(!is_newer_nomination_or_ballot_st(&confirm_st, &prepare_st));
+        assert!(!is_newer_nomination_or_ballot_st(
+            &externalize_st,
+            &prepare_st
+        ));
+        assert!(!is_newer_nomination_or_ballot_st(
+            &externalize_st,
+            &confirm_st
+        ));
+
+        // Same type (Externalize → Externalize): false
+        assert!(!is_newer_nomination_or_ballot_st(
+            &externalize_st,
+            &externalize_st
+        ));
+    }
+
+    /// Cross-type upgrade is independent of ballot value: type ordering wins.
+    #[test]
+    fn test_cross_type_ballot_upgrade_value_independent() {
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let qs_hash = crate::quorum::hash_quorum_set(&qs);
+
+        // Prepare has a "higher" ballot value than Confirm
+        let prepare_st = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: qs_hash.into(),
+                ballot: make_ballot(99, &[255]),
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+
+        let confirm_st = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
+                ballot: make_ballot(1, &[1]),
+                n_prepared: 1,
+                n_commit: 1,
+                n_h: 1,
+                quorum_set_hash: qs_hash.into(),
+            }),
+        };
+
+        // Type ordering wins: PREPARE→CONFIRM is an upgrade regardless of ballot
+        assert!(is_newer_nomination_or_ballot_st(&prepare_st, &confirm_st));
+        assert!(!is_newer_nomination_or_ballot_st(&confirm_st, &prepare_st));
+    }
+
+    /// Node mismatch returns false (SCP.cpp:420).
+    #[test]
+    fn test_node_mismatch_returns_false() {
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let qs = make_quorum_set(vec![node1.clone()], 1);
+        let qs_hash = crate::quorum::hash_quorum_set(&qs);
+
+        let st1 = ScpStatement {
+            node_id: node1,
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: qs_hash.into(),
+                ballot: make_ballot(1, &[1]),
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+
+        let st2 = ScpStatement {
+            node_id: node2,
+            slot_index: 1,
+            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
+                ballot: make_ballot(1, &[1]),
+                n_prepared: 1,
+                n_commit: 1,
+                n_h: 1,
+                quorum_set_hash: qs_hash.into(),
+            }),
+        };
+
+        assert!(!is_newer_nomination_or_ballot_st(&st1, &st2));
+    }
+
+    /// Slot mismatch returns false (SCP.cpp:420).
+    #[test]
+    fn test_slot_mismatch_returns_false() {
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let qs_hash = crate::quorum::hash_quorum_set(&qs);
+
+        let st1 = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: qs_hash.into(),
+                ballot: make_ballot(1, &[1]),
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+
+        let st2 = ScpStatement {
+            node_id: node,
+            slot_index: 2,
+            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
+                ballot: make_ballot(1, &[1]),
+                n_prepared: 1,
+                n_commit: 1,
+                n_h: 1,
+                quorum_set_hash: qs_hash.into(),
+            }),
+        };
+
+        assert!(!is_newer_nomination_or_ballot_st(&st1, &st2));
+    }
+
+    /// Regression test mirroring the overlay queue replacement pattern:
+    /// same node/slot, stale PREPARE replaced by advancing CONFIRM.
+    #[test]
+    fn test_queue_replacement_regression() {
+        let node = make_node_id(42);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let qs_hash = crate::quorum::hash_quorum_set(&qs);
+
+        let stale_prepare = ScpStatement {
+            node_id: node.clone(),
+            slot_index: 100,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: qs_hash.into(),
+                ballot: make_ballot(1, &[1]),
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+
+        let advancing_confirm = ScpStatement {
+            node_id: node,
+            slot_index: 100,
+            pledges: ScpStatementPledges::Confirm(stellar_xdr::curr::ScpStatementConfirm {
+                ballot: make_ballot(5, &[1]),
+                n_prepared: 3,
+                n_commit: 2,
+                n_h: 4,
+                quorum_set_hash: qs_hash.into(),
+            }),
+        };
+
+        // Queue trimming should allow replacing stale PREPARE with CONFIRM
+        assert!(is_newer_nomination_or_ballot_st(
+            &stale_prepare,
+            &advancing_confirm
+        ));
+        // But not the reverse
+        assert!(!is_newer_nomination_or_ballot_st(
+            &advancing_confirm,
+            &stale_prepare
         ));
     }
 }

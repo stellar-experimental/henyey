@@ -13,32 +13,7 @@ impl BallotProtocol {
     }
 
     fn is_newer_statement_pair(old: &ScpStatement, new: &ScpStatement) -> bool {
-        let old_rank = Self::pledge_rank(&old.pledges);
-        let new_rank = Self::pledge_rank(&new.pledges);
-
-        if old_rank != new_rank {
-            return old_rank < new_rank;
-        }
-
-        match (&old.pledges, &new.pledges) {
-            (ScpStatementPledges::Externalize(_), ScpStatementPledges::Externalize(_)) => false,
-            (ScpStatementPledges::Confirm(old_c), ScpStatementPledges::Confirm(new_c)) => {
-                crate::compare::is_newer_confirm(old_c, new_c)
-            }
-            (ScpStatementPledges::Prepare(old_p), ScpStatementPledges::Prepare(new_p)) => {
-                crate::compare::is_newer_prepare(old_p, new_p)
-            }
-            _ => false,
-        }
-    }
-
-    fn pledge_rank(pledges: &ScpStatementPledges) -> u8 {
-        match pledges {
-            ScpStatementPledges::Prepare(_) => 0,
-            ScpStatementPledges::Confirm(_) => 1,
-            ScpStatementPledges::Externalize(_) => 2,
-            _ => 3,
-        }
+        crate::compare::is_newer_ballot_st(old, new)
     }
 
     pub(crate) fn is_statement_sane<D: SCPDriver>(
