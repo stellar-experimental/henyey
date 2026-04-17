@@ -199,23 +199,7 @@ impl App {
         // On mainnet with 24+ validators, SCP messages can arrive faster
         // than they're processed.  An unbounded drain starves everything
         // else in the tick (sync recovery, consensus trigger, tx_set requests).
-        //
-        // Lowered from 200 to 32 in the close-time-lag fix: each
-        // `pump_scp_intake` call can itself process up to
-        // `VERIFIED_DRAIN_BUDGET` verified envelopes as a side-effect, so a
-        // single drain loop could serialize hundreds of awaits before
-        // returning to `select!`. That starved the fetch-channel drain,
-        // timers, and `pending_close` for tens of seconds in bursts.  The
-        // select! itself polls these branches on the next iteration, so a
-        // tighter cap only changes how often we yield, not total throughput.
-        const MAX_DRAIN_PER_TICK: usize = 32;
-
-        // Wall-time budget for the post-close and tick drain loops.  If a
-        // single drain pass exceeds this, we stop early and return to
-        // `select!` so the consensus timer, `pending_close` poll, and other
-        // branches get a chance to fire.  Paired with `MAX_DRAIN_PER_TICK`
-        // to cap worst-case starvation.
-        const DRAIN_WALL_BUDGET: Duration = Duration::from_millis(50);
+        const MAX_DRAIN_PER_TICK: usize = 200;
 
         let mut select_iteration: u64 = 0;
         loop {
@@ -269,25 +253,14 @@ impl App {
                             self.try_trigger_consensus().await;
                         }
 
-                        // Drain SCP + fetch response channels.  Bounded by
-                        // both a count cap and a wall-clock budget so we
-                        // never starve the outer `select!` (timers,
-                        // `pending_close`, etc.) during SCP bursts.
-                        let drain_start = self.clock.now();
+                        // Drain SCP + fetch response channels.
                         for _ in 0..MAX_DRAIN_PER_TICK {
-                            if drain_start.elapsed() > DRAIN_WALL_BUDGET {
-                                break;
-                            }
                             match scp_message_rx.try_recv() {
                                 Ok(scp_msg) => self.pump_scp_intake(scp_msg, &mut verified_rx).await,
                                 Err(_) => break,
                             }
                         }
-                        let drain_start = self.clock.now();
                         for _ in 0..MAX_DRAIN_PER_TICK {
-                            if drain_start.elapsed() > DRAIN_WALL_BUDGET {
-                                break;
-                            }
                             match fetch_response_rx.try_recv() {
                                 Ok(fetch_msg) => {
                                     self.decrement_fetch_channel_depth();
@@ -621,15 +594,8 @@ impl App {
                     // arrived since the last tick are processed before we decide
                     // whether to trigger catchup or consensus.
 
-                    // Drain dedicated SCP channel first (highest priority).
-                    // Bounded by count + wall-clock (see MAX_DRAIN_PER_TICK
-                    // and DRAIN_WALL_BUDGET) so consensus triggering doesn't
-                    // starve on SCP bursts.
-                    let drain_start = self.clock.now();
+                    // Drain dedicated SCP channel first (highest priority)
                     for _ in 0..MAX_DRAIN_PER_TICK {
-                        if drain_start.elapsed() > DRAIN_WALL_BUDGET {
-                            break;
-                        }
                         match scp_message_rx.try_recv() {
                             Ok(scp_msg) => self.pump_scp_intake(scp_msg, &mut verified_rx).await,
                             Err(_) => break,
@@ -637,11 +603,7 @@ impl App {
                     }
 
                     // Drain dedicated fetch response channel (tx_sets, dont_have, etc.)
-                    let drain_start = self.clock.now();
                     for _ in 0..MAX_DRAIN_PER_TICK {
-                        if drain_start.elapsed() > DRAIN_WALL_BUDGET {
-                            break;
-                        }
                         match fetch_response_rx.try_recv() {
                             Ok(fetch_msg) => {
                                 self.decrement_fetch_channel_depth();
@@ -1500,15 +1462,7 @@ impl App {
     /// Maximum number of verified envelopes drained per `pump_scp_intake`
     /// call before yielding to the outer select! (so timers and intake
     /// from other channels stay responsive under verified-backlog bursts).
-    ///
-    /// Lowered from 32 to 8 in the close-time-lag fix: each
-    /// `process_verified` call can do substantial async work
-    /// (herder state mutation, `process_externalized_slots`, overlay
-    /// messaging). Combined with an outer drain cap that invoked
-    /// `pump_scp_intake` up to 200x per tick, the inner budget of 32
-    /// produced up to 6400 sequential awaits per tick and wedged the
-    /// outer `select!` for seconds.
-    const VERIFIED_DRAIN_BUDGET: usize = 8;
+    const VERIFIED_DRAIN_BUDGET: usize = 32;
 
     /// Pure helper: drain up to `budget` already-queued envelopes from an
     /// unbounded verified-output channel via non-blocking `try_recv`, calling
@@ -1537,47 +1491,6 @@ impl App {
             match verified_rx.try_recv() {
                 Ok(ve) => {
                     f(ve).await;
-                    drained += 1;
-                }
-                Err(_) => break,
-            }
-        }
-        drained
-    }
-
-    /// Pure helper: drain from an mpsc receiver under both a count cap AND
-    /// a wall-time cap. Returns the number of items drained. Stops at
-    /// whichever limit hits first.  Mirrors the per-tick drain loops in
-    /// the main `select!` — extracted as a standalone helper to make the
-    /// dual-cap invariant unit-testable without spinning up an App.
-    ///
-    /// This is the testable core of the fix for the "30s close-time lag"
-    /// bug: before the fix, the per-tick drains had only a count cap
-    /// (`MAX_DRAIN_PER_TICK = 200`), and each iteration could itself take
-    /// milliseconds of async work. A single drain pass could wedge the
-    /// event loop for seconds, which showed up as `scp_silent_secs` of
-    /// 10–23s on heartbeats even though peers were delivering SCP to the
-    /// unbounded intake channel normally.
-    #[cfg(test)]
-    pub(crate) async fn drain_with_caps<T, F, Fut>(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<T>,
-        count_cap: usize,
-        time_cap: Duration,
-        mut f: F,
-    ) -> usize
-    where
-        F: FnMut(T) -> Fut,
-        Fut: std::future::Future<Output = ()>,
-    {
-        let start = Instant::now();
-        let mut drained = 0;
-        while drained < count_cap {
-            if start.elapsed() > time_cap {
-                break;
-            }
-            match rx.try_recv() {
-                Ok(item) => {
-                    f(item).await;
                     drained += 1;
                 }
                 Err(_) => break,
@@ -2005,72 +1918,5 @@ mod pump_tests {
         let drained = App::drain_verified_bounded(&mut rx, 32, |_ve| async {}).await;
         assert_eq!(drained, 5);
         assert_eq!(rx.len(), 0);
-    }
-
-    /// Regression test for the 30s close-time lag: the per-tick drain loops
-    /// must stop early when per-item async work exceeds the wall-time
-    /// budget, even if the count cap is far higher. Before the fix, a
-    /// single drain pass could sequentially call `pump_scp_intake` up to
-    /// 200 times, each doing millisecond-scale async work, wedging the
-    /// outer `select!` for seconds and starving timers / `pending_close`.
-    ///
-    /// Simulates "slow per-item work" by sleeping 10ms per item. With
-    /// count_cap=200 and time_cap=50ms, the drain MUST yield well before
-    /// processing all 200 items — a strict upper bound on close-time lag
-    /// injected by any single drain pass.
-    #[tokio::test(flavor = "current_thread")]
-    async fn test_drain_respects_wall_time_budget() {
-        use std::time::Duration;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
-        for i in 0..200 {
-            tx.send(i).unwrap();
-        }
-
-        // Slow per-item work: 10ms each real-time sleep. With a 50ms wall
-        // budget we must stop well before the 200 count cap.
-        let start = std::time::Instant::now();
-        let drained =
-            App::drain_with_caps(&mut rx, 200, Duration::from_millis(50), |_item| async {
-                // Busy-work for ~10ms using a real sleep. This is real
-                // wall-clock time so the drain's own `Instant::now()` sees
-                // budget expiration even without tokio time control.
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            })
-            .await;
-        let elapsed = start.elapsed();
-
-        assert!(
-            drained < 200,
-            "drain must yield before count cap when wall budget is exhausted (drained={drained})"
-        );
-        assert!(
-            drained > 0,
-            "drain must make progress on non-empty channel (drained={drained})"
-        );
-        // Allow generous slack for CI noise but require the drain did not
-        // run anywhere near the full 200 items (which would be ~2s).
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "drain elapsed must stay bounded near the wall budget \
-             (elapsed={elapsed:?}, drained={drained})"
-        );
-        // Remaining items stay on the channel for the next drain pass.
-        assert_eq!(rx.len() + drained, 200, "no items dropped");
-    }
-
-    /// Verifies the dual-cap: when time is NOT the bottleneck (instant
-    /// per-item work), the count cap governs and the drain yields exactly
-    /// at the cap.
-    #[tokio::test]
-    async fn test_drain_respects_count_cap() {
-        use std::time::Duration;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
-        for i in 0..200 {
-            tx.send(i).unwrap();
-        }
-        let drained =
-            App::drain_with_caps(&mut rx, 32, Duration::from_secs(10), |_item| async {}).await;
-        assert_eq!(drained, 32);
-        assert_eq!(rx.len(), 168);
     }
 }
