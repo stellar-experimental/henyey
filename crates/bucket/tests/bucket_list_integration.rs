@@ -1983,3 +1983,76 @@ async fn test_scan_for_entries_of_types_soroban_combined() {
     assert_eq!(config_count, 0, "Should find 0 ConfigSettings (none added)");
     assert_eq!(other_count, 0, "Should not find Account or Offer entries");
 }
+
+// =============================================================================
+// AUDIT-152: Zero-budget eviction scan
+// =============================================================================
+
+#[tokio::test]
+async fn test_eviction_scan_zero_budget_does_not_advance_iterator() {
+    use henyey_bucket::EvictionIterator;
+    use stellar_xdr::curr::StateArchivalSettings;
+
+    let mut bl = BucketList::new();
+
+    let current_ledger = 1u32;
+    let ttl_expiration = current_ledger + 2;
+
+    // Create entries so the bucket is non-empty
+    let mut entries = Vec::new();
+    for i in 0..5 {
+        let code_entry = make_contract_code_entry(i, current_ledger);
+        let code_key = make_contract_code_key(i);
+        let ttl_entry = make_ttl_entry(&code_key, ttl_expiration, current_ledger);
+        entries.push(code_entry);
+        entries.push(ttl_entry);
+    }
+
+    bl.add_batch(
+        current_ledger,
+        TEST_PROTOCOL,
+        BucketListType::Live,
+        entries,
+        vec![],
+        vec![],
+    )
+    .unwrap();
+
+    // eviction_scan_size = 0 means zero budget
+    let settings = StateArchivalSettings {
+        starting_eviction_scan_level: 0,
+        eviction_scan_size: 0,
+        max_entries_to_archive: 1000,
+        ..Default::default()
+    };
+
+    let start_iter = EvictionIterator {
+        bucket_list_level: 0,
+        is_curr_bucket: true,
+        bucket_file_offset: 0,
+    };
+
+    // Scan at a ledger past expiration
+    let result = bl
+        .scan_for_eviction_incremental(start_iter.clone(), 100, &settings)
+        .unwrap();
+
+    // stellar-core returns immediately with no work when bytesToScan == 0
+    assert!(
+        result.candidates.is_empty(),
+        "Zero budget must produce no eviction candidates"
+    );
+    assert_eq!(result.bytes_scanned, 0, "Zero budget must scan zero bytes");
+    assert_eq!(
+        result.end_iterator.bucket_file_offset, start_iter.bucket_file_offset,
+        "Zero budget must not advance the eviction iterator"
+    );
+    assert_eq!(
+        result.end_iterator.bucket_list_level, start_iter.bucket_list_level,
+        "Zero budget must not change the iterator level"
+    );
+    assert_eq!(
+        result.end_iterator.is_curr_bucket, start_iter.is_curr_bucket,
+        "Zero budget must not change the iterator bucket selector"
+    );
+}

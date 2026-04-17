@@ -504,6 +504,11 @@ pub(crate) fn scan_bucket_region(
         return Ok((entries_scanned, bytes_used, true));
     }
 
+    // Mirror stellar-core: if (bytesToScan == 0) return Loop::COMPLETE
+    if max_bytes == 0 {
+        return Ok((entries_scanned, bytes_used, false));
+    }
+
     let start_offset = iter.bucket_file_offset;
 
     for result in bucket.iter_from_offset_with_sizes(start_offset)? {
