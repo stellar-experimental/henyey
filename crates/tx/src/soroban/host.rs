@@ -2145,4 +2145,63 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert!(result[0].new_entry.is_none());
     }
+
+    /// Test that `convert_diagnostic_events_cross_version` skips events that
+    /// fail serialization or deserialization, while preserving order of valid
+    /// events.
+    #[test]
+    fn test_convert_diagnostic_events_cross_version_skip_corrupt() {
+        use stellar_xdr::curr::{
+            ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, DiagnosticEvent,
+            ExtensionPoint, WriteXdr,
+        };
+
+        // Build valid DiagnosticEvent XDR bytes
+        fn valid_diag_bytes(val: u32) -> Vec<u8> {
+            let event = DiagnosticEvent {
+                in_successful_contract_call: true,
+                event: ContractEvent {
+                    ext: ExtensionPoint::V0,
+                    contract_id: None,
+                    type_: ContractEventType::Contract,
+                    body: ContractEventBody::V0(ContractEventV0 {
+                        topics: vec![].try_into().unwrap(),
+                        data: ScVal::U32(val),
+                    }),
+                },
+            };
+            event.to_xdr(Limits::none()).unwrap()
+        }
+
+        // 4 items: good1, bad_serialize, bad_deserialize, good2
+        let items: Vec<(&str, Option<Vec<u8>>)> = vec![
+            ("good1", Some(valid_diag_bytes(1))),
+            ("bad_serialize", None), // serialize closure will return Err
+            ("bad_deserialize", Some(vec![0xFF])), // valid Ok but invalid XDR
+            ("good2", Some(valid_diag_bytes(2))),
+        ];
+
+        let result = convert_diagnostic_events_cross_version(
+            items,
+            "test",
+            |item: &(&str, Option<Vec<u8>>)| match &item.1 {
+                Some(bytes) => Ok(bytes.clone()),
+                None => Err(format!("mock serialize failure for {}", item.0)),
+            },
+        );
+
+        // Only the two valid events should survive, in order
+        assert_eq!(
+            result.len(),
+            2,
+            "expected 2 valid events, got {}",
+            result.len()
+        );
+        match &result[0].event.body {
+            ContractEventBody::V0(v0) => assert_eq!(v0.data, ScVal::U32(1)),
+        }
+        match &result[1].event.body {
+            ContractEventBody::V0(v0) => assert_eq!(v0.data, ScVal::U32(2)),
+        }
+    }
 }
