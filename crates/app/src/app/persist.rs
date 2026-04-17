@@ -106,6 +106,42 @@ impl CatchupFinalizer {
     }
 }
 
+/// How [`App::handle_close_complete`] finalizes post-close persistence.
+///
+/// Required argument — construction is compile-time mandatory so callers
+/// cannot silently drop the [`PersistJob::LedgerClose`] handle. Mirrors
+/// [`CatchupFinalizer`] for the ledger-close path (#1751 follow-up to #1749).
+pub struct LedgerCloseFinalizer(pub(super) LedgerCloseFinalizerInner);
+
+pub(super) enum LedgerCloseFinalizerInner {
+    /// Drive persist to completion before `handle_close_complete` returns.
+    /// Used by the manual-close path (admin HTTP + simulation) and the
+    /// `try_apply_buffered_ledgers` test helper. Persist-task panics are
+    /// silently discarded to preserve the prior `let _ = pt.handle.await`
+    /// semantics at those sites.
+    Inline,
+    /// Hand the spawned [`PendingPersist`] back over a oneshot. Used by
+    /// the event loop, which stores the handle in its local
+    /// `pending_persist` slot and gates the next close on its completion.
+    Deferred(tokio::sync::oneshot::Sender<PendingPersist>),
+}
+
+impl LedgerCloseFinalizer {
+    /// Drive the persist task inline before returning.
+    pub fn inline() -> Self {
+        Self(LedgerCloseFinalizerInner::Inline)
+    }
+
+    /// Hand the [`PendingPersist`] back to the caller via a oneshot for
+    /// event-loop-driven completion. Matches the send-failure tolerance
+    /// of [`CatchupFinalizer::deferred`]: if the receiver was dropped
+    /// (caller cancellation), the persist task runs detached and reports
+    /// its own errors via [`fatal_persist_error`].
+    pub(crate) fn deferred(tx: tokio::sync::oneshot::Sender<PendingPersist>) -> Self {
+        Self(LedgerCloseFinalizerInner::Deferred(tx))
+    }
+}
+
 /// Type alias for the boxed persist write function.
 type PersistWriteFn = Box<dyn FnOnce(&Database) -> anyhow::Result<()> + Send>;
 
@@ -349,5 +385,23 @@ mod tests {
             .with_connection(|c| c.get_state(henyey_db::schema::state_keys::HISTORY_ARCHIVE_STATE))
             .unwrap();
         assert_eq!(has.as_deref(), Some("{\"version\":1}"));
+    }
+
+    /// Shape-level regression for #1751: `LedgerCloseFinalizer` must be
+    /// constructible via both `inline()` and `deferred(tx)` and must
+    /// round-trip the correct inner variant. This is the API-surface
+    /// invariant that prevents silent-drop regressions — any future
+    /// caller of `handle_close_complete` must construct one of these
+    /// two variants, which is what the type system enforces.
+    #[test]
+    fn ledger_close_finalizer_construction_and_variant_shape() {
+        // Inline: unit variant.
+        let inline = LedgerCloseFinalizer::inline();
+        assert!(matches!(inline.0, LedgerCloseFinalizerInner::Inline));
+
+        // Deferred: carries a oneshot::Sender<PendingPersist>.
+        let (tx, _rx) = tokio::sync::oneshot::channel::<crate::app::types::PendingPersist>();
+        let deferred = LedgerCloseFinalizer::deferred(tx);
+        assert!(matches!(deferred.0, LedgerCloseFinalizerInner::Deferred(_)));
     }
 }

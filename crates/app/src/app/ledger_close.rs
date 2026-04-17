@@ -1395,11 +1395,13 @@ impl App {
             None => return,
         };
         let join_result = (&mut pending.handle).await;
-        let (success, persist_task) = self.handle_close_complete(pending, join_result).await;
-        // In buffered-catchup path, await persist inline (not the main event loop).
-        if let Some(pt) = persist_task {
-            let _ = pt.handle.await;
-        }
+        let success = self
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::inline(),
+            )
+            .await;
 
         // After closing a buffered ledger, reset timestamps and
         // tracking state so the heartbeat stall detector doesn't fire based
@@ -1570,12 +1572,14 @@ impl App {
     ///
     /// Performs all post-close work: meta emission, DB persistence, herder
     /// notification, and state updates. Returns `true` on success.
-    /// Process a completed ledger close.
     ///
-    /// Returns `(success, Option<PendingPersist>)`. When success is true,
-    /// a persist task has been spawned to write the ledger data to SQLite
-    /// and flush bucket files. The caller must track the `PendingPersist`
-    /// and wait for it to complete before starting the next ledger close.
+    /// The post-close persist (bucket flush + SQLite writes) is gated on
+    /// the `finalize` argument: [`LedgerCloseFinalizer::inline`] drives it
+    /// to completion before return; [`LedgerCloseFinalizer::deferred`]
+    /// hands a [`PendingPersist`] back over a oneshot for the event loop
+    /// to await before starting the next close. Because the finalizer is
+    /// a required argument, callers cannot silently drop the persist
+    /// handle — matches the [`CatchupFinalizer`] pattern from #1749.
     ///
     /// All in-memory state updates (herder, tx queue, bucket snapshot) are
     /// performed inline before returning, so the node can continue
@@ -1584,7 +1588,8 @@ impl App {
         &self,
         pending: PendingLedgerClose,
         join_result: Result<std::result::Result<LedgerCloseResult, String>, tokio::task::JoinError>,
-    ) -> (bool, Option<PendingPersist>) {
+        finalize: super::persist::LedgerCloseFinalizer,
+    ) -> bool {
         self.set_applying_ledger(false);
 
         let result = match join_result {
@@ -1607,7 +1612,7 @@ impl App {
                         "Hash mismatch detected - cleared all buffered ledgers, will trigger catchup"
                     );
                 }
-                return (false, None);
+                return false;
             }
             Err(e) => {
                 tracing::error!(
@@ -1615,7 +1620,7 @@ impl App {
                     error = %e,
                     "Ledger close task panicked"
                 );
-                return (false, None);
+                return false;
             }
         };
 
@@ -1907,25 +1912,38 @@ impl App {
         // SQLite transaction), but the outer task is a normal tokio task
         // that yields between blocking operations. This avoids the
         // deadlock from awaiting spawn_blocking inline in the select! loop.
-        let persist_task = match persist_data {
-            Ok(data) => {
-                let ledger_seq = pending.ledger_seq;
-                Some(super::persist::spawn_persist_task(
-                    super::persist::PersistJob::LedgerClose {
-                        write_fn: Box::new(move |db| data.serialize_and_write_to_db(db)),
-                        meta_xdr: meta_xdr,
-                        db: self.db.clone(),
-                        ledger_manager: self.ledger_manager.clone(),
-                        bucket_dir: self.bucket_manager.bucket_dir().to_path_buf(),
-                    },
-                    ledger_seq,
-                ))
-            }
+        let data = match persist_data {
+            Ok(data) => data,
             Err(err) => {
                 super::persist::fatal_persist_error("prepare ledger persist data", &err);
             }
         };
+        let pending_persist = super::persist::spawn_persist_task(
+            super::persist::PersistJob::LedgerClose {
+                write_fn: Box::new(move |db| data.serialize_and_write_to_db(db)),
+                meta_xdr,
+                db: self.db.clone(),
+                ledger_manager: self.ledger_manager.clone(),
+                bucket_dir: self.bucket_manager.bucket_dir().to_path_buf(),
+            },
+            pending.ledger_seq,
+        );
 
-        (true, persist_task)
+        // Dispatch on the finalizer. Inline drives the persist to
+        // completion (matches the prior `let _ = pt.handle.await;` at
+        // the manual-close and test-helper call sites, panics ignored).
+        // Deferred hands the handle back to the caller via oneshot;
+        // send-failure is silently tolerated to match CatchupFinalizer's
+        // Deferred variant at catchup_impl.rs:549-553.
+        match finalize.0 {
+            super::persist::LedgerCloseFinalizerInner::Inline => {
+                let _ = pending_persist.handle.await;
+            }
+            super::persist::LedgerCloseFinalizerInner::Deferred(tx) => {
+                let _ = tx.send(pending_persist);
+            }
+        }
+
+        true
     }
 }

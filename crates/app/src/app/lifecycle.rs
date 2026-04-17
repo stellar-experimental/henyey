@@ -260,18 +260,36 @@ impl App {
                     self.set_phase(6); // 6 = pending_close
                     tracing::debug!(select_iteration, "BRANCH: pending_close completed");
                     let pending = pending_close.take().unwrap();
-                    let (success, persist_task) = self.handle_close_complete(pending, join_result).await;
+                    let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
+                    let success = self
+                        .handle_close_complete(
+                            pending,
+                            join_result,
+                            super::persist::LedgerCloseFinalizer::deferred(persist_tx),
+                        )
+                        .await;
                     // Chain persist and next close if successful.
                     if success {
-                        // Track the deferred persist task. The next close
-                        // will be started when persist completes (see the
-                        // pending_persist branch below).
-                        if let Some(pt) = persist_task {
-                            debug_assert!(
-                                pending_persist.is_none(),
-                                "new close persist while previous persist still pending"
-                            );
-                            pending_persist = Some(pt);
+                        // Track the deferred persist task. Deferred always
+                        // sends on success (see handle_close_complete
+                        // dispatch at ledger_close.rs); the `try_recv` is
+                        // non-blocking because the send already happened
+                        // synchronously inside handle_close_complete.
+                        debug_assert!(
+                            pending_persist.is_none(),
+                            "new close persist while previous persist still pending"
+                        );
+                        match persist_rx.try_recv() {
+                            Ok(pt) => {
+                                pending_persist = Some(pt);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    ?e,
+                                    "persist_rx empty after successful close — unreachable"
+                                );
+                                debug_assert!(false, "success without persist send");
+                            }
                         }
 
                         // Publish queued history checkpoints (if any).

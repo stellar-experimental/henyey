@@ -92,11 +92,15 @@ impl HerderCallback for App {
             _ => None,
         };
 
-        let (success, persist_task) = self.handle_close_complete(pending, join_result).await;
-        // In manual close path (simulation/test), await persist inline.
-        if let Some(pt) = persist_task {
-            let _ = pt.handle.await;
-        }
+        // Manual close (admin HTTP / simulation) — Inline finalizer drives
+        // persist to completion before `handle_close_complete` returns.
+        let success = self
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::inline(),
+            )
+            .await;
 
         if success {
             Ok(header_hash.unwrap())

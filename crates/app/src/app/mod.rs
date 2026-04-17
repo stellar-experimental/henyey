@@ -2576,7 +2576,13 @@ mod tests {
 
         let mut pending = pending;
         let join_result = (&mut pending.handle).await;
-        let (success, _persist) = app.handle_close_complete(pending, join_result).await;
+        let success = app
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::inline(),
+            )
+            .await;
 
         assert!(!success, "should return false on error");
         assert!(
@@ -2618,7 +2624,13 @@ mod tests {
 
         let mut pending = pending;
         let join_result = (&mut pending.handle).await;
-        let (success, _persist) = app.handle_close_complete(pending, join_result).await;
+        let success = app
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::inline(),
+            )
+            .await;
 
         assert!(!success, "should return false on panic");
         assert!(
@@ -2676,7 +2688,13 @@ mod tests {
 
         let mut pending = pending;
         let join_result = (&mut pending.handle).await;
-        let (success, _persist) = app.handle_close_complete(pending, join_result).await;
+        let success = app
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::inline(),
+            )
+            .await;
 
         assert!(!success);
         // Buffer should have been cleared due to hash mismatch.
