@@ -435,7 +435,7 @@ fn resolve_auth_mode(
             let p25_auth: Vec<soroban_host::xdr::SorobanAuthorizationEntry> = tx_auth
                 .iter()
                 .map(|a| {
-                    convert::ws_to_p25(a).ok_or_else(|| {
+                    convert::ws_to_p25(a).map_err(|_| {
                         JsonRpcError::invalid_params(
                             "invalid SorobanAuthorizationEntry XDR in auth entries",
                         )
@@ -468,7 +468,7 @@ fn resolve_auth_mode(
                 let p25_auth: Vec<soroban_host::xdr::SorobanAuthorizationEntry> = tx_auth
                     .iter()
                     .map(|a| {
-                        convert::ws_to_p25(a).ok_or_else(|| {
+                        convert::ws_to_p25(a).map_err(|_| {
                             JsonRpcError::invalid_params(
                                 "invalid SorobanAuthorizationEntry XDR in auth entries",
                             )

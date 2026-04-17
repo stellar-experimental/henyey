@@ -38,9 +38,9 @@ pub(super) fn run_invoke_simulation(
 
     // Convert workspace types to P25 types for the host invocation
     let p25_host_fn: soroban_host::xdr::HostFunction =
-        super::convert::ws_to_p25_result(&host_fn, "HostFunction")?;
+        super::convert::ws_to_p25(&host_fn).map_err(|e| e.to_string())?;
     let p25_source: soroban_host::xdr::AccountId =
-        super::convert::ws_to_p25_result(&source_account, "AccountId")?;
+        super::convert::ws_to_p25(&source_account).map_err(|e| e.to_string())?;
 
     let result = invoke_host_function_in_recording_mode(
         &budget,
@@ -175,7 +175,8 @@ fn resolve_entry(
     use soroban_host::e2e_invoke::entry_size_for_rent;
     use soroban_host::ledger_info::get_key_durability;
 
-    let p25_key: soroban_host::xdr::LedgerKey = super::convert::ws_to_p25_result(key, "LedgerKey")?;
+    let p25_key: soroban_host::xdr::LedgerKey =
+        super::convert::ws_to_p25(key).map_err(|e| e.to_string())?;
 
     let durability = get_key_durability(&p25_key)
         .ok_or_else(|| "only contract data/code entries have TTL".to_string())?;
@@ -193,7 +194,7 @@ fn resolve_entry(
         .map_err(|e| format!("failed to serialize entry to XDR: {e}"))?;
 
     let p25_entry: soroban_host::xdr::LedgerEntry =
-        super::convert::ws_to_p25_result(&entry, "LedgerEntry")?;
+        super::convert::ws_to_p25(&entry).map_err(|e| e.to_string())?;
     let entry_rent_size = entry_size_for_rent(budget, &p25_entry, entry_xdr_size).map_err(|e| {
         tracing::warn!(error = ?e, "entry_size_for_rent failed");
         "entry_size_for_rent failed".to_string()

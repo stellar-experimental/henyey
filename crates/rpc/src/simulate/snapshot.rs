@@ -65,15 +65,12 @@ impl SnapshotSource for BucketListSnapshotSource {
         // Convert P25 LedgerKey to workspace LedgerKey for bucket list lookup.
         // Conversion failure is an internal error (structurally valid P25 keys
         // should always convert), not "key not found".
-        let ws_key: LedgerKey = match super::convert::p25_to_ws(key.as_ref()) {
-            Some(k) => k,
-            None => {
-                return Err(HostError::from(soroban_host::Error::from_type_and_code(
-                    soroban_host::xdr::ScErrorType::Value,
-                    soroban_host::xdr::ScErrorCode::InternalError,
-                )));
-            }
-        };
+        let ws_key: LedgerKey = super::convert::p25_to_ws(key.as_ref()).map_err(|_| {
+            HostError::from(soroban_host::Error::from_type_and_code(
+                soroban_host::xdr::ScErrorType::Value,
+                soroban_host::xdr::ScErrorCode::InternalError,
+            ))
+        })?;
 
         let make_err = || {
             HostError::from(soroban_host::Error::from_type_and_code(
@@ -102,7 +99,7 @@ impl SnapshotSource for BucketListSnapshotSource {
                 normalize_entry(&mut entry);
                 // Convert workspace LedgerEntry to P25 LedgerEntry
                 let p25_entry: soroban_host::xdr::LedgerEntry = super::convert::ws_to_p25(&entry)
-                    .ok_or_else(|| {
+                    .map_err(|_| {
                     HostError::from(soroban_host::Error::from_type_and_code(
                         soroban_host::xdr::ScErrorType::Value,
                         soroban_host::xdr::ScErrorCode::InternalError,

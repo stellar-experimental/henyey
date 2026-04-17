@@ -28,12 +28,11 @@ pub(super) fn build_invoke_response(
     state_changes: Vec<LedgerEntryDiff>,
     ctx: InvokeResponseContext<'_>,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    use super::convert::{p25_to_ws, p25_to_ws_result};
+    use super::convert::p25_to_ws;
 
     // Convert P25 resources to workspace types
-    let resources: stellar_xdr::curr::SorobanResources =
-        p25_to_ws_result(&sim_result.resources, "SorobanResources")
-            .map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))?;
+    let resources: stellar_xdr::curr::SorobanResources = p25_to_ws(&sim_result.resources)
+        .map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))?;
 
     // Apply resource adjustments (mirrors soroban-simulation default_adjustment)
     let mut adjusted_resources = resources.clone();
@@ -46,10 +45,7 @@ pub(super) fn build_invoke_response(
     let ws_auth: Vec<stellar_xdr::curr::SorobanAuthorizationEntry> = sim_result
         .auth
         .iter()
-        .map(|a| {
-            p25_to_ws_result(a, "SorobanAuthorizationEntry")
-                .map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))
-        })
+        .map(|a| p25_to_ws(a).map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e)))
         .collect::<Result<Vec<_>, _>>()?;
 
     // Estimate the transaction size for fee computation
@@ -117,9 +113,9 @@ pub(super) fn build_invoke_response(
             Vec::with_capacity(diagnostic_events.len());
         for e in &diagnostic_events {
             match p25_to_ws(e) {
-                Some(ws) => ws_events.push(ws),
-                None => {
-                    tracing::warn!("failed to convert DiagnosticEvent from P25 XDR, skipping");
+                Ok(ws) => ws_events.push(ws),
+                Err(err) => {
+                    tracing::warn!("skipping DiagnosticEvent: {err}");
                 }
             }
         }
@@ -130,10 +126,9 @@ pub(super) fn build_invoke_response(
 
     // Encode auth entries and return value
     let return_value: Option<stellar_xdr::curr::ScVal> = match &sim_result.invoke_result {
-        Ok(val) => Some(
-            p25_to_ws_result(val, "ScVal (return value)")
-                .map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))?,
-        ),
+        Ok(val) => {
+            Some(p25_to_ws(val).map_err(|e| JsonRpcError::internal_logged("xdr_conversion", &e))?)
+        }
         Err(_) => None,
     };
 
