@@ -1124,8 +1124,10 @@ mod tests {
     /// the normal tx (800/1=800 rate) beats the fee-bumped tx (1000/2=500 rate).
     #[test]
     fn test_fee_bump_soroban_uses_per_op_rate() {
-        use stellar_xdr::curr::{FeeBumpTransaction, FeeBumpTransactionEnvelope,
-            FeeBumpTransactionInnerTx, FeeBumpTransactionExt};
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
 
         // Normal tx: fee=800, resource_fee=0, inclusion_fee=800, 1 op → rate=800
         let tx_normal =
@@ -1151,18 +1153,17 @@ mod tests {
 
         // Only room for 1 tx (instruction limit). Per-op rate ordering should
         // pick tx_normal (rate=800) over fee_bump (rate=500).
-        let (stages, _) = build_with_stage_count(
-            &[fee_bump, tx_normal],
-            test_network_id(),
-            100_000,
-            1,
-            1,
-        );
+        let (stages, _) =
+            build_with_stage_count(&[fee_bump, tx_normal], test_network_id(), 100_000, 1, 1);
 
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].len(), 1);
         // tx_normal is index 1 in the input slice
-        assert_eq!(stages[0][0], vec![1], "per-op rate ordering should prefer normal tx");
+        assert_eq!(
+            stages[0][0],
+            vec![1],
+            "per-op rate ordering should prefer normal tx"
+        );
     }
 
     #[test]
