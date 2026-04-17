@@ -2,6 +2,50 @@
 
 use super::*;
 
+/// Why the node cannot apply the next buffered slot even though the herder
+/// has an EXTERNALIZE for every slot in `[current_ledger+1, latest_externalized]`.
+///
+/// Extracted from [`App::analyze_externalized_gaps`] so the classification
+/// logic can be unit tested without spinning up a full [`App`] (see
+/// issue #1759: the historical "missing tx_sets" warning was emitted even for
+/// the sequence-gap case, hiding the real fault during diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CannotApplyReason {
+    /// At least one buffered slot in `[current_ledger+1, latest_externalized]`
+    /// is missing its tx_set (`without_tx_set > 0`). Either the fetch is
+    /// in-flight, or peers have evicted the tx_set from their caches.
+    MissingTxSets,
+    /// Every buffered slot has its tx_set (`without_tx_set == 0`), but the
+    /// buffer does not start at `current_ledger + 1` — one or more ledgers
+    /// between `current_ledger + 1` and `first_buffered - 1` are missing
+    /// from the buffer entirely. This is the condition `catchup_impl`
+    /// surfaces as "Buffered gap detected".
+    BufferedSequenceGap,
+}
+
+/// Pure decision helper for which "cannot apply" diagnostic to emit.
+///
+/// * `without_tx_set` — count of buffered slots (>= `current_ledger + 1`)
+///   whose `LedgerCloseInfo.tx_set` is `None`.
+/// * `sequence_gap` — `first_buffered - (current_ledger + 1)`, saturating
+///   to zero when the buffer is empty or contiguous with `current_ledger`.
+///
+/// Returns [`CannotApplyReason::BufferedSequenceGap`] only when tx_sets are
+/// fully present *and* a sequence gap is observed. All other shapes
+/// (tx_sets missing, empty buffer, etc.) fall back to the legacy
+/// "missing tx_sets" classification.
+#[inline]
+pub(super) fn classify_cannot_apply_reason(
+    without_tx_set: usize,
+    sequence_gap: u32,
+) -> CannotApplyReason {
+    if without_tx_set == 0 && sequence_gap > 0 {
+        CannotApplyReason::BufferedSequenceGap
+    } else {
+        CannotApplyReason::MissingTxSets
+    }
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger (validators only).
     ///
@@ -375,25 +419,81 @@ impl App {
                 }
             }
         } else {
-            // No gaps in externalized, but we can't apply — missing tx_sets.
-            let (total, with_tx_set) = {
+            // No gaps in externalized (herder has EXTERNALIZE for every slot),
+            // but we still can't apply. Two distinct causes are possible:
+            //
+            //   1. The buffer's first slot sits at `current_ledger + 1` (contiguous)
+            //      and one or more slots lack a tx_set. This is the true
+            //      "missing tx_sets" case.
+            //
+            //   2. The buffer starts at `current_ledger + 2` or later (a sequence
+            //      gap). Every buffered slot may already have its tx_set
+            //      (`without_tx_set == 0`), but the missing slot(s) between
+            //      `current_ledger + 1` and `first_buffered - 1` block the apply.
+            //      This path is driven by `catchup_impl::maybe_start_buffered_catchup`
+            //      which logs "Buffered gap detected".
+            //
+            // Historically this branch printed "missing tx_sets" in both cases,
+            // which made diagnostics misleading (see issue #1759). Emit a
+            // distinct `buffered_sequence_gap` warning when the true cause is a
+            // sequence gap, so operators can triage the right subsystem.
+            let (total, with_tx_set, first_buffered, last_buffered) = {
                 let buffer = self.syncing_ledgers.read().await;
                 let total = buffer.range((current_ledger + 1)..).count();
                 let with_tx_set = buffer
                     .range((current_ledger + 1)..)
                     .filter(|(_, info)| info.tx_set.is_some())
                     .count();
-                (total, with_tx_set)
+                let first = buffer
+                    .range((current_ledger + 1)..)
+                    .next()
+                    .map(|(seq, _)| *seq);
+                let last = buffer
+                    .range((current_ledger + 1)..)
+                    .next_back()
+                    .map(|(seq, _)| *seq);
+                (total, with_tx_set, first, last)
             };
+            let without_tx_set = total - with_tx_set;
+            let required_first = current_ledger + 1;
+            let sequence_gap = first_buffered
+                .map(|f| f.saturating_sub(required_first))
+                .unwrap_or(0);
 
-            tracing::warn!(
-                current_ledger,
-                latest_externalized,
-                total_buffered = total,
-                with_tx_set,
-                without_tx_set = total - with_tx_set,
-                "All slots externalized but cannot apply - missing tx_sets"
-            );
+            match classify_cannot_apply_reason(without_tx_set, sequence_gap) {
+                CannotApplyReason::BufferedSequenceGap => {
+                    // tx_sets are all present — the real blocker is a gap
+                    // in buffered ledger sequences.
+                    tracing::warn!(
+                        current_ledger,
+                        latest_externalized,
+                        total_buffered = total,
+                        first_buffered,
+                        last_buffered,
+                        required_first,
+                        sequence_gap,
+                        "All slots externalized but cannot apply - buffered sequence gap \
+                         (tx_sets present, but missing ledgers between current_ledger+1 \
+                         and first_buffered)"
+                    );
+                }
+                CannotApplyReason::MissingTxSets => {
+                    // At least one buffered slot is missing its tx_set, so the
+                    // original diagnostic is accurate.
+                    tracing::warn!(
+                        current_ledger,
+                        latest_externalized,
+                        total_buffered = total,
+                        with_tx_set,
+                        without_tx_set,
+                        first_buffered,
+                        last_buffered,
+                        required_first,
+                        sequence_gap,
+                        "All slots externalized but cannot apply - missing tx_sets"
+                    );
+                }
+            }
 
             if with_tx_set == 0 && total > 0 {
                 tracing::warn!(
@@ -959,5 +1059,67 @@ impl App {
             reset_stuck_state,
             re_arm_recovery,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_cannot_apply_reason, CannotApplyReason};
+
+    /// Regression for issue #1759 (the original production symptom):
+    /// `without_tx_set = 0, sequence_gap > 0` must classify as
+    /// `BufferedSequenceGap`, not `MissingTxSets`. Matches the observed
+    /// mainnet log line:
+    /// `total_buffered=17 with_tx_set=17 without_tx_set=0`, where
+    /// `first_buffered=62164651` and `current_ledger=62164648`
+    /// (sequence_gap = 62164651 - 62164649 = 2).
+    #[test]
+    fn test_classify_sequence_gap_not_missing_tx_sets() {
+        assert_eq!(
+            classify_cannot_apply_reason(0, 2),
+            CannotApplyReason::BufferedSequenceGap
+        );
+    }
+
+    /// When at least one buffered slot is missing its tx_set, the legacy
+    /// "missing tx_sets" diagnostic is the correct one, even if a sequence
+    /// gap also exists (the tx_set gap is the operator-actionable signal
+    /// first).
+    #[test]
+    fn test_classify_missing_tx_sets_wins_over_gap() {
+        assert_eq!(
+            classify_cannot_apply_reason(3, 2),
+            CannotApplyReason::MissingTxSets
+        );
+        assert_eq!(
+            classify_cannot_apply_reason(1, 0),
+            CannotApplyReason::MissingTxSets
+        );
+    }
+
+    /// Degenerate case: no buffered slots at all (`total == 0`,
+    /// `sequence_gap == 0`, `without_tx_set == 0`). The decision must stay
+    /// on the legacy path so the follow-up `with_tx_set == 0 && total > 0`
+    /// guard in `analyze_externalized_gaps` retains its semantics.
+    #[test]
+    fn test_classify_empty_buffer_keeps_legacy_label() {
+        assert_eq!(
+            classify_cannot_apply_reason(0, 0),
+            CannotApplyReason::MissingTxSets
+        );
+    }
+
+    /// Non-regression: a contiguous buffer with every tx_set present
+    /// (`without_tx_set == 0, sequence_gap == 0`) should never emit the
+    /// sequence-gap diagnostic. This shape is rare in practice — it
+    /// would mean the caller reached the outer `else` branch despite
+    /// having an applyable next slot — but the classifier must still be
+    /// stable.
+    #[test]
+    fn test_classify_contiguous_buffer_with_all_tx_sets() {
+        assert_eq!(
+            classify_cannot_apply_reason(0, 0),
+            CannotApplyReason::MissingTxSets
+        );
     }
 }
