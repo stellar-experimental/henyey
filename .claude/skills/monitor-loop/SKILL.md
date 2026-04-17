@@ -54,10 +54,17 @@ Two classes of fix exist in this skill; treat them differently.
   main.
 
 If you are unsure whether to delegate at all, err toward filing an issue
-and spawning the `/plan-do-review` Agent. "A spawned agent fixed a
-trivial CI issue" is cheap; "the monitor touched the running node's
-source tree while investigating a consensus bug and corrupted the build"
-is not.
+and spawning the `/plan-do-review` Agent.
+
+Because the monitor is a single-investigator process (only one
+`/monitor-loop` holds the concurrency lock at a time — see Startup step
+1), the investigation phase itself — reading source files, grepping for
+symbols, running `git log`, reading the running node's log — can
+happen directly in the main checkout. The "isolate edits" concern only
+applies to *writing* code: investigation is read-only, and pretending
+otherwise adds ceremony without safety. The moment the work turns into
+code edits, it MUST go through `/plan-do-review` (or the CI-fix inline
+path); never edit the main checkout to fix a node bug.
 
 ## Configurations
 
@@ -122,8 +129,11 @@ doesn't change when it should — you MUST investigate. Specifically:
 
 When a bug is detected (hash mismatch, error, crash, sync failure):
 
-1. **Investigate to root cause** — read source code, check logs, trace
-   code paths. Document findings with file:line references.
+1. **Investigate to root cause directly in the main checkout** — read
+   source code, check logs, trace code paths, grep, `git log`, read the
+   running node's log file. No worktree needed: only one monitor-loop
+   runs at a time (concurrency lock) and investigation is read-only.
+   Document findings with file:line references.
 2. **File a GitHub issue** with the investigation findings, root cause
    analysis, and proposed fix approach using `gh issue create`. Capture
    the issue number `N` returned by `gh`. Write the issue body as a
@@ -137,9 +147,11 @@ When a bug is detected (hash mismatch, error, crash, sync failure):
    responsibility ends here: no worktree management, no cherry-pick,
    no diff review, no merge decision. Those all live inside
    `/plan-do-review`.
-4. **Do NOT edit the main checkout to fix a node bug.** CI-only fixes
-   (build errors, test failures, clippy, workflow YAML) are exempt per
-   the Fix-Routing Policy.
+4. **Do NOT edit the main checkout to fix a node bug.** Investigation
+   reads in the main checkout are fine; code edits for a node-bug fix
+   are not — those go through `/plan-do-review`. CI-only fixes (build
+   errors, test failures, clippy, workflow YAML) are exempt per the
+   Fix-Routing Policy.
 
 The next redeploy tick (check 10) will pick up whatever `/plan-do-review`
 lands on main — rebuild, kill, restart. The bug-fix progress itself is
