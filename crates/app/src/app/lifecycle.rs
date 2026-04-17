@@ -307,19 +307,13 @@ impl App {
                         // Don't start the next close here — wait for
                         // pending_persist to complete first. This ensures
                         // the DB has the previous ledger's data before the
-                        // next close references it.
-                        //
-                        // If there's no persist task (shouldn't happen on
-                        // success, but defensive), start next close now.
-                        if pending_persist.is_none() {
-                            pending_close = self.try_start_ledger_close().await;
-                        }
-
-                        // If no close is pending AND no persist is pending,
-                        // we just finished a rapid close cycle.
-                        if pending_close.is_none() && pending_persist.is_none() {
-                            self.finish_rapid_close_cycle().await;
-                        }
+                        // next close references it. `pending_persist` is
+                        // always Some on success (handle_close_complete's
+                        // Err arm at line 1924 calls fatal_persist_error),
+                        // so starting the next close here is unreachable.
+                        // `finish_rapid_close_cycle` is also unreachable
+                        // here — it fires from the `persist_result` arm
+                        // once the deferred persist completes.
                     }
                 }
 
