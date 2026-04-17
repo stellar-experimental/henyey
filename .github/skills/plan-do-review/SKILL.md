@@ -80,6 +80,39 @@ Extract:
 - **Comments**: any existing discussion (prior reviews, context)
 - **State**: must be open (if closed, stop and report)
 
+### Readiness Triage
+
+Before proceeding, assess whether the issue is actionable. An issue is **not
+ready** if any of these are true:
+
+- The body is empty or contains only a vague one-liner with no concrete proposal
+- It depends on another issue that is still open
+- It requires information or decisions that are not yet available
+- It describes a problem but proposes no approach and the correct approach is
+  unclear even after reading the referenced code
+
+If the issue is **not ready**:
+
+1. Add the `not-ready` label:
+   ```bash
+   gh issue edit $ISSUE --add-label "not-ready"
+   ```
+2. Post a comment explaining why the issue is not ready and what is needed:
+   ```bash
+   gh issue comment $ISSUE --body "Marking as not-ready: {reason}. This issue needs {what's missing} before it can be picked up."
+   ```
+3. Unassign yourself:
+   ```bash
+   gh issue edit $ISSUE --remove-assignee @me
+   ```
+4. Stop. Do not proceed to Step 2.
+
+If the issue **is ready**, remove the `not-ready` label if present (it may have
+been added previously and the issue has since been updated):
+```bash
+gh issue edit $ISSUE --remove-label "not-ready" 2>/dev/null || true
+```
+
 Read any files, crates, or stellar-core references mentioned in the issue body
 to build context. You need enough understanding to critique and rewrite the
 proposal intelligently.

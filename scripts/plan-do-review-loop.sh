@@ -3,7 +3,7 @@
 # `/plan-do-review` skill on one open GitHub issue at a time.
 #
 # Usage:
-#   ./scripts/plan-do-review-loop.sh                  # process newest open unassigned issue
+#   ./scripts/plan-do-review-loop.sh                  # process oldest open unassigned issue
 #   LOOP_LABEL=proposal ./scripts/plan-do-review-loop.sh
 #   LOOP_MODEL=claude-opus-4.6 ./scripts/plan-do-review-loop.sh
 #
@@ -13,9 +13,10 @@
 #   LOOP_EMPTY_SLEEP   Seconds to sleep when no issues found (default: 60)
 #   LOOP_LOG_DIR       Directory for per-run logs (default: ~/data/plan-do-review-loop)
 #
-# Selection rule: newest open issue that is unassigned AND does not have the
-# `plan-do-review-loop-failed` label. Assigning the issue to @me serves as the
-# lock; failures are labeled and unassigned so the loop moves on.
+# Selection rule: oldest open issue that is unassigned AND does not have the
+# `plan-do-review-loop-failed` or `not-ready` labels. Assigning the issue to
+# @me serves as the lock; failures are labeled and unassigned so the loop
+# moves on.
 #
 # Crashed runs leave the issue assigned to you. The loop will NOT auto-pick it
 # up again — unassign manually once you've reviewed what happened.
@@ -27,6 +28,7 @@ LOOP_LABEL="${LOOP_LABEL:-}"
 LOOP_EMPTY_SLEEP="${LOOP_EMPTY_SLEEP:-60}"
 LOOP_LOG_DIR="${LOOP_LOG_DIR:-$HOME/data/plan-do-review-loop}"
 FAIL_LABEL="plan-do-review-loop-failed"
+NOT_READY_LABEL="not-ready"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
@@ -46,10 +48,14 @@ ME="$(gh api user -q .login)"
 
 mkdir -p "$LOOP_LOG_DIR"
 
-# Ensure failure label exists (idempotent).
+# Ensure labels exist (idempotent).
 gh label create "$FAIL_LABEL" \
   --color D93F0B \
   --description "plan-do-review-loop attempted and failed" \
+  >/dev/null 2>&1 || true
+gh label create "$NOT_READY_LABEL" \
+  --color FBCA04 \
+  --description "Issue is not ready for plan-do-review" \
   >/dev/null 2>&1 || true
 
 log "=== plan-do-review-loop ==="
@@ -61,7 +67,7 @@ log "Log dir:   $LOOP_LOG_DIR"
 
 # --- Main loop ---
 while true; do
-  search="sort:created-desc -label:$FAIL_LABEL"
+  search="sort:created-asc -label:$FAIL_LABEL -label:$NOT_READY_LABEL"
   if [[ -n "$LOOP_LABEL" ]]; then
     search="$search label:$LOOP_LABEL"
   fi
