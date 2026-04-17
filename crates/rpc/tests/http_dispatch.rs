@@ -58,6 +58,10 @@ async fn boot_single_node_sim() -> (Simulation, String) {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(
+        sim.have_all_app_nodes_externalized(2, 0),
+        "node failed to externalize ledger 2 within 10s"
+    );
 
     (sim, "node0".to_string())
 }
@@ -102,10 +106,9 @@ async fn rpc_http_dispatch_covers_core_methods() {
         let _ = running.serve().await;
     });
 
-    // Give the serve loop a tick to be ready; `bind` has already completed
-    // the TcpListener::bind, so this is just letting axum's accept start.
-    tokio::time::sleep(Duration::from_millis(20)).await;
-
+    // `bind` already completed `TcpListener::bind`, so the kernel accept
+    // queue accepts connects before `serve()` starts polling. No sleep
+    // needed.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()

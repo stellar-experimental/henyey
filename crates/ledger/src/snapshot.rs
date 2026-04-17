@@ -826,7 +826,7 @@ mod tests {
         }));
 
         // load_entries fetches from lookup_fn (count goes to 1)
-        let loaded = handle.load_entries(&[key.clone()]).unwrap();
+        let loaded = handle.load_entries(std::slice::from_ref(&key)).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
 

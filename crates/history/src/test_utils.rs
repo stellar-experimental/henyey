@@ -25,7 +25,6 @@ use stellar_xdr::curr::{
     Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt,
     StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
 };
-use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -144,7 +143,6 @@ pub struct HistoryArchiveFixture {
     pub checkpoint: u32,
     /// Network passphrase embedded in the HAS.
     pub network_passphrase: String,
-    _tempdir: TempDir,
     _server: AbortOnDrop,
 }
 
@@ -160,9 +158,27 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Error returned when the fixture server cannot bind a loopback socket
+/// — typically because the test environment does not permit listening
+/// sockets. Callers can treat this as a signal to skip the test.
+#[derive(Debug)]
+pub struct FixtureBindDenied;
+
+impl std::fmt::Display for FixtureBindDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tcp bind not permitted in this environment")
+    }
+}
+
+impl std::error::Error for FixtureBindDenied {}
+
 /// Build a history archive fixture containing a single checkpoint at
 /// `checkpoint` (which must be a valid checkpoint boundary — e.g. 63, 127, …
 /// under the default 64-ledger cadence).
+///
+/// Returns `Err(FixtureBindDenied)` when the loopback bind is refused by
+/// the OS (sandboxed environments), so callers can gracefully skip the
+/// test instead of panicking. All other bind errors panic.
 ///
 /// The archive has:
 /// - an empty bucket (level 0 `curr`) plus zero-hash buckets on all other
@@ -172,7 +188,9 @@ impl Drop for AbortOnDrop {
 ///   the bucket list + empty hot-archive,
 /// - a `history-<checkpoint>.json` HAS file,
 /// - an in-process axum server serving all of the above.
-pub async fn build_single_checkpoint_archive(checkpoint: u32) -> HistoryArchiveFixture {
+pub async fn build_single_checkpoint_archive(
+    checkpoint: u32,
+) -> Result<HistoryArchiveFixture, FixtureBindDenied> {
     let bucket_data: Vec<u8> = Vec::new();
     let bucket_hash = Hash256::hash(&bucket_data);
     let bucket_list = make_bucket_list_with_hash(bucket_hash);
@@ -255,19 +273,22 @@ pub async fn build_single_checkpoint_archive(checkpoint: u32) -> HistoryArchiveF
             )
             .with_state(Arc::clone(&fixtures));
 
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind fixture server");
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(FixtureBindDenied);
+        }
+        Err(e) => panic!("fixture bind failed: {e}"),
+    };
     let addr = listener.local_addr().expect("fixture addr");
     let handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
 
-    HistoryArchiveFixture {
+    Ok(HistoryArchiveFixture {
         base_url: format!("http://{}/", addr),
         checkpoint,
         network_passphrase: DEFAULT_FIXTURE_PASSPHRASE.to_string(),
-        _tempdir: TempDir::new().expect("tempdir"),
         _server: AbortOnDrop(Some(handle)),
-    }
+    })
 }

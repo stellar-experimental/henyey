@@ -238,13 +238,16 @@ impl StatusServer {
         tracing::info!(%addr, "Starting HTTP status server");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        // Emit the kernel-assigned port on stdout in a deterministic
-        // machine-readable form. Integration tests that launch the node as
-        // a subprocess with `http.port = 0` parse this line to discover
-        // the ephemeral port. The prefix is stable and plain `println!` so
-        // it bypasses any tracing subscriber filtering.
-        let bound_port = listener.local_addr()?.port();
-        println!("{ADMIN_PORT_LOG_PREFIX}{bound_port}");
+        // When bound to port 0 (ephemeral), emit the kernel-assigned port
+        // on stdout in a deterministic machine-readable form. Integration
+        // tests that launch the node as a subprocess parse this line to
+        // discover the port. Plain `println!` bypasses any tracing
+        // subscriber filtering. Static-port deployments skip the line so
+        // production log aggregators see no new output.
+        if self.port == 0 {
+            let bound_port = listener.local_addr()?.port();
+            println!("{ADMIN_PORT_LOG_PREFIX}{bound_port}");
+        }
 
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {

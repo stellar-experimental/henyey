@@ -1643,7 +1643,7 @@ mod tests {
         let mut queues: Vec<std::collections::VecDeque<TransactionEnvelope>> = by_account
             .into_values()
             .map(|mut txs| {
-                txs.sort_by(|a, b| seq_num(a).cmp(&seq_num(b)));
+                txs.sort_by_key(seq_num);
                 txs.into_iter().collect()
             })
             .collect();
@@ -1831,7 +1831,7 @@ mod tests {
         );
         let expected: Vec<Hash256> = classic_expected
             .into_iter()
-            .chain(soroban_expected.into_iter())
+            .chain(soroban_expected)
             .collect();
 
         let variant = TransactionSetVariant::Generalized(gen_set);

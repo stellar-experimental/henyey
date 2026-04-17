@@ -322,7 +322,6 @@ async fn test_catchup_replay_bucket_hash_verification() {
             // end-to-end on testnet.
             verify_buckets: false,
             verify_headers: false,
-            ..CatchupOptions::default()
         })
         .build()
         .expect("catchup manager");

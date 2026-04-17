@@ -2345,7 +2345,7 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
 
         let tx = Transaction {
             source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
-            fee: base_fee * 1, // 1 op
+            fee: base_fee, // 1 op
             seq_num: SequenceNumber(101 + i as i64),
             cond: Preconditions::None,
             memo: Memo::None,

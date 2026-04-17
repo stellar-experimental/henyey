@@ -1453,7 +1453,7 @@ fn test_classic_events_emitted_for_claim_atoms_order_book() {
         classic_events,
     );
     let source_muxed = MuxedAccount::Ed25519(Uint256(*source_secret.public_key().as_bytes()));
-    op_event_manager.events_for_claim_atoms(&source_muxed, &[claim.clone()]);
+    op_event_manager.events_for_claim_atoms(&source_muxed, std::slice::from_ref(&claim));
 
     let events = op_event_manager.finalize();
     assert_eq!(events.len(), 2);

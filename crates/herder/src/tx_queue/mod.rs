@@ -3247,7 +3247,7 @@ mod tests {
         };
 
         let mut expected = vec![hash_classic, included_dex];
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        expected.sort_by_key(|a| a.0);
         let hashes: Vec<_> = set.transactions.iter().map(full_hash).collect();
         assert_eq!(hashes, expected);
     }
