@@ -1030,33 +1030,38 @@ pub fn execute_operation_with_soroban(
                             if ttl >= context.sequence {
                                 continue;
                             }
-                            // Case 3: TTL exists but expired -> restore from live bucket list
-                            if let Some(entry) = state.get_entry(key) {
-                                let entry_xdr = entry
-                                    .to_xdr(stellar_xdr::curr::Limits::none())
-                                    .unwrap_or_else(|e| {
-                                        tracing::error!(
-                                            "restore: failed to serialize LedgerEntry: {e}"
-                                        );
-                                        Vec::new()
-                                    });
-                                let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
-                                    context.protocol_version,
-                                    &entry,
-                                    entry_xdr.len() as u32,
-                                    soroban
-                                        .config
-                                        .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
-                                );
-                                let (is_persistent, is_code_entry) = rent_classification(key);
-                                snapshots.push(RentSnapshot {
-                                    key: key.clone(),
-                                    is_persistent,
-                                    is_code_entry,
-                                    old_size_bytes: entry_size,
-                                    old_live_until: ttl,
+                            // Case 3: TTL exists but expired -> data entry must exist
+                            // stellar-core: releaseAssertOrThrow(entryLeOpt)
+                            let entry = state.get_entry(key).unwrap_or_else(|| {
+                                panic!(
+                                    "restore rent snapshot: expired TTL exists but data entry missing for key {:?}",
+                                    key
+                                )
+                            });
+                            let entry_xdr = entry
+                                .to_xdr(stellar_xdr::curr::Limits::none())
+                                .unwrap_or_else(|e| {
+                                    tracing::error!(
+                                        "restore: failed to serialize LedgerEntry: {e}"
+                                    );
+                                    Vec::new()
                                 });
-                            }
+                            let entry_size = entry_size_for_rent_by_protocol_with_cost_params(
+                                context.protocol_version,
+                                &entry,
+                                entry_xdr.len() as u32,
+                                soroban
+                                    .config
+                                    .map(|c| (&c.cpu_cost_params, &c.mem_cost_params)),
+                            );
+                            let (is_persistent, is_code_entry) = rent_classification(key);
+                            snapshots.push(RentSnapshot {
+                                key: key.clone(),
+                                is_persistent,
+                                is_code_entry,
+                                old_size_bytes: entry_size,
+                                old_live_until: ttl,
+                            });
                         } else {
                             // Case 2: No TTL -> check hot archive
                             // Per stellar-core createEntryRentChangeWithoutModification():

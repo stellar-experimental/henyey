@@ -272,11 +272,15 @@ fn restore_entry(
             // Entry is still live, no restoration needed.
             Ok(())
         }
-        Some(_) | None => {
-            let entry = match state.get_entry(key) {
-                None => return Ok(()),
-                Some(e) => e,
-            };
+        Some(_) => {
+            // TTL exists but expired → data entry must exist
+            // stellar-core: releaseAssertOrThrow(entryLeOpt) (RestoreFootprintOpFrame.cpp:178)
+            let entry = state.get_entry(key).unwrap_or_else(|| {
+                panic!(
+                    "restore_footprint: expired TTL exists but data entry missing for key {:?}",
+                    key
+                )
+            });
 
             let entry_size = xdr_entry_size(&entry);
 
@@ -301,6 +305,11 @@ fn restore_entry(
                 state.create_ttl(ttl_entry);
             }
 
+            Ok(())
+        }
+        None => {
+            // No TTL at all → not archived in live bucket list, skip.
+            // Hot archive restores are handled separately (lines 160-164).
             Ok(())
         }
     }
@@ -1032,5 +1041,108 @@ mod tests {
             },
         );
         assert_restore_result(result, RestoreFootprintResult::ResourceLimitExceeded);
+    }
+
+    /// Regression test: expired TTL exists but data entry is missing → must panic.
+    /// stellar-core: releaseAssertOrThrow(entryLeOpt) at RestoreFootprintOpFrame.cpp:178.
+    #[test]
+    #[should_panic(expected = "expired TTL exists but data entry missing")]
+    fn test_restore_footprint_panics_on_expired_ttl_missing_entry() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        // Use sequence=1000 so TTL=500 is expired (500 < 1000)
+        let context = LedgerContext::testnet(1000, 1000);
+        let source = create_test_account_id(0);
+
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+
+        // Add an expired TTL entry (live_until < current_ledger=1000) but NO data entry
+        let key_hash = crate::soroban::compute_key_hash(&contract_key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: 500, // expired
+        });
+
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![contract_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 10_000,
+                write_bytes: 10_000,
+            },
+            resource_fee: 0,
+        };
+
+        // This should panic because expired TTL exists but data entry is missing
+        let _ = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+                size_limits: None,
+            },
+        );
+    }
+
+    /// Regression test: no TTL + entry present → does NOT panic, returns success.
+    /// This is the hot-archive path; the entry should be skipped (not restored from
+    /// live BL) since hot archive restores are handled separately.
+    #[test]
+    fn test_restore_footprint_no_ttl_skips_without_panic() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+
+        // No TTL entry, but data entry exists — should just skip
+        let op = RestoreFootprintOp {
+            ext: ExtensionPoint::V0,
+        };
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![contract_key].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 10_000,
+                write_bytes: 10_000,
+            },
+            resource_fee: 0,
+        };
+
+        let result = execute_restore_footprint(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            RestoreFootprintResources {
+                soroban_data: Some(&soroban_data),
+                min_persistent_entry_ttl: TEST_MIN_PERSISTENT_TTL,
+                hot_archive_restores: &[],
+                ttl_key_cache: None,
+                size_limits: None,
+            },
+        );
+        assert_restore_result(result, RestoreFootprintResult::Success);
     }
 }

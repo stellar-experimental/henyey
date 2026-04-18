@@ -104,10 +104,12 @@ pub(crate) fn execute_extend_footprint_ttl(
 
         // The main entry must exist (TTL exists and is live => entry exists)
         // stellar-core: releaseAssertOrThrow(entryOpt)
-        let entry = match state.get_entry(key) {
-            None => continue,
-            Some(e) => e,
-        };
+        let entry = state.get_entry(key).unwrap_or_else(|| {
+            panic!(
+                "extend_footprint_ttl: live TTL exists but data entry missing for key {:?}",
+                key
+            )
+        });
 
         // Validate contract entry size against config limits.
         // Matches stellar-core validateContractLedgerEntry() which rejects
@@ -1122,5 +1124,59 @@ mod tests {
             }
             _ => panic!("Unexpected result type"),
         }
+    }
+
+    /// Regression test: live TTL exists but data entry is missing → must panic.
+    /// stellar-core: releaseAssertOrThrow(entryOpt) at ExtendFootprintTTLOpFrame.cpp:143.
+    #[test]
+    #[should_panic(expected = "live TTL exists but data entry missing")]
+    fn test_extend_footprint_ttl_panics_on_live_ttl_missing_entry() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+        let source = create_test_account_id(0);
+
+        let contract_key = LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash([1u8; 32]),
+        });
+
+        // Add a live TTL entry (live_until > current_ledger=1000) but NO data entry
+        let key_hash = crate::soroban::compute_key_hash(&contract_key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: 2000,
+        });
+
+        let op = ExtendFootprintTtlOp {
+            ext: ExtensionPoint::V0,
+            extend_to: 5000,
+        };
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![contract_key].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 0,
+                disk_read_bytes: 10_000,
+                write_bytes: 0,
+            },
+            resource_fee: 0,
+        };
+
+        // This should panic because live TTL exists but data entry is missing
+        let _ = execute_extend_footprint_ttl(
+            &op,
+            &source,
+            &mut state,
+            &context,
+            &SorobanExtendConfig {
+                soroban_data: Some(&soroban_data),
+                ttl_key_cache: None,
+                size_limits: None,
+                max_entry_ttl: TEST_MAX_ENTRY_TTL,
+            },
+        );
     }
 }
