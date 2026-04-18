@@ -441,6 +441,13 @@ impl Slot {
     ) -> EnvelopeState {
         let ctx = slot_ctx!(self, driver);
         if !self.ballot.is_statement_sane(&envelope.statement, &ctx) {
+            tracing::info!(
+                target: "henyey::envelope_path",
+                slot = self.slot_index,
+                node_id = ?envelope.statement.node_id,
+                scp_gate = "statement_not_sane",
+                "scp receive rejected (ballot)",
+            );
             return EnvelopeState::Invalid;
         }
 
@@ -448,6 +455,13 @@ impl Slot {
         // redundant validate_value calls. Matches stellar-core which
         // checks is_newer_statement before validateValues.
         if self.ballot.is_stale_ballot_statement(&envelope.statement) {
+            tracing::info!(
+                target: "henyey::envelope_path",
+                slot = self.slot_index,
+                node_id = ?envelope.statement.node_id,
+                scp_gate = "stale_ballot",
+                "scp receive rejected (ballot)",
+            );
             return EnvelopeState::Invalid;
         }
 
@@ -456,6 +470,13 @@ impl Slot {
                 .validate_statement_values(&envelope.statement, driver, self.slot_index);
 
         if validation == crate::ValidationLevel::Invalid {
+            tracing::info!(
+                target: "henyey::envelope_path",
+                slot = self.slot_index,
+                node_id = ?envelope.statement.node_id,
+                scp_gate = "validate_invalid",
+                "scp receive rejected (ballot)",
+            );
             return EnvelopeState::Invalid;
         }
 

@@ -532,10 +532,26 @@ impl BallotProtocol {
             ScpStatementPledges::Prepare(_)
             | ScpStatementPledges::Confirm(_)
             | ScpStatementPledges::Externalize(_) => {}
-            _ => return EnvelopeState::Invalid,
+            _ => {
+                tracing::info!(
+                    target: "henyey::envelope_path",
+                    slot = envelope.statement.slot_index,
+                    node_id = ?node_id,
+                    scp_gate = "unexpected_pledge",
+                    "scp receive rejected (ballot)",
+                );
+                return EnvelopeState::Invalid;
+            }
         }
 
         if !self.is_newer_statement(node_id, &envelope.statement) {
+            tracing::info!(
+                target: "henyey::envelope_path",
+                slot = envelope.statement.slot_index,
+                node_id = ?node_id,
+                scp_gate = "not_newer_statement",
+                "scp receive rejected (ballot)",
+            );
             return EnvelopeState::Invalid;
         }
 
@@ -545,6 +561,13 @@ impl BallotProtocol {
                     .insert(node_id.clone(), envelope.clone());
                 return EnvelopeState::Valid;
             }
+            tracing::info!(
+                target: "henyey::envelope_path",
+                slot = envelope.statement.slot_index,
+                node_id = ?node_id,
+                scp_gate = "externalize_value_mismatch",
+                "scp receive rejected (ballot)",
+            );
             return EnvelopeState::Invalid;
         }
 

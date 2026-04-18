@@ -1335,7 +1335,13 @@ impl App {
                 }
             }
         } else {
-            tracing::debug!(latest_externalized, last_processed, "Already processed");
+            tracing::info!(
+                target: "henyey::envelope_path",
+                latest_externalized,
+                last_processed,
+                current_ledger = self.current_ledger_seq(),
+                "process_externalized_slots: has_new_slots=false short-circuit",
+            );
         }
 
         // Always check for catchup even when no new slots - we may need to
@@ -2515,6 +2521,7 @@ mod extract_contract_events_tests {
 
         // TOID = (ledger_seq << 32) | (tx_index << 12) | op_index
         // For ledger 42, tx 0, op 0: toid = 42 << 32 = 180388626432
+        #[allow(clippy::identity_op)]
         let expected_toid = (42u64 << 32) | (0u64 << 12) | 0u64;
         let expected_id = format!("{:019}-{:010}", expected_toid, 0);
         assert_eq!(events[0].id, expected_id);

@@ -1799,8 +1799,17 @@ impl App {
             // (pre-filter drop reasons are not re-run here; the Herder's
             // `process_verified` handles the InvalidSignature/Panic cases
             // without running downstream logic).
-            let (_, reason) = self.herder.process_verified(ve);
+            let node_id = ve.intake.envelope.statement.node_id.clone();
+            let (envelope_result, reason) = self.herder.process_verified(ve);
             self.record_post_verify_reason(reason);
+            tracing::info!(
+                target: "henyey::envelope_path",
+                slot,
+                node_id = ?node_id,
+                result = ?envelope_result,
+                reason = ?reason,
+                "envelope path outcome (verify-rejected)",
+            );
             return;
         }
 
@@ -1840,6 +1849,20 @@ impl App {
 
         // Per-reason post-verify metric.
         self.record_post_verify_reason(reason);
+
+        // Structured attribution log for Issue #1806 investigation. Emits
+        // the envelope outcome and the PostVerifyReason so a single grep of
+        // `target=henyey::envelope_path` across the shard log reveals which
+        // gate (self-message, non-quorum, pending-buffer state, close-time
+        // drift, signature failure, or accepted) fires for each envelope.
+        tracing::info!(
+            target: "henyey::envelope_path",
+            slot,
+            node_id = ?sender_node_id,
+            result = ?envelope_result,
+            reason = ?reason,
+            "envelope path outcome",
+        );
 
         // Aggregate post-verify drop counter (backward compat): envelopes that
         // were accepted by pre_filter but dropped downstream.

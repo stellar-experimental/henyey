@@ -1970,7 +1970,14 @@ impl App {
                     // the state restored by catchup.
                     self.update_bucket_snapshot();
 
-                    tracing::info!(ledger_seq = result.ledger_seq, "{} catchup complete", label);
+                    tracing::info!(
+                        target: "henyey::envelope_path",
+                        ledger_seq = result.ledger_seq,
+                        latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0),
+                        tracking_slot = self.herder.tracking_slot(),
+                        "{} catchup complete",
+                        label
+                    );
 
                     // Reset last_processed_slot to current_ledger so the main
                     // loop's process_externalized_slots() re-evaluates the gap
