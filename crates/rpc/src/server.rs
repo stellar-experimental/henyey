@@ -263,21 +263,40 @@ async fn rpc_handler(
     State(ctx): State<Arc<RpcContext>>,
     body: axum::body::Bytes,
 ) -> (StatusCode, Json<JsonRpcResponse>) {
-    // Reject batch requests (JSON arrays)
-    if body.first().copied() == Some(b'[') {
+    // Stage 1: Parse raw bytes to a generic JSON value.
+    // Syntax errors get -32700 (Parse error) with no serde details leaked.
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, "malformed JSON-RPC request body");
+            return ok_json_response(JsonRpcResponse::error(
+                serde_json::Value::Null,
+                JsonRpcError::parse_error("parse error"),
+            ));
+        }
+    };
+
+    // Stage 2: Reject batch requests (JSON arrays).
+    // Checking the parsed Value is robust to leading whitespace.
+    if value.is_array() {
         return ok_json_response(JsonRpcResponse::error(
             serde_json::Value::Null,
             JsonRpcError::invalid_request("batch requests are not supported"),
         ));
     }
 
-    // Parse the request body
-    let request: JsonRpcRequest = match serde_json::from_slice(&body) {
+    // Stage 3: Deserialize to typed request.
+    // Recover the request id from the parsed Value so the client can correlate
+    // the error response, even when other fields are malformed.
+    let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+
+    let request: JsonRpcRequest = match serde_json::from_value(value) {
         Ok(req) => req,
         Err(e) => {
+            tracing::debug!(error = %e, "invalid JSON-RPC request structure");
             return ok_json_response(JsonRpcResponse::error(
-                serde_json::Value::Null,
-                JsonRpcError::invalid_request(format!("invalid JSON: {}", e)),
+                id,
+                JsonRpcError::invalid_request("invalid request"),
             ));
         }
     };
@@ -391,13 +410,15 @@ mod tests {
 
     #[test]
     fn test_batch_request_detected() {
-        // The handler checks `body.first().copied() == Some(b'[')` for batch rejection
+        // The handler parses to serde_json::Value, then checks .is_array()
         let batch_body = b"[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}]";
-        assert_eq!(batch_body.first().copied(), Some(b'['));
+        let val: serde_json::Value = serde_json::from_slice(batch_body).unwrap();
+        assert!(val.is_array());
 
         // Non-batch body should not trigger
         let single_body = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}";
-        assert_ne!(single_body.first().copied(), Some(b'['));
+        let val: serde_json::Value = serde_json::from_slice(single_body).unwrap();
+        assert!(!val.is_array());
     }
 
     #[test]
@@ -423,5 +444,72 @@ mod tests {
         let err = JsonRpcError::method_not_found("doesNotExist");
         assert_eq!(err.code, crate::error::METHOD_NOT_FOUND);
         assert!(err.message.contains("doesNotExist"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Category G: Error Sanitization (AUDIT-163 regression tests)
+    // -----------------------------------------------------------------------
+
+    /// Simulate the handler's parse stage: malformed JSON returns -32700 with
+    /// no serde details.
+    #[test]
+    fn test_malformed_json_parse_error_no_leak() {
+        let body = b"not json at all";
+        let result: Result<serde_json::Value, _> = serde_json::from_slice(body);
+        assert!(result.is_err());
+        // The handler would return this:
+        let err = JsonRpcError::parse_error("parse error");
+        assert_eq!(err.code, crate::error::PARSE_ERROR);
+        assert_eq!(err.message, "parse error");
+        // No serde details in the message
+        assert!(!err.message.contains("expected"));
+        assert!(!err.message.contains("line"));
+        assert!(!err.message.contains("column"));
+    }
+
+    /// Valid JSON but missing required fields: returns -32600 with generic message.
+    #[test]
+    fn test_invalid_request_structure_no_leak() {
+        // Valid JSON object but missing "method" (required by JsonRpcRequest)
+        let body = br#"{"jsonrpc":"2.0","id":7}"#;
+        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let result: Result<JsonRpcRequest, _> = serde_json::from_value(value.clone());
+        assert!(result.is_err());
+        // Handler recovers id from parsed Value
+        let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        assert_eq!(id, json!(7));
+        // The handler would return this:
+        let err = JsonRpcError::invalid_request("invalid request");
+        assert_eq!(err.code, crate::error::INVALID_REQUEST);
+        assert_eq!(err.message, "invalid request");
+        assert!(!err.message.contains("missing field"));
+    }
+
+    /// Valid JSON with no id: handler falls back to null.
+    #[test]
+    fn test_invalid_request_no_id_fallback() {
+        let body = br#"{"jsonrpc":"2.0"}"#;
+        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let id = value.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        assert_eq!(id, serde_json::Value::Null);
+    }
+
+    /// Whitespace-prefixed batch is still detected by value.is_array().
+    #[test]
+    fn test_whitespace_prefixed_batch_detected() {
+        let body = b"  \n[{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getHealth\"}]";
+        let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+        assert!(
+            value.is_array(),
+            "whitespace-prefixed array must be detected"
+        );
+    }
+
+    /// Parse error code constant is -32700 per JSON-RPC 2.0 spec.
+    #[test]
+    fn test_parse_error_code() {
+        assert_eq!(crate::error::PARSE_ERROR, -32700);
+        let err = JsonRpcError::parse_error("test");
+        assert_eq!(err.code, -32700);
     }
 }

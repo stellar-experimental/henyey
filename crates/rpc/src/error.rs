@@ -1,6 +1,7 @@
 use serde::Serialize;
 
 /// JSON-RPC 2.0 error codes.
+pub(crate) const PARSE_ERROR: i32 = -32700;
 pub(crate) const INVALID_REQUEST: i32 = -32600;
 pub(crate) const METHOD_NOT_FOUND: i32 = -32601;
 pub(crate) const INVALID_PARAMS: i32 = -32602;
@@ -24,6 +25,10 @@ impl JsonRpcError {
             message: message.into(),
             data: None,
         }
+    }
+
+    pub(crate) fn parse_error(msg: impl Into<String>) -> Self {
+        Self::new(PARSE_ERROR, msg)
     }
 
     pub(crate) fn invalid_request(msg: impl Into<String>) -> Self {
