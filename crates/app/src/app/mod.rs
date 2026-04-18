@@ -1961,14 +1961,6 @@ impl App {
             });
     }
 
-    /// Test-only: rewind the last-event-loop-tick timestamp to a specific
-    /// millisecond value. Used by the watchdog regression test to
-    /// synthesize a freeze without actually stalling the tokio runtime.
-    #[cfg(test)]
-    pub(crate) fn set_last_event_loop_tick_for_test(&self, ms: u64) {
-        self.last_event_loop_tick_ms.store(ms, Ordering::Relaxed);
-    }
-
     /// Record a new event loop tick (for watchdog freshness tracking).
     #[inline]
     fn tick_event_loop(&self) {
@@ -2124,22 +2116,8 @@ impl App {
                         //   Tier 2 — py-spy / gdb / gcore (richer
                         //            user-space frames, but requires
                         //            the tool to be installed)
-                        tracing::error!(
-                            pid,
-                            "WATCHDOG: Thread state + wchan summary may have been logged above \
-                             (best-effort, Linux/procfs-specific). \
-                             Tier 1 — manual wchan sample (no install needed): \
-                             for t in /proc/{}/task/*; do \
-                             printf '%-8s %s\\n' \"$(basename $t)\" \"$(cat $t/wchan)\"; \
-                             done | sort -k2 | uniq -cf1   \
-                             Tier 2 — richer frames (if installed): \
-                             py-spy dump --pid {}  \
-                             (or: sudo gcore {} && gdb -ex 'thread apply all bt' -ex quit core.{})",
-                            pid,
-                            pid,
-                            pid,
-                            pid
-                        );
+                        let hint = format_watchdog_diagnostic_hint(pid);
+                        tracing::error!(pid, "{}", hint);
                     } else if stale_secs >= 15 {
                         tracing::warn!(
                             stale_secs,
@@ -2212,6 +2190,32 @@ pub(crate) fn warn_if_slow(elapsed: std::time::Duration, op: &'static str, count
             SLOW_OP_THRESHOLD.as_millis()
         );
     }
+}
+
+/// Format the tiered diagnostic hint message for a watchdog freeze event.
+///
+/// Pure function that builds the operator hint string with pre-substituted
+/// PID. Extracted from the watchdog loop so the text can be unit-tested
+/// without waiting for the 10-second poll interval or propagating a tracing
+/// subscriber across thread boundaries.
+///
+/// Tiers:
+/// - **Tier 0** (automatic): `/proc/<pid>/task/*/wchan` scrape logged above
+///   (best-effort, Linux/procfs-specific).
+/// - **Tier 1** (manual): wchan one-liner for repeated sampling.
+/// - **Tier 2** (if installed): `py-spy` / `gdb` / `gcore`.
+pub(crate) fn format_watchdog_diagnostic_hint(pid: u32) -> String {
+    format!(
+        "WATCHDOG: Thread state + wchan summary may have been logged above \
+         (best-effort, Linux/procfs-specific). \
+         Tier 1 — manual wchan sample (no install needed): \
+         for t in /proc/{pid}/task/*; do \
+         printf '%-8s %s\\n' \"$(basename $t)\" \"$(cat $t/wchan)\"; \
+         done | sort -k2 | uniq -cf1   \
+         Tier 2 — richer frames (if installed): \
+         py-spy dump --pid {pid}  \
+         (or: sudo gcore {pid} && gdb -ex 'thread apply all bt' -ex quit core.{pid})"
+    )
 }
 
 #[cfg(test)]
@@ -4343,61 +4347,45 @@ mod tests {
         );
     }
 
-    /// Regression test for the #1759 / #1764 watchdog diagnostic hints.
+    /// Test the `format_watchdog_diagnostic_hint` helper directly.
     ///
-    /// Synthesize a freeze by rewinding `last_event_loop_tick_ms` to 60 s
-    /// in the past. Start the watchdog thread. After one watchdog tick
-    /// (~10 s), the captured log must contain the tiered diagnostic hints:
-    /// tier-1 `/proc` wchan one-liner and tier-2 `py-spy dump --pid`.
+    /// Verifies that the hint text includes:
+    /// - Tier-1 `/proc/<pid>/task/*/wchan` one-liner with the PID substituted
+    /// - Tier-2 `py-spy dump --pid <pid>` with the PID substituted
+    /// - Tier-2 `gcore` / `gdb` alternative with the PID substituted
     ///
-    /// This test is `#[ignore]`d by default because it has to wait for
-    /// the 10-second watchdog poll interval. Run with
-    /// `cargo test -p henyey-app -- --ignored watchdog_diagnostic`.
-    #[tokio::test]
-    #[ignore = "waits for 10s watchdog interval; run with --ignored"]
-    async fn test_watchdog_emits_diagnostic_hint_on_freeze() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("rs-stellar-test.db");
-        let config = crate::config::ConfigBuilder::new()
-            .database_path(db_path)
-            .build();
-        let app = App::new(config).await.unwrap();
+    /// This replaces the old `#[ignore]`d integration test that tried to
+    /// capture logs from the spawned watchdog thread — that approach was
+    /// broken because `tracing::subscriber::set_default` is thread-local.
+    #[test]
+    fn test_watchdog_diagnostic_hint_content() {
+        let pid = 12345u32;
+        let hint = super::format_watchdog_diagnostic_hint(pid);
 
-        let sub = CapturingSubscriber::default();
-        let events = sub.events.clone();
-        let _guard = tracing::subscriber::set_default(sub);
-
-        // Rewind the tick so the watchdog sees a 60 s freeze.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        app.set_last_event_loop_tick_for_test(now_ms.saturating_sub(60_000));
-        app.start_event_loop_watchdog();
-
-        // Wait slightly longer than one watchdog poll interval.
-        tokio::time::sleep(std::time::Duration::from_secs(11)).await;
-
-        let events = events.lock().unwrap();
-
-        // Tier 1: the hint must mention /proc wchan sampling.
-        let wchan_hint = events
-            .iter()
-            .find(|e| e.contains("/proc/") && e.contains("wchan"));
+        // Tier 1: /proc wchan one-liner with PID substituted.
         assert!(
-            wchan_hint.is_some(),
-            "watchdog must emit a tier-1 /proc wchan hint when stale_secs >= 30; \
-             captured events: {:?}",
-            *events
+            hint.contains("/proc/12345/task/"),
+            "tier-1 hint must contain /proc/<pid>/task; got: {hint}"
+        );
+        assert!(
+            hint.contains("wchan"),
+            "tier-1 hint must mention wchan; got: {hint}"
         );
 
-        // Tier 2: the hint must still include py-spy for richer frames.
-        let pyspy_hint = events.iter().find(|e| e.contains("py-spy dump --pid"));
+        // Tier 2: py-spy with PID substituted.
         assert!(
-            pyspy_hint.is_some(),
-            "watchdog must emit a tier-2 py-spy hint when stale_secs >= 30; \
-             captured events: {:?}",
-            *events
+            hint.contains("py-spy dump --pid 12345"),
+            "tier-2 hint must contain py-spy dump --pid <pid>; got: {hint}"
+        );
+
+        // Tier 2: gcore alternative with PID substituted.
+        assert!(
+            hint.contains("gcore 12345"),
+            "tier-2 hint must contain gcore <pid>; got: {hint}"
+        );
+        assert!(
+            hint.contains("core.12345"),
+            "tier-2 hint must contain core.<pid>; got: {hint}"
         );
     }
 
