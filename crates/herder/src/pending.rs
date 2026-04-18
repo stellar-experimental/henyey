@@ -27,6 +27,23 @@ use std::time::{Duration, Instant};
 use stellar_xdr::curr::ScpEnvelope;
 
 /// Configuration for pending envelope management.
+///
+/// Parity reference — stellar-core has two independent sizing concerns:
+/// - `MAX_SLOTS_TO_REMEMBER` (12) for already-externalized-slot retention
+///   (`stellar-core/src/herder/Herder.h`), controlled by
+///   `HerderConfig::max_externalized_slots` in henyey.
+/// - `LEDGER_VALIDITY_BRACKET` (100) for envelope-acceptance horizon
+///   (`stellar-core/src/herder/Herder.cpp:19`), enforced at the pre-filter
+///   layer in henyey (`herder.rs::pre_filter_scp_envelope`).
+///
+/// Stellar-core's `PendingEnvelopes` does NOT impose a separate
+/// per-slot-distance horizon inside the buffer — envelope acceptance is
+/// gated ONCE at the pre-filter. Henyey previously had an additional narrow
+/// gate (`max_slot_distance = 12`) here that caused issue #1807: in
+/// accelerated mode (1 s/ledger) the primary could run > 12 slots ahead of
+/// the captive-core observer post-catchup, and otherwise-valid EXTERNALIZE
+/// envelopes were silently dropped as `SlotTooFar`. The field has been
+/// removed to match stellar-core.
 #[derive(Debug, Clone)]
 pub struct PendingConfig {
     /// Maximum number of pending envelopes per slot.
@@ -35,17 +52,18 @@ pub struct PendingConfig {
     pub max_slots: usize,
     /// Maximum age of pending envelopes before eviction.
     pub max_age: Duration,
-    /// How far ahead of the current slot to accept envelopes.
-    pub max_slot_distance: u64,
 }
 
 impl Default for PendingConfig {
     fn default() -> Self {
         Self {
             max_per_slot: 100,
-            max_slots: 12,
+            // Sized to cover a full `LEDGER_VALIDITY_BRACKET = 100` window so
+            // that post-catchup buffering can hold one envelope per slot
+            // across the pre-filter horizon. Worst-case memory cost:
+            // `max_per_slot × max_slots × ~2 KB = ~20 MB`.
+            max_slots: 100,
             max_age: Duration::from_secs(300),
-            max_slot_distance: 12,
         }
     }
 }
@@ -86,8 +104,6 @@ pub enum PendingResult {
     Added,
     /// Envelope is a duplicate.
     Duplicate,
-    /// Slot is too far ahead.
-    SlotTooFar,
     /// Slot is too old.
     SlotTooOld,
     /// Buffer is full.
@@ -122,8 +138,6 @@ pub struct PendingStats {
     pub duplicates: u64,
     /// Envelopes rejected for being too old.
     pub too_old: u64,
-    /// Envelopes rejected for being too far ahead.
-    pub too_far: u64,
     /// Envelopes released for processing.
     pub released: u64,
     /// Envelopes evicted due to expiration.
@@ -170,11 +184,10 @@ impl PendingEnvelopes {
             return PendingResult::SlotTooOld;
         }
 
-        // Check if slot is too far ahead
-        if slot > current + self.config.max_slot_distance {
-            self.stats.write().too_far += 1;
-            return PendingResult::SlotTooFar;
-        }
+        // No per-slot-distance horizon here — the envelope-acceptance horizon
+        // (`LEDGER_VALIDITY_BRACKET = 100`) is enforced at the pre-filter
+        // layer in `herder::pre_filter_scp_envelope`, matching stellar-core's
+        // single-gate design. See `PendingConfig` doc comment and #1807.
 
         let pending = PendingEnvelope::new(envelope);
 
@@ -420,18 +433,27 @@ mod tests {
         assert_eq!(result, PendingResult::SlotTooOld);
     }
 
+    /// Regression for issue #1807.
+    ///
+    /// Stellar-core's `PendingEnvelopes` (`stellar-core/src/herder/
+    /// PendingEnvelopes.cpp::recvSCPEnvelope`) has no per-slot-distance cap;
+    /// envelope acceptance is enforced exactly once at the pre-filter layer
+    /// (`HerderImpl::recvSCPEnvelope` via `LEDGER_VALIDITY_BRACKET = 100`).
+    /// Henyey previously imposed a narrower second gate here that dropped
+    /// EXTERNALIZE envelopes the primary sent for slots > 12 ahead of the
+    /// post-catchup observer's `tracking_slot` — freezing captive-core in
+    /// the accelerated-mode Quickstart shards. The field and gate are now
+    /// removed; any slot within the pre-filter horizon must be buffered.
     #[test]
-    fn test_slot_too_far() {
-        let config = PendingConfig {
-            max_slot_distance: 5,
-            ..Default::default()
-        };
-        let pending = PendingEnvelopes::new(config);
-        pending.set_current_slot(100);
+    fn test_far_future_slot_is_buffered_not_rejected() {
+        let pending = PendingEnvelopes::with_defaults();
+        pending.set_current_slot(272);
 
-        let envelope = make_test_envelope(106);
-        let result = pending.add(106, envelope);
-        assert_eq!(result, PendingResult::SlotTooFar);
+        // Slot 320 is 48 ahead of current_slot — well within the pre-filter
+        // horizon of `LEDGER_VALIDITY_BRACKET = 100`. Previously this was
+        // rejected as `SlotTooFar`; now it must be buffered.
+        let envelope = make_test_envelope(320);
+        assert_eq!(pending.add(320, envelope), PendingResult::Added);
     }
 
     #[test]

@@ -310,10 +310,20 @@ impl Herder {
 
     /// Shared constructor logic for both observer and validator modes.
     fn build(config: HerderConfig, secret_key: Option<SecretKey>) -> Self {
-        let mut pending_config = config.pending_config.clone();
+        // Decouple the pending-envelope buffer sizing from
+        // `max_externalized_slots`. These control different things:
+        // `max_externalized_slots` caps the already-externalized-slot
+        // retention window (stellar-core's `MAX_SLOTS_TO_REMEMBER = 12`,
+        // used for peer state queries and `SlotQuorumTracker` capacity);
+        // `pending_config.max_slots` caps the forward-looking buffer that
+        // holds EXTERNALIZE envelopes for slots the observer hasn't
+        // reached yet (stellar-core scales this with
+        // `LEDGER_VALIDITY_BRACKET = 100`). Previously both were clamped
+        // together, which narrowed the pending buffer to 12 slots and
+        // caused issue #1807 — EXTERNALIZEs more than 12 slots ahead of
+        // the post-catchup tracking slot were silently dropped.
+        let pending_config = config.pending_config.clone();
         let max_slots = config.max_externalized_slots.max(1);
-        pending_config.max_slots = pending_config.max_slots.min(max_slots);
-        pending_config.max_slot_distance = pending_config.max_slot_distance.min(max_slots as u64);
 
         let scp_driver_config = ScpDriverConfig {
             node_id: config.node_public_key,
@@ -1308,13 +1318,6 @@ impl Herder {
                         EnvelopeState::Duplicate,
                         PostVerifyReason::PendingAddDuplicate,
                     );
-                }
-                PendingResult::SlotTooFar => {
-                    debug!(
-                        slot,
-                        current_slot, pending_slot, "Envelope rejected: slot too far ahead"
-                    );
-                    return (EnvelopeState::Invalid, PostVerifyReason::PendingAddTooFar);
                 }
                 PendingResult::SlotTooOld => {
                     debug!(
@@ -2965,6 +2968,76 @@ mod tests {
         // Should be buffered in PendingEnvelopes (not immediately processed)
         assert_eq!(result, EnvelopeState::Pending);
         // Tracking slot should NOT have advanced (envelope is buffered)
+        assert_eq!(herder.tracking_slot(), tracking);
+    }
+
+    /// Regression for issue #1807.
+    ///
+    /// After archive catchup in accelerated mode, the primary can run many
+    /// slots ahead of the captive-core observer — for example, primary at
+    /// slot 320 while observer just bootstrapped with `tracking_slot=272`.
+    /// Primary's EXTERNALIZE envelopes for slots 285..320 must all be
+    /// buffered (not rejected) so that when the observer externalizes the
+    /// intermediate slots, the buffered envelopes drain into
+    /// `record_externalized` and the observer catches up to the primary.
+    ///
+    /// Before this fix, `PendingEnvelopes::max_slot_distance` (12, clamped
+    /// again in `Herder::build` to `max_externalized_slots=12`) rejected
+    /// any envelope more than 12 slots ahead of `tracking_slot` — the gate
+    /// was removed in #1807 so the pre-filter `LEDGER_VALIDITY_BRACKET=100`
+    /// horizon is the only horizon.
+    #[test]
+    fn test_externalize_48_slots_ahead_is_buffered_not_rejected() {
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, local_secret);
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set)
+            .unwrap();
+
+        let tracking = herder.tracking_slot(); // 101
+
+        // Primary is 48 slots ahead — this matches the post-catchup Quickstart
+        // scenario where captive-core just bootstrapped at `tracking_slot=N`
+        // and the primary is at ~`N+48`. Pre-fix this was rejected as
+        // `PendingAddTooFar`; now it must be buffered.
+        let far_future_slot = tracking + 48;
+        let envelope = make_signed_externalize_from(far_future_slot, &herder, &other_secret);
+        let result = herder.receive_scp_envelope(envelope);
+
+        assert_eq!(
+            result,
+            EnvelopeState::Pending,
+            "EXTERNALIZE 48 slots ahead must be buffered, got {:?}",
+            result
+        );
+        // Tracking slot must not advance on buffering alone.
         assert_eq!(herder.tracking_slot(), tracking);
     }
 
