@@ -34,6 +34,8 @@ pub(crate) enum RpcXdrError {
     },
     /// Base64 decoding failed.
     Base64Decode { cause: String },
+    /// DB row key disagrees with the ledger sequence inside the XDR blob.
+    SequenceMismatch { db_seq: u32, parsed_seq: u32 },
 }
 
 impl std::fmt::Display for RpcXdrError {
@@ -47,6 +49,12 @@ impl std::fmt::Display for RpcXdrError {
             }
             RpcXdrError::Base64Decode { cause } => {
                 write!(f, "base64 decode failed: {cause}")
+            }
+            RpcXdrError::SequenceMismatch { db_seq, parsed_seq } => {
+                write!(
+                    f,
+                    "DB/XDR sequence mismatch: db_seq={db_seq}, parsed_seq={parsed_seq}"
+                )
             }
         }
     }
@@ -384,6 +392,31 @@ pub(crate) fn ledger_header_entry(lcm: &LedgerCloseMeta) -> &LedgerHeaderHistory
         LedgerCloseMeta::V1(v1) => &v1.ledger_header,
         LedgerCloseMeta::V2(v2) => &v2.ledger_header,
     }
+}
+
+/// Parse a [`LedgerCloseMeta`] from raw bytes and validate that the embedded
+/// ledger sequence matches the expected `db_seq` from the database row key.
+///
+/// Returns [`RpcXdrError::XdrParse`] if XDR deserialization fails, or
+/// [`RpcXdrError::SequenceMismatch`] if the parsed sequence disagrees with
+/// `db_seq` (indicating data corruption).
+pub(crate) fn parse_ledger_close_meta_checked(
+    db_seq: u32,
+    meta_bytes: &[u8],
+) -> Result<LedgerCloseMeta, RpcXdrError> {
+    let lcm = LedgerCloseMeta::from_xdr(meta_bytes, Limits::none()).map_err(|e| {
+        RpcXdrError::XdrParse {
+            type_name: "LedgerCloseMeta",
+            cause: e.to_string(),
+        }
+    })?;
+
+    let parsed_seq = ledger_header_entry(&lcm).header.ledger_seq;
+    if parsed_seq != db_seq {
+        return Err(RpcXdrError::SequenceMismatch { db_seq, parsed_seq });
+    }
+
+    Ok(lcm)
 }
 
 // ---------------------------------------------------------------------------
@@ -1399,5 +1432,92 @@ mod tests {
             42,
             "bounded_blocking should return the closure result"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // parse_ledger_close_meta_checked tests
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal `LedgerCloseMeta` with the given ledger sequence and
+    /// serialize it to XDR bytes.
+    fn make_lcm_bytes(seq: u32) -> Vec<u8> {
+        use stellar_xdr::curr::{
+            Hash, LedgerCloseMetaV0, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntryExt,
+            StellarValue, StellarValueExt, TimePoint, TransactionSet, WriteXdr,
+        };
+
+        let lcm = LedgerCloseMeta::V0(LedgerCloseMetaV0 {
+            ledger_header: LedgerHeaderHistoryEntry {
+                hash: Hash([0; 32]),
+                header: LedgerHeader {
+                    ledger_version: 21,
+                    previous_ledger_hash: Hash([0; 32]),
+                    scp_value: StellarValue {
+                        tx_set_hash: Hash([0; 32]),
+                        close_time: TimePoint(0),
+                        upgrades: vec![].try_into().unwrap(),
+                        ext: StellarValueExt::Basic,
+                    },
+                    tx_set_result_hash: Hash([0; 32]),
+                    bucket_list_hash: Hash([0; 32]),
+                    ledger_seq: seq,
+                    total_coins: 0,
+                    fee_pool: 0,
+                    inflation_seq: 0,
+                    id_pool: 0,
+                    base_fee: 100,
+                    base_reserve: 5_000_000,
+                    max_tx_set_size: 100,
+                    skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+                    ext: LedgerHeaderExt::V0,
+                },
+                ext: LedgerHeaderHistoryEntryExt::V0,
+            },
+            tx_set: TransactionSet {
+                previous_ledger_hash: Hash([0; 32]),
+                txs: vec![].try_into().unwrap(),
+            },
+            tx_processing: vec![].try_into().unwrap(),
+            upgrades_processing: vec![].try_into().unwrap(),
+            scp_info: vec![].try_into().unwrap(),
+        });
+        lcm.to_xdr(Limits::none()).unwrap()
+    }
+
+    #[test]
+    fn test_parse_lcm_checked_happy_path() {
+        let bytes = make_lcm_bytes(42);
+        let lcm = parse_ledger_close_meta_checked(42, &bytes).unwrap();
+        assert_eq!(ledger_header_entry(&lcm).header.ledger_seq, 42);
+    }
+
+    #[test]
+    fn test_parse_lcm_checked_sequence_mismatch() {
+        let bytes = make_lcm_bytes(42);
+        let err = parse_ledger_close_meta_checked(99, &bytes).unwrap_err();
+        match &err {
+            RpcXdrError::SequenceMismatch { db_seq, parsed_seq } => {
+                assert_eq!(*db_seq, 99);
+                assert_eq!(*parsed_seq, 42);
+            }
+            other => panic!("expected SequenceMismatch, got: {other:?}"),
+        }
+        assert!(
+            err.to_string().contains("mismatch"),
+            "Display should mention mismatch: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_lcm_checked_invalid_xdr() {
+        let garbage = &[0xFF, 0xFE, 0xFD];
+        let err = parse_ledger_close_meta_checked(1, garbage).unwrap_err();
+        match &err {
+            RpcXdrError::XdrParse { type_name, .. } => {
+                assert_eq!(*type_name, "LedgerCloseMeta");
+            }
+            other => panic!("expected XdrParse, got: {other:?}"),
+        }
     }
 }

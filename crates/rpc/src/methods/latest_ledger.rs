@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde_json::json;
-use stellar_xdr::curr::{LedgerCloseMeta, Limits, ReadXdr, WriteXdr};
+use stellar_xdr::curr::{Limits, WriteXdr};
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -35,9 +35,8 @@ pub async fn handle(ctx: &Arc<RpcContext>) -> Result<serde_json::Value, JsonRpcE
         JsonRpcError::internal("database error")
     })?
     .map(|meta_bytes| {
-        // Validate the stored bytes before returning them to clients.
-        LedgerCloseMeta::from_xdr(&meta_bytes, Limits::none())
-            .map_err(|e| JsonRpcError::internal_logged("XDR data integrity error", &e))?;
+        // Validate the stored bytes (parse + sequence check) before returning.
+        util::parse_ledger_close_meta_checked(ledger_num, &meta_bytes)?;
         Ok::<_, JsonRpcError>(BASE64.encode(&meta_bytes))
     })
     .transpose()?

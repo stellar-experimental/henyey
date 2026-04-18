@@ -657,3 +657,114 @@ async fn get_ledgers_corrupt_metadata() {
     handle.abort();
     drop(sim);
 }
+
+// ---------------------------------------------------------------------------
+// Sequence mismatch tests (valid XDR, wrong embedded sequence)
+// ---------------------------------------------------------------------------
+
+/// Build a minimal, valid `LedgerCloseMeta` with the given ledger sequence.
+fn valid_lcm_bytes(seq: u32) -> Vec<u8> {
+    use stellar_xdr::curr::{
+        Hash, LedgerCloseMeta, LedgerCloseMetaV0, LedgerHeader, LedgerHeaderExt,
+        LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, StellarValue, StellarValueExt,
+        TimePoint, TransactionSet, WriteXdr,
+    };
+    let lcm = LedgerCloseMeta::V0(LedgerCloseMetaV0 {
+        ledger_header: LedgerHeaderHistoryEntry {
+            hash: Hash([0; 32]),
+            header: LedgerHeader {
+                ledger_version: 21,
+                previous_ledger_hash: Hash([0; 32]),
+                scp_value: StellarValue {
+                    tx_set_hash: Hash([0; 32]),
+                    close_time: TimePoint(0),
+                    upgrades: vec![].try_into().unwrap(),
+                    ext: StellarValueExt::Basic,
+                },
+                tx_set_result_hash: Hash([0; 32]),
+                bucket_list_hash: Hash([0; 32]),
+                ledger_seq: seq,
+                total_coins: 0,
+                fee_pool: 0,
+                inflation_seq: 0,
+                id_pool: 0,
+                base_fee: 100,
+                base_reserve: 5_000_000,
+                max_tx_set_size: 100,
+                skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+                ext: LedgerHeaderExt::V0,
+            },
+            ext: LedgerHeaderHistoryEntryExt::V0,
+        },
+        tx_set: TransactionSet {
+            previous_ledger_hash: Hash([0; 32]),
+            txs: vec![].try_into().unwrap(),
+        },
+        tx_processing: vec![].try_into().unwrap(),
+        upgrades_processing: vec![].try_into().unwrap(),
+        scp_info: vec![].try_into().unwrap(),
+    });
+    lcm.to_xdr(Limits::none()).unwrap()
+}
+
+#[tokio::test]
+async fn get_ledgers_sequence_mismatch() {
+    let (sim, url, client, app, handle) = setup_rpc().await;
+
+    // Store a valid LCM whose embedded sequence (9999) differs from the DB key.
+    let ledger_num = app.ledger_summary().num;
+    let wrong_seq_lcm = valid_lcm_bytes(9999);
+    app.database()
+        .with_connection(|conn| conn.store_ledger_close_meta(ledger_num, &wrong_seq_lcm))
+        .unwrap();
+
+    let id = json!("ledgers-seq-mismatch");
+    let (status, resp) = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLedgers",
+            "params": {"startLedger": ledger_num}
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_xdr_integrity_error(&resp, &id);
+
+    handle.abort();
+    drop(sim);
+}
+
+#[tokio::test]
+async fn get_latest_ledger_sequence_mismatch() {
+    let (sim, url, client, app, handle) = setup_rpc().await;
+
+    // Store a valid LCM whose embedded sequence (9999) differs from the
+    // current ledger number used by getLatestLedger.
+    let ledger_num = app.ledger_summary().num;
+    let wrong_seq_lcm = valid_lcm_bytes(9999);
+    app.database()
+        .with_connection(|conn| conn.store_ledger_close_meta(ledger_num, &wrong_seq_lcm))
+        .unwrap();
+
+    let id = json!("latest-seq-mismatch");
+    let (status, resp) = post_rpc(
+        &client,
+        &url,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLatestLedger"
+        }),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    assert_xdr_integrity_error(&resp, &id);
+
+    handle.abort();
+    drop(sim);
+}

@@ -26,8 +26,8 @@
 use std::sync::RwLock;
 
 use stellar_xdr::curr::{
-    InnerTransactionResultResult, LedgerCloseMeta, Limits, ReadXdr, SorobanTransactionMetaExt,
-    TransactionMeta, TransactionResultPair, TransactionResultResult,
+    InnerTransactionResultResult, LedgerCloseMeta, SorobanTransactionMetaExt, TransactionMeta,
+    TransactionResultPair, TransactionResultResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -342,15 +342,8 @@ impl FeeWindows {
         db_seq: u32,
         meta_bytes: &[u8],
     ) -> Result<(), FeeWindowError> {
-        let lcm = LedgerCloseMeta::from_xdr(meta_bytes, Limits::none())
-            .map_err(|e| FeeWindowError::Parse(format!("failed to parse LedgerCloseMeta: {e}")))?;
-
-        let parsed_seq = crate::util::ledger_header_entry(&lcm).header.ledger_seq;
-        if parsed_seq != db_seq {
-            return Err(FeeWindowError::Parse(format!(
-                "DB/XDR sequence mismatch: db_seq={db_seq}, parsed_seq={parsed_seq}"
-            )));
-        }
+        let lcm = crate::util::parse_ledger_close_meta_checked(db_seq, meta_bytes)
+            .map_err(|e| FeeWindowError::Parse(e.to_string()))?;
 
         // Pre-mutation contiguity check against the classic window (both
         // windows are always appended together, so checking one suffices).
