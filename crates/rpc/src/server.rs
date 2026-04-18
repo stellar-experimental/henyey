@@ -6,9 +6,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 
-use henyey_app::App;
-
-use crate::context::RpcContext;
+use crate::context::{RpcAppHandle, RpcContext};
 use crate::dispatch;
 use crate::error::JsonRpcError;
 use crate::fee_window::{FeeWindowError, FeeWindows};
@@ -20,7 +18,7 @@ const MAX_REQUEST_BODY_BYTES: usize = 512 * 1024;
 /// Stellar JSON-RPC 2.0 server.
 pub struct RpcServer {
     port: u16,
-    app: Arc<App>,
+    app: Arc<dyn RpcAppHandle>,
 }
 
 /// A bound but not-yet-serving RPC server.
@@ -55,7 +53,7 @@ impl RpcServerRunning {
 
 impl RpcServer {
     /// Create a new RPC server on the given port.
-    pub fn new(port: u16, app: Arc<App>) -> Self {
+    pub fn new(port: u16, app: Arc<dyn RpcAppHandle>) -> Self {
         Self { port, app }
     }
 
@@ -114,14 +112,14 @@ impl RpcServer {
 /// On startup, does a bulk load of the last `retention_window` ledgers from DB,
 /// then polls every second for new ones.
 async fn fee_window_poller(
-    app: Arc<App>,
+    app: Arc<dyn RpcAppHandle>,
     windows: Arc<FeeWindows>,
     shutdown: &mut tokio::sync::broadcast::Receiver<()>,
 ) {
     let retention = app.config().rpc.retention_window;
 
     // Initial bulk load
-    if let Err(e) = bulk_load_fees(&app, &windows, retention) {
+    if let Err(e) = bulk_load_fees(&*app, &windows, retention) {
         tracing::warn!(error = %e, "Failed initial fee window load");
     }
 
@@ -260,7 +258,11 @@ fn ingest_metas_best_effort(windows: &FeeWindows, metas: &[(u32, Vec<u8>)]) -> I
 }
 
 /// Bulk-load the last N ledgers' fees from the database.
-fn bulk_load_fees(app: &App, windows: &FeeWindows, retention: u32) -> Result<(), String> {
+fn bulk_load_fees(
+    app: &dyn RpcAppHandle,
+    windows: &FeeWindows,
+    retention: u32,
+) -> Result<(), String> {
     let current = app.ledger_summary().num;
     if current == 0 {
         return Ok(());
@@ -283,7 +285,7 @@ fn bulk_load_fees(app: &App, windows: &FeeWindows, retention: u32) -> Result<(),
 }
 
 fn load_fee_window_metas(
-    app: &App,
+    app: &dyn RpcAppHandle,
     start: u32,
     end: u32,
     retention: u32,
@@ -409,7 +411,7 @@ mod tests {
     use std::time::Duration;
 
     use henyey_app::config::QuorumSetConfig;
-    use henyey_app::AppState;
+    use henyey_app::{App, AppState};
     use henyey_common::Hash256;
     use henyey_crypto::SecretKey;
     use henyey_simulation::{Simulation, SimulationMode};
@@ -463,7 +465,7 @@ mod tests {
 
     /// Build an `RpcContext` with custom semaphore sizes and timeout.
     fn make_ctx(
-        app: std::sync::Arc<App>,
+        app: std::sync::Arc<dyn RpcAppHandle>,
         request_sem: usize,
         db_sem: usize,
         bucket_io_sem: usize,

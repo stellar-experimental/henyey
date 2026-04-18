@@ -31,7 +31,8 @@ flowchart TD
 | Type | Description |
 |------|-------------|
 | `RpcServer` | Public entry point that binds the HTTP listener and serves the JSON-RPC endpoint. |
-| `RpcContext` | Shared state passed to handlers, holding the `App` and fee-window cache. |
+| `RpcAppHandle` | Trait abstracting the subset of `App` used by RPC handlers; enables test fakes. |
+| `RpcContext` | Shared state passed to handlers, holding an `Arc<dyn RpcAppHandle>` and fee-window cache. |
 | `JsonRpcRequest` | Deserialized JSON-RPC 2.0 request envelope. |
 | `JsonRpcResponse` | Serialized JSON-RPC success or error envelope. |
 | `JsonRpcError` | JSON-RPC error payload with standard codes and optional data. |
@@ -50,6 +51,7 @@ use henyey_app::App;
 use henyey_rpc::RpcServer;
 
 async fn run_rpc(app: Arc<App>) -> anyhow::Result<()> {
+    // Arc<App> coerces to Arc<dyn RpcAppHandle> automatically.
     let server = RpcServer::new(8000, app);
     server.start().await
 }
@@ -93,8 +95,8 @@ fn build_simulation_request(tx_b64: &str) -> serde_json::Value {
 
 | Module | Description |
 |--------|-------------|
-| `lib.rs` | Crate root; declares modules and re-exports `RpcServer`. |
-| `context.rs` | Shared request context used by all handlers. |
+| `lib.rs` | Crate root; declares modules and re-exports `RpcServer`, `RpcAppHandle`. |
+| `context.rs` | `RpcAppHandle` trait and shared request context used by all handlers. |
 | `dispatch.rs` | Routes JSON-RPC method names to handler functions. |
 | `error.rs` | JSON-RPC error codes and error object helpers. |
 | `fee_window.rs` | Sliding fee-window implementation and percentile calculation. |

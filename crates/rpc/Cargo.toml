@@ -47,6 +47,9 @@ rand.workspace = true
 # Logging
 tracing.workspace = true
 
+# Async trait (for RpcAppHandle dyn dispatch)
+async-trait.workspace = true
+
 # Error handling
 anyhow.workspace = true
 

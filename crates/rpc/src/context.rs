@@ -1,8 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use henyey_app::config::RpcConfig;
-use henyey_app::App;
+use henyey_app::app::AppInfo;
+use henyey_app::config::{AppConfig, RpcConfig};
+use henyey_app::{App, AppState, LedgerSummary};
+use henyey_bucket::BucketSnapshotManager;
+use henyey_herder::TxQueueResult;
+use henyey_ledger::{LedgerManager, SorobanNetworkInfo};
+use stellar_xdr::curr::TransactionEnvelope;
 use tokio::sync::Semaphore;
 
 use crate::fee_window::FeeWindows;
@@ -13,10 +18,73 @@ use crate::fee_window::FeeWindows;
 /// acquires). Also prevents the same footgun for simulations and DB.
 const MIN_SEMAPHORE_CAPACITY: usize = 1;
 
+/// Subset of [`App`] functionality needed by RPC handlers.
+///
+/// Decouples the RPC crate from the concrete `App` runtime type so that
+/// integration tests can provide lightweight fakes without booting the full
+/// application. `App` implements this trait via a delegating impl below.
+#[async_trait::async_trait]
+pub trait RpcAppHandle: Send + Sync + 'static {
+    /// Application configuration.
+    fn config(&self) -> &AppConfig;
+    /// Application version, network passphrase, and build metadata.
+    fn info(&self) -> AppInfo;
+    /// Current ledger header snapshot (sequence, hash, close time, etc.).
+    fn ledger_summary(&self) -> LedgerSummary;
+    /// Ledger manager (for raw header access in `getLatestLedger`).
+    fn ledger_manager(&self) -> &Arc<LedgerManager>;
+    /// Database connection pool.
+    fn database(&self) -> &henyey_db::Database;
+    /// Bucket list snapshot manager (for Soroban simulation).
+    fn bucket_snapshot_manager(&self) -> &Arc<BucketSnapshotManager>;
+    /// Soroban network configuration (TTL bounds, fees, etc.).
+    fn soroban_network_info(&self) -> Option<SorobanNetworkInfo>;
+    /// Subscribe to the application shutdown broadcast channel.
+    fn subscribe_shutdown(&self) -> tokio::sync::broadcast::Receiver<()>;
+    /// Submit a transaction to the herder queue and flood to peers.
+    async fn submit_transaction(&self, tx: TransactionEnvelope) -> TxQueueResult;
+    /// Current application state (e.g., `Validating`, `Synced`).
+    async fn state(&self) -> AppState;
+}
+
+#[async_trait::async_trait]
+impl RpcAppHandle for App {
+    fn config(&self) -> &AppConfig {
+        App::config(self)
+    }
+    fn info(&self) -> AppInfo {
+        App::info(self)
+    }
+    fn ledger_summary(&self) -> LedgerSummary {
+        App::ledger_summary(self)
+    }
+    fn ledger_manager(&self) -> &Arc<LedgerManager> {
+        App::ledger_manager(self)
+    }
+    fn database(&self) -> &henyey_db::Database {
+        App::database(self)
+    }
+    fn bucket_snapshot_manager(&self) -> &Arc<BucketSnapshotManager> {
+        App::bucket_snapshot_manager(self)
+    }
+    fn soroban_network_info(&self) -> Option<SorobanNetworkInfo> {
+        App::soroban_network_info(self)
+    }
+    fn subscribe_shutdown(&self) -> tokio::sync::broadcast::Receiver<()> {
+        App::subscribe_shutdown(self)
+    }
+    async fn submit_transaction(&self, tx: TransactionEnvelope) -> TxQueueResult {
+        App::submit_transaction(self, tx).await
+    }
+    async fn state(&self) -> AppState {
+        App::state(self).await
+    }
+}
+
 /// Shared state for all RPC handlers.
 pub struct RpcContext {
-    /// The application instance.
-    pub app: Arc<App>,
+    /// The application handle (production: `App`; tests: lightweight fake).
+    pub app: Arc<dyn RpcAppHandle>,
     /// Sliding-window fee statistics for `getFeeStats`.
     pub fee_windows: Arc<FeeWindows>,
     /// Limits concurrent `simulateTransaction` requests to prevent CPU/thread exhaustion.
@@ -37,7 +105,7 @@ impl RpcContext {
     /// Construct an `RpcContext` from the given app, sizing semaphores and
     /// timeout from `app.config().rpc`. The returned `Arc` is the shared
     /// state passed to axum handlers.
-    pub fn new(app: Arc<App>, fee_windows: Arc<FeeWindows>) -> Arc<Self> {
+    pub fn new(app: Arc<dyn RpcAppHandle>, fee_windows: Arc<FeeWindows>) -> Arc<Self> {
         let ctx = Self::from_config(app.config().rpc.clone(), app, fee_windows);
         Arc::new(ctx)
     }
@@ -45,7 +113,11 @@ impl RpcContext {
     /// Construct an `RpcContext` directly from an [`RpcConfig`], separated
     /// so tests can exercise the capacity-clamp logic without booting a
     /// full `App`.
-    fn from_config(rpc_config: RpcConfig, app: Arc<App>, fee_windows: Arc<FeeWindows>) -> Self {
+    fn from_config(
+        rpc_config: RpcConfig,
+        app: Arc<dyn RpcAppHandle>,
+        fee_windows: Arc<FeeWindows>,
+    ) -> Self {
         let max_sims = (rpc_config.max_concurrent_simulations as usize).max(MIN_SEMAPHORE_CAPACITY);
         let max_requests = rpc_config
             .max_concurrent_requests

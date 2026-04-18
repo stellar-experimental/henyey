@@ -210,7 +210,7 @@ impl SimulationContext {
     ///
     /// Uses the snapshot's own ledger header instead of `app.ledger_summary()`
     /// to avoid TOCTOU: the snapshot and header are captured atomically.
-    fn from_app(app: &henyey_app::App) -> Result<Self, JsonRpcError> {
+    fn from_app(app: &dyn crate::context::RpcAppHandle) -> Result<Self, JsonRpcError> {
         let bl_snapshot = app
             .bucket_snapshot_manager()
             .copy_searchable_live_snapshot()
@@ -368,7 +368,7 @@ pub async fn handle(
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
 
-    let sim = SimulationContext::from_app(&ctx.app)?;
+    let sim = SimulationContext::from_app(&*ctx.app)?;
 
     match soroban_op {
         SorobanOp::InvokeHostFunction { host_fn, auth } => {
