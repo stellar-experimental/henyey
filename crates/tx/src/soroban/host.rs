@@ -129,24 +129,53 @@ pub struct SorobanExecutionError {
     pub mem_bytes_consumed: u64,
 }
 
+/// What kind of storage change the host reported.
+#[derive(Debug)]
+pub enum StorageChangeKind {
+    /// The host returned new entry data. Whether this is a create or update
+    /// is determined at apply time by checking the current ledger state.
+    ///
+    /// The inner `LedgerEntry` can be any type the host returns, including
+    /// `LedgerEntryData::Ttl(...)` for direct TTL entries. Direct TTL entries
+    /// skip per-entry TTL emission and write-byte accounting (their fees come
+    /// from refundable fee).
+    Modified {
+        /// The new ledger entry data.
+        entry: Box<LedgerEntry>,
+        /// New live_until ledger sequence for TTL, if any.
+        live_until: Option<u32>,
+        /// Whether the TTL was extended relative to ledger-start state.
+        ttl_extended: bool,
+    },
+    /// Only the TTL changed; no data modification. This happens when a contract
+    /// reads an entry and its TTL gets auto-extended by the host.
+    ///
+    /// For read-only footprint entries (`read_only = true`), stellar-core includes
+    /// the TTL bump in transaction meta but defers the state update so subsequent
+    /// transactions in the same ledger don't see the bumped value (CAP-0063).
+    ///
+    /// Hot-archive read-only restores may surface as `TtlOnly` but are
+    /// short-circuited by the `hot_archive_restored_keys` check in
+    /// `apply_soroban_storage_change` before this variant is inspected.
+    TtlOnly {
+        /// New live_until ledger sequence.
+        live_until: u32,
+        /// Whether this is a read-only footprint entry.
+        read_only: bool,
+    },
+    /// The entry was explicitly deleted. No new value and no TTL change.
+    Deleted,
+}
+
 /// A single storage change from Soroban execution.
 pub struct StorageChange {
     /// The ledger key.
     pub key: LedgerKey,
-    /// The new entry (None if deleted or read-only).
-    pub new_entry: Option<LedgerEntry>,
-    /// The new live_until ledger (for TTL).
-    pub live_until: Option<u32>,
-    /// Whether the TTL was extended (new > old).
-    pub ttl_extended: bool,
+    /// What happened to this entry.
+    pub kind: StorageChangeKind,
     /// Whether the entry was included due to rent calculations (old_entry_size_bytes_for_rent > 0).
     /// Rent-related read-only entries should still emit TTL updates.
     pub is_rent_related: bool,
-    /// Whether this is a read-only entry with only a TTL change (no data modification).
-    /// Such changes should be applied to state (bucket list) but NOT included in transaction meta.
-    /// This matches stellar-core's behavior per CAP-0063: read-only TTL bumps are accumulated
-    /// separately and flushed at write barriers, not in individual transaction meta.
-    pub is_read_only_ttl_bump: bool,
 }
 
 /// Persistent module cache that can be reused across transactions.
@@ -965,23 +994,42 @@ fn map_storage_changes(
             })
             .unwrap_or(false);
 
-        let is_read_only_ttl_bump = change.read_only && !is_modification && ttl_extended;
-
         if is_modification || is_deletion || ttl_extended {
-            let new_entry = change
-                .encoded_new_value
-                .as_ref()
-                .map(|bytes| LedgerEntry::from_xdr(bytes, Limits::none()))
-                .transpose()
-                .map_err(|_| make_error("failed to decode LedgerEntry from storage change"))?;
-            let live_until = change.ttl_new_live_until_ledger;
+            // Determine the kind based on the three-way discrimination that
+            // mirrors apply_soroban_storage_change's if/else chain:
+            //   1. encoded_new_value present → Modified
+            //   2. encoded_new_value absent, live_until present → TtlOnly
+            //   3. encoded_new_value absent, live_until absent → Deleted
+            //
+            // CRITICAL: when is_deletion=true AND live_until=Some(...), the
+            // current code enters the TTL-only path (not deletion), which
+            // contains the hot_archive_restored_keys short-circuit. We must
+            // preserve this by mapping to TtlOnly, not Deleted.
+            let kind = if is_modification {
+                let entry = change
+                    .encoded_new_value
+                    .as_ref()
+                    .map(|bytes| LedgerEntry::from_xdr(bytes, Limits::none()))
+                    .transpose()
+                    .map_err(|_| make_error("failed to decode LedgerEntry from storage change"))?
+                    .expect("is_modification implies encoded_new_value is Some");
+                StorageChangeKind::Modified {
+                    entry: Box::new(entry),
+                    live_until: change.ttl_new_live_until_ledger,
+                    ttl_extended,
+                }
+            } else if let Some(live_until) = change.ttl_new_live_until_ledger {
+                StorageChangeKind::TtlOnly {
+                    live_until,
+                    read_only: change.read_only,
+                }
+            } else {
+                StorageChangeKind::Deleted
+            };
             result.push(StorageChange {
                 key,
-                new_entry,
-                live_until,
-                ttl_extended,
+                kind,
                 is_rent_related,
-                is_read_only_ttl_bump,
             });
         }
     }
@@ -1885,23 +1933,26 @@ mod tests {
             key: LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
                 hash: Hash([4u8; 32]),
             }),
-            new_entry: Some(LedgerEntry {
-                last_modified_ledger_seq: 100,
-                data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
-                    ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
-                    hash: Hash([4u8; 32]),
-                    code: vec![0xDE, 0xAD].try_into().unwrap(),
+            kind: StorageChangeKind::Modified {
+                entry: Box::new(LedgerEntry {
+                    last_modified_ledger_seq: 100,
+                    data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
+                        ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                        hash: Hash([4u8; 32]),
+                        code: vec![0xDE, 0xAD].try_into().unwrap(),
+                    }),
+                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
                 }),
-                ext: stellar_xdr::curr::LedgerEntryExt::V0,
-            }),
-            live_until: Some(1000),
-            ttl_extended: false,
+                live_until: Some(1000),
+                ttl_extended: false,
+            },
             is_rent_related: false,
-            is_read_only_ttl_bump: false,
         };
 
-        assert!(change.new_entry.is_some());
-        assert_eq!(change.live_until, Some(1000));
+        assert!(matches!(change.kind, StorageChangeKind::Modified { .. }));
+        if let StorageChangeKind::Modified { live_until, .. } = &change.kind {
+            assert_eq!(*live_until, Some(1000));
+        }
     }
 
     /// Test StorageChange struct with TTL extension.
@@ -1911,16 +1962,21 @@ mod tests {
             key: LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
                 hash: Hash([5u8; 32]),
             }),
-            new_entry: None,
-            live_until: Some(2000),
-            ttl_extended: true,
+            kind: StorageChangeKind::TtlOnly {
+                live_until: 2000,
+                read_only: true,
+            },
             is_rent_related: true,
-            is_read_only_ttl_bump: true,
         };
 
-        assert!(change.ttl_extended);
+        assert!(matches!(
+            change.kind,
+            StorageChangeKind::TtlOnly {
+                read_only: true,
+                ..
+            }
+        ));
         assert!(change.is_rent_related);
-        assert!(change.is_read_only_ttl_bump);
     }
 
     /// Regression test for VE-14 / L61593050: XDR deserialization metering.
@@ -1999,22 +2055,18 @@ mod tests {
         );
     }
 
-    /// Test StorageChange struct representing a delete (new_entry = None).
+    /// Test StorageChange struct representing a delete.
     #[test]
     fn test_storage_change_delete() {
         let change = StorageChange {
             key: LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
                 hash: Hash([6u8; 32]),
             }),
-            new_entry: None,
-            live_until: None,
-            ttl_extended: false,
+            kind: StorageChangeKind::Deleted,
             is_rent_related: false,
-            is_read_only_ttl_bump: false,
         };
 
-        assert!(change.new_entry.is_none());
-        assert!(change.live_until.is_none());
+        assert!(matches!(change.kind, StorageChangeKind::Deleted));
         assert!(matches!(change.key, LedgerKey::ContractCode(_)));
     }
 
@@ -2117,7 +2169,7 @@ mod tests {
         }];
         let result = map_storage_changes(changes, &state, None, &make_error).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(result[0].new_entry.is_some());
+        assert!(matches!(result[0].kind, StorageChangeKind::Modified { .. }));
 
         // Deletion (no new value, not read_only)
         let changes = vec![NormalizedLedgerChange {
@@ -2129,7 +2181,7 @@ mod tests {
         }];
         let result = map_storage_changes(changes, &state, None, &make_error).unwrap();
         assert_eq!(result.len(), 1);
-        assert!(result[0].new_entry.is_none());
+        assert!(matches!(result[0].kind, StorageChangeKind::Deleted));
     }
 
     /// Test that `convert_diagnostic_events_cross_version` skips events that

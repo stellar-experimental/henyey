@@ -582,7 +582,7 @@ fn validate_and_compute_write_bytes(
 ) -> StorageChangeValidation {
     let mut total: u32 = 0;
     for change in storage_changes {
-        if let Some(entry) = &change.new_entry {
+        if let crate::soroban::StorageChangeKind::Modified { entry, .. } = &change.kind {
             // Skip TTL entries - their write fees are handled separately
             if matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
                 continue;
@@ -846,7 +846,10 @@ fn apply_soroban_storage_changes(
     // Track all keys that were created or modified by the host
     let mut created_and_modified_keys: HashSet<LedgerKey> = HashSet::new();
     for change in changes {
-        if change.new_entry.is_some() {
+        if matches!(
+            change.kind,
+            crate::soroban::StorageChangeKind::Modified { .. }
+        ) {
             created_and_modified_keys.insert(change.key.clone());
         }
     }
@@ -859,10 +862,7 @@ fn apply_soroban_storage_changes(
     for change in changes.iter() {
         tracing::debug!(
             key_type = ?std::mem::discriminant(&change.key),
-            has_new_entry = change.new_entry.is_some(),
-            has_live_until = change.live_until.is_some(),
-            live_until = ?change.live_until,
-            ttl_extended = change.ttl_extended,
+            kind = ?change.kind,
             is_rent_related = change.is_rent_related,
             "Applying storage change"
         );
@@ -1007,190 +1007,209 @@ fn apply_soroban_storage_change(
     // Track whether this entry was created (vs updated)
     let mut was_created = false;
 
-    if let Some(entry) = &change.new_entry {
-        // Handle contract data and code entries.
-        match &entry.data {
-            stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
-                let exists = state
-                    .get_contract_data(&cd.contract, &cd.key, cd.durability)
-                    .is_some();
-                let already_in_delta = is_hot_archive_restore
-                    && key_already_created_in_delta(state.delta(), &change.key);
-                if should_create_contract_entry(exists, is_hot_archive_restore, already_in_delta) {
-                    state.create_contract_data(cd.clone());
-                    was_created = true;
-                } else {
-                    state.update_contract_data(cd.clone());
-                }
-            }
-            stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
-                let exists = state.get_contract_code(&cc.hash).is_some();
-                let already_in_delta = is_hot_archive_restore
-                    && key_already_created_in_delta(state.delta(), &change.key);
-                if should_create_contract_entry(exists, is_hot_archive_restore, already_in_delta) {
-                    state.create_contract_code(cc.clone());
-                    was_created = true;
-                } else {
-                    state.update_contract_code(cc.clone());
-                }
-            }
-            stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
-                let exists = state.get_ttl(&ttl.key_hash).is_some();
-                tracing::debug!(
-                    key_hash = ?ttl.key_hash,
-                    live_until = ttl.live_until_ledger_seq,
-                    existing = exists,
-                    "TTL emit: direct TTL entry"
-                );
-                was_created = !exists;
-                create_or_update_ttl(state, ttl.clone(), exists);
-            }
-            // SAC (Stellar Asset Contract) can modify Account and Trustline entries
-            stellar_xdr::curr::LedgerEntryData::Account(acc) => {
-                if state.get_account(&acc.account_id).is_some() {
-                    state.update_account(acc.clone());
-                } else {
-                    state.create_account(acc.clone());
-                    was_created = true;
-                }
-            }
-            stellar_xdr::curr::LedgerEntryData::Trustline(tl) => {
-                if state
-                    .get_trustline_by_trustline_asset(&tl.account_id, &tl.asset)
-                    .is_some()
-                {
-                    state.update_trustline(tl.clone());
-                } else {
-                    state.create_trustline(tl.clone());
-                    was_created = true;
-                }
-            }
-            other => {
-                // stellar-core generically upserts any entry returned by the host.
-                // If we reach here, the host returned an entry type we don't handle,
-                // which would cause state divergence. Fail loudly.
-                panic!(
-                    "apply_soroban_storage_change: unhandled entry type {:?} returned by host",
-                    std::mem::discriminant(other)
-                );
-            }
-        }
-
-        // Apply TTL if present for contract entries.
-        //
-        // CRITICAL: We must use the `ttl_extended` flag from the host to determine whether
-        // to emit a TTL update, NOT compare against our current state. This is because:
-        // 1. Multiple transactions in the same ledger may modify the same entry's TTL
-        // 2. The host computes ttl_extended based on the ledger state at the START of the ledger
-        // 3. Our state reflects changes from all previous transactions in this ledger
-        //
-        // Example: TX 5 extends TTL from 682237->700457, TX 7 also extends the same entry.
-        // - TX 7's host sees old_ttl=682237, new_ttl=700457, so ttl_extended=true
-        // - But our state already has 700457 from TX 5
-        // - If we compare against state, we'd skip emission (700457==700457)
-        // - But stellar-core emits it because from the ledger-start perspective, TTL WAS extended
-        //
-        // For hot archive restores, the TTL entry is also being restored so we use create.
-        // Note: TTL keys are not directly in archived_soroban_entries, but when the associated
-        // data/code entry is restored, its TTL is also restored.
-        //
-        // Skip TTL emission for TTL entries themselves - they were already handled above
-        // and computing key_hash of a TTL key would give the wrong hash.
-        if !matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
-            if let Some(live_until) = change.live_until {
-                if live_until == 0 {
-                    return was_created;
-                }
-                let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
-                let existing_ttl = state.get_ttl(&key_hash);
-                let ttl = TtlEntry {
-                    key_hash: key_hash.clone(),
-                    live_until_ledger_seq: live_until,
-                };
-
-                // For hot archive restores, check if the TTL was already created in the delta
-                // (by a previous TX in this ledger). We can't use existing_ttl.is_some() because
-                // TTLs are pre-loaded from InMemorySorobanState.
-                let ttl_already_restored = is_hot_archive_restore
-                    && ttl_already_created_in_delta(state.delta(), &key_hash);
-
-                if is_hot_archive_restore && !ttl_already_restored {
-                    // First restoration from hot archive - create TTL
-                    tracing::debug!(?key_hash, live_until, "TTL emit: hot archive restore");
-                    state.create_ttl(ttl);
-                    created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                        key_hash: key_hash.clone(),
-                    }));
-                } else if is_hot_archive_restore && ttl_already_restored {
-                    // TTL was already restored by earlier TX - update
-                    tracing::debug!(
-                        ?key_hash,
-                        live_until,
-                        "TTL emit: already restored, updating"
-                    );
-                    state.update_ttl(ttl);
-                } else if change.ttl_extended {
-                    // TTL was extended from the host's perspective (based on ledger-start state).
-                    // We must emit this update even if our current state already has this value
-                    // (e.g., from an earlier tx in the same ledger).
-                    let exists = existing_ttl.is_some();
-                    tracing::debug!(
-                        ?key_hash,
-                        live_until,
-                        ttl_extended = change.ttl_extended,
+    match &change.kind {
+        crate::soroban::StorageChangeKind::Modified {
+            entry,
+            live_until,
+            ttl_extended,
+        } => {
+            // Handle contract data and code entries.
+            match &entry.data {
+                stellar_xdr::curr::LedgerEntryData::ContractData(cd) => {
+                    let exists = state
+                        .get_contract_data(&cd.contract, &cd.key, cd.durability)
+                        .is_some();
+                    let already_in_delta = is_hot_archive_restore
+                        && key_already_created_in_delta(state.delta(), &change.key);
+                    if should_create_contract_entry(
                         exists,
-                        "TTL emit: data modified, TTL extended or new"
+                        is_hot_archive_restore,
+                        already_in_delta,
+                    ) {
+                        state.create_contract_data(cd.clone());
+                        was_created = true;
+                    } else {
+                        state.update_contract_data(cd.clone());
+                    }
+                }
+                stellar_xdr::curr::LedgerEntryData::ContractCode(cc) => {
+                    let exists = state.get_contract_code(&cc.hash).is_some();
+                    let already_in_delta = is_hot_archive_restore
+                        && key_already_created_in_delta(state.delta(), &change.key);
+                    if should_create_contract_entry(
+                        exists,
+                        is_hot_archive_restore,
+                        already_in_delta,
+                    ) {
+                        state.create_contract_code(cc.clone());
+                        was_created = true;
+                    } else {
+                        state.update_contract_code(cc.clone());
+                    }
+                }
+                stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => {
+                    let exists = state.get_ttl(&ttl.key_hash).is_some();
+                    tracing::debug!(
+                        key_hash = ?ttl.key_hash,
+                        live_until = ttl.live_until_ledger_seq,
+                        existing = exists,
+                        "TTL emit: direct TTL entry"
                     );
-                    if !exists {
+                    was_created = !exists;
+                    create_or_update_ttl(state, ttl.clone(), exists);
+                }
+                // SAC (Stellar Asset Contract) can modify Account and Trustline entries
+                stellar_xdr::curr::LedgerEntryData::Account(acc) => {
+                    if state.get_account(&acc.account_id).is_some() {
+                        state.update_account(acc.clone());
+                    } else {
+                        state.create_account(acc.clone());
+                        was_created = true;
+                    }
+                }
+                stellar_xdr::curr::LedgerEntryData::Trustline(tl) => {
+                    if state
+                        .get_trustline_by_trustline_asset(&tl.account_id, &tl.asset)
+                        .is_some()
+                    {
+                        state.update_trustline(tl.clone());
+                    } else {
+                        state.create_trustline(tl.clone());
+                        was_created = true;
+                    }
+                }
+                other => {
+                    // stellar-core generically upserts any entry returned by the host.
+                    // If we reach here, the host returned an entry type we don't handle,
+                    // which would cause state divergence. Fail loudly.
+                    panic!(
+                        "apply_soroban_storage_change: unhandled entry type {:?} returned by host",
+                        std::mem::discriminant(other)
+                    );
+                }
+            }
+
+            // Apply TTL if present for contract entries.
+            //
+            // CRITICAL: We must use the `ttl_extended` flag from the host to determine whether
+            // to emit a TTL update, NOT compare against our current state. This is because:
+            // 1. Multiple transactions in the same ledger may modify the same entry's TTL
+            // 2. The host computes ttl_extended based on the ledger state at the START of the ledger
+            // 3. Our state reflects changes from all previous transactions in this ledger
+            //
+            // Example: TX 5 extends TTL from 682237->700457, TX 7 also extends the same entry.
+            // - TX 7's host sees old_ttl=682237, new_ttl=700457, so ttl_extended=true
+            // - But our state already has 700457 from TX 5
+            // - If we compare against state, we'd skip emission (700457==700457)
+            // - But stellar-core emits it because from the ledger-start perspective, TTL WAS extended
+            //
+            // For hot archive restores, the TTL entry is also being restored so we use create.
+            // Note: TTL keys are not directly in archived_soroban_entries, but when the associated
+            // data/code entry is restored, its TTL is also restored.
+            //
+            // Skip TTL emission for TTL entries themselves - they were already handled above
+            // and computing key_hash of a TTL key would give the wrong hash.
+            if !matches!(entry.data, stellar_xdr::curr::LedgerEntryData::Ttl(_)) {
+                if let Some(live_until) = live_until {
+                    if *live_until == 0 {
+                        return was_created;
+                    }
+                    let key_hash =
+                        crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
+                    let existing_ttl = state.get_ttl(&key_hash);
+                    let ttl = TtlEntry {
+                        key_hash: key_hash.clone(),
+                        live_until_ledger_seq: *live_until,
+                    };
+
+                    // For hot archive restores, check if the TTL was already created in the delta
+                    // (by a previous TX in this ledger). We can't use existing_ttl.is_some() because
+                    // TTLs are pre-loaded from InMemorySorobanState.
+                    let ttl_already_restored = is_hot_archive_restore
+                        && ttl_already_created_in_delta(state.delta(), &key_hash);
+
+                    if is_hot_archive_restore && !ttl_already_restored {
+                        // First restoration from hot archive - create TTL
+                        tracing::debug!(?key_hash, live_until, "TTL emit: hot archive restore");
+                        state.create_ttl(ttl);
                         created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
                             key_hash: key_hash.clone(),
                         }));
+                    } else if is_hot_archive_restore && ttl_already_restored {
+                        // TTL was already restored by earlier TX - update
+                        tracing::debug!(
+                            ?key_hash,
+                            live_until,
+                            "TTL emit: already restored, updating"
+                        );
+                        state.update_ttl(ttl);
+                    } else if *ttl_extended {
+                        // TTL was extended from the host's perspective (based on ledger-start state).
+                        // We must emit this update even if our current state already has this value
+                        // (e.g., from an earlier tx in the same ledger).
+                        let exists = existing_ttl.is_some();
+                        tracing::debug!(
+                            ?key_hash,
+                            live_until,
+                            ttl_extended,
+                            exists,
+                            "TTL emit: data modified, TTL extended or new"
+                        );
+                        if !exists {
+                            created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                                key_hash: key_hash.clone(),
+                            }));
+                        }
+                        create_or_update_ttl(state, ttl, exists);
+                    } else if existing_ttl.is_none() {
+                        // New entry being created - emit TTL
+                        tracing::debug!(?key_hash, live_until, "TTL emit: new TTL entry");
+                        state.create_ttl(ttl);
+                        created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
+                            key_hash: key_hash.clone(),
+                        }));
+                    } else {
+                        // TTL was NOT extended and entry already exists - skip emission
+                        tracing::debug!(
+                            ?key_hash,
+                            live_until,
+                            "TTL skip: data modified but TTL not extended"
+                        );
                     }
-                    create_or_update_ttl(state, ttl, exists);
-                } else if existing_ttl.is_none() {
-                    // New entry being created - emit TTL
-                    tracing::debug!(?key_hash, live_until, "TTL emit: new TTL entry");
-                    state.create_ttl(ttl);
-                    created_keys.insert(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-                        key_hash: key_hash.clone(),
-                    }));
-                } else {
-                    // TTL was NOT extended and entry already exists - skip emission
-                    tracing::debug!(
-                        ?key_hash,
-                        live_until,
-                        "TTL skip: data modified but TTL not extended"
-                    );
                 }
             }
         }
-    } else if let Some(live_until) = change.live_until {
-        if live_until == 0 {
-            return false;
-        }
-        // For hot archive read-only restores (new_entry=None), skip TTL INIT.
-        // stellar-core's handleArchivedEntry creates DATA+TTL INIT then erases both
-        // for read-only access → net: nothing in live BL.
-        // HOT_ARCHIVE_LIVE tombstone is still added correctly via hot_archive_restored_keys.
-        if is_hot_archive_restore {
-            return false;
-        }
-        // TTL-only change: the data entry wasn't modified, but its TTL was bumped.
-        // This happens when a contract reads an entry and its TTL gets auto-extended.
-        // Only emit when TTL was actually extended (new > old).
-        if change.ttl_extended {
+        crate::soroban::StorageChangeKind::TtlOnly {
+            live_until,
+            read_only,
+        } => {
+            if *live_until == 0 {
+                return false;
+            }
+            // For hot archive read-only restores (no data returned), skip TTL INIT.
+            // stellar-core's handleArchivedEntry creates DATA+TTL INIT then erases both
+            // for read-only access → net: nothing in live BL.
+            // HOT_ARCHIVE_LIVE tombstone is still added correctly via hot_archive_restored_keys.
+            if is_hot_archive_restore {
+                return false;
+            }
+            // TTL-only change: the data entry wasn't modified, but its TTL was bumped.
+            // This happens when a contract reads an entry and its TTL gets auto-extended.
+            // Only emit when TTL was actually extended (new > old).
+            // Note: ttl_extended is implicitly true for TtlOnly — the map_storage_changes
+            // filter only emits TtlOnly when ttl_extended is true.
             let key_hash = crate::soroban::get_or_compute_key_hash(ttl_key_cache, &change.key);
             let existing_ttl = state.get_ttl(&key_hash);
             let ttl = TtlEntry {
                 key_hash: key_hash.clone(),
-                live_until_ledger_seq: live_until,
+                live_until_ledger_seq: *live_until,
             };
 
-            // Read-only TTL bumps: stellar-core includes them in transaction meta but defers state updates.
-            // Transaction meta is built from the op result (which has all TTL changes).
-            // State visibility is deferred so subsequent TXs don't see the bump.
-            // Per stellar-core, RO TTL bumps ARE in transaction meta but deferred for state.
-            if change.is_read_only_ttl_bump {
+            // Read-only TTL bumps: stellar-core includes them in transaction meta but
+            // defers state updates. Transaction meta is built from the op result (which
+            // has all TTL changes). State visibility is deferred so subsequent TXs in
+            // this ledger don't see the bumped value (CAP-0063).
+            if *read_only {
                 tracing::debug!(
                     ?key_hash,
                     live_until,
@@ -1199,7 +1218,7 @@ fn apply_soroban_storage_change(
                 );
                 // Record in delta for transaction meta, but defer state update
                 // so subsequent TXs in this ledger don't see the bumped value
-                state.record_ro_ttl_bump_for_meta(&key_hash, live_until);
+                state.record_ro_ttl_bump_for_meta(&key_hash, *live_until);
             } else {
                 let exists = existing_ttl.is_some();
                 tracing::debug!(
@@ -1212,9 +1231,9 @@ fn apply_soroban_storage_change(
                 create_or_update_ttl(state, ttl, exists);
             }
         }
-    } else {
-        // Deletion case: new_entry is None and live_until is None
-        apply_deletion(state, &change.key, ttl_key_cache);
+        crate::soroban::StorageChangeKind::Deleted => {
+            apply_deletion(state, &change.key, ttl_key_cache);
+        }
     }
     was_created
 }
@@ -2180,11 +2199,12 @@ mod tests {
 
         let change = StorageChange {
             key: key.clone(),
-            new_entry: Some(ledger_entry),
-            live_until: Some(200),
-            ttl_extended: false,
+            kind: crate::soroban::StorageChangeKind::Modified {
+                entry: Box::new(ledger_entry),
+                live_until: Some(200),
+                ttl_extended: false,
+            },
             is_rent_related: false,
-            is_read_only_ttl_bump: false,
         };
 
         let no_restored_keys = std::collections::HashSet::new();
@@ -2204,11 +2224,8 @@ mod tests {
 
         let delete_change = StorageChange {
             key,
-            new_entry: None,
-            live_until: None,
-            ttl_extended: false,
+            kind: crate::soroban::StorageChangeKind::Deleted,
             is_rent_related: false,
-            is_read_only_ttl_bump: false,
         };
 
         apply_soroban_storage_change(
@@ -2307,11 +2324,12 @@ mod tests {
 
         let modify_change = StorageChange {
             key: key.clone(),
-            new_entry: Some(modified_entry),
-            live_until: Some(226129), // Same TTL as before
-            ttl_extended: false,
+            kind: crate::soroban::StorageChangeKind::Modified {
+                entry: Box::new(modified_entry),
+                live_until: Some(226129), // Same TTL as before
+                ttl_extended: false,
+            },
             is_rent_related: true, // This was true in the actual ledger
-            is_read_only_ttl_bump: false,
         };
 
         let no_restored_keys = std::collections::HashSet::new();
@@ -2456,11 +2474,12 @@ mod tests {
 
         let change = StorageChange {
             key,
-            new_entry: Some(ledger_entry),
-            live_until: Some(200),
-            ttl_extended: false,
+            kind: crate::soroban::StorageChangeKind::Modified {
+                entry: Box::new(ledger_entry),
+                live_until: Some(200),
+                ttl_extended: false,
+            },
             is_rent_related: false,
-            is_read_only_ttl_bump: false,
         };
 
         let changes = vec![change];
@@ -2505,11 +2524,12 @@ mod tests {
 
         let change = StorageChange {
             key,
-            new_entry: Some(ledger_entry),
-            live_until: Some(200),
-            ttl_extended: false,
+            kind: crate::soroban::StorageChangeKind::Modified {
+                entry: Box::new(ledger_entry),
+                live_until: Some(200),
+                ttl_extended: false,
+            },
             is_rent_related: false,
-            is_read_only_ttl_bump: false,
         };
 
         let changes = vec![change];
@@ -2572,11 +2592,12 @@ mod tests {
 
         let change = StorageChange {
             key: key.clone(),
-            new_entry: Some(ledger_entry),
-            live_until: Some(250000),
-            ttl_extended: false,
+            kind: crate::soroban::StorageChangeKind::Modified {
+                entry: Box::new(ledger_entry),
+                live_until: Some(250000),
+                ttl_extended: false,
+            },
             is_rent_related: false,
-            is_read_only_ttl_bump: false,
         };
 
         // Case 1: Entry exists in state, NOT in hot_archive_keys -> should use update (LIVE)
@@ -2793,11 +2814,11 @@ mod tests {
         let restored_live_until: u32 = 62_014_364; // from L59940765 log
         let change = StorageChange {
             key: key.clone(),
-            new_entry: None, // host did not return data (read-only access)
-            live_until: Some(restored_live_until),
-            ttl_extended: true, // false positive: restored_live_until > 0 = ledger_start_ttl
+            kind: crate::soroban::StorageChangeKind::TtlOnly {
+                live_until: restored_live_until,
+                read_only: false, // RW footprint entry
+            },
             is_rent_related: false,
-            is_read_only_ttl_bump: false,
         };
 
         // Mark the key as a hot-archive restore.
@@ -2872,11 +2893,11 @@ mod tests {
         let restored_live_until: u32 = 62_014_364;
         let change = StorageChange {
             key: key.clone(),
-            new_entry: None,
-            live_until: Some(restored_live_until),
-            ttl_extended: true,
+            kind: crate::soroban::StorageChangeKind::TtlOnly {
+                live_until: restored_live_until,
+                read_only: false,
+            },
             is_rent_related: false,
-            is_read_only_ttl_bump: false,
         };
 
         let mut hot_archive_restored_keys = std::collections::HashSet::new();
