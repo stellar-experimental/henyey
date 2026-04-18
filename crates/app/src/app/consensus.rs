@@ -124,9 +124,12 @@ impl App {
     /// `RECOVERY_ESCALATION_CATCHUP` attempts (~6s at 1s interval) we trigger
     /// a full catchup.
     pub(super) async fn out_of_sync_recovery(&self, current_ledger: u32) -> Option<PendingCatchup> {
+        use super::phase::*;
+
         let latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0);
         let last_processed = *self.last_processed_slot.read().await;
         let pending_tx_sets = self.herder.get_pending_tx_sets();
+        self.set_phase_sub(PHASE_13_6_OUT_OF_SYNC_BUFFER_COUNT_READ);
         let buffer_count = tracked_lock::tracked_read("syncing_ledgers", &self.syncing_ledgers)
             .await
             .len();
@@ -180,6 +183,7 @@ impl App {
 
         // --- Escalation: after many failed attempts, force catchup ---
         if attempts >= RECOVERY_ESCALATION_CATCHUP {
+            self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
             return self
                 .trigger_recovery_catchup(current_ledger, latest_externalized, gap, attempts)
                 .await;
@@ -212,6 +216,7 @@ impl App {
             // but recovery would immediately clear the request, so the
             // tx_set was never fetched and the slot could never close.
             {
+                self.set_phase_sub(PHASE_13_7_OUT_OF_SYNC_CLEAR_SYNCING_WRITE);
                 let mut buffer =
                     tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
                 let pre_count = buffer.len();
@@ -259,6 +264,7 @@ impl App {
                          tx_sets evicted from peers, fast-tracking catchup"
                     );
                     // Jump directly to catchup instead of waiting 6 cycles
+                    self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
                     return self
                         .trigger_recovery_catchup(
                             current_ledger,
@@ -291,6 +297,7 @@ impl App {
         }
 
         // Detect gaps in externalized slots and potentially trigger catchup.
+        self.set_phase_sub(PHASE_13_8_OUT_OF_SYNC_ANALYZE_GAPS);
         if let Some(result) = self
             .analyze_externalized_gaps(current_ledger, latest_externalized, gap, attempts)
             .await
@@ -299,6 +306,7 @@ impl App {
         }
 
         // Broadcast recent SCP envelopes and request SCP state from peers.
+        self.set_phase_sub(PHASE_13_9_BROADCAST_RECOVERY);
         self.broadcast_recovery_scp_state(current_ledger).await;
         None
     }
@@ -827,6 +835,7 @@ impl App {
         // publishes checkpoints every ~5 minutes, so re-asking every 10s is
         // guaranteed waste (and creates a "Querying history archives" log
         // storm during a stall). We still run the peer-SCP fallback below.
+        self.set_phase_sub(super::phase::PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ);
         let backoff_active = {
             let guard = self.archive_behind_until.read().await;
             match *guard {
@@ -1009,16 +1018,19 @@ impl App {
         // actually start. Previously callers did this before spawn_catchup,
         // which falsely mutated state when spawn returned None (incrementing
         // lost_sync_count, clearing is_tracking).
+        self.set_phase_sub(super::phase::PHASE_13_11_SPAWN_CATCHUP_SET_STATE);
         self.set_state(AppState::CatchingUp).await;
         self.herder.set_state(henyey_herder::HerderState::Syncing);
 
         // Start catchup message caching (belt-and-suspenders for tx_set ordering)
+        self.set_phase_sub(super::phase::PHASE_13_12_SPAWN_CATCHUP_MSG_CACHE);
         let message_cache_handle = self.start_catchup_message_caching_from_self().await;
 
         // Create oneshot channel for result delivery
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
 
         // Upgrade self_arc for the spawned task
+        self.set_phase_sub(super::phase::PHASE_13_13_SPAWN_CATCHUP_SELF_ARC_READ);
         let app = {
             let weak = self.self_arc.read().await;
             match weak.upgrade() {

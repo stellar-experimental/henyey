@@ -1216,6 +1216,8 @@ impl App {
     }
 
     pub(super) async fn maybe_start_buffered_catchup(&self) -> Option<PendingCatchup> {
+        use super::phase::*;
+
         // Fatal-failure guard (spec §13.3): block further catchup after a
         // verification/integrity failure.
         if self.catchup_fatal_failure.load(Ordering::SeqCst) {
@@ -1228,6 +1230,7 @@ impl App {
         // 10 seconds gives enough time for SCP messages to arrive and fill
         // small gaps after catchup + buffered ledger drain.
         const EVALUATION_COOLDOWN_SECS: u64 = 10;
+        self.set_phase_sub(PHASE_13_4_BUFFERED_LAST_CATCHUP_COMPLETED_READ);
         let cooldown_elapsed = self
             .last_catchup_completed_at
             .read()
@@ -1273,6 +1276,14 @@ impl App {
         }
 
         let (first_buffered, last_buffered) = {
+            // NOTE: tokio::sync::RwLock is NOT reentrant per task. The prior
+            // guard taken by `process_externalized_slots` (ledger_close.rs
+            // ~line 1120) MUST be dropped before this acquire or the event
+            // loop deadlocks. Any refactor that hoists the prior guard's
+            // scope will silently reintroduce the freeze class of
+            // #1759/#1784/#1788. See `App::syncing_ledgers` docstring for
+            // the full invariant.
+            self.set_phase_sub(PHASE_13_1_BUFFERED_SYNCING_LEDGERS_WRITE);
             let mut buffer = self.syncing_ledgers.write().await;
             let pre_trim_count = buffer.len();
             let pre_trim_first = buffer.keys().next().copied();
@@ -1352,6 +1363,7 @@ impl App {
 
         // Check if sequential ledger has tx set available
         let sequential_with_tx_set = if first_buffered == current_ledger + 1 {
+            self.set_phase_sub(PHASE_13_2_BUFFERED_SYNCING_LEDGERS_READ);
             let buffer = self.syncing_ledgers.read().await;
             buffer
                 .get(&first_buffered)
@@ -1415,6 +1427,7 @@ impl App {
                 // This handles the case where we have a gap but can't reach the trigger
                 let now = self.clock.now();
                 let action = {
+                    self.set_phase_sub(PHASE_13_3_BUFFERED_CONSENSUS_STUCK_WRITE);
                     let mut stuck_state = self.consensus_stuck_state.write().await;
                     match stuck_state.as_mut() {
                         // Match on current_ledger only. first_buffered can change as
@@ -1445,6 +1458,7 @@ impl App {
                             // checkpoint boundary conditions are met (handled above by
                             // can_trigger_immediate). When recently caught up, only do
                             // recovery (re-request SCP state) to fill gaps.
+                            self.set_phase_sub(PHASE_13_4_BUFFERED_LAST_CATCHUP_COMPLETED_READ);
                             let recently_caught_up = self
                                 .last_catchup_completed_at
                                 .read()
@@ -1460,6 +1474,7 @@ impl App {
                             // the post-catchup branch — spawning catchup would
                             // only hit the skip path and spin. Peer-SCP
                             // recovery still runs on its normal cadence.
+                            self.set_phase_sub(PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ);
                             let archive_behind = self
                                 .archive_behind_until
                                 .read()
@@ -1671,6 +1686,7 @@ impl App {
 
         // Validate target checkpoint is published before attempting download.
         if !use_current_target {
+            self.set_phase_sub(super::phase::PHASE_13_14_VALIDATE_TARGET_CHECKPOINT);
             if !self
                 .validate_target_checkpoint_published(current_ledger, target)
                 .await
@@ -1681,6 +1697,7 @@ impl App {
 
         // For CatchupTarget::Current, check archive has a newer checkpoint.
         if use_current_target {
+            self.set_phase_sub(super::phase::PHASE_13_15_VALIDATE_ARCHIVE_NEWER);
             if !self
                 .validate_archive_has_newer_checkpoint(current_ledger, first_buffered)
                 .await

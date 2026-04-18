@@ -198,6 +198,7 @@ mod ledger_close;
 mod lifecycle;
 mod peers;
 mod persist;
+mod phase;
 mod publish;
 mod survey_impl;
 mod tracked_lock;
@@ -538,6 +539,16 @@ pub struct App {
     ///        31=scp_verifier (pump_scp_intake: pre-filter + verifier enqueue),
     ///        32=scp_verified (draining verified envelopes)
     event_loop_phase: Arc<AtomicU64>,
+
+    /// Fine-grained sub-phase code for pinpointing a stall inside a
+    /// coarse phase. See [`phase`](super::phase) for the `PHASE_13_*`
+    /// constants stamped before every notable `.await` on the
+    /// buffered-catchup arm (issue #1788 investigation).
+    ///
+    /// Zero means "coarse phase entered, sub-phase not yet set".
+    /// `set_phase` clears this to 0 so stale sub-phase values from a
+    /// prior phase do not leak across coarse-phase transitions.
+    event_loop_phase_sub: Arc<AtomicU32>,
 }
 
 impl App {
@@ -818,6 +829,7 @@ impl App {
             self_arc: RwLock::new(std::sync::Weak::new()),
             last_event_loop_tick_ms: Arc::new(AtomicU64::new(0)),
             event_loop_phase: Arc::new(AtomicU64::new(0)),
+            event_loop_phase_sub: Arc::new(AtomicU32::new(0)),
         })
     }
 
@@ -1857,9 +1869,35 @@ impl App {
     }
 
     /// Update the event loop phase code (for watchdog diagnostics).
+    ///
+    /// Also clears the fine-grained sub-phase counter back to 0 so stale
+    /// `PHASE_13_*` values stamped by a prior coarse phase do not leak
+    /// into subsequent WATCHDOG reports.
     #[inline]
     fn set_phase(&self, phase: u64) {
         self.event_loop_phase.store(phase, Ordering::Relaxed);
+        self.event_loop_phase_sub.store(0, Ordering::Relaxed);
+    }
+
+    /// Stamp the fine-grained sub-phase. Read alongside
+    /// [`event_loop_phase`](Self::event_loop_phase) by the WATCHDOG thread
+    /// (issue #1788). Constants live in [`super::phase`].
+    ///
+    /// Callers stamp the sub-phase immediately before each `.await` they
+    /// want to attribute in a freeze capture. The WATCHDOG prints both
+    /// `phase` and `phase_sub` in its error/warn log lines.
+    #[inline]
+    pub(crate) fn set_phase_sub(&self, sub: u32) {
+        self.event_loop_phase_sub.store(sub, Ordering::Relaxed);
+    }
+
+    /// Test hook: snapshot the current (phase, sub) pair.
+    #[cfg(test)]
+    pub(crate) fn phase_snapshot_for_test(&self) -> (u64, u32) {
+        (
+            self.event_loop_phase.load(Ordering::Relaxed),
+            self.event_loop_phase_sub.load(Ordering::Relaxed),
+        )
     }
 
     /// Decrement the overlay fetch-channel depth gauge by one, clamped at
@@ -1914,6 +1952,7 @@ impl App {
 
         let tick_ms = Arc::clone(&self.last_event_loop_tick_ms);
         let phase = Arc::clone(&self.event_loop_phase);
+        let phase_sub = Arc::clone(&self.event_loop_phase_sub);
         let fetch_depth = Arc::clone(&self.fetch_channel_depth);
         let fetch_depth_max = Arc::clone(&self.fetch_channel_depth_max);
         let pid = std::process::id();
@@ -1939,6 +1978,7 @@ impl App {
                         .as_millis() as u64;
                     let stale_secs = now_ms.saturating_sub(last_tick) / 1000;
                     let current_phase = phase.load(Ordering::Relaxed);
+                    let current_phase_sub = phase_sub.load(Ordering::Relaxed);
                     let fetch_channel_depth = fetch_depth.load(Ordering::Relaxed);
                     let fetch_channel_depth_max = fetch_depth_max.load(Ordering::Relaxed);
 
@@ -1946,6 +1986,7 @@ impl App {
                         tracing::error!(
                             stale_secs,
                             phase = current_phase,
+                            phase_sub = current_phase_sub,
                             fetch_channel_depth,
                             fetch_channel_depth_max,
                             pid,
@@ -1959,7 +2000,9 @@ impl App {
                              20=stats, 21=tx_advert, 22=tx_demand, 23=survey, \
                              24=survey_req, 25=survey_phase, 26=scp_timeout, \
                              27=ping, 28=peer_maint, 29=peer_refresh, \
-                             30=herder_cleanup, 31=scp_verifier, 32=scp_verified"
+                             30=herder_cleanup, 31=scp_verifier, 32=scp_verified. \
+                             Sub-phase 13.N labels (issue #1788): see \
+                             crates/app/src/app/phase.rs for PHASE_13_* constants."
                         );
 
                         // Log thread states AND kernel wait-channels
@@ -2038,6 +2081,7 @@ impl App {
                         tracing::warn!(
                             stale_secs,
                             phase = current_phase,
+                            phase_sub = current_phase_sub,
                             fetch_channel_depth,
                             fetch_channel_depth_max,
                             "WATCHDOG: Event loop slow (>15s since last tick)"
@@ -4851,5 +4895,78 @@ mod tests {
              populated_delta={populated_delta}, N={N_ENVELOPES}). Pre-fix \
              this value was ~2 × N × (1 + ops)."
         );
+    }
+
+    /// `set_phase` MUST clear the fine-grained sub-phase so stale
+    /// `PHASE_13_*` values from a prior coarse phase cannot leak into
+    /// a later WATCHDOG capture. Regression guard for issue #1788's
+    /// sub-phase instrumentation.
+    #[tokio::test]
+    async fn test_set_phase_clears_phase_sub() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("phase-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Stamp both phase and sub.
+        app.set_phase(13);
+        app.set_phase_sub(super::phase::PHASE_13_7_OUT_OF_SYNC_CLEAR_SYNCING_WRITE);
+        assert_eq!(
+            app.phase_snapshot_for_test(),
+            (13, super::phase::PHASE_13_7_OUT_OF_SYNC_CLEAR_SYNCING_WRITE)
+        );
+
+        // Transitioning coarse phase must zero the sub-phase.
+        app.set_phase(14);
+        assert_eq!(
+            app.phase_snapshot_for_test(),
+            (14, 0),
+            "set_phase must clear phase_sub — see issue #1788 instrumentation"
+        );
+    }
+
+    /// All `PHASE_13_*` sub-phase constants are distinct and within a
+    /// sensible range. Prevents accidental constant collision during
+    /// future edits.
+    #[test]
+    fn test_phase_13_constants_distinct_and_dense() {
+        use super::phase::*;
+        let all = [
+            PHASE_13_1_BUFFERED_SYNCING_LEDGERS_WRITE,
+            PHASE_13_2_BUFFERED_SYNCING_LEDGERS_READ,
+            PHASE_13_3_BUFFERED_CONSENSUS_STUCK_WRITE,
+            PHASE_13_4_BUFFERED_LAST_CATCHUP_COMPLETED_READ,
+            PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ,
+            PHASE_13_6_OUT_OF_SYNC_BUFFER_COUNT_READ,
+            PHASE_13_7_OUT_OF_SYNC_CLEAR_SYNCING_WRITE,
+            PHASE_13_8_OUT_OF_SYNC_ANALYZE_GAPS,
+            PHASE_13_9_BROADCAST_RECOVERY,
+            PHASE_13_10_TRIGGER_RECOVERY_CATCHUP,
+            PHASE_13_11_SPAWN_CATCHUP_SET_STATE,
+            PHASE_13_12_SPAWN_CATCHUP_MSG_CACHE,
+            PHASE_13_13_SPAWN_CATCHUP_SELF_ARC_READ,
+            PHASE_13_14_VALIDATE_TARGET_CHECKPOINT,
+            PHASE_13_15_VALIDATE_ARCHIVE_NEWER,
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            all.len(),
+            "phase-13 sub-phase constants must all be distinct"
+        );
+        assert_eq!(sorted.first().copied(), Some(1));
+        assert_eq!(sorted.last().copied(), Some(max_defined_sub_phase()));
+        // Dense: no gaps.
+        for (i, v) in sorted.iter().enumerate() {
+            assert_eq!(
+                *v,
+                (i as u32) + 1,
+                "phase-13 sub-phase constants must be densely numbered 1..=N"
+            );
+        }
     }
 }
