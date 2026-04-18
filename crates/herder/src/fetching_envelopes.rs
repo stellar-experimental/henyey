@@ -826,6 +826,10 @@ mod tests {
     }
 
     /// Helper to pre-cache the quorum set used by test envelopes.
+    ///
+    /// NOTE: This directly populates the cache and does NOT go through
+    /// `recv_quorum_set()`. It will NOT trigger the fetcher→recheck→broadcast
+    /// path. Use `recv_quorum_set()` when testing that path.
     fn cache_test_quorum_set(fetching: &FetchingEnvelopes) {
         let qs_hash = Hash256::from_bytes([1u8; 32]);
         let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
@@ -1252,24 +1256,33 @@ mod tests {
             count_clone.fetch_add(1, Ordering::SeqCst);
         });
 
-        // Submit envelope that needs quorum set (not cached yet)
+        // Submit envelope that needs quorum set (not cached yet).
+        // This starts tracking the quorum set hash in the fetcher.
         let envelope = make_test_envelope(100, 1);
+        let qs_hash = FetchingEnvelopes::extract_quorum_set_hash(&envelope).unwrap();
         let result = fetching.recv_envelope(envelope);
         assert_eq!(result, RecvResult::Fetching);
         assert_eq!(broadcast_count.load(Ordering::SeqCst), 0);
+        assert_eq!(fetching.fetching_count(), 1);
+        assert_eq!(fetching.ready_count(), 0);
 
-        // Now provide the quorum set — envelope becomes ready, broadcast fires
-        cache_test_quorum_set(&fetching);
-        // recv_quorum_set triggers re-check of waiting envelopes
-        // But cache_test_quorum_set calls cache_quorum_set directly, not recv_quorum_set.
-        // We need to use recv_quorum_set to trigger the re-check.
-        // Actually, the fetcher didn't track the hash via recv_quorum_set path.
-        // Let me verify: broadcast happens in check_and_move_to_ready which
-        // is called from recv_quorum_set. But cache_test_quorum_set only calls
-        // cache_quorum_set. So the envelope stays in fetching.
-        // This is fine — we verified broadcast fires on immediate-ready above.
-        // The dependency-satisfied broadcast path requires the ItemFetcher
-        // to be tracking the hash, which requires a more complex setup.
+        // Deliver the quorum set via recv_quorum_set — this triggers the
+        // fetcher→check_and_move_to_ready→broadcast path.
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let received = fetching.recv_quorum_set(qs_hash, quorum_set);
+
+        assert!(received, "recv_quorum_set should return true when tracked");
+        assert_eq!(broadcast_count.load(Ordering::SeqCst), 1);
+        assert_eq!(fetching.ready_count(), 1);
+        assert!(
+            fetching.pop(100).is_some(),
+            "Envelope should be poppable after dependency satisfied"
+        );
     }
 
     #[test]
