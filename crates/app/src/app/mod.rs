@@ -524,6 +524,12 @@ pub struct App {
     #[cfg(test)]
     pub(crate) close_complete_inject_blocking_ms: AtomicU64,
 
+    /// Regression-only hook for testing that `process_externalized_slots`
+    /// does NOT hold `syncing_ledgers` write lock during the iteration phase.
+    /// Set by tests that need deterministic synchronization; `None` otherwise.
+    #[cfg(test)]
+    pub(crate) pes_iteration_gate: Option<Arc<PesIterationGate>>,
+
     /// Flag set by SyncRecoveryManager to request recovery from the main loop.
     /// The main loop checks this and triggers buffered catchup when set.
     sync_recovery_pending: AtomicBool,
@@ -859,6 +865,8 @@ impl App {
             is_applying_ledger: AtomicBool::new(false),
             #[cfg(test)]
             close_complete_inject_blocking_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            pes_iteration_gate: None,
             sync_recovery_pending: AtomicBool::new(false),
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
@@ -2217,6 +2225,19 @@ pub(crate) fn format_watchdog_diagnostic_hint(pid: u32) -> String {
          py-spy dump --pid {pid}  \
          (or: sudo gcore {pid} && gdb -ex 'thread apply all bt' -ex quit core.{pid})"
     )
+}
+
+/// Two-way synchronization gate for the `process_externalized_slots`
+/// split-writer regression test. The iteration loop signals `entered`
+/// after the first non-stale slot's `check_ledger_close`, then blocks
+/// on `resume`. This gives the test a deterministic window to verify
+/// that `syncing_ledgers` write lock is NOT held during phase 2.
+#[cfg(test)]
+pub(crate) struct PesIterationGate {
+    /// Signaled by the iteration loop when phase 2 is in progress.
+    pub entered: tokio::sync::Notify,
+    /// The iteration loop blocks here until the test signals resume.
+    pub resume: tokio::sync::Notify,
 }
 
 #[cfg(test)]
@@ -5126,88 +5147,77 @@ mod tests {
         assert!(buf.get(&((n + 1) as u32)).unwrap().tx_set.is_none());
     }
 
-    /// Regression for #1788/#1769: the split holds
+    /// Regression for #1788/#1769/#1789: the split holds
     /// `syncing_ledgers.write()` only during the apply pass, not across
     /// the per-slot `check_ledger_close` iteration.
     ///
-    /// Structural guarantee: we verify that a concurrent write lock
-    /// acquirer is NOT blocked during the iteration window. We drive
-    /// `process_externalized_slots` against a large externalized set and
-    /// concurrently race a `syncing_ledgers.write()` acquire. Under the
-    /// legacy code the concurrent writer blocks for the full iteration
-    /// duration; under the split it acquires immediately or in the small
-    /// apply-pass window.
+    /// Sentinel point-in-time assertion: we verify that a concurrent
+    /// write lock acquirer is NOT blocked at a sample point during the
+    /// lockless iteration phase (phase 2). A two-way gate pauses the
+    /// iteration after the first non-stale slot, giving us a
+    /// deterministic window to prove the write lock is free.
     ///
-    /// We assert that the concurrent writer's time-to-acquire is bounded
-    /// by the per-iteration yield cadence, not by the total iteration
-    /// duration. Concretely: the writer acquire elapsed should be
-    /// noticeably less than the pes total elapsed.
+    /// Pre-split (regression): the entire iteration held the write lock,
+    /// so the concurrent writer would deadlock/timeout. Post-split: the
+    /// iteration is lockless, so the writer acquires instantly.
+    ///
+    /// Correctness is pinned by the companion semantics tests
+    /// (`_matches_legacy_semantics`, `_rerequest_tx_set_preserved`);
+    /// this test pins the concurrency property.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_process_externalized_slots_split_does_not_block_writer() {
-        let app = Arc::new(mk_test_app_for_pes_split().await);
+        use std::time::Duration;
+
+        // Build App with the two-way gate installed before Arc::new.
+        let gate = Arc::new(super::PesIterationGate {
+            entered: tokio::sync::Notify::new(),
+            resume: tokio::sync::Notify::new(),
+        });
+        let mut app = mk_test_app_for_pes_split().await;
+        app.pes_iteration_gate = Some(Arc::clone(&gate));
+        let app = Arc::new(app);
         app.herder.set_state(henyey_herder::HerderState::Tracking);
 
-        // Seed many externalized slots so the iteration has measurable
-        // work. 500 slots × XDR parse + DashMap ops is enough to create a
-        // visible iteration window under `cargo test` release-profile.
+        // Seed externalized slots. All slots > current_ledger (0), so
+        // none are stale — the gate fires on the first iteration.
         let n: u64 = 10_000;
         let driver = app.herder.scp_driver();
-        for slot in (n + 1)..=(n + 500) {
+        for slot in (n + 1)..=(n + 10) {
             let hash = [(slot & 0xff) as u8; 32];
             let xdr = mk_stellar_value_xdr(hash);
             driver.record_externalized(slot, mk_value(xdr));
         }
         *app.last_processed_slot.write().await = n;
 
-        // Race a concurrent writer. Gate it on a Notify so it starts
-        // exactly when the pes run begins.
-        let writer_app = Arc::clone(&app);
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let gate_rx = Arc::clone(&gate);
-        let writer_handle = tokio::spawn(async move {
-            gate_rx.notified().await;
-            let acquire_start = std::time::Instant::now();
-            let _g = writer_app.syncing_ledgers.write().await;
-            acquire_start.elapsed()
-        });
+        // Spawn process_externalized_slots on a separate task.
+        let pes_app = Arc::clone(&app);
+        let pes_handle = tokio::spawn(async move { pes_app.process_externalized_slots().await });
 
-        // Give the writer task a moment to park on `notified().await`.
-        tokio::task::yield_now().await;
-        gate.notify_one();
+        // Wait for the iteration loop to signal phase 2 is in progress.
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("iteration gate must fire within 5s — phase 2 never reached");
 
-        let pes_start = std::time::Instant::now();
-        let _ = app.process_externalized_slots().await;
-        let pes_elapsed = pes_start.elapsed();
-
-        let writer_wait = writer_handle.await.unwrap();
-
-        eprintln!(
-            "pes_elapsed={:?} writer_wait={:?} ratio={:.3}",
-            pes_elapsed,
-            writer_wait,
-            writer_wait.as_secs_f64() / pes_elapsed.as_secs_f64().max(1e-9)
-        );
-
-        // Structural invariant: the writer wait must be at most the
-        // apply-pass hold time, which is a small fraction of the total
-        // pes elapsed on a non-trivial workload. We allow a generous
-        // slack factor (writer_wait < 2× pes_elapsed) to avoid CI
-        // flakes while still failing clearly if the split regresses
-        // back to "hold lock for full iteration".
-        //
-        // Pre-split, writer_wait would equal (or exceed) pes_elapsed
-        // minus tiny scheduling overhead. Post-split, writer_wait is
-        // bounded by apply-pass hold only.
-        //
-        // Note: this is a behavioral sanity check, not a strict
-        // invariant. The semantics tests above (_matches_legacy_*) pin
-        // correctness; this test gives us early warning if the split
-        // is refactored to reintroduce the long-held lock.
+        // KEY ASSERTION: syncing_ledgers.write() is acquirable while the
+        // iteration is paused mid-phase-2. If the iteration held the
+        // write lock (pre-split behavior), this would timeout.
+        let write_result =
+            tokio::time::timeout(Duration::from_secs(5), app.syncing_ledgers.write()).await;
         assert!(
-            pes_elapsed >= std::time::Duration::from_micros(1),
-            "pes_elapsed should be nonzero: {:?}",
-            pes_elapsed
+            write_result.is_ok(),
+            "syncing_ledgers.write() must be acquirable during the lockless \
+             iteration phase — the split must not hold the write lock here"
         );
+        drop(write_result);
+
+        // Resume the iteration so it can complete (apply phase + rest).
+        gate.resume.notify_one();
+
+        // Await completion with a generous timeout.
+        tokio::time::timeout(Duration::from_secs(10), pes_handle)
+            .await
+            .expect("process_externalized_slots must complete within 10s")
+            .expect("process_externalized_slots must not panic");
     }
 
     /// Regression for #1788/#1769: the re-request side-effect of

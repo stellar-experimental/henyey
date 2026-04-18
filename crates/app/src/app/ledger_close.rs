@@ -1188,6 +1188,8 @@ impl App {
             let mut skipped_stale = 0u64;
             let mut missing_tx_set = false;
             let mut pes_iterated: u64 = 0;
+            #[cfg(test)]
+            let mut gate_fired = false;
             for slot in iter_start..=latest_externalized {
                 pes_iterated += 1;
                 // Skip slots that have already been closed. Stale
@@ -1206,6 +1208,18 @@ impl App {
 
                 let slot_u32 = slot as u32;
                 let existing_entry = existing.get(&slot_u32).copied();
+
+                // Test hook: fire the two-way gate once on the first
+                // non-stale slot. Proves phase 2 (lockless iteration) is
+                // in progress — no syncing_ledgers lock is held here.
+                #[cfg(test)]
+                if !gate_fired {
+                    if let Some(ref gate) = self.pes_iteration_gate {
+                        gate_fired = true;
+                        gate.entered.notify_one();
+                        gate.resume.notified().await;
+                    }
+                }
 
                 if let Some(info) = self.herder.check_ledger_close(slot) {
                     // Mirror legacy `missing_tx_set` semantics on the
