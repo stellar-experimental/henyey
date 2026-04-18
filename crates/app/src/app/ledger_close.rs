@@ -740,7 +740,7 @@ impl App {
             ledger_flags,
         );
 
-        // Seed Soroban per-tx limits from network config.
+        // Seed Soroban per-tx limits and dynamic resource limits from network config.
         if let Some(soroban_info) = self.soroban_network_info() {
             self.herder.tx_queue().set_soroban_limits(SorobanTxLimits {
                 tx_max_instructions: soroban_info.tx_max_instructions as u64,
@@ -753,15 +753,11 @@ impl App {
             self.herder
                 .tx_queue()
                 .set_max_contract_size(soroban_info.max_contract_size);
+            self.update_herder_soroban_limits(&soroban_info);
             tracing::info!(
                 ledger_seq = header.ledger_seq,
                 "Seeded validation context with Soroban limits"
             );
-        }
-
-        // Also seed the dynamic Soroban resource limits for queue admission and selection.
-        if let Some(soroban_info) = self.soroban_network_info() {
-            self.update_herder_soroban_limits(&soroban_info);
         }
     }
 

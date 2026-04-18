@@ -1140,6 +1140,13 @@ struct LedgerState {
     /// The manager must be initialized (via `initialize` or
     /// by loading from database) before ledger close operations can begin.
     initialized: bool,
+
+    /// Pre-computed Soroban network info for the current ledger epoch.
+    ///
+    /// Populated eagerly in `commit_close()` and `initialize*()`, cleared on
+    /// `reset()`. `None` means pre-Soroban protocol or not yet initialized.
+    /// Reading this field is O(1) — no snapshot or bucket-list lookup required.
+    soroban_network_info: Option<SorobanNetworkInfo>,
 }
 
 /// The core ledger manager for rs-stellar-core.
@@ -1289,6 +1296,7 @@ impl LedgerManager {
                 header: create_genesis_header(),
                 header_hash: Hash256::ZERO,
                 initialized: false,
+                soroban_network_info: None,
             }),
             config,
             module_cache: RwLock::new(None),
@@ -1358,6 +1366,12 @@ impl LedgerManager {
         let mut state = self.state.write();
         state.header = header;
         state.header_hash = header_hash;
+        // Invalidate cached info — test helpers may bypass normal close paths.
+        state.soroban_network_info = None;
+        drop(state);
+        // Recompute from the current bucket-list state.
+        let info = self.compute_soroban_info();
+        self.state.write().soroban_network_info = info;
     }
 
     /// Get bucket list level hashes (curr, snap) for persistence.
@@ -1474,6 +1488,9 @@ impl LedgerManager {
         )?;
         self.initialize_all_caches(protocol_version, 0)?;
 
+        // Eagerly compute and cache Soroban network info from the initialized state.
+        self.state.write().soroban_network_info = self.compute_soroban_info();
+
         info!(
             ledger_seq = self.state.read().header.ledger_seq,
             header_hash = %self.state.read().header_hash.to_hex(),
@@ -1526,6 +1543,9 @@ impl LedgerManager {
         *self.soroban_state.write() = cache_data.soroban_state;
         *self.offers_initialized.write() = true;
         crate::memory_report::log_startup_memory("after_cache_install");
+
+        // Eagerly compute and cache Soroban network info from the initialized state.
+        self.state.write().soroban_network_info = self.compute_soroban_info();
 
         info!(
             ledger_seq = self.state.read().header.ledger_seq,
@@ -1641,6 +1661,7 @@ impl LedgerManager {
         state.header = create_genesis_header();
         state.header_hash = Hash256::ZERO;
         state.initialized = false;
+        state.soroban_network_info = None;
 
         debug!("Ledger manager reset complete");
     }
@@ -2213,6 +2234,14 @@ impl LedgerManager {
             state.header_hash = new_header_hash;
         }
 
+        // Eagerly recompute Soroban network info from the committed state.
+        // Cost: one snapshot + ~15 config lookups. Runs on the blocking thread,
+        // so all subsequent event-loop reads are O(1).
+        {
+            let info = self.compute_soroban_info();
+            self.state.write().soroban_network_info = info;
+        }
+
         // Drop offer/pool changes on a background thread if non-trivial.
         if !offer_pool_changes.is_empty() {
             std::thread::spawn(move || drop(offer_pool_changes));
@@ -2379,14 +2408,21 @@ impl LedgerManager {
     }
 
     pub fn soroban_network_info(&self) -> Option<SorobanNetworkInfo> {
-        if !self.is_initialized() {
-            return None;
-        }
+        self.state.read().soroban_network_info.clone()
+    }
+
+    /// Compute `SorobanNetworkInfo` from the current bucket-list state.
+    ///
+    /// Creates a snapshot and loads all ~15 ConfigSetting entries. This is
+    /// called once per ledger close (on the blocking thread) and once during
+    /// initialization. All subsequent reads go through the cached field in
+    /// `LedgerState`.
+    fn compute_soroban_info(&self) -> Option<SorobanNetworkInfo> {
         let snapshot = self.create_snapshot().ok()?;
         match load_soroban_network_info(&snapshot) {
             Ok(info) => info,
             Err(e) => {
-                tracing::warn!(error = ?e, "Failed to load Soroban network info");
+                tracing::warn!(error = ?e, "Failed to compute Soroban network info");
                 None
             }
         }
