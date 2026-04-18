@@ -1,16 +1,23 @@
 //! Shared persist utilities for deferred I/O tasks.
 //!
 //! Both post-close and catchup paths need to flush bucket persist handles
-//! and write to SQLite on background threads. This module consolidates
+//! and write to SQLite on blocking threads. This module consolidates
 //! the common patterns to avoid duplication.
 //!
 //! # Architecture
 //!
-//! The event loop spawns persist work as a [`PersistJob`] via
-//! [`spawn_persist_task`], which returns a [`PendingPersist`] tracked in
-//! the select loop. The next ledger close is gated on persist completion.
+//! All persist work runs through [`PersistJob::run_blocking`], a single
+//! synchronous method that encapsulates the entire persist pipeline (bucket
+//! flush, hot-archive file I/O, SQLite writes). The event loop dispatches
+//! persist work via [`spawn_persist_task`], which wraps `run_blocking` in
+//! a single `tokio::task::spawn_blocking` call and returns a
+//! [`PendingPersist`] tracked in the select loop. The next ledger close
+//! is gated on persist completion.
+//!
+//! This design avoids the nested `tokio::spawn(async { spawn_blocking })`
+//! pattern that caused a 662-second deadlock on mainnet (#1735).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use henyey_bucket::HotArchiveBucket;
@@ -44,27 +51,6 @@ impl CatchupPersistData {
             Ok(())
         })
     }
-
-    /// Finalize catchup state: flush bucket persist handles, then write
-    /// header/HAS/LCL to the database.
-    ///
-    /// This is the single source of truth for post-catchup persistence.
-    /// It is called synchronously by the `Inline` finalizer variant and
-    /// by the deferred [`PersistJob::Catchup`] event-loop task. Any
-    /// failure aborts the process — persist failures are unrecoverable
-    /// because on-disk state would diverge from in-memory state.
-    pub(crate) async fn apply(self, db: Database, ledger_manager: Arc<LedgerManager>) {
-        flush_bucket_persist(&ledger_manager).await;
-
-        let db2 = db.clone();
-        let data = self;
-        if let Err(e) = tokio::task::spawn_blocking(move || data.write_to_db(&db2))
-            .await
-            .unwrap_or_else(|e| Err(henyey_db::DbError::Integrity(e.to_string())))
-        {
-            fatal_persist_error("catchup DB write", &e);
-        }
-    }
 }
 
 /// How [`App::catchup_with_mode`] finalizes state after catchup completes.
@@ -92,8 +78,12 @@ pub(super) enum CatchupFinalizerInner {
 impl CatchupFinalizer {
     /// Finalize catchup synchronously before returning.
     ///
-    /// The caller must not be running inside a `tokio::spawn` context
-    /// where calling `spawn_blocking` could deadlock (see #1713).
+    /// Uses `spawn_blocking` + `.await` internally, so the calling tokio
+    /// worker yields while the blocking thread runs. Safe for top-level
+    /// callers (CLI, `run_cmd::run_node` before `app.run()` is spawned)
+    /// where the blocking pool is not saturated. Must not be used from
+    /// inside the event loop's `select!` branches — use
+    /// [`CatchupFinalizer::deferred`] there instead (see #1713, #1735).
     pub fn inline(db: Database, ledger_manager: Arc<LedgerManager>) -> Self {
         Self(CatchupFinalizerInner::Inline { db, ledger_manager })
     }
@@ -145,10 +135,11 @@ impl LedgerCloseFinalizer {
 /// Type alias for the boxed persist write function.
 type PersistWriteFn = Box<dyn FnOnce(&Database) -> anyhow::Result<()> + Send>;
 
-/// Describes the work to be done by a deferred persist task.
+/// Describes the work to be done by a persist task.
 ///
 /// Created by `handle_close_complete` (ledger close) or the catchup
-/// completion handler, then passed to [`spawn_persist_task`].
+/// completion handler, then dispatched via [`spawn_persist_task`] or
+/// called directly via [`PersistJob::run_blocking`].
 pub(super) enum PersistJob {
     /// Post-catchup: flush buckets + write catchup state to DB.
     Catchup {
@@ -165,25 +156,31 @@ pub(super) enum PersistJob {
         meta_xdr: Option<Vec<u8>>,
         db: Database,
         ledger_manager: Arc<LedgerManager>,
-        bucket_dir: PathBuf,
+        bucket_dir: std::path::PathBuf,
     },
 }
 
-/// Spawn a deferred persist task and return a [`PendingPersist`] handle.
-///
-/// The task runs as a normal `tokio::spawn` async task that uses
-/// `spawn_blocking` internally for individual I/O operations. This avoids
-/// the deadlock from calling `spawn_blocking` inside `tokio::spawn` tasks
-/// or inline in the `select!` loop.
-pub(super) fn spawn_persist_task(job: PersistJob, ledger_seq: u32) -> PendingPersist {
-    let handle = tokio::spawn(async move {
-        match job {
+impl PersistJob {
+    /// Run the entire persist pipeline synchronously on the calling thread.
+    ///
+    /// Every persist operation is blocking (file I/O, thread join, SQLite
+    /// transaction). This is the single source of truth for all persist
+    /// work — both the Deferred path (via [`spawn_persist_task`]) and the
+    /// Inline path call this method. Any failure on the critical path
+    /// aborts the process via [`fatal_persist_error`]; LedgerCloseMeta
+    /// write failures are non-fatal (warned only).
+    pub(super) fn run_blocking(self, ledger_seq: u32) {
+        match self {
             PersistJob::Catchup {
                 data,
                 db,
                 ledger_manager,
             } => {
-                (*data).apply(db, ledger_manager).await;
+                flush_bucket_persist_sync(&ledger_manager);
+
+                if let Err(e) = data.write_to_db(&db) {
+                    fatal_persist_error("catchup DB write", &e);
+                }
 
                 tracing::info!(ledger_seq, "Catchup persist completed");
             }
@@ -194,53 +191,58 @@ pub(super) fn spawn_persist_task(job: PersistJob, ledger_seq: u32) -> PendingPer
                 ledger_manager,
                 bucket_dir,
             } => {
-                flush_hot_archive_and_buckets(&ledger_manager, bucket_dir).await;
+                flush_hot_archive_and_buckets_sync(&ledger_manager, &bucket_dir);
 
-                let db2 = db.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || write_fn(&db2))
-                    .await
-                    .unwrap_or_else(|e| Err(anyhow::anyhow!("persist task panicked: {}", e)))
-                {
+                if let Err(e) = write_fn(&db) {
                     fatal_persist_error("ledger close DB write", &e);
                 }
 
                 // LedgerCloseMeta for RPC (non-fatal).
                 if let Some(meta) = meta_xdr {
-                    let db3 = db.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        if let Err(e) = db3.store_ledger_close_meta(ledger_seq, &meta) {
-                            tracing::warn!(
-                                error = %e,
-                                ledger_seq,
-                                "Failed to persist LedgerCloseMeta"
-                            );
-                        }
-                    })
-                    .await;
+                    if let Err(e) = db.store_ledger_close_meta(ledger_seq, &meta) {
+                        tracing::warn!(
+                            error = %e,
+                            ledger_seq,
+                            "Failed to persist LedgerCloseMeta"
+                        );
+                    }
                 }
             }
         }
-    });
+    }
+}
+
+/// Spawn a persist task on a blocking thread and return a [`PendingPersist`]
+/// handle.
+///
+/// The task runs as a single `tokio::task::spawn_blocking` call that
+/// executes [`PersistJob::run_blocking`] — all persist work (bucket flush,
+/// hot-archive file I/O, SQLite writes) happens on one blocking thread
+/// with no nested `spawn_blocking` calls. This avoids the deadlock pattern
+/// from #1735 where `tokio::spawn(async { spawn_blocking })` nested
+/// blocking-pool dispatch under pool saturation.
+///
+/// Cancellation note: `spawn_blocking` tasks are non-abortable — the
+/// blocking thread runs to completion even if the handle is dropped.
+/// This is acceptable because persist work must complete to maintain
+/// on-disk/in-memory consistency, and no caller ever aborts the handle.
+pub(super) fn spawn_persist_task(job: PersistJob, ledger_seq: u32) -> PendingPersist {
+    let handle = tokio::task::spawn_blocking(move || job.run_blocking(ledger_seq));
     PendingPersist { handle, ledger_seq }
 }
 
-/// Flush the pending bucket persist handle on a blocking thread.
+/// Flush the pending bucket persist handle synchronously.
 ///
 /// Takes the pending persist handle from the bucket list (brief write lock),
 /// then joins the background thread WITHOUT holding the lock. This prevents
-/// blocking concurrent `bucket_list()` reads from `prepare_persist_data` on
-/// the event loop.
-async fn flush_bucket_persist(ledger_manager: &Arc<LedgerManager>) {
+/// blocking concurrent `bucket_list()` reads on the event loop.
+fn flush_bucket_persist_sync(ledger_manager: &LedgerManager) {
     let pending_handle = ledger_manager.bucket_list_mut().take_pending_persist();
     if let Some(handle) = pending_handle {
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            handle
-                .join()
-                .expect("bucket persist thread panicked")
-                .map_err(|e| format!("flush_pending_persist: {e}"))
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("flush task panicked: {e}")))
+        if let Err(e) = handle
+            .join()
+            .expect("bucket persist thread panicked")
+            .map_err(|e| format!("flush_pending_persist: {e}"))
         {
             fatal_persist_error("bucket flush", &e);
         }
@@ -249,34 +251,20 @@ async fn flush_bucket_persist(ledger_manager: &Arc<LedgerManager>) {
 
 /// Persist hot archive buckets to disk, then flush the pending bucket persist.
 ///
-/// Used by the post-close path where hot archive persist must happen on
-/// the blocking thread (not on the event loop).
-async fn flush_hot_archive_and_buckets(ledger_manager: &Arc<LedgerManager>, bucket_dir: PathBuf) {
-    let lm = ledger_manager.clone();
-    let bd = bucket_dir;
-    if let Err(e) = tokio::task::spawn_blocking(move || {
-        // Persist hot archive buckets to disk.
-        let habl_guard = lm.hot_archive_bucket_list();
-        if let Some(habl) = habl_guard.as_ref() {
-            persist_hot_archive_to_dir(habl.levels(), &bd)?;
+/// Used by the post-close path where hot archive persist and bucket flush
+/// both run on the calling blocking thread.
+fn flush_hot_archive_and_buckets_sync(ledger_manager: &LedgerManager, bucket_dir: &Path) {
+    // Persist hot archive buckets to disk.
+    let habl_guard = ledger_manager.hot_archive_bucket_list();
+    if let Some(habl) = habl_guard.as_ref() {
+        if let Err(e) = persist_hot_archive_to_dir(habl.levels(), bucket_dir) {
+            fatal_persist_error("hot archive persist", &e);
         }
-        drop(habl_guard);
-
-        // Flush pending bucket persist (take-then-join without holding the lock).
-        let pending_handle = lm.bucket_list_mut().take_pending_persist();
-        if let Some(handle) = pending_handle {
-            handle
-                .join()
-                .expect("bucket persist thread panicked")
-                .map_err(|e| format!("flush_pending_persist: {e}"))?;
-        }
-        Ok(())
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("flush task panicked: {e}")))
-    {
-        fatal_persist_error("hot archive + bucket flush", &e);
     }
+    drop(habl_guard);
+
+    // Flush pending bucket persist (take-then-join without holding the lock).
+    flush_bucket_persist_sync(ledger_manager);
 }
 
 /// Write hot archive bucket files to the bucket directory.

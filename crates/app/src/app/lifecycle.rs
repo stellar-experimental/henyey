@@ -391,10 +391,9 @@ impl App {
                                 self.sync_recovery_pending.store(true, Ordering::SeqCst);
                             }
 
-                            // Spawn catchup persist task if there's data to write.
-                            // This runs the flush + DB write on spawn_blocking from
-                            // the EVENT LOOP (not from inside the catchup task),
-                            // avoiding the spawn_blocking pool deadlock (#1713).
+                            // Spawn catchup persist task on a blocking thread.
+                            // Dispatched from the event loop (not inside the catchup
+                            // task) to avoid nested spawn_blocking (#1713, #1735).
                             if let Some(persist_data) = result.persist_data {
                                 let seq = persist_data.header.ledger_seq;
                                 debug_assert!(

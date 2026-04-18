@@ -539,7 +539,15 @@ impl App {
         if let Some(persist_data) = catchup_persist_data {
             match finalize.0 {
                 super::persist::CatchupFinalizerInner::Inline { db, ledger_manager } => {
-                    persist_data.apply(db, ledger_manager).await;
+                    let seq = persist_data.header.ledger_seq;
+                    let job = super::persist::PersistJob::Catchup {
+                        data: Box::new(persist_data),
+                        db,
+                        ledger_manager,
+                    };
+                    tokio::task::spawn_blocking(move || job.run_blocking(seq))
+                        .await
+                        .expect("inline catchup persist panicked");
                     tracing::info!(
                         ledger_seq = catchup_result.ledger_seq,
                         "Catchup persist completed (inline)"

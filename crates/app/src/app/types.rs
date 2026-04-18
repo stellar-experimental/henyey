@@ -396,7 +396,7 @@ pub(super) struct PendingLedgerClose {
 /// to ensure the DB has the previous ledger's data before the next
 /// close references it.
 pub(super) struct PendingPersist {
-    /// Join handle for the spawned async task that runs the persist.
+    /// Join handle for the blocking task that runs the persist pipeline.
     pub handle: tokio::task::JoinHandle<()>,
     /// Sequence number being persisted (for logging).
     pub ledger_seq: u32,

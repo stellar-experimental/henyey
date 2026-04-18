@@ -2231,11 +2231,9 @@ impl App {
         self.tx_set_all_peers_exhausted
             .store(false, Ordering::SeqCst);
 
-        // Spawn the persist task as a background async task. It uses
-        // spawn_blocking internally for the actual I/O (bucket flush +
-        // SQLite transaction), but the outer task is a normal tokio task
-        // that yields between blocking operations. This avoids the
-        // deadlock from awaiting spawn_blocking inline in the select! loop.
+        // Spawn the persist task on a blocking thread. All persist work
+        // (hot-archive file I/O, bucket flush, SQLite transaction) runs in a
+        // single spawn_blocking call — no nested spawn_blocking (#1735).
         let data = match persist_data {
             Ok(data) => data,
             Err(err) => {
