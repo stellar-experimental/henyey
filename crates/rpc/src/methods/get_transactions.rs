@@ -76,7 +76,9 @@ pub async fn handle(
     // End ledger for query: latest + 1 (exclusive upper bound)
     let end_ledger = lctx.latest_ledger + 1;
 
-    // Query transactions and batch-load close times in a single blocking DB call
+    // Query transactions and batch-load close times in a single blocking DB call.
+    // On pruning race (require_close_times fails), fall back to batch_close_times
+    // and skip records with missing headers rather than returning a 500.
     let (records, close_time_cache) = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
             use henyey_db::{HistoryQueries, LedgerQueries};
@@ -93,7 +95,17 @@ pub async fn handle(
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let close_times = conn.require_close_times(&seqs)?;
+            let close_times = match conn.require_close_times(&seqs) {
+                Ok(ct) => ct,
+                Err(henyey_db::DbError::Integrity(msg)) => {
+                    tracing::warn!(
+                        error = %msg,
+                        "pruning race in getTransactions; falling back to partial close times"
+                    );
+                    conn.batch_close_times(&seqs)?
+                }
+                Err(e) => return Err(e),
+            };
             Ok((records, close_times))
         })
     })
@@ -111,8 +123,15 @@ pub async fn handle(
         // Application order is 1-based (txindex is 0-based in DB)
         let application_order = record.tx_index + 1;
 
-        // Ledger close time — returned as a number (not string) per upstream getTransactions
-        let created_at = close_time_cache[&record.ledger_seq];
+        // Ledger close time — returned as a number (not string) per upstream getTransactions.
+        // Skip records whose header was pruned during a maintenance race.
+        let Some(created_at) = close_time_cache.get(&record.ledger_seq).copied() else {
+            tracing::warn!(
+                ledger_seq = record.ledger_seq,
+                "skipping transaction with pruned header in getTransactions"
+            );
+            continue;
+        };
 
         // Build TOID cursor for this transaction
         let toid = util::toid_encode(record.ledger_seq, application_order, 0);

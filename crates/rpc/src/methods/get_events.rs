@@ -55,7 +55,9 @@ pub async fn handle(
     // Convert borrowed cursor to owned for the blocking closure
     let cursor_owned = cursor.map(String::from);
 
-    // Query events and batch-load close times in a single blocking DB call
+    // Query events and batch-load close times in a single blocking DB call.
+    // On pruning race (require_close_times fails), fall back to batch_close_times
+    // and skip events with missing headers rather than returning a 500.
     let (events, close_time_cache) = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
             use henyey_db::{EventQueries, LedgerQueries};
@@ -74,7 +76,17 @@ pub async fn handle(
                 .collect::<std::collections::BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let close_times = conn.require_close_times(&seqs)?;
+            let close_times = match conn.require_close_times(&seqs) {
+                Ok(ct) => ct,
+                Err(henyey_db::DbError::Integrity(msg)) => {
+                    tracing::warn!(
+                        error = %msg,
+                        "pruning race in getEvents; falling back to partial close times"
+                    );
+                    conn.batch_close_times(&seqs)?
+                }
+                Err(e) => return Err(e),
+            };
             Ok((events, close_times))
         })
     })
@@ -87,7 +99,14 @@ pub async fn handle(
     // Build response using pre-fetched close times
     let mut event_json: Vec<serde_json::Value> = Vec::with_capacity(events.len());
     for event in &events {
-        let close_time_unix = close_time_cache[&event.ledger_seq];
+        // Skip events whose header was pruned during a maintenance race.
+        let Some(close_time_unix) = close_time_cache.get(&event.ledger_seq).copied() else {
+            tracing::warn!(
+                ledger_seq = event.ledger_seq,
+                "skipping event with pruned header in getEvents"
+            );
+            continue;
+        };
         let close_time = format_unix_timestamp_utc(close_time_unix);
 
         let event_type_str = match event.event_type {
