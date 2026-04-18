@@ -80,12 +80,61 @@ pub enum ValidationLevel {
     /// may be expensive or require context not yet available. Values
     /// at this level can participate in nomination but will require
     /// full validation before being committed.
+    ///
+    /// In the ballot protocol (see
+    /// `BallotProtocol::process_envelope`), a `MaybeValid` value
+    /// clears the slot's `fully_validated` flag, matching stellar-core
+    /// `BallotProtocol.cpp:208-211`. Typical sources of `MaybeValid`:
+    /// past/future-slot validation where we cannot fully verify a
+    /// value against tracking state.
     MaybeValid,
+
+    /// Structurally valid value whose transaction set is not yet
+    /// available locally.
+    ///
+    /// This variant is a henyey extension with no counterpart in
+    /// stellar-core. Upstream buffers peer EXTERNALIZE envelopes in
+    /// `PendingEnvelopes` until their tx_set arrives, so
+    /// `validateValueAgainstLocalState` never sees the "missing tx_set
+    /// for LCL+1" case — it returns `kInvalidValue` there (see
+    /// `stellar-core/src/herder/HerderSCPDriver.cpp:306-311`).
+    ///
+    /// Henyey's EXTERNALIZE fast-path (see
+    /// `crates/herder/src/herder.rs::process_scp_envelope`)
+    /// deliberately forwards peer EXTERNALIZE envelopes to SCP before
+    /// the tx_set is fetched, so tracking advance can proceed during
+    /// catchup. In that window,
+    /// `validate_value_against_local_state` returns
+    /// `MaybeValidTxSetPending` instead of `MaybeValid`.
+    ///
+    /// Behaviorally, this level is identical to `MaybeValid` except it
+    /// does NOT cause the ballot protocol to clear
+    /// `Slot::fully_validated`. Clearing on a transient tx_set gap was
+    /// the root cause of issue #1795 — once `fully_validated` was
+    /// flipped to false it was never restored, and the validator
+    /// stopped broadcasting its own EXTERNALIZE envelopes.
+    ///
+    /// See [`ValidationLevel::clears_fully_validated`] for the
+    /// callsite.
+    MaybeValidTxSetPending,
 
     /// The value has been fully validated and is known to be valid.
     ///
     /// Only fully validated values can be externalized (committed).
     FullyValidated,
+}
+
+impl ValidationLevel {
+    /// Whether this validation level should cause the ballot protocol
+    /// to clear the slot's `fully_validated` flag.
+    ///
+    /// Matches stellar-core `BallotProtocol.cpp:208-211` which clears
+    /// only on `kMaybeValidValue`. The henyey-specific
+    /// [`ValidationLevel::MaybeValidTxSetPending`] does not clear —
+    /// see its doc comment for the rationale.
+    pub fn clears_fully_validated(self) -> bool {
+        matches!(self, Self::MaybeValid)
+    }
 }
 
 /// Callback interface for the SCP consensus protocol.

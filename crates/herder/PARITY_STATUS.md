@@ -144,7 +144,7 @@ Corresponds to: `HerderSCPDriver.h`
 | `wrapEnvelope()` | _(handled differently)_ | None |
 | `signEnvelope()` | `sign_envelope()` | Full |
 | `emitEnvelope()` | `emit_envelope()` | Full |
-| `validateValue()` | `validate_value()` | Full |
+| `validateValue()` | `validate_value()` | Extended |
 | `extractValidValue()` | `extract_valid_value()` | Full |
 | `toShortString()` | `to_short_string()` | Full |
 | `getValueString()` | `get_value_string()` | Full |
@@ -519,7 +519,26 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: No metrics infrastructure; statistics tracked via simple structs
    - **Rationale**: Metrics will use Rust ecosystem libraries (prometheus, metrics crate) when added
 
-7. **Error Handling**
+7. **EXTERNALIZE fast-path + `MaybeValidTxSetPending`** (issue #1795)
+   - **stellar-core**: `PendingEnvelopes` buffers peer EXTERNALIZE
+     envelopes until their tx_set arrives. By the time
+     `validateValueAgainstLocalState` runs, the tx_set is always
+     present. Missing tx_set on LCL+1 returns `kInvalidValue`
+     (`HerderSCPDriver.cpp:306-311`).
+   - **Rust**: `process_scp_envelope` forwards peer EXTERNALIZE to SCP
+     before the tx_set is fetched, so tracking advance can proceed
+     during catchup. `validate_value_against_local_state` returns
+     `ValueValidation::MaybeValidTxSetPending` in that window, which
+     maps to `ValidationLevel::MaybeValidTxSetPending` — a henyey
+     extension that does NOT clear `Slot::fully_validated`.
+   - **Rationale**: The original fast-path fixed a post-catchup stall
+     where evicted tx_sets blocked EXTERNALIZE from reaching SCP. The
+     `MaybeValidTxSetPending` variant preserves that behavior while
+     avoiding the secondary bug (issue #1795) where `MaybeValid`
+     cleared `fully_validated` and permanently suppressed the
+     validator's own EXTERNALIZE emission.
+
+8. **Error Handling**
    - **stellar-core**: C++ exceptions and integer result codes
    - **Rust**: `Result<T, HerderError>` with `thiserror` derive macros
    - **Rationale**: Idiomatic Rust error handling with no exceptions

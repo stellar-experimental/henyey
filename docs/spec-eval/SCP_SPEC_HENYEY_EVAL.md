@@ -151,7 +151,7 @@ The spec defines SCP's wire types: `SCPBallot`, `SCPNomination`, `SCPStatement`,
 | §6.2 `computeTimeout` — required | ✅ | `compute_timeout()` at `driver.rs:235` |
 | §6.3 `validateValue` — default `kMaybeValidValue` | ✅ | `validate_value()` is a required trait method; default provided by herder |
 | §6.3 `extractValidValue` — default null | ✅ | `extract_valid_value()` at `driver.rs:152` |
-| §6.4 `ValidationLevel` enum with 3 levels | ✅ | `ValidationLevel::Invalid`, `MaybeValid`, `FullyValidated` at `driver.rs:71-89` |
+| §6.4 `ValidationLevel` enum with 3 levels | ✅ (extended) | `ValidationLevel::Invalid`, `MaybeValid`, `MaybeValidTxSetPending` (henyey extension for issue #1795 — EXTERNALIZE fast-path), `FullyValidated` at `driver.rs` |
 | §6.5 Event callbacks (7 total) | ✅ | `value_externalized`, `nominating_value`, `updated_candidate_value`, `started_ballot_protocol`, `accepted_ballot_prepared` (via `ballot_did_prepare`), `confirmed_ballot_prepared` (via `ballot_did_confirm`), `accepted_commit`, `ballot_did_hear_from_quorum` — all present |
 | §6.6 Hash functions with domain separation (hash_N=1, hash_P=2, hash_K=3) | ✅ | `compute_hash_node()` (neighborhood/priority) and `compute_value_hash()` delegate to driver with appropriate flags |
 | §6.7 `getNodeWeight` — recursive weight computation | ✅ | `base_get_node_weight()` at `driver.rs:426` matches spec algorithm exactly; `compute_weight()` at `driver.rs:409` uses `u128` for overflow safety |

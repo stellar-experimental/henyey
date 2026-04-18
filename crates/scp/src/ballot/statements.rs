@@ -504,6 +504,24 @@ pub fn get_working_ballot(statement: &ScpStatement) -> Option<ScpBallot> {
     }
 }
 
+/// Return the "worse" of two validation levels.
+///
+/// Ordering (worst → best):
+/// `Invalid` < `MaybeValid` < `MaybeValidTxSetPending` <
+/// `FullyValidated`.
+///
+/// In a multi-value statement, any `Invalid` forces the whole
+/// statement to `Invalid`; any `MaybeValid` forces to `MaybeValid`
+/// (which clears `fully_validated` via
+/// `BallotProtocol::process_envelope`); any `MaybeValidTxSetPending`
+/// forces to `MaybeValidTxSetPending` (which does NOT clear
+/// `fully_validated`); otherwise `FullyValidated`.
+///
+/// Placing `MaybeValid` stricter than `MaybeValidTxSetPending`
+/// guarantees that a genuine MaybeValid (past/future slot, etc.) in
+/// any sub-value still triggers the fully_validated clear, even if
+/// other sub-values were merely tx_set-pending. See `ValidationLevel`
+/// doc comments and issue #1795.
 pub(crate) fn min_validation_level(
     left: ValidationLevel,
     right: ValidationLevel,
@@ -513,6 +531,8 @@ pub(crate) fn min_validation_level(
         (ValidationLevel::MaybeValid, _) | (_, ValidationLevel::MaybeValid) => {
             ValidationLevel::MaybeValid
         }
+        (ValidationLevel::MaybeValidTxSetPending, _)
+        | (_, ValidationLevel::MaybeValidTxSetPending) => ValidationLevel::MaybeValidTxSetPending,
         _ => ValidationLevel::FullyValidated,
     }
 }

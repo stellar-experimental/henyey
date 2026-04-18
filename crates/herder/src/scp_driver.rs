@@ -79,8 +79,17 @@ fn describe_stellar_value_ext(ext: &StellarValueExt) -> String {
 pub enum ValueValidation {
     /// Value is fully valid.
     Valid,
-    /// Value might be valid but we're missing data.
+    /// Value might be valid but we're missing data (past/future slot
+    /// without tracking context, close-time check against stale data,
+    /// etc.). Maps to `ValidationLevel::MaybeValid`, which clears the
+    /// slot's `fully_validated` flag (stellar-core parity).
     MaybeValid,
+    /// Structurally valid value whose transaction set has not yet
+    /// been fetched. Maps to `ValidationLevel::MaybeValidTxSetPending`,
+    /// which does NOT clear `fully_validated`. See the
+    /// `ValidationLevel` enum in `henyey_scp::driver` for the full
+    /// rationale (issue #1795).
+    MaybeValidTxSetPending,
     /// Value is invalid.
     Invalid,
 }
@@ -832,14 +841,25 @@ impl ScpDriver {
                 // PendingEnvelopes buffers all envelopes until deps are fetched,
                 // so validateValue always has the tx_set. Our code sends
                 // EXTERNALIZE to SCP immediately for faster tracking advance
-                // (see process_scp_envelope). Return MaybeValid so SCP can
-                // still externalize the slot while the tx_set fetch completes.
+                // (see process_scp_envelope). Return MaybeValidTxSetPending so
+                // SCP can still externalize the slot while the tx_set fetch
+                // completes, WITHOUT clearing the slot's fully_validated flag.
+                //
+                // Returning ValidationLevel::MaybeValid here was the root cause
+                // of issue #1795: the ballot protocol's MaybeValid handler
+                // cleared fully_validated (matching stellar-core parity), but
+                // stellar-core never actually reaches this code path with a
+                // missing tx_set — its PendingEnvelopes buffering ensures the
+                // tx_set is always present by the time validateValue runs. See
+                // the `ValidationLevel::MaybeValidTxSetPending` doc comment for
+                // the complete rationale.
                 if !nomination {
                     debug!(
-                        "Missing transaction set during ballot protocol: {} (MaybeValid)",
+                        "Missing transaction set during ballot protocol: {} \
+                         (MaybeValidTxSetPending)",
                         tx_set_hash
                     );
-                    return ValueValidation::MaybeValid;
+                    return ValueValidation::MaybeValidTxSetPending;
                 }
                 debug!("Missing transaction set: {}", tx_set_hash);
                 return ValueValidation::Invalid;
@@ -2304,13 +2324,20 @@ mod cache_tests {
             "missing tx set during nomination should return Invalid"
         );
 
-        // During ballot protocol: missing tx set should return MaybeValid
-        // (EXTERNALIZE envelopes may arrive before the tx_set is fetched)
+        // During ballot protocol: missing tx set should return
+        // MaybeValidTxSetPending (EXTERNALIZE envelopes may arrive
+        // before the tx_set is fetched, via the herder fast-path).
+        // This variant specifically does NOT cause the ballot
+        // protocol to clear `Slot::fully_validated` — see the enum
+        // doc comment on `ValidationLevel` and regression test
+        // `test_issue_1795_maybe_valid_tx_set_pending_does_not_clear_fully_validated`
+        // in `crates/scp/src/ballot/mod.rs`.
         let result_ballot = driver.validate_value_impl(1, &value, false);
         assert_eq!(
             result_ballot,
-            ValueValidation::MaybeValid,
-            "missing tx set during ballot protocol should return MaybeValid"
+            ValueValidation::MaybeValidTxSetPending,
+            "missing tx set during ballot protocol should return \
+             MaybeValidTxSetPending (issue #1795)"
         );
 
         // Now cache the tx set and re-validate — should pass the tx set check
@@ -2386,6 +2413,7 @@ impl SCPDriver for HerderScpCallback {
         {
             ValueValidation::Valid => ValidationLevel::FullyValidated,
             ValueValidation::MaybeValid => ValidationLevel::MaybeValid,
+            ValueValidation::MaybeValidTxSetPending => ValidationLevel::MaybeValidTxSetPending,
             ValueValidation::Invalid => ValidationLevel::Invalid,
         }
     }

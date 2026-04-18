@@ -282,7 +282,19 @@ Corresponds to: `SCPDriver.h`
 | `confirmedBallotPrepared()` | `confirmed_ballot_prepared()` | Full |
 | `acceptedCommit()` | None | None |
 | `ballotDidHearFromQuorum()` | `ballot_did_hear_from_quorum()` | Full |
-| `ValidationLevel` enum | `ValidationLevel` enum | Full |
+| `ValidationLevel` enum | `ValidationLevel` enum | Extended |
+
+**Extension note (issue #1795):** henyey's `ValidationLevel` adds a
+fourth variant `MaybeValidTxSetPending` that has no upstream equivalent.
+Stellar-core's `PendingEnvelopes` buffers EXTERNALIZE envelopes until the
+tx_set arrives, so `validateValueAgainstLocalState` never sees the
+"missing tx_set for LCL+1" case. Henyey forwards EXTERNALIZE to SCP
+before the tx_set arrives (to allow tracking advance during catchup) and
+uses the new variant to signal "we could not fully validate because the
+tx_set is still pending — do NOT clear `Slot::fully_validated`". The
+variant behaves identically to `MaybeValid` for all other SCP state
+transitions; the single behavioral difference is gated through
+`ValidationLevel::clears_fully_validated()`.
 | `hashHelper()` (private) | Inlined in `compute_hash_node()` / `compute_value_hash()` | Full |
 
 ### compare (`compare.rs`)
