@@ -442,6 +442,16 @@ pub struct App {
     /// Whether ledger application is currently in progress (for sync recovery).
     is_applying_ledger: AtomicBool,
 
+    /// Test-only: injects a synthetic blocking sleep (in milliseconds) inside
+    /// the post-close tx-queue update `spawn_blocking` closure (#1775 Phase 2).
+    ///
+    /// Regression test `test_close_complete_spawn_blocking_frees_event_loop`
+    /// uses this to simulate a 200 ms CPU-heavy close without having to stand
+    /// up 400 real signed envelopes. When set to 0 (the default), the closure
+    /// behaves exactly as in production.
+    #[cfg(test)]
+    pub(crate) close_complete_inject_blocking_ms: AtomicU64,
+
     /// Flag set by SyncRecoveryManager to request recovery from the main loop.
     /// The main loop checks this and triggers buffered catchup when set.
     sync_recovery_pending: AtomicBool,
@@ -740,6 +750,8 @@ impl App {
             drift_tracker: std::sync::Mutex::new(CloseTimeDriftTracker::new()),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             is_applying_ledger: AtomicBool::new(false),
+            #[cfg(test)]
+            close_complete_inject_blocking_ms: AtomicU64::new(0),
             sync_recovery_pending: AtomicBool::new(false),
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
@@ -4201,6 +4213,195 @@ mod tests {
             "watchdog must emit the py-spy hint line when stale_secs >= 30; \
              captured events: {:?}",
             *events
+        );
+    }
+
+    /// Regression test for #1775 Phase 2: verify `handle_close_complete`'s
+    /// post-close tx-queue update (herder_ledger_closed + tx_queue_invalidation
+    /// sub-phases) is moved off the event-loop thread via `spawn_blocking`.
+    ///
+    /// The test injects a 200 ms synthetic blocking workload inside the
+    /// `spawn_blocking` closure (via `close_complete_inject_blocking_ms`) so
+    /// the fix's behavior is observable without 400 real signed envelopes.
+    ///
+    /// **Two independent assertions**:
+    ///
+    /// 1. **PhaseTimer sub-phase marks** (user's explicit acceptance criterion
+    ///    — #1775 Phase 2 mandate): `herder_ledger_closed_ms` +
+    ///    `tx_queue_invalidation_ms` read < 50 ms combined. Verified by
+    ///    capturing the PhaseTimer's structured WARN emission with
+    ///    `CapturingSubscriber`. Pre-fix (inline), each mark reports the full
+    ///    ~200 ms wall-clock; post-fix (marks before `join.await`), each
+    ///    reports microseconds. A log assertion proves the fix.
+    ///
+    /// 2. **Spawn-blocking wait visibility**: `tx_queue_background_wait_ms`
+    ///    (new mark) reports ~200 ms, confirming the off-thread compute is
+    ///    actually happening in the background pool rather than bypassed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_close_complete_spawn_blocking_frees_event_loop() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Inject 400 ms of synthetic blocking work inside the spawn_blocking
+        // closure to simulate the mainnet-observed ~666 ms compute load. 400 ms
+        // is comfortably above the PhaseTimer's 250 ms threshold so the WARN
+        // is always emitted regardless of preamble timing jitter on slow CI.
+        app.close_complete_inject_blocking_ms
+            .store(400, Ordering::Relaxed);
+        app.set_applying_ledger(true);
+
+        // Capture tracing output to inspect PhaseTimer WARN emissions.
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        // Simulate a successful empty close.  The tx_set is empty so
+        // remove_applied and get_invalid_tx_list do negligible real work, but
+        // the injected 200 ms sleep inside the spawn_blocking closure
+        // simulates the real-world CPU cost.
+        let pending = PendingLedgerClose {
+            handle: tokio::task::spawn_blocking(|| {
+                Ok(henyey_ledger::LedgerCloseResult {
+                    header: stellar_xdr::curr::LedgerHeader {
+                        ledger_version: 24,
+                        previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        scp_value: stellar_xdr::curr::StellarValue {
+                            tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                            close_time: stellar_xdr::curr::TimePoint(1),
+                            upgrades: stellar_xdr::curr::VecM::default(),
+                            ext: stellar_xdr::curr::StellarValueExt::Basic,
+                        },
+                        tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        ledger_seq: 1,
+                        total_coins: 0,
+                        fee_pool: 0,
+                        inflation_seq: 0,
+                        id_pool: 0,
+                        base_fee: 100,
+                        base_reserve: 5_000_000,
+                        max_tx_set_size: 100,
+                        skip_list: [
+                            stellar_xdr::curr::Hash([0u8; 32]),
+                            stellar_xdr::curr::Hash([0u8; 32]),
+                            stellar_xdr::curr::Hash([0u8; 32]),
+                            stellar_xdr::curr::Hash([0u8; 32]),
+                        ],
+                        ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                    },
+                    header_hash: henyey_common::Hash256::ZERO,
+                    tx_results: Vec::new(),
+                    meta: None,
+                    perf: None,
+                })
+            }),
+            ledger_seq: 1,
+            tx_set: henyey_herder::TransactionSet {
+                hash: henyey_common::Hash256::ZERO,
+                previous_ledger_hash: henyey_common::Hash256::ZERO,
+                transactions: Vec::new(),
+                generalized_tx_set: None,
+            },
+            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
+            close_time: 1,
+            upgrades: Vec::new(),
+        };
+
+        let mut pending = pending;
+        let join_result = (&mut pending.handle).await;
+        let close_start = std::time::Instant::now();
+        let success = app
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::inline(),
+            )
+            .await;
+        let close_elapsed = close_start.elapsed();
+
+        assert!(success, "close should succeed");
+        assert!(
+            close_elapsed.as_millis() >= 300,
+            "expected close to take at least 300 ms with 400 ms injection; \
+             actual: {:?}",
+            close_elapsed
+        );
+
+        // Scan the captured events for the PhaseTimer WARN line and extract
+        // the sub-phase times. The WARN line is emitted with
+        // `call="app.handle_close_complete"` when total_ms >= 250 (which it
+        // always is with the 200 ms injection plus preamble).
+        let (phase_line, all_events) = {
+            let locked = events.lock().unwrap();
+            (
+                locked
+                    .iter()
+                    .find(|e| e.contains("app.handle_close_complete"))
+                    .cloned(),
+                locked.clone(),
+            )
+        };
+
+        let phase_line = phase_line.unwrap_or_else(|| {
+            panic!(
+                "PhaseTimer WARN line for app.handle_close_complete was not captured. \
+                 close_elapsed={:?}. All captured events ({}):\n{}",
+                close_elapsed,
+                all_events.len(),
+                all_events.join("\n")
+            )
+        });
+
+        // Extract sub-phase numbers via substring parsing. Format:
+        //   phases="... herder_ledger_closed_ms=0 tx_queue_invalidation_ms=0
+        //                tx_queue_background_wait_ms=200 ..."
+        fn extract_ms(line: &str, label: &str) -> Option<u128> {
+            let tag = format!("{}=", label);
+            let start = line.find(&tag)? + tag.len();
+            let tail = &line[start..];
+            let end = tail
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(tail.len());
+            tail[..end].parse().ok()
+        }
+
+        let herder_ms = extract_ms(&phase_line, "herder_ledger_closed_ms")
+            .expect("WARN line should contain herder_ledger_closed_ms field");
+        let invalidation_ms = extract_ms(&phase_line, "tx_queue_invalidation_ms")
+            .expect("WARN line should contain tx_queue_invalidation_ms field");
+        let wait_ms = extract_ms(&phase_line, "tx_queue_background_wait_ms").expect(
+            "WARN line should contain tx_queue_background_wait_ms field (new in #1775 Phase 2)",
+        );
+
+        // User's acceptance criterion (#1775 Phase 2 mandate):
+        // `herder_ledger_closed_ms` + `tx_queue_invalidation_ms` combined < 50 ms.
+        // Post-fix both marks fire BEFORE `join.await` so each reads < 5 ms.
+        // Pre-fix (inline) both would read ~100–200 ms individually.
+        assert!(
+            herder_ms + invalidation_ms < 50,
+            "herder_ledger_closed_ms ({}) + tx_queue_invalidation_ms ({}) must be < 50 ms \
+             post-fix; WARN line was: {}",
+            herder_ms,
+            invalidation_ms,
+            phase_line
+        );
+
+        // The 400 ms injected work must show up under the new
+        // tx_queue_background_wait_ms label. If this is < 300 ms, the fix is
+        // bypassing spawn_blocking entirely and the off-load is illusory.
+        assert!(
+            wait_ms >= 300,
+            "tx_queue_background_wait_ms ({}) should reflect the 400 ms injected \
+             blocking work; WARN line was: {}",
+            wait_ms,
+            phase_line
         );
     }
 }
