@@ -10,18 +10,19 @@
 //! from stellar-core `src/herder/TxSetUtils.cpp`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+use henyey_common::resource::ResourceType;
 use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::SorobanNetworkInfo;
 use henyey_tx::{
     check_valid_pre_seq_num_with_config, collect_signers_for_account, get_threshold_level,
-    muxed_to_account_id, soroban_disk_read_entries, validate_basic, LedgerContext,
-    SignatureChecker, TransactionFrame,
+    muxed_to_account_id, validate_basic, LedgerContext, SignatureChecker, TransactionFrame,
 };
 use stellar_xdr::curr::{
     AccountEntry, AccountId, GeneralizedTransactionSet, LedgerHeader, Preconditions, SignerKey,
-    SorobanTransactionDataExt, TransactionEnvelope, TransactionPhase, TxSetComponent,
+    TransactionEnvelope, TransactionPhase, TxSetComponent,
 };
 use tracing::{debug, warn};
 
@@ -955,76 +956,6 @@ fn envelope_soroban_resources(
     }
 }
 
-/// Extract `SorobanTransactionDataExt` from a transaction envelope.
-fn envelope_soroban_data_ext(env: &TransactionEnvelope) -> Option<&SorobanTransactionDataExt> {
-    let ext = match env {
-        TransactionEnvelope::Tx(e) => &e.tx.ext,
-        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.ext,
-        },
-        _ => return None,
-    };
-    match ext {
-        stellar_xdr::curr::TransactionExt::V1(data) => Some(&data.ext),
-        _ => None,
-    }
-}
-
-/// Check if a transaction is a RestoreFootprint operation.
-fn is_restore_footprint_envelope(env: &TransactionEnvelope) -> bool {
-    let ops = match env {
-        TransactionEnvelope::TxV0(e) => &e.tx.operations,
-        TransactionEnvelope::Tx(e) => &e.tx.operations,
-        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
-        },
-    };
-    ops.len() == 1
-        && matches!(
-            ops[0].body,
-            stellar_xdr::curr::OperationBody::RestoreFootprint(_)
-        )
-}
-
-/// Get the XDR-encoded size of a Soroban transaction envelope for resource
-/// accounting.
-///
-/// Mirrors stellar-core's TX_BYTE_SIZE resource dimension:
-/// - Non-fee-bump: `TransactionFrame::getSize()` = `xdr_size(mEnvelope)`
-/// - Fee-bump: `FeeBumpTransactionFrame::getResources()` inherits the **inner**
-///   tx's size (does NOT override TX_BYTE_SIZE), so we compute the inner
-///   envelope's XDR size.
-fn envelope_soroban_tx_size(env: &TransactionEnvelope) -> i64 {
-    match env {
-        TransactionEnvelope::TxFeeBump(e) => {
-            // Fee-bump: use inner tx envelope size, matching stellar-core's
-            // FeeBumpTransactionFrame::getResources() which inherits inner
-            // tx size unchanged.
-            match &e.tx.inner_tx {
-                stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                    let inner_env = TransactionEnvelope::Tx(inner.clone());
-                    henyey_common::xdr_stream::xdr_encoded_len(&inner_env) as i64
-                }
-            }
-        }
-        _ => henyey_common::xdr_stream::xdr_encoded_len(env) as i64,
-    }
-}
-
-/// Get the operation count for a Soroban transaction in the resource dimension.
-///
-/// Mirrors stellar-core's OPERATIONS resource dimension:
-/// - Non-fee-bump Soroban: hardcoded to 1
-///   (`TransactionFrame::getResources()`: `int64_t const opCount = 1`)
-/// - Fee-bump Soroban: `FeeBumpTransactionFrame::getNumOperations()` =
-///   `inner_ops + 1`, overriding the OPERATIONS dimension.
-fn envelope_soroban_op_count(env: &TransactionEnvelope) -> i64 {
-    match env {
-        TransactionEnvelope::TxFeeBump(_) => envelope_num_ops(env) as i64,
-        _ => 1,
-    }
-}
-
 /// Validate that component base fees and per-TX inclusion fees meet minimums.
 ///
 /// Mirrors stellar-core's `checkFeeMap()` (TxSetFrame.cpp:722-751).
@@ -1184,14 +1115,9 @@ pub(crate) fn check_valid_soroban(
         return false;
     }
 
-    // Aggregate total resources across all TXs (all 7 dimensions)
-    let mut total_instructions: i64 = 0;
-    let mut total_read_entries: i64 = 0;
-    let mut total_read_bytes: i64 = 0;
-    let mut total_write_entries: i64 = 0;
-    let mut total_write_bytes: i64 = 0;
-    let mut total_tx_size_bytes: i64 = 0;
-    let mut total_ops: i64 = 0;
+    // Aggregate total resources across all TXs using TransactionFrame::resources()
+    // which correctly handles fee-bump tx_size and operation count.
+    let mut total_resources = henyey_common::resource::Resource::make_empty_soroban();
 
     let all_txs = collect_phase_txs(phase);
 
@@ -1200,22 +1126,24 @@ pub(crate) fn check_valid_soroban(
             debug!("Got bad txSet: non-Soroban transaction found in Soroban phase");
             return false;
         }
-        total_tx_size_bytes = total_tx_size_bytes.saturating_add(envelope_soroban_tx_size(tx));
-        total_ops = total_ops.saturating_add(envelope_soroban_op_count(tx));
-        if let Some(resources) = envelope_soroban_resources(tx) {
-            total_instructions = total_instructions.saturating_add(resources.instructions as i64);
-            // Parity: For protocol >= 23, use disk read entries (only classic + archived)
-            // matching stellar-core's getNumDiskReadEntries().
-            let ext = envelope_soroban_data_ext(tx);
-            let is_restore = is_restore_footprint_envelope(tx);
-            let disk_read = soroban_disk_read_entries(resources, ext, is_restore, protocol);
-            total_read_entries = total_read_entries.saturating_add(disk_read);
-            total_read_bytes = total_read_bytes.saturating_add(resources.disk_read_bytes as i64);
-            total_write_entries =
-                total_write_entries.saturating_add(resources.footprint.read_write.len() as i64);
-            total_write_bytes = total_write_bytes.saturating_add(resources.write_bytes as i64);
+        let frame = TransactionFrame::new(Arc::new((*tx).clone()));
+        let res = frame.resources(false, protocol);
+        match total_resources.checked_add(&res) {
+            Ok(sum) => total_resources = sum,
+            Err(_) => {
+                debug!("Got bad txSet: Soroban resource overflow");
+                return false;
+            }
         }
     }
+
+    let total_instructions = total_resources.get_val(ResourceType::Instructions);
+    let total_read_entries = total_resources.get_val(ResourceType::ReadLedgerEntries);
+    let total_read_bytes = total_resources.get_val(ResourceType::DiskReadBytes);
+    let total_write_entries = total_resources.get_val(ResourceType::WriteLedgerEntries);
+    let total_write_bytes = total_resources.get_val(ResourceType::WriteBytes);
+    let total_tx_size_bytes = total_resources.get_val(ResourceType::TxByteSize);
+    let total_ops = total_resources.get_val(ResourceType::Operations);
 
     // Check resource limits (skip instructions for parallel — handled below)
     if !is_parallel && total_instructions > soroban_info.ledger_max_instructions {
@@ -2817,41 +2745,6 @@ mod tests {
         info.ledger_max_tx_count = 1;
         let phase = make_v0_phase_with_fee(vec![fee_bump], Some(100));
         assert!(!check_valid_soroban(&phase, &header, &info));
-    }
-
-    #[test]
-    fn test_envelope_soroban_tx_size_non_fee_bump() {
-        let tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
-        let expected = henyey_common::xdr_stream::xdr_encoded_len(&tx) as i64;
-        assert_eq!(envelope_soroban_tx_size(&tx), expected);
-        assert!(expected > 0);
-    }
-
-    #[test]
-    fn test_envelope_soroban_tx_size_fee_bump_uses_inner() {
-        let inner = make_soroban_envelope(100, 100, 100, vec![], vec![]);
-        let inner_size = henyey_common::xdr_stream::xdr_encoded_len(&inner) as i64;
-        let fee_bump = make_fee_bump_envelope(inner, 50000);
-        let outer_size = henyey_common::xdr_stream::xdr_encoded_len(&fee_bump) as i64;
-        let computed = envelope_soroban_tx_size(&fee_bump);
-        // Must equal inner size, not outer
-        assert_eq!(computed, inner_size);
-        assert_ne!(computed, outer_size);
-    }
-
-    #[test]
-    fn test_envelope_soroban_op_count_non_fee_bump() {
-        let tx = make_soroban_envelope(100, 100, 100, vec![], vec![]);
-        // Non-fee-bump Soroban: hardcoded 1
-        assert_eq!(envelope_soroban_op_count(&tx), 1);
-    }
-
-    #[test]
-    fn test_envelope_soroban_op_count_fee_bump() {
-        let inner = make_soroban_envelope(100, 100, 100, vec![], vec![]);
-        let fee_bump = make_fee_bump_envelope(inner, 50000);
-        // Fee-bump: inner ops (1) + 1 = 2
-        assert_eq!(envelope_soroban_op_count(&fee_bump), 2);
     }
 
     /// Regression: get_invalid_tx_list must reject txs that fail check_valid_pre_seq_num

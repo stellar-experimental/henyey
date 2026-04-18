@@ -199,7 +199,7 @@ impl SurgePricingLaneConfig for OpsOnlyLaneConfig {
     }
 
     fn tx_resources(&self, frame: &TransactionFrame, _ledger_version: u32) -> Resource {
-        let ops = i64::try_from(frame.operation_count()).unwrap_or(i64::MAX);
+        let ops = i64::try_from(frame.resource_operation_count()).unwrap_or(i64::MAX);
         Resource::new(vec![ops])
     }
 

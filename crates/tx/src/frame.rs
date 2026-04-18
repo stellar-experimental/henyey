@@ -401,6 +401,29 @@ impl TransactionFrame {
         self.operations().len()
     }
 
+    /// Returns the operation count for resource/fee accounting.
+    ///
+    /// For fee-bump transactions, returns `inner_ops + 1`, matching
+    /// stellar-core's `FeeBumpTransactionFrame::getNumOperations()`.
+    /// For regular transactions, returns `operations().len()`.
+    pub fn resource_operation_count(&self) -> usize {
+        if self.is_fee_bump() {
+            self.operation_count() + 1
+        } else {
+            self.operation_count()
+        }
+    }
+
+    /// Returns the transaction size in bytes for resource accounting.
+    ///
+    /// For fee-bump transactions, returns the inner envelope XDR size,
+    /// matching stellar-core's delegation pattern where
+    /// `FeeBumpTransactionFrame::getResources()` inherits the inner tx's size.
+    /// For regular transactions, returns the full envelope XDR size.
+    pub fn resource_tx_size_bytes(&self) -> u32 {
+        self.inner_tx_size_bytes()
+    }
+
     /// Collect all keys needed for fee processing (source accounts).
     pub fn keys_for_fee_processing(&self) -> Vec<LedgerKey> {
         use stellar_xdr::curr::LedgerKeyAccount;
@@ -552,8 +575,13 @@ impl TransactionFrame {
     }
 
     /// Return the resource footprint used for surge pricing and limits.
+    ///
+    /// Mirrors stellar-core's `TransactionFrame::getResources()` and
+    /// `FeeBumpTransactionFrame::getResources()`. For fee-bump transactions:
+    /// - TX_BYTE_SIZE uses the inner envelope size (delegation pattern)
+    /// - OPERATIONS uses inner_ops + 1 (`getNumOperations()`)
     pub fn resources(&self, use_byte_limit_in_classic: bool, ledger_version: u32) -> Resource {
-        let tx_size = self.tx_size_bytes() as i64;
+        let tx_size = self.resource_tx_size_bytes() as i64;
 
         if self.is_soroban() {
             let data = self.soroban_data();
@@ -568,7 +596,13 @@ impl TransactionFrame {
             };
             let resources = data.map(|d| &d.resources).unwrap_or(&fallback_resources);
 
-            let op_count = 1i64;
+            // stellar-core: TransactionFrame::getResources() hardcodes opCount = 1,
+            // FeeBumpTransactionFrame::getResources() overrides with getNumOperations()
+            let op_count = if self.is_fee_bump() {
+                self.resource_operation_count() as i64
+            } else {
+                1i64
+            };
             let disk_read_entries = soroban_disk_read_entries(
                 resources,
                 data.map(|d| &d.ext),
@@ -589,9 +623,9 @@ impl TransactionFrame {
         }
 
         if use_byte_limit_in_classic {
-            Resource::new(vec![self.operation_count() as i64, tx_size])
+            Resource::new(vec![self.resource_operation_count() as i64, tx_size])
         } else {
-            Resource::new(vec![self.operation_count() as i64])
+            Resource::new(vec![self.resource_operation_count() as i64])
         }
     }
 
@@ -1868,6 +1902,134 @@ mod tests {
             v0_hash, v1_hash,
             "V0 tx with time bounds must hash identically to equivalent V1 tx \
              (time bounds must not be dropped during V0→V1 conversion)"
+        );
+    }
+
+    /// Helper: wrap a classic tx in a fee-bump envelope.
+    fn create_classic_fee_bump(inner_fee: u32, outer_fee: i64) -> TransactionEnvelope {
+        let inner = create_test_transaction();
+        let inner_env = match inner {
+            TransactionEnvelope::Tx(mut env) => {
+                env.tx.fee = inner_fee;
+                env
+            }
+            _ => panic!("expected inner Tx"),
+        };
+
+        let fee_bump = FeeBumpTransaction {
+            fee_source: MuxedAccount::Ed25519(Uint256([3u8; 32])),
+            fee: outer_fee,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+            ext: FeeBumpTransactionExt::V0,
+        };
+
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: fee_bump,
+            signatures: VecM::default(),
+        })
+    }
+
+    #[test]
+    fn test_resource_operation_count_regular() {
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        assert_eq!(frame.resource_operation_count(), 1);
+        assert_eq!(frame.resource_operation_count(), frame.operation_count());
+    }
+
+    #[test]
+    fn test_resource_operation_count_fee_bump() {
+        // Fee-bump classic: inner has 1 op, resource_operation_count should be 2
+        let frame = TransactionFrame::from_owned(create_classic_fee_bump(100, 200));
+        assert_eq!(frame.operation_count(), 1); // raw inner ops
+        assert_eq!(frame.resource_operation_count(), 2); // inner_ops + 1
+    }
+
+    #[test]
+    fn test_resource_tx_size_bytes_regular() {
+        let envelope = create_test_transaction();
+        let frame = TransactionFrame::from_owned(envelope.clone());
+        let expected = envelope.to_xdr(Limits::none()).unwrap().len() as u32;
+        assert_eq!(frame.resource_tx_size_bytes(), expected);
+        assert_eq!(frame.resource_tx_size_bytes(), frame.tx_size_bytes());
+    }
+
+    #[test]
+    fn test_resource_tx_size_bytes_fee_bump_uses_inner() {
+        let inner = create_test_transaction();
+        let inner_size = inner.to_xdr(Limits::none()).unwrap().len() as u32;
+        let fee_bump = create_classic_fee_bump(100, 200);
+        let outer_size = fee_bump.to_xdr(Limits::none()).unwrap().len() as u32;
+
+        let frame = TransactionFrame::from_owned(fee_bump);
+        assert_eq!(frame.resource_tx_size_bytes(), inner_size);
+        assert_ne!(frame.resource_tx_size_bytes(), outer_size);
+        assert!(inner_size < outer_size);
+    }
+
+    #[test]
+    fn test_resources_soroban_fee_bump_op_count() {
+        // Soroban fee-bump: OPERATIONS should be inner_ops + 1 = 2
+        let envelope = create_fee_bump_soroban(600, 150, 900);
+        let frame = TransactionFrame::from_owned(envelope);
+        let resources = frame.resources(false, 25);
+
+        assert_eq!(resources.size(), 7);
+        assert_eq!(resources.get_val(ResourceType::Operations), 2);
+    }
+
+    #[test]
+    fn test_resources_soroban_fee_bump_tx_size_uses_inner() {
+        // Soroban fee-bump: TX_BYTE_SIZE should use inner envelope size
+        let inner = create_soroban_transaction_with_fees(150, 600);
+        let inner_size = inner.to_xdr(Limits::none()).unwrap().len() as i64;
+
+        let fee_bump = create_fee_bump_soroban(600, 150, 900);
+        let outer_size = fee_bump.to_xdr(Limits::none()).unwrap().len() as i64;
+
+        let frame = TransactionFrame::from_owned(fee_bump);
+        let resources = frame.resources(false, 25);
+
+        assert_eq!(resources.get_val(ResourceType::TxByteSize), inner_size);
+        assert_ne!(resources.get_val(ResourceType::TxByteSize), outer_size);
+    }
+
+    #[test]
+    fn test_resources_soroban_non_fee_bump_unchanged() {
+        // Non-fee-bump Soroban: OPERATIONS should still be 1
+        let frame = TransactionFrame::from_owned(create_soroban_transaction());
+        let resources = frame.resources(false, 25);
+
+        assert_eq!(resources.size(), 7);
+        assert_eq!(resources.get_val(ResourceType::Operations), 1);
+        assert_eq!(resources.get_val(ResourceType::Instructions), 100);
+    }
+
+    #[test]
+    fn test_resources_classic_fee_bump_ops() {
+        // Classic fee-bump: OPERATIONS should be inner_ops + 1
+        let frame = TransactionFrame::from_owned(create_classic_fee_bump(100, 200));
+        let resources = frame.resources(false, 25);
+
+        assert_eq!(resources.size(), 1);
+        assert_eq!(resources.get_val(ResourceType::Operations), 2);
+    }
+
+    #[test]
+    fn test_resources_classic_fee_bump_with_bytes() {
+        // Classic fee-bump with byte limit: tx_size should be inner, ops should be inner + 1
+        let inner = create_test_transaction();
+        let inner_size = inner.to_xdr(Limits::none()).unwrap().len() as i64;
+
+        let fee_bump = create_classic_fee_bump(100, 200);
+        let frame = TransactionFrame::from_owned(fee_bump);
+        let resources = frame.resources(true, 25);
+
+        assert_eq!(resources.size(), 2);
+        assert_eq!(resources.get_val(ResourceType::Operations), 2); // index 0 = ops
+                                                                    // In classic 2-element resource, index 1 = tx_size (reusing Instructions slot)
+        assert_eq!(
+            resources.try_get_val(ResourceType::Instructions).unwrap(),
+            inner_size
         );
     }
 }

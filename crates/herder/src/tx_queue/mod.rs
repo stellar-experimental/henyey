@@ -1027,7 +1027,7 @@ impl TransactionQueue {
             ));
         }
 
-        let tx_size = frame.tx_size_bytes() as u64;
+        let tx_size = frame.resource_tx_size_bytes() as u64;
         if tx_size > limits.tx_max_size_bytes {
             return Err(format!(
                 "tx size {} exceeds limit {}",
@@ -4311,9 +4311,10 @@ mod tests {
     /// eviction check doesn't account for the to-be-replaced tx's resources.
     #[test]
     fn test_audit_088_replace_by_fee_at_ops_limit() {
-        // max_queue_ops = 3: room for exactly 3 ops total
+        // max_queue_ops = 4: the fee-bump costs 3 ops (2 inner + 1 wrapper),
+        // plus tx_b's 1 op = 4 total.
         let config = TxQueueConfig {
-            max_queue_ops: Some(3),
+            max_queue_ops: Some(4),
             max_size: 10,
             min_fee_per_op: 0,
             ..Default::default()
@@ -4328,14 +4329,16 @@ mod tests {
         let mut tx_b = make_test_envelope(100, 1);
         set_source(&mut tx_b, 51);
 
-        // Add both: now at 3/3 ops
+        // Add both: now at 3/4 ops (tx_a=2 + tx_b=1)
         assert_eq!(queue.try_add(tx_a.clone()), TxQueueResult::Added);
         assert_eq!(queue.try_add(tx_b), TxQueueResult::Added);
         assert_eq!(queue.len(), 2);
 
         // Build a fee-bump wrapping the same inner tx (source 50, seq 1)
         // with a higher fee. This should succeed because the old tx's 2 ops
-        // are excluded from the capacity check.
+        // are excluded from the capacity check. The fee-bump costs 3 ops
+        // (2 inner + 1 fee-bump wrapper), matching stellar-core's
+        // FeeBumpTransactionFrame::getNumOperations().
         let inner = match tx_a {
             TransactionEnvelope::Tx(ref env) => env.clone(),
             _ => panic!("expected v1"),
