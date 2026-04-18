@@ -1104,120 +1104,187 @@ impl App {
                 *self.last_externalized_at.write().await = self.clock.now();
             }
 
-            let mut missing_tx_set = false;
-            let mut buffered_count = 0usize;
-            let mut advance_to;
+            let current_ledger = self.current_ledger_seq();
+            let (iter_start, initial_advance_to) = Self::externalized_iteration_window(
+                last_processed,
+                current_ledger,
+                latest_externalized,
+            );
+
+            // Pre-read the existing buffer keys/tx_set presence for the slot
+            // range we will iterate. This is a SHORT read lock (clone one
+            // bool per key). It lets us decide, during the lockless
+            // iteration below, whether to re-request a tx_set when
+            // check_ledger_close returns None (matching legacy behavior at
+            // the old line 1203-1210).
+            //
+            // Type: { slot → existing_tx_set_hash_and_has_tx_set }. Absence
+            // means slot not currently buffered.
+            let pre_read_start = std::time::Instant::now();
+            let existing: std::collections::HashMap<u32, (henyey_common::Hash256, bool)> = {
+                let buffer =
+                    tracked_lock::tracked_read("syncing_ledgers", &self.syncing_ledgers).await;
+                // Only the slots in our iteration range are relevant.
+                let mut map = std::collections::HashMap::with_capacity(buffer.len());
+                for slot in iter_start..=latest_externalized {
+                    if let Some(info) = buffer.get(&(slot as u32)) {
+                        map.insert(slot as u32, (info.tx_set_hash, info.tx_set.is_some()));
+                    }
+                }
+                map
+                // Read guard dropped at end of scope.
+            };
+            super::warn_if_slow(
+                pre_read_start.elapsed(),
+                "process_externalized_slots_pre_read",
+                existing.len() as u64,
+            );
+
+            // Plan: per-slot mutation description built OUTSIDE any
+            // syncing_ledgers lock. Iteration includes the expensive work
+            // (`check_ledger_close` XDR-parses each externalized slot's
+            // StellarValue) plus the side-effect `request_tx_set` call.
+            //
+            // Semantics-preserving: the apply loop below produces the same
+            // buffer state and the same (advance_to, missing_tx_set,
+            // buffered_count, skipped_stale) return values as the legacy
+            // inline critical section would.
+            //
+            // Side-effect ordering change: today's code interleaves
+            // `request_tx_set` calls with buffer mutations; after this
+            // split, all `request_tx_set` calls fire during the lockless
+            // iteration, BEFORE any buffer mutation. This is safe because
+            // `TxSetTracker` (the backing store for request_tx_set) is a
+            // DashMap, independent of `syncing_ledgers`. Earlier firing of
+            // tx_set requests is arguably better for latency.
+            /// Per-slot mutation for the final `syncing_ledgers.write()`
+            /// apply pass. Built during the lockless iteration above from
+            /// the pre-read buffer snapshot and the per-slot
+            /// `check_ledger_close` result. Only slots with a non-None
+            /// `info` mutate the buffer; the others (re-request / no-op)
+            /// completed their work during the lockless iteration and are
+            /// not carried forward.
+            struct SlotPlan {
+                slot: u32,
+                info: henyey_herder::LedgerCloseInfo,
+            }
+
+            let iter_start_instant = std::time::Instant::now();
+            let mut plans: Vec<SlotPlan> = Vec::new();
+            let mut advance_to = initial_advance_to;
             let mut skipped_stale = 0u64;
-            // Time the `syncing_ledgers.write()`-held critical section
-            // plus the slot iteration it guards (#1759 diagnostics). Long
-            // iterations here block every other `syncing_ledgers`
-            // acquirer, including `try_start_ledger_close`.
-            let pes_critical_start = std::time::Instant::now();
+            let mut missing_tx_set = false;
             let mut pes_iterated: u64 = 0;
-            {
-                let current_ledger = self.current_ledger_seq();
+            for slot in iter_start..=latest_externalized {
+                pes_iterated += 1;
+                // Skip slots that have already been closed. Stale
+                // EXTERNALIZE messages (e.g., from SCP state responses) can
+                // set latest_externalized to old slots whose tx_sets are
+                // evicted from peers' caches. Creating syncing_ledgers
+                // entries for these would cause unfulfillable tx_set
+                // requests and infinite recovery loops.
+                if slot <= current_ledger as u64 {
+                    skipped_stale += 1;
+                    if slot == advance_to + 1 {
+                        advance_to = slot;
+                    }
+                    continue;
+                }
+
+                let slot_u32 = slot as u32;
+                let existing_entry = existing.get(&slot_u32).copied();
+
+                if let Some(info) = self.herder.check_ledger_close(slot) {
+                    // Mirror legacy `missing_tx_set` semantics on the
+                    // post-apply state:
+                    //  - Occupied (had existing entry): missing iff
+                    //    existing had no tx_set AND info also has no
+                    //    tx_set (i.e. no upgrade available).
+                    //  - Vacant (no existing): missing iff info has no
+                    //    tx_set.
+                    let post_update_missing = match existing_entry {
+                        Some((_hash, existing_had_tx_set)) => {
+                            !(existing_had_tx_set || info.tx_set.is_some())
+                        }
+                        None => info.tx_set.is_none(),
+                    };
+                    if post_update_missing {
+                        missing_tx_set = true;
+                    }
+                    plans.push(SlotPlan {
+                        slot: slot_u32,
+                        info,
+                    });
+                    if slot == advance_to + 1 {
+                        advance_to = slot;
+                    }
+                } else if let Some((existing_hash, existing_has_tx_set)) = existing_entry {
+                    // check_ledger_close returned None — the externalized
+                    // data for this slot was evicted from cache. If we
+                    // already have a syncing_ledgers entry with a
+                    // tx_set_hash, re-register the pending tx_set request
+                    // so request_pending_tx_sets can try to fetch it.
+                    //
+                    // This side-effect (request_tx_set) fires BEFORE the
+                    // apply pass — safe because TxSetTracker is DashMap,
+                    // independent of `syncing_ledgers`.
+                    if !existing_has_tx_set {
+                        self.herder.scp_driver().request_tx_set(existing_hash, slot);
+                        missing_tx_set = true;
+                    }
+                    if slot == advance_to + 1 {
+                        advance_to = slot;
+                    }
+                } else {
+                    // check_ledger_close returned None and slot not buffered.
+                    // Legacy code still advanced `advance_to` if contiguous
+                    // (old ledger_close.rs:1211).
+                    if slot == advance_to + 1 {
+                        advance_to = slot;
+                    }
+                }
+            }
+            super::warn_if_slow(
+                iter_start_instant.elapsed(),
+                "process_externalized_slots_iteration",
+                pes_iterated,
+            );
+
+            // Apply the plan under ONE short write lock. No XDR parses, no
+            // herder calls: just BTreeMap mutations whose hold time is
+            // bounded by O(plans.len()) — orders of magnitude faster than
+            // the legacy critical section for long iter ranges
+            // (especially in the `checkpoint_unpublished` branch of
+            // `externalized_iteration_window` which has no slot-range cap).
+            let apply_start = std::time::Instant::now();
+            let buffered_count = plans.len();
+            if !plans.is_empty() {
                 let mut buffer =
                     tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
-
-                // Only iterate slots that peers are likely to still have
-                // tx_sets for.  When the gap between last_processed and
-                // latest_externalized is large (e.g., after catchup resets
-                // last_processed_slot to current_ledger), iterating old
-                // slots creates syncing_ledgers entries with tx_set: None
-                // that trigger futile fetch requests.  Limit to the most
-                // recent TX_SET_REQUEST_WINDOW slots; the gap check below
-                // will trigger catchup for larger gaps.
-                //
-                // Exception: when the first replay ledger falls in an
-                // unpublished checkpoint, archive-based catchup would fail
-                // (the checkpoint file doesn't exist yet).  In that case,
-                // process ALL slots so the node can close ledgers from
-                // cached SCP messages + peer-fetched tx_sets instead of
-                // waiting for the checkpoint.
-                //
-                // This is critical after catchup + rapid close: the gap
-                // re-opens (e.g., 10-15 slots), the EXTERNALIZE for
-                // current_ledger+1 may not be in the cache (peers evicted
-                // SCP state for old slots), but we still need to create
-                // syncing_ledgers entries and request tx_sets for all gap
-                // slots.  When EXTERNALIZE messages arrive from the gap
-                // slot handler, they match with already-fetched tx_sets.
-                let (iter_start, next_advance_to) = Self::externalized_iteration_window(
-                    last_processed,
-                    current_ledger,
-                    latest_externalized,
-                );
-                advance_to = next_advance_to;
-
-                for slot in iter_start..=latest_externalized {
-                    pes_iterated += 1;
-                    // Skip slots that have already been closed. Stale
-                    // EXTERNALIZE messages (e.g., from SCP state responses)
-                    // can set latest_externalized to old slots whose tx_sets
-                    // are evicted from peers' caches. Creating syncing_ledgers
-                    // entries for these would cause unfulfillable tx_set
-                    // requests and infinite recovery loops.
-                    if slot <= current_ledger as u64 {
-                        skipped_stale += 1;
-                        if slot == advance_to + 1 {
-                            advance_to = slot;
-                        }
-                        continue;
-                    }
-
-                    if let Some(info) = self.herder.check_ledger_close(slot) {
-                        let has_tx_set = info.tx_set.is_some();
-                        // Update existing entry's tx_set if it was missing but now available,
-                        // or insert new entry if slot wasn't buffered yet.
-                        match buffer.entry(info.slot as u32) {
-                            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                                let existing = entry.get_mut();
-                                if existing.tx_set.is_none() && info.tx_set.is_some() {
-                                    existing.tx_set = info.tx_set;
-                                    tracing::info!(
-                                        slot,
-                                        "Updated buffered ledger with tx_set from check_ledger_close"
-                                    );
-                                }
-                                if existing.tx_set.is_none() {
-                                    missing_tx_set = true;
-                                }
+                for plan in plans {
+                    match buffer.entry(plan.slot) {
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            let existing_local = entry.get_mut();
+                            if existing_local.tx_set.is_none() && plan.info.tx_set.is_some() {
+                                existing_local.tx_set = plan.info.tx_set;
+                                tracing::info!(
+                                    slot = plan.slot,
+                                    "Updated buffered ledger with tx_set from check_ledger_close"
+                                );
                             }
-                            std::collections::btree_map::Entry::Vacant(entry) => {
-                                if !has_tx_set {
-                                    missing_tx_set = true;
-                                }
-                                entry.insert(info);
-                            }
+                            // missing_tx_set already recorded from
+                            // pre-read state during iteration.
                         }
-                        buffered_count += 1;
-                        if slot == advance_to + 1 {
-                            advance_to = slot;
-                        }
-                    } else {
-                        // check_ledger_close returned None — the externalized
-                        // data for this slot was evicted from cache.  If we
-                        // already have a syncing_ledgers entry with a tx_set_hash,
-                        // re-register the pending tx_set request so
-                        // request_pending_tx_sets can try to fetch it.
-                        if let Some(existing) = buffer.get(&(slot as u32)) {
-                            if existing.tx_set.is_none() {
-                                self.herder
-                                    .scp_driver()
-                                    .request_tx_set(existing.tx_set_hash, slot);
-                                missing_tx_set = true;
-                            }
-                        }
-                        if slot == advance_to + 1 {
-                            advance_to = slot;
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(plan.info);
                         }
                     }
                 }
             }
             super::warn_if_slow(
-                pes_critical_start.elapsed(),
-                "process_externalized_slots_critical_section",
-                pes_iterated,
+                apply_start.elapsed(),
+                "process_externalized_slots_apply",
+                buffered_count as u64,
             );
             if skipped_stale > 0 {
                 tracing::debug!(
