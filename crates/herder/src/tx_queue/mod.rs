@@ -787,6 +787,29 @@ impl TransactionQueue {
             .store(skip, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Test-only: insert an envelope directly into the queue, bypassing
+    /// all admission validation.
+    ///
+    /// Used by regression tests that need to drive code paths (e.g.,
+    /// post-close re-validation) over an arbitrary queue population
+    /// without constructing fully-valid signed envelopes. Matches the
+    /// behaviour of `try_add` on success but performs no checks —
+    /// callers are responsible for providing a structurally valid
+    /// envelope.
+    ///
+    /// Returns `true` if insertion succeeded, `false` if the envelope
+    /// failed to parse fees/ops.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn insert_for_test(&self, envelope: TransactionEnvelope) -> bool {
+        let Ok(queued) = QueuedTransaction::new(envelope) else {
+            return false;
+        };
+        let hash = queued.hash;
+        self.by_hash.write().insert(hash, queued);
+        self.seen.write().insert(hash);
+        true
+    }
+
     /// Create with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(TxQueueConfig::default())

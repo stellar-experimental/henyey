@@ -13,7 +13,7 @@ path = "src/lib.rs"
 [features]
 default = []
 loadgen = []
-test-utils = ["henyey-herder/test-utils"]
+test-utils = ["henyey-herder/test-utils", "henyey-ledger/test-utils"]
 
 [dependencies]
 # Workspace crates
@@ -80,3 +80,12 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+# Enable test-only instrumentation on henyey-ledger so the regression
+# test for #1759 can read `LedgerManager::test_snapshot_count()` to
+# assert that the post-close tx-queue re-validation builds exactly one
+# snapshot per pass.
+henyey-ledger = { workspace = true, features = ["test-utils"] }
+# Enable test-only instrumentation on henyey-herder (e.g.
+# `TransactionQueue::insert_for_test`) used by the #1759 regression
+# test to populate the tx_queue without running admission validation.
+henyey-herder = { workspace = true, features = ["test-utils"] }

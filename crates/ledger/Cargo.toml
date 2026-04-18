@@ -33,6 +33,11 @@ tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 [features]
 jemalloc = ["dep:tikv-jemalloc-ctl"]
+# Enables test-only instrumentation (e.g., snapshot-creation counter on
+# `LedgerManager`) so that regression tests in dependent crates can
+# assert invariants like "batch validation creates one snapshot per pass"
+# (see #1759). Gated behind a feature so production builds pay nothing.
+test-utils = []
 
 [dev-dependencies]
 tempfile.workspace = true

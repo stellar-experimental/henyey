@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use henyey_common::Hash256;
 use henyey_herder::{AccountProvider, FeeBalanceProvider, Herder};
-use henyey_ledger::{LedgerManager, TransactionSetVariant};
+use henyey_ledger::{LedgerManager, SnapshotHandle, TransactionSetVariant};
 use henyey_overlay::{PeerId, ScpQueueCallback};
 use stellar_xdr::curr::{
     Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, TransactionEnvelope, UpgradeType,
@@ -781,6 +781,84 @@ impl AccountProvider for LedgerAccountProvider {
         // which holds a single snapshot for the entire validation run.
         let snapshot = self.ledger_manager.create_snapshot().ok()?;
         snapshot.get_account(account_id).ok()?
+    }
+}
+
+/// Single-snapshot validation provider for **batch** tx-set validation
+/// (post-close re-validation and nomination-path `trim_invalid_two_phase`).
+///
+/// Holds ONE `SnapshotHandle` for the entire validation pass, so
+/// re-validating N pending envelopes is O(N), not O(N × create_snapshot).
+/// Implements both [`AccountProvider`] and [`FeeBalanceProvider`] so the
+/// same instance serves both lookup roles from the same frozen snapshot.
+///
+/// # Parity
+///
+/// Mirrors stellar-core's single `LedgerSnapshot ls(app)` at the top of
+/// `TxSetUtils::getInvalidTxListWithErrors`
+/// (`stellar-core/src/herder/TxSetUtils.cpp:167`). Upstream mutates
+/// `ls.getLedgerHeader().currentToModify().ledgerSeq = LCL + 1` before
+/// the validation pass; our caller encodes the same bump via
+/// `TxSetValidationContext.next_ledger_seq`, so the snapshot itself does
+/// not need header mutation. `base_reserve` is read unchanged from
+/// `SnapshotHandle::header()` — upstream also reads the unchanged
+/// `base_reserve` from the mutated header (the mutation only touches
+/// `ledgerSeq`).
+///
+/// # When to use
+///
+/// * **Batch paths** (N txs → 1 snapshot): use this type.
+/// * **Admission paths** (1 tx → 1 snapshot): keep the per-call
+///   [`LedgerAccountProvider`] / [`LedgerFeeBalanceProvider`] — no
+///   amplification, no benefit.
+///
+/// # Memory
+///
+/// Peak memory is unchanged vs. the per-call pattern. The per-call
+/// pattern allocates and drops N snapshots rapidly (1 live at a time);
+/// this type holds 1 snapshot for the duration of the pass (still 1
+/// live). The savings come from eliminating the per-call alloc/drop
+/// churn — hundreds of thousands of `Arc` increments over the
+/// in-memory Soroban state and bucket list snapshot.
+pub(super) struct SnapshotValidationProviders {
+    snapshot: SnapshotHandle,
+}
+
+impl SnapshotValidationProviders {
+    /// Build one snapshot for the whole validation pass.
+    ///
+    /// Returns `Err` if `create_snapshot` fails (e.g., state /
+    /// bucket-list lock poison). Callers must degrade gracefully — see
+    /// the `ledger_close.rs` post-close call site for the expected
+    /// `warn!` + skip-stateful-validation pattern. Callers MUST NOT
+    /// fall back to the per-call [`LedgerAccountProvider`] on this
+    /// error path: re-introducing a quadratic snapshot pattern would
+    /// silently paper over the bug this type was introduced to fix
+    /// (see #1759).
+    pub fn new(ledger_manager: &LedgerManager) -> henyey_ledger::Result<Self> {
+        Ok(Self {
+            snapshot: ledger_manager.create_snapshot()?,
+        })
+    }
+}
+
+impl AccountProvider for SnapshotValidationProviders {
+    fn load_account(
+        &self,
+        account_id: &stellar_xdr::curr::AccountId,
+    ) -> Option<stellar_xdr::curr::AccountEntry> {
+        self.snapshot.get_account(account_id).ok().flatten()
+    }
+}
+
+impl FeeBalanceProvider for SnapshotValidationProviders {
+    fn get_available_balance(&self, account_id: &stellar_xdr::curr::AccountId) -> Option<i64> {
+        let acc = self.snapshot.get_account(account_id).ok().flatten()?;
+        let base_reserve = self.snapshot.header().base_reserve;
+        Some(henyey_ledger::reserves::available_to_send(
+            &acc,
+            base_reserve,
+        ))
     }
 }
 

@@ -4593,4 +4593,196 @@ mod tests {
              re-added to the event-loop path. WARN line: {phase_line}"
         );
     }
+
+    /// Regression test for #1759: the post-close tx-queue re-validation pass
+    /// must build **one** `LedgerSnapshot` per close, not one per
+    /// `load_account` / `get_available_balance` call.
+    ///
+    /// Pre-fix, the stored `LedgerAccountProvider` / `LedgerFeeBalanceProvider`
+    /// each called `LedgerManager::create_snapshot()` on every lookup, so
+    /// re-validating N queued envelopes built `~N × (1 + ops) × 2`
+    /// snapshots per close. On populated mainnet queues this produced
+    /// a 94.8 s `tx_queue_background_wait_ms` tail driving 15+ WATCHDOG
+    /// freezes.
+    ///
+    /// Post-fix, the close-path call site builds one
+    /// `SnapshotValidationProviders` for the whole re-validation pass,
+    /// matching stellar-core's single `LedgerSnapshot ls(app)` in
+    /// `TxSetUtils::getInvalidTxListWithErrors`.
+    ///
+    /// Assertion strategy: measure the *delta* in
+    /// `LedgerManager::test_snapshot_count()` across a single
+    /// `handle_close_complete` invocation over a tx_queue populated with
+    /// N>=50 envelopes. Pre-fix the delta would be O(N × ops) (hundreds).
+    /// Post-fix it is exactly 1.
+    ///
+    /// Using a delta (instead of an absolute `== 1`) isolates the
+    /// re-validation pass from any other `create_snapshot` calls that
+    /// `handle_close_complete` might legitimately make outside the
+    /// re-validation path (e.g., `update_bucket_snapshot`, RPC
+    /// server paths). We compute the baseline from a close with an
+    /// empty tx_queue and subtract.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_post_close_revalidation_is_single_snapshot() {
+        use stellar_xdr::curr::{
+            CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
+            Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionExt,
+            TransactionV1Envelope, Uint256,
+        };
+
+        /// Build a synthetic envelope unique in `source_account` per `seed`.
+        /// The source account intentionally does not exist in the ledger, so
+        /// every `load_account` call returns `None` — exercising the full
+        /// re-validation path (source lookup, ops-auth lookup) without
+        /// needing a populated bucket list.
+        fn make_synthetic_envelope(seed: u8) -> stellar_xdr::curr::TransactionEnvelope {
+            let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+            let dest =
+                stellar_xdr::curr::AccountId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                    Uint256([seed.wrapping_add(1); 32]),
+                ));
+            let tx = Transaction {
+                source_account: source,
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::CreateAccount(CreateAccountOp {
+                        destination: dest,
+                        starting_balance: 1_000_000_000,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            };
+            stellar_xdr::curr::TransactionEnvelope::Tx(TransactionV1Envelope {
+                tx,
+                signatures: vec![DecoratedSignature {
+                    hint: SignatureHint([0u8; 4]),
+                    signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+                }]
+                .try_into()
+                .unwrap(),
+            })
+        }
+
+        async fn run_close(app: &App) {
+            app.set_applying_ledger(true);
+            let pending = PendingLedgerClose {
+                handle: tokio::task::spawn_blocking(|| {
+                    Ok(henyey_ledger::LedgerCloseResult {
+                        header: stellar_xdr::curr::LedgerHeader {
+                            ledger_version: 24,
+                            previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                            scp_value: stellar_xdr::curr::StellarValue {
+                                tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                                close_time: stellar_xdr::curr::TimePoint(1),
+                                upgrades: stellar_xdr::curr::VecM::default(),
+                                ext: stellar_xdr::curr::StellarValueExt::Basic,
+                            },
+                            tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                            bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                            ledger_seq: 1,
+                            total_coins: 0,
+                            fee_pool: 0,
+                            inflation_seq: 0,
+                            id_pool: 0,
+                            base_fee: 100,
+                            base_reserve: 5_000_000,
+                            max_tx_set_size: 100,
+                            skip_list: [
+                                stellar_xdr::curr::Hash([0u8; 32]),
+                                stellar_xdr::curr::Hash([0u8; 32]),
+                                stellar_xdr::curr::Hash([0u8; 32]),
+                                stellar_xdr::curr::Hash([0u8; 32]),
+                            ],
+                            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                        },
+                        header_hash: henyey_common::Hash256::ZERO,
+                        tx_results: Vec::new(),
+                        meta: None,
+                        perf: None,
+                    })
+                }),
+                ledger_seq: 1,
+                tx_set: henyey_herder::TransactionSet {
+                    hash: henyey_common::Hash256::ZERO,
+                    previous_ledger_hash: henyey_common::Hash256::ZERO,
+                    transactions: Vec::new(),
+                    generalized_tx_set: None,
+                },
+                tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    txs: stellar_xdr::curr::VecM::default(),
+                }),
+                close_time: 1,
+                upgrades: Vec::new(),
+            };
+            let mut pending = pending;
+            let join_result = (&mut pending.handle).await;
+            let success = app
+                .handle_close_complete(
+                    pending,
+                    join_result,
+                    super::persist::LedgerCloseFinalizer::inline(),
+                )
+                .await;
+            assert!(success, "close should succeed");
+        }
+
+        // Baseline: close with an empty tx_queue. Measures any
+        // create_snapshot calls `handle_close_complete` makes OUTSIDE the
+        // re-validation pass (the re-validation pass is skipped entirely
+        // when `pending_envelopes()` is empty, per the
+        // `if !pending_envs.is_empty()` guard in `ledger_close.rs`).
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("baseline.db"))
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let baseline_before = app.ledger_manager.test_snapshot_count();
+        run_close(&app).await;
+        let baseline_after = app.ledger_manager.test_snapshot_count();
+        let baseline_delta = baseline_after - baseline_before;
+
+        // Populated run: same close with N=50 envelopes in the tx_queue.
+        // Pre-fix this would take O(N × ops × 2) snapshots ≈ 200.
+        // Post-fix the re-validation pass adds exactly ONE snapshot
+        // beyond the baseline.
+        let dir2 = tempfile::tempdir().expect("temp dir");
+        let config2 = crate::config::ConfigBuilder::new()
+            .database_path(dir2.path().join("populated.db"))
+            .build();
+        let app2 = App::new(config2).await.unwrap();
+
+        const N_ENVELOPES: u8 = 50;
+        for i in 1..=N_ENVELOPES {
+            let env = make_synthetic_envelope(i);
+            assert!(
+                app2.herder.tx_queue().insert_for_test(env),
+                "failed to insert synthetic envelope seed={i} into tx_queue"
+            );
+        }
+
+        let populated_before = app2.ledger_manager.test_snapshot_count();
+        run_close(&app2).await;
+        let populated_after = app2.ledger_manager.test_snapshot_count();
+        let populated_delta = populated_after - populated_before;
+
+        let revalidation_snapshots = populated_delta.saturating_sub(baseline_delta);
+
+        assert_eq!(
+            revalidation_snapshots, 1,
+            "#1759 regression: post-close re-validation must build exactly \
+             ONE snapshot for the full pass, not one per load_account / \
+             get_available_balance call. Observed: {revalidation_snapshots} \
+             snapshots (baseline_delta={baseline_delta}, \
+             populated_delta={populated_delta}, N={N_ENVELOPES}). Pre-fix \
+             this value was ~2 × N × (1 + ops)."
+        );
+    }
 }

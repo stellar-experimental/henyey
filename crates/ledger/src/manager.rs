@@ -1256,6 +1256,15 @@ pub struct LedgerManager {
     /// and `prepare_with_normalization` checks it before starting new merges.
     /// This avoids redundant merge computations across restarts and catchup.
     finished_merges: Option<Arc<std::sync::RwLock<BucketMergeMap>>>,
+
+    /// Test-only counter: number of `create_snapshot()` invocations.
+    ///
+    /// Used by regression tests (e.g., #1759) to assert that batch
+    /// validation paths build exactly one snapshot per pass rather than
+    /// one per `load_account` call. Behind `test-utils` so production
+    /// builds pay nothing.
+    #[cfg(any(test, feature = "test-utils"))]
+    snapshot_count: std::sync::atomic::AtomicU64,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -1290,12 +1299,24 @@ impl LedgerManager {
             executor: Mutex::new(None),
             pending_eviction_scan: Mutex::new(None),
             finished_merges: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            snapshot_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Get the network ID.
     pub fn network_id(&self) -> &NetworkId {
         &self.network_id
+    }
+
+    /// Test-only: total number of `create_snapshot()` invocations since
+    /// construction. Used by regression tests to assert batch validation
+    /// paths build one snapshot per pass instead of one per lookup
+    /// (see #1759).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_snapshot_count(&self) -> u64 {
+        self.snapshot_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Check if the ledger has been initialized.
@@ -1940,6 +1961,9 @@ impl LedgerManager {
     /// The snapshot includes a lookup function for entries not in the cache,
     /// which queries the bucket list for the entry.
     pub fn create_snapshot(&self) -> Result<SnapshotHandle> {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.snapshot_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state = self.state.read();
         // Use an empty entry cache - all lookups go through lookup_fn which handles:
         // - Soroban types (CONTRACT_DATA, CONTRACT_CODE, TTL): O(1) via in-memory soroban_state

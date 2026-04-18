@@ -1888,6 +1888,12 @@ impl App {
         let network_id = NetworkId(self.network_id());
         let herder = Arc::clone(&self.herder);
         let clock = Arc::clone(&self.clock);
+        // Captured for post-close tx-queue re-validation: needed so the
+        // closure can build a SINGLE `SnapshotValidationProviders` for
+        // the whole re-validation pass (fix for #1759 — per-tx snapshot
+        // amplification that caused `tx_queue_background_wait_ms` to
+        // hit 95 s on mainnet post-catchup).
+        let ledger_manager = Arc::clone(&self.ledger_manager);
         // Move (not clone): `all_txs` / `failed_hashes` are not used after this
         // point, and the applied-tx list for a full mainnet ledger can be
         // several hundred KB.
@@ -2035,15 +2041,43 @@ impl App {
                     ledger_flags,
                     max_contract_size_bytes,
                 };
-                let fee_provider = herder.tx_queue().get_fee_balance_provider();
-                let account_provider = herder.tx_queue().get_account_provider();
-                let invalid = get_invalid_tx_list(
-                    &pending_envs,
-                    &ctx,
-                    &CloseTimeBounds::with_offsets(0, upper_bound_offset),
-                    fee_provider.as_deref(),
-                    account_provider.as_deref(),
-                );
+                // Build ONE snapshot for the whole re-validation pass.
+                //
+                // Prior to #1759 the tx_queue's stored per-call
+                // `LedgerAccountProvider` / `LedgerFeeBalanceProvider`
+                // called `create_snapshot()` on every `load_account` /
+                // `get_available_balance`, amplifying to ~N_txs × ops × 2
+                // snapshots per close. On populated mainnet queues this
+                // produced a 94.8s `tx_queue_background_wait_ms` tail and
+                // 15+ WATCHDOG freezes.
+                //
+                // Parity: matches stellar-core's single `LedgerSnapshot
+                // ls(app)` in `TxSetUtils::getInvalidTxListWithErrors`
+                // (`stellar-core/src/herder/TxSetUtils.cpp:167`).
+                //
+                // On snapshot-build failure we log and skip the stateful
+                // re-validation pass for this ledger (equivalent to
+                // passing `None` providers). We must NOT fall back to
+                // the per-call providers — that would silently
+                // re-introduce the quadratic path.
+                let invalid = match SnapshotValidationProviders::new(&ledger_manager) {
+                    Ok(providers) => get_invalid_tx_list(
+                        &pending_envs,
+                        &ctx,
+                        &CloseTimeBounds::with_offsets(0, upper_bound_offset),
+                        Some(&providers as &dyn henyey_herder::FeeBalanceProvider),
+                        Some(&providers as &dyn henyey_herder::AccountProvider),
+                    ),
+                    Err(err) => {
+                        tracing::warn!(
+                            ledger_seq,
+                            error = %err,
+                            "Failed to build post-close validation snapshot; \
+                             skipping stateful tx-queue re-validation for this ledger"
+                        );
+                        Vec::new()
+                    }
+                };
                 if !invalid.is_empty() {
                     let invalid_hashes: Vec<Hash256> = invalid
                         .iter()
