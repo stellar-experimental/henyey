@@ -1984,8 +1984,14 @@ impl App {
     ///
     /// The watchdog runs independently of the tokio runtime. Every 10 seconds
     /// it checks the last event loop tick timestamp. If the event loop hasn't
-    /// ticked in 30+ seconds, it logs an error with the current phase code
-    /// and thread backtraces to help diagnose deadlocks.
+    /// ticked in 30+ seconds, it emits tiered diagnostics:
+    ///
+    /// - **Tier 0** (automatic): scrapes `/proc/<pid>/task/*/wchan` and
+    ///   thread states (Linux/procfs-specific, best-effort).
+    /// - **Tier 1** (operator hint): logs a manual one-liner for repeated
+    ///   wchan sampling with a pre-substituted PID.
+    /// - **Tier 2** (operator hint): suggests `py-spy` / `gdb` when
+    ///   installed, for full user-space stack traces.
     ///
     /// It also monitors the SCP signature-verifier thread (see
     /// [`henyey_herder::scp_verify`]): it fires an error if the worker is
@@ -2051,13 +2057,14 @@ impl App {
                              crates/app/src/app/phase.rs for PHASE_13_* constants."
                         );
 
-                        // Log thread states AND kernel wait-channels
-                        // (wchan) from /proc. The wchan histogram is
-                        // the direct fallback when py-spy / gdb are
-                        // not installed on a production validator
-                        // host: the 21:07 #1759 live capture used
-                        // exactly this signal to identify futex
-                        // contention as the freeze mechanism.
+                        // Tier 0 (automatic): scrape thread states and
+                        // kernel wait-channels (wchan) from /proc.
+                        // Best-effort and Linux/procfs-specific — may
+                        // silently produce no output on non-Linux hosts
+                        // or permission-restricted kernels. The 21:07
+                        // #1759 live capture proved this signal alone
+                        // is sufficient to classify lock-contention
+                        // freezes without py-spy or gdb on the host.
                         if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/task", pid)) {
                             let mut states: std::collections::HashMap<String, u32> =
                                 std::collections::HashMap::new();
@@ -2106,19 +2113,29 @@ impl App {
                             }
                         }
 
-                        // Operator hint for #1759 diagnostics: name the exact
-                        // shell commands needed to capture the blocked
-                        // tokio frames while the freeze is live. The first
-                        // reporter of #1759 explicitly asked for this kind
-                        // of stack dump — surfacing the command in the
-                        // error log means the next recurrence is
-                        // self-diagnostic rather than requiring tribal
-                        // knowledge.
+                        // Tiered operator hints (#1759 / #1764):
+                        // The automatic wchan scrape above (tier 0) is
+                        // best-effort and may have failed. The hints
+                        // below give the operator escalation options
+                        // ordered by availability:
+                        //   Tier 1 — manual /proc wchan one-liner
+                        //            (always available on Linux, no
+                        //            install, no root)
+                        //   Tier 2 — py-spy / gdb / gcore (richer
+                        //            user-space frames, but requires
+                        //            the tool to be installed)
                         tracing::error!(
                             pid,
-                            "WATCHDOG: To capture blocked frames while the event loop is frozen, \
-                             run: py-spy dump --pid {}  \
+                            "WATCHDOG: Thread state + wchan summary may have been logged above \
+                             (best-effort, Linux/procfs-specific). \
+                             Tier 1 — manual wchan sample (no install needed): \
+                             for t in /proc/{}/task/*; do \
+                             printf '%-8s %s\\n' \"$(basename $t)\" \"$(cat $t/wchan)\"; \
+                             done | sort -k2 | uniq -cf1   \
+                             Tier 2 — richer frames (if installed): \
+                             py-spy dump --pid {}  \
                              (or: sudo gcore {} && gdb -ex 'thread apply all bt' -ex quit core.{})",
+                            pid,
                             pid,
                             pid,
                             pid
@@ -4326,21 +4343,19 @@ mod tests {
         );
     }
 
-    /// Regression test for the #1759 watchdog operator-hint line.
+    /// Regression test for the #1759 / #1764 watchdog diagnostic hints.
     ///
     /// Synthesize a freeze by rewinding `last_event_loop_tick_ms` to 60 s
     /// in the past. Start the watchdog thread. After one watchdog tick
-    /// (~10 s), the captured log must contain the `py-spy dump --pid`
-    /// operator instruction. Without this line, the next recurrence of
-    /// #1759 has no machine-readable breadcrumb pointing the operator
-    /// at the stack-dump command.
+    /// (~10 s), the captured log must contain the tiered diagnostic hints:
+    /// tier-1 `/proc` wchan one-liner and tier-2 `py-spy dump --pid`.
     ///
     /// This test is `#[ignore]`d by default because it has to wait for
     /// the 10-second watchdog poll interval. Run with
-    /// `cargo test -p henyey-app -- --ignored watchdog_hint`.
+    /// `cargo test -p henyey-app -- --ignored watchdog_diagnostic`.
     #[tokio::test]
     #[ignore = "waits for 10s watchdog interval; run with --ignored"]
-    async fn test_watchdog_emits_pyspy_hint_on_freeze() {
+    async fn test_watchdog_emits_diagnostic_hint_on_freeze() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -4364,10 +4379,23 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_secs(11)).await;
 
         let events = events.lock().unwrap();
-        let hint = events.iter().find(|e| e.contains("py-spy dump --pid"));
+
+        // Tier 1: the hint must mention /proc wchan sampling.
+        let wchan_hint = events
+            .iter()
+            .find(|e| e.contains("/proc/") && e.contains("wchan"));
         assert!(
-            hint.is_some(),
-            "watchdog must emit the py-spy hint line when stale_secs >= 30; \
+            wchan_hint.is_some(),
+            "watchdog must emit a tier-1 /proc wchan hint when stale_secs >= 30; \
+             captured events: {:?}",
+            *events
+        );
+
+        // Tier 2: the hint must still include py-spy for richer frames.
+        let pyspy_hint = events.iter().find(|e| e.contains("py-spy dump --pid"));
+        assert!(
+            pyspy_hint.is_some(),
+            "watchdog must emit a tier-2 py-spy hint when stale_secs >= 30; \
              captured events: {:?}",
             *events
         );
