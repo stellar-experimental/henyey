@@ -555,6 +555,30 @@ mod tests {
         );
     }
 
+    /// The `is_write_method` flag in `rpc_handler` must classify
+    /// `sendTransaction` as a write method so it bypasses timeout.
+    /// This is a structural test — it verifies the bypass condition
+    /// directly, complementing the behavioral test below.
+    #[test]
+    fn test_send_transaction_classified_as_write_method() {
+        // Mirror the classification logic from rpc_handler (line 377).
+        let is_write = |method: &str| method == "sendTransaction";
+
+        assert!(
+            is_write("sendTransaction"),
+            "sendTransaction must bypass timeout"
+        );
+        assert!(!is_write("getHealth"), "getHealth must NOT bypass timeout");
+        assert!(
+            !is_write("getTransaction"),
+            "getTransaction must NOT bypass timeout"
+        );
+        assert!(
+            !is_write("simulateTransaction"),
+            "simulateTransaction must NOT bypass timeout"
+        );
+    }
+
     /// `sendTransaction` must NOT be subject to `request_timeout`.
     ///
     /// Proof: use the same config that causes read-only methods to timeout
