@@ -1779,21 +1779,8 @@ impl TransactionQueue {
             return Ok(());
         }
 
-        // O(log n): try to evict the lowest-fee transaction
-        if let Some(min_entry) = store.lowest_fee().cloned() {
-            if queued.is_better_than_entry(&min_entry) {
-                let evict_hash = min_entry.hash;
-                let evicted = store.remove(&evict_hash).unwrap();
-                self.seen.write().remove(&evict_hash);
-                let mut account_states = self.account_states.write();
-                Self::drop_transaction(&mut account_states, &evicted);
-                return Ok(());
-            }
-        }
-
-        // Fallback: incoming tx has worse fee than all queued txs.
-        // Try to evict one expired tx to make room (preserves existing semantic
-        // that try_add can free space from expired txs even if the new tx has low fee).
+        // Prefer evicting an expired tx first — this is a "free" eviction that
+        // doesn't displace any valid live transaction, matching pre-refactor behavior.
         let expired_hash = store
             .iter()
             .find(|(_, tx)| tx.is_expired(self.config.max_age_secs))
@@ -1804,6 +1791,18 @@ impl TransactionQueue {
             let mut account_states = self.account_states.write();
             Self::drop_transaction(&mut account_states, &evicted);
             return Ok(());
+        }
+
+        // O(log n): no expired txs available, try to evict the lowest-fee transaction
+        if let Some(min_entry) = store.lowest_fee().cloned() {
+            if queued.is_better_than_entry(&min_entry) {
+                let evict_hash = min_entry.hash;
+                let evicted = store.remove(&evict_hash).unwrap();
+                self.seen.write().remove(&evict_hash);
+                let mut account_states = self.account_states.write();
+                Self::drop_transaction(&mut account_states, &evicted);
+                return Ok(());
+            }
         }
 
         Err(TxQueueResult::QueueFull)
@@ -6353,6 +6352,58 @@ mod tests {
         let store = queue.store.read();
         let remaining: Vec<u64> = store.values().map(|tx| tx.inclusion_fee).collect();
         assert_eq!(remaining, vec![50]);
+        store.assert_consistent();
+    }
+
+    /// Test that ensure_queue_capacity prefers evicting an expired high-fee tx
+    /// over a live low-fee tx when both are present in a full queue.
+    #[test]
+    fn test_ensure_capacity_prefers_expired_over_live() {
+        let config = TxQueueConfig {
+            max_size: 2,
+            max_age_secs: 5,
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add a high-fee tx (will be backdated to expired)
+        let mut tx_high = make_test_envelope(1000, 1);
+        set_source(&mut tx_high, 1);
+        assert_eq!(queue.try_add(tx_high), TxQueueResult::Added);
+
+        // Add a low-fee tx (will remain live)
+        let mut tx_low = make_test_envelope(10, 1);
+        set_source(&mut tx_low, 2);
+        assert_eq!(queue.try_add(tx_low), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // Backdate only the high-fee tx to make it expired
+        {
+            let mut store = queue.store.write();
+            // Find the high-fee tx and backdate it
+            for tx in store.values_mut() {
+                if tx.inclusion_fee == 1000 {
+                    tx.received_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
+                }
+            }
+        }
+
+        // Add a mid-fee tx — should evict the expired high-fee tx, NOT the live low-fee tx
+        let mut tx_mid = make_test_envelope(500, 1);
+        set_source(&mut tx_mid, 3);
+        assert_eq!(queue.try_add(tx_mid), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // Verify: expired high-fee (1000) was evicted, live low-fee (10) and new mid (500) remain
+        let store = queue.store.read();
+        let mut fees: Vec<u64> = store.values().map(|tx| tx.inclusion_fee).collect();
+        fees.sort();
+        assert_eq!(
+            fees,
+            vec![10, 500],
+            "expired tx should be evicted over live tx"
+        );
         store.assert_consistent();
     }
 }
