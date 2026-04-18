@@ -257,14 +257,14 @@ What the monitor does NOT do on recurrence:
      RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey \
        --mainnet run --validator \
        -c configs/validator-mainnet-rpc.toml \
-       > ~/data/<session-id>/logs/monitor.log 2>&1 &
+       >> ~/data/<session-id>/logs/monitor.log 2>&1 &
      ```
    - **watcher**:
      ```
      RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey \
        --mainnet run \
        -c configs/mainnet.toml \
-       > ~/data/<session-id>/logs/monitor.log 2>&1 &
+       >> ~/data/<session-id>/logs/monitor.log 2>&1 &
      ```
 
 7. **Verify the node started.** Wait 10 seconds, then tail the last 30
@@ -318,7 +318,7 @@ Determine fresh-start state once up-front: if ~/data/mainnet/mainnet.db does NOT
 HEALTH CHECKS:
 (1) Log scan — run: tail -n 500 ~/data/<session-id>/logs/monitor.log. Scan for: hash mismatches ("hash mismatch", "HashMismatch", differing expected/actual hashes), panics/crashes ("panic", "thread.*panicked", "SIGABRT", "SIGSEGV"), ERROR-level log lines, assertion failures ("assertion failed").
 (2) Ledger progression & sync deadline — persist ledger progression across ticks so STUCK can be detected by a single invocation: (a) read ~/data/<session-id>/last_ledger (if it exists) — format is "<ledger>|<unix-timestamp>". (b) extract the current ledger from the most recent Heartbeat line in the log tail. (c) if the file exists and its ledger equals the current ledger and the recorded timestamp is more than 600s old, flag STUCK. (d) if the ledger has advanced or the file is missing, overwrite ~/data/<session-id>/last_ledger with "<current-ledger>|<now>". Additionally, check node uptime: run ps -o etime= -p $(pgrep -f 'henyey.*run' | head -1). Compare uptime against the deadline from FRESH_START. If uptime exceeds the deadline and the node is not yet in real-time sync: check the latest Heartbeat for the gap between `ledger` and `latest_ext` — if gap > 5, or if RPC status is "unhealthy", or if `heard_from_quorum=false`, flag as SYNC FAILURE. This is a bug, not a transient condition. Do NOT report it as a WARNING and wait. Investigate the catchup path: check for checkpoint-boundary stalls ("failed to download header"), hash mismatches, or event loop freezes in the log. If FRESH_START=yes and uptime is under 4h, a large gap is expected — report CATCHING UP instead of SYNC FAILURE.
-(3) Process alive — run: pgrep -af 'henyey.*run'. If not running, restart: RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey --mainnet run <RUN_FLAGS> -c <CONFIG> > ~/data/<session-id>/logs/monitor.log 2>&1 &
+(3) Process alive — run: pgrep -af 'henyey.*run'. If not running, before relaunching: (i) `rm -f ~/data/mainnet/mainnet.lock` to clear any stale lockfile the dead process left behind; (ii) preserve the prior session's log so its final lines are post-mortem-debuggable — `mv ~/data/<session-id>/logs/monitor.log ~/data/<session-id>/logs/monitor.log.crashed-$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true`; (iii) relaunch with **append** redirection so interleaving restart pathways don't nuke history: RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey --mainnet run <RUN_FLAGS> -c <CONFIG> >> ~/data/<session-id>/logs/monitor.log 2>&1 &
 (4) Memory — run: ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1) and convert to MB. If RSS > 12 GB, flag HIGH MEMORY. If RSS > 16 GB or free memory < 4 GB, restart the node (kill <PID>, wait 10s, kill -9 if still alive, then relaunch as in check 3).
 (5) Disk — run: df -h ~/data | tail -1. If usage > 85%, flag LOW DISK.
 (6) Session disk — run: du -sh ~/data/<session-id>/ and du -sh ~/data/mainnet/. If combined > 200 GB, flag SESSION DISK HIGH.
