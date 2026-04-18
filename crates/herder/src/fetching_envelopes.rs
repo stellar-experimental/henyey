@@ -602,25 +602,27 @@ impl FetchingEnvelopes {
 
     /// Check all fetching envelopes and move any that are now ready.
     fn move_ready_envelopes_for_tx_set(&self, tx_set_hash: &Hash256) {
-        // Iterate through all slots and check envelopes
-        for slot_entry in self.slots.iter() {
-            let slot = *slot_entry.key();
-            let mut fetching_to_check: Vec<(Hash256, ScpEnvelope)> = Vec::new();
-
-            // Collect envelopes that reference this tx set
-            if let Some(slot_state) = self.slots.get(&slot) {
-                for (env_hash, (envelope, _)) in slot_state.fetching.iter() {
-                    let hashes = Self::extract_tx_set_hashes(envelope);
-                    if hashes.iter().any(|h| h == tx_set_hash) {
-                        fetching_to_check.push((*env_hash, envelope.clone()));
+        // Phase 1: Collect envelopes under read guards only.
+        // Scoped to ensure all RefMulti (per-shard read guards) drop
+        // before phase 2 acquires write locks via get_mut().
+        let to_check: Vec<ScpEnvelope> = {
+            let mut result = Vec::new();
+            for slot_entry in self.slots.iter() {
+                for (_, (env, _)) in slot_entry.fetching.iter() {
+                    if Self::extract_tx_set_hashes(env)
+                        .iter()
+                        .any(|h| h == tx_set_hash)
+                    {
+                        result.push(env.clone());
                     }
                 }
             }
+            result
+        }; // ← All RefMulti guards dropped here
 
-            // Check each one
-            for (_env_hash, envelope) in fetching_to_check {
-                self.check_and_move_to_ready(envelope);
-            }
+        // Phase 2: Mutate with no read guards held.
+        for envelope in to_check {
+            self.check_and_move_to_ready(envelope);
         }
     }
 
@@ -1463,6 +1465,111 @@ mod tests {
             "tx_set_cache should not exceed max_tx_set_cache={}, got {}",
             4,
             fetching.tx_set_cache_size()
+        );
+    }
+
+    // =========================================================================
+    // Regression: DashMap iter + get_mut deadlock (#1719)
+    // =========================================================================
+
+    /// Build a signed StellarValue referencing a specific tx_set_hash.
+    fn make_signed_stellar_value_with_hash(tx_set_hash: Hash256) -> Vec<u8> {
+        use stellar_xdr::curr::{
+            LedgerCloseValueSignature, StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
+        };
+        let sv = StellarValue {
+            tx_set_hash: Hash(tx_set_hash.0),
+            close_time: TimePoint(12345),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id: XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }),
+        };
+        sv.to_xdr(Limits::none()).unwrap()
+    }
+
+    /// Regression test for #1719: move_ready_envelopes_for_tx_set deadlocked
+    /// because it called check_and_move_to_ready (which acquires a write lock
+    /// via get_mut) while still holding a read guard from slots.iter().
+    ///
+    /// Uses a timeout channel to detect deadlock without hanging the test binary.
+    #[test]
+    fn test_tx_set_available_does_not_deadlock() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let slot: SlotIndex = 100;
+        let tx_set_hash = Hash256::from_bytes([42u8; 32]);
+        let qs_hash = Hash256::from_bytes([1u8; 32]);
+
+        let fetching = Arc::new(FetchingEnvelopes::with_defaults());
+
+        // Cache the quorum set so the only missing dependency is the TxSet.
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        fetching.cache_quorum_set(
+            qs_hash,
+            ScpQuorumSet {
+                threshold: 1,
+                validators: vec![node_id.clone()].try_into().unwrap(),
+                inner_sets: vec![].try_into().unwrap(),
+            },
+        );
+
+        // Build an envelope whose StellarValue references our tx_set_hash.
+        let sv_bytes = make_signed_stellar_value_with_hash(tx_set_hash);
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: Hash(qs_hash.0),
+                    votes: vec![Value(sv_bytes.try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: Signature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        // Insert directly into slots.fetching, bypassing the fetcher tracker.
+        // This ensures recv_tx_set (called inside tx_set_available) won't
+        // handle it, forcing the fallback scan in move_ready_envelopes_for_tx_set.
+        let env_hash = FetchingEnvelopes::compute_envelope_hash(&envelope);
+        fetching
+            .slots
+            .entry(slot)
+            .or_default()
+            .fetching
+            .insert(env_hash, (envelope, Instant::now()));
+
+        assert_eq!(fetching.fetching_count(), 1);
+        assert_eq!(fetching.ready_count(), 0);
+
+        // Call tx_set_available on a separate thread with a timeout.
+        // Before the fix, this deadlocked inside move_ready_envelopes_for_tx_set.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let fe = fetching.clone();
+        std::thread::spawn(move || {
+            fe.tx_set_available(tx_set_hash, slot);
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("tx_set_available deadlocked (regression #1719)");
+
+        // Envelope should have moved from fetching to ready.
+        assert_eq!(
+            fetching.fetching_count(),
+            0,
+            "envelope should no longer be in fetching"
+        );
+        assert_eq!(
+            fetching.ready_count(),
+            1,
+            "envelope should have moved to ready"
         );
     }
 }
