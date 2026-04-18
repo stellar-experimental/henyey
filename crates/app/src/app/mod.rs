@@ -206,6 +206,7 @@ mod archive_cache;
 mod bootstrap;
 mod catchup_impl;
 mod close;
+mod close_pipeline;
 mod consensus;
 mod ledger_close;
 mod lifecycle;
@@ -3015,16 +3016,12 @@ mod tests {
             upgrades: Vec::new(),
         };
 
-        let mut pending_close = Some(pending);
-        let mut pending_persist: Option<super::types::PendingPersist> = None;
+        let mut pipeline = super::close_pipeline::ClosePipeline::new();
+        pipeline.start_close(pending);
 
-        app.drain_close_pipeline(&mut pending_persist, &mut pending_close)
-            .await;
+        app.drain_close_pipeline(&mut pipeline).await;
 
-        assert!(
-            pending_close.is_none(),
-            "pending_close should be consumed by drain"
-        );
+        assert!(pipeline.is_idle(), "pipeline should be idle after drain");
         assert!(
             !app.is_applying_ledger.load(Ordering::Relaxed),
             "is_applying_ledger should be cleared after drain"
@@ -3054,7 +3051,11 @@ mod tests {
             persist_done_clone.store(true, Ordering::SeqCst);
         });
 
-        let mut pending_persist = Some(super::types::PendingPersist {
+        // Note: The state machine normally prevents both being active at once,
+        // but drain_close_pipeline handles it defensively by draining persist
+        // first, then close. We test this by directly setting both fields.
+        let mut pipeline = super::close_pipeline::ClosePipeline::new();
+        pipeline.persisting = Some(super::types::PendingPersist {
             handle: persist_handle,
             ledger_seq: 41,
         });
@@ -3085,13 +3086,11 @@ mod tests {
             upgrades: Vec::new(),
         };
 
-        let mut pending_close = Some(pending);
+        pipeline.closing = Some(pending);
 
-        app.drain_close_pipeline(&mut pending_persist, &mut pending_close)
-            .await;
+        app.drain_close_pipeline(&mut pipeline).await;
 
-        assert!(pending_persist.is_none(), "persist should be consumed");
-        assert!(pending_close.is_none(), "close should be consumed");
+        assert!(pipeline.is_idle(), "pipeline should be idle after drain");
         assert!(
             persist_done.load(Ordering::SeqCst),
             "persist should have completed"

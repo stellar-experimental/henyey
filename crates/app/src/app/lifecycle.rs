@@ -214,12 +214,8 @@ impl App {
         let mut scp_messages_last_heartbeat: u64 = 0;
         let mut last_scp_message_at = self.clock.now();
 
-        // In-progress background ledger close. Polled in the select loop.
-        let mut pending_close: Option<PendingLedgerClose> = None;
-
-        // In-progress background persist (DB writes + bucket flush).
-        // Gated: next close won't start until persist completes.
-        let mut pending_persist: Option<PendingPersist> = None;
+        // Close + persist pipeline state machine. See close_pipeline.rs.
+        let mut close_pipeline = super::close_pipeline::ClosePipeline::new();
 
         // Maximum messages to drain from SCP/fetch channels per tick.
         // On mainnet with 24+ validators, SCP messages can arrive faster
@@ -249,14 +245,14 @@ impl App {
 
                 // Await pending ledger close completion
                 join_result = async {
-                    match pending_close.as_mut() {
+                    match close_pipeline.closing.as_mut() {
                         Some(p) => (&mut p.handle).await,
                         None => std::future::pending().await,
                     }
                 } => {
                     self.set_phase(6); // 6 = pending_close
                     tracing::debug!(select_iteration, "BRANCH: pending_close completed");
-                    let pending = pending_close.take().unwrap();
+                    let pending = close_pipeline.take_close();
                     let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
                     let success = self
                         .handle_close_complete(
@@ -272,13 +268,9 @@ impl App {
                         // dispatch at ledger_close.rs); the `try_recv` is
                         // non-blocking because the send already happened
                         // synchronously inside handle_close_complete.
-                        debug_assert!(
-                            pending_persist.is_none(),
-                            "new close persist while previous persist still pending"
-                        );
                         match persist_rx.try_recv() {
                             Ok(pt) => {
-                                pending_persist = Some(pt);
+                                close_pipeline.start_persist(pt);
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -341,15 +333,13 @@ impl App {
                         }
 
                         // Don't start the next close here — wait for
-                        // pending_persist to complete first. This ensures
-                        // the DB has the previous ledger's data before the
-                        // next close references it. `pending_persist` is
-                        // always Some on success (handle_close_complete's
-                        // Err arm at line 1924 calls fatal_persist_error),
-                        // so starting the next close here is unreachable.
-                        // `finish_rapid_close_cycle` is also unreachable
-                        // here — it fires from the `persist_result` arm
-                        // once the deferred persist completes.
+                        // persist to complete first. This ensures the DB
+                        // has the previous ledger's data before the next
+                        // close references it. The pipeline is now in
+                        // Persisting state (start_persist above), so
+                        // is_idle() returns false and no close can start.
+                        // `finish_rapid_close_cycle` fires from the
+                        // persist_result arm once persist completes.
                     }
                 }
 
@@ -395,11 +385,7 @@ impl App {
                             // Dispatched from the event loop (not inside the catchup
                             // task) to avoid nested spawn_blocking (#1713, #1735).
                             if let Some(ready) = persist_ready {
-                                debug_assert!(
-                                    pending_persist.is_none(),
-                                    "new catchup persist while previous persist still pending"
-                                );
-                                pending_persist = Some(ready.spawn());
+                                close_pipeline.start_persist(ready.spawn());
                             }
                         }
                         Err(_) => {
@@ -432,10 +418,11 @@ impl App {
                         }
                     }
 
-                    // Kick off first buffered close — but only if no persist
-                    // is pending (it will start close when persist completes).
-                    if pending_close.is_none() && pending_persist.is_none() {
-                        pending_close = self.try_start_ledger_close().await;
+                    // Kick off first buffered close — but only if pipeline is idle
+                    // (no persist pending from catchup or prior close).
+                    if close_pipeline.is_idle() {
+                        let next = self.try_start_ledger_close().await;
+                        close_pipeline.try_start_close(next);
                     }
                 }
 
@@ -443,12 +430,12 @@ impl App {
                 // Once the DB writes and bucket flush finish, we can start
                 // the next ledger close.
                 persist_result = async {
-                    match pending_persist.as_mut() {
+                    match close_pipeline.persisting.as_mut() {
                         Some(p) => (&mut p.handle).await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    let persist = pending_persist.take().unwrap();
+                    let persist = close_pipeline.take_persist();
                     if let Err(e) = persist_result {
                         tracing::error!(
                             error = %e,
@@ -463,11 +450,12 @@ impl App {
                     );
 
                     // Now start the next close (persist is done, DB is up to date).
-                    if pending_close.is_none() {
-                        pending_close = self.try_start_ledger_close().await;
+                    if close_pipeline.is_idle() {
+                        let next = self.try_start_ledger_close().await;
+                        close_pipeline.try_start_close(next);
 
                         // If no more closes ready, rapid close cycle ended.
-                        if pending_close.is_none() {
+                        if close_pipeline.is_idle() {
                             self.finish_rapid_close_cycle().await;
                         }
                     }
@@ -483,8 +471,9 @@ impl App {
                     self.process_verified(ve).await;
                     self.scp_verify_output_backlog
                         .store(verified_rx.len() as u64, Ordering::Relaxed);
-                    if pending_close.is_none() && pending_catchup.is_none() {
-                        pending_close = self.try_start_ledger_close().await;
+                    if close_pipeline.is_idle() && pending_catchup.is_none() {
+                        let next = self.try_start_ledger_close().await;
+                        close_pipeline.try_start_close(next);
                     }
                     tracing::trace!(select_iteration, "BRANCH: verified_rx done");
                 }
@@ -510,8 +499,9 @@ impl App {
                     self.pump_scp_intake(scp_msg, &mut verified_rx).await;
                     // After processing an SCP message (which may buffer an
                     // EXTERNALIZE), kick off a buffered close if none is running.
-                    if pending_close.is_none() && pending_catchup.is_none() {
-                        pending_close = self.try_start_ledger_close().await;
+                    if close_pipeline.is_idle() && pending_catchup.is_none() {
+                        let next = self.try_start_ledger_close().await;
+                        close_pipeline.try_start_close(next);
                     }
                     tracing::trace!(select_iteration, "BRANCH: scp_message_rx done");
                 }
@@ -531,8 +521,9 @@ impl App {
                     self.handle_overlay_message(fetch_msg).await;
                     // After processing a fetch response (which may deliver a
                     // tx_set), kick off a buffered close if none is running.
-                    if pending_close.is_none() && pending_catchup.is_none() {
-                        pending_close = self.try_start_ledger_close().await;
+                    if close_pipeline.is_idle() && pending_catchup.is_none() {
+                        let next = self.try_start_ledger_close().await;
+                        close_pipeline.try_start_close(next);
                     }
                     tracing::trace!(select_iteration, "BRANCH: fetch_response_rx done");
                 }
@@ -714,8 +705,9 @@ impl App {
                     }
 
                     // Start a background ledger close if one isn't already running.
-                    if pending_close.is_none() {
-                        pending_close = self.try_start_ledger_close().await;
+                    if close_pipeline.is_idle() {
+                        let next = self.try_start_ledger_close().await;
+                        close_pipeline.try_start_close(next);
 
                         // Proactive gap detection: if no close started and the next
                         // slot's EXTERNALIZE is missing while we have later ones,
@@ -723,7 +715,7 @@ impl App {
                         // missed EXTERNALIZEs within seconds, while peers still have
                         // the data cached (~60s window). Without this, the node waits
                         // for SyncRecoveryManager (35s timeout) which is too late.
-                        if pending_close.is_none() && self.herder.state().can_receive_scp() {
+                        if close_pipeline.is_idle() && self.herder.state().can_receive_scp() {
                             let cl = self.current_ledger_seq();
                             let latest = self.herder.latest_externalized_slot().unwrap_or(0);
                             let next = cl as u64 + 1;
@@ -752,8 +744,8 @@ impl App {
                     self.request_pending_tx_sets().await;
 
                     // Publish queued history checkpoints.  This is normally done
-                    // from the pending_close arm, but for solo validators the
-                    // select may pick the tick arm repeatedly before pending_close.
+                    // from the close_pipeline completion arm, but for solo validators
+                    // the select may pick the tick arm repeatedly before close completes.
                     if self.is_validator {
                         self.maybe_publish_history().await;
                     }
@@ -968,8 +960,7 @@ impl App {
 
         // Drain the close pipeline before shutdown (parity: stellar-core
         // joins the ledger-close thread first in idempotentShutdown).
-        self.drain_close_pipeline(&mut pending_persist, &mut pending_close)
-            .await;
+        self.drain_close_pipeline(&mut close_pipeline).await;
 
         self.set_state(AppState::ShuttingDown).await;
         self.shutdown_internal().await?;
@@ -1468,19 +1459,19 @@ impl App {
     /// thread first before tearing down subsystems.
     ///
     /// Order matters:
-    /// 1. Drain `pending_persist` first — a prior close's (or catchup's) DB
-    ///    writes may be in-flight.  Persist panics abort the process, matching
-    ///    the normal event-loop behavior (`lifecycle.rs` persist-complete arm).
-    /// 2. Drain `pending_close` — await the `spawn_blocking` task, then call
+    /// 1. Drain persist first — a prior close's (or catchup's) DB writes may
+    ///    be in-flight.  Persist panics abort the process, matching the normal
+    ///    event-loop behavior (persist-complete arm).
+    /// 2. Drain close — await the `spawn_blocking` task, then call
     ///    `handle_close_complete()` with `LedgerCloseFinalizer::inline()` so
     ///    the close's own persist runs to completion before we return.
     pub(super) async fn drain_close_pipeline(
         &self,
-        pending_persist: &mut Option<super::types::PendingPersist>,
-        pending_close: &mut Option<super::types::PendingLedgerClose>,
+        pipeline: &mut super::close_pipeline::ClosePipeline,
     ) {
         // 1. Drain prior persist (abort on panic, matching the normal path).
-        if let Some(persist) = pending_persist.take() {
+        if pipeline.persisting.is_some() {
+            let persist = pipeline.take_persist();
             tracing::info!(
                 ledger_seq = persist.ledger_seq,
                 "Awaiting pending persist on shutdown"
@@ -1497,7 +1488,8 @@ impl App {
 
         // 2. Drain pending close (parity: stellar-core joins ledger-close
         //    thread first in idempotentShutdown).
-        if let Some(mut pending) = pending_close.take() {
+        if pipeline.closing.is_some() {
+            let mut pending = pipeline.take_close();
             tracing::info!(
                 ledger_seq = pending.ledger_seq,
                 "Awaiting pending ledger close on shutdown"
