@@ -125,7 +125,10 @@ impl Cluster {
     }
 
     fn merge(&mut self, other: &Cluster) {
-        self.instructions += other.instructions;
+        self.instructions = self
+            .instructions
+            .checked_add(other.instructions)
+            .expect("cluster instructions overflow on merge");
         self.conflicts.union_with(&other.conflicts);
         self.tx_ids.union_with(&other.tx_ids);
     }
@@ -163,7 +166,9 @@ impl ParallelPartitionConfig {
     }
 
     fn instructions_per_stage(&self) -> u64 {
-        self.instructions_per_cluster * self.clusters_per_stage as u64
+        self.instructions_per_cluster
+            .checked_mul(self.clusters_per_stage as u64)
+            .expect("instructions_per_stage overflow")
     }
 }
 
@@ -199,7 +204,11 @@ impl Stage {
     /// Try to add a transaction to this stage. Returns true if successful.
     fn try_add(&mut self, tx: &BuilderTx) -> bool {
         // Fast fail: check if total instructions would exceed stage limit.
-        if self.total_instructions + tx.instructions as u64 > self.config.instructions_per_stage() {
+        if self
+            .total_instructions
+            .checked_add(tx.instructions as u64)
+            .map_or(true, |sum| sum > self.config.instructions_per_stage())
+        {
             return false;
         }
 
@@ -223,7 +232,10 @@ impl Stage {
         let merged_cluster = new_clusters.last().unwrap();
         if self.try_in_place_bin_packing(merged_cluster, &conflicting_indices) {
             self.clusters = new_clusters;
-            self.total_instructions += tx.instructions as u64;
+            self.total_instructions = self
+                .total_instructions
+                .checked_add(tx.instructions as u64)
+                .expect("total instructions overflow");
             return true;
         }
 
@@ -244,7 +256,10 @@ impl Stage {
                 self.clusters = new_clusters;
                 self.bin_packing = new_packing;
                 self.bin_instructions = new_bin_instructions;
-                self.total_instructions += tx.instructions as u64;
+                self.total_instructions = self
+                    .total_instructions
+                    .checked_add(tx.instructions as u64)
+                    .expect("total instructions overflow");
                 true
             }
             None => {
@@ -301,23 +316,36 @@ impl Stage {
         let mut removed: Vec<(usize, u64, BitSet)> = Vec::new();
         for &idx in conflicting_indices {
             let cluster = &self.clusters[idx];
-            // Find which bin this cluster is in.
-            for (bin_id, bin) in self.bin_packing.iter().enumerate() {
-                if bin.intersects(&cluster.tx_ids) {
-                    removed.push((bin_id, cluster.instructions, cluster.tx_ids.clone()));
-                    self.bin_instructions[bin_id] -= cluster.instructions;
-                    self.bin_packing[bin_id].difference_with(&cluster.tx_ids);
-                    break;
-                }
-            }
+            // Find which bin this cluster is in — must exist in exactly one.
+            let matching_bins: Vec<usize> = self
+                .bin_packing
+                .iter()
+                .enumerate()
+                .filter(|(_, bin)| bin.intersects(&cluster.tx_ids))
+                .map(|(id, _)| id)
+                .collect();
+            assert!(
+                matching_bins.len() == 1,
+                "cluster must be in exactly one bin, found {}",
+                matching_bins.len()
+            );
+            let bin_id = matching_bins[0];
+            removed.push((bin_id, cluster.instructions, cluster.tx_ids.clone()));
+            self.bin_instructions[bin_id] = self.bin_instructions[bin_id]
+                .checked_sub(cluster.instructions)
+                .expect("bin instructions underflow during removal");
+            self.bin_packing[bin_id].difference_with(&cluster.tx_ids);
         }
 
         // Try to fit the new (merged) cluster into an existing bin.
         for bin_id in 0..self.config.clusters_per_stage as usize {
-            if self.bin_instructions[bin_id] + new_cluster.instructions
-                <= self.config.instructions_per_cluster
+            if self.bin_instructions[bin_id]
+                .checked_add(new_cluster.instructions)
+                .map_or(false, |sum| sum <= self.config.instructions_per_cluster)
             {
-                self.bin_instructions[bin_id] += new_cluster.instructions;
+                self.bin_instructions[bin_id] = self.bin_instructions[bin_id]
+                    .checked_add(new_cluster.instructions)
+                    .expect("bin instructions overflow during placement");
                 self.bin_packing[bin_id].union_with(&new_cluster.tx_ids);
                 return true;
             }
@@ -325,7 +353,9 @@ impl Stage {
 
         // Revert the removals.
         for (bin_id, insns, tx_ids) in removed {
-            self.bin_instructions[bin_id] += insns;
+            self.bin_instructions[bin_id] = self.bin_instructions[bin_id]
+                .checked_add(insns)
+                .expect("bin instructions overflow during revert");
             self.bin_packing[bin_id].union_with(&tx_ids);
         }
         false
@@ -362,8 +392,13 @@ fn bin_pack_clusters(
         let cluster = &clusters[idx];
         let mut packed = false;
         for bin_id in 0..n_bins {
-            if bin_instructions[bin_id] + cluster.instructions <= max_instructions_per_bin {
-                bin_instructions[bin_id] += cluster.instructions;
+            if bin_instructions[bin_id]
+                .checked_add(cluster.instructions)
+                .map_or(false, |sum| sum <= max_instructions_per_bin)
+            {
+                bin_instructions[bin_id] = bin_instructions[bin_id]
+                    .checked_add(cluster.instructions)
+                    .expect("bin instructions overflow during packing");
                 bins[bin_id].union_with(&cluster.tx_ids);
                 packed = true;
                 break;
@@ -1326,6 +1361,182 @@ mod tests {
             !had_tx_not_fitting,
             "should not report tx not fitting when all txs included"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Overflow guard tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "cluster instructions overflow on merge")]
+    fn test_cluster_merge_overflow() {
+        let mut c1 = Cluster {
+            instructions: u64::MAX - 10,
+            conflicts: BitSet::default(),
+            tx_ids: BitSet::default(),
+        };
+        let c2 = Cluster {
+            instructions: 20,
+            conflicts: BitSet::default(),
+            tx_ids: BitSet::default(),
+        };
+        c1.merge(&c2);
+    }
+
+    #[test]
+    #[should_panic(expected = "instructions_per_stage overflow")]
+    fn test_instructions_per_stage_overflow() {
+        let config = ParallelPartitionConfig {
+            clusters_per_stage: u32::MAX,
+            instructions_per_cluster: u64::MAX,
+        };
+        let _ = config.instructions_per_stage();
+    }
+
+    #[test]
+    fn test_try_add_rejects_on_overflow_comparison() {
+        // Create a stage with total_instructions near u64::MAX.
+        let config = ParallelPartitionConfig {
+            clusters_per_stage: 2,
+            instructions_per_cluster: u64::MAX / 2,
+        };
+        let mut stage = Stage::new(config);
+        stage.total_instructions = u64::MAX - 5;
+
+        // A tx with instructions > 5 should be rejected (not panic) because
+        // the checked_add comparison detects potential overflow.
+        let tx = BuilderTx {
+            id: 0,
+            instructions: 100,
+            conflicts: BitSet::default(),
+        };
+        assert!(!stage.try_add(&tx));
+    }
+
+    #[test]
+    #[should_panic(expected = "bin instructions underflow during removal")]
+    fn test_bin_instructions_underflow() {
+        let config = ParallelPartitionConfig {
+            clusters_per_stage: 2,
+            instructions_per_cluster: 1000,
+        };
+        let mut stage = Stage::new(config);
+
+        // Manually set up corrupt state: cluster claims 500 instructions
+        // but bin only has 100.
+        let mut tx_ids = BitSet::default();
+        tx_ids.set(0);
+        stage.bin_packing[0].set(0);
+        stage.bin_instructions[0] = 100;
+        stage.clusters.push(Cluster {
+            instructions: 500,
+            conflicts: BitSet::default(),
+            tx_ids,
+        });
+
+        // A new cluster that conflicts with cluster 0.
+        let mut new_conflicts = BitSet::default();
+        new_conflicts.set(0);
+        let mut new_tx_ids = BitSet::default();
+        new_tx_ids.set(1);
+        let new_cluster = Cluster {
+            instructions: 50,
+            conflicts: new_conflicts,
+            tx_ids: new_tx_ids,
+        };
+
+        // This should panic during removal since 100 - 500 underflows.
+        stage.try_in_place_bin_packing(&new_cluster, &[0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "cluster must be in exactly one bin")]
+    fn test_cluster_not_found_in_bin_panics() {
+        let config = ParallelPartitionConfig {
+            clusters_per_stage: 2,
+            instructions_per_cluster: 1000,
+        };
+        let mut stage = Stage::new(config);
+
+        // Cluster exists but its tx_ids are NOT in any bin_packing.
+        let mut tx_ids = BitSet::default();
+        tx_ids.set(0);
+        stage.clusters.push(Cluster {
+            instructions: 100,
+            conflicts: BitSet::default(),
+            tx_ids,
+        });
+        // bin_packing is empty — cluster 0 is not in any bin.
+
+        let mut new_tx_ids = BitSet::default();
+        new_tx_ids.set(1);
+        let new_cluster = Cluster {
+            instructions: 50,
+            conflicts: BitSet::default(),
+            tx_ids: new_tx_ids,
+        };
+
+        stage.try_in_place_bin_packing(&new_cluster, &[0]);
+    }
+
+    #[test]
+    fn test_bin_pack_comparison_rejects_on_overflow() {
+        // Set up bin_instructions near u64::MAX to test the checked_add
+        // comparison in bin_pack_clusters.
+        let mut bin_instructions = vec![u64::MAX - 5, 0];
+        let mut cluster_tx_ids = BitSet::default();
+        cluster_tx_ids.set(0);
+        let clusters = vec![Cluster {
+            instructions: 100,
+            conflicts: BitSet::default(),
+            tx_ids: cluster_tx_ids,
+        }];
+
+        // First bin would overflow, second bin has room (max is u64::MAX).
+        let result = bin_pack_clusters(&clusters, 2, u64::MAX, &mut bin_instructions);
+        // Should succeed by packing into second bin (not panic).
+        assert!(result.is_some());
+        assert_eq!(bin_instructions[0], u64::MAX - 5); // unchanged
+        assert_eq!(bin_instructions[1], 100); // packed here
+    }
+
+    #[test]
+    fn test_normal_bin_accounting_cycle() {
+        // Verify normal operation: add clusters, remove, revert.
+        let config = ParallelPartitionConfig {
+            clusters_per_stage: 2,
+            instructions_per_cluster: 1000,
+        };
+        let mut stage = Stage::new(config);
+
+        // Add cluster 0 with 300 instructions to bin 0.
+        let mut tx_ids_0 = BitSet::default();
+        tx_ids_0.set(0);
+        stage.bin_packing[0].set(0);
+        stage.bin_instructions[0] = 300;
+        stage.clusters.push(Cluster {
+            instructions: 300,
+            conflicts: BitSet::default(),
+            tx_ids: tx_ids_0,
+        });
+
+        // New cluster that conflicts with cluster 0.
+        let mut new_conflicts = BitSet::default();
+        new_conflicts.set(0);
+        let mut new_tx_ids = BitSet::default();
+        new_tx_ids.set(1);
+        let new_cluster = Cluster {
+            instructions: 200,
+            conflicts: new_conflicts,
+            tx_ids: new_tx_ids,
+        };
+
+        // This should succeed: remove cluster 0 (300), then fit new_cluster (200).
+        let result = stage.try_in_place_bin_packing(&new_cluster, &[0]);
+        assert!(result);
+        // The new cluster (200 instructions) should be in some bin.
+        let total: u64 = stage.bin_instructions.iter().sum();
+        assert_eq!(total, 200);
     }
 }
 
