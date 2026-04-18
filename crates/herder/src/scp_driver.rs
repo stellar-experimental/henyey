@@ -79,17 +79,20 @@ fn describe_stellar_value_ext(ext: &StellarValueExt) -> String {
 pub enum ValueValidation {
     /// Value is fully valid.
     Valid,
-    /// Value might be valid but we're missing data (past/future slot
-    /// without tracking context, close-time check against stale data,
-    /// etc.). Maps to `ValidationLevel::MaybeValid`, which clears the
-    /// slot's `fully_validated` flag (stellar-core parity).
+    /// Value might be valid but we're missing data (no tracking state,
+    /// past-slot `tracking_index > slot_index`, close-time check
+    /// against stale data, etc.). Maps to
+    /// `ValidationLevel::MaybeValid`, which clears the slot's
+    /// `fully_validated` flag (stellar-core parity).
     MaybeValid,
-    /// Structurally valid value whose transaction set has not yet
-    /// been fetched. Maps to `ValidationLevel::MaybeValidTxSetPending`,
-    /// which does NOT clear `fully_validated`. See the
-    /// `ValidationLevel` enum in `henyey_scp::driver` for the full
-    /// rationale (issue #1795).
-    MaybeValidTxSetPending,
+    /// Structurally valid value whose full validation is deferred by a
+    /// henyey-specific fast-path divergence from stellar-core. Covers
+    /// the missing-tx_set-for-current-ledger case (#1795) and the
+    /// future-slot-while-apply-lags-SCP case (#1798). Maps to
+    /// `ValidationLevel::MaybeValidDeferred`, which does NOT clear
+    /// `fully_validated`. See the `ValidationLevel` enum in
+    /// `henyey_scp::driver` for the full rationale.
+    MaybeValidDeferred,
     /// Value is invalid.
     Invalid,
 }
@@ -706,11 +709,36 @@ impl ScpDriver {
             return ValueValidation::Invalid;
         }
 
+        // `tracking_index == slot_index` combined with `slot_index !=
+        // lcl_seq + 1` (the assertion at the top of this function)
+        // implies `lcl_seq + 1 < slot_index` — i.e. ledger apply is
+        // lagging behind SCP externalization, and the caller is
+        // processing a peer envelope that henyey's
+        // `advance_tracking_slot` →
+        // `drain_and_process_pending(consensus_index)` just released
+        // synchronously, ahead of apply.
+        //
+        // Stellar-core's `safelyProcessSCPQueue` defers the drain to
+        // the main thread via `postOnMainThread`
+        // (`HerderImpl.cpp:1194`), giving apply a chance to complete
+        // first. Henyey's fast-path does not — so we see this code
+        // path with `lcl_seq + 1 < slot_index`, whereas stellar-core
+        // typically would not. Return `MaybeValidDeferred` rather than
+        // `MaybeValid` so the ballot protocol does NOT clear the
+        // slot's `fully_validated` flag. If we cleared it here, the
+        // validator would later reach consensus on this slot but
+        // `send_latest_envelope` would refuse to emit the local
+        // EXTERNALIZE — silently dropping out of consensus from that
+        // slot onward. This was the observed stall in issue #1798.
+        //
+        // See the `ValidationLevel::MaybeValidDeferred` doc comment
+        // (`crates/scp/src/driver.rs`) for the full rationale.
         trace!(
-            "Can't validate locally, value may be valid for slot {}",
+            "Can't validate locally, value may be valid for slot {} \
+             (MaybeValidDeferred; apply lagging SCP)",
             slot_index
         );
-        ValueValidation::MaybeValid
+        ValueValidation::MaybeValidDeferred
     }
 
     /// Validate an SCP value.
@@ -841,7 +869,7 @@ impl ScpDriver {
                 // PendingEnvelopes buffers all envelopes until deps are fetched,
                 // so validateValue always has the tx_set. Our code sends
                 // EXTERNALIZE to SCP immediately for faster tracking advance
-                // (see process_scp_envelope). Return MaybeValidTxSetPending so
+                // (see process_scp_envelope). Return MaybeValidDeferred so
                 // SCP can still externalize the slot while the tx_set fetch
                 // completes, WITHOUT clearing the slot's fully_validated flag.
                 //
@@ -851,15 +879,15 @@ impl ScpDriver {
                 // stellar-core never actually reaches this code path with a
                 // missing tx_set — its PendingEnvelopes buffering ensures the
                 // tx_set is always present by the time validateValue runs. See
-                // the `ValidationLevel::MaybeValidTxSetPending` doc comment for
-                // the complete rationale.
+                // the `ValidationLevel::MaybeValidDeferred` doc comment for
+                // the complete rationale (issues #1795 and #1798).
                 if !nomination {
                     debug!(
                         "Missing transaction set during ballot protocol: {} \
-                         (MaybeValidTxSetPending)",
+                         (MaybeValidDeferred)",
                         tx_set_hash
                     );
-                    return ValueValidation::MaybeValidTxSetPending;
+                    return ValueValidation::MaybeValidDeferred;
                 }
                 debug!("Missing transaction set: {}", tx_set_hash);
                 return ValueValidation::Invalid;
@@ -2325,19 +2353,19 @@ mod cache_tests {
         );
 
         // During ballot protocol: missing tx set should return
-        // MaybeValidTxSetPending (EXTERNALIZE envelopes may arrive
-        // before the tx_set is fetched, via the herder fast-path).
-        // This variant specifically does NOT cause the ballot
-        // protocol to clear `Slot::fully_validated` — see the enum
-        // doc comment on `ValidationLevel` and regression test
-        // `test_issue_1795_maybe_valid_tx_set_pending_does_not_clear_fully_validated`
+        // MaybeValidDeferred (EXTERNALIZE envelopes may arrive before
+        // the tx_set is fetched, via the herder fast-path). This
+        // variant specifically does NOT cause the ballot protocol to
+        // clear `Slot::fully_validated` — see the enum doc comment on
+        // `ValidationLevel` and regression test
+        // `test_issue_1795_maybe_valid_deferred_does_not_clear_fully_validated_tx_set_pending`
         // in `crates/scp/src/ballot/mod.rs`.
         let result_ballot = driver.validate_value_impl(1, &value, false);
         assert_eq!(
             result_ballot,
-            ValueValidation::MaybeValidTxSetPending,
+            ValueValidation::MaybeValidDeferred,
             "missing tx set during ballot protocol should return \
-             MaybeValidTxSetPending (issue #1795)"
+             MaybeValidDeferred (issue #1795)"
         );
 
         // Now cache the tx set and re-validate — should pass the tx set check
@@ -2413,7 +2441,7 @@ impl SCPDriver for HerderScpCallback {
         {
             ValueValidation::Valid => ValidationLevel::FullyValidated,
             ValueValidation::MaybeValid => ValidationLevel::MaybeValid,
-            ValueValidation::MaybeValidTxSetPending => ValidationLevel::MaybeValidTxSetPending,
+            ValueValidation::MaybeValidDeferred => ValidationLevel::MaybeValidDeferred,
             ValueValidation::Invalid => ValidationLevel::Invalid,
         }
     }
@@ -3360,15 +3388,26 @@ mod tests {
         );
     }
 
+    /// When tracking is ahead of LCL (ledger apply lagging SCP), a peer
+    /// envelope for the future slot whose `tracking_index == slot_index`
+    /// drains through the fast-path before apply catches up. This must
+    /// return `MaybeValidDeferred` — NOT plain `MaybeValid` — so the
+    /// ballot protocol does not clear `Slot::fully_validated` and
+    /// suppress the local EXTERNALIZE.
+    ///
+    /// This is the regression test for issue #1798. See the
+    /// `ValidationLevel::MaybeValidDeferred` doc comment for the full
+    /// rationale.
     #[test]
-    fn test_validate_past_or_future_value_tracking_same_slot() {
+    fn test_issue_1798_validate_past_or_future_value_tracking_same_slot_returns_deferred() {
         let driver = make_test_driver();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        // Tracking and tracking_index == slot_index -> re-check with tracking close time
+        // Tracking and tracking_index == slot_index with slot_index
+        // > lcl_seq + 1 (apply lagging SCP) -> MaybeValidDeferred.
         assert_eq!(
             driver.validate_past_or_future_value(
                 150,
@@ -3383,9 +3422,14 @@ mod tests {
                     }),
                 }
             ),
-            ValueValidation::MaybeValid
+            ValueValidation::MaybeValidDeferred,
+            "tracking_index == slot_index with apply lagging SCP must \
+             return MaybeValidDeferred (issue #1798) — NOT plain \
+             MaybeValid, which would clear fully_validated and \
+             suppress the local EXTERNALIZE"
         );
-        // If close_time <= tracking_close_time -> Invalid
+        // If close_time <= tracking_close_time -> Invalid (the
+        // close-time check fires before the level is selected).
         assert_eq!(
             driver.validate_past_or_future_value(
                 150,

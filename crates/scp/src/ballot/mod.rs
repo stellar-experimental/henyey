@@ -552,10 +552,10 @@ impl BallotProtocol {
         // mFullyValidated here, before advanceSlot, so that any
         // send_latest_envelope during advance_slot sees the correct state.
         //
-        // The henyey-specific `MaybeValidTxSetPending` variant does NOT
+        // The henyey-specific `MaybeValidDeferred` variant does NOT
         // clear (see the enum doc comment on `ValidationLevel` and
-        // issue #1795). Using `clears_fully_validated()` keeps the
-        // distinction in the type system.
+        // issues #1795 / #1798). Using `clears_fully_validated()`
+        // keeps the distinction in the type system.
         if validation.clears_fully_validated() {
             self.fully_validated = false;
         }
@@ -3296,18 +3296,33 @@ mod tests {
     }
 
     // =========================================================================
-    // Issue #1795: MaybeValidTxSetPending must NOT clear fully_validated
+    // Issues #1795 / #1798: MaybeValidDeferred must NOT clear fully_validated
     // =========================================================================
     //
-    // Root cause: the herder's EXTERNALIZE fast-path forwards a peer
-    // EXTERNALIZE to SCP before the tx_set is fetched, and the validator
-    // returned ValidationLevel::MaybeValid in that window. MaybeValid
-    // clears Slot::fully_validated, which in turn suppresses local
-    // EXTERNALIZE emission forever (sync_externalized_value_from_ballot
-    // never restores the flag, matching stellar-core parity). The fix
-    // introduces a distinct `MaybeValidTxSetPending` that signals "we
-    // couldn't fully validate because tx_set is still being fetched"
-    // without triggering the clear.
+    // Root cause (both issues): henyey's SCP fast-path forwards a peer
+    // envelope to the ballot protocol earlier than stellar-core's
+    // PendingEnvelopes / processSCPQueue would, producing a "maybe
+    // valid" result the validator cannot recover from:
+    //
+    //   - #1795: EXTERNALIZE forwarded before tx_set is fetched.
+    //     `validate_value_against_local_state` returned
+    //     `ValueValidation::MaybeValid` on the `is_current_ledger &&
+    //     !has_tx_set` branch.
+    //
+    //   - #1798: drain_and_process_pending(N+1) runs synchronously on
+    //     SCP externalize of slot N, ahead of ledger apply; a peer
+    //     envelope for slot N+1 drains with `lcl_seq < N` but
+    //     `tracking_index == slot_index == N+1`. In
+    //     `validate_past_or_future_value`, the
+    //     `tracking_index == slot_index` branch returned
+    //     `ValueValidation::MaybeValid`.
+    //
+    // Either MaybeValid cleared Slot::fully_validated, suppressing
+    // local EXTERNALIZE emission forever (stellar-core parity:
+    // fully_validated is never restored once cleared). The fix is a
+    // shared `MaybeValidDeferred` level that signals "we couldn't
+    // fully validate because of a henyey-specific fast-path
+    // divergence" without triggering the ballot-layer clear.
 
     /// Driver that returns a configurable ValidationLevel.
     struct ConfigurableValidationDriver {
@@ -3382,22 +3397,23 @@ mod tests {
         }
     }
 
-    /// Regression test for issue #1795: `MaybeValidTxSetPending` must NOT
-    /// clear the ballot protocol's `fully_validated` flag.
+    /// Regression test for issue #1795: `MaybeValidDeferred` must NOT
+    /// clear the ballot protocol's `fully_validated` flag on the
+    /// tx_set-pending trigger.
     ///
     /// Scenario: validator is tracking; a peer sends a PREPARE envelope
     /// for the current slot; the tx_set is not yet cached, so the herder
-    /// driver returns `MaybeValidTxSetPending`. The ballot protocol
-    /// MUST leave `fully_validated` untouched so the validator can
-    /// continue broadcasting its own EXTERNALIZE envelopes once the slot
+    /// driver returns `MaybeValidDeferred`. The ballot protocol MUST
+    /// leave `fully_validated` untouched so the validator can continue
+    /// broadcasting its own EXTERNALIZE envelopes once the slot
     /// externalizes.
     #[test]
-    fn test_issue_1795_maybe_valid_tx_set_pending_does_not_clear_fully_validated() {
+    fn test_issue_1795_maybe_valid_deferred_does_not_clear_fully_validated_tx_set_pending() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let driver = Arc::new(ConfigurableValidationDriver::new(
             quorum_set.clone(),
-            ValidationLevel::MaybeValidTxSetPending,
+            ValidationLevel::MaybeValidDeferred,
         ));
         let mut bp = BallotProtocol::new();
         bp.fully_validated = true;
@@ -3416,22 +3432,76 @@ mod tests {
             driver: &driver,
             slot_index: 42,
         };
-        bp.process_envelope(&envelope, &ctx, ValidationLevel::MaybeValidTxSetPending);
+        bp.process_envelope(&envelope, &ctx, ValidationLevel::MaybeValidDeferred);
 
         assert!(
             bp.fully_validated,
-            "MaybeValidTxSetPending must NOT clear fully_validated — \
-             this is the root cause of #1795"
+            "MaybeValidDeferred must NOT clear fully_validated on the \
+             tx_set-pending trigger — this is the root cause of #1795"
+        );
+    }
+
+    /// Regression test for issue #1798: `MaybeValidDeferred` must NOT
+    /// clear the ballot protocol's `fully_validated` flag on the
+    /// future-slot trigger (apply lagging SCP).
+    ///
+    /// Scenario: SCP has externalized slot N; tracking advanced to
+    /// `consensus_index = N+1`; ledger apply for slot N has not
+    /// finished, so LCL is still < N. A peer envelope for slot N+1
+    /// drains from `PendingEnvelopes` and reaches the ballot protocol.
+    /// `validate_past_or_future_value` returns `MaybeValidDeferred`
+    /// because `tracking_index == slot_index` but `slot_index > LCL+1`.
+    /// The ballot protocol MUST leave `fully_validated` untouched so
+    /// the validator can later broadcast its own EXTERNALIZE for
+    /// slot N+1 once it reaches consensus.
+    #[test]
+    fn test_issue_1798_maybe_valid_deferred_does_not_clear_fully_validated_future_slot() {
+        let node = make_node_id(1);
+        let quorum_set = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(ConfigurableValidationDriver::new(
+            quorum_set.clone(),
+            ValidationLevel::MaybeValidDeferred,
+        ));
+        let mut bp = BallotProtocol::new();
+        bp.fully_validated = true;
+
+        // A CONFIRM envelope (non-EXTERNALIZE, so the Externalize-phase
+        // early return does not apply) arrives from a peer for this
+        // future slot.
+        let value = make_value(&[4, 5, 6]);
+        let envelope = make_prepare_envelope(
+            make_node_id(2),
+            100,
+            &quorum_set,
+            ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+        );
+
+        let ctx = SlotContext {
+            local_node_id: &node,
+            local_quorum_set: &quorum_set,
+            driver: &driver,
+            slot_index: 100,
+        };
+        bp.process_envelope(&envelope, &ctx, ValidationLevel::MaybeValidDeferred);
+
+        assert!(
+            bp.fully_validated,
+            "MaybeValidDeferred must NOT clear fully_validated on the \
+             future-slot trigger — this is the root cause of #1798"
         );
     }
 
     /// Regression guard in the opposite direction: a genuine `MaybeValid`
-    /// (past/future slot, stale close-time, etc.) MUST still clear
-    /// `fully_validated`, matching stellar-core
-    /// `BallotProtocol.cpp:208-211`. This pins the stellar-core parity
-    /// so the #1795 fix does not accidentally regress it.
+    /// (no tracking, past-slot `tracking_index > slot_index`, stale
+    /// close-time, etc.) MUST still clear `fully_validated`, matching
+    /// stellar-core `BallotProtocol.cpp:208-211`. This pins the
+    /// stellar-core parity so the #1795 / #1798 fixes do not
+    /// accidentally regress it.
     #[test]
-    fn test_issue_1795_maybe_valid_still_clears_fully_validated() {
+    fn test_maybe_valid_still_clears_fully_validated() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let driver = Arc::new(ConfigurableValidationDriver::new(
@@ -3470,12 +3540,12 @@ mod tests {
     fn test_validation_level_clears_fully_validated_helper() {
         assert!(!ValidationLevel::Invalid.clears_fully_validated());
         assert!(ValidationLevel::MaybeValid.clears_fully_validated());
-        assert!(!ValidationLevel::MaybeValidTxSetPending.clears_fully_validated());
+        assert!(!ValidationLevel::MaybeValidDeferred.clears_fully_validated());
         assert!(!ValidationLevel::FullyValidated.clears_fully_validated());
     }
 
     /// Unit test for `min_validation_level`:
-    /// `Invalid < MaybeValid < MaybeValidTxSetPending < FullyValidated`.
+    /// `Invalid < MaybeValid < MaybeValidDeferred < FullyValidated`.
     #[test]
     fn test_min_validation_level_ordering() {
         use crate::ballot::statements::min_validation_level;
@@ -3488,36 +3558,37 @@ mod tests {
         assert_eq!(
             min_validation_level(
                 ValidationLevel::Invalid,
-                ValidationLevel::MaybeValidTxSetPending
+                ValidationLevel::MaybeValidDeferred
             ),
             ValidationLevel::Invalid
         );
 
-        // MaybeValid dominates MaybeValidTxSetPending — critical for
-        // issue #1795: if one sub-value is "properly" MaybeValid, the
-        // whole statement must still clear fully_validated.
+        // MaybeValid dominates MaybeValidDeferred — critical for
+        // issues #1795 / #1798: if one sub-value is "properly"
+        // MaybeValid, the whole statement must still clear
+        // fully_validated.
         assert_eq!(
             min_validation_level(
                 ValidationLevel::MaybeValid,
-                ValidationLevel::MaybeValidTxSetPending
+                ValidationLevel::MaybeValidDeferred
             ),
             ValidationLevel::MaybeValid
         );
         assert_eq!(
             min_validation_level(
-                ValidationLevel::MaybeValidTxSetPending,
+                ValidationLevel::MaybeValidDeferred,
                 ValidationLevel::MaybeValid
             ),
             ValidationLevel::MaybeValid
         );
 
-        // MaybeValidTxSetPending dominates FullyValidated.
+        // MaybeValidDeferred dominates FullyValidated.
         assert_eq!(
             min_validation_level(
-                ValidationLevel::MaybeValidTxSetPending,
+                ValidationLevel::MaybeValidDeferred,
                 ValidationLevel::FullyValidated
             ),
-            ValidationLevel::MaybeValidTxSetPending
+            ValidationLevel::MaybeValidDeferred
         );
 
         // Two FullyValidated stays FullyValidated.

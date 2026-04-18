@@ -471,9 +471,10 @@ impl Slot {
         // to match Slot::set_fully_validated behavior.
         //
         // Use the same `clears_fully_validated()` gate as the ballot
-        // protocol so the henyey-specific `MaybeValidTxSetPending`
-        // variant does not poison the slot's fully_validated flag. See
-        // the enum doc comment on `ValidationLevel` and issue #1795.
+        // protocol so the henyey-specific `MaybeValidDeferred` variant
+        // does not poison the slot's fully_validated flag. See the
+        // enum doc comment on `ValidationLevel` and issues #1795 /
+        // #1798.
         if result != EnvelopeState::Invalid
             && validation.clears_fully_validated()
             && self.externalized_value.is_none()

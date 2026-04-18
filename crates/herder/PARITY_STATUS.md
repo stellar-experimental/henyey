@@ -519,22 +519,31 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: No metrics infrastructure; statistics tracked via simple structs
    - **Rationale**: Metrics will use Rust ecosystem libraries (prometheus, metrics crate) when added
 
-7. **EXTERNALIZE fast-path + `MaybeValidTxSetPending`** (issue #1795)
+7. **Fast-path + `MaybeValidDeferred`** (issues #1795 and #1798)
    - **stellar-core**: `PendingEnvelopes` buffers peer EXTERNALIZE
      envelopes until their tx_set arrives. By the time
      `validateValueAgainstLocalState` runs, the tx_set is always
-     present. Missing tx_set on LCL+1 returns `kInvalidValue`
-     (`HerderSCPDriver.cpp:306-311`).
+     present; missing tx_set on LCL+1 returns `kInvalidValue`
+     (`HerderSCPDriver.cpp:306-311`). In parallel-apply mode,
+     `safelyProcessSCPQueue` defers the SCP queue drain to the main
+     thread via `postOnMainThread` (`HerderImpl.cpp:1194`), giving
+     ledger apply a chance to complete before peer envelopes for the
+     next tracking slot are processed.
    - **Rust**: `process_scp_envelope` forwards peer EXTERNALIZE to SCP
      before the tx_set is fetched, so tracking advance can proceed
-     during catchup. `validate_value_against_local_state` returns
-     `ValueValidation::MaybeValidTxSetPending` in that window, which
-     maps to `ValidationLevel::MaybeValidTxSetPending` — a henyey
-     extension that does NOT clear `Slot::fully_validated`.
-   - **Rationale**: The original fast-path fixed a post-catchup stall
-     where evicted tx_sets blocked EXTERNALIZE from reaching SCP. The
-     `MaybeValidTxSetPending` variant preserves that behavior while
-     avoiding the secondary bug (issue #1795) where `MaybeValid`
+     during catchup (#1795). `advance_tracking_slot` then runs
+     `drain_and_process_pending(consensus_index)` synchronously on the
+     SCP externalize callback, ahead of ledger apply (#1798). In both
+     windows, `validate_value_against_local_state` /
+     `validate_past_or_future_value` return
+     `ValueValidation::MaybeValidDeferred`, which maps to
+     `ValidationLevel::MaybeValidDeferred` — a henyey extension that
+     does NOT clear `Slot::fully_validated`.
+   - **Rationale**: The fast-path fixed a post-catchup stall where
+     evicted tx_sets blocked EXTERNALIZE from reaching SCP, and the
+     synchronous drain avoided an extra round-trip during catchup. The
+     `MaybeValidDeferred` variant preserves both behaviors while
+     avoiding the secondary bugs (#1795 / #1798) where `MaybeValid`
      cleared `fully_validated` and permanently suppressed the
      validator's own EXTERNALIZE emission.
 

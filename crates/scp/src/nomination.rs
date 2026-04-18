@@ -525,12 +525,13 @@ impl NominationProtocol {
                         modified = true;
                     }
                 }
-                // `MaybeValidTxSetPending` is a henyey extension that
+                // `MaybeValidDeferred` is a henyey extension that
                 // behaves like `MaybeValid` outside the ballot-layer
                 // fully_validated clear (see `ValidationLevel` doc
-                // comment). Nomination treats both equally.
+                // comment, issues #1795/#1798). Nomination treats
+                // both equally.
                 ValidationLevel::MaybeValid
-                | ValidationLevel::MaybeValidTxSetPending
+                | ValidationLevel::MaybeValidDeferred
                 | ValidationLevel::Invalid => {
                     if let Some(extracted) = ctx.driver.extract_valid_value(ctx.slot_index, value) {
                         if Self::insert_unique(&mut self.votes, extracted) {
@@ -804,12 +805,13 @@ impl NominationProtocol {
                               best: &mut Option<(u64, Value)>| {
             let candidate = match ctx.driver.validate_value(ctx.slot_index, value, true) {
                 ValidationLevel::FullyValidated => Some(value.clone()),
-                // `MaybeValidTxSetPending` is a henyey extension that
+                // `MaybeValidDeferred` is a henyey extension that
                 // behaves like `MaybeValid` outside the ballot-layer
                 // fully_validated clear (see `ValidationLevel` doc
-                // comment). Nomination treats both equally.
+                // comment, issues #1795/#1798). Nomination treats
+                // both equally.
                 ValidationLevel::MaybeValid
-                | ValidationLevel::MaybeValidTxSetPending
+                | ValidationLevel::MaybeValidDeferred
                 | ValidationLevel::Invalid => ctx.driver.extract_valid_value(ctx.slot_index, value),
             };
 

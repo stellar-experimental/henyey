@@ -284,17 +284,30 @@ Corresponds to: `SCPDriver.h`
 | `ballotDidHearFromQuorum()` | `ballot_did_hear_from_quorum()` | Full |
 | `ValidationLevel` enum | `ValidationLevel` enum | Extended |
 
-**Extension note (issue #1795):** henyey's `ValidationLevel` adds a
-fourth variant `MaybeValidTxSetPending` that has no upstream equivalent.
-Stellar-core's `PendingEnvelopes` buffers EXTERNALIZE envelopes until the
-tx_set arrives, so `validateValueAgainstLocalState` never sees the
-"missing tx_set for LCL+1" case. Henyey forwards EXTERNALIZE to SCP
-before the tx_set arrives (to allow tracking advance during catchup) and
-uses the new variant to signal "we could not fully validate because the
-tx_set is still pending — do NOT clear `Slot::fully_validated`". The
-variant behaves identically to `MaybeValid` for all other SCP state
-transitions; the single behavioral difference is gated through
-`ValidationLevel::clears_fully_validated()`.
+**Extension note (issues #1795 and #1798):** henyey's `ValidationLevel`
+adds a fourth variant `MaybeValidDeferred` that has no upstream
+equivalent. The variant covers two related divergences where henyey's
+fast-path forwards an SCP envelope to the ballot protocol earlier than
+stellar-core's `PendingEnvelopes` / `processSCPQueue` would:
+
+1. **Missing tx_set for LCL+1 (#1795).** Stellar-core's
+   `PendingEnvelopes` buffers EXTERNALIZE envelopes until the tx_set
+   arrives, so `validateValueAgainstLocalState` never sees that case.
+   Henyey forwards EXTERNALIZE to SCP before the tx_set arrives (to
+   allow tracking advance during catchup).
+2. **Future slot while apply lags SCP (#1798).** Henyey's
+   `advance_tracking_slot` runs `drain_and_process_pending` synchronously
+   on the SCP externalize callback, ahead of ledger apply. Peer
+   envelopes for the new tracking slot drain through while
+   `lcl_seq + 1 < slot_index == tracking_index`. Stellar-core's
+   `safelyProcessSCPQueue` defers the drain to the main thread via
+   `postOnMainThread` (`HerderImpl.cpp:1194`).
+
+In both cases henyey uses `MaybeValidDeferred` to signal "we could not
+fully validate because of a fast-path divergence — do NOT clear
+`Slot::fully_validated`". The variant behaves identically to
+`MaybeValid` for all other SCP state transitions; the single behavioral
+difference is gated through `ValidationLevel::clears_fully_validated()`.
 | `hashHelper()` (private) | Inlined in `compute_hash_node()` / `compute_value_hash()` | Full |
 
 ### compare (`compare.rs`)

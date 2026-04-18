@@ -89,34 +89,57 @@ pub enum ValidationLevel {
     /// value against tracking state.
     MaybeValid,
 
-    /// Structurally valid value whose transaction set is not yet
-    /// available locally.
+    /// Structurally valid value whose full validation is deferred by
+    /// a henyey-specific fast-path that runs ahead of stellar-core's
+    /// equivalent timing.
     ///
     /// This variant is a henyey extension with no counterpart in
-    /// stellar-core. Upstream buffers peer EXTERNALIZE envelopes in
-    /// `PendingEnvelopes` until their tx_set arrives, so
-    /// `validateValueAgainstLocalState` never sees the "missing tx_set
-    /// for LCL+1" case — it returns `kInvalidValue` there (see
-    /// `stellar-core/src/herder/HerderSCPDriver.cpp:306-311`).
+    /// stellar-core. It covers two related divergences where we forward
+    /// an SCP envelope into the ballot protocol earlier than
+    /// stellar-core's `PendingEnvelopes` / `processSCPQueue` would:
     ///
-    /// Henyey's EXTERNALIZE fast-path (see
-    /// `crates/herder/src/herder.rs::process_scp_envelope`)
-    /// deliberately forwards peer EXTERNALIZE envelopes to SCP before
-    /// the tx_set is fetched, so tracking advance can proceed during
-    /// catchup. In that window,
-    /// `validate_value_against_local_state` returns
-    /// `MaybeValidTxSetPending` instead of `MaybeValid`.
+    /// 1. **Missing tx_set for the current ledger (#1795).**
+    ///    Stellar-core buffers peer EXTERNALIZE envelopes in
+    ///    `PendingEnvelopes` until their tx_set arrives (see
+    ///    `stellar-core/src/herder/HerderSCPDriver.cpp:306-311`, which
+    ///    returns `kInvalidValue` when the tx_set is missing). Henyey's
+    ///    EXTERNALIZE fast-path in
+    ///    `crates/herder/src/herder.rs::process_scp_envelope`
+    ///    deliberately forwards peer EXTERNALIZE envelopes to SCP
+    ///    before the tx_set is fetched so tracking advance can proceed
+    ///    during catchup.
+    ///
+    /// 2. **Future-slot envelope while apply lags SCP (#1798).**
+    ///    After SCP externalizes slot N, henyey's
+    ///    `advance_tracking_slot`
+    ///    (`crates/herder/src/herder.rs`) runs
+    ///    `drain_and_process_pending(N+1)` synchronously on the SCP
+    ///    externalize callback, ahead of ledger apply. While apply for
+    ///    slot N is still in flight, `lcl_seq < N` but
+    ///    `consensus_index = N+1`. A peer envelope for slot N+1 drains
+    ///    out of `PendingEnvelopes`, reaches
+    ///    `validate_value_against_local_state`, and takes the
+    ///    past/future path (not the `is_current_ledger` path, because
+    ///    `lcl_seq + 1 < N+1 == slot_index`). In
+    ///    `validate_past_or_future_value`, the
+    ///    `tracking_index == slot_index` branch returns this level —
+    ///    stellar-core's parallel-apply mode can also enter the same
+    ///    code path, but its `safelyProcessSCPQueue` defers drain to
+    ///    the main thread (`HerderImpl.cpp:1194`), giving apply a
+    ///    chance to catch up first.
     ///
     /// Behaviorally, this level is identical to `MaybeValid` except it
     /// does NOT cause the ballot protocol to clear
-    /// `Slot::fully_validated`. Clearing on a transient tx_set gap was
-    /// the root cause of issue #1795 — once `fully_validated` was
-    /// flipped to false it was never restored, and the validator
-    /// stopped broadcasting its own EXTERNALIZE envelopes.
+    /// `Slot::fully_validated`. Clearing on a transient fast-path
+    /// divergence was the root cause of issue #1795 (tx_set trigger)
+    /// and its sequel #1798 (future-slot trigger) — once
+    /// `fully_validated` flipped to false it was never restored, and
+    /// the validator stopped broadcasting its own EXTERNALIZE
+    /// envelopes.
     ///
     /// See [`ValidationLevel::clears_fully_validated`] for the
     /// callsite.
-    MaybeValidTxSetPending,
+    MaybeValidDeferred,
 
     /// The value has been fully validated and is known to be valid.
     ///
@@ -130,8 +153,8 @@ impl ValidationLevel {
     ///
     /// Matches stellar-core `BallotProtocol.cpp:208-211` which clears
     /// only on `kMaybeValidValue`. The henyey-specific
-    /// [`ValidationLevel::MaybeValidTxSetPending`] does not clear —
-    /// see its doc comment for the rationale.
+    /// [`ValidationLevel::MaybeValidDeferred`] does not clear — see its
+    /// doc comment for the rationale (issues #1795 and #1798).
     pub fn clears_fully_validated(self) -> bool {
         matches!(self, Self::MaybeValid)
     }
