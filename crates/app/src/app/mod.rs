@@ -319,6 +319,40 @@ pub struct App {
     /// When set, a background task is publishing a checkpoint.
     publish_in_progress: AtomicBool,
     /// Buffered externalized ledgers waiting to apply.
+    ///
+    /// # Invariant (event-loop freeze guard rail)
+    ///
+    /// All writers of this map execute on the event-loop task. There
+    /// are no background-task writers in production — the only
+    /// `.write()` callers are reachable from the event-loop select!
+    /// arms (`process_externalized_slots`, `maybe_start_buffered_catchup`,
+    /// `attach_tx_set_by_hash`, `buffer_externalized_tx_set`,
+    /// `update_buffered_tx_set`, `out_of_sync_recovery`,
+    /// `handle_catchup_result`).
+    ///
+    /// Holders of `.write()` MUST NOT hold the write guard across a
+    /// `.await` other than short same-map mutations (insert, remove,
+    /// retain on ≤100 entries). Held-lock time MUST be bounded by
+    /// O(buffer size), not O(external work). In particular, XDR
+    /// parsing (`herder.check_ledger_close`), herder queries, database
+    /// I/O, and network operations MUST happen outside the critical
+    /// section — snapshot inputs, compute a mutation plan lock-free,
+    /// then apply the plan under a single short write.
+    ///
+    /// Violating this invariant re-opens the class of event-loop
+    /// freeze documented in issues #1759 (phase=2 fetch_resp / phase=6
+    /// pending_close), #1784 (phase=13 buffered_catchup archive-HTTP),
+    /// and #1788 (phase=13 buffered_catchup recurrence). The split of
+    /// `process_externalized_slots`' critical section (commit that
+    /// closed #1769) specifically moves the per-slot XDR parse out of
+    /// this write lock.
+    ///
+    /// tokio::sync::RwLock is NOT reentrant per task. If you hold this
+    /// lock and `.await` something that eventually tries to acquire it
+    /// again on the same task, the task deadlocks silently. See the
+    /// comment at the second acquire in `maybe_start_buffered_catchup`
+    /// (catchup_impl.rs, PHASE_13_1 stamp site) for the concrete
+    /// example.
     syncing_ledgers: RwLock<BTreeMap<u32, henyey_herder::LedgerCloseInfo>>,
     /// Latest externalized slot we've observed (for liveness checks).
     last_externalized_slot: AtomicU64,
