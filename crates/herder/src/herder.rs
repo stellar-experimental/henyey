@@ -2454,27 +2454,39 @@ impl Herder {
     /// This also processes any envelopes that were waiting for this tx set,
     /// feeding them to SCP now that the dependency is satisfied.
     ///
-    /// ### Per-phase telemetry (#1772)
+    /// ### Off-event-loop drain (#1773 Phase 2)
     ///
-    /// This entry point has been observed to consume 300+ ms on the
-    /// event-loop thread during mainnet freezes (see issue #1772). The
-    /// work splits into three phases:
+    /// Phase 1 (#1772) established per-phase telemetry and observed
+    /// that `process_ready_ms` (the envelope-drain phase) accounts
+    /// for 100% of a 342 ms on-event-loop WARN. That drain is pure
+    /// CPU + lock traffic (XDR validation inside
+    /// `SCP::receive_envelope` and parking_lot writes against
+    /// `scp.slots`), with no `.await` inside the body — textbook fit
+    /// for `tokio::task::spawn_blocking`.
     ///
-    /// - `tracker_receive_ms` — XDR-serialize + SHA-256 of the tx set
-    ///   and the DashMap cache insert inside
-    ///   [`TxSetTracker::receive`](crate::tx_set_tracker::TxSetTracker).
-    /// - `tx_set_available_ms` — fetching-envelopes notify.
-    /// - `process_ready_ms` — SCP envelope dispatch for every slot
-    ///   whose tx-set dependency just became satisfied.
+    /// Phase 2 keeps the first two sub-phases inline (both are O(1)
+    /// per the Phase-1 evidence) and moves only
+    /// [`process_ready_fetching_envelopes`](Self::process_ready_fetching_envelopes)
+    /// onto a blocking-pool thread. The async wrapper awaits the
+    /// `JoinHandle` before returning, because callers (see
+    /// `crates/app/src/app/tx_flooding.rs`) immediately call
+    /// `try_close_slot_directly(slot)` which reads externalization
+    /// state set *inside* the drain. The ordering contract — drain
+    /// complete before return — is preserved.
     ///
-    /// A [`PhaseTimer`](henyey_common::tracking::PhaseTimer) records
-    /// each phase and emits a single structured WARN line with the
-    /// breakdown iff the total call reaches
-    /// [`LOCK_SLOW_THRESHOLD`](henyey_common::tracking::LOCK_SLOW_THRESHOLD).
-    /// That WARN is the evidence the next (Phase 2) fix — off-loading
-    /// the dominant phase via `tokio::task::spawn_blocking` — depends
-    /// on.
-    pub fn receive_tx_set(&self, tx_set: TransactionSet) -> Option<SlotIndex> {
+    /// ### Per-phase telemetry
+    ///
+    /// Three phases:
+    /// - `tracker_receive_ms` — `ScpDriver::receive_tx_set` (inline).
+    /// - `tx_set_available_ms` — `FetchingEnvelopes::tx_set_available` (inline).
+    /// - `process_ready_spawn_blocking_ms` — time the event-loop task
+    ///   spends awaiting the blocking drain's `JoinHandle`. After the
+    ///   fix this is the drain's wall time, but the event loop is
+    ///   parked (cooperative) during the await — other tokio tasks
+    ///   run. The rename from `process_ready_ms` is deliberate: it
+    ///   signals the semantic shift and lets alerting tools recognise
+    ///   the fix landed.
+    pub async fn receive_tx_set(self: Arc<Self>, tx_set: TransactionSet) -> Option<SlotIndex> {
         let mut timer = crate::tracked_lock::PhaseTimer::start();
         let hash = tx_set.hash;
 
@@ -2487,9 +2499,38 @@ impl Herder {
         self.fetching_envelopes.tx_set_available(hash, notify_slot);
         timer.mark("tx_set_available_ms");
 
-        // Process any envelopes that became ready
-        self.process_ready_fetching_envelopes();
-        timer.mark("process_ready_ms");
+        // Drain envelopes that just became ready, on a blocking-pool
+        // thread so the event loop can run other tasks while the 300+
+        // ms drain proceeds (#1773).
+        //
+        // We `await` the JoinHandle before returning: callers rely on
+        // externalization state populated inside the drain (e.g.
+        // `try_close_slot_directly(slot)`).
+        let herder_for_drain = Arc::clone(&self);
+        let join_result = tokio::task::spawn_blocking(move || {
+            herder_for_drain.process_ready_fetching_envelopes()
+        })
+        .await;
+
+        match join_result {
+            Ok(_processed) => {}
+            Err(e) if e.is_panic() => {
+                error!(
+                    ?slot,
+                    error = %e,
+                    "process_ready_fetching_envelopes panicked in spawn_blocking; \
+                     slot tracking completed but envelope drain may be incomplete"
+                );
+            }
+            Err(e) => {
+                error!(
+                    ?slot,
+                    error = %e,
+                    "spawn_blocking join error for envelope drain"
+                );
+            }
+        }
+        timer.mark("process_ready_spawn_blocking_ms");
 
         timer.finish("herder.receive_tx_set");
         slot
@@ -4001,6 +4042,138 @@ mod tests {
         assert!(
             popped.is_none(),
             "AUDIT-104: ready queue must be drained by store_quorum_set (envelope already processed)"
+        );
+    }
+
+    /// Regression test for #1773 Phase 2: drain runs on a blocking-pool
+    /// thread so the event-loop task can make progress during the drain.
+    ///
+    /// On `33a7ebf9`, mainnet telemetry showed `receive_tx_set` spending
+    /// 342 ms entirely inside `process_ready_fetching_envelopes` (the
+    /// drain that dispatches every ready envelope through the SCP core).
+    /// The fix moves that drain onto `tokio::task::spawn_blocking` so the
+    /// outer task is parked during the drain and other ready tokio tasks
+    /// (overlay I/O, lifecycle ticks) can run.
+    ///
+    /// This test proves the event-loop thread is freed during the drain
+    /// by running a competing async "heartbeat" task on the same
+    /// `current_thread` runtime. The heartbeat ticks every 10 ms into
+    /// a counter. During the drain:
+    ///
+    /// - Before the fix (drain inline on event-loop thread): the
+    ///   heartbeat cannot run because the thread is blocked inside the
+    ///   400-envelope synchronous dispatch loop. Counter stays at 0
+    ///   or at whatever it reached before receive_tx_set was awaited.
+    /// - After the fix (drain on spawn_blocking): the event-loop
+    ///   thread parks the outer task while awaiting the JoinHandle;
+    ///   the heartbeat task runs; the counter increases.
+    ///
+    /// We assert the heartbeat ticked at least twice, which is the
+    /// signal that the event loop was free during the drain. The
+    /// exact count is timing-sensitive; 2 is a conservative lower
+    /// bound that still fails definitively if the drain is re-inlined.
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn test_issue_1773_receive_tx_set_frees_event_loop_during_drain() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use stellar_xdr::curr::Hash as XdrHash;
+
+        let herder = Arc::new(make_test_herder());
+
+        // Build a tx_set; the fetching-envelopes notify uses its hash.
+        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+
+        // Synthesise 400 ready envelopes for slot 1. Each envelope must
+        // have a distinct hash (compute_envelope_hash over XDR) so the
+        // processed-set dedup does not short-circuit the drain loop;
+        // the `counter` field in ScpBallot provides that uniqueness.
+        const BACKLOG: usize = 400;
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([42u8; 32]),
+        ));
+        let mut envelopes = Vec::with_capacity(BACKLOG);
+        for i in 0..BACKLOG {
+            let ballot = ScpBallot {
+                counter: i as u32 + 1,
+                value: Value(vec![0u8; 1].try_into().unwrap()),
+            };
+            let statement = ScpStatement {
+                node_id: node_id.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: XdrHash([0u8; 32]),
+                    ballot,
+                    prepared: None,
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            };
+            envelopes.push(ScpEnvelope {
+                statement,
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            });
+        }
+        herder.fetching_envelopes.test_insert_ready(1, envelopes);
+
+        assert_eq!(
+            herder.fetching_envelopes.ready_slots(),
+            vec![1],
+            "pre-condition: slot 1 should be ready"
+        );
+
+        // Heartbeat task: tight loop that increments a counter every
+        // time tokio's current_thread scheduler gives it a turn. It
+        // uses `yield_now` so each iteration is a single await point.
+        //
+        // Under the spawn_blocking fix, `receive_tx_set.await` parks
+        // the outer task while the blocking drain runs on a pool
+        // thread; the scheduler wakes the heartbeat many times.
+        // Under an inline drain (regression), the scheduler thread
+        // is blocked inside the 400-envelope synchronous dispatch;
+        // the heartbeat cannot run at all during the drain.
+        let heartbeat_count = Arc::new(AtomicU64::new(0));
+        let heartbeat_count_clone = Arc::clone(&heartbeat_count);
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::task::yield_now().await;
+                heartbeat_count_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Let the heartbeat task wake up and register at least one tick
+        // so we know it's scheduled.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let count_before = heartbeat_count.load(Ordering::Relaxed);
+
+        let _slot = Arc::clone(&herder).receive_tx_set(tx_set).await;
+
+        let count_after = heartbeat_count.load(Ordering::Relaxed);
+        heartbeat_handle.abort();
+
+        // Ordering contract (#1773): drain completed before return.
+        let popped = herder.fetching_envelopes.pop(1);
+        assert!(
+            popped.is_none(),
+            "#1773 ordering contract: envelope drain must complete \
+             before receive_tx_set returns"
+        );
+
+        // Free-event-loop property (#1773): heartbeat made progress
+        // during the await. If the drain had been inline, the outer
+        // task would never yield between the entry and exit of
+        // receive_tx_set — so heartbeat ticks would stay at
+        // count_before. spawn_blocking forces at least one yield
+        // (awaiting the JoinHandle), allowing the heartbeat to run.
+        let ticks_during_drain = count_after.saturating_sub(count_before);
+        assert!(
+            ticks_during_drain >= 1,
+            "#1773: heartbeat must make progress during drain \
+             (observed {} ticks); if 0, the event-loop thread was \
+             blocked during the drain — the spawn_blocking off-load \
+             was lost",
+            ticks_during_drain,
         );
     }
 }

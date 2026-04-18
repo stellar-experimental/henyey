@@ -492,7 +492,14 @@ impl App {
             tracing::info!(hash = %internal_tx_set.hash, "TxSet not pending");
         }
 
-        let received_slot = self.herder.receive_tx_set(internal_tx_set.clone());
+        // `receive_tx_set` is async as of #1773: the envelope-drain phase
+        // runs on a blocking-pool thread so the event loop stays free
+        // during the 300+ ms dispatch.
+        let received_slot = self
+            .herder
+            .clone()
+            .receive_tx_set(internal_tx_set.clone())
+            .await;
         if let Some(slot) = received_slot {
             tracing::info!(slot, "Received pending TxSet, attempting ledger close");
             if let Some(pending) = self.process_externalized_slots().await {
@@ -675,13 +682,20 @@ impl App {
             map.remove(&internal_tx_set.hash);
         }
 
-        // Time-wrapped (#1759 diagnostics): writes
-        // `Herder::scp_driver`'s pending-tx-set table under its
-        // parking_lot::RwLock. Called once per inbound
-        // GeneralizedTxSet in the event loop hot path.
-        let received_slot = tracked_lock::time_call("herder.receive_tx_set", || {
-            self.herder.receive_tx_set(internal_tx_set.clone())
-        });
+        // `receive_tx_set` is async as of #1773: the envelope-drain phase
+        // runs on a blocking-pool thread so the event loop stays free
+        // during the 300+ ms dispatch. The inner `PhaseTimer` inside
+        // `receive_tx_set` emits the per-phase WARN when slow; the outer
+        // `time_call` here has been removed because the Phase-2 rework
+        // makes the total wall time include a spawn_blocking await,
+        // which is expected to be long while still being non-blocking
+        // for the event loop. The inner `process_ready_spawn_blocking_ms`
+        // phase name signals whether the fix is behaving as intended.
+        let received_slot = self
+            .herder
+            .clone()
+            .receive_tx_set(internal_tx_set.clone())
+            .await;
         if let Some(slot) = received_slot {
             tracing::debug!(
                 slot,

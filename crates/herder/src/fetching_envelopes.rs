@@ -362,6 +362,21 @@ impl FetchingEnvelopes {
         None
     }
 
+    /// Test-only: directly insert envelopes into a slot's ready queue.
+    ///
+    /// Bypasses `recv_envelope`'s signature/dependency checks so tests can
+    /// synthesise a large pre-ready backlog (e.g. to measure drain latency
+    /// for #1773 regression coverage) without constructing valid signed
+    /// StellarValues and a matching quorum-set graph.
+    ///
+    /// Not for production use: callers of `recv_envelope` get the full
+    /// dependency resolution pipeline; this helper skips it entirely.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn test_insert_ready(&self, slot: SlotIndex, envelopes: Vec<ScpEnvelope>) {
+        let mut slot_state = self.slots.entry(slot).or_default();
+        slot_state.ready.extend(envelopes);
+    }
+
     /// Get all ready slots in ascending order.
     ///
     /// Parity: stellar-core returns slots in sorted order since it uses std::map.
