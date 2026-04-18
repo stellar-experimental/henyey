@@ -522,6 +522,15 @@ pub struct TestingConfig {
     /// Maps to stellar-core's `GENESIS_TEST_ACCOUNT_COUNT`.
     #[serde(default)]
     pub genesis_test_account_count: u32,
+
+    /// When true, the node operates as a standalone validator not connected
+    /// to a real network. Standalone validators are exempt from certain
+    /// config restrictions that protect networked validators (diagnostic
+    /// events, metadata stream, query port).
+    ///
+    /// Maps to stellar-core's `RUN_STANDALONE`.
+    #[serde(default)]
+    pub run_standalone: bool,
 }
 
 /// Catchup behavior configuration.
@@ -1418,6 +1427,15 @@ impl AppConfig {
         }
     }
 
+    /// Returns true if this is a validator connected to a real network.
+    ///
+    /// Standalone validators (local/testing mode) are excluded. Several
+    /// configuration restrictions only apply to networked validators.
+    /// Mirrors stellar-core's `isNetworkedValidator` (ApplicationImpl.cpp:664-665).
+    pub fn is_networked_validator(&self) -> bool {
+        self.node.is_validator && !self.testing.run_standalone
+    }
+
     /// Validate the configuration.
     pub fn validate(&self) -> anyhow::Result<()> {
         // Validators must have a node seed
@@ -1475,14 +1493,35 @@ impl AppConfig {
             );
         }
 
-        // Reject metadata stream on a validator node.
-        // Matches stellar-core's validateAndLogConfig() which forbids
+        // Reject metadata stream on a networked validator.
+        // Matches stellar-core's ApplicationImpl.cpp:674-680 which forbids
         // METADATA_OUTPUT_STREAM on networked validators because synchronous
         // FIFO opens can block indefinitely and stall consensus.
-        if self.metadata.output_stream.is_some() && self.node.is_validator {
+        if self.metadata.output_stream.is_some() && self.is_networked_validator() {
             anyhow::bail!(
-                "metadata.output_stream cannot be used on a validator node \
-                 (set node.is_validator = false for watcher/captive-core mode)"
+                "metadata.output_stream cannot be used on a networked validator \
+                 (set node.is_validator = false for watcher/captive-core mode, \
+                 or set testing.run_standalone = true for standalone mode)"
+            );
+        }
+
+        // Reject Soroban diagnostic events on a networked validator.
+        // Matches stellar-core's ApplicationImpl.cpp:667-673.
+        if self.diagnostics.soroban_diagnostic_events && self.is_networked_validator() {
+            anyhow::bail!(
+                "diagnostics.soroban_diagnostic_events cannot be enabled on a networked \
+                 validator (set node.is_validator = false for watcher mode, \
+                 or set testing.run_standalone = true for standalone mode)"
+            );
+        }
+
+        // Reject query server on a networked validator.
+        // Matches stellar-core's ApplicationImpl.cpp:723-730.
+        if self.query.port.is_some() && self.is_networked_validator() {
+            anyhow::bail!(
+                "query.port cannot be set on a networked validator \
+                 (set node.is_validator = false for watcher mode, \
+                 or set testing.run_standalone = true for standalone mode)"
             );
         }
 
@@ -2162,13 +2201,136 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
         let result = config.validate();
         assert!(
             result.is_err(),
-            "Validator with metadata stream should fail validation"
+            "Networked validator with metadata stream should fail validation"
         );
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("metadata.output_stream cannot be used on a validator"),
+            err.contains("metadata.output_stream cannot be used on a networked validator"),
             "Expected metadata rejection error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_validation_metadata_stream_allowed_on_standalone_validator() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.node.node_seed =
+            Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
+        config.testing.run_standalone = true;
+        config.metadata.output_stream = Some("/tmp/meta.pipe".to_string());
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "Standalone validator with metadata stream should pass: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_validation_query_port_on_networked_validator() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.node.node_seed =
+            Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
+        config.query.port = Some(11625);
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "Networked validator with query port should fail validation"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("query.port cannot be set on a networked validator"),
+            "Expected query port rejection error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_query_port_on_standalone_validator() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.node.node_seed =
+            Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
+        config.testing.run_standalone = true;
+        config.query.port = Some(11625);
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "Standalone validator with query port should pass: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_validation_query_port_on_watcher() {
+        let mut config = AppConfig::default();
+        config.query.port = Some(11625);
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "Watcher with query port should pass: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_validation_diagnostic_events_on_networked_validator() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.node.node_seed =
+            Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
+        config.diagnostics.soroban_diagnostic_events = true;
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "Networked validator with diagnostic events should fail validation"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("diagnostics.soroban_diagnostic_events cannot be enabled on a networked"),
+            "Expected diagnostic events rejection error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_diagnostic_events_on_standalone_validator() {
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.node.node_seed =
+            Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
+        config.testing.run_standalone = true;
+        config.diagnostics.soroban_diagnostic_events = true;
+        let result = config.validate();
+        assert!(
+            result.is_ok(),
+            "Standalone validator with diagnostic events should pass: {:?}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn test_run_standalone_parsed_from_toml() {
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[testing]
+run_standalone = true
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.testing.run_standalone);
+    }
+
+    #[test]
+    fn test_run_standalone_false_by_default() {
+        let config = AppConfig::default();
+        assert!(!config.testing.run_standalone);
     }
 }

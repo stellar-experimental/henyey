@@ -1192,6 +1192,7 @@ fn local_config() -> AppConfig {
             ledger_close_time: None,
             generate_load_for_testing: true,
             genesis_test_account_count: 0,
+            run_standalone: true,
         },
         compat_http: CompatHttpConfig {
             enabled: true,
@@ -1739,6 +1740,7 @@ async fn cmd_apply_load(mut config: AppConfig, opts: ApplyLoadOptions) -> anyhow
     // closes ledgers directly via LedgerManager.
     config.node.manual_close = true;
     config.node.is_validator = true;
+    config.testing.run_standalone = true;
     config.http.enabled = false;
     config.compat_http.enabled = false;
 

@@ -397,9 +397,12 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     if let Some(v) = get_u32(table, "GENESIS_TEST_ACCOUNT_COUNT") {
         config.testing.genesis_test_account_count = v;
     }
+    if let Some(v) = get_bool(table, "RUN_STANDALONE") {
+        config.testing.run_standalone = v;
+    }
 
     // --- Ignored keys (accepted silently for compatibility) ---
-    // UNSAFE_QUORUM, RUN_STANDALONE, FORCE_SCP, DISABLE_XDR_FSYNC, etc.
+    // UNSAFE_QUORUM, FORCE_SCP, DISABLE_XDR_FSYNC, etc.
 
     Ok(config)
 }
@@ -1243,5 +1246,29 @@ mod tests {
             .map(|t| t.contains_key("VALIDATORS"))
             .unwrap_or(false);
         assert!(has_validators, "fixture should have VALIDATORS section");
+    }
+
+    #[test]
+    fn test_compat_run_standalone_parsed() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+RUN_STANDALONE=true
+NODE_IS_VALIDATOR=true
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+HTTP_QUERY_PORT=11627
+
+[HISTORY.local]
+get="curl -sf http://localhost:1570/{0} -o {1}"
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert!(config.testing.run_standalone);
+        assert!(config.node.is_validator);
+        assert_eq!(config.query.port, Some(11627));
+        // Verify is_networked_validator returns false for standalone validators.
+        assert!(
+            !config.is_networked_validator(),
+            "Standalone validator should not be treated as networked"
+        );
     }
 }
