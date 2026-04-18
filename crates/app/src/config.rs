@@ -1024,6 +1024,12 @@ pub struct RpcConfig {
     /// Should be ≤ the database connection pool size (10) to avoid contention.
     #[serde(default = "default_rpc_db_concurrency")]
     pub rpc_db_concurrency: usize,
+
+    /// Maximum concurrent bucket-list I/O blocking tasks.
+    /// Independent from `rpc_db_concurrency` so bucket reads and DB queries
+    /// don't starve each other on the shared `spawn_blocking` pool.
+    #[serde(default = "default_bucket_io_concurrency")]
+    pub bucket_io_concurrency: usize,
 }
 
 impl Default for RpcConfig {
@@ -1037,6 +1043,7 @@ impl Default for RpcConfig {
             max_concurrent_requests: default_max_concurrent_requests(),
             request_timeout_secs: default_request_timeout_secs(),
             rpc_db_concurrency: default_rpc_db_concurrency(),
+            bucket_io_concurrency: default_bucket_io_concurrency(),
         }
     }
 }
@@ -1044,6 +1051,9 @@ impl Default for RpcConfig {
 impl RpcConfig {
     /// Validate config values at startup.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_concurrent_simulations == 0 {
+            return Err("rpc.max_concurrent_simulations must be > 0".to_string());
+        }
         if self.max_concurrent_requests == 0 {
             return Err("rpc.max_concurrent_requests must be > 0".to_string());
         }
@@ -1052,6 +1062,9 @@ impl RpcConfig {
         }
         if self.rpc_db_concurrency == 0 {
             return Err("rpc.rpc_db_concurrency must be > 0".to_string());
+        }
+        if self.bucket_io_concurrency == 0 {
+            return Err("rpc.bucket_io_concurrency must be > 0".to_string());
         }
         Ok(())
     }
@@ -1082,6 +1095,10 @@ fn default_request_timeout_secs() -> u64 {
 }
 
 fn default_rpc_db_concurrency() -> usize {
+    8
+}
+
+fn default_bucket_io_concurrency() -> usize {
     8
 }
 
@@ -2332,5 +2349,47 @@ run_standalone = true
     fn test_run_standalone_false_by_default() {
         let config = AppConfig::default();
         assert!(!config.testing.run_standalone);
+    }
+
+    #[test]
+    fn test_rpc_bucket_io_concurrency_zero_fails_validation() {
+        let mut rpc = RpcConfig::default();
+        rpc.bucket_io_concurrency = 0;
+        let err = rpc.validate().unwrap_err();
+        assert!(
+            err.contains("bucket_io_concurrency"),
+            "expected bucket_io_concurrency error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rpc_max_concurrent_simulations_zero_fails_validation() {
+        let mut rpc = RpcConfig::default();
+        rpc.max_concurrent_simulations = 0;
+        let err = rpc.validate().unwrap_err();
+        assert!(
+            err.contains("max_concurrent_simulations"),
+            "expected max_concurrent_simulations error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_rpc_bucket_io_concurrency_default() {
+        let rpc = RpcConfig::default();
+        assert_eq!(rpc.bucket_io_concurrency, 8);
+        assert!(rpc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_rpc_bucket_io_concurrency_deserialized_independently() {
+        let toml_str = r#"
+[rpc]
+enabled = true
+rpc_db_concurrency = 4
+bucket_io_concurrency = 12
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.rpc.rpc_db_concurrency, 4);
+        assert_eq!(config.rpc.bucket_io_concurrency, 12);
     }
 }

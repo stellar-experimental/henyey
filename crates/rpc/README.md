@@ -125,6 +125,19 @@ fn build_simulation_request(tx_b64: &str) -> serde_json::Value {
 - Simulation reads from a live bucket snapshot instead of the history database so preflight sees the same current-state shape as the validator path, including TTL handling.
 - Account entries are normalized to V3 extensions before simulation so resource metering matches upstream Soroban expectations.
 
+### Concurrency Control
+
+The server uses per-resource-class semaphores to prevent any single category of work from monopolizing Tokio's shared `spawn_blocking` pool:
+
+| Semaphore | Config Field | Default | Protects |
+|-----------|-------------|---------|----------|
+| `request_semaphore` | `max_concurrent_requests` | 64 | Global async admission gate |
+| `simulation_semaphore` | `max_concurrent_simulations` | 10 | CPU-heavy `simulateTransaction` |
+| `db_semaphore` | `rpc_db_concurrency` | 8 | SQLite database queries |
+| `bucket_io_semaphore` | `bucket_io_concurrency` | 8 | Bucket-list disk reads |
+
+The `request_semaphore` gates async admission (try-acquire, immediate reject). The three blocking semaphores (`simulation`, `db`, `bucket_io`) bound concurrent `spawn_blocking` work. They provide admission control on the shared pool — not isolated thread pools.
+
 ## stellar-core Mapping
 
 This crate has no direct `stellar-core` counterpart. The implemented API surface corresponds to the standalone `stellar-rpc` service, while henyey-specific integrations replace captive-core and ingestion components with direct access to `henyey-app`, `henyey-db`, and bucket snapshots.

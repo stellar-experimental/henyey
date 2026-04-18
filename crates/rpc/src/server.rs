@@ -466,6 +466,7 @@ mod tests {
         app: std::sync::Arc<App>,
         request_sem: usize,
         db_sem: usize,
+        bucket_io_sem: usize,
         timeout: Duration,
     ) -> std::sync::Arc<RpcContext> {
         std::sync::Arc::new(RpcContext {
@@ -474,7 +475,7 @@ mod tests {
             simulation_semaphore: std::sync::Arc::new(Semaphore::new(1)),
             request_semaphore: std::sync::Arc::new(Semaphore::new(request_sem)),
             db_semaphore: std::sync::Arc::new(Semaphore::new(db_sem)),
-            bucket_io_semaphore: std::sync::Arc::new(Semaphore::new(db_sem)),
+            bucket_io_semaphore: std::sync::Arc::new(Semaphore::new(bucket_io_sem)),
             request_timeout: timeout,
         })
     }
@@ -499,7 +500,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_server_busy_when_semaphore_exhausted() {
         let (_sim, app) = boot_test_app().await;
-        let ctx = make_ctx(app, 1, 1, Duration::from_secs(30));
+        let ctx = make_ctx(app, 1, 1, 1, Duration::from_secs(30));
 
         // Exhaust the single permit
         let _held = ctx.request_semaphore.try_acquire().unwrap();
@@ -530,7 +531,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_read_only_timeout_releases_permit() {
         let (_sim, app) = boot_test_app().await;
-        let ctx = make_ctx(app, 2, 1, Duration::from_millis(100));
+        let ctx = make_ctx(app, 2, 1, 1, Duration::from_millis(100));
 
         // Hold the DB semaphore so getHealth's blocking_db call blocks
         // indefinitely on acquire_owned().
@@ -601,7 +602,7 @@ mod tests {
         };
 
         let (_sim, app) = boot_test_app().await;
-        let ctx = make_ctx(app, 2, 1, Duration::from_millis(100));
+        let ctx = make_ctx(app, 2, 1, 1, Duration::from_millis(100));
 
         // Hold DB semaphore — read-only methods (getHealth) would timeout,
         // but sendTransaction doesn't use blocking_db and bypasses timeout.

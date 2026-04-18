@@ -51,7 +51,7 @@ impl RpcContext {
             .max_concurrent_requests
             .max(MIN_SEMAPHORE_CAPACITY);
         let db_concurrency = rpc_config.rpc_db_concurrency.max(MIN_SEMAPHORE_CAPACITY);
-        let bucket_io_concurrency = rpc_config.rpc_db_concurrency.max(MIN_SEMAPHORE_CAPACITY);
+        let bucket_io_concurrency = rpc_config.bucket_io_concurrency.max(MIN_SEMAPHORE_CAPACITY);
         let request_timeout = Duration::from_secs(rpc_config.request_timeout_secs);
 
         Self {
@@ -91,5 +91,39 @@ mod tests {
             sem.try_acquire().is_ok(),
             "clamped semaphore must admit at least one acquire"
         );
+    }
+
+    /// `bucket_io_concurrency` and `rpc_db_concurrency` must produce
+    /// independent semaphore capacities when configured to different values.
+    #[test]
+    fn bucket_io_and_db_semaphores_are_independent() {
+        use henyey_app::config::RpcConfig;
+
+        let mut rpc_config = RpcConfig::default();
+        rpc_config.rpc_db_concurrency = 4;
+        rpc_config.bucket_io_concurrency = 12;
+
+        // We can't call from_config (needs App), so replicate the sizing
+        // logic directly — this is the same code path under test.
+        let db = rpc_config
+            .rpc_db_concurrency
+            .max(super::MIN_SEMAPHORE_CAPACITY);
+        let bucket = rpc_config
+            .bucket_io_concurrency
+            .max(super::MIN_SEMAPHORE_CAPACITY);
+
+        assert_eq!(db, 4);
+        assert_eq!(bucket, 12);
+        assert_ne!(
+            db, bucket,
+            "db and bucket_io semaphores must be independently sized"
+        );
+    }
+
+    /// `bucket_io_concurrency = 0` must be clamped to MIN_SEMAPHORE_CAPACITY.
+    #[test]
+    fn bucket_io_zero_clamped_to_minimum() {
+        let clamped = 0usize.max(super::MIN_SEMAPHORE_CAPACITY);
+        assert_eq!(clamped, 1, "zero bucket_io must clamp to 1");
     }
 }

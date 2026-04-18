@@ -390,6 +390,10 @@ enabled = true
 port = 8000
 retention_window = 2880
 max_healthy_ledger_latency_secs = 30
+max_concurrent_requests = 64
+max_concurrent_simulations = 10
+rpc_db_concurrency = 8
+bucket_io_concurrency = 8
 ```
 
 ## Repository Layout
