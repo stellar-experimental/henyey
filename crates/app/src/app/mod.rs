@@ -4216,29 +4216,38 @@ mod tests {
         );
     }
 
-    /// Regression test for #1775 Phase 2: verify `handle_close_complete`'s
-    /// post-close tx-queue update (herder_ledger_closed + tx_queue_invalidation
-    /// sub-phases) is moved off the event-loop thread via `spawn_blocking`.
+    /// Regression test for #1775 Phase 2 + #1778 label correction: verify
+    /// `handle_close_complete`'s post-close tx-queue update is actually
+    /// moved off the event-loop thread via `spawn_blocking`, AND that the
+    /// PhaseTimer sub-phase marks attribute the time to the right labels.
     ///
-    /// The test injects a 200 ms synthetic blocking workload inside the
+    /// The test injects a 400 ms synthetic blocking workload inside the
     /// `spawn_blocking` closure (via `close_complete_inject_blocking_ms`) so
     /// the fix's behavior is observable without 400 real signed envelopes.
     ///
-    /// **Two independent assertions**:
+    /// **Assertions**:
     ///
-    /// 1. **PhaseTimer sub-phase marks** (user's explicit acceptance criterion
-    ///    — #1775 Phase 2 mandate): `herder_ledger_closed_ms` +
-    ///    `tx_queue_invalidation_ms` read < 50 ms combined. Verified by
-    ///    capturing the PhaseTimer's structured WARN emission with
-    ///    `CapturingSubscriber`. Pre-fix (inline), each mark reports the full
-    ///    ~200 ms wall-clock; post-fix (marks before `join.await`), each
-    ///    reports microseconds. A log assertion proves the fix.
+    /// 1. **PhaseTimer attribution (#1778)**: the WARN line emitted by
+    ///    `PhaseTimer::finish("app.handle_close_complete")` contains the
+    ///    post-#1778 field names — `overlay_bookkeeping_ms`,
+    ///    `spawn_blocking_setup_ms`, `tx_queue_background_wait_ms` — and
+    ///    does NOT contain the pre-#1778 misnamed fields
+    ///    `herder_ledger_closed_ms` / `tx_queue_invalidation_ms` (which were
+    ///    attributing inline preamble work to labels that named the
+    ///    off-loaded work).
     ///
-    /// 2. **Spawn-blocking wait visibility**: `tx_queue_background_wait_ms`
-    ///    (new mark) reports ~200 ms, confirming the off-thread compute is
-    ///    actually happening in the background pool rather than bypassed.
+    /// 2. **Event-loop blocking time**: the sum of the two pre-spawn marks
+    ///    (`overlay_bookkeeping_ms + spawn_blocking_setup_ms`) is < 50 ms.
+    ///    These brackets span only inline overlay/survey/drift bookkeeping
+    ///    plus the preamble that moves fields into the spawn_blocking
+    ///    closure — pure sync CPU + a handful of tokio RwLock reads.
+    ///
+    /// 3. **Spawn-blocking wait visibility (#1775)**:
+    ///    `tx_queue_background_wait_ms >= 300 ms`, confirming the injected
+    ///    400 ms heavy work actually runs off-thread on the blocking pool
+    ///    rather than being bypassed or accidentally on the event loop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_close_complete_spawn_blocking_frees_event_loop() {
+    async fn test_close_complete_event_loop_marks_correctly_attributed() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -4360,8 +4369,8 @@ mod tests {
         });
 
         // Extract sub-phase numbers via substring parsing. Format:
-        //   phases="... herder_ledger_closed_ms=0 tx_queue_invalidation_ms=0
-        //                tx_queue_background_wait_ms=200 ..."
+        //   phases="... overlay_bookkeeping_ms=0 spawn_blocking_setup_ms=0
+        //                tx_queue_background_wait_ms=400 ..."
         fn extract_ms(line: &str, label: &str) -> Option<u128> {
             let tag = format!("{}=", label);
             let start = line.find(&tag)? + tag.len();
@@ -4372,36 +4381,52 @@ mod tests {
             tail[..end].parse().ok()
         }
 
-        let herder_ms = extract_ms(&phase_line, "herder_ledger_closed_ms")
-            .expect("WARN line should contain herder_ledger_closed_ms field");
-        let invalidation_ms = extract_ms(&phase_line, "tx_queue_invalidation_ms")
-            .expect("WARN line should contain tx_queue_invalidation_ms field");
+        // Assertion (1): PhaseTimer attribution (#1778). The pre-#1778 field
+        // names `herder_ledger_closed_ms` / `tx_queue_invalidation_ms` were
+        // misattributing inline preamble work to labels that named the
+        // off-loaded work. Confirm they are gone from the emitted WARN.
+        assert!(
+            !phase_line.contains("herder_ledger_closed_ms="),
+            "#1778 regression: WARN line should NOT contain the misnamed \
+             `herder_ledger_closed_ms` field; it was replaced by \
+             `overlay_bookkeeping_ms` + `spawn_blocking_setup_ms`. \
+             WARN line: {phase_line}"
+        );
+        assert!(
+            !phase_line.contains("tx_queue_invalidation_ms="),
+            "#1778 regression: WARN line should NOT contain the misnamed \
+             `tx_queue_invalidation_ms` field; the queue-invalidation work \
+             runs inside `spawn_blocking` and is measured by \
+             `tx_queue_background_wait_ms`. WARN line: {phase_line}"
+        );
+
+        let overlay_ms = extract_ms(&phase_line, "overlay_bookkeeping_ms")
+            .expect("WARN line should contain overlay_bookkeeping_ms field (#1778)");
+        let setup_ms = extract_ms(&phase_line, "spawn_blocking_setup_ms")
+            .expect("WARN line should contain spawn_blocking_setup_ms field (#1778)");
         let wait_ms = extract_ms(&phase_line, "tx_queue_background_wait_ms").expect(
             "WARN line should contain tx_queue_background_wait_ms field (new in #1775 Phase 2)",
         );
 
-        // User's acceptance criterion (#1775 Phase 2 mandate):
-        // `herder_ledger_closed_ms` + `tx_queue_invalidation_ms` combined < 50 ms.
-        // Post-fix both marks fire BEFORE `join.await` so each reads < 5 ms.
-        // Pre-fix (inline) both would read ~100–200 ms individually.
+        // Assertion (2): Event-loop blocking time < 50 ms. The two pre-spawn
+        // marks bracket only inline overlay/survey/drift bookkeeping plus
+        // the preamble that moves fields into the spawn_blocking closure.
+        // Post-fix this is microseconds of real CPU cost; pre-#1778 (misnamed
+        // marks) this window used to read ~200 ms because the marks fired
+        // AFTER work that had moved off-thread in #1775 Phase 2.
         assert!(
-            herder_ms + invalidation_ms < 50,
-            "herder_ledger_closed_ms ({}) + tx_queue_invalidation_ms ({}) must be < 50 ms \
-             post-fix; WARN line was: {}",
-            herder_ms,
-            invalidation_ms,
-            phase_line
+            overlay_ms + setup_ms < 50,
+            "overlay_bookkeeping_ms ({overlay_ms}) + spawn_blocking_setup_ms \
+             ({setup_ms}) must be < 50 ms post-fix; WARN line was: {phase_line}"
         );
 
-        // The 400 ms injected work must show up under the new
-        // tx_queue_background_wait_ms label. If this is < 300 ms, the fix is
+        // Assertion (3): The 400 ms injected work must show up under
+        // tx_queue_background_wait_ms. If this is < 300 ms, the fix is
         // bypassing spawn_blocking entirely and the off-load is illusory.
         assert!(
             wait_ms >= 300,
-            "tx_queue_background_wait_ms ({}) should reflect the 400 ms injected \
-             blocking work; WARN line was: {}",
-            wait_ms,
-            phase_line
+            "tx_queue_background_wait_ms ({wait_ms}) should reflect the 400 ms \
+             injected blocking work; WARN line was: {phase_line}"
         );
     }
 }

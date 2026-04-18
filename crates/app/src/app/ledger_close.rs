@@ -1834,6 +1834,15 @@ impl App {
                 tracing::warn!("{}", warning);
             }
         }
+        // Mark end of the inline overlay/survey/drift bookkeeping window.
+        // This brackets lines that touch tokio RwLocks (overlay, survey_limiter)
+        // and the std::Mutex drift tracker. Each internal operation is
+        // microseconds of CPU cost, but the field's wall-clock will also
+        // include scheduler-driven backlog drain at the `.await` yields on a
+        // saturated single-threaded runtime — that is the intended measurement
+        // and is what lets us tell the inline window apart from the
+        // off-loaded work in the `spawn_blocking` below.
+        timer.mark("overlay_bookkeeping_ms");
 
         // === Off-load the two CPU-heavy sub-phases ============================
         //
@@ -1845,12 +1854,13 @@ impl App {
         // proposal for the investigation). The fix moves them into a single
         // `spawn_blocking` so the event loop is freed during the ~666 ms compute.
         //
-        // The two `timer.mark(...)` calls fire BEFORE `join.await` so the
-        // sub-phase fields report *event-loop-blocking time* (microseconds) for
-        // each sub-phase, satisfying the acceptance criterion that the two
-        // combined are < 50 ms on the fix binary. The new
-        // `tx_queue_background_wait_ms` mark after the await captures the
-        // blocking-pool wait time so pool saturation remains observable.
+        // `spawn_blocking_setup_ms` brackets the preamble that extracts fields
+        // out of `result.header` / `pending` / `self.*` so the closure can
+        // own them; it's all pure sync CPU, expected to be microseconds.
+        // `tx_queue_background_wait_ms` (after `join.await`) captures the
+        // wall-clock the blocking-pool thread took to run the off-loaded
+        // work — `>= 300 ms` in steady state, `~0 ms` when the queue is
+        // empty or the blocking pool is idle.
         //
         // Single-flight is preserved: `lifecycle.rs:255` awaits
         // `handle_close_complete` before the next loop iteration, and no other
@@ -1925,12 +1935,13 @@ impl App {
             .close_complete_inject_blocking_ms
             .load(Ordering::Relaxed);
 
-        // Marks fire BEFORE the await so sub-phase fields report event-loop
-        // blocking time (microseconds), not wall-clock of the off-thread
-        // compute. The outer `warn_if_slow` at 500 ms continues to report the
-        // full handle_close_complete wall-clock.
-        timer.mark("herder_ledger_closed_ms");
-        timer.mark("tx_queue_invalidation_ms");
+        // Mark end of the spawn_blocking preamble (field extraction + Soroban
+        // resource limit computation + clock read + moves into the closure).
+        // This is pure sync CPU, expected to be << 1 ms. Reported by the
+        // structured PhaseTimer WARN as `spawn_blocking_setup_ms` so it is
+        // attributable separately from `overlay_bookkeeping_ms` and from
+        // `tx_queue_background_wait_ms`.
+        timer.mark("spawn_blocking_setup_ms");
 
         let join = tokio::task::spawn_blocking(move || {
             // Test-only synthetic blocking work — lets the regression test
