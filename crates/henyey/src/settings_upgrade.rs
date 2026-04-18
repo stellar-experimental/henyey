@@ -28,6 +28,7 @@ use stellar_xdr::curr::{
 };
 
 use henyey_crypto::{sha256, SecretKey};
+use rand::Rng;
 
 // Resource fee and total fee budgets for the 4 settings upgrade transactions.
 // These match the values used in stellar-core's SettingsUpgradeUtils.cpp.
@@ -170,7 +171,10 @@ fn get_upload_tx(public_key: &Uint256, seq_num: i64) -> (TransactionEnvelope, Le
     (envelope, contract_code_key)
 }
 
-/// Build the contract creation transaction (tx 3 of 4).
+/// Build the contract creation transaction (tx 3 of 4) with a random salt.
+///
+/// Mirrors stellar-core's `getCreateTx` which generates a random salt internally
+/// via `autocheck::generator<Hash>()(5)`.
 fn get_create_tx(
     public_key: &Uint256,
     contract_code_key: &LedgerKey,
@@ -178,22 +182,40 @@ fn get_create_tx(
     seq_num: i64,
     add_resource_fee: i64,
 ) -> (TransactionEnvelope, ContractDeployment) {
+    let salt = Uint256(rand::thread_rng().gen());
+    get_create_tx_with_salt(
+        public_key,
+        contract_code_key,
+        network_passphrase,
+        seq_num,
+        add_resource_fee,
+        salt,
+    )
+}
+
+/// Build the contract creation transaction (tx 3 of 4) with an explicit salt.
+///
+/// Separated from [`get_create_tx`] for testability: tests can supply a fixed
+/// salt to assert deterministic output.
+fn get_create_tx_with_salt(
+    public_key: &Uint256,
+    contract_code_key: &LedgerKey,
+    network_passphrase: &str,
+    seq_num: i64,
+    add_resource_fee: i64,
+    salt: Uint256,
+) -> (TransactionEnvelope, ContractDeployment) {
     let wasm_hash = match contract_code_key {
         LedgerKey::ContractCode(k) => k.hash.clone(),
         _ => panic!("Expected ContractCode ledger key"),
     };
-
-    // Generate a salt. stellar-core uses autocheck::generator<Hash>()(5) which
-    // produces a pseudo-random hash. We use a fixed salt since the exact value
-    // doesn't matter — it just needs to produce a unique contract ID.
-    let salt = sha256(b"settings-upgrade-salt");
 
     // Build contract ID preimage
     let id_preimage = ContractIdPreimage::Address(ContractIdPreimageFromAddress {
         address: ScAddress::Account(stellar_xdr::curr::AccountId(
             stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(public_key.clone()),
         )),
-        salt: Uint256(salt.0),
+        salt,
     });
 
     // Compute contract ID
@@ -501,4 +523,70 @@ fn read_secret_from_stdin() -> anyhow::Result<String> {
     Ok(std::io::read_to_string(std::io::stdin())?
         .trim()
         .to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_public_key() -> Uint256 {
+        Uint256([1u8; 32])
+    }
+
+    fn test_contract_code_key() -> LedgerKey {
+        LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: Hash(sha256(WRITE_BYTES_WASM).0),
+        })
+    }
+
+    const TEST_NETWORK: &str = "Test SDF Network ; September 2015";
+
+    #[test]
+    fn test_get_create_tx_different_salts_produce_different_contract_ids() {
+        let pk = test_public_key();
+        let code_key = test_contract_code_key();
+
+        let salt_a = Uint256([0xAA; 32]);
+        let salt_b = Uint256([0xBB; 32]);
+
+        let (_, deployment_a) =
+            get_create_tx_with_salt(&pk, &code_key, TEST_NETWORK, 100, 0, salt_a);
+        let (_, deployment_b) =
+            get_create_tx_with_salt(&pk, &code_key, TEST_NETWORK, 100, 0, salt_b);
+
+        assert_ne!(
+            deployment_a.contract_id, deployment_b.contract_id,
+            "Different salts must produce different contract IDs"
+        );
+    }
+
+    #[test]
+    fn test_get_create_tx_same_salt_is_deterministic() {
+        let pk = test_public_key();
+        let code_key = test_contract_code_key();
+        let salt = Uint256([0xCC; 32]);
+
+        let (_, deployment_a) =
+            get_create_tx_with_salt(&pk, &code_key, TEST_NETWORK, 100, 0, salt.clone());
+        let (_, deployment_b) = get_create_tx_with_salt(&pk, &code_key, TEST_NETWORK, 100, 0, salt);
+
+        assert_eq!(
+            deployment_a.contract_id, deployment_b.contract_id,
+            "Same salt must produce identical contract IDs"
+        );
+    }
+
+    #[test]
+    fn test_get_create_tx_generates_unique_ids() {
+        let pk = test_public_key();
+        let code_key = test_contract_code_key();
+
+        let (_, deployment_a) = get_create_tx(&pk, &code_key, TEST_NETWORK, 100, 0);
+        let (_, deployment_b) = get_create_tx(&pk, &code_key, TEST_NETWORK, 100, 0);
+
+        assert_ne!(
+            deployment_a.contract_id, deployment_b.contract_id,
+            "Public get_create_tx must generate unique contract IDs on each call"
+        );
+    }
 }
