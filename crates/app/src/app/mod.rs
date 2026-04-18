@@ -4429,4 +4429,168 @@ mod tests {
              injected blocking work; WARN line was: {phase_line}"
         );
     }
+
+    /// Regression test for #1780: after moving the `spawn_blocking` preamble
+    /// work into the closure, `spawn_blocking_setup_ms` must be minimal
+    /// (microseconds on this synthetic close path) — NOT the ~670 ms
+    /// observed pre-fix on mainnet binary `3a6388b9`.
+    ///
+    /// Unlike `test_close_complete_event_loop_marks_correctly_attributed`,
+    /// this test injects NO synthetic blocking work. It exercises the
+    /// smallest possible close (empty tx_set, no meta), so the WARN line
+    /// may not fire at the 250 ms PhaseTimer threshold; the assertion
+    /// uses the DEBUG-level "start" / "finish" path by triggering the
+    /// WARN unconditionally via a tiny 260 ms injection (comfortably above
+    /// the 250 ms gate but small enough that it does not mask a
+    /// setup-window regression).
+    ///
+    /// **Assertions**:
+    ///
+    /// 1. The WARN line contains `spawn_blocking_setup_ms`.
+    /// 2. `spawn_blocking_setup_ms <= 10 ms` — the acceptance criterion
+    ///    from #1780. Pre-fix this field read ~670 ms on mainnet because
+    ///    two redundant `soroban_network_info()` calls ran on the event
+    ///    loop between the `overlay_bookkeeping_ms` and
+    ///    `spawn_blocking_setup_ms` marks. Post-fix, those calls are
+    ///    coalesced to one (inside `overlay_bookkeeping_ms`) and the
+    ///    derived arithmetic runs inside the `spawn_blocking` closure.
+    ///
+    /// A synthetic-close setup window is a LOWER bound than mainnet (no
+    /// real tx_set, no populated Soroban state), so a passing assertion
+    /// here does NOT alone prove the mainnet fix. It DOES lock in the
+    /// invariant that the preamble is structurally off the event loop,
+    /// so future regressions that re-add snapshot-scale work to the
+    /// preamble will be caught by CI rather than by a production
+    /// validator WARN.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_close_complete_setup_preamble_is_minimal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Inject 260 ms of synthetic blocking work INSIDE the spawn_blocking
+        // closure (just above the PhaseTimer's 250 ms WARN gate) so the
+        // WARN line always fires and the sub-phase numbers can be parsed.
+        // The injection sits inside `spawn_blocking`, so it shows up under
+        // `tx_queue_background_wait_ms`, NOT under
+        // `spawn_blocking_setup_ms`. Any value leaking into
+        // `spawn_blocking_setup_ms` is the real regression.
+        app.close_complete_inject_blocking_ms
+            .store(260, Ordering::Relaxed);
+        app.set_applying_ledger(true);
+
+        let sub = CapturingSubscriber::default();
+        let events = sub.events.clone();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        let pending = PendingLedgerClose {
+            handle: tokio::task::spawn_blocking(|| {
+                Ok(henyey_ledger::LedgerCloseResult {
+                    header: stellar_xdr::curr::LedgerHeader {
+                        ledger_version: 24,
+                        previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        scp_value: stellar_xdr::curr::StellarValue {
+                            tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                            close_time: stellar_xdr::curr::TimePoint(1),
+                            upgrades: stellar_xdr::curr::VecM::default(),
+                            ext: stellar_xdr::curr::StellarValueExt::Basic,
+                        },
+                        tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                        ledger_seq: 1,
+                        total_coins: 0,
+                        fee_pool: 0,
+                        inflation_seq: 0,
+                        id_pool: 0,
+                        base_fee: 100,
+                        base_reserve: 5_000_000,
+                        max_tx_set_size: 100,
+                        skip_list: [
+                            stellar_xdr::curr::Hash([0u8; 32]),
+                            stellar_xdr::curr::Hash([0u8; 32]),
+                            stellar_xdr::curr::Hash([0u8; 32]),
+                            stellar_xdr::curr::Hash([0u8; 32]),
+                        ],
+                        ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+                    },
+                    header_hash: henyey_common::Hash256::ZERO,
+                    tx_results: Vec::new(),
+                    meta: None,
+                    perf: None,
+                })
+            }),
+            ledger_seq: 1,
+            tx_set: henyey_herder::TransactionSet {
+                hash: henyey_common::Hash256::ZERO,
+                previous_ledger_hash: henyey_common::Hash256::ZERO,
+                transactions: Vec::new(),
+                generalized_tx_set: None,
+            },
+            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
+            close_time: 1,
+            upgrades: Vec::new(),
+        };
+
+        let mut pending = pending;
+        let join_result = (&mut pending.handle).await;
+        let success = app
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::inline(),
+            )
+            .await;
+
+        assert!(success, "close should succeed");
+
+        let (phase_line, all_events) = {
+            let locked = events.lock().unwrap();
+            (
+                locked
+                    .iter()
+                    .find(|e| e.contains("app.handle_close_complete"))
+                    .cloned(),
+                locked.clone(),
+            )
+        };
+
+        let phase_line = phase_line.unwrap_or_else(|| {
+            panic!(
+                "PhaseTimer WARN line for app.handle_close_complete was not \
+                 captured. All captured events ({}):\n{}",
+                all_events.len(),
+                all_events.join("\n")
+            )
+        });
+
+        fn extract_ms(line: &str, label: &str) -> Option<u128> {
+            let tag = format!("{}=", label);
+            let start = line.find(&tag)? + tag.len();
+            let tail = &line[start..];
+            let end = tail
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(tail.len());
+            tail[..end].parse().ok()
+        }
+
+        let setup_ms = extract_ms(&phase_line, "spawn_blocking_setup_ms")
+            .expect("WARN line should contain spawn_blocking_setup_ms field");
+
+        // Acceptance criterion from #1780:
+        // `spawn_blocking_setup_ms` <= 10 ms per close.
+        assert!(
+            setup_ms <= 10,
+            "#1780 regression: spawn_blocking_setup_ms ({setup_ms}) exceeds \
+             the 10 ms budget. The preamble between `overlay_bookkeeping_ms` \
+             and `spawn_blocking_setup_ms` should be microseconds of \
+             capture-list moves; any larger value indicates heavy work was \
+             re-added to the event-loop path. WARN line: {phase_line}"
+        );
+    }
 }

@@ -1794,6 +1794,19 @@ impl App {
         // stellar-core `HerderImpl::lastClosedLedgerIncreased`:
         // `maybeHandleUpgrade` (overlay housekeeping) → `updateTransactionQueue`.
 
+        // Load `SorobanNetworkInfo` once for this close. Pre-#1780 this
+        // accessor was called three times per close (once here inside the
+        // overlay window, twice more in the preamble below); each call does
+        // a full bucket-list snapshot + ~15 ConfigSetting lookups. The
+        // two preamble calls were accounting for the ~670 ms
+        // `spawn_blocking_setup_ms` cost observed on mainnet binary
+        // `3a6388b9` (#1780). Binding the value once here and reusing it
+        // at all downstream callsites eliminates the redundant work.
+        //
+        // The value is a plain data struct (`Option<SorobanNetworkInfo>`);
+        // `Clone` / `as_ref()` is cheap (all primitive fields).
+        let soroban_info = self.soroban_network_info();
+
         // Clear per-ledger overlay state (flood gate, etc.) for old ledgers.
         // Mirrors upstream HerderImpl::eraseBelow() -> clearLedgersBelow().
         {
@@ -1805,9 +1818,7 @@ impl App {
         // Notify peers if max tx size increased due to a protocol upgrade.
         // Mirrors upstream HerderImpl::maybeHandleUpgrade().
         {
-            let soroban_tx_max = self
-                .soroban_network_info()
-                .map(|info| info.tx_max_size_bytes);
+            let soroban_tx_max = soroban_info.as_ref().map(|info| info.tx_max_size_bytes);
             let new_max = compute_max_tx_size(result.header.ledger_version, soroban_tx_max);
             let old_max = self.max_tx_size_bytes.load(Ordering::Relaxed);
             let diff = new_max.saturating_sub(old_max);
@@ -1854,9 +1865,14 @@ impl App {
         // proposal for the investigation). The fix moves them into a single
         // `spawn_blocking` so the event loop is freed during the ~666 ms compute.
         //
-        // `spawn_blocking_setup_ms` brackets the preamble that extracts fields
-        // out of `result.header` / `pending` / `self.*` so the closure can
-        // own them; it's all pure sync CPU, expected to be microseconds.
+        // `spawn_blocking_setup_ms` brackets the capture moves into the
+        // closure (`pending`, `result.header`, `applied_txs`, `Arc` clones,
+        // etc.). Post-#1780 this is strictly the capture-list move + a
+        // trivial `network_id()` hash; the field-extraction work that used
+        // to live here (two redundant `soroban_network_info()` calls, the
+        // Soroban-limit arithmetic, the wall-clock drift computation) now
+        // runs INSIDE the closure on the spawn_blocking thread. Expected
+        // to be microseconds.
         // `tx_queue_background_wait_ms` (after `join.await`) captures the
         // wall-clock the blocking-pool thread took to run the off-loaded
         // work — `>= 300 ms` in steady state, `~0 ms` when the queue is
@@ -1867,66 +1883,23 @@ impl App {
         // production call site invokes it concurrently, so a new
         // `handle_close_complete_inner` cannot overlap with the spawn_blocking
         // of a prior one.
-        let ledger_flags = match &result.header.ext {
-            stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
-            stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
-        };
-        let close_time_ctx = result.header.scp_value.close_time.0;
-        let base_fee = result.header.base_fee;
-        let base_reserve = result.header.base_reserve;
-        let protocol_version = result.header.ledger_version;
         let ledger_seq = pending.ledger_seq;
         let close_time = pending.close_time;
         let network_id = NetworkId(self.network_id());
-        let max_contract_size_bytes = self
-            .soroban_network_info()
-            .map(|info| info.max_contract_size);
-        let (queue_limit, selection_limit) = match self.soroban_network_info() {
-            Some(info) => {
-                let m = POOL_LEDGER_MULTIPLIER as i64;
-                let queue = henyey_common::Resource::soroban_ledger_limits(
-                    info.ledger_max_tx_count as i64 * m,
-                    info.ledger_max_instructions * m,
-                    info.ledger_max_tx_size_bytes as i64 * m,
-                    info.ledger_max_read_bytes as i64 * m,
-                    info.ledger_max_write_bytes as i64 * m,
-                    info.ledger_max_read_ledger_entries as i64 * m,
-                    info.ledger_max_write_ledger_entries as i64 * m,
-                );
-                let selection = henyey_common::Resource::soroban_ledger_limits(
-                    info.ledger_max_tx_count as i64,
-                    info.ledger_max_instructions,
-                    info.ledger_max_tx_size_bytes as i64,
-                    info.ledger_max_read_bytes as i64,
-                    info.ledger_max_write_bytes as i64,
-                    info.ledger_max_read_ledger_entries as i64,
-                    info.ledger_max_write_ledger_entries as i64,
-                );
-                (Some(queue), Some(selection))
-            }
-            None => (None, None),
-        };
-
-        // Compute upper-bound close-time offset (stellar-core parity) on the
-        // event loop — needs `self.clock` / `self.target_ledger_close_time`.
-        const EXPECTED_CLOSE_TIME_MULT: u64 = 2;
-        let expected_close_secs = self.target_ledger_close_time() as u64;
-        let wall_now = self
-            .clock
-            .system_now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system clock before UNIX epoch")
-            .as_secs();
-        let close_time_drift = wall_now.saturating_sub(close_time_ctx);
-        let upper_bound_offset = expected_close_secs * EXPECTED_CLOSE_TIME_MULT + close_time_drift;
-
         let herder = Arc::clone(&self.herder);
+        let clock = Arc::clone(&self.clock);
         // Move (not clone): `all_txs` / `failed_hashes` are not used after this
         // point, and the applied-tx list for a full mainnet ledger can be
         // several hundred KB.
         let applied_txs = std::mem::take(&mut all_txs);
         let applied_upgrades = pending.upgrades.clone();
         let failed_hashes_for_ban = std::mem::take(&mut failed_hashes);
+        // Move the full header into the closure. `LedgerHeader` contains only
+        // primitive / `Copy`-ish fields; the move is O(1) and lets the closure
+        // extract `ledger_version`, `ext`, `scp_value.close_time`, `base_fee`,
+        // and `base_reserve` on the spawn_blocking thread instead of the
+        // event loop.
+        let result_header = result.header;
 
         // Test-only: simulate a heavy CPU-bound close without 400 real signed
         // envelopes (see `close_complete_inject_blocking_ms` field doc).
@@ -1935,12 +1908,16 @@ impl App {
             .close_complete_inject_blocking_ms
             .load(Ordering::Relaxed);
 
-        // Mark end of the spawn_blocking preamble (field extraction + Soroban
-        // resource limit computation + clock read + moves into the closure).
+        // Mark end of the spawn_blocking preamble (capture-list moves).
         // This is pure sync CPU, expected to be << 1 ms. Reported by the
         // structured PhaseTimer WARN as `spawn_blocking_setup_ms` so it is
         // attributable separately from `overlay_bookkeeping_ms` and from
         // `tx_queue_background_wait_ms`.
+        //
+        // Post-#1780 the field-extraction work that used to live here (two
+        // redundant `soroban_network_info()` calls, Soroban-limit
+        // arithmetic, `wall_now` / drift computation) runs INSIDE the
+        // closure on the blocking-pool thread.
         timer.mark("spawn_blocking_setup_ms");
 
         let join = tokio::task::spawn_blocking(move || {
@@ -1950,6 +1927,65 @@ impl App {
             if inject_blocking_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(inject_blocking_ms));
             }
+
+            // === Closure-local field extraction (was preamble pre-#1780) =====
+            //
+            // All of the following computations used to run on the event
+            // loop between the `overlay_bookkeeping_ms` and
+            // `spawn_blocking_setup_ms` marks. They are pure sync CPU with
+            // no `.await`/lock requirements, so they moved inside
+            // `spawn_blocking` to free ~670 ms of event-loop time (#1780).
+            let ledger_flags = match &result_header.ext {
+                stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
+                stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
+            };
+            let close_time_ctx = result_header.scp_value.close_time.0;
+            let base_fee = result_header.base_fee;
+            let base_reserve = result_header.base_reserve;
+            let protocol_version = result_header.ledger_version;
+
+            let max_contract_size_bytes = soroban_info.as_ref().map(|info| info.max_contract_size);
+            let (queue_limit, selection_limit) = match soroban_info.as_ref() {
+                Some(info) => {
+                    let m = POOL_LEDGER_MULTIPLIER as i64;
+                    let queue = henyey_common::Resource::soroban_ledger_limits(
+                        info.ledger_max_tx_count as i64 * m,
+                        info.ledger_max_instructions * m,
+                        info.ledger_max_tx_size_bytes as i64 * m,
+                        info.ledger_max_read_bytes as i64 * m,
+                        info.ledger_max_write_bytes as i64 * m,
+                        info.ledger_max_read_ledger_entries as i64 * m,
+                        info.ledger_max_write_ledger_entries as i64 * m,
+                    );
+                    let selection = henyey_common::Resource::soroban_ledger_limits(
+                        info.ledger_max_tx_count as i64,
+                        info.ledger_max_instructions,
+                        info.ledger_max_tx_size_bytes as i64,
+                        info.ledger_max_read_bytes as i64,
+                        info.ledger_max_write_bytes as i64,
+                        info.ledger_max_read_ledger_entries as i64,
+                        info.ledger_max_write_ledger_entries as i64,
+                    );
+                    (Some(queue), Some(selection))
+                }
+                None => (None, None),
+            };
+
+            // Compute upper-bound close-time offset (stellar-core parity).
+            // Reading `wall_now` inside the closure instead of on the event
+            // loop differs by at most a few hundred µs of scheduler
+            // latency; `upper_bound_offset` is denominated in whole
+            // seconds and feeds no hash, so the semantics are preserved.
+            const EXPECTED_CLOSE_TIME_MULT: u64 = 2;
+            let expected_close_secs = herder.ledger_close_time() as u64;
+            let wall_now = clock
+                .system_now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX epoch")
+                .as_secs();
+            let close_time_drift = wall_now.saturating_sub(close_time_ctx);
+            let upper_bound_offset =
+                expected_close_secs * EXPECTED_CLOSE_TIME_MULT + close_time_drift;
 
             // Sub-phase 1: herder.ledger_closed + ban failed txs.
             // `herder.ledger_closed` runs `tx_queue.remove_applied`, cleanup,
