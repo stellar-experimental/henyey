@@ -2751,4 +2751,109 @@ mod tests {
             ARCHIVE_BEHIND_BACKOFF_SECS
         );
     }
+
+    /// Regression test for #1786 / #1784: exercises the **real HTTP client
+    /// path** (ArchiveHttpFetcher → reqwest → TCP) against a local TCP
+    /// listener that accepts connections but never sends response data.
+    ///
+    /// Verifies:
+    /// 1. `validate_target_checkpoint_published` returns within 100 ms
+    ///    (non-blocking, cold-cache path).
+    /// 2. The background refresh times out via the outer
+    ///    `ARCHIVE_REFRESH_TIMEOUT_SECS` (30 s) ceiling.
+    /// 3. The HTTP client actually connected to the hung listener.
+    ///
+    /// Coverage: post-TCP-connect HTTP-read hang. Does NOT cover
+    /// DNS/TLS/connect-timeout scenarios.
+    #[tokio::test]
+    async fn test_real_tcp_hang_does_not_block_event_loop() {
+        use std::time::{Duration, Instant};
+
+        // 1. Bind a TCP listener on an ephemeral loopback port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Accept connections but never send data. Retain sockets so the
+        // client sees a connected-but-silent peer (not EOF or RST).
+        let accepted = Arc::new(parking_lot::Mutex::new(Vec::<tokio::net::TcpStream>::new()));
+        let accepted_clone = Arc::clone(&accepted);
+        let accept_handle = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accepted_clone.lock().push(stream);
+            }
+        });
+
+        // 2. Build config with ONLY the hung listener as the archive.
+        //    ConfigBuilder::new() starts from AppConfig::testnet() which
+        //    includes sdf1/2/3 — replace the archive list entirely.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        config.history.archives = vec![crate::config::HistoryArchiveEntry {
+            name: "hung".to_string(),
+            url: format!("http://127.0.0.1:{port}"),
+            get_enabled: true,
+            put_enabled: false,
+            put: None,
+            mkdir: None,
+        }];
+
+        // App::new wires ArchiveHttpFetcher::for_background_refresh from
+        // config.history.archives — no manual fetcher replacement needed.
+        let app = App::new(config).await.unwrap();
+
+        // Cache starts cold (no seed), so get_cached() returns None and
+        // spawns a background refresh via the real HTTP fetcher.
+
+        // 3. Assert non-blocking behavior.
+        let start = Instant::now();
+        let ok = app.validate_target_checkpoint_published(50, 10_000).await;
+        let elapsed = start.elapsed();
+
+        assert!(ok, "cold-cache branch must proceed");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "event-loop query blocked for {elapsed:?} (must be < 100ms)",
+        );
+        assert!(
+            app.archive_checkpoint_cache.is_refreshing(),
+            "background refresh should be in flight",
+        );
+
+        // 4. Wait for the background refresh to complete via the outer
+        //    ARCHIVE_REFRESH_TIMEOUT_SECS (30 s) ceiling. Poll with a
+        //    35 s wall-clock deadline.
+        let deadline = Instant::now() + Duration::from_secs(35);
+        loop {
+            if !app.archive_checkpoint_cache.is_refreshing() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background refresh did not complete within 35s",
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        assert_eq!(
+            app.archive_checkpoint_cache.refresh_timeouts(),
+            1,
+            "the outer 30s timeout should have fired exactly once",
+        );
+        assert_eq!(
+            app.archive_checkpoint_cache.refresh_errors(),
+            0,
+            "no fetch errors expected — timeout should fire before inner retries complete",
+        );
+
+        // 5. Verify the HTTP client actually reached our TCP listener.
+        assert!(
+            !accepted.lock().is_empty(),
+            "reqwest should have connected to the hung TCP listener",
+        );
+
+        accept_handle.abort();
+    }
 }
