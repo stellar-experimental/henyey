@@ -1970,11 +1970,15 @@ impl App {
                     // the state restored by catchup.
                     self.update_bucket_snapshot();
 
+                    let last_processed_slot_snapshot = *self.last_processed_slot.read().await;
+                    let herder_state_snapshot = self.herder.state();
                     tracing::info!(
                         target: "henyey::envelope_path",
                         ledger_seq = result.ledger_seq,
                         latest_externalized = self.herder.latest_externalized_slot().unwrap_or(0),
                         tracking_slot = self.herder.tracking_slot(),
+                        last_processed_slot = last_processed_slot_snapshot,
+                        herder_state = ?herder_state_snapshot,
                         "{} catchup complete",
                         label
                     );
