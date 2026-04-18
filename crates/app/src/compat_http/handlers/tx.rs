@@ -9,8 +9,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
@@ -103,15 +102,9 @@ pub(crate) async fn compat_tx_handler(
             let xdr_result_result = code
                 .map(|c| c.to_xdr_result())
                 .unwrap_or(TransactionResultResult::TxInternalError);
-            let error_b64 = match encode_tx_result(xdr_result_result, 0) {
+            let error_b64 = match encode_tx_result_or_exception(xdr_result_result, 0) {
                 Ok(b64) => b64,
-                Err(e) => {
-                    tracing::error!(%e, "Failed to encode transaction result XDR");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"exception": "Internal error: failed to encode transaction result"})),
-                    ).into_response();
-                }
+                Err(resp) => return resp,
             };
             CompatTxResponse {
                 status: "ERROR".to_string(),
@@ -120,16 +113,11 @@ pub(crate) async fn compat_tx_handler(
             }
         }
         TxQueueResult::Banned => {
-            let error_b64 = match encode_tx_result(TransactionResultResult::TxBadAuth, 0) {
-                Ok(b64) => b64,
-                Err(e) => {
-                    tracing::error!(%e, "Failed to encode transaction result XDR");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"exception": "Internal error: failed to encode transaction result"})),
-                    ).into_response();
-                }
-            };
+            let error_b64 =
+                match encode_tx_result_or_exception(TransactionResultResult::TxBadAuth, 0) {
+                    Ok(b64) => b64,
+                    Err(resp) => return resp,
+                };
             CompatTxResponse {
                 status: "ERROR".to_string(),
                 error: Some(error_b64),
@@ -137,15 +125,12 @@ pub(crate) async fn compat_tx_handler(
             }
         }
         TxQueueResult::FeeTooLow => {
-            let error_b64 = match encode_tx_result(TransactionResultResult::TxInsufficientFee, 0) {
+            let error_b64 = match encode_tx_result_or_exception(
+                TransactionResultResult::TxInsufficientFee,
+                0,
+            ) {
                 Ok(b64) => b64,
-                Err(e) => {
-                    tracing::error!(%e, "Failed to encode transaction result XDR");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"exception": "Internal error: failed to encode transaction result"})),
-                    ).into_response();
-                }
+                Err(resp) => return resp,
             };
             CompatTxResponse {
                 status: "ERROR".to_string(),
@@ -170,6 +155,24 @@ fn encode_tx_result(
     };
     let bytes = tx_result.to_xdr(Limits::none())?;
     Ok(BASE64.encode(&bytes))
+}
+
+/// Encode a result or return a stellar-core-compatible `{"exception": ...}` response.
+///
+/// On encoding failure, logs the error and returns an HTTP 200 JSON exception
+/// matching the compat layer convention (all errors are 200 with `"exception"` key).
+#[allow(clippy::result_large_err)]
+fn encode_tx_result_or_exception(
+    result: TransactionResultResult,
+    fee_charged: i64,
+) -> Result<String, Response> {
+    encode_tx_result(result, fee_charged).map_err(|e| {
+        tracing::error!(%e, "Failed to encode transaction result XDR");
+        Json(serde_json::json!({
+            "exception": "Internal error: failed to encode transaction result"
+        }))
+        .into_response()
+    })
 }
 
 /// stellar-core compatible tx submission response.
