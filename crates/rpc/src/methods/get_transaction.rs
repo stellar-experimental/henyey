@@ -21,7 +21,10 @@ pub async fn handle(
 
     let lctx = util::LedgerContext::from_app(ctx).await?;
 
-    // Look up the transaction and its close time in a single blocking DB call
+    // Look up the transaction and its close time in a single blocking DB call.
+    // If the header was pruned (require_close_times fails), check whether the
+    // tx is below the retention boundary (NOT_FOUND) or genuinely missing
+    // (propagate integrity error).
     let hash_owned = hash.to_string();
     let tx_record_with_time = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
@@ -29,15 +32,25 @@ pub async fn handle(
             let record = conn.load_transaction(&hash_owned)?;
             match record {
                 Some(record) => {
-                    // Atomic retention check: if the tx's ledger is below the
-                    // oldest retained header, treat as not found.
-                    let oldest = conn.get_oldest_ledger_seq()?.unwrap_or(0);
-                    if record.ledger_seq < oldest {
-                        return Ok(None);
+                    match conn.require_close_times(&[record.ledger_seq]) {
+                        Ok(close_times) => {
+                            let close_time = close_times[&record.ledger_seq];
+                            Ok(Some((record, close_time)))
+                        }
+                        Err(henyey_db::DbError::Integrity(_)) => {
+                            // Header pruned — check if below retention boundary
+                            let oldest = conn.get_oldest_ledger_seq()?.unwrap_or(0);
+                            if record.ledger_seq < oldest {
+                                Ok(None) // stale tx, treat as NOT_FOUND
+                            } else {
+                                Err(henyey_db::DbError::Integrity(format!(
+                                    "missing close time for retained ledger {}",
+                                    record.ledger_seq
+                                )))
+                            }
+                        }
+                        Err(e) => Err(e),
                     }
-                    let close_times = conn.require_close_times(&[record.ledger_seq])?;
-                    let close_time = close_times[&record.ledger_seq];
-                    Ok(Some((record, close_time)))
                 }
                 None => Ok(None),
             }
