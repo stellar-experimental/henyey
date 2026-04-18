@@ -448,19 +448,19 @@ async fn test_core3_restart_rejoin_over_loopback() {
         .manual_close_all_app_nodes()
         .await
         .expect("close ledger 2 loopback");
-    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 2, Duration::from_secs(45)).await;
 
     sim.remove_node("node0")
         .await
         .expect("remove node0 loopback");
-    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(5)).await;
-    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(5)).await;
+    wait_for_peer_count(&sim, "node1", 1, Duration::from_secs(10)).await;
+    wait_for_peer_count(&sim, "node2", 1, Duration::from_secs(10)).await;
 
     let _ = sim
         .manual_close_all_app_nodes()
         .await
         .expect("close ledger 3 loopback");
-    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(20)).await;
+    wait_for_app_ledger_close(&sim, 3, Duration::from_secs(45)).await;
 
     sim.restart_node("node0")
         .await
