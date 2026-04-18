@@ -556,38 +556,74 @@ mod tests {
     }
 
     /// `sendTransaction` must NOT be subject to `request_timeout`.
-    /// With the same short timeout, `sendTransaction` with invalid params
-    /// returns its method-specific error immediately — not a timeout error.
+    ///
+    /// Proof: use the same config that causes read-only methods to timeout
+    /// (DB semaphore held + 100ms timeout), then submit a parseable
+    /// TransactionEnvelope via `sendTransaction`. Since `sendTransaction`
+    /// bypasses the timeout wrapper, it processes the transaction to
+    /// completion (herder rejects it, but no timeout error). Read-only
+    /// methods under the same config timeout (proven by
+    /// `test_read_only_timeout_releases_permit`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_send_transaction_exempt_from_timeout() {
+        use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+        use stellar_xdr::curr::{
+            Limits, Memo, MuxedAccount, Operation, OperationBody, Preconditions, SequenceNumber,
+            Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256,
+            WriteXdr,
+        };
+
         let (_sim, app) = boot_test_app().await;
         let ctx = make_ctx(app, 2, 1, Duration::from_millis(100));
 
-        // Hold DB semaphore — would cause read-only methods to timeout,
-        // but sendTransaction doesn't use blocking_db.
+        // Hold DB semaphore — read-only methods (getHealth) would timeout,
+        // but sendTransaction doesn't use blocking_db and bypasses timeout.
         let _db_held = ctx.db_semaphore.clone().try_acquire_owned().unwrap();
 
-        let body = br#"{"jsonrpc":"2.0","id":99,"method":"sendTransaction","params":{}}"#;
-        let (status, resp) = call_handler(&ctx, body).await;
+        // Build a minimal TransactionEnvelope that passes XDR parsing,
+        // reaching submit_transaction (async herder call). The tx will be
+        // rejected by the herder (invalid account), but that's fine — we're
+        // testing that it doesn't timeout, not that it succeeds.
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([0; 32])),
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Inflation,
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let xdr_bytes = envelope.to_xdr(Limits::none()).unwrap();
+        let tx_b64 = BASE64.encode(&xdr_bytes);
+
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":99,"method":"sendTransaction","params":{{"transaction":"{}"}}}}"#,
+            tx_b64
+        );
+        let (status, resp) = call_handler(&ctx, body.as_bytes()).await;
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 99);
-        // sendTransaction with missing 'transaction' param returns invalid_params
-        let err = &resp["error"];
-        assert_eq!(
-            err["code"],
-            json!(-32602),
-            "sendTransaction should return INVALID_PARAMS, not timeout"
-        );
-        assert!(
-            err["message"]
-                .as_str()
-                .unwrap()
-                .contains("missing 'transaction' parameter"),
-            "expected missing-parameter error, got: {}",
-            err["message"]
-        );
+        // sendTransaction must NOT return "request timed out". It should
+        // return a result (herder rejection) or method-specific error.
+        if let Some(err) = resp.get("error") {
+            assert_ne!(
+                err["message"].as_str().unwrap_or(""),
+                "request timed out",
+                "sendTransaction must NOT be subject to request_timeout"
+            );
+        }
+        // If result is present, sendTransaction completed normally — also fine.
     }
 
     #[test]
