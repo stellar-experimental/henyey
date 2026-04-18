@@ -2793,6 +2793,126 @@ mod tests {
     }
 
     // ============================================================
+    // Shutdown Drain Tests (regression for #1715: pending close not drained)
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_drain_close_pipeline_resets_applying_flag() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+        app.set_applying_ledger(true);
+
+        // Simulate a failed close result.
+        let pending = PendingLedgerClose {
+            handle: tokio::task::spawn_blocking(|| Err("simulated error".to_string())),
+            ledger_seq: 42,
+            tx_set: henyey_herder::TransactionSet {
+                hash: henyey_common::Hash256::ZERO,
+                previous_ledger_hash: henyey_common::Hash256::ZERO,
+                transactions: Vec::new(),
+                generalized_tx_set: None,
+            },
+            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
+            close_time: 1,
+            upgrades: Vec::new(),
+        };
+
+        let mut pending_close = Some(pending);
+        let mut pending_persist: Option<super::types::PendingPersist> = None;
+
+        app.drain_close_pipeline(&mut pending_persist, &mut pending_close)
+            .await;
+
+        assert!(
+            pending_close.is_none(),
+            "pending_close should be consumed by drain"
+        );
+        assert!(
+            !app.is_applying_ledger.load(Ordering::Relaxed),
+            "is_applying_ledger should be cleared after drain"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drain_close_pipeline_both_pending() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+
+        let app = App::new(config).await.unwrap();
+        app.set_applying_ledger(true);
+
+        // Track ordering: persist must complete before close is awaited.
+        let persist_done = Arc::new(AtomicBool::new(false));
+        let persist_done_clone = persist_done.clone();
+
+        // Simulate a persist task that sets the flag.
+        let persist_handle = tokio::spawn(async move {
+            persist_done_clone.store(true, Ordering::SeqCst);
+        });
+
+        let mut pending_persist = Some(super::types::PendingPersist {
+            handle: persist_handle,
+            ledger_seq: 41,
+        });
+
+        // Simulate a close that verifies persist already ran.
+        let persist_done_check = persist_done.clone();
+        let pending = PendingLedgerClose {
+            handle: tokio::task::spawn_blocking(move || {
+                // By the time close is awaited, persist should be done.
+                assert!(
+                    persist_done_check.load(Ordering::SeqCst),
+                    "persist should complete before close is awaited"
+                );
+                Err("simulated error after persist".to_string())
+            }),
+            ledger_seq: 42,
+            tx_set: henyey_herder::TransactionSet {
+                hash: henyey_common::Hash256::ZERO,
+                previous_ledger_hash: henyey_common::Hash256::ZERO,
+                transactions: Vec::new(),
+                generalized_tx_set: None,
+            },
+            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
+            close_time: 1,
+            upgrades: Vec::new(),
+        };
+
+        let mut pending_close = Some(pending);
+
+        app.drain_close_pipeline(&mut pending_persist, &mut pending_close)
+            .await;
+
+        assert!(pending_persist.is_none(), "persist should be consumed");
+        assert!(pending_close.is_none(), "close should be consumed");
+        assert!(
+            persist_done.load(Ordering::SeqCst),
+            "persist should have completed"
+        );
+        assert!(
+            !app.is_applying_ledger.load(Ordering::Relaxed),
+            "is_applying_ledger should be cleared"
+        );
+    }
+
+    // ============================================================
     // Tx Set Request Timeout Tests (regression for silent GetTxSet drops)
     // ============================================================
 

@@ -976,6 +976,11 @@ impl App {
             self.catchup_in_progress.store(false, Ordering::SeqCst);
         }
 
+        // Drain the close pipeline before shutdown (parity: stellar-core
+        // joins the ledger-close thread first in idempotentShutdown).
+        self.drain_close_pipeline(&mut pending_persist, &mut pending_close)
+            .await;
+
         self.set_state(AppState::ShuttingDown).await;
         self.shutdown_internal().await?;
 
@@ -1465,6 +1470,59 @@ impl App {
     /// Subscribe to shutdown notifications.
     pub fn subscribe_shutdown(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.shutdown_tx.subscribe()
+    }
+
+    /// Drain the close pipeline on shutdown.
+    ///
+    /// stellar-core parity: `idempotentShutdown()` joins the ledger-close
+    /// thread first before tearing down subsystems.
+    ///
+    /// Order matters:
+    /// 1. Drain `pending_persist` first — a prior close's (or catchup's) DB
+    ///    writes may be in-flight.  Persist panics abort the process, matching
+    ///    the normal event-loop behavior (`lifecycle.rs` persist-complete arm).
+    /// 2. Drain `pending_close` — await the `spawn_blocking` task, then call
+    ///    `handle_close_complete()` with `LedgerCloseFinalizer::inline()` so
+    ///    the close's own persist runs to completion before we return.
+    pub(super) async fn drain_close_pipeline(
+        &self,
+        pending_persist: &mut Option<super::types::PendingPersist>,
+        pending_close: &mut Option<super::types::PendingLedgerClose>,
+    ) {
+        // 1. Drain prior persist (abort on panic, matching the normal path).
+        if let Some(persist) = pending_persist.take() {
+            tracing::info!(
+                ledger_seq = persist.ledger_seq,
+                "Awaiting pending persist on shutdown"
+            );
+            if let Err(e) = persist.handle.await {
+                tracing::error!(
+                    error = %e,
+                    ledger_seq = persist.ledger_seq,
+                    "Persist task panicked during shutdown"
+                );
+                std::process::abort();
+            }
+        }
+
+        // 2. Drain pending close (parity: stellar-core joins ledger-close
+        //    thread first in idempotentShutdown).
+        if let Some(mut pending) = pending_close.take() {
+            tracing::info!(
+                ledger_seq = pending.ledger_seq,
+                "Awaiting pending ledger close on shutdown"
+            );
+            let join_result = (&mut pending.handle).await;
+            // Use inline finalizer — persist must complete before
+            // shutdown_internal tears down the database.
+            let _ = self
+                .handle_close_complete(
+                    pending,
+                    join_result,
+                    super::persist::LedgerCloseFinalizer::inline(),
+                )
+                .await;
+        }
     }
 
     /// Internal shutdown cleanup.
