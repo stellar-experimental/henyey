@@ -879,17 +879,20 @@ impl App {
                     None
                 }
                 None => {
-                    // Cache cold/stale (background refresh in flight).
-                    // Arm the backoff to avoid a per-tick query storm;
-                    // still fall through to peer-SCP fallback below.
-                    let deadline =
-                        self.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
-                    let mut guard = self.archive_behind_until.write().await;
-                    *guard = Some(deadline);
+                    // Cache cold/stale — a background refresh has been
+                    // spawned and will complete within a few seconds. Do
+                    // NOT arm `archive_behind_until`: that backoff exists
+                    // to suppress redundant queries against a known-behind
+                    // archive, and `None` is a transient state (refresh in
+                    // flight), not a confirmed "archive behind" signal.
+                    // Armoring 60s would force a skip across ~5 recovery
+                    // ticks even after the refresh completes on tick 2.
+                    // Fall through to peer-SCP fallback; the next tick
+                    // (10 s later) will see the refreshed cache.
                     tracing::debug!(
                         next_checkpoint = next_cp,
-                        backoff_secs = ARCHIVE_BEHIND_BACKOFF_SECS,
-                        "Archive checkpoint cache cold/stale — arming backoff"
+                        "Archive checkpoint cache cold/stale — \
+                         falling through to peer-SCP while refresh completes"
                     );
                     None
                 }

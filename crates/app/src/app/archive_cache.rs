@@ -239,8 +239,10 @@ impl ArchiveCheckpointCache {
         Ok(checkpoint)
     }
 
-    /// Test / setup hook: overwrite the cached value.
-    #[allow(dead_code)]
+    /// Overwrite the cached value. Used by `handle_catchup_result` to
+    /// seed the cache with the ledger we just caught up to (an
+    /// authoritative checkpoint value), and by tests to pre-warm the
+    /// cache without going through the HTTP fetcher.
     pub(super) fn seed(&self, checkpoint: u32) {
         *self.value.write() = Some(CachedCheckpoint {
             checkpoint,
@@ -258,8 +260,10 @@ impl ArchiveCheckpointCache {
         });
     }
 
-    /// Test / setup hook: clear the cached value.
-    #[allow(dead_code)]
+    /// Clear the cached value. Used by `trigger_recovery_catchup` to
+    /// force the next non-blocking read to be "cold", so the background
+    /// refresh spawns immediately — matching the previous behavior of
+    /// invalidating the cache before a recovery-escalation archive query.
     pub(super) fn clear(&self) {
         *self.value.write() = None;
     }

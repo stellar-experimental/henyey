@@ -1782,11 +1782,16 @@ impl App {
                 true
             }
             None => {
-                tracing::warn!(
+                // Cold/stale cache — transient state with a refresh in
+                // flight. Skip this tick WITHOUT arming the 60 s backoff
+                // (see `clear_catchup_triggered_on_skip` rationale); the
+                // next recovery tick (10 s later) will see the refreshed
+                // cache and can re-evaluate.
+                tracing::debug!(
                     current_ledger,
                     "Archive checkpoint cache cold/stale; skipping catchup (will retry next tick)"
                 );
-                self.arm_archive_behind_backoff().await;
+                self.clear_catchup_triggered_on_skip().await;
                 false
             }
         }
@@ -1794,15 +1799,28 @@ impl App {
 
     /// Arm the `archive_behind_until` backoff and clear `catchup_triggered`.
     ///
-    /// Called from the catchup skip paths. The backoff suppresses redundant
-    /// archive queries and suppresses `TriggerCatchup` in the post-catchup
-    /// decision helper for `ARCHIVE_BEHIND_BACKOFF_SECS`. Clearing
-    /// `catchup_triggered` keeps the stuck-state semantics consistent: a
-    /// skipped catchup is not "in flight", so a future catchup (once the
-    /// archive catches up) must be allowed to trigger.
+    /// Called from the catchup skip paths when we **observed** the archive
+    /// is behind or unreachable (authoritative negative signal). The
+    /// backoff suppresses redundant archive queries and suppresses
+    /// `TriggerCatchup` in the post-catchup decision helper for
+    /// `ARCHIVE_BEHIND_BACKOFF_SECS`. Clearing `catchup_triggered` keeps
+    /// the stuck-state semantics consistent: a skipped catchup is not
+    /// "in flight", so a future catchup (once the archive catches up)
+    /// must be allowed to trigger.
     async fn arm_archive_behind_backoff(&self) {
         let deadline = self.clock.now() + Duration::from_secs(ARCHIVE_BEHIND_BACKOFF_SECS);
         *self.archive_behind_until.write().await = Some(deadline);
+        self.clear_catchup_triggered_on_skip().await;
+    }
+
+    /// Clear `catchup_triggered` on a catchup skip without arming the
+    /// archive-behind backoff. Used when the skip is caused by a transient
+    /// condition (e.g. cold/stale cache with a background refresh
+    /// in flight) rather than an authoritative "archive behind" signal.
+    /// Arming the 60 s backoff in those cases would force ~5 recovery
+    /// ticks to skip the archive check even after the refresh completes
+    /// within 2–15 s.
+    async fn clear_catchup_triggered_on_skip(&self) {
         if let Some(state) = self.consensus_stuck_state.write().await.as_mut() {
             state.catchup_triggered = false;
         }
