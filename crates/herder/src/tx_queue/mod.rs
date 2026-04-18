@@ -411,8 +411,24 @@ impl QueuedTransaction {
         self.received_at.elapsed().as_secs() > max_age_secs
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn is_better_than(&self, other: &QueuedTransaction) -> bool {
         better_fee_ratio(self, other)
+    }
+
+    /// Compare this transaction's fee rate against a FeeEntry (from the index).
+    fn is_better_than_entry(&self, entry: &FeeEntry) -> bool {
+        match fee_rate_cmp(
+            self.inclusion_fee,
+            self.op_count,
+            entry.inclusion_fee,
+            entry.op_count,
+        ) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => self.hash.0 < entry.hash.0,
+        }
     }
 }
 
@@ -558,6 +574,140 @@ pub(super) struct SelectedTxs {
     pub(super) classic_limited: bool,
 }
 
+/// Entry in the fee-ordered index. Sorted ascending by fee rate (using
+/// cross-multiplication via `fee_rate_cmp`), with reverse-hash tie-break
+/// to match the existing `ensure_queue_capacity` eviction semantics.
+#[derive(Clone, Eq, PartialEq, Debug)]
+struct FeeEntry {
+    inclusion_fee: u64,
+    op_count: u32,
+    hash: Hash256,
+}
+
+impl FeeEntry {
+    fn from_queued(tx: &QueuedTransaction) -> Self {
+        Self {
+            inclusion_fee: tx.inclusion_fee,
+            op_count: tx.op_count,
+            hash: tx.hash,
+        }
+    }
+}
+
+impl Ord for FeeEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        fee_rate_cmp(
+            self.inclusion_fee,
+            self.op_count,
+            other.inclusion_fee,
+            other.op_count,
+        )
+        .then_with(|| other.hash.0.cmp(&self.hash.0))
+    }
+}
+
+impl PartialOrd for FeeEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Co-located transaction store with fee index. All mutations go through
+/// helpers that maintain both structures atomically.
+struct QueueStore {
+    by_hash: HashMap<Hash256, QueuedTransaction>,
+    fee_index: std::collections::BTreeSet<FeeEntry>,
+}
+
+impl QueueStore {
+    fn new() -> Self {
+        Self {
+            by_hash: HashMap::new(),
+            fee_index: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn insert(&mut self, tx: QueuedTransaction) {
+        let entry = FeeEntry::from_queued(&tx);
+        self.by_hash.insert(tx.hash, tx);
+        self.fee_index.insert(entry);
+    }
+
+    fn remove(&mut self, hash: &Hash256) -> Option<QueuedTransaction> {
+        if let Some(tx) = self.by_hash.remove(hash) {
+            self.fee_index.remove(&FeeEntry::from_queued(&tx));
+            Some(tx)
+        } else {
+            None
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_hash.clear();
+        self.fee_index.clear();
+    }
+
+    fn get(&self, hash: &Hash256) -> Option<&QueuedTransaction> {
+        self.by_hash.get(hash)
+    }
+
+    fn contains_key(&self, hash: &Hash256) -> bool {
+        self.by_hash.contains_key(hash)
+    }
+
+    fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_hash.is_empty()
+    }
+
+    fn values(&self) -> impl Iterator<Item = &QueuedTransaction> {
+        self.by_hash.values()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[allow(dead_code)]
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut QueuedTransaction> {
+        self.by_hash.values_mut()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&Hash256, &QueuedTransaction)> {
+        self.by_hash.iter()
+    }
+
+    /// Direct read access to the underlying HashMap for iteration patterns
+    /// that need a `&HashMap` reference (e.g., `EvictionScan`).
+    fn as_hash_map(&self) -> &HashMap<Hash256, QueuedTransaction> {
+        &self.by_hash
+    }
+
+    /// Peek the lowest-fee entry from the index. O(log n).
+    fn lowest_fee(&self) -> Option<&FeeEntry> {
+        self.fee_index.iter().next()
+    }
+
+    /// Debug assertion: verify fee_index ↔ by_hash consistency.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn assert_consistent(&self) {
+        assert_eq!(
+            self.by_hash.len(),
+            self.fee_index.len(),
+            "QueueStore: by_hash.len() != fee_index.len()"
+        );
+        for (hash, tx) in &self.by_hash {
+            let entry = FeeEntry::from_queued(tx);
+            assert!(
+                self.fee_index.contains(&entry),
+                "QueueStore: tx {:?} in by_hash but not in fee_index",
+                hash
+            );
+        }
+    }
+}
+
 /// Bundled properties of a transaction being evaluated for queue admission.
 struct EvictionCandidate<'a> {
     queued: &'a QueuedTransaction,
@@ -656,8 +806,8 @@ fn account_id_from_fee_source_key(key: &[u8]) -> AccountId {
 pub struct TransactionQueue {
     /// Configuration.
     config: TxQueueConfig,
-    /// Transactions indexed by hash.
-    by_hash: RwLock<HashMap<Hash256, QueuedTransaction>>,
+    /// Transactions indexed by hash with co-located fee index.
+    store: RwLock<QueueStore>,
     /// Seen transaction hashes (includes recently applied).
     seen: RwLock<HashSet<Hash256>>,
     /// Validation context (ledger state info for validation).
@@ -734,7 +884,7 @@ impl TransactionQueue {
 
         Self {
             config,
-            by_hash: RwLock::new(HashMap::new()),
+            store: RwLock::new(QueueStore::new()),
             seen: RwLock::new(HashSet::new()),
             validation_context: RwLock::new(ctx),
             classic_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
@@ -782,8 +932,8 @@ impl TransactionQueue {
 
     /// Return all queued transaction envelopes (for post-close invalidation).
     pub fn pending_envelopes(&self) -> Vec<TransactionEnvelope> {
-        let by_hash = self.by_hash.read();
-        by_hash.values().map(|qt| qt.envelope.clone()).collect()
+        let store = self.store.read();
+        store.values().map(|qt| qt.envelope.clone()).collect()
     }
 
     /// Update Soroban resource limits dynamically after ledger close.
@@ -854,7 +1004,7 @@ impl TransactionQueue {
             return false;
         };
         let hash = queued.hash;
-        self.by_hash.write().insert(hash, queued);
+        self.store.write().insert(queued);
         self.seen.write().insert(hash);
         true
     }
@@ -1446,7 +1596,7 @@ impl TransactionQueue {
             return TxQueueResult::FeeTooLow;
         }
 
-        let mut by_hash = self.by_hash.write();
+        let mut store = self.store.write();
         let ledger_version = self.validation_context.read().protocol_version;
         let queued_frame = henyey_tx::TransactionFrame::from_owned_with_network(
             queued.envelope.clone(),
@@ -1469,7 +1619,7 @@ impl TransactionQueue {
         }
 
         // Check for duplicate in queue
-        if by_hash.contains_key(&queued.hash) {
+        if store.contains_key(&queued.hash) {
             return TxQueueResult::Duplicate;
         }
 
@@ -1499,7 +1649,7 @@ impl TransactionQueue {
         };
 
         let pending_eviction_list = match self.check_and_collect_evictions(
-            &by_hash,
+            store.as_hash_map(),
             &candidate,
             seed,
             replaced_tx.as_ref(),
@@ -1510,7 +1660,7 @@ impl TransactionQueue {
 
         // Check queue size (accounting for pending evictions) and evict if needed.
         if let Err(result) =
-            self.ensure_queue_capacity(&mut by_hash, pending_eviction_list.len(), &queued)
+            self.ensure_queue_capacity(&mut store, pending_eviction_list.len(), &queued)
         {
             return result;
         }
@@ -1528,7 +1678,7 @@ impl TransactionQueue {
         // Parity: stellar-core TransactionQueue.cpp:733-739 bans each evicted
         // victim so it cannot be re-submitted immediately.
         for evicted in &pending_eviction_list {
-            by_hash.remove(&evicted.hash);
+            store.remove(&evicted.hash);
         }
         if !pending_eviction_list.is_empty() {
             let mut seen = self.seen.write();
@@ -1548,8 +1698,8 @@ impl TransactionQueue {
 
         // Handle fee-bump replacement if applicable
         if let Some(ref old_tx) = replaced_tx {
-            // Remove the old transaction from by_hash and seen
-            by_hash.remove(&old_tx.hash);
+            // Remove the old transaction from store and seen
+            store.remove(&old_tx.hash);
             self.seen.write().remove(&old_tx.hash);
 
             // If the old tx has a different fee-source, release the fee from that account
@@ -1608,74 +1758,55 @@ impl TransactionQueue {
             }
         }
 
-        by_hash.insert(hash, queued);
+        store.insert(queued);
         self.seen.write().insert(hash);
 
         TxQueueResult::Added
     }
 
-    /// Ensure queue has capacity, evicting expired or lowest-fee transactions if needed.
+    /// Ensure queue has capacity, evicting lowest-fee or expired transactions if needed.
+    ///
+    /// Primary path uses the fee index for O(log n) eviction. Falls back to an
+    /// expired-tx scan only when fee-based eviction fails (incoming tx has worse fee).
     fn ensure_queue_capacity(
         &self,
-        by_hash: &mut parking_lot::RwLockWriteGuard<
-            '_,
-            HashMap<henyey_common::Hash256, QueuedTransaction>,
-        >,
+        store: &mut QueueStore,
         pending_eviction_count: usize,
         queued: &QueuedTransaction,
     ) -> std::result::Result<(), TxQueueResult> {
-        let effective_len = by_hash.len() - pending_eviction_count;
+        let effective_len = store.len().saturating_sub(pending_eviction_count);
         if effective_len < self.config.max_size {
             return Ok(());
         }
 
-        // Try to evict expired transactions
-        let expired: Vec<QueuedTransaction> = by_hash
+        // O(log n): try to evict the lowest-fee transaction
+        if let Some(min_entry) = store.lowest_fee().cloned() {
+            if queued.is_better_than_entry(&min_entry) {
+                let evict_hash = min_entry.hash;
+                let evicted = store.remove(&evict_hash).unwrap();
+                self.seen.write().remove(&evict_hash);
+                let mut account_states = self.account_states.write();
+                Self::drop_transaction(&mut account_states, &evicted);
+                return Ok(());
+            }
+        }
+
+        // Fallback: incoming tx has worse fee than all queued txs.
+        // Try to evict one expired tx to make room (preserves existing semantic
+        // that try_add can free space from expired txs even if the new tx has low fee).
+        let expired_hash = store
             .iter()
-            .filter(|(_, tx)| tx.is_expired(self.config.max_age_secs))
-            .map(|(_, tx)| tx.clone())
-            .collect();
-
-        if !expired.is_empty() {
-            let mut seen = self.seen.write();
+            .find(|(_, tx)| tx.is_expired(self.config.max_age_secs))
+            .map(|(h, _)| *h);
+        if let Some(hash) = expired_hash {
+            let evicted = store.remove(&hash).unwrap();
+            self.seen.write().remove(&hash);
             let mut account_states = self.account_states.write();
-            for tx in &expired {
-                by_hash.remove(&tx.hash);
-                seen.remove(&tx.hash);
-                Self::drop_transaction(&mut account_states, tx);
-            }
+            Self::drop_transaction(&mut account_states, &evicted);
+            return Ok(());
         }
 
-        if by_hash.len().saturating_sub(pending_eviction_count) >= self.config.max_size {
-            if let Some((evict_hash, evict_tx)) = by_hash
-                .iter()
-                .min_by(|a, b| {
-                    let a_tx = a.1;
-                    let b_tx = b.1;
-                    fee_rate_cmp(
-                        a_tx.inclusion_fee,
-                        a_tx.op_count,
-                        b_tx.inclusion_fee,
-                        b_tx.op_count,
-                    )
-                    .then_with(|| b_tx.hash.0.cmp(&a_tx.hash.0))
-                })
-                .map(|(h, tx)| (*h, tx.clone()))
-            {
-                if queued.is_better_than(&evict_tx) {
-                    by_hash.remove(&evict_hash);
-                    self.seen.write().remove(&evict_hash);
-                    let mut account_states = self.account_states.write();
-                    Self::drop_transaction(&mut account_states, &evict_tx);
-                } else {
-                    return Err(TxQueueResult::QueueFull);
-                }
-            } else {
-                return Err(TxQueueResult::QueueFull);
-            }
-        }
-
-        Ok(())
+        Err(TxQueueResult::QueueFull)
     }
 
     /// Validate that the fee source has sufficient balance for the transaction.
@@ -1739,7 +1870,7 @@ impl TransactionQueue {
     /// cleaning up empty entries.
     ///
     /// Mirrors stellar-core's `dropTransaction()` + `releaseFeeMaybeEraseAccountState()`.
-    /// The caller must have already removed the transaction from `by_hash`.
+    /// The caller must have already removed the transaction from the store.
     fn drop_transaction(
         account_states: &mut HashMap<Vec<u8>, AccountState>,
         queued: &QueuedTransaction,
@@ -1778,22 +1909,22 @@ impl TransactionQueue {
 
     /// Get a transaction by hash.
     pub fn get(&self, hash: &Hash256) -> Option<QueuedTransaction> {
-        self.by_hash.read().get(hash).cloned()
+        self.store.read().get(hash).cloned()
     }
 
     /// Check if a transaction is in the queue.
     pub fn contains(&self, hash: &Hash256) -> bool {
-        self.by_hash.read().contains_key(hash)
+        self.store.read().contains_key(hash)
     }
 
     /// Get the number of pending transactions.
     pub fn len(&self) -> usize {
-        self.by_hash.read().len()
+        self.store.read().len()
     }
 
     /// Check if the queue is empty.
     pub fn is_empty(&self) -> bool {
-        self.by_hash.read().is_empty()
+        self.store.read().is_empty()
     }
 
     /// Reset all lane-based and global eviction fee thresholds.
@@ -1808,18 +1939,18 @@ impl TransactionQueue {
 
     /// Clear expired transactions.
     pub fn evict_expired(&self) {
-        let mut by_hash = self.by_hash.write();
+        let mut store = self.store.write();
         let mut account_states = self.account_states.write();
         let max_age = self.config.max_age_secs;
         // Collect expired transactions, then remove them so account_states
         // are properly cleaned up (fee release + empty entry removal).
-        let expired_hashes: Vec<Hash256> = by_hash
+        let expired_hashes: Vec<Hash256> = store
             .iter()
             .filter(|(_, tx)| tx.is_expired(max_age))
             .map(|(hash, _)| *hash)
             .collect();
         for hash in &expired_hashes {
-            if let Some(removed) = by_hash.remove(hash) {
+            if let Some(removed) = store.remove(hash) {
                 Self::drop_transaction(&mut account_states, &removed);
             }
         }
@@ -1837,7 +1968,7 @@ impl TransactionQueue {
 
     /// Clear all transactions.
     pub fn clear(&self) {
-        self.by_hash.write().clear();
+        self.store.write().clear();
         self.account_states.write().clear();
         // Don't clear seen - prevents replay
     }
@@ -1871,11 +2002,11 @@ impl TransactionQueue {
 
         // Also remove from the queue if present, cleaning up account_states.
         // Mirrors stellar-core's ban() which calls dropTransaction().
-        let mut by_hash = self.by_hash.write();
+        let mut store = self.store.write();
         let mut account_states = self.account_states.write();
         let mut seen = self.seen.write();
         for hash in tx_hashes {
-            if let Some(removed) = by_hash.remove(hash) {
+            if let Some(removed) = store.remove(hash) {
                 Self::drop_transaction(&mut account_states, &removed);
             }
             seen.remove(hash);
@@ -1948,7 +2079,7 @@ impl TransactionQueue {
         }
 
         let mut account_states = self.account_states.write();
-        let mut by_hash = self.by_hash.write();
+        let mut store = self.store.write();
         let mut banned = self.banned_transactions.write();
 
         // Collect fee releases to apply after processing all transactions
@@ -1975,9 +2106,9 @@ impl TransactionQueue {
                 if let Some(ref queued_tx) = state.transaction {
                     // Drop if queued tx has seq <= applied seq
                     if queued_tx.sequence_number() <= *applied_seq {
-                        // Remove from by_hash
+                        // Remove from store
                         let removed_hash = queued_tx.hash;
-                        by_hash.remove(&removed_hash);
+                        store.remove(&removed_hash);
                         removed_hashes.push(removed_hash);
 
                         // Collect fee release info
@@ -2042,7 +2173,7 @@ impl TransactionQueue {
     pub fn shift(&self) -> ShiftResult {
         let mut banned = self.banned_transactions.write();
         let mut account_states = self.account_states.write();
-        let mut by_hash = self.by_hash.write();
+        let mut store = self.store.write();
 
         // Remove the oldest set (front) to unban those transactions
         let unbanned_count = banned.pop_front().map(|s| s.len()).unwrap_or(0);
@@ -2068,8 +2199,8 @@ impl TransactionQueue {
                     if let Some(newest) = banned.back_mut() {
                         newest.insert(queued_tx.hash);
                     }
-                    // Remove from by_hash and track for seen cleanup
-                    by_hash.remove(&queued_tx.hash);
+                    // Remove from store and track for seen cleanup
+                    store.remove(&queued_tx.hash);
                     evicted_hashes.push(queued_tx.hash);
 
                     // Track fee release for the fee-source account
@@ -2137,15 +2268,14 @@ impl TransactionQueue {
 
         // Extract all current transactions before clearing state.
         let existing_txs: Vec<TransactionEnvelope> = {
-            let by_hash = self.by_hash.read();
-            by_hash.values().map(|qt| qt.envelope.clone()).collect()
+            let store = self.store.read();
+            store.values().map(|qt| qt.envelope.clone()).collect()
         };
 
         // Clear queue state but preserve bans (bans cannot be invalidated
         // by a protocol upgrade, matching upstream).
         {
-            let mut by_hash = self.by_hash.write();
-            by_hash.clear();
+            self.store.write().clear();
         }
         {
             let mut seen = self.seen.write();
@@ -2186,10 +2316,10 @@ impl TransactionQueue {
     }
 
     pub fn pending_accounts(&self) -> Vec<AccountId> {
-        let by_hash = self.by_hash.read();
+        let store = self.store.read();
         let mut accounts: HashSet<Vec<u8>> = HashSet::new();
         let mut out = Vec::new();
-        for tx in by_hash.values() {
+        for tx in store.values() {
             let account_id = account_id_from_envelope(&tx.envelope);
             let key = account_key_from_account_id(&account_id);
             if accounts.insert(key) {
@@ -2201,8 +2331,8 @@ impl TransactionQueue {
 
     /// Return transaction hashes ordered by fee per op (desc) then received time (asc).
     pub fn ordered_hashes_by_fee(&self, limit: usize) -> Vec<Hash256> {
-        let by_hash = self.by_hash.read();
-        let mut entries: Vec<_> = by_hash
+        let store = self.store.read();
+        let mut entries: Vec<_> = store
             .values()
             .map(|tx| (tx.fee_per_op, tx.received_at, tx.hash))
             .collect();
@@ -2220,18 +2350,18 @@ impl TransactionQueue {
 
     /// Get statistics about the transaction queue.
     pub fn stats(&self) -> TxQueueStats {
-        let by_hash = self.by_hash.read();
+        let store = self.store.read();
         let seen = self.seen.read();
 
         // Count accounts with pending transactions
         let mut accounts: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-        for tx in by_hash.values() {
+        for tx in store.values() {
             let account_id = account_id_from_envelope(&tx.envelope);
             accounts.insert(account_key_from_account_id(&account_id));
         }
 
         TxQueueStats {
-            pending_count: by_hash.len(),
+            pending_count: store.len(),
             account_count: accounts.len(),
             banned_count: self.banned_count(),
             seen_count: seen.len(),
@@ -3803,8 +3933,8 @@ mod tests {
         assert_eq!(queue.len(), 1);
 
         {
-            let mut by_hash = queue.by_hash.write();
-            for tx in by_hash.values_mut() {
+            let mut store = queue.store.write();
+            for tx in store.values_mut() {
                 tx.received_at = tx
                     .received_at
                     .checked_sub(std::time::Duration::from_secs(10))
@@ -5888,8 +6018,8 @@ mod tests {
 
         // Artificially expire the transaction
         {
-            let mut by_hash = queue.by_hash.write();
-            for tx in by_hash.values_mut() {
+            let mut store = queue.store.write();
+            for tx in store.values_mut() {
                 tx.received_at = tx
                     .received_at
                     .checked_sub(std::time::Duration::from_secs(10))
@@ -6010,8 +6140,8 @@ mod tests {
 
         // Make tx1 expired by backdating received_at
         {
-            let mut by_hash = queue.by_hash.write();
-            for tx in by_hash.values_mut() {
+            let mut store = queue.store.write();
+            for tx in store.values_mut() {
                 tx.received_at = tx
                     .received_at
                     .checked_sub(std::time::Duration::from_secs(10))
@@ -6105,6 +6235,125 @@ mod tests {
             queue.is_banned(&low_hash),
             "Evicted tx should remain banned after one shift()"
         );
+    }
+
+    /// Test that the fee index stays consistent after a sequence of operations.
+    #[test]
+    fn test_fee_index_consistency_after_mixed_operations() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            max_age_secs: 60,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add several transactions
+        for i in 1..=5u64 {
+            let mut tx = make_test_envelope(100 * i as u32, 1);
+            set_source(&mut tx, i as u8);
+            assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+        }
+        queue.store.read().assert_consistent();
+
+        // Remove via ban
+        let hash = {
+            let store = queue.store.read();
+            let h = store.iter().next().map(|(h, _)| *h).unwrap();
+            h
+        };
+        queue.ban(&[hash]);
+        queue.store.read().assert_consistent();
+        assert_eq!(queue.store.read().len(), 4);
+
+        // Shift (age-out)
+        queue.shift();
+        queue.store.read().assert_consistent();
+
+        // Clear
+        queue.clear();
+        queue.store.read().assert_consistent();
+        assert_eq!(queue.store.read().len(), 0);
+    }
+
+    /// Test that ensure_queue_capacity evicts the lowest-fee transaction.
+    #[test]
+    fn test_ensure_capacity_evicts_lowest_fee() {
+        let config = TxQueueConfig {
+            max_size: 3,
+            max_age_secs: 600,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Fill queue with fees 100, 200, 300
+        for i in 1..=3u64 {
+            let mut tx = make_test_envelope(100 * i as u32, 1);
+            set_source(&mut tx, i as u8);
+            assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+        }
+        assert_eq!(queue.len(), 3);
+
+        // Add tx with fee 400 — should evict fee=100
+        let mut tx4 = make_test_envelope(400, 1);
+        set_source(&mut tx4, 4);
+        assert_eq!(queue.try_add(tx4), TxQueueResult::Added);
+        assert_eq!(queue.len(), 3);
+
+        // Verify fee=100 was evicted (lowest fee)
+        let store = queue.store.read();
+        let fees: Vec<u64> = store.values().map(|tx| tx.inclusion_fee).collect();
+        assert!(
+            !fees.contains(&100),
+            "lowest-fee tx should have been evicted"
+        );
+        assert!(fees.contains(&200));
+        assert!(fees.contains(&300));
+        assert!(fees.contains(&400));
+        store.assert_consistent();
+    }
+
+    /// Test that ensure_queue_capacity falls back to expired eviction when
+    /// the incoming tx has a worse fee than all queued txs.
+    #[test]
+    fn test_ensure_capacity_expired_fallback() {
+        let config = TxQueueConfig {
+            max_size: 1,
+            max_age_secs: 0, // immediate expiry
+            min_fee_per_op: 0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add a high-fee transaction
+        let mut tx1 = make_test_envelope(1000, 1);
+        set_source(&mut tx1, 1);
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+
+        // Backdate to make it expired
+        {
+            let mut store = queue.store.write();
+            for tx in store.values_mut() {
+                tx.received_at = tx
+                    .received_at
+                    .checked_sub(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(|| {
+                        std::time::Instant::now() - std::time::Duration::from_secs(10)
+                    });
+            }
+        }
+
+        // Add a LOW-fee tx — would normally be rejected by fee comparison,
+        // but the expired fallback should evict the high-fee expired tx.
+        let mut tx2 = make_test_envelope(50, 1);
+        set_source(&mut tx2, 2);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+        assert_eq!(queue.len(), 1);
+
+        // Verify the new tx is the one in the queue
+        let store = queue.store.read();
+        let remaining: Vec<u64> = store.values().map(|tx| tx.inclusion_fee).collect();
+        assert_eq!(remaining, vec![50]);
+        store.assert_consistent();
     }
 }
 

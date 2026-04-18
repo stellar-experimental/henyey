@@ -253,10 +253,10 @@ impl TransactionQueue {
         } else {
             rand::thread_rng().gen()
         };
-        let by_hash = self.by_hash.read();
+        let store = self.store.read();
         let mut per_account: HashMap<Vec<u8>, Vec<QueuedTransaction>> = HashMap::new();
 
-        for tx in by_hash.values() {
+        for tx in store.values() {
             if tx.is_expired(self.config.max_age_secs) {
                 continue;
             }
