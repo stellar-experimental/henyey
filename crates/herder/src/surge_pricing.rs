@@ -399,12 +399,20 @@ impl SurgePricingPriorityQueue {
         ledger_version: u32,
         network_id: &henyey_common::NetworkId,
     ) {
-        if self.lanes[lane].remove(entry) {
-            let frame =
-                TransactionFrame::from_owned_with_network(entry.tx.envelope.clone(), *network_id);
-            let resources = self.lane_config.tx_resources(&frame, ledger_version);
-            self.lane_current_count[lane] -= resources;
-        }
+        // Match stellar-core ordering: get stored element → compute resources →
+        // assert → subtract → remove (SurgePricingUtils.cpp:279-287).
+        let Some(stored) = self.lanes[lane].get(entry) else {
+            return;
+        };
+        let frame =
+            TransactionFrame::from_owned_with_network(stored.tx.envelope.clone(), *network_id);
+        let resources = self.lane_config.tx_resources(&frame, ledger_version);
+        assert!(
+            resources.leq(&self.lane_current_count[lane]),
+            "erase: resources exceed lane current count"
+        );
+        self.lane_current_count[lane] -= resources;
+        self.lanes[lane].remove(entry);
     }
 
     fn top_entry(&self, lane: usize) -> Option<QueueEntry> {
@@ -705,5 +713,74 @@ mod tests {
         let new_limit = Resource::new(vec![300]);
         queue.update_generic_lane_limit(new_limit.clone());
         assert_eq!(queue.lane_limits(GENERIC_LANE), new_limit);
+    }
+
+    /// Verify that `erase()` panics when resources exceed `lane_current_count`,
+    /// matching stellar-core's `releaseAssert(res <= mLaneCurrentCount[lane])`
+    /// in SurgePricingUtils.cpp:284.
+    #[test]
+    #[should_panic(expected = "erase: resources exceed lane current count")]
+    fn test_erase_panics_when_resources_exceed_lane_count() {
+        use crate::tx_queue::QueuedTransaction;
+        use henyey_common::NetworkId;
+        use stellar_xdr::curr::{
+            DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+            SequenceNumber, Signature, SignatureHint, Transaction, TransactionEnvelope,
+            TransactionV1Envelope, Uint256,
+        };
+
+        let network_id = NetworkId::testnet();
+        let config = Box::new(OpsOnlyLaneConfig::new(Resource::new(vec![100])));
+        let mut queue = SurgePricingPriorityQueue::new(config, 42);
+
+        // Build a minimal 1-op transaction.
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([1u8; 32])),
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Inflation,
+            }]
+            .try_into()
+            .unwrap(),
+            ext: stellar_xdr::curr::TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0; 4]),
+                signature: Signature(vec![0; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+        let queued = QueuedTransaction {
+            envelope,
+            hash: henyey_common::Hash256::from_bytes([1u8; 32]),
+            total_fee: 100,
+            inclusion_fee: 100,
+            op_count: 1,
+            fee_per_op: 100,
+            received_at: std::time::Instant::now(),
+        };
+
+        // Add the transaction (lane_current_count[0] becomes Resource([1])).
+        queue.add(queued.clone(), &network_id, 22);
+        assert_eq!(
+            queue.lane_current_count[GENERIC_LANE],
+            Resource::new(vec![1])
+        );
+
+        // Corrupt lane_current_count to zero — simulates an accounting bug.
+        queue.lane_current_count[GENERIC_LANE] = Resource::new(vec![0]);
+
+        // Build a QueueEntry matching the stored one for the erase() lookup.
+        let entry = QueueEntry::new(queued, queue.seed);
+
+        // erase() should panic: resources (1 op) > lane_current_count (0).
+        queue.erase(GENERIC_LANE, &entry, 22, &network_id);
     }
 }

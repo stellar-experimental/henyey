@@ -19,7 +19,7 @@
 | TransactionQueue | Partial | Missing arb damping; fee release and drop now implemented |
 | TxQueueLimiter | Partial | Missing visitTopTxs with custom limits |
 | TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
-| SurgePricingUtils | Full | All lane configs and priority queue |
+| SurgePricingUtils | Full | All lane configs and priority queue; `erase()` guard matches `releaseAssert(res <= mLaneCurrentCount[lane])` |
 | Upgrades / ConfigUpgradeSetFrame | Partial | Missing ConfigUpgradeSetFrame entirely |
 | QuorumIntersectionChecker | None | Not implemented |
 | ParallelTxSetBuilder | Full | Implemented in parallel_tx_set_builder.rs |
