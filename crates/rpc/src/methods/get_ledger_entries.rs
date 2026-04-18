@@ -61,8 +61,10 @@ pub async fn handle(
 
     let ledger_seq = snapshot.ledger_seq();
 
-    // Look up entries in a blocking task (bucket reads can hit disk)
-    let snapshot_results = tokio::task::spawn_blocking(move || {
+    // Look up entries in a blocking task (bucket reads can hit disk).
+    // Uses bounded_blocking with bucket_io_semaphore for cancellation-safe
+    // concurrency bounding — the permit survives async timeout cancellation.
+    let snapshot_results = util::bounded_blocking(&ctx.bucket_io_semaphore, move || {
         #[allow(clippy::type_complexity)]
         let mut results: Vec<(String, Option<(LedgerEntry, Option<u32>)>)> =
             Vec::with_capacity(ledger_keys.len());
@@ -81,8 +83,17 @@ pub async fn handle(
         Ok::<_, henyey_bucket::BucketError>(results)
     })
     .await
-    .map_err(|e| JsonRpcError::internal_logged("internal error", &e))?
-    .map_err(|e| JsonRpcError::internal_logged("internal error", &e))?;
+    .map_err(|e| match e {
+        util::BlockingError::Inner(e) => JsonRpcError::internal_logged("internal error", &e),
+        util::BlockingError::JoinError(e) => JsonRpcError::internal_logged("internal error", &e),
+        util::BlockingError::SemaphoreClosed => {
+            JsonRpcError::internal("bucket I/O semaphore closed")
+        }
+        util::BlockingError::SemaphoreFull => {
+            // bounded_blocking waits, so this shouldn't happen
+            JsonRpcError::internal("bucket I/O semaphore full")
+        }
+    })?;
 
     // Build JSON response from snapshot results
     let mut result_entries = Vec::new();

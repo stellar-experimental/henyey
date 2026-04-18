@@ -371,9 +371,11 @@ async fn rpc_handler(
     // NOTE: When timeout fires, any spawn_blocking work (DB queries, bucket reads,
     // simulations) continues to completion on the blocking threadpool. The request
     // permit is freed so new requests can be admitted. This is an inherent limitation
-    // of spawn_blocking — blocking work cannot be cancelled. Concurrent blocking work
-    // is still bounded by the DB semaphore, simulation semaphore, and the Tokio
-    // blocking thread pool limit.
+    // of spawn_blocking — blocking work cannot be cancelled. However, domain-specific
+    // semaphore permits (db_semaphore, simulation_semaphore, bucket_io_semaphore) are
+    // held inside blocking closures via OwnedSemaphorePermit, so concurrent blocking
+    // work remains bounded even after request timeout. The fee window poller
+    // (server.rs background task) is outside these semaphores.
     let is_write_method = request.method == "sendTransaction";
 
     if is_write_method {
@@ -472,6 +474,7 @@ mod tests {
             simulation_semaphore: std::sync::Arc::new(Semaphore::new(1)),
             request_semaphore: std::sync::Arc::new(Semaphore::new(request_sem)),
             db_semaphore: std::sync::Arc::new(Semaphore::new(db_sem)),
+            bucket_io_semaphore: std::sync::Arc::new(Semaphore::new(db_sem)),
             request_timeout: timeout,
         })
     }

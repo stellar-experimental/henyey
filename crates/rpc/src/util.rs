@@ -1,11 +1,14 @@
 //! Shared utility functions for the RPC crate.
 
+use std::sync::Arc;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Serialize;
 use stellar_xdr::curr::{
     DiagnosticEvent, LedgerCloseMeta, LedgerHeaderHistoryEntry, LedgerKey, Limits, ReadXdr,
     TransactionMeta, TransactionResultPair, WriteXdr,
 };
+use tokio::sync::Semaphore;
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -56,6 +59,86 @@ impl From<RpcXdrError> for JsonRpcError {
 }
 
 // ---------------------------------------------------------------------------
+// Bounded blocking helpers
+// ---------------------------------------------------------------------------
+
+/// Generic error for semaphore-bounded blocking execution.
+#[derive(Debug)]
+pub(crate) enum BlockingError<E> {
+    /// The closure returned an error.
+    Inner(E),
+    /// The `spawn_blocking` task panicked or was cancelled.
+    JoinError(tokio::task::JoinError),
+    /// The semaphore was closed (dropped).
+    SemaphoreClosed,
+    /// The semaphore had no available permits (try-acquire only).
+    SemaphoreFull,
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for BlockingError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockingError::Inner(e) => write!(f, "{e}"),
+            BlockingError::JoinError(e) => write!(f, "task join error: {e}"),
+            BlockingError::SemaphoreClosed => write!(f, "semaphore closed"),
+            BlockingError::SemaphoreFull => write!(f, "semaphore full"),
+        }
+    }
+}
+
+/// Run a closure on a blocking thread with semaphore-bounded concurrency.
+///
+/// Acquires an `OwnedSemaphorePermit` before spawning, then moves it into
+/// the blocking closure. The permit is held until the blocking work completes,
+/// even if the caller's async future is cancelled (e.g. by a timeout).
+pub(crate) async fn bounded_blocking<T, E, F>(
+    semaphore: &Arc<Semaphore>,
+    f: F,
+) -> Result<T, BlockingError<E>>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+{
+    let permit = semaphore
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| BlockingError::SemaphoreClosed)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit; // held until closure returns
+        f()
+    })
+    .await
+    .map_err(BlockingError::JoinError)?
+    .map_err(BlockingError::Inner)
+}
+
+/// Like [`bounded_blocking`], but uses `try_acquire_owned` for immediate
+/// rejection when the semaphore is full (no backpressure).
+pub(crate) async fn try_bounded_blocking<T, E, F>(
+    semaphore: &Arc<Semaphore>,
+    f: F,
+) -> Result<T, BlockingError<E>>
+where
+    T: Send + 'static,
+    E: Send + 'static,
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+{
+    let permit = semaphore.clone().try_acquire_owned().map_err(|e| match e {
+        tokio::sync::TryAcquireError::Closed => BlockingError::SemaphoreClosed,
+        tokio::sync::TryAcquireError::NoPermits => BlockingError::SemaphoreFull,
+    })?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit; // held until closure returns
+        f()
+    })
+    .await
+    .map_err(BlockingError::JoinError)?
+    .map_err(BlockingError::Inner)
+}
+
+// ---------------------------------------------------------------------------
 // Async DB access
 // ---------------------------------------------------------------------------
 
@@ -77,31 +160,33 @@ impl std::fmt::Display for DbAccessError {
     }
 }
 
+impl From<BlockingError<henyey_db::DbError>> for DbAccessError {
+    fn from(e: BlockingError<henyey_db::DbError>) -> Self {
+        match e {
+            BlockingError::Inner(e) => DbAccessError::Db(e),
+            BlockingError::JoinError(e) => DbAccessError::JoinError(e),
+            BlockingError::SemaphoreClosed | BlockingError::SemaphoreFull => {
+                DbAccessError::SemaphoreClosed
+            }
+        }
+    }
+}
+
 /// Run a synchronous database closure on a blocking thread, with
 /// semaphore-bounded concurrency.
 ///
-/// The DB semaphore permit is moved into the blocking closure via
-/// `OwnedSemaphorePermit`, so it remains held until the DB work completes
-/// even if the caller's future is cancelled by a timeout.
+/// Delegates to [`bounded_blocking`] with the DB semaphore. The permit is
+/// held inside the blocking closure until the DB work completes, even if
+/// the caller's future is cancelled by a timeout.
 pub(crate) async fn blocking_db<T, F>(ctx: &RpcContext, f: F) -> Result<T, DbAccessError>
 where
     T: Send + 'static,
     F: FnOnce(&henyey_db::Database) -> Result<T, henyey_db::DbError> + Send + 'static,
 {
-    let permit = ctx
-        .db_semaphore
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| DbAccessError::SemaphoreClosed)?;
     let db = ctx.app.database().clone();
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit; // held until closure returns
-        f(&db)
-    })
-    .await
-    .map_err(DbAccessError::JoinError)?
-    .map_err(DbAccessError::Db)
+    bounded_blocking(&ctx.db_semaphore, move || f(&db))
+        .await
+        .map_err(DbAccessError::from)
 }
 
 // ---------------------------------------------------------------------------
@@ -979,6 +1064,7 @@ mod tests {
             simulation_semaphore: StdArc::new(tokio::sync::Semaphore::new(1)),
             request_semaphore: StdArc::new(tokio::sync::Semaphore::new(1)),
             db_semaphore: StdArc::new(tokio::sync::Semaphore::new(1)),
+            bucket_io_semaphore: StdArc::new(tokio::sync::Semaphore::new(1)),
             request_timeout: Duration::from_secs(30),
         });
 
@@ -1035,5 +1121,183 @@ mod tests {
         );
 
         drop(sim);
+    }
+
+    // -------------------------------------------------------------------
+    // bounded_blocking cancellation-safety
+    // -------------------------------------------------------------------
+
+    /// `bounded_blocking` moves an `OwnedSemaphorePermit` into the
+    /// `spawn_blocking` closure.  If the caller's future is cancelled
+    /// (e.g. by a timeout), the permit must remain held until the blocking
+    /// work finishes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_bounded_blocking_permit_survives_cancellation() {
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        let sem = StdArc::new(tokio::sync::Semaphore::new(1));
+
+        // Channel: closure signals "I'm running and hold the permit"
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        // Barrier: test tells closure "you may finish now"
+        let barrier = StdArc::new(std::sync::Barrier::new(2));
+        let barrier2 = barrier.clone();
+
+        let sem2 = sem.clone();
+        let handle = tokio::spawn(async move {
+            bounded_blocking(&sem2, move || {
+                let _ = tx.send(());
+                barrier2.wait();
+                Ok::<(), String>(())
+            })
+            .await
+        });
+
+        // Wait for the closure to start.
+        rx.recv().expect("closure must signal start");
+
+        // Cancel the outer future.
+        handle.abort();
+        let join_result = handle.await;
+        assert!(
+            join_result.unwrap_err().is_cancelled(),
+            "task must be cancelled"
+        );
+
+        // The permit must still be held by the blocking thread.
+        assert!(
+            sem.try_acquire().is_err(),
+            "permit must still be held after caller cancellation"
+        );
+
+        // Let the closure finish — releases the permit.
+        barrier.wait();
+
+        // Poll until the permit is returned.
+        let mut acquired = false;
+        for _ in 0..100 {
+            if sem.try_acquire().is_ok() {
+                acquired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            acquired,
+            "permit must be returned after blocking work completes"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // try_bounded_blocking rejection and closed
+    // -------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_try_bounded_blocking_rejects_when_full() {
+        use std::sync::Arc as StdArc;
+
+        let sem = StdArc::new(tokio::sync::Semaphore::new(1));
+        // Exhaust the single permit.
+        let _held = sem.clone().try_acquire_owned().unwrap();
+
+        let result = try_bounded_blocking(&sem, || Ok::<(), String>(())).await;
+        assert!(
+            matches!(result, Err(BlockingError::SemaphoreFull)),
+            "must return SemaphoreFull when permits exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_try_bounded_blocking_detects_closed_semaphore() {
+        use std::sync::Arc as StdArc;
+
+        let sem = StdArc::new(tokio::sync::Semaphore::new(1));
+        sem.close();
+
+        let result = try_bounded_blocking(&sem, || Ok::<(), String>(())).await;
+        assert!(
+            matches!(result, Err(BlockingError::SemaphoreClosed)),
+            "must return SemaphoreClosed when semaphore is closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bounded_blocking_detects_closed_semaphore() {
+        use std::sync::Arc as StdArc;
+
+        let sem = StdArc::new(tokio::sync::Semaphore::new(1));
+        sem.close();
+
+        let result = bounded_blocking(&sem, || Ok::<(), String>(())).await;
+        assert!(
+            matches!(result, Err(BlockingError::SemaphoreClosed)),
+            "must return SemaphoreClosed when semaphore is closed"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Simulation-style cancellation regression
+    // -------------------------------------------------------------------
+
+    /// Simulates the pattern used by try_bounded_blocking in simulation:
+    /// acquire permit, run blocking work, cancel outer future. The permit
+    /// must survive and concurrent try_acquire must fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_try_bounded_blocking_permit_survives_cancellation() {
+        use std::sync::Arc as StdArc;
+        use std::time::Duration;
+
+        let sem = StdArc::new(tokio::sync::Semaphore::new(1));
+
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let barrier = StdArc::new(std::sync::Barrier::new(2));
+        let barrier2 = barrier.clone();
+
+        let sem2 = sem.clone();
+        let handle = tokio::spawn(async move {
+            try_bounded_blocking(&sem2, move || {
+                let _ = tx.send(());
+                barrier2.wait();
+                Ok::<(), String>(())
+            })
+            .await
+        });
+
+        rx.recv().expect("closure must signal start");
+
+        // Cancel the outer future.
+        handle.abort();
+        let _ = handle.await;
+
+        // Permit is still held — concurrent simulation attempt must fail.
+        assert!(
+            sem.clone().try_acquire_owned().is_err(),
+            "permit must still be held after cancellation"
+        );
+
+        // A second try_bounded_blocking must return SemaphoreFull.
+        let result = try_bounded_blocking(&sem, || Ok::<(), String>(())).await;
+        assert!(
+            matches!(result, Err(BlockingError::SemaphoreFull)),
+            "concurrent simulation must be rejected"
+        );
+
+        // Let the closure finish.
+        barrier.wait();
+
+        // Poll until the permit is returned.
+        let mut acquired = false;
+        for _ in 0..100 {
+            if sem.try_acquire().is_ok() {
+                acquired = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            acquired,
+            "permit must be returned after blocking work completes"
+        );
     }
 }

@@ -21,10 +21,11 @@ use stellar_xdr::curr::{
     HostFunction, LedgerKey, Limits, OperationBody, ReadXdr, SorobanTransactionData,
     TransactionEnvelope,
 };
+use tokio::sync::Semaphore;
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
-use crate::util::{self, XdrFormat};
+use crate::util::{self, BlockingError, XdrFormat};
 
 use preflight::{run_invoke_simulation, simulate_extend_ttl_op, simulate_restore_op};
 use response::{
@@ -254,7 +255,11 @@ impl SimulationContext {
 ///
 /// The caller provides a closure that performs the actual simulation given
 /// references to the snapshot source, ledger info, and soroban network config.
+///
+/// Uses [`try_bounded_blocking`] to acquire and hold an `OwnedSemaphorePermit`
+/// inside the blocking closure, ensuring the permit survives async cancellation.
 async fn run_footprint_simulation<F>(
+    simulation_semaphore: &Arc<Semaphore>,
     snapshot_source: BucketListSnapshotSource,
     ledger_info: soroban_host::LedgerInfo,
     soroban_info: henyey_ledger::SorobanNetworkInfo,
@@ -271,14 +276,23 @@ where
         + Send
         + 'static,
 {
-    let result =
-        tokio::task::spawn_blocking(move || sim_fn(&snapshot_source, &ledger_info, &soroban_info))
-            .await
-            .map_err(|e| JsonRpcError::internal_logged("simulation failed", &e))?;
+    let result = util::try_bounded_blocking(simulation_semaphore, move || {
+        sim_fn(&snapshot_source, &ledger_info, &soroban_info)
+    })
+    .await;
 
     match result {
         Ok(tx_data) => build_footprint_response(tx_data, latest_ledger, format),
-        Err(e) => build_error_response(e, latest_ledger),
+        Err(BlockingError::Inner(e)) => build_error_response(e, latest_ledger),
+        Err(BlockingError::SemaphoreFull) => Err(JsonRpcError::server_busy(
+            "too many concurrent simulation requests",
+        )),
+        Err(BlockingError::SemaphoreClosed) => {
+            Err(JsonRpcError::internal("simulation semaphore closed"))
+        }
+        Err(BlockingError::JoinError(e)) => {
+            Err(JsonRpcError::internal_logged("simulation failed", &e))
+        }
     }
 }
 
@@ -287,16 +301,12 @@ where
 // ---------------------------------------------------------------------------
 
 // SECURITY: simulation input bounded by HTTP body size limit and serde type validation.
-// SECURITY: concurrent simulations bounded by semaphore (max_concurrent_simulations config).
+// SECURITY: concurrent simulations bounded by try_bounded_blocking with simulation_semaphore.
+// Pre-blocking work (XDR parsing, validation) is bounded by request_semaphore at the server level.
 pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let _permit = ctx
-        .simulation_semaphore
-        .try_acquire()
-        .map_err(|_| JsonRpcError::server_busy("too many concurrent simulation requests"))?;
-
     let format = util::parse_format(&params)?;
 
     let tx_b64 = params
@@ -375,17 +385,20 @@ pub async fn handle(
             // Determine the effective auth mode
             let resolved_auth_mode = resolve_auth_mode(auth_mode_str, &auth)?;
 
-            handle_invoke(InvokeRequest {
-                host_fn,
-                source_account,
-                ledger_info: sim.ledger_info,
-                snapshot_source: sim.snapshot_source,
-                soroban_info: sim.soroban_info.clone(),
-                latest_ledger: sim.latest_ledger,
-                format,
-                auth_mode: resolved_auth_mode,
-                instruction_leeway,
-            })
+            handle_invoke(
+                &ctx.simulation_semaphore,
+                InvokeRequest {
+                    host_fn,
+                    source_account,
+                    ledger_info: sim.ledger_info,
+                    snapshot_source: sim.snapshot_source,
+                    soroban_info: sim.soroban_info.clone(),
+                    latest_ledger: sim.latest_ledger,
+                    format,
+                    auth_mode: resolved_auth_mode,
+                    instruction_leeway,
+                },
+            )
             .await
         }
         SorobanOp::ExtendFootprintTtl { keys, extend_to } => {
@@ -395,6 +408,7 @@ pub async fn handle(
                 ));
             }
             run_footprint_simulation(
+                &ctx.simulation_semaphore,
                 sim.snapshot_source,
                 sim.ledger_info,
                 sim.soroban_info,
@@ -411,6 +425,7 @@ pub async fn handle(
                 ));
             }
             run_footprint_simulation(
+                &ctx.simulation_semaphore,
                 sim.snapshot_source,
                 sim.ledger_info,
                 sim.soroban_info,
@@ -485,14 +500,17 @@ fn resolve_auth_mode(
 // InvokeHostFunction path
 // ---------------------------------------------------------------------------
 
-async fn handle_invoke(request: InvokeRequest) -> Result<serde_json::Value, JsonRpcError> {
+async fn handle_invoke(
+    simulation_semaphore: &Arc<Semaphore>,
+    request: InvokeRequest,
+) -> Result<serde_json::Value, JsonRpcError> {
     let host_fn_clone = request.host_fn.clone();
     let source_account_clone = request.source_account.clone();
     let ledger_info_clone = request.ledger_info.clone();
     let snapshot_source = request.snapshot_source;
     let auth_mode = request.auth_mode;
 
-    let result = tokio::task::spawn_blocking(move || {
+    let result = util::try_bounded_blocking(simulation_semaphore, move || {
         run_invoke_simulation(
             host_fn_clone,
             source_account_clone,
@@ -501,8 +519,7 @@ async fn handle_invoke(request: InvokeRequest) -> Result<serde_json::Value, Json
             auth_mode,
         )
     })
-    .await
-    .map_err(|e| JsonRpcError::internal_logged("simulation failed", &e))?;
+    .await;
 
     match result {
         Ok(sim_output) => build_invoke_response(
@@ -517,7 +534,16 @@ async fn handle_invoke(request: InvokeRequest) -> Result<serde_json::Value, Json
                 instruction_leeway: request.instruction_leeway,
             },
         ),
-        Err(e) => build_error_response(e, request.latest_ledger),
+        Err(BlockingError::Inner(e)) => build_error_response(e, request.latest_ledger),
+        Err(BlockingError::SemaphoreFull) => Err(JsonRpcError::server_busy(
+            "too many concurrent simulation requests",
+        )),
+        Err(BlockingError::SemaphoreClosed) => {
+            Err(JsonRpcError::internal("simulation semaphore closed"))
+        }
+        Err(BlockingError::JoinError(e)) => {
+            Err(JsonRpcError::internal_logged("simulation failed", &e))
+        }
     }
 }
 
@@ -611,13 +637,20 @@ mod tests {
 
     #[test]
     fn test_audit_001_simulation_semaphore_rejects_when_full() {
-        // Verify that try_acquire on a zero-permit semaphore returns Err,
-        // which is the mechanism used in handle() to reject excess requests.
-        let sem = tokio::sync::Semaphore::new(2);
-        let _p1 = sem.try_acquire().expect("first permit should succeed");
-        let _p2 = sem.try_acquire().expect("second permit should succeed");
+        // Verify that try_acquire_owned on a full semaphore returns Err,
+        // which is the mechanism used by try_bounded_blocking to reject excess
+        // simulation requests.
+        let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+        let _p1 = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("first permit should succeed");
+        let _p2 = sem
+            .clone()
+            .try_acquire_owned()
+            .expect("second permit should succeed");
         assert!(
-            sem.try_acquire().is_err(),
+            sem.clone().try_acquire_owned().is_err(),
             "third acquire should fail when semaphore is full"
         );
     }

@@ -25,6 +25,10 @@ pub struct RpcContext {
     pub request_semaphore: Arc<Semaphore>,
     /// Limits concurrent RPC database queries (aligned to DB pool capacity).
     pub db_semaphore: Arc<Semaphore>,
+    /// Limits concurrent bucket I/O blocking tasks (bucket list reads).
+    /// Independent from `db_semaphore` so bucket reads and DB queries don't
+    /// starve each other.
+    pub bucket_io_semaphore: Arc<Semaphore>,
     /// Timeout for read-only request execution.
     pub request_timeout: Duration,
 }
@@ -47,6 +51,7 @@ impl RpcContext {
             .max_concurrent_requests
             .max(MIN_SEMAPHORE_CAPACITY);
         let db_concurrency = rpc_config.rpc_db_concurrency.max(MIN_SEMAPHORE_CAPACITY);
+        let bucket_io_concurrency = rpc_config.rpc_db_concurrency.max(MIN_SEMAPHORE_CAPACITY);
         let request_timeout = Duration::from_secs(rpc_config.request_timeout_secs);
 
         Self {
@@ -55,6 +60,7 @@ impl RpcContext {
             simulation_semaphore: Arc::new(Semaphore::new(max_sims)),
             request_semaphore: Arc::new(Semaphore::new(max_requests)),
             db_semaphore: Arc::new(Semaphore::new(db_concurrency)),
+            bucket_io_semaphore: Arc::new(Semaphore::new(bucket_io_concurrency)),
             request_timeout,
         }
     }
