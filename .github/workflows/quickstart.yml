@@ -34,7 +34,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # Quickstart runs take 15–30 min and are expensive to restart. Let the
+  # current run finish; GitHub collapses intermediate queued runs so only
+  # the most recent queued run executes after the current one completes.
+  cancel-in-progress: false
 
 jobs:
   build:
