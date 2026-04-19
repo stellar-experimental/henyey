@@ -692,6 +692,14 @@ impl QueueStore {
         self.fee_index.insert(entry);
     }
 
+    /// Remove a transaction by hash (pure storage operation).
+    ///
+    /// Does NOT reset eviction thresholds. Queue-shrinking callers (ban,
+    /// evict_expired, remove_applied) must reset thresholds explicitly after
+    /// removal — use a `did_remove` flag with `eviction_thresholds.reset_all()`
+    /// after the batch. Admission-path callers (try_add, ensure_queue_capacity)
+    /// should NOT reset because thresholds were freshly computed by
+    /// `record_lane_evictions`.
     fn remove(&mut self, hash: &Hash256, ledger_version: u32) -> Option<QueuedTransaction> {
         if let Some(tx) = self.by_hash.remove(hash) {
             self.fee_index.remove(&FeeEntry::from_queued(&tx));
@@ -2278,9 +2286,11 @@ impl TransactionQueue {
             .filter(|(_, tx)| tx.is_expired(max_age))
             .map(|(hash, _)| *hash)
             .collect();
+        let mut did_remove = false;
         for hash in &expired_hashes {
             if let Some(removed) = store.remove(hash, ledger_version) {
                 Self::drop_transaction(&mut account_states, &removed);
+                did_remove = true;
             }
         }
         if !expired_hashes.is_empty() {
@@ -2290,10 +2300,12 @@ impl TransactionQueue {
             }
         }
 
-        // Mirror stellar-core: clear eviction thresholds after aging to avoid
-        // carrying stale min-fee requirements. Queues are already updated
-        // incrementally by store.remove() above.
-        self.eviction_thresholds.reset_all();
+        // Reset eviction thresholds after aging to avoid carrying stale
+        // min-fee requirements. Only reset if something was actually removed —
+        // if the queue didn't change, cached thresholds are still valid.
+        if did_remove {
+            self.eviction_thresholds.reset_all();
+        }
     }
 
     /// Clear all transactions.
@@ -2338,17 +2350,20 @@ impl TransactionQueue {
         let mut account_states = self.account_states.write();
         let mut seen = self.seen.write();
         let ledger_version = self.validation_context.read().protocol_version;
+        let mut did_remove = false;
         for hash in tx_hashes {
             if let Some(removed) = store.remove(hash, ledger_version) {
                 Self::drop_transaction(&mut account_states, &removed);
+                did_remove = true;
             }
             seen.remove(hash);
         }
 
-        // Reset cached thresholds: a banned tx may have been the one that
-        // set the eviction threshold, so keeping stale thresholds could
-        // cause spurious FeeTooLow rejections.
-        self.eviction_thresholds.reset_all();
+        // Reset cached thresholds if a banned tx was removed from the queue —
+        // it may have been the one that set the eviction threshold.
+        if did_remove {
+            self.eviction_thresholds.reset_all();
+        }
     }
 
     /// Check if a transaction is banned.
@@ -2497,11 +2512,13 @@ impl TransactionQueue {
             }
         }
 
-        // Reset cached thresholds: removed txs may have been the ones that
-        // set eviction thresholds. Defensively clear to avoid stale FeeTooLow.
-        // In practice shift() follows shortly and does full invalidation, but
-        // this makes the invariant explicit.
-        self.eviction_thresholds.reset_all();
+        // Reset cached thresholds if any txs were removed — they may have
+        // been the ones that set eviction thresholds. In practice shift()
+        // follows shortly and does full invalidation, but this makes the
+        // invariant explicit.
+        if !removed_hashes.is_empty() {
+            self.eviction_thresholds.reset_all();
+        }
     }
 
     /// Shift the queue after a ledger close.
@@ -8065,6 +8082,216 @@ mod eviction_queue_tests {
             queue.try_add(tx4_low),
             TxQueueResult::Added,
             "lower-fee tx should be accepted after remove_applied resets thresholds"
+        );
+    }
+
+    /// Admission-path eviction (try_add) should preserve cached thresholds so
+    /// that subsequent low-fee submissions are still fast-rejected.
+    #[test]
+    fn test_try_add_eviction_preserves_thresholds() {
+        // Queue with ops limit=2.
+        let queue = TransactionQueue::new(TxQueueConfig {
+            max_size: 100,
+            max_age_secs: 300,
+            max_queue_ops: Some(2),
+            ..Default::default()
+        });
+
+        // Fill queue with 2 txs.
+        let mut tx1 = make_test_envelope(1000, 1);
+        set_source(&mut tx1, 121);
+        let mut tx2 = make_test_envelope(2000, 1);
+        set_source(&mut tx2, 122);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+
+        // Add a higher-fee tx that evicts tx1, setting the eviction threshold.
+        let mut tx3 = make_test_envelope(3000, 1);
+        set_source(&mut tx3, 123);
+        assert_eq!(queue.try_add(tx3), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // The eviction threshold from tx1's eviction should still be cached.
+        // A tx below that threshold should be rejected.
+        let mut tx4_low = make_test_envelope(500, 1);
+        set_source(&mut tx4_low, 124);
+        assert_eq!(
+            queue.try_add(tx4_low),
+            TxQueueResult::FeeTooLow,
+            "admission-path eviction should preserve cached thresholds"
+        );
+    }
+
+    /// Banning hashes that are NOT in the queue should not touch thresholds.
+    #[test]
+    fn test_ban_noop_preserves_thresholds() {
+        // Queue with ops limit=2.
+        let queue = TransactionQueue::new(TxQueueConfig {
+            max_size: 100,
+            max_age_secs: 300,
+            max_queue_ops: Some(2),
+            ..Default::default()
+        });
+
+        // Fill queue with 2 txs.
+        let mut tx1 = make_test_envelope(1000, 1);
+        set_source(&mut tx1, 131);
+        let mut tx2 = make_test_envelope(2000, 1);
+        set_source(&mut tx2, 132);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+
+        // Add a higher-fee tx that evicts tx1, setting the eviction threshold.
+        let mut tx3 = make_test_envelope(3000, 1);
+        set_source(&mut tx3, 133);
+        assert_eq!(queue.try_add(tx3), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // Verify threshold is active.
+        let mut tx4_low = make_test_envelope(500, 1);
+        set_source(&mut tx4_low, 134);
+        assert_eq!(queue.try_add(tx4_low.clone()), TxQueueResult::FeeTooLow);
+
+        // Ban a hash that's NOT in the queue — should not reset thresholds.
+        let fake_hash = Hash256::from([0xFFu8; 32]);
+        queue.ban(&[fake_hash]);
+
+        // Threshold should still be active.
+        assert_eq!(
+            queue.try_add(tx4_low),
+            TxQueueResult::FeeTooLow,
+            "banning absent hash should not reset thresholds"
+        );
+    }
+
+    /// evict_expired() with actual expired txs should reset thresholds.
+    #[test]
+    fn test_evict_expired_resets_thresholds() {
+        // Queue with ops limit=2 and very short max_age.
+        let queue = TransactionQueue::new(TxQueueConfig {
+            max_size: 100,
+            max_age_secs: 0, // expire after >0 seconds
+            max_queue_ops: Some(2),
+            ..Default::default()
+        });
+
+        // Fill queue with 2 txs.
+        let mut tx1 = make_test_envelope(1000, 1);
+        set_source(&mut tx1, 141);
+        let mut tx2 = make_test_envelope(2000, 1);
+        set_source(&mut tx2, 142);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+
+        // Add a higher-fee tx that evicts tx1, setting the eviction threshold.
+        let mut tx3 = make_test_envelope(3000, 1);
+        set_source(&mut tx3, 143);
+        assert_eq!(queue.try_add(tx3), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // Verify threshold is active.
+        let mut tx4_low = make_test_envelope(500, 1);
+        set_source(&mut tx4_low, 144);
+        assert_eq!(queue.try_add(tx4_low.clone()), TxQueueResult::FeeTooLow);
+
+        // Wait >1 second so is_expired() (as_secs() > 0) returns true.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        queue.evict_expired();
+        assert_eq!(queue.len(), 0, "all txs should be expired");
+
+        // Thresholds should be reset after eviction removed expired txs.
+        // The low-fee tx should now succeed (queue is empty).
+        assert_eq!(
+            queue.try_add(tx4_low),
+            TxQueueResult::Added,
+            "evict_expired should reset thresholds after removing expired txs"
+        );
+    }
+
+    /// evict_expired() with nothing to expire should preserve thresholds.
+    #[test]
+    fn test_evict_expired_noop_preserves_thresholds() {
+        // Queue with ops limit=2 and long max_age.
+        let queue = TransactionQueue::new(TxQueueConfig {
+            max_size: 100,
+            max_age_secs: 300,
+            max_queue_ops: Some(2),
+            ..Default::default()
+        });
+
+        // Fill queue with 2 txs.
+        let mut tx1 = make_test_envelope(1000, 1);
+        set_source(&mut tx1, 151);
+        let mut tx2 = make_test_envelope(2000, 1);
+        set_source(&mut tx2, 152);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+
+        // Add a higher-fee tx that evicts tx1, setting the eviction threshold.
+        let mut tx3 = make_test_envelope(3000, 1);
+        set_source(&mut tx3, 153);
+        assert_eq!(queue.try_add(tx3), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // Verify threshold is active.
+        let mut tx4_low = make_test_envelope(500, 1);
+        set_source(&mut tx4_low, 154);
+        assert_eq!(queue.try_add(tx4_low.clone()), TxQueueResult::FeeTooLow);
+
+        // evict_expired with nothing to expire — thresholds should be preserved.
+        queue.evict_expired();
+
+        assert_eq!(
+            queue.try_add(tx4_low),
+            TxQueueResult::FeeTooLow,
+            "evict_expired with no expired txs should preserve thresholds"
+        );
+    }
+
+    /// remove_applied() with no matching queued tx should preserve thresholds.
+    #[test]
+    fn test_remove_applied_noop_preserves_thresholds() {
+        // Queue with ops limit=2.
+        let queue = TransactionQueue::new(TxQueueConfig {
+            max_size: 100,
+            max_age_secs: 300,
+            max_queue_ops: Some(2),
+            ..Default::default()
+        });
+
+        // Fill queue with 2 txs.
+        let mut tx1 = make_test_envelope(1000, 1);
+        set_source(&mut tx1, 161);
+        let mut tx2 = make_test_envelope(2000, 1);
+        set_source(&mut tx2, 162);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+
+        // Add a higher-fee tx that evicts tx1, setting the eviction threshold.
+        let mut tx3 = make_test_envelope(3000, 1);
+        set_source(&mut tx3, 163);
+        assert_eq!(queue.try_add(tx3), TxQueueResult::Added);
+        assert_eq!(queue.len(), 2);
+
+        // Verify threshold is active.
+        let mut tx4_low = make_test_envelope(500, 1);
+        set_source(&mut tx4_low, 164);
+        assert_eq!(queue.try_add(tx4_low.clone()), TxQueueResult::FeeTooLow);
+
+        // remove_applied with a tx that's NOT in the queue — thresholds preserved.
+        let mut unrelated_tx = make_test_envelope(9999, 1);
+        set_source(&mut unrelated_tx, 199);
+        queue.remove_applied(&[(unrelated_tx, 999)]);
+
+        assert_eq!(
+            queue.try_add(tx4_low),
+            TxQueueResult::FeeTooLow,
+            "remove_applied with no matching queued tx should preserve thresholds"
         );
     }
 }
