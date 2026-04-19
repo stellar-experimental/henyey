@@ -308,6 +308,18 @@ fully validate because of a fast-path divergence — do NOT clear
 `Slot::fully_validated`". The variant behaves identically to
 `MaybeValid` for all other SCP state transitions; the single behavioral
 difference is gated through `ValidationLevel::clears_fully_validated()`.
+
+**No re-validation after tx_set arrival (#1796):** `ValidationLevel` is
+ephemeral — computed on-the-fly by `validate_statement_values`, used for
+the `Invalid` rejection check and the `clears_fully_validated()` gate,
+then discarded. No per-envelope validation state is stored in SCP.
+When the tx_set arrives after a `MaybeValidDeferred` EXTERNALIZE, there
+is no stored verdict to "upgrade" to `FullyValidated`. Re-feeding the
+same EXTERNALIZE to SCP would be rejected by `is_stale_ballot_statement`.
+Since both `MaybeValidDeferred` and `FullyValidated` return `false` from
+`clears_fully_validated()`, the slot end states (externalized,
+`fully_validated=true`, emission visibility) are identical.
+
 | `hashHelper()` (private) | Inlined in `compute_hash_node()` / `compute_value_hash()` | Full |
 
 ### compare (`compare.rs`)

@@ -733,6 +733,10 @@ impl ScpDriver {
         //
         // See the `ValidationLevel::MaybeValidDeferred` doc comment
         // (`crates/scp/src/driver.rs`) for the full rationale.
+        //
+        // No re-validation is needed when apply catches up — see #1796
+        // and the SCP/herder PARITY_STATUS.md sections on
+        // MaybeValidDeferred for the analysis.
         trace!(
             "Can't validate locally, value may be valid for slot {} \
              (MaybeValidDeferred; apply lagging SCP)",
@@ -882,6 +886,10 @@ impl ScpDriver {
                 // the `ValidationLevel::MaybeValidDeferred` doc comment for
                 // the complete rationale (issues #1795 and #1798).
                 if !nomination {
+                    // No re-validation is needed when the tx_set arrives
+                    // later — ValidationLevel is ephemeral (not stored
+                    // per-envelope), and MaybeValidDeferred produces the
+                    // same end state as FullyValidated. See #1796.
                     debug!(
                         "Missing transaction set during ballot protocol: {} \
                          (MaybeValidDeferred)",

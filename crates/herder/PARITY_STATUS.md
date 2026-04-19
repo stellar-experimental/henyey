@@ -546,6 +546,15 @@ Features not yet implemented. These ARE counted against parity %.
      avoiding the secondary bugs (#1795 / #1798) where `MaybeValid`
      cleared `fully_validated` and permanently suppressed the
      validator's own EXTERNALIZE emission.
+   - **No re-validation after tx_set arrival (#1796):**
+     `process_ready_fetching_envelopes` only drains buffered
+     non-EXTERNALIZE envelopes. The EXTERNALIZE that bypassed buffering
+     via the fast-path is NOT re-validated when the tx_set arrives
+     because `ValidationLevel` is ephemeral (not stored per-envelope in
+     SCP). Both `MaybeValidDeferred` and `FullyValidated` return `false`
+     from `clears_fully_validated()`, producing identical slot end
+     states: externalized, `fully_validated=true`, same emission
+     visibility.
 
 8. **Error Handling**
    - **stellar-core**: C++ exceptions and integer result codes

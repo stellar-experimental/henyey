@@ -1397,7 +1397,11 @@ impl Herder {
                 for hash in &missing_tx_sets {
                     self.scp_driver.request_tx_set(*hash, slot);
                 }
-                // Process through SCP to allow externalization + tracking advance
+                // Process through SCP to allow externalization + tracking advance.
+                // The EXTERNALIZE is NOT buffered for later re-validation because
+                // ValidationLevel is ephemeral (not stored per-envelope in SCP) —
+                // MaybeValidDeferred produces the same end state as FullyValidated.
+                // See #1796 and the SCP/herder PARITY_STATUS.md sections.
                 let result = self.process_scp_envelope_with_tx_set(envelope);
                 // If the slot externalized without the tx_set, the ledger
                 // close path will wait for the tx_set to arrive before

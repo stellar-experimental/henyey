@@ -955,7 +955,7 @@ impl Slot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::{make_node_id, MockDriver};
+    use crate::test_utils::{make_node_id, MockDriver, MockDriverBuilder};
 
     fn make_quorum_set() -> Arc<ScpQuorumSet> {
         Arc::new(ScpQuorumSet {
@@ -1811,6 +1811,100 @@ mod tests {
         assert!(
             slot.fully_validated,
             "Slot should be fully validated for validator"
+        );
+    }
+
+    /// Regression test for issue #1796: `MaybeValidDeferred` and
+    /// `FullyValidated` EXTERNALIZE produce identical slot end states.
+    ///
+    /// `ValidationLevel` is ephemeral — not stored per-envelope. Both
+    /// levels return `false` from `clears_fully_validated()`, so the
+    /// slot's `fully_validated` flag is preserved in both cases. After
+    /// tx_set arrival there is no stored verdict to "upgrade"; re-feeding
+    /// the same EXTERNALIZE to SCP would be rejected by
+    /// `is_stale_ballot_statement`. This test proves the end states are
+    /// identical.
+    #[test]
+    fn test_issue_1796_maybe_valid_deferred_externalize_end_state() {
+        use crate::driver::ValidationLevel;
+
+        let local_node = make_node_id(1);
+        let peer_node = make_node_id(2);
+        let qs = make_quorum_set();
+        let value: Value = vec![42, 43, 44].try_into().unwrap();
+
+        // Build a peer EXTERNALIZE envelope.
+        let ext = stellar_xdr::curr::ScpStatementExternalize {
+            commit: stellar_xdr::curr::ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            n_h: 1,
+            commit_quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
+        };
+        let envelope = ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: peer_node.clone(),
+                slot_index: 10,
+                pledges: ScpStatementPledges::Externalize(ext),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+
+        // --- Slot A: MaybeValidDeferred (simulates missing tx_set fast-path) ---
+        let driver_deferred = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValidDeferred)
+                .build(),
+        );
+        let mut slot_a = Slot::new(10, local_node.clone(), qs.clone(), true);
+        assert!(slot_a.fully_validated, "validator starts fully_validated");
+
+        let result_a = slot_a.process_envelope(envelope.clone(), &driver_deferred);
+        // EXTERNALIZE from a single peer won't necessarily externalize the
+        // slot (depends on quorum), but it MUST NOT clear fully_validated.
+        assert!(
+            slot_a.fully_validated,
+            "MaybeValidDeferred must not clear fully_validated (#1796)"
+        );
+
+        // --- Slot B: FullyValidated (normal path, tx_set present) ---
+        let driver_validated = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::FullyValidated)
+                .build(),
+        );
+        let mut slot_b = Slot::new(10, local_node.clone(), qs.clone(), true);
+        assert!(slot_b.fully_validated, "validator starts fully_validated");
+
+        let result_b = slot_b.process_envelope(envelope.clone(), &driver_validated);
+
+        // Assert identical end states.
+        assert_eq!(
+            slot_a.fully_validated, slot_b.fully_validated,
+            "fully_validated must be identical for both validation levels"
+        );
+        assert_eq!(
+            slot_a.is_externalized(),
+            slot_b.is_externalized(),
+            "externalization status must be identical"
+        );
+        assert_eq!(
+            slot_a.get_externalized_value(),
+            slot_b.get_externalized_value(),
+            "externalized value must be identical"
+        );
+        assert_eq!(
+            result_a, result_b,
+            "envelope processing result must be identical"
+        );
+        // Emission-facing state: get_externalizing_state depends on
+        // fully_validated and ballot externalization, so identical
+        // fully_validated + identical ballot state ⇒ identical output.
+        assert_eq!(
+            slot_a.get_externalizing_state().len(),
+            slot_b.get_externalizing_state().len(),
+            "externalizing state visibility must be identical"
         );
     }
 }
