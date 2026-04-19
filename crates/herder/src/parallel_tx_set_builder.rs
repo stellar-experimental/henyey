@@ -1618,7 +1618,7 @@ mod tests {
 
         assert!(!had_not_fitting, "all txs should fit");
         assert!(!stages.is_empty(), "should produce at least one stage");
-        // With saturated fees, the fee threshold is (i64::MAX * 0.95) which
+        // With saturated fees, the fee threshold is (i64::MAX * 0.999) which
         // both stage counts meet. The builder should select the option with
         // fewer actual stages.
         assert!(stages.len() <= 2, "should produce 1 or 2 stages");
