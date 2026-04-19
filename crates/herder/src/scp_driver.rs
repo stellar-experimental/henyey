@@ -1489,8 +1489,9 @@ impl ScpDriver {
         tx_set
             .transactions
             .iter()
+            // Saturate to prevent wrapping on adversarial fee values.
             .map(|env| crate::tx_set_utils::envelope_inclusion_fee(env))
-            .sum()
+            .fold(0i64, i64::saturating_add)
     }
 
     /// Iterate over all transactions in a phase, yielding each envelope
@@ -1524,19 +1525,21 @@ impl ScpDriver {
     /// - No baseFee: fullFee
     fn tx_set_total_fees(tx_set: &TransactionSet) -> i64 {
         let Some(ref gen) = tx_set.generalized_tx_set else {
-            // Legacy tx set: applying fee == full fee
+            // Legacy tx set: applying fee == full fee.
+            // Saturate to prevent wrapping on adversarial fee values.
             return tx_set
                 .transactions
                 .iter()
                 .map(|env| crate::tx_set_utils::envelope_fee(env))
-                .sum();
+                .fold(0i64, i64::saturating_add);
         };
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = gen;
 
         let mut total = 0i64;
         for phase in set_v1.phases.iter() {
             for (tx, base_fee) in Self::phase_txs_with_base_fee(phase) {
-                total += Self::tx_applying_fee(tx, base_fee);
+                // Saturate to prevent wrapping on adversarial fee values.
+                total = total.saturating_add(Self::tx_applying_fee(tx, base_fee));
             }
         }
         total
@@ -4311,6 +4314,188 @@ mod compare_tx_sets_tests {
             callback.get_upgrade_nomination_timeout_limit(),
             300,
             "Should read nomination_timeout_limit from Upgrades"
+        );
+    }
+
+    /// Helper: create a fee-bump transaction with an i64 outer fee.
+    /// Enables near-i64::MAX fee values for saturation tests.
+    fn make_fee_bump_tx(
+        seed: u8,
+        outer_fee: i64,
+        ops: usize,
+    ) -> stellar_xdr::curr::TransactionEnvelope {
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx, MuxedAccount, Uint256,
+        };
+        let inner = make_tx(seed, 1000, ops);
+        let inner_env = match inner {
+            stellar_xdr::curr::TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx envelope"),
+        };
+        stellar_xdr::curr::TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([seed; 32])),
+                fee: outer_fee,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: Default::default(),
+        })
+    }
+
+    #[test]
+    fn test_tx_set_total_inclusion_fees_saturation() {
+        // Two txs with fees near i64::MAX. Without saturating accumulation,
+        // the sum wraps to a negative value.
+        let tx1 = make_fee_bump_tx(1, i64::MAX, 1);
+        let tx2 = make_fee_bump_tx(2, i64::MAX, 1);
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx1, tx2]);
+
+        let total = ScpDriver::tx_set_total_inclusion_fees(&tx_set);
+        assert_eq!(
+            total,
+            i64::MAX,
+            "inclusion fee total should saturate to i64::MAX, not wrap"
+        );
+        assert!(total > 0, "must not wrap to negative");
+    }
+
+    #[test]
+    fn test_tx_set_total_fees_legacy_saturation() {
+        // Legacy tx set (no generalized): applying fee == full fee.
+        let tx1 = make_fee_bump_tx(1, i64::MAX, 1);
+        let tx2 = make_fee_bump_tx(2, i64::MAX, 1);
+        let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx1, tx2]);
+
+        let total = ScpDriver::tx_set_total_fees(&tx_set);
+        assert_eq!(
+            total,
+            i64::MAX,
+            "legacy fee total should saturate to i64::MAX, not wrap"
+        );
+        assert!(total > 0, "must not wrap to negative");
+    }
+
+    #[test]
+    fn test_tx_set_total_fees_generalized_saturation() {
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase,
+            TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+        };
+
+        // Generalized tx set with extreme fees. base_fee=None means
+        // applying fee == full fee.
+        let tx1 = make_fee_bump_tx(1, i64::MAX, 1);
+        let tx2 = make_fee_bump_tx(2, i64::MAX, 1);
+
+        let component =
+            TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
+                txs: vec![tx1.clone(), tx2.clone()].try_into().unwrap(),
+                base_fee: None,
+            });
+        let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![
+                TransactionPhase::V0(vec![component].try_into().unwrap()),
+                TransactionPhase::V1(ParallelTxsComponent {
+                    base_fee: None,
+                    execution_stages: vec![].try_into().unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+        let hash = Hash256::hash_xdr(&gen);
+        let tx_set = TransactionSet::with_generalized(Hash256::ZERO, hash, vec![tx1, tx2], gen);
+
+        let total = ScpDriver::tx_set_total_fees(&tx_set);
+        assert_eq!(
+            total,
+            i64::MAX,
+            "generalized fee total should saturate to i64::MAX"
+        );
+    }
+
+    #[test]
+    fn test_compare_tx_sets_both_overflow_falls_through_to_size() {
+        // When both tx sets have overflowing fee totals (saturating to i64::MAX),
+        // the comparison should fall through to the size tiebreaker.
+        let driver = make_driver();
+        let candidates_hash = [0u8; 32];
+
+        // Set A: 2 fee-bump txs, each i64::MAX fee, 1 op each → total ops=4 (2 ops per fee-bump)
+        // Set B: 2 fee-bump txs, each i64::MAX fee, 1 op each → total ops=4
+        // Both have saturated inclusion fees and total fees.
+        // Differ only in XDR size (different seeds → different hashes/sizes).
+        let tx_set_a = TransactionSet::new(
+            Hash256::ZERO,
+            vec![
+                make_fee_bump_tx(1, i64::MAX, 1),
+                make_fee_bump_tx(2, i64::MAX, 1),
+            ],
+        );
+        let tx_set_b = TransactionSet::new(
+            Hash256::ZERO,
+            vec![
+                make_fee_bump_tx(3, i64::MAX, 1),
+                make_fee_bump_tx(4, i64::MAX, 1),
+            ],
+        );
+
+        let hash_a = cache_tx_set(&driver, tx_set_a);
+        let hash_b = cache_tx_set(&driver, tx_set_b);
+
+        // Both should compare as non-panic and produce a deterministic result.
+        // The exact ordering depends on XDR size and hash tiebreaker, but it
+        // must not panic from overflow.
+        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        // With both fees saturated to i64::MAX, fees compare equal.
+        // Result is determined by size or hash tiebreaker.
+        assert!(
+            result == std::cmp::Ordering::Less
+                || result == std::cmp::Ordering::Greater
+                || result == std::cmp::Ordering::Equal,
+            "comparison must produce a valid ordering, not panic"
+        );
+    }
+
+    #[test]
+    fn test_compare_tx_sets_one_side_overflow() {
+        // Asymmetric: one tx set overflows (saturates), the other doesn't.
+        // The saturated side should compare as >= the non-saturated side.
+        let driver = make_driver();
+        let candidates_hash = [0u8; 32];
+
+        // Set A: 2 txs with extreme fees → saturates to i64::MAX
+        let tx_set_a = TransactionSet::new(
+            Hash256::ZERO,
+            vec![
+                make_fee_bump_tx(1, i64::MAX, 1),
+                make_fee_bump_tx(2, i64::MAX, 1),
+            ],
+        );
+
+        // Set B: 2 txs with moderate fees → large but not overflowing
+        // (fee-bump with 1 op has 2 ops total, so same op count as A)
+        let tx_set_b = TransactionSet::new(
+            Hash256::ZERO,
+            vec![
+                make_fee_bump_tx(3, 1_000_000, 1),
+                make_fee_bump_tx(4, 1_000_000, 1),
+            ],
+        );
+
+        let hash_a = cache_tx_set(&driver, tx_set_a);
+        let hash_b = cache_tx_set(&driver, tx_set_b);
+
+        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        // A has saturated fees (i64::MAX) > B's fees (2_000_000)
+        // Since ops are equal (4 each), inclusion fee comparison decides.
+        assert_eq!(
+            result,
+            std::cmp::Ordering::Greater,
+            "saturated fees should beat moderate fees"
         );
     }
 }

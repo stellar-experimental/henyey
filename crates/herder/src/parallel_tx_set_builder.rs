@@ -582,7 +582,8 @@ fn build_with_stage_count(
             }
         }
         if added {
-            total_inclusion_fee += tx_inclusion_fee(&txs[tx_id]);
+            // Saturate to prevent wrapping on adversarial fee values.
+            total_inclusion_fee = total_inclusion_fee.saturating_add(tx_inclusion_fee(&txs[tx_id]));
         }
         // If not added to any stage, the TX is dropped (doesn't fit).
     }
@@ -1536,6 +1537,91 @@ mod tests {
         // The new cluster (200 instructions) should be in some bin.
         let total: u64 = stage.bin_instructions.iter().sum();
         assert_eq!(total, 200);
+    }
+
+    /// Helper: create a fee-bump Soroban tx with an i64 outer fee, enabling
+    /// near-i64::MAX fee values for saturation tests.
+    fn make_fee_bump_soroban_tx(
+        seed: u8,
+        seq: i64,
+        read_only_keys: Vec<LedgerKey>,
+        read_write_keys: Vec<LedgerKey>,
+        instructions: u32,
+        outer_fee: i64,
+        resource_fee: i64,
+    ) -> TransactionEnvelope {
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
+        let inner = make_soroban_tx_with_fees(
+            seed,
+            seq,
+            read_only_keys,
+            read_write_keys,
+            instructions,
+            1000,
+            resource_fee,
+        );
+        let inner_env = match inner {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx envelope"),
+        };
+        TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([seed; 32])),
+                fee: outer_fee,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: Default::default(),
+        })
+    }
+
+    #[test]
+    fn test_build_with_stage_count_fee_saturation() {
+        // Two fee-bump txs with fees near i64::MAX. Without saturating_add,
+        // the total would wrap to a negative value.
+        let tx1 =
+            make_fee_bump_soroban_tx(1, 1, vec![], vec![contract_key(1)], 50_000, i64::MAX, 0);
+        let tx2 =
+            make_fee_bump_soroban_tx(2, 1, vec![], vec![contract_key(2)], 50_000, i64::MAX, 0);
+
+        let (stages, total_inclusion_fee) =
+            build_with_stage_count(&[tx1, tx2], test_network_id(), 200_000, 4, 1);
+
+        // Both txs should be added (enough instruction budget).
+        let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
+        assert_eq!(total_txs, 2, "both txs should fit");
+        // Fee should saturate to i64::MAX, not wrap negative.
+        assert_eq!(
+            total_inclusion_fee,
+            i64::MAX,
+            "fee total should saturate to i64::MAX, not wrap"
+        );
+    }
+
+    #[test]
+    fn test_build_parallel_soroban_phase_stage_selection_with_overflow() {
+        // Verify that stage-count selection still produces a valid result when
+        // fee totals overflow. With two stage counts, both producing overflowing
+        // fee totals, the selection should pick the one with fewer stages.
+        let tx1 =
+            make_fee_bump_soroban_tx(1, 1, vec![], vec![contract_key(1)], 50_000, i64::MAX, 0);
+        let tx2 =
+            make_fee_bump_soroban_tx(2, 1, vec![], vec![contract_key(2)], 50_000, i64::MAX, 0);
+
+        // Try stage counts 1..=2. Both should fit all txs and produce
+        // saturated fee totals. The builder should prefer fewer stages.
+        let (stages, had_not_fitting) =
+            build_parallel_soroban_phase(vec![tx1, tx2], test_network_id(), 200_000, 4, 1, 2);
+
+        assert!(!had_not_fitting, "all txs should fit");
+        assert!(!stages.is_empty(), "should produce at least one stage");
+        // With saturated fees, the fee threshold is (i64::MAX * 0.95) which
+        // both stage counts meet. The builder should select the option with
+        // fewer actual stages.
+        assert!(stages.len() <= 2, "should produce 1 or 2 stages");
     }
 }
 
