@@ -2035,107 +2035,91 @@ impl App {
                     let fetch_channel_depth = fetch_depth.load(Ordering::Relaxed);
                     let fetch_channel_depth_max = fetch_depth_max.load(Ordering::Relaxed);
 
-                    if stale_secs >= 30 {
-                        tracing::error!(
-                            stale_secs,
-                            phase = current_phase,
-                            phase_sub = current_phase_sub,
-                            fetch_channel_depth,
-                            fetch_channel_depth_max,
-                            pid,
-                            "WATCHDOG: Event loop appears frozen! \
-                             Phase codes: 0=select, 1=scp_msg, 2=fetch_resp, \
-                             3=broadcast, 4=scp_broadcast, 5=consensus_tick, \
-                             6=pending_close, 10=process_externalized, \
-                             11=externalized_catchup, 12=try_apply_buffered, \
-                             13=buffered_catchup, 14=catchup_running, \
-                             15=pending_catchup_complete, 16=heartbeat, \
-                             20=stats, 21=tx_advert, 22=tx_demand, 23=survey, \
-                             24=survey_req, 25=survey_phase, 26=scp_timeout, \
-                             27=ping, 28=peer_maint, 29=peer_refresh, \
-                             30=herder_cleanup, 31=scp_verifier, 32=scp_verified. \
-                             Sub-phase 13.N labels (issue #1788): see \
-                             crates/app/src/app/phase.rs for PHASE_13_* constants."
-                        );
+                    let snap = WatchdogSnapshot {
+                        stale_secs,
+                        phase: current_phase,
+                        phase_sub: current_phase_sub,
+                        fetch_channel_depth,
+                        fetch_channel_depth_max,
+                        pid,
+                    };
 
-                        // Tier 0 (automatic): scrape thread states and
-                        // kernel wait-channels (wchan) from /proc.
-                        // Best-effort and Linux/procfs-specific — may
-                        // silently produce no output on non-Linux hosts
-                        // or permission-restricted kernels. The 21:07
-                        // #1759 live capture proved this signal alone
-                        // is sufficient to classify lock-contention
-                        // freezes without py-spy or gdb on the host.
-                        if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/task", pid)) {
-                            let mut states: std::collections::HashMap<String, u32> =
-                                std::collections::HashMap::new();
-                            let mut wchans: std::collections::HashMap<String, u32> =
-                                std::collections::HashMap::new();
-                            for entry in entries.flatten() {
-                                let task_path = entry.path();
-                                let status_path = format!("{}/status", task_path.display());
-                                if let Ok(status) = std::fs::read_to_string(&status_path) {
-                                    let state = status
-                                        .lines()
-                                        .find(|l| l.starts_with("State:"))
-                                        .map(|l| l.to_string())
-                                        .unwrap_or_else(|| "Unknown".into());
-                                    *states.entry(state).or_insert(0) += 1;
+                    match snap.tier() {
+                        WatchdogTier::Error => {
+                            snap.emit_error();
+
+                            // Tier 0 (automatic): scrape thread states and
+                            // kernel wait-channels (wchan) from /proc.
+                            // Best-effort and Linux/procfs-specific — may
+                            // silently produce no output on non-Linux hosts
+                            // or permission-restricted kernels. The 21:07
+                            // #1759 live capture proved this signal alone
+                            // is sufficient to classify lock-contention
+                            // freezes without py-spy or gdb on the host.
+                            if let Ok(entries) = std::fs::read_dir(format!("/proc/{}/task", pid)) {
+                                let mut states: std::collections::HashMap<String, u32> =
+                                    std::collections::HashMap::new();
+                                let mut wchans: std::collections::HashMap<String, u32> =
+                                    std::collections::HashMap::new();
+                                for entry in entries.flatten() {
+                                    let task_path = entry.path();
+                                    let status_path = format!("{}/status", task_path.display());
+                                    if let Ok(status) = std::fs::read_to_string(&status_path) {
+                                        let state = status
+                                            .lines()
+                                            .find(|l| l.starts_with("State:"))
+                                            .map(|l| l.to_string())
+                                            .unwrap_or_else(|| "Unknown".into());
+                                        *states.entry(state).or_insert(0) += 1;
+                                    }
+                                    // wchan: single-line kernel wait
+                                    // channel symbol (e.g.
+                                    // "futex_wait_queue", "ep_poll",
+                                    // "hrtimer_nanosleep"). Best effort
+                                    // — some kernels permission-restrict.
+                                    let wchan_path = format!("{}/wchan", task_path.display());
+                                    if let Ok(wchan) = std::fs::read_to_string(&wchan_path) {
+                                        let key = wchan.trim().to_string();
+                                        let key = if key.is_empty() {
+                                            "(running)".to_string()
+                                        } else {
+                                            key
+                                        };
+                                        *wchans.entry(key).or_insert(0) += 1;
+                                    }
                                 }
-                                // wchan: single-line kernel wait
-                                // channel symbol (e.g.
-                                // "futex_wait_queue", "ep_poll",
-                                // "hrtimer_nanosleep"). Best effort
-                                // — some kernels permission-restrict.
-                                let wchan_path = format!("{}/wchan", task_path.display());
-                                if let Ok(wchan) = std::fs::read_to_string(&wchan_path) {
-                                    let key = wchan.trim().to_string();
-                                    let key = if key.is_empty() {
-                                        "(running)".to_string()
-                                    } else {
-                                        key
-                                    };
-                                    *wchans.entry(key).or_insert(0) += 1;
+                                for (state, count) in &states {
+                                    tracing::error!(
+                                        count,
+                                        state = state.as_str(),
+                                        "WATCHDOG: Thread state summary"
+                                    );
+                                }
+                                for (wchan, count) in &wchans {
+                                    tracing::error!(
+                                        count,
+                                        wchan = wchan.as_str(),
+                                        "WATCHDOG: Thread wchan summary"
+                                    );
                                 }
                             }
-                            for (state, count) in &states {
-                                tracing::error!(
-                                    count,
-                                    state = state.as_str(),
-                                    "WATCHDOG: Thread state summary"
-                                );
-                            }
-                            for (wchan, count) in &wchans {
-                                tracing::error!(
-                                    count,
-                                    wchan = wchan.as_str(),
-                                    "WATCHDOG: Thread wchan summary"
-                                );
-                            }
+
+                            // Tiered operator hints (#1759 / #1764):
+                            // The automatic wchan scrape above (tier 0)
+                            // is best-effort and may have failed. The
+                            // hints below give the operator escalation
+                            // options ordered by availability:
+                            //   Tier 1 — manual /proc wchan one-liner
+                            //            (always available on Linux, no
+                            //            install, no root)
+                            //   Tier 2 — py-spy / gdb / gcore (richer
+                            //            user-space frames, but requires
+                            //            the tool to be installed)
+                            let hint = format_watchdog_diagnostic_hint(pid);
+                            tracing::error!(pid, "{}", hint);
                         }
-
-                        // Tiered operator hints (#1759 / #1764):
-                        // The automatic wchan scrape above (tier 0) is
-                        // best-effort and may have failed. The hints
-                        // below give the operator escalation options
-                        // ordered by availability:
-                        //   Tier 1 — manual /proc wchan one-liner
-                        //            (always available on Linux, no
-                        //            install, no root)
-                        //   Tier 2 — py-spy / gdb / gcore (richer
-                        //            user-space frames, but requires
-                        //            the tool to be installed)
-                        let hint = format_watchdog_diagnostic_hint(pid);
-                        tracing::error!(pid, "{}", hint);
-                    } else if stale_secs >= 15 {
-                        tracing::warn!(
-                            stale_secs,
-                            phase = current_phase,
-                            phase_sub = current_phase_sub,
-                            fetch_channel_depth,
-                            fetch_channel_depth_max,
-                            "WATCHDOG: Event loop slow (>15s since last tick)"
-                        );
+                        WatchdogTier::Warn => snap.emit_warn(),
+                        WatchdogTier::None => {}
                     }
 
                     // SCP verifier health block (issue #1734 Phase B).
@@ -2208,6 +2192,90 @@ pub(crate) fn warn_if_slow(elapsed: std::time::Duration, op: &'static str, count
 /// without waiting for the 10-second poll interval or propagating a tracing
 /// subscriber across thread boundaries.
 ///
+/// Phase-code legend embedded in the ≥30s WATCHDOG error event.
+///
+/// This is the canonical operator-facing source for phase-code mappings.
+/// When adding a new phase constant, update this legend and the tests.
+pub(crate) const WATCHDOG_PHASE_LEGEND: &str = "\
+    Phase codes: 0=select, 1=scp_msg, 2=fetch_resp, \
+    3=broadcast, 4=scp_broadcast, 5=consensus_tick, \
+    6=pending_close, 10=process_externalized, \
+    11=externalized_catchup, 12=try_apply_buffered, \
+    13=buffered_catchup, 14=catchup_running, \
+    15=pending_catchup_complete, 16=heartbeat, \
+    20=stats, 21=tx_advert, 22=tx_demand, 23=survey, \
+    24=survey_req, 25=survey_phase, 26=scp_timeout, \
+    27=ping, 28=peer_maint, 29=peer_refresh, \
+    30=herder_cleanup, 31=scp_verifier, 32=scp_verified.";
+
+/// Which tier of WATCHDOG alert to emit based on event-loop staleness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatchdogTier {
+    /// < 15s — no alert.
+    None,
+    /// ≥ 15s — warning.
+    Warn,
+    /// ≥ 30s — error with full diagnostics.
+    Error,
+}
+
+/// Snapshot of event-loop health fields read by the watchdog thread.
+///
+/// Extracting these into a struct lets us test the field set and
+/// threshold routing without spawning a real watchdog thread.
+pub(crate) struct WatchdogSnapshot {
+    pub stale_secs: u64,
+    pub phase: u64,
+    pub phase_sub: u32,
+    pub fetch_channel_depth: i64,
+    pub fetch_channel_depth_max: i64,
+    pub pid: u32,
+}
+
+impl WatchdogSnapshot {
+    /// Determine which alert tier this snapshot falls into.
+    pub(crate) fn tier(&self) -> WatchdogTier {
+        if self.stale_secs >= 30 {
+            WatchdogTier::Error
+        } else if self.stale_secs >= 15 {
+            WatchdogTier::Warn
+        } else {
+            WatchdogTier::None
+        }
+    }
+
+    /// Emit the ≥15s warning-tier WATCHDOG event.
+    ///
+    /// `pid` is intentionally omitted (matches the existing schema —
+    /// pid is only on the error path).
+    pub(crate) fn emit_warn(&self) {
+        tracing::warn!(
+            stale_secs = self.stale_secs,
+            phase = self.phase,
+            phase_sub = self.phase_sub,
+            fetch_channel_depth = self.fetch_channel_depth,
+            fetch_channel_depth_max = self.fetch_channel_depth_max,
+            "WATCHDOG: Event loop slow (>15s since last tick)"
+        );
+    }
+
+    /// Emit the ≥30s error-tier WATCHDOG event with the phase-code legend.
+    pub(crate) fn emit_error(&self) {
+        tracing::error!(
+            stale_secs = self.stale_secs,
+            phase = self.phase,
+            phase_sub = self.phase_sub,
+            fetch_channel_depth = self.fetch_channel_depth,
+            fetch_channel_depth_max = self.fetch_channel_depth_max,
+            pid = self.pid,
+            "WATCHDOG: Event loop appears frozen! {} \
+             Sub-phase 13.N labels (issue #1788): see \
+             crates/app/src/app/phase.rs for PHASE_13_* constants.",
+            WATCHDOG_PHASE_LEGEND,
+        );
+    }
+}
+
 /// Tiers:
 /// - **Tier 0** (automatic): `/proc/<pid>/task/*/wchan` scrape logged above
 ///   (best-effort, Linux/procfs-specific).
@@ -4407,6 +4475,249 @@ mod tests {
             hint.contains("core.12345"),
             "tier-2 hint must contain core.<pid>; got: {hint}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // WatchdogSnapshot / WatchdogTier tests (issue #1791)
+    // ------------------------------------------------------------------
+
+    /// A richer capturing subscriber that records level + fields so
+    /// watchdog tests can assert on event severity and field presence.
+    #[derive(Clone, Default)]
+    struct WatchdogCapturingSubscriber {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedWatchdogEvent>>>,
+    }
+
+    #[derive(Debug)]
+    struct CapturedWatchdogEvent {
+        level: tracing::Level,
+        fields: String,
+    }
+
+    impl tracing::Subscriber for WatchdogCapturingSubscriber {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visit(String);
+            impl tracing::field::Visit for Visit {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.0.push_str(&format!(" {}={:?}", field.name(), value));
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.0.push_str(&format!(" {}={}", field.name(), value));
+                }
+                fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+                    self.0.push_str(&format!(" {}={}", field.name(), value));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.0.push_str(&format!(" {}={}", field.name(), value));
+                }
+            }
+            let mut v = Visit(String::new());
+            event.record(&mut v);
+            self.events.lock().unwrap().push(CapturedWatchdogEvent {
+                level: *event.metadata().level(),
+                fields: v.0,
+            });
+        }
+        fn enter(&self, _span: &tracing::Id) {}
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    fn test_snapshot(stale_secs: u64) -> super::WatchdogSnapshot {
+        super::WatchdogSnapshot {
+            stale_secs,
+            phase: 13,
+            phase_sub: 7,
+            fetch_channel_depth: 42,
+            fetch_channel_depth_max: 100,
+            pid: 99999,
+        }
+    }
+
+    /// Test A: `WatchdogSnapshot::tier()` boundary routing.
+    #[test]
+    fn watchdog_tier_routing() {
+        use super::WatchdogTier;
+        assert_eq!(test_snapshot(0).tier(), WatchdogTier::None);
+        assert_eq!(test_snapshot(14).tier(), WatchdogTier::None);
+        assert_eq!(test_snapshot(15).tier(), WatchdogTier::Warn);
+        assert_eq!(test_snapshot(29).tier(), WatchdogTier::Warn);
+        assert_eq!(test_snapshot(30).tier(), WatchdogTier::Error);
+        assert_eq!(test_snapshot(999).tier(), WatchdogTier::Error);
+    }
+
+    /// Test B: `emit_warn()` emits a WARN event with the correct fields
+    /// and does NOT include `pid` (warn schema).
+    #[test]
+    fn watchdog_emit_warn_fields() {
+        let sub = WatchdogCapturingSubscriber::default();
+        let events = sub.events.clone();
+        let snap = test_snapshot(20);
+        tracing::subscriber::with_default(sub, || {
+            snap.emit_warn();
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one event expected");
+        let ev = &events[0];
+
+        assert_eq!(ev.level, tracing::Level::WARN, "must be WARN level");
+
+        // Required fields with correct values.
+        assert!(
+            ev.fields.contains("stale_secs=20"),
+            "stale_secs: {}",
+            ev.fields
+        );
+        assert!(ev.fields.contains("phase=13"), "phase: {}", ev.fields);
+        assert!(
+            ev.fields.contains("phase_sub=7"),
+            "phase_sub: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("fetch_channel_depth=42"),
+            "fetch_channel_depth: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("fetch_channel_depth_max=100"),
+            "fetch_channel_depth_max: {}",
+            ev.fields
+        );
+
+        // Message content.
+        assert!(
+            ev.fields.contains("WATCHDOG: Event loop slow"),
+            "message: {}",
+            ev.fields
+        );
+
+        // pid must NOT be present on warn events.
+        assert!(
+            !ev.fields.contains("pid="),
+            "pid must not appear in warn event: {}",
+            ev.fields
+        );
+    }
+
+    /// Test C: `emit_error()` emits an ERROR event with all fields
+    /// including `pid` and phase-code legend substrings.
+    #[test]
+    fn watchdog_emit_error_fields() {
+        let sub = WatchdogCapturingSubscriber::default();
+        let events = sub.events.clone();
+        let snap = test_snapshot(45);
+        tracing::subscriber::with_default(sub, || {
+            snap.emit_error();
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one event expected");
+        let ev = &events[0];
+
+        assert_eq!(ev.level, tracing::Level::ERROR, "must be ERROR level");
+
+        // Required fields with correct values.
+        assert!(
+            ev.fields.contains("stale_secs=45"),
+            "stale_secs: {}",
+            ev.fields
+        );
+        assert!(ev.fields.contains("phase=13"), "phase: {}", ev.fields);
+        assert!(
+            ev.fields.contains("phase_sub=7"),
+            "phase_sub: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("fetch_channel_depth=42"),
+            "fetch_channel_depth: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("fetch_channel_depth_max=100"),
+            "fetch_channel_depth_max: {}",
+            ev.fields
+        );
+        assert!(ev.fields.contains("pid=99999"), "pid: {}", ev.fields);
+
+        // Message content.
+        assert!(
+            ev.fields.contains("WATCHDOG: Event loop appears frozen"),
+            "message: {}",
+            ev.fields
+        );
+
+        // Legend substrings (representative, not exhaustive exact-match).
+        assert!(
+            ev.fields.contains("0=select"),
+            "legend 0=select: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("13=buffered_catchup"),
+            "legend 13=buffered_catchup: {}",
+            ev.fields
+        );
+        assert!(
+            ev.fields.contains("32=scp_verified"),
+            "legend 32=scp_verified: {}",
+            ev.fields
+        );
+    }
+
+    /// Test D: `WATCHDOG_PHASE_LEGEND` contains all known phase codes.
+    #[test]
+    fn watchdog_phase_legend_coverage() {
+        let legend = super::WATCHDOG_PHASE_LEGEND;
+        // Every phase code N=label that appears in the watchdog loop.
+        let expected = [
+            "0=select",
+            "1=scp_msg",
+            "2=fetch_resp",
+            "3=broadcast",
+            "4=scp_broadcast",
+            "5=consensus_tick",
+            "6=pending_close",
+            "10=process_externalized",
+            "11=externalized_catchup",
+            "12=try_apply_buffered",
+            "13=buffered_catchup",
+            "14=catchup_running",
+            "15=pending_catchup_complete",
+            "16=heartbeat",
+            "20=stats",
+            "21=tx_advert",
+            "22=tx_demand",
+            "23=survey",
+            "24=survey_req",
+            "25=survey_phase",
+            "26=scp_timeout",
+            "27=ping",
+            "28=peer_maint",
+            "29=peer_refresh",
+            "30=herder_cleanup",
+            "31=scp_verifier",
+            "32=scp_verified",
+        ];
+        for entry in &expected {
+            assert!(
+                legend.contains(entry),
+                "WATCHDOG_PHASE_LEGEND missing '{}'; got: {}",
+                entry,
+                legend
+            );
+        }
     }
 
     /// Regression test for #1775 Phase 2 + #1778 label correction: verify
