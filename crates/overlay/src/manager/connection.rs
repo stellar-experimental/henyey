@@ -102,8 +102,12 @@ impl OverlayManager {
             Some(&exclude),
         ) {
             if peer.is_ready() {
-                if let Err(e) = peer.send(message).await {
-                    debug!("Failed to send peers to {}: {}", peer_id, e);
+                match peer.send(message).await {
+                    Ok(()) => shared.metrics.messages_written.inc(),
+                    Err(e) => {
+                        debug!("Failed to send peers to {}: {}", peer_id, e);
+                        shared.metrics.errors_write.inc();
+                    }
                 }
             }
         }
@@ -174,7 +178,10 @@ impl OverlayManager {
                 peer_id, reason
             );
             let err_msg = make_error_msg(ErrorCode::Load, "peer rejected");
-            let _ = peer.send(err_msg).await;
+            match peer.send(err_msg).await {
+                Ok(()) => shared.metrics.messages_written.inc(),
+                Err(_) => shared.metrics.errors_write.inc(),
+            }
             peer.close().await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();

@@ -642,4 +642,36 @@ mod tests {
         // They should be the same reference (OnceLock returns the same value).
         assert!(std::ptr::eq(h1, h2));
     }
+
+    #[test]
+    fn test_removed_overlay_metrics_absent() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        // These overlay metrics were intentionally removed because they lack
+        // production producers. Verify they don't silently reappear.
+        let removed = [
+            "stellar_overlay_message_drop_total",
+            "stellar_overlay_byte_read_total",
+            "stellar_overlay_byte_write_total",
+            "stellar_overlay_pending_peers",
+            "stellar_overlay_authenticated_peers",
+            "stellar_overlay_flood_demanded_total",
+            "stellar_overlay_flood_fulfilled_total",
+            "stellar_overlay_demand_timeout_total",
+            "stellar_overlay_connection_latency_us_sum",
+            "stellar_overlay_connection_latency_us_count",
+            "stellar_overlay_tx_pull_latency_us_sum",
+            "stellar_overlay_tx_pull_latency_us_count",
+        ];
+        for name in &removed {
+            assert!(
+                !output.contains(&format!("# HELP {}", name)),
+                "metric {} should not be registered (no production producer)",
+                name
+            );
+        }
+    }
 }

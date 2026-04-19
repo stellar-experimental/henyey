@@ -1009,8 +1009,10 @@ impl OverlayManager {
                     ErrorCode::Load,
                     "unexpected flood message, peer at capacity",
                 );
-                let _ = ctx.peer.send(err).await;
-                state.metrics.messages_written.inc();
+                match ctx.peer.send(err).await {
+                    Ok(()) => state.metrics.messages_written.inc(),
+                    Err(_) => state.metrics.errors_write.inc(),
+                }
                 return RecvAction::Break;
             }
         };
