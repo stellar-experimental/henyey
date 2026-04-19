@@ -2280,6 +2280,69 @@ mod tests {
     use stellar_xdr::curr::StellarValueExt;
     use tempfile;
 
+    /// Construct a `PendingLedgerClose` with default tx_set/upgrades.
+    ///
+    /// The caller provides the blocking task handle (which determines the
+    /// close outcome — success, error, or panic) and a sequence number.
+    fn make_test_pending_close(
+        handle: tokio::task::JoinHandle<Result<henyey_ledger::LedgerCloseResult, String>>,
+        seq: u32,
+    ) -> PendingLedgerClose {
+        PendingLedgerClose {
+            handle,
+            ledger_seq: seq,
+            tx_set: henyey_herder::TransactionSet {
+                hash: henyey_common::Hash256::ZERO,
+                previous_ledger_hash: henyey_common::Hash256::ZERO,
+                transactions: Vec::new(),
+                generalized_tx_set: None,
+            },
+            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                txs: stellar_xdr::curr::VecM::default(),
+            }),
+            close_time: seq as u64,
+            upgrades: Vec::new(),
+        }
+    }
+
+    /// Minimal successful `LedgerCloseResult` for the given sequence.
+    fn make_successful_close_result(seq: u32) -> henyey_ledger::LedgerCloseResult {
+        henyey_ledger::LedgerCloseResult {
+            header: stellar_xdr::curr::LedgerHeader {
+                ledger_version: 24,
+                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                scp_value: stellar_xdr::curr::StellarValue {
+                    tx_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    close_time: stellar_xdr::curr::TimePoint(seq as u64),
+                    upgrades: stellar_xdr::curr::VecM::default(),
+                    ext: stellar_xdr::curr::StellarValueExt::Basic,
+                },
+                tx_set_result_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                bucket_list_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                ledger_seq: seq,
+                total_coins: 0,
+                fee_pool: 0,
+                inflation_seq: 0,
+                id_pool: 0,
+                base_fee: 100,
+                base_reserve: 5_000_000,
+                max_tx_set_size: 100,
+                skip_list: [
+                    stellar_xdr::curr::Hash([0u8; 32]),
+                    stellar_xdr::curr::Hash([0u8; 32]),
+                    stellar_xdr::curr::Hash([0u8; 32]),
+                    stellar_xdr::curr::Hash([0u8; 32]),
+                ],
+                ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+            },
+            header_hash: henyey_common::Hash256::ZERO,
+            tx_results: Vec::new(),
+            meta: None,
+            perf: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_app_creation() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -5606,5 +5669,240 @@ mod tests {
                 "phase-13 sub-phase constants must be densely numbered 1..=N"
             );
         }
+    }
+
+    // ============================================================
+    // Deferred-finalizer contract tests (issue #1809)
+    //
+    // The production event loop uses `LedgerCloseFinalizer::deferred()`
+    // (lifecycle.rs:255-273). On success, `handle_close_complete` sends
+    // a `PendingPersist` through the oneshot synchronously before
+    // returning `true`. On error/panic, the sender is dropped (no send)
+    // and the function returns `false`.
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_deferred_finalizer_success_sends_persist() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        app.set_applying_ledger(true);
+
+        let mut pending = make_test_pending_close(
+            tokio::task::spawn_blocking(|| Ok(make_successful_close_result(1))),
+            1,
+        );
+        let join_result = (&mut pending.handle).await;
+
+        let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
+        let success = app
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::deferred(persist_tx),
+            )
+            .await;
+
+        assert!(
+            success,
+            "handle_close_complete should return true on success"
+        );
+        assert!(
+            !app.is_applying_ledger.load(Ordering::Relaxed),
+            "is_applying_ledger should be cleared"
+        );
+
+        // The deferred contract: a PendingPersist was sent synchronously.
+        let pt = persist_rx
+            .try_recv()
+            .expect("deferred finalizer must send PendingPersist on success");
+        assert_eq!(
+            pt.ledger_seq, 1,
+            "PendingPersist should carry the correct ledger_seq"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_finalizer_error_drops_sender() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        app.set_applying_ledger(true);
+
+        let mut pending = make_test_pending_close(
+            tokio::task::spawn_blocking(|| Err("simulated error".to_string())),
+            1,
+        );
+        let join_result = (&mut pending.handle).await;
+
+        let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
+        let success = app
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::deferred(persist_tx),
+            )
+            .await;
+
+        assert!(
+            !success,
+            "handle_close_complete should return false on error"
+        );
+        assert!(
+            !app.is_applying_ledger.load(Ordering::Relaxed),
+            "is_applying_ledger should be cleared on error"
+        );
+
+        // The negative contract: sender was dropped, not sent.
+        assert!(
+            matches!(
+                persist_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "deferred sender must be dropped (not sent) on error path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_finalizer_panic_drops_sender() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        app.set_applying_ledger(true);
+
+        let mut pending = make_test_pending_close(
+            tokio::task::spawn_blocking(|| {
+                panic!("simulated panic");
+            }),
+            1,
+        );
+        let join_result = (&mut pending.handle).await;
+
+        let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
+        let success = app
+            .handle_close_complete(
+                pending,
+                join_result,
+                super::persist::LedgerCloseFinalizer::deferred(persist_tx),
+            )
+            .await;
+
+        assert!(
+            !success,
+            "handle_close_complete should return false on panic"
+        );
+        assert!(
+            !app.is_applying_ledger.load(Ordering::Relaxed),
+            "is_applying_ledger should be cleared on panic"
+        );
+
+        assert!(
+            matches!(
+                persist_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ),
+            "deferred sender must be dropped (not sent) on panic path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_deferred_close_persist_lifecycle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let mut pipeline = super::close_pipeline::ClosePipeline::new();
+        assert!(pipeline.is_idle(), "pipeline should start idle");
+
+        // --- Cycle 1 (seq=1) ---
+        app.set_applying_ledger(true);
+
+        let pending = make_test_pending_close(
+            tokio::task::spawn_blocking(|| Ok(make_successful_close_result(1))),
+            1,
+        );
+        pipeline.start_close(pending);
+        assert!(!pipeline.is_idle(), "pipeline should be in Closing state");
+
+        // Simulate close completion: await handle, take from pipeline.
+        let mut taken = pipeline.take_close();
+        let join_result = (&mut taken.handle).await;
+
+        // Deferred finalizer handoff (production path).
+        let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
+        let success = app
+            .handle_close_complete(
+                taken,
+                join_result,
+                super::persist::LedgerCloseFinalizer::deferred(persist_tx),
+            )
+            .await;
+        assert!(success, "cycle 1: close should succeed");
+
+        // Receive the persist handle and install it.
+        let pt = persist_rx
+            .try_recv()
+            .expect("cycle 1: deferred must send PendingPersist");
+        assert_eq!(pt.ledger_seq, 1);
+        pipeline.start_persist(pt);
+
+        // Gating invariant: pipeline is NOT idle while persisting.
+        assert!(
+            !pipeline.is_idle(),
+            "pipeline must not be idle during persist"
+        );
+
+        // Await persist completion and take.
+        let mut persist = pipeline.take_persist();
+        let _ = (&mut persist.handle).await;
+        assert!(pipeline.is_idle(), "pipeline should be idle after persist");
+
+        // --- Cycle 2 (seq=2) ---
+        app.set_applying_ledger(true);
+
+        let pending2 = make_test_pending_close(
+            tokio::task::spawn_blocking(|| Ok(make_successful_close_result(2))),
+            2,
+        );
+        pipeline.start_close(pending2);
+
+        let mut taken2 = pipeline.take_close();
+        let join_result2 = (&mut taken2.handle).await;
+
+        let (persist_tx2, mut persist_rx2) = tokio::sync::oneshot::channel();
+        let success2 = app
+            .handle_close_complete(
+                taken2,
+                join_result2,
+                super::persist::LedgerCloseFinalizer::deferred(persist_tx2),
+            )
+            .await;
+        assert!(success2, "cycle 2: close should succeed");
+
+        let pt2 = persist_rx2
+            .try_recv()
+            .expect("cycle 2: deferred must send PendingPersist");
+        assert_eq!(pt2.ledger_seq, 2, "cycle 2: persist should carry seq=2");
+        pipeline.start_persist(pt2);
+        assert!(!pipeline.is_idle());
+
+        let mut persist2 = pipeline.take_persist();
+        let _ = (&mut persist2.handle).await;
+        assert!(
+            pipeline.is_idle(),
+            "pipeline should be idle after second cycle"
+        );
     }
 }
