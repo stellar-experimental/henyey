@@ -54,14 +54,23 @@ impl CatchupManager {
                             });
                     conn.store_tx_history_entry(data.header.ledger_seq, &tx_history_entry)?;
 
-                    let tx_result_entry = data.tx_result_entry.clone().unwrap_or_else(|| {
-                        let results = data.tx_results.clone().try_into().unwrap_or_default();
-                        TransactionHistoryResultEntry {
-                            ledger_seq: data.header.ledger_seq,
-                            tx_result_set: TransactionResultSet { results },
-                            ext: TransactionHistoryResultEntryExt::default(),
+                    let tx_result_entry = match data.tx_result_entry.clone() {
+                        Some(entry) => entry,
+                        None => {
+                            let results =
+                                data.tx_results.clone().try_into().map_err(|e| {
+                                    DbError::Integrity(format!(
+                                        "failed to convert tx results to XDR VecM for ledger {}: {e}",
+                                        data.header.ledger_seq
+                                    ))
+                                })?;
+                            TransactionHistoryResultEntry {
+                                ledger_seq: data.header.ledger_seq,
+                                tx_result_set: TransactionResultSet { results },
+                                ext: TransactionHistoryResultEntryExt::default(),
+                            }
                         }
-                    });
+                    };
                     conn.store_tx_result_entry(data.header.ledger_seq, &tx_result_entry)?;
 
                     let tx_results: Vec<TransactionResultPair> = tx_result_entry
@@ -76,7 +85,15 @@ impl CatchupManager {
                         .into_iter()
                         .map(|(tx, _)| tx)
                         .collect::<Vec<_>>();
-                    let tx_count = transactions.len().min(tx_results.len());
+                    if transactions.len() != tx_results.len() {
+                        return Err(DbError::Integrity(format!(
+                            "tx count mismatch in catchup persist: {} envelopes vs {} results for ledger {}",
+                            transactions.len(),
+                            tx_results.len(),
+                            data.header.ledger_seq
+                        )));
+                    }
+                    let tx_count = transactions.len();
 
                     for (idx, tx) in transactions.iter().take(tx_count).enumerate() {
                         let tx_result = &tx_results[idx];
@@ -117,8 +134,13 @@ impl CatchupManager {
 
                 Ok(())
             })
-            .map_err(|err| {
-                HistoryError::CatchupFailed(format!("failed to persist history: {}", err))
+            .map_err(|err| match err {
+                henyey_db::DbError::Integrity(msg) => {
+                    HistoryError::VerificationFailed(format!("persist integrity: {msg}"))
+                }
+                other => {
+                    HistoryError::CatchupFailed(format!("failed to persist history: {other}"))
+                }
             })?;
 
         Ok(())
@@ -226,5 +248,253 @@ impl CatchupManager {
         if let Some(ref callback) = self.meta_callback {
             callback(meta);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use henyey_bucket::BucketManager;
+    use henyey_db::Database;
+    use stellar_xdr::curr::{
+        Hash, LedgerHeader, Memo, MuxedAccount, Preconditions, SequenceNumber, Transaction,
+        TransactionEnvelope, TransactionExt, TransactionHistoryResultEntry,
+        TransactionHistoryResultEntryExt, TransactionResult, TransactionResultExt,
+        TransactionResultPair, TransactionResultResult, TransactionResultSet, TransactionSet,
+        TransactionV1Envelope, Uint256,
+    };
+
+    fn test_network_id() -> NetworkId {
+        NetworkId::from_passphrase("Test SDF Network ; September 2015")
+    }
+
+    fn make_test_catchup_manager() -> CatchupManager {
+        let db = Database::open_in_memory().expect("in-memory db");
+        let tmp_dir = tempfile::tempdir().expect("temp dir");
+        let bucket_manager = BucketManager::new(tmp_dir.keep()).expect("bucket manager");
+        let archive = crate::HistoryArchive::new("https://example.com").expect("archive");
+        CatchupManager::new(vec![archive], bucket_manager, db)
+    }
+
+    fn make_test_envelope() -> TransactionEnvelope {
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![].try_into().unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        })
+    }
+
+    fn make_success_result() -> TransactionResultPair {
+        TransactionResultPair {
+            transaction_hash: Hash([0u8; 32]),
+            result: TransactionResult {
+                fee_charged: 100,
+                result: TransactionResultResult::TxSuccess(vec![].try_into().unwrap()),
+                ext: TransactionResultExt::V0,
+            },
+        }
+    }
+
+    fn make_header(ledger_seq: u32) -> LedgerHeader {
+        LedgerHeader {
+            ledger_seq,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_persist_ledger_history_happy_path() {
+        let manager = make_test_catchup_manager();
+        let network_id = test_network_id();
+
+        let envelope = make_test_envelope();
+        let result_pair = make_success_result();
+
+        let tx_result_entry = TransactionHistoryResultEntry {
+            ledger_seq: 100,
+            tx_result_set: TransactionResultSet {
+                results: vec![result_pair].try_into().unwrap(),
+            },
+            ext: TransactionHistoryResultEntryExt::default(),
+        };
+
+        let data = LedgerData {
+            header: make_header(100),
+            tx_set: TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: vec![envelope].try_into().unwrap(),
+            }),
+            tx_results: vec![],
+            tx_history_entry: None,
+            tx_result_entry: Some(tx_result_entry),
+        };
+
+        let result = manager.persist_ledger_history(&[data], &network_id);
+        assert!(
+            result.is_ok(),
+            "happy path should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_persist_ledger_history_none_entry_happy_path() {
+        let manager = make_test_catchup_manager();
+        let network_id = test_network_id();
+
+        // tx_result_entry = None, empty tx_results, empty tx_set
+        let data = LedgerData {
+            header: make_header(200),
+            tx_set: TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: vec![].try_into().unwrap(),
+            }),
+            tx_results: vec![],
+            tx_history_entry: None,
+            tx_result_entry: None,
+        };
+
+        let result = manager.persist_ledger_history(&[data], &network_id);
+        assert!(
+            result.is_ok(),
+            "None entry with empty data should succeed: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_persist_ledger_history_length_mismatch_errors() {
+        let manager = make_test_catchup_manager();
+        let network_id = test_network_id();
+
+        let envelope = make_test_envelope();
+
+        // tx_result_entry has 0 results but tx_set has 1 transaction
+        let tx_result_entry = TransactionHistoryResultEntry {
+            ledger_seq: 300,
+            tx_result_set: TransactionResultSet {
+                results: vec![].try_into().unwrap(),
+            },
+            ext: TransactionHistoryResultEntryExt::default(),
+        };
+
+        let data = LedgerData {
+            header: make_header(300),
+            tx_set: TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: vec![envelope].try_into().unwrap(),
+            }),
+            tx_results: vec![],
+            tx_history_entry: None,
+            tx_result_entry: Some(tx_result_entry),
+        };
+
+        let result = manager.persist_ledger_history(&[data], &network_id);
+        assert!(result.is_err(), "length mismatch should error");
+        let err = result.unwrap_err();
+        assert!(
+            err.is_fatal_catchup_failure(),
+            "length mismatch should be a fatal catchup failure, got: {err}"
+        );
+        assert!(
+            matches!(&err, HistoryError::VerificationFailed(_)),
+            "expected VerificationFailed, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_persist_ledger_history_none_entry_mismatch_errors() {
+        let manager = make_test_catchup_manager();
+        let network_id = test_network_id();
+
+        let envelope = make_test_envelope();
+
+        // tx_result_entry = None, tx_results empty, but tx_set has 1 tx
+        // The synthesized entry will have 0 results, triggering mismatch
+        let data = LedgerData {
+            header: make_header(400),
+            tx_set: TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: vec![envelope].try_into().unwrap(),
+            }),
+            tx_results: vec![],
+            tx_history_entry: None,
+            tx_result_entry: None,
+        };
+
+        let result = manager.persist_ledger_history(&[data], &network_id);
+        assert!(
+            result.is_err(),
+            "None entry with non-empty tx_set should error"
+        );
+        let err = result.unwrap_err();
+        assert!(err.is_fatal_catchup_failure(), "should be fatal: {err}");
+    }
+
+    #[test]
+    fn test_persist_ledger_history_batch_rollback() {
+        let manager = make_test_catchup_manager();
+        let network_id = test_network_id();
+
+        let envelope = make_test_envelope();
+        let result_pair = make_success_result();
+
+        // First ledger: valid
+        let good_entry = TransactionHistoryResultEntry {
+            ledger_seq: 500,
+            tx_result_set: TransactionResultSet {
+                results: vec![result_pair].try_into().unwrap(),
+            },
+            ext: TransactionHistoryResultEntryExt::default(),
+        };
+        let good_data = LedgerData {
+            header: make_header(500),
+            tx_set: TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: vec![envelope.clone()].try_into().unwrap(),
+            }),
+            tx_results: vec![],
+            tx_history_entry: None,
+            tx_result_entry: Some(good_entry),
+        };
+
+        // Second ledger: mismatch (1 tx, 0 results)
+        let bad_entry = TransactionHistoryResultEntry {
+            ledger_seq: 501,
+            tx_result_set: TransactionResultSet {
+                results: vec![].try_into().unwrap(),
+            },
+            ext: TransactionHistoryResultEntryExt::default(),
+        };
+        let bad_data = LedgerData {
+            header: make_header(501),
+            tx_set: TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: Hash([0u8; 32]),
+                txs: vec![envelope].try_into().unwrap(),
+            }),
+            tx_results: vec![],
+            tx_history_entry: None,
+            tx_result_entry: Some(bad_entry),
+        };
+
+        let result = manager.persist_ledger_history(&[good_data, bad_data], &network_id);
+        assert!(result.is_err(), "batch with bad ledger should fail");
+
+        // Verify rollback: the good ledger's header should NOT be persisted
+        let header_check = manager.db.with_connection(|conn| {
+            use henyey_db::queries::LedgerQueries;
+            conn.load_ledger_header(500)
+        });
+        assert!(
+            header_check.is_err() || header_check.unwrap().is_none(),
+            "good ledger should be rolled back when batch fails"
+        );
     }
 }
