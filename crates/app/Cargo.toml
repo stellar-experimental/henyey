@@ -80,6 +80,8 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
+http-body-util = "0.1"
+http = "1"
 # Enable test-only instrumentation on henyey-ledger so the regression
 # test for #1759 can read `LedgerManager::test_snapshot_count()` to
 # assert that the post-close tx-queue re-validation builds exactly one

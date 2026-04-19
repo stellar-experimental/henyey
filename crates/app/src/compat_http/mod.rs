@@ -124,11 +124,14 @@ pub(crate) fn build_compat_router(state: Arc<CompatServerState>) -> Router {
 
 /// Panic handler for the `CatchPanicLayer`.
 ///
-/// Matches stellar-core's `safeRouter` behavior: on exception/panic, return
-/// `{"exception": "<message>"}`.
+/// Matches stellar-core's generic catch-all exception path
+/// (`CommandHandler.cpp:196-198`): on unhandled panic, return HTTP 200
+/// with `{"exception": "generic"}`. stellar-core's HTTP server
+/// (`lib/http/server.cpp:129`) unconditionally sets `reply::ok` after a
+/// matched route handler returns, so even exception responses use 200.
 fn safe_router_panic_handler(_err: Box<dyn std::any::Any + Send + 'static>) -> Response {
     (
-        StatusCode::INTERNAL_SERVER_ERROR,
+        StatusCode::OK,
         axum::Json(serde_json::json!({"exception": "generic"})),
     )
         .into_response()
@@ -208,17 +211,70 @@ impl CompatServer {
 
 #[cfg(test)]
 mod tests {
-    /// Verify the panic handler returns `{"exception": "generic"}`.
-    ///
-    /// This matches stellar-core's `safeRouter` behavior.
-    #[test]
-    fn test_panic_handler_response_shape() {
-        // The panic handler is tested by verifying the JSON it would produce.
-        // We can't easily trigger it without a full server, but we can verify
-        // the shape matches stellar-core.
-        let value = serde_json::json!({"exception": "generic"});
-        let obj = value.as_object().unwrap();
-        assert_eq!(obj.len(), 1, "should only have 'exception'");
-        assert_eq!(value["exception"], "generic");
+    use super::*;
+    use http_body_util::BodyExt;
+
+    /// Verify the panic handler function returns HTTP 200 with the expected
+    /// JSON body, matching stellar-core's catch-all exception behavior.
+    #[tokio::test]
+    async fn test_panic_handler_returns_200_with_exception_json() {
+        let err: Box<dyn std::any::Any + Send + 'static> = Box::new("test panic");
+        let response = safe_router_panic_handler(err);
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("should have content-type")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("application/json"),
+            "expected application/json, got {content_type}"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!({"exception": "generic"}));
+    }
+
+    /// End-to-end regression test: a panicking handler behind
+    /// `CatchPanicLayer::custom(safe_router_panic_handler)` produces an
+    /// HTTP 200 response with `{"exception": "generic"}`.
+    #[tokio::test]
+    async fn test_panic_through_catch_panic_layer_returns_200() {
+        async fn panicking_handler() -> &'static str {
+            panic!("intentional test panic");
+        }
+
+        let mut app = Router::new()
+            .route("/panic", get(panicking_handler))
+            .layer(CatchPanicLayer::custom(safe_router_panic_handler))
+            .into_service();
+
+        let request = http::Request::builder()
+            .uri("/panic")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let response = tower::Service::call(&mut app, request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("should have content-type")
+            .to_str()
+            .unwrap();
+        assert!(
+            content_type.contains("application/json"),
+            "expected application/json, got {content_type}"
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!({"exception": "generic"}));
     }
 }
