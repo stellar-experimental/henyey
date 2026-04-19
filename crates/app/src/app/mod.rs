@@ -118,17 +118,14 @@ const PEER_MAX_FAILURES_TO_SEND: u32 = 10;
 const TX_SET_REQUEST_WINDOW: u64 = 12;
 const MAX_TX_SET_REQUESTS_PER_TICK: usize = 32;
 /// Consensus stuck timeout matching stellar-core's CONSENSUS_STUCK_TIMEOUT_SECONDS.
-/// If no ledger closes within this time while we have buffered ledgers waiting,
-/// we trigger out-of-sync recovery.
+/// No longer used in the unified decision function (see #1831), but kept
+/// for the parity-checking test assertion.
+#[cfg(test)]
 const CONSENSUS_STUCK_TIMEOUT_SECS: u64 = 35;
 
 /// Pool ledger multiplier: queue limits = per-ledger limits × this factor.
 /// Matches stellar-core's `poolLedgerMultiplier` default (2).
 const POOL_LEDGER_MULTIPLIER: u32 = 2;
-
-/// Faster timeout when all peers report DontHave or disconnect.
-/// This allows us to trigger catchup sooner when we know peers don't have the tx sets.
-const TX_SET_UNAVAILABLE_TIMEOUT_SECS: u64 = 5;
 
 /// Number of consecutive recovery attempts without ledger progress before
 /// escalating from passive waiting to actively requesting SCP state from
@@ -219,10 +216,21 @@ const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
 /// OUT_OF_SYNC_RECOVERY_TIMER_SECS.
 const HARD_RESET_STALL_SECS: u64 = 120;
 
-/// Minimum interval between hard resets. One checkpoint cycle; after
-/// this, if the stall persists, we hard-reset again and operators get
-/// another WARN in logs.
-const HARD_RESET_COOLDOWN_SECS: u64 = 300;
+/// Hard floor: never reset more than once per this interval.
+/// Prevents reset storms when the node is legitimately stabilizing.
+const HARD_RESET_MIN_COOLDOWN_SECS: u64 = 60;
+
+/// Soft ceiling: after this, always allow a reset if consensus is
+/// still stuck. Prevents operator-visible lockout when automation
+/// is the only remediation path.
+const HARD_RESET_MAX_COOLDOWN_SECS: u64 = 300;
+
+/// Gap escalation threshold: if the gap has grown by ≥ this many
+/// slots since the last reset, override the cooldown (but never the
+/// absolute MIN). Tied to TX_SET_REQUEST_WINDOW because that is the
+/// peer-cache window — growth past it means peer-SCP has failed and
+/// the stall is worsening.
+const HARD_RESET_GAP_ESCALATION: u64 = TX_SET_REQUEST_WINDOW;
 
 /// /health returns unhealthy (503) when consensus_stuck_state has been
 /// populated for at least this long. Strictly less than
@@ -560,6 +568,9 @@ pub struct App {
     /// Monotonic offset (seconds since `start_instant`) of the last hard reset.
     /// 0 means "never". Used for cooldown enforcement.
     last_hard_reset_offset: AtomicU64,
+    /// Gap (latest_externalized - current_ledger) at the last hard reset.
+    /// Used for gap-escalation cooldown override.
+    last_hard_reset_gap: AtomicU64,
     /// Total number of post-catchup hard resets performed.
     pub(crate) post_catchup_hard_reset_total: AtomicU64,
     /// Deterministic per-node jitter seed derived from the keypair's public key.
@@ -899,6 +910,7 @@ impl App {
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
             last_hard_reset_offset: AtomicU64::new(0),
+            last_hard_reset_gap: AtomicU64::new(0),
             post_catchup_hard_reset_total: AtomicU64::new(0),
             jitter_seed,
             start_instant,
@@ -2625,12 +2637,13 @@ mod tests {
 
     #[test]
     fn test_consensus_stuck_action_variants() {
+        use crate::app::types::HardResetReason;
         // Verify all action variants exist and can be matched
         let actions = [
             ConsensusStuckAction::Wait,
             ConsensusStuckAction::AttemptRecovery,
             ConsensusStuckAction::TriggerCatchup,
-            ConsensusStuckAction::HardReset,
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted),
         ];
 
         for action in actions {
@@ -2638,7 +2651,7 @@ mod tests {
                 ConsensusStuckAction::Wait => {}
                 ConsensusStuckAction::AttemptRecovery => {}
                 ConsensusStuckAction::TriggerCatchup => {}
-                ConsensusStuckAction::HardReset => {}
+                ConsensusStuckAction::HardReset(_) => {}
             }
         }
     }

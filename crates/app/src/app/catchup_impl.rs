@@ -1183,69 +1183,63 @@ impl App {
         );
     }
 
-    /// Decide what action to take in the post-catchup (recently-caught-up)
-    /// branch of the consensus-stuck state machine.
+    /// Unified decision function for the consensus-stuck state machine.
     ///
-    /// Pure function; extracted from `maybe_start_buffered_catchup` for unit
-    /// testing. See issue #1753 for the bug this fixes: without the
-    /// `archive_behind` gate, the node re-triggers a catchup that will
-    /// immediately be skipped ("target checkpoint not yet published"), and
-    /// since the skip path used to refresh the post-catchup window, the node
-    /// would spin. With this helper:
+    /// Pure function; takes a [`StuckSignals`] snapshot and returns the
+    /// single best action. Called from both the "recently caught up" and
+    /// "not recently caught up" branches of `maybe_start_buffered_catchup`,
+    /// eliminating the class of bug where branch-specific logic drifts apart
+    /// (see #1831).
     ///
-    /// - When `archive_behind == true`, `TriggerCatchup` is never returned;
-    ///   peer-SCP `AttemptRecovery` continues on schedule.
-    /// - When `catchup_triggered == true` (a catchup is actually in flight),
-    ///   only `AttemptRecovery` is permitted, so peer-SCP recovery still
-    ///   runs while the catchup does its work; we never re-spawn catchup.
+    /// Decision table (archive_behind gates HardReset; when archive is OK,
+    /// normal TriggerCatchup is preferred):
     ///
-    /// See `crates/app/src/app/catchup_impl.rs` tests at the bottom of the
-    /// file for the full decision table.
-    fn decide_post_catchup_action(
-        catchup_triggered: bool,
-        recovery_attempts: u32,
-        since_recovery: u64,
-        archive_behind: bool,
-        tx_set_exhausted: bool,
-        stuck_duration: u64,
-    ) -> ConsensusStuckAction {
-        let schedule_due = since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS;
-        let recovery_exhausted = recovery_attempts >= MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
+    /// | catchup_triggered | archive_behind | rec_exhausted | tx_set_ex | stuck≥120s | schedule_due | Action |
+    /// |---|---|---|---|---|---|---|
+    /// | true  | *     | *    | *     | *     | true (ab)  | AttemptRecovery |
+    /// | true  | *     | *    | *     | *     | false      | Wait |
+    /// | false | true  | true | -     | -     | true       | HardReset(RecoveryExhausted) |
+    /// | false | true  | -    | true  | -     | true       | HardReset(TxSetExhausted) |
+    /// | false | true  | -    | -     | true  | true       | HardReset(StallWallClock) |
+    /// | false | true  | false| false | false | true       | AttemptRecovery |
+    /// | false | true  | *    | *     | *     | false      | Wait |
+    /// | false | false | true | *     | *     | -          | TriggerCatchup |
+    /// | false | false | false| *     | *     | true       | AttemptRecovery |
+    /// | false | false | false| *     | *     | false      | Wait |
+    fn decide_consensus_stuck_action(s: StuckSignals) -> ConsensusStuckAction {
+        let recovery_exhausted = s.recovery_attempts >= MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
 
-        if catchup_triggered {
+        if s.catchup_triggered {
             // A catchup is in flight. Don't re-trigger. If the archive is
             // also known behind the target checkpoint, the in-flight catchup
-            // is effectively stalled waiting for the archive — in that case
-            // keep peer-SCP recovery running on schedule so small gaps can
-            // still be bridged. Otherwise, defer entirely to the in-flight
-            // catchup (which will bring in all the slots anyway) and wait.
-            if archive_behind && schedule_due {
+            // is effectively stalled — keep peer-SCP recovery running on
+            // schedule. Otherwise, defer entirely to the in-flight catchup.
+            if s.archive_behind && s.schedule_due {
                 ConsensusStuckAction::AttemptRecovery
             } else {
                 ConsensusStuckAction::Wait
             }
-        } else if recovery_exhausted {
-            // Recovery has run MAX times without progress. Ordinarily
-            // this escalates to catchup, but if the archive is known
-            // behind the target checkpoint, catchup would immediately
-            // skip — keep doing recovery on schedule instead.
-            if archive_behind {
-                if schedule_due {
-                    // Escalate to HardReset when tx_set bytes are confirmed
-                    // lost (all peers DontHave) or the stall has exceeded
-                    // the wall-clock gate (envelopes never arrived).
-                    if tx_set_exhausted || stuck_duration >= HARD_RESET_STALL_SECS {
-                        ConsensusStuckAction::HardReset
-                    } else {
-                        ConsensusStuckAction::AttemptRecovery
-                    }
+        } else if s.archive_behind {
+            // Archive is behind — normal TriggerCatchup would just be
+            // skipped. Check for HardReset escalation, otherwise keep
+            // running peer-SCP recovery.
+            if s.schedule_due {
+                if recovery_exhausted {
+                    ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+                } else if s.tx_set_exhausted {
+                    ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
+                } else if s.stuck_duration >= HARD_RESET_STALL_SECS {
+                    ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindStallWallClock)
                 } else {
-                    ConsensusStuckAction::Wait
+                    ConsensusStuckAction::AttemptRecovery
                 }
             } else {
-                ConsensusStuckAction::TriggerCatchup
+                ConsensusStuckAction::Wait
             }
-        } else if schedule_due {
+        } else if recovery_exhausted {
+            // Archive is OK, recovery exhausted → escalate to catchup.
+            ConsensusStuckAction::TriggerCatchup
+        } else if s.schedule_due {
             ConsensusStuckAction::AttemptRecovery
         } else {
             ConsensusStuckAction::Wait
@@ -1260,25 +1254,57 @@ impl App {
         since_recovery + jitter >= OUT_OF_SYNC_RECOVERY_TIMER_SECS
     }
 
+    /// Effective recovery attempts: max of the per-stuck counter and the
+    /// consensus-tick atomic. Using the max ensures we see exhaustion as
+    /// soon as either observation path records it, while keeping the
+    /// "reset means fresh start" semantics. See #1831.
+    fn effective_recovery_attempts(&self, stuck: &ConsensusStuckState) -> u32 {
+        let atomic = self
+            .recovery_attempts_without_progress
+            .load(Ordering::SeqCst)
+            .min(u64::from(u32::MAX)) as u32;
+        stuck.recovery_attempts.max(atomic)
+    }
+
     /// Hard-reset the post-catchup recovery state to break the livelock
     /// described in #1822. Clears buffered state, tx_set tracking, and
-    /// archive-behind backoff so the next event-loop tick can re-evaluate
-    /// from a clean slate.
+    /// archive-behind backoff, then actively spawns a catchup to the latest
+    /// archive checkpoint (if available) rather than waiting for the normal
+    /// loop to re-evaluate (#1831).
     ///
-    /// Does NOT spawn catchup — lets the normal catchup loop pick a target
-    /// on the next tick.
-    async fn force_post_catchup_hard_reset(&self, current_ledger: u32) {
+    /// Progress-bound cooldown: min floor of 60s is always respected; the
+    /// 300s max ceiling is overridden when the gap grows by ≥
+    /// TX_SET_REQUEST_WINDOW since the last reset.
+    async fn force_post_catchup_hard_reset(
+        &self,
+        current_ledger: u32,
+        reason: HardResetReason,
+    ) -> Option<PendingCatchup> {
         let now_offset = self.start_instant.elapsed().as_secs();
         let last = self.last_hard_reset_offset.load(Ordering::Relaxed);
-        if last != 0 && now_offset.saturating_sub(last) < HARD_RESET_COOLDOWN_SECS {
-            tracing::warn!(
-                current_ledger,
-                cooldown_remaining =
-                    HARD_RESET_COOLDOWN_SECS.saturating_sub(now_offset.saturating_sub(last)),
-                "Hard reset cooldown active; consensus-stuck persists — \
-                 manual intervention may be required"
-            );
-            return;
+        let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+        let current_gap = latest_ext.saturating_sub(current_ledger as u64);
+
+        // Progress-bound cooldown check.
+        if last != 0 {
+            let elapsed = now_offset.saturating_sub(last);
+            let last_gap = self.last_hard_reset_gap.load(Ordering::Relaxed);
+            let gap_grew = current_gap.saturating_sub(last_gap) >= HARD_RESET_GAP_ESCALATION;
+            let min_elapsed = elapsed >= HARD_RESET_MIN_COOLDOWN_SECS;
+            let max_elapsed = elapsed >= HARD_RESET_MAX_COOLDOWN_SECS;
+
+            if !(max_elapsed || min_elapsed && gap_grew) {
+                tracing::warn!(
+                    current_ledger,
+                    cooldown_remaining = HARD_RESET_MAX_COOLDOWN_SECS.saturating_sub(elapsed),
+                    current_gap,
+                    last_gap,
+                    elapsed,
+                    "Hard reset cooldown active; consensus-stuck persists — \
+                     manual intervention may be required"
+                );
+                return None;
+            }
         }
 
         // Lock order: archive_behind_until → syncing_ledgers → consensus_stuck_state
@@ -1322,25 +1348,24 @@ impl App {
             .store(0, Ordering::SeqCst);
 
         // 6. Reset consensus_stuck_state recovery_attempts (keep stuck_start).
-        let (prior_recovery_attempts, stuck_duration, latest_externalized, gap) = {
+        let (prior_recovery_attempts, stuck_duration) = {
             let mut guard = self.consensus_stuck_state.write().await;
             if let Some(ref mut state) = *guard {
                 let prior = state.recovery_attempts;
                 let dur = state.stuck_start.elapsed().as_secs();
                 state.recovery_attempts = 0;
                 state.catchup_triggered = false;
-                let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
-                let gap = latest_ext.saturating_sub(current_ledger as u64);
-                (prior, dur, latest_ext, gap)
+                (prior, dur)
             } else {
-                (0, 0, 0, 0)
+                (0, 0)
             }
         };
 
-        // 7. Record the reset. Use max(1) so that a reset at sub-second uptime
-        // still arms the cooldown check (last != 0 means "has been reset").
+        // 7. Record the reset and gap for cooldown tracking.
         self.last_hard_reset_offset
             .store(now_offset.max(1), Ordering::Relaxed);
+        self.last_hard_reset_gap
+            .store(current_gap, Ordering::Relaxed);
         let total = self
             .post_catchup_hard_reset_total
             .fetch_add(1, Ordering::Relaxed)
@@ -1348,8 +1373,9 @@ impl App {
 
         tracing::warn!(
             current_ledger,
-            latest_externalized,
-            gap,
+            latest_externalized = latest_ext,
+            gap = current_gap,
+            ?reason,
             stuck_duration_secs = stuck_duration,
             prior_recovery_attempts,
             evicted_syncing_entries,
@@ -1357,9 +1383,46 @@ impl App {
             tx_set_exhausted_before_reset,
             archive_behind_until_was_armed,
             total,
-            "Post-catchup livelock detected — hard reset: dropped buffered state, \
-             letting normal catchup loop re-evaluate"
+            "Post-catchup livelock detected — hard reset: dropped buffered state"
         );
+
+        // 8. Spawn a catchup to the latest archive checkpoint if available.
+        // This is the key difference from the original #1822 hard-reset:
+        // instead of waiting for the normal loop to re-evaluate (which
+        // would immediately re-arm archive_behind_until), we actively
+        // target the latest known checkpoint.
+        match self.get_cached_archive_checkpoint_nonblocking() {
+            Some(latest) if latest > current_ledger => {
+                tracing::warn!(
+                    current_ledger,
+                    archive_latest = latest,
+                    "Hard reset: spawning catchup to latest archive checkpoint"
+                );
+                self.spawn_catchup(
+                    CatchupTarget::Ledger(latest),
+                    "HardResetEscalation",
+                    true, // reset_stuck_state
+                    true, // re_arm_recovery
+                )
+                .await
+            }
+            Some(latest) => {
+                tracing::warn!(
+                    current_ledger,
+                    archive_latest = latest,
+                    "Hard reset: archive at/behind us, no catchup to spawn"
+                );
+                None
+            }
+            None => {
+                tracing::debug!(
+                    current_ledger,
+                    "Hard reset: archive cache cold/stale, skipping catchup spawn \
+                     (background refresh will warm cache)"
+                );
+                None
+            }
+        }
     }
 
     pub(super) async fn maybe_start_buffered_catchup(&self) -> Option<PendingCatchup> {
@@ -1589,16 +1652,6 @@ impl App {
                             let elapsed = state.stuck_start.elapsed().as_secs();
                             let since_recovery = state.last_recovery_attempt.elapsed().as_secs();
 
-                            // These signals help determine the stuck timeout when NOT
-                            // recently caught up. When all peers report DontHave or
-                            // requests have been waiting too long, use a faster timeout.
-                            let all_peers_exhausted =
-                                self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
-                            let has_stale_requests = self
-                                .herder
-                                .has_stale_pending_tx_set(TX_SET_UNAVAILABLE_TIMEOUT_SECS);
-                            let recovery_failed = state.recovery_attempts >= 2;
-
                             // Cooldown: don't trigger catchup if we recently completed
                             // catchup. stellar-core does NOT have a stuck timeout
                             // that triggers catchup — it only triggers catchup when
@@ -1615,12 +1668,9 @@ impl App {
                                 });
 
                             // Is the archive known to be behind the target
-                            // checkpoint? A prior tick (in consensus.rs or the
-                            // validate_* paths below) may have armed this
-                            // backoff. When true, suppress TriggerCatchup in
-                            // the post-catchup branch — spawning catchup would
-                            // only hit the skip path and spin. Peer-SCP
-                            // recovery still runs on its normal cadence.
+                            // checkpoint? When true, suppress TriggerCatchup —
+                            // spawning catchup would only hit the skip path
+                            // and spin. HardReset is the escape hatch.
                             self.set_phase_sub(PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ);
                             let archive_behind = self
                                 .archive_behind_until
@@ -1628,123 +1678,50 @@ impl App {
                                 .await
                                 .is_some_and(|deadline| self.clock.now() < deadline);
 
-                            // When recently caught up, prefer recovery over catchup.
-                            // The next checkpoint won't be published to archives for
-                            // ~5 min, so archive-based catchup will fail trying to
-                            // download unpublished checkpoint data. However, if
-                            // recovery has been attempted multiple times without
-                            // progress, the missing slots have likely been evicted
-                            // from peers' caches and recovery will never succeed.
-                            // In that case, fall through to catchup — unless the
-                            // archive is also known to be behind the target
-                            // checkpoint, in which case keep running recovery on
-                            // schedule instead of spinning on a catchup that is
-                            // guaranteed to be skipped.
-                            if recently_caught_up {
-                                let tx_set_exhausted =
-                                    self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
-                                let stuck_duration = state.stuck_start.elapsed().as_secs();
-                                let jittered_due =
-                                    Self::jittered_schedule_due(since_recovery, self.jitter_seed);
-                                let decision = Self::decide_post_catchup_action(
-                                    state.catchup_triggered,
-                                    state.recovery_attempts,
-                                    if jittered_due {
-                                        OUT_OF_SYNC_RECOVERY_TIMER_SECS
-                                    } else {
-                                        since_recovery
-                                    },
-                                    archive_behind,
-                                    tx_set_exhausted,
-                                    stuck_duration,
-                                );
-                                match decision {
-                                    ConsensusStuckAction::TriggerCatchup => {
-                                        tracing::warn!(
-                                            current_ledger,
-                                            first_buffered,
-                                            last_buffered,
-                                            elapsed_secs = elapsed,
-                                            recovery_attempts = state.recovery_attempts,
-                                            "Post-catchup recovery exhausted; \
-                                             missing slots unrecoverable via SCP. \
-                                             Triggering catchup."
-                                        );
-                                        state.catchup_triggered = true;
-                                    }
-                                    ConsensusStuckAction::AttemptRecovery => {
-                                        state.last_recovery_attempt = now;
-                                        state.recovery_attempts = state
-                                            .recovery_attempts
-                                            .saturating_add(1)
-                                            .min(MAX_POST_CATCHUP_RECOVERY_ATTEMPTS + 1);
-                                        tracing::info!(
-                                            current_ledger,
-                                            first_buffered,
-                                            elapsed_secs = elapsed,
-                                            recovery_attempts = state.recovery_attempts,
-                                            max_recovery_attempts =
-                                                MAX_POST_CATCHUP_RECOVERY_ATTEMPTS,
-                                            archive_behind,
-                                            "Attempting out-of-sync recovery \
-                                             (post-catchup gap)"
-                                        );
-                                    }
-                                    ConsensusStuckAction::Wait => {
-                                        tracing::debug!(
-                                            current_ledger,
-                                            first_buffered,
-                                            elapsed_secs = elapsed,
-                                            catchup_triggered = state.catchup_triggered,
-                                            archive_behind,
-                                            "Waiting for SCP to fill post-catchup gap"
-                                        );
-                                    }
-                                    ConsensusStuckAction::HardReset => {
-                                        // Handled after dropping the stuck_state
-                                        // write guard — see the outer match below.
-                                    }
-                                }
-                                decision
-                            } else {
-                                // Not recently caught up — use stuck timeout logic.
-                                let use_fast_timeout =
-                                    all_peers_exhausted || has_stale_requests || recovery_failed;
-                                let effective_timeout = if use_fast_timeout {
-                                    TX_SET_UNAVAILABLE_TIMEOUT_SECS
-                                } else {
-                                    CONSENSUS_STUCK_TIMEOUT_SECS
-                                };
+                            // Unified recovery counter: max of the per-stuck
+                            // counter and the consensus-tick atomic. See #1831.
+                            let effective_attempts = self.effective_recovery_attempts(state);
 
-                                if state.catchup_triggered {
-                                    tracing::debug!(
-                                        current_ledger,
-                                        first_buffered,
-                                        elapsed_secs = elapsed,
-                                        "Catchup already triggered, waiting for progress"
-                                    );
-                                    ConsensusStuckAction::Wait
-                                } else if elapsed >= effective_timeout {
+                            let tx_set_exhausted =
+                                self.tx_set_all_peers_exhausted.load(Ordering::SeqCst);
+                            let stuck_duration = state.stuck_start.elapsed().as_secs();
+                            let jittered_due =
+                                Self::jittered_schedule_due(since_recovery, self.jitter_seed);
+                            let schedule_due = if recently_caught_up {
+                                jittered_due
+                            } else {
+                                since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS
+                            };
+
+                            let signals = StuckSignals {
+                                catchup_triggered: state.catchup_triggered,
+                                archive_behind,
+                                tx_set_exhausted,
+                                schedule_due,
+                                stuck_duration,
+                                recovery_attempts: effective_attempts,
+                            };
+
+                            let decision = Self::decide_consensus_stuck_action(signals);
+                            match decision {
+                                ConsensusStuckAction::TriggerCatchup => {
                                     tracing::warn!(
                                         current_ledger,
                                         first_buffered,
                                         last_buffered,
-                                        required_first,
-                                        trigger,
                                         elapsed_secs = elapsed,
-                                        recovery_attempts = state.recovery_attempts,
-                                        all_peers_exhausted,
-                                        has_stale_requests,
-                                        recovery_failed,
-                                        effective_timeout,
-                                        "Buffered catchup stuck timeout; triggering catchup"
+                                        recovery_attempts = effective_attempts,
+                                        recently_caught_up,
+                                        "Recovery exhausted; triggering catchup"
                                     );
                                     state.catchup_triggered = true;
-                                    self.tx_set_all_peers_exhausted
-                                        .store(false, Ordering::SeqCst);
-                                    self.tx_set_exhausted_warned.write().await.clear();
-                                    ConsensusStuckAction::TriggerCatchup
-                                } else if since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS {
+                                    if !recently_caught_up {
+                                        self.tx_set_all_peers_exhausted
+                                            .store(false, Ordering::SeqCst);
+                                        self.tx_set_exhausted_warned.write().await.clear();
+                                    }
+                                }
+                                ConsensusStuckAction::AttemptRecovery => {
                                     state.last_recovery_attempt = now;
                                     state.recovery_attempts = state
                                         .recovery_attempts
@@ -1755,23 +1732,29 @@ impl App {
                                         first_buffered,
                                         elapsed_secs = elapsed,
                                         recovery_attempts = state.recovery_attempts,
-                                        timeout_secs = CONSENSUS_STUCK_TIMEOUT_SECS,
-                                        "Attempting out-of-sync recovery (buffered gap)"
+                                        max_recovery_attempts = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS,
+                                        archive_behind,
+                                        recently_caught_up,
+                                        "Attempting out-of-sync recovery"
                                     );
-                                    ConsensusStuckAction::AttemptRecovery
-                                } else {
+                                }
+                                ConsensusStuckAction::Wait => {
                                     tracing::debug!(
                                         current_ledger,
                                         first_buffered,
-                                        last_buffered,
-                                        required_first,
-                                        trigger,
                                         elapsed_secs = elapsed,
-                                        "Waiting for buffered catchup trigger ledger"
+                                        catchup_triggered = state.catchup_triggered,
+                                        archive_behind,
+                                        recently_caught_up,
+                                        "Waiting for consensus gap to resolve"
                                     );
-                                    ConsensusStuckAction::Wait
+                                }
+                                ConsensusStuckAction::HardReset(_) => {
+                                    // Handled after dropping the stuck_state
+                                    // write guard — see the outer match below.
                                 }
                             }
+                            decision
                         }
                         _ => {
                             tracing::info!(
@@ -1803,9 +1786,10 @@ impl App {
                     ConsensusStuckAction::TriggerCatchup => {
                         // Fall through to catchup below
                     }
-                    ConsensusStuckAction::HardReset => {
-                        self.force_post_catchup_hard_reset(current_ledger).await;
-                        return None;
+                    ConsensusStuckAction::HardReset(reason) => {
+                        return self
+                            .force_post_catchup_hard_reset(current_ledger, reason)
+                            .await;
                     }
                 }
             }
@@ -2506,36 +2490,30 @@ mod tests {
     const MAX: u32 = MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
     const TIMER: u64 = OUT_OF_SYNC_RECOVERY_TIMER_SECS;
 
-    /// Helper: call decide_post_catchup_action with default (non-triggering)
-    /// values for the new tx_set_exhausted and stuck_duration params.
     fn decide(
         catchup_triggered: bool,
         recovery_attempts: u32,
         since_recovery: u64,
         archive_behind: bool,
     ) -> ConsensusStuckAction {
-        App::decide_post_catchup_action(
+        App::decide_consensus_stuck_action(StuckSignals {
             catchup_triggered,
-            recovery_attempts,
-            since_recovery,
             archive_behind,
-            false, // tx_set_exhausted
-            0,     // stuck_duration (won't trigger HardReset)
-        )
+            tx_set_exhausted: false,
+            schedule_due: since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS,
+            stuck_duration: 0,
+            recovery_attempts,
+        })
     }
 
     #[test]
-    fn test_decide_post_catchup_action_catchup_in_flight_waits_when_not_due() {
-        // Regression for #1753: when a catchup is already in flight, never
-        // re-trigger. Wait if peer-SCP recovery isn't due yet.
+    fn test_decide_catchup_in_flight_waits_when_not_due() {
         let action = decide(true, 0, TIMER - 1, false);
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
     #[test]
-    fn test_decide_post_catchup_action_catchup_in_flight_waits_when_due_and_archive_ok() {
-        // Catchup in flight and archive NOT behind — defer entirely to the
-        // in-flight catchup; do not run redundant peer-SCP recovery.
+    fn test_decide_catchup_in_flight_waits_when_due_and_archive_ok() {
         let action = decide(true, 0, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::Wait);
 
@@ -2544,21 +2522,16 @@ mod tests {
     }
 
     #[test]
-    fn test_decide_post_catchup_action_catchup_in_flight_recovers_when_archive_behind() {
-        // Catchup in flight but archive is known behind (so catchup is
-        // effectively stalled) — keep peer-SCP recovery running on schedule.
+    fn test_decide_catchup_in_flight_recovers_when_archive_behind() {
         let action = decide(true, 0, TIMER, true);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
 
-        // Not yet due: wait.
         let action = decide(true, 0, TIMER - 1, true);
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
     #[test]
-    fn test_decide_post_catchup_action_catchup_in_flight_never_retriggers_even_after_max() {
-        // If a catchup is in flight, we must not trigger another one even if
-        // recovery_attempts has already saturated.
+    fn test_decide_catchup_in_flight_never_retriggers_even_after_max() {
         let action = decide(true, MAX + 5, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::Wait);
 
@@ -2570,36 +2543,35 @@ mod tests {
     }
 
     #[test]
-    fn test_decide_post_catchup_action_triggers_catchup_when_recovery_exhausted() {
-        // After MAX recovery attempts with no catchup in flight and no
-        // archive-behind signal, escalate to catchup.
+    fn test_decide_triggers_catchup_when_recovery_exhausted() {
         let action = decide(false, MAX, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::TriggerCatchup);
     }
 
     #[test]
-    fn test_decide_post_catchup_action_archive_behind_prevents_trigger() {
-        // Regression for #1753: when recovery is exhausted AND the archive is
-        // known behind, do NOT trigger catchup (which would just be skipped).
-        // Instead, keep peer-SCP recovery running on schedule — but only if
-        // the HardReset gates are not yet met (no tx_set_exhausted, short stall).
+    fn test_decide_archive_behind_escalates_to_hard_reset() {
+        // archive_behind + recovery exhausted → HardReset (the key #1831 fix).
         let action = decide(false, MAX, TIMER, true);
-        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+        assert!(matches!(
+            action,
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+        ));
 
         let action = decide(false, MAX + 10, TIMER, true);
-        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+        assert!(matches!(
+            action,
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+        ));
     }
 
     #[test]
-    fn test_decide_post_catchup_action_archive_behind_waits_when_not_due() {
-        // Archive behind + recovery exhausted + peer-SCP not due => wait.
+    fn test_decide_archive_behind_waits_when_not_due() {
         let action = decide(false, MAX, TIMER - 1, true);
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
     #[test]
-    fn test_decide_post_catchup_action_normal_recovery_on_schedule() {
-        // Before recovery is exhausted, just run recovery on its schedule.
+    fn test_decide_normal_recovery_on_schedule() {
         let action = decide(false, 0, TIMER, false);
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
 
@@ -2611,103 +2583,245 @@ mod tests {
     }
 
     // ================================================================
-    // New tests for #1822: HardReset, jitter, saturation
+    // #1822: HardReset, jitter, saturation
     // ================================================================
 
     #[test]
-    fn test_decide_post_catchup_action_hard_reset_on_tx_set_exhausted() {
-        // archive_behind + recovery exhausted + tx_set_exhausted → HardReset
-        // even with short stuck_duration.
-        let action = App::decide_post_catchup_action(
-            false, MAX, TIMER, true, // archive_behind
-            true, // tx_set_exhausted
-            30,   // stuck_duration — below HARD_RESET_STALL_SECS
-        );
-        assert_eq!(action, ConsensusStuckAction::HardReset);
+    fn test_decide_hard_reset_on_tx_set_exhausted() {
+        // archive_behind + tx_set_exhausted → HardReset even without
+        // recovery exhaustion or long stall.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: true,
+            schedule_due: true,
+            stuck_duration: 30,
+            recovery_attempts: 0,
+        });
+        assert!(matches!(
+            action,
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
+        ));
     }
 
     #[test]
-    fn test_decide_post_catchup_action_hard_reset_on_sustained_stall() {
-        // archive_behind + recovery exhausted + stuck >= HARD_RESET_STALL_SECS
-        // → HardReset (even with tx_set_exhausted=false).
-        let action = App::decide_post_catchup_action(
-            false,
-            MAX,
-            TIMER,
-            true,  // archive_behind
-            false, // tx_set_exhausted
-            HARD_RESET_STALL_SECS,
-        );
-        assert_eq!(action, ConsensusStuckAction::HardReset);
+    fn test_decide_hard_reset_on_sustained_stall() {
+        // archive_behind + stuck >= HARD_RESET_STALL_SECS → HardReset.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS,
+            recovery_attempts: 0,
+        });
+        assert!(matches!(
+            action,
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindStallWallClock)
+        ));
     }
 
     #[test]
-    fn test_decide_post_catchup_action_no_hard_reset_before_gates() {
-        // tx_set_exhausted=false, stuck_duration < HARD_RESET_STALL_SECS
-        // → stays on AttemptRecovery.
-        let action = App::decide_post_catchup_action(
-            false, MAX, TIMER, true, false, 60, // below HARD_RESET_STALL_SECS
-        );
+    fn test_decide_no_hard_reset_before_gates() {
+        // archive_behind + schedule_due but no exhaustion signals → AttemptRecovery.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 60,
+            recovery_attempts: 0,
+        });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
 
     #[test]
-    fn test_decide_post_catchup_action_no_hard_reset_when_archive_ok() {
-        // archive_behind=false + all hard-reset signals → TriggerCatchup
-        // (normal escalation, not HardReset).
-        let action = App::decide_post_catchup_action(
-            false,
-            MAX,
-            TIMER,
-            false, // archive NOT behind
-            true,
-            HARD_RESET_STALL_SECS + 100,
-        );
+    fn test_decide_no_hard_reset_when_archive_ok() {
+        // archive_behind=false → TriggerCatchup (normal escalation).
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: false,
+            tx_set_exhausted: true,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS + 100,
+            recovery_attempts: MAX,
+        });
         assert_eq!(action, ConsensusStuckAction::TriggerCatchup);
     }
 
     #[test]
-    fn test_decide_post_catchup_action_no_hard_reset_when_recovery_not_exhausted() {
-        // recovery_attempts < MAX → normal AttemptRecovery regardless of
-        // tx_set_exhausted or stuck_duration.
-        let action = App::decide_post_catchup_action(
-            false,
-            0,
-            TIMER,
-            true,
-            true,
-            HARD_RESET_STALL_SECS + 100,
-        );
-        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    fn test_decide_hard_reset_recovery_exhausted_and_archive_behind() {
+        // recovery_attempts >= MAX + archive_behind → HardReset(RecoveryExhausted).
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 0,
+            recovery_attempts: MAX,
+        });
+        assert!(matches!(
+            action,
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+        ));
     }
 
     #[test]
-    fn test_decide_post_catchup_action_wait_when_not_due() {
+    fn test_decide_wait_when_not_due() {
         // All hard-reset-qualifying params but schedule not due → Wait.
-        let action = App::decide_post_catchup_action(
-            false,
-            MAX,
-            TIMER - 1, // not due
-            true,
-            true,
-            HARD_RESET_STALL_SECS + 100,
-        );
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: true,
+            schedule_due: false,
+            stuck_duration: HARD_RESET_STALL_SECS + 100,
+            recovery_attempts: MAX,
+        });
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
 
     #[test]
-    fn test_decide_post_catchup_action_catchup_in_flight_never_hard_resets() {
-        // With catchup in flight, HardReset is never returned.
-        let action = App::decide_post_catchup_action(
-            true,
-            MAX,
-            TIMER,
-            true,
-            true,
-            HARD_RESET_STALL_SECS + 100,
-        );
-        // With archive_behind + schedule_due, it's AttemptRecovery (not HardReset).
+    fn test_decide_catchup_in_flight_never_hard_resets() {
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: true,
+            archive_behind: true,
+            tx_set_exhausted: true,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS + 100,
+            recovery_attempts: MAX,
+        });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
+    }
+
+    // ================================================================
+    // #1831: HardReset reachable from both branches, unified counter
+    // ================================================================
+
+    #[test]
+    fn test_hard_reset_fires_from_not_recently_caught_up_scenario() {
+        // Reproduces the issue-body scenario: not recently caught up,
+        // archive_behind, recovery exhausted via atomic counter,
+        // stuck 130s. HardReset must fire.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 130,
+            recovery_attempts: 7, // from atomic counter (> MAX_POST_CATCHUP_RECOVERY_ATTEMPTS)
+        });
+        assert!(matches!(action, ConsensusStuckAction::HardReset(_)));
+    }
+
+    #[test]
+    fn test_hard_reset_reason_priority() {
+        // When multiple HardReset conditions are true, the priority is:
+        // recovery_exhausted > tx_set_exhausted > wall_clock.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: true,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS + 10,
+            recovery_attempts: MAX,
+        });
+        // recovery_exhausted wins because it's checked first.
+        assert!(matches!(
+            action,
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+        ));
+
+        // When recovery NOT exhausted but tx_set_exhausted and stall:
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: true,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS + 10,
+            recovery_attempts: 0,
+        });
+        // tx_set_exhausted wins over wall_clock.
+        assert!(matches!(
+            action,
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
+        ));
+    }
+
+    #[test]
+    fn test_decision_table_completeness() {
+        // Exhaustive check of the decision table from the doc comment.
+        // archive_behind=true paths:
+        let s = |ct: bool, ab: bool, re: u32, tx: bool, sd: u64, due: bool| {
+            App::decide_consensus_stuck_action(StuckSignals {
+                catchup_triggered: ct,
+                archive_behind: ab,
+                tx_set_exhausted: tx,
+                schedule_due: due,
+                stuck_duration: sd,
+                recovery_attempts: re,
+            })
+        };
+
+        // catchup_triggered + archive_behind + schedule_due → AttemptRecovery
+        assert_eq!(
+            s(true, true, MAX, true, 999, true),
+            ConsensusStuckAction::AttemptRecovery
+        );
+        // catchup_triggered + !schedule_due → Wait
+        assert_eq!(
+            s(true, true, MAX, true, 999, false),
+            ConsensusStuckAction::Wait
+        );
+        assert_eq!(
+            s(true, false, MAX, true, 999, false),
+            ConsensusStuckAction::Wait
+        );
+
+        // !catchup_triggered + archive_behind + rec_exhausted + schedule_due → HardReset
+        assert!(matches!(
+            s(false, true, MAX, false, 0, true),
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+        ));
+        // !catchup_triggered + archive_behind + tx_set_exhausted + schedule_due → HardReset
+        assert!(matches!(
+            s(false, true, 0, true, 0, true),
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
+        ));
+        // !catchup_triggered + archive_behind + stuck>=120s + schedule_due → HardReset
+        assert!(matches!(
+            s(false, true, 0, false, HARD_RESET_STALL_SECS, true),
+            ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindStallWallClock)
+        ));
+        // !catchup_triggered + archive_behind + no gates + schedule_due → AttemptRecovery
+        assert_eq!(
+            s(false, true, 0, false, 0, true),
+            ConsensusStuckAction::AttemptRecovery
+        );
+        // !catchup_triggered + archive_behind + !schedule_due → Wait
+        assert_eq!(
+            s(false, true, MAX, true, 999, false),
+            ConsensusStuckAction::Wait
+        );
+
+        // !archive_behind + rec_exhausted → TriggerCatchup
+        assert_eq!(
+            s(false, false, MAX, false, 0, true),
+            ConsensusStuckAction::TriggerCatchup
+        );
+        assert_eq!(
+            s(false, false, MAX, false, 0, false),
+            ConsensusStuckAction::TriggerCatchup
+        );
+        // !archive_behind + !rec_exhausted + schedule_due → AttemptRecovery
+        assert_eq!(
+            s(false, false, 0, false, 0, true),
+            ConsensusStuckAction::AttemptRecovery
+        );
+        // !archive_behind + !rec_exhausted + !schedule_due → Wait
+        assert_eq!(
+            s(false, false, 0, false, 0, false),
+            ConsensusStuckAction::Wait
+        );
     }
 
     #[test]
@@ -3236,7 +3350,11 @@ mod tests {
         );
 
         // Execute hard reset.
-        app.force_post_catchup_hard_reset(current_ledger).await;
+        app.force_post_catchup_hard_reset(
+            current_ledger,
+            HardResetReason::ArchiveBehindRecoveryExhausted,
+        )
+        .await;
 
         // Verify leading N+1, N+2 evicted; N+25 preserved; N+26 preserved.
         {
@@ -3326,7 +3444,11 @@ mod tests {
         }
 
         // First hard reset — should succeed.
-        app.force_post_catchup_hard_reset(current_ledger).await;
+        app.force_post_catchup_hard_reset(
+            current_ledger,
+            HardResetReason::ArchiveBehindRecoveryExhausted,
+        )
+        .await;
         assert_eq!(
             app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
             1,
@@ -3342,7 +3464,11 @@ mod tests {
         }
 
         // Second hard reset immediately — should be blocked by cooldown.
-        app.force_post_catchup_hard_reset(current_ledger).await;
+        app.force_post_catchup_hard_reset(
+            current_ledger,
+            HardResetReason::ArchiveBehindRecoveryExhausted,
+        )
+        .await;
         assert_eq!(
             app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
             1,

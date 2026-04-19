@@ -484,6 +484,29 @@ pub(crate) struct ConsensusStuckState {
     pub catchup_triggered: bool,
 }
 
+/// Why a hard reset was triggered. Logged at WARN for observability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HardResetReason {
+    /// archive_behind + recovery attempts exhausted.
+    ArchiveBehindRecoveryExhausted,
+    /// archive_behind + all peers said DontHave for the tx_set.
+    ArchiveBehindTxSetExhausted,
+    /// archive_behind + wall-clock stall exceeded HARD_RESET_STALL_SECS.
+    ArchiveBehindStallWallClock,
+}
+
+/// All signals the consensus-stuck state machine needs to pick an action.
+/// Built once per tick, consumed by `decide_consensus_stuck_action`.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct StuckSignals {
+    pub catchup_triggered: bool,
+    pub archive_behind: bool,
+    pub tx_set_exhausted: bool,
+    pub schedule_due: bool,
+    pub stuck_duration: u64,
+    pub recovery_attempts: u32,
+}
+
 /// Actions to take when consensus is stuck.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConsensusStuckAction {
@@ -493,10 +516,12 @@ pub(super) enum ConsensusStuckAction {
     AttemptRecovery,
     /// Trigger catchup after timeout.
     TriggerCatchup,
-    /// Hard reset: clear buffered state and let the normal catchup loop
-    /// re-evaluate on the next tick. Fires when archive_behind + recovery
-    /// exhausted + either tx_set bytes lost or wall-clock stall exceeded.
-    HardReset,
+    /// Hard reset: clear buffered state and spawn a catchup to the latest
+    /// archive checkpoint. Reachable from both `recently_caught_up` and
+    /// `not recently caught up` branches when archive_behind is true and
+    /// either recovery is exhausted, tx_sets are lost, or wall-clock
+    /// stall exceeds the threshold.
+    HardReset(HardResetReason),
 }
 
 /// Ordered, deduplicated queue of pending transaction hashes to advertise.
