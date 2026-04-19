@@ -69,9 +69,22 @@ pub struct LedgerResponse {
 }
 
 /// Response for the /health endpoint.
+///
+/// `reason` is present only when `status == "unhealthy"` and conveys
+/// *why* the node is unhealthy. Existing consumers that parse only
+/// `status` / `state` are unaffected — the field is omitted when
+/// `None` (see `#[serde(skip_serializing_if)]`).
+///
+/// Known values for `reason`:
+/// - `"not_synced"` — AppState is not Synced or Validating.
+/// - `"post_catchup_stalled"` — AppState is Synced/Validating but
+///   `consensus_stuck_state` has been populated for at least
+///   `HEALTH_STALL_SECS`; see issue #1822.
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     pub state: String,
     pub ledger_seq: u32,
     pub peer_count: usize,

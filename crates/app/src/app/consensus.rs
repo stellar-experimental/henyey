@@ -1039,6 +1039,19 @@ impl App {
         self.set_state(AppState::CatchingUp).await;
         self.herder.set_state(henyey_herder::HerderState::Syncing);
 
+        // Issue #1822: a catchup is now in flight; the consensus-stuck
+        // signal is stale. Clear it so `/health` reflects the active
+        // catchup truthfully rather than continuing to report
+        // `post_catchup_stalled`. If the catchup fails, the next
+        // `maybe_start_buffered_catchup` tick re-detects the stall and
+        // repopulates — that is correct behavior (a failed catchup
+        // counts as forward progress in the state machine's decision
+        // table).
+        {
+            let mut guard = self.consensus_stuck_state.write().await;
+            *guard = None;
+        }
+
         // Start catchup message caching (belt-and-suspenders for tx_set ordering)
         self.set_phase_sub(super::phase::PHASE_13_12_SPAWN_CATCHUP_MSG_CACHE);
         let message_cache_handle = self.start_catchup_message_caching_from_self().await;

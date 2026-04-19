@@ -107,14 +107,40 @@ pub(crate) async fn status_handler(State(state): State<Arc<ServerState>>) -> Jso
     })
 }
 
-pub(crate) async fn health_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
+pub(crate) async fn health_handler(
+    State(state): State<Arc<ServerState>>,
+) -> (StatusCode, Json<HealthResponse>) {
     let app_state = state.app.state().await;
-    let is_healthy = matches!(app_state, AppState::Synced | AppState::Validating);
     let ledger_seq = state.app.ledger_info().ledger_seq;
     let peer_count = state.app.peer_snapshots().await.len();
 
+    // Issue #1822: the AppState gate alone cannot detect the post-
+    // catchup livelock — the node keeps reporting Validating while
+    // ledgers stop advancing. Consult `consensus_stuck_state` for a
+    // direct signal.
+    let stall_elapsed = state
+        .app
+        .consensus_stuck_state_read()
+        .await
+        .map(|s| s.stuck_start.elapsed().as_secs());
+
+    let state_healthy = matches!(app_state, AppState::Synced | AppState::Validating);
+    let stalled = stall_elapsed
+        .map(|e| e >= crate::app::HEALTH_STALL_SECS)
+        .unwrap_or(false);
+    let is_healthy = state_healthy && !stalled;
+
+    let reason = if !state_healthy {
+        Some("not_synced".to_string())
+    } else if stalled {
+        Some("post_catchup_stalled".to_string())
+    } else {
+        None
+    };
+
     let response = HealthResponse {
         status: if is_healthy { "healthy" } else { "unhealthy" }.to_string(),
+        reason,
         state: format!("{}", app_state),
         ledger_seq,
         peer_count,
@@ -265,5 +291,163 @@ pub(crate) async fn dumpproposedsettings_handler(
                 "error": "configUpgradeSet is missing or invalid"
             })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Issue #1822 coverage for the `/health` handler: the endpoint must
+    //! report `unhealthy` + `reason = "post_catchup_stalled"` when
+    //! `consensus_stuck_state.stuck_start` is older than
+    //! `HEALTH_STALL_SECS`, and must omit the `reason` field from the
+    //! serialized JSON when the node is healthy (backward compat).
+
+    use super::*;
+    // ConsensusStuckState is re-exported from the app module root for
+    // use by cross-module tests; see `crate::app::types`.
+    use crate::app::ConsensusStuckState;
+    use crate::app::{App, AppState};
+    use crate::config::ConfigBuilder;
+    use crate::http::types::HealthResponse;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    async fn make_app() -> Arc<App> {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = ConfigBuilder::new().database_path(db_path).build();
+        // Leak the tempdir for the duration of the test (App holds file
+        // locks referencing it).
+        std::mem::forget(dir);
+        Arc::new(App::new(config).await.unwrap())
+    }
+
+    fn server_state(app: Arc<App>) -> Arc<ServerState> {
+        Arc::new(ServerState {
+            app,
+            start_time: Instant::now(),
+            started_on: "test".to_string(),
+            log_handle: None,
+            #[cfg(feature = "loadgen")]
+            loadgen_state: None,
+        })
+    }
+
+    /// Call the handler directly and unpack the `(StatusCode, Json<_>)` tuple.
+    async fn call_health(state: Arc<ServerState>) -> (u16, HealthResponse) {
+        let (status, Json(body)) = health_handler(axum::extract::State(state)).await;
+        (status.as_u16(), body)
+    }
+
+    #[tokio::test]
+    async fn test_health_healthy_when_synced_and_no_stall() {
+        let app = make_app().await;
+        app.set_state(AppState::Synced).await;
+        let state = server_state(app);
+        let (code, body) = call_health(state).await;
+        assert_eq!(code, 200);
+        assert_eq!(body.status, "healthy");
+        assert!(body.reason.is_none(), "reason must be omitted when healthy");
+    }
+
+    #[tokio::test]
+    async fn test_health_unhealthy_not_synced_when_catching_up() {
+        let app = make_app().await;
+        app.set_state(AppState::CatchingUp).await;
+        // Even with a stale stuck state, CatchingUp should report
+        // "not_synced" (the AppState gate wins).
+        let now = app.clock_for_test().now();
+        app.seed_consensus_stuck_state_for_test(Some(ConsensusStuckState {
+            current_ledger: 42,
+            first_buffered: 44,
+            stuck_start: now - std::time::Duration::from_secs(crate::app::HEALTH_STALL_SECS + 10),
+            last_recovery_attempt: now,
+            recovery_attempts: 5,
+            catchup_triggered: false,
+        }))
+        .await;
+        let state = server_state(app);
+        let (code, body) = call_health(state).await;
+        assert_eq!(code, 503);
+        assert_eq!(body.reason.as_deref(), Some("not_synced"));
+    }
+
+    #[tokio::test]
+    async fn test_health_unhealthy_post_catchup_stalled() {
+        let app = make_app().await;
+        app.set_state(AppState::Validating).await;
+        let now = app.clock_for_test().now();
+        app.seed_consensus_stuck_state_for_test(Some(ConsensusStuckState {
+            current_ledger: 62187968,
+            first_buffered: 62187971,
+            stuck_start: now - std::time::Duration::from_secs(crate::app::HEALTH_STALL_SECS + 10),
+            last_recovery_attempt: now,
+            recovery_attempts: 12,
+            catchup_triggered: false,
+        }))
+        .await;
+        let state = server_state(app);
+        let (code, body) = call_health(state).await;
+        assert_eq!(code, 503);
+        assert_eq!(body.reason.as_deref(), Some("post_catchup_stalled"));
+    }
+
+    #[tokio::test]
+    async fn test_health_healthy_when_stall_below_threshold() {
+        let app = make_app().await;
+        app.set_state(AppState::Validating).await;
+        let now = app.clock_for_test().now();
+        // Stall just started — under the threshold.
+        app.seed_consensus_stuck_state_for_test(Some(ConsensusStuckState {
+            current_ledger: 10,
+            first_buffered: 12,
+            stuck_start: now,
+            last_recovery_attempt: now,
+            recovery_attempts: 1,
+            catchup_triggered: false,
+        }))
+        .await;
+        let state = server_state(app);
+        let (code, body) = call_health(state).await;
+        assert_eq!(code, 200);
+        assert_eq!(body.status, "healthy");
+        assert!(body.reason.is_none());
+    }
+
+    #[test]
+    fn test_health_response_reason_omitted_when_healthy() {
+        // Serialize a `HealthResponse { reason: None, .. }` and verify
+        // the JSON does not contain the `reason` key (backward compat
+        // with pre-1822 consumers).
+        let resp = HealthResponse {
+            status: "healthy".to_string(),
+            reason: None,
+            state: "Synced".to_string(),
+            ledger_seq: 100,
+            peer_count: 5,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("reason"),
+            "reason must be omitted from JSON when healthy"
+        );
+        // Four keys: status, state, ledger_seq, peer_count.
+        assert_eq!(json.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_health_response_reason_present_when_unhealthy() {
+        let resp = HealthResponse {
+            status: "unhealthy".to_string(),
+            reason: Some("post_catchup_stalled".to_string()),
+            state: "Validating".to_string(),
+            ledger_seq: 100,
+            peer_count: 5,
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json.get("reason").and_then(|v| v.as_str()),
+            Some("post_catchup_stalled")
+        );
     }
 }

@@ -202,6 +202,28 @@ const POST_CATCHUP_RECOVERY_WINDOW_SECS: u64 = 300;
 /// recovery will never succeed. 3 attempts × 10s interval = 30s before fallback.
 const MAX_POST_CATCHUP_RECOVERY_ATTEMPTS: u32 = 3;
 
+/// Wall-clock gate for HardReset in the post-catchup recovery state machine
+/// (see `decide_post_catchup_action`). Fires when the stall has persisted this
+/// long even without `tx_set_all_peers_exhausted` flipping — covers the
+/// "envelopes never arrived" sub-failure of issue #1822 where the missing
+/// slots' externalize envelopes were dropped in the overlay cache window and
+/// cannot be re-requested by hash.
+///
+/// 120 s = 12 ticks of `OUT_OF_SYNC_RECOVERY_TIMER_SECS`.
+const HARD_RESET_STALL_SECS: u64 = 120;
+
+/// Minimum interval between hard resets. One checkpoint cycle; after this,
+/// if the stall persists, the node hard-resets again and operators get
+/// another WARN in the log trail. Prevents oscillation when the network
+/// itself is the problem, not just our local state.
+const HARD_RESET_COOLDOWN_SECS: u64 = 300;
+
+/// `/health` returns `unhealthy` (503) when `consensus_stuck_state` has
+/// been populated for at least this long. Strictly less than
+/// `HARD_RESET_STALL_SECS` so operators see the stall *before* the node
+/// tries to self-heal.
+pub(crate) const HEALTH_STALL_SECS: u64 = 60;
+
 mod archive_cache;
 mod bootstrap;
 mod catchup_impl;
@@ -227,6 +249,10 @@ pub use types::{
     OverlayFetchChannelMetrics, ScpSlotSnapshot, ScpVerifyMetrics, SelfCheckResult,
     SimulationDebugStats, SurveyPeerReport, SurveyReport,
 };
+// Re-exported for cross-module tests (e.g. `/health` handler tests in
+// `http::handlers::info`) that need to seed stuck-state scenarios.
+// Issue #1822.
+pub(crate) use types::ConsensusStuckState;
 
 /// The main application struct coordinating all Stellar Core subsystems.
 ///
@@ -413,6 +439,23 @@ pub struct App {
     nomination_timeout_fires: AtomicU64,
     /// Number of ballot timeout firings.
     ballot_timeout_fires: AtomicU64,
+    /// Monotonic reference used by `last_hard_reset_offset` to stay
+    /// clock-skew-safe (SystemTime can jump; `Instant` cannot).
+    ///
+    /// Initialized once at `App::new`. Never updated.
+    start_instant: Instant,
+    /// Seconds into `start_instant` at which the last post-catchup
+    /// hard reset fired, or 0 if none has fired. Used to enforce
+    /// `HARD_RESET_COOLDOWN_SECS`.
+    last_hard_reset_offset: AtomicU64,
+    /// Total number of post-catchup hard resets over the lifetime of
+    /// this process. Incremented by `force_post_catchup_hard_reset`.
+    post_catchup_hard_reset_total: AtomicU64,
+    /// Per-node static jitter seed, derived from the first 8 bytes of
+    /// the node public key. Mixed into the `schedule_due` calculation
+    /// in the post-catchup recovery state machine so that a fleet of
+    /// nodes hitting the same livelock does not hard-reset in lockstep.
+    jitter_seed: u64,
     /// Time when we last observed an externalized slot.
     last_externalized_at: RwLock<Instant>,
     /// Last time we requested SCP state due to stalled externalization.
@@ -759,6 +802,8 @@ impl App {
             tracing::info!("Envelope sender configured for validator mode");
         }
 
+        let jitter_seed = Self::derive_jitter_seed(&keypair);
+
         Ok(Self {
             is_validator,
             config,
@@ -806,6 +851,10 @@ impl App {
             consensus_trigger_failures: AtomicU64::new(0),
             nomination_timeout_fires: AtomicU64::new(0),
             ballot_timeout_fires: AtomicU64::new(0),
+            start_instant: Instant::now(),
+            last_hard_reset_offset: AtomicU64::new(0),
+            post_catchup_hard_reset_total: AtomicU64::new(0),
+            jitter_seed,
             last_externalized_at: RwLock::new(now),
             last_scp_state_request_at: RwLock::new(now),
             survey_data: RwLock::new(SurveyDataManager::new(
@@ -952,6 +1001,26 @@ impl App {
             anyhow::anyhow!("database is locked (lockfile: {})", lock_path.display())
         })?;
         Ok(file)
+    }
+
+    /// Derive a per-node static jitter seed from the node public key.
+    ///
+    /// Used by the post-catchup recovery state machine to stagger
+    /// recovery-tick schedules across a fleet: if every validator were to
+    /// enter the livelock described in issue #1822 at the same wall-clock
+    /// moment, synchronized hard resets across the fleet would create a
+    /// herd of catchup attempts against the same archive. Mixing in a
+    /// per-node static jitter avoids this without any runtime RNG.
+    ///
+    /// The seed is the little-endian interpretation of the first 8 bytes
+    /// of the Ed25519 public key — deterministic for a given node, and
+    /// essentially collision-free across distinct validators.
+    fn derive_jitter_seed(keypair: &henyey_crypto::SecretKey) -> u64 {
+        let pk = keypair.public_key();
+        let bytes = pk.as_bytes();
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[0..8]);
+        u64::from_le_bytes(buf)
     }
 
     /// Initialize the node keypair.
@@ -1121,6 +1190,70 @@ impl App {
         self.tx_set_dont_have.write().await.clear();
         self.tx_set_last_request.write().await.clear();
         self.tx_set_exhausted_warned.write().await.clear();
+    }
+
+    /// Read a clone of `consensus_stuck_state` under the read lock.
+    ///
+    /// Used by the `/health` handler to report `post_catchup_stalled`
+    /// when the node has been sitting in the consensus-stuck state
+    /// machine without ledger progress for longer than
+    /// `HEALTH_STALL_SECS`.
+    ///
+    /// Kept as a single-call accessor so the `consensus_stuck_state`
+    /// lock does not need to be exposed to sibling crates. The
+    /// cloned payload is tiny (`ConsensusStuckState: ~48 B`).
+    pub(crate) async fn consensus_stuck_state_read(&self) -> Option<ConsensusStuckState> {
+        self.consensus_stuck_state.read().await.clone()
+    }
+
+    /// Cumulative count of post-catchup hard resets (issue #1822).
+    ///
+    /// Exposed via the internal info/metrics plumbing so operators can
+    /// correlate a rising count with `/health` stall alerts.
+    #[allow(dead_code)] // reserved for /metrics exposure — see follow-up in #1822
+    pub(crate) fn post_catchup_hard_reset_total(&self) -> u64 {
+        self.post_catchup_hard_reset_total.load(Ordering::Relaxed)
+    }
+
+    /// Per-node static jitter seed. See [`App::derive_jitter_seed`].
+    pub(crate) fn jitter_seed(&self) -> u64 {
+        self.jitter_seed
+    }
+
+    /// Seconds elapsed since `start_instant`. Used as a monotonic
+    /// wall-clock-equivalent for bookkeeping that must survive NTP
+    /// steps (e.g. `last_hard_reset_offset`).
+    pub(crate) fn start_instant_elapsed_secs(&self) -> u64 {
+        self.start_instant.elapsed().as_secs()
+    }
+
+    /// Handle on the `last_hard_reset_offset` counter (issue #1822).
+    pub(crate) fn last_hard_reset_offset(&self) -> &AtomicU64 {
+        &self.last_hard_reset_offset
+    }
+
+    /// Handle on the `post_catchup_hard_reset_total` counter (issue #1822).
+    pub(crate) fn post_catchup_hard_reset_total_counter(&self) -> &AtomicU64 {
+        &self.post_catchup_hard_reset_total
+    }
+
+    /// Test helper: seed `consensus_stuck_state` directly. Cross-module
+    /// tests (e.g. the `/health` handler tests in `http::handlers::info`)
+    /// use this to exercise the `/health` stall-reporting logic without
+    /// replaying the full consensus state machine.
+    #[cfg(test)]
+    pub(crate) async fn seed_consensus_stuck_state_for_test(
+        &self,
+        state: Option<ConsensusStuckState>,
+    ) {
+        *self.consensus_stuck_state.write().await = state;
+    }
+
+    /// Test helper: read-only clock handle. See
+    /// `seed_consensus_stuck_state_for_test` for usage rationale.
+    #[cfg(test)]
+    pub(crate) fn clock_for_test(&self) -> &dyn Clock {
+        self.clock.as_ref()
     }
 
     /// Persist in-memory hot archive buckets to disk.
@@ -2544,11 +2677,15 @@ mod tests {
 
     #[test]
     fn test_consensus_stuck_action_variants() {
-        // Verify all action variants exist and can be matched
+        // Verify all action variants exist and can be matched.
+        // `HardReset` was added in #1822 for the post-catchup livelock
+        // exit path; its behavior is tested in
+        // `catchup_impl::tests::test_decide_post_catchup_action_hard_reset_*`.
         let actions = [
             ConsensusStuckAction::Wait,
             ConsensusStuckAction::AttemptRecovery,
             ConsensusStuckAction::TriggerCatchup,
+            ConsensusStuckAction::HardReset,
         ];
 
         for action in actions {
@@ -2556,6 +2693,7 @@ mod tests {
                 ConsensusStuckAction::Wait => {}
                 ConsensusStuckAction::AttemptRecovery => {}
                 ConsensusStuckAction::TriggerCatchup => {}
+                ConsensusStuckAction::HardReset => {}
             }
         }
     }

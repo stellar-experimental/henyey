@@ -467,7 +467,7 @@ pub(super) struct TxSetRequestState {
 /// State for tracking consensus stuck condition.
 /// Matches stellar-core's out-of-sync recovery behavior.
 #[derive(Debug, Clone)]
-pub(super) struct ConsensusStuckState {
+pub(crate) struct ConsensusStuckState {
     /// Current ledger when stuck was detected.
     pub current_ledger: u32,
     /// First buffered ledger when stuck was detected.
@@ -485,6 +485,16 @@ pub(super) struct ConsensusStuckState {
 }
 
 /// Actions to take when consensus is stuck.
+///
+/// `HardReset` is a Henyey-specific safety valve introduced in issue
+/// #1822: when post-catchup recovery is stuck in the
+/// `archive_behind + recovery_exhausted` corner AND either
+/// `tx_set_all_peers_exhausted` has flipped or the stall has exceeded
+/// `HARD_RESET_STALL_SECS`, we drop self-reinforcing state (evict leading
+/// no-tx_set buffered entries, clear pending tx-sets and
+/// `archive_behind_until`) and let the normal catchup loop re-evaluate
+/// on the next tick. Stellar-core has no equivalent — because
+/// stellar-core has no post-catchup recovery window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ConsensusStuckAction {
     /// Wait for tx set to arrive.
@@ -493,6 +503,9 @@ pub(super) enum ConsensusStuckAction {
     AttemptRecovery,
     /// Trigger catchup after timeout.
     TriggerCatchup,
+    /// Force the state machine out of the post-catchup livelock by
+    /// clearing self-reinforcing state (see `force_post_catchup_hard_reset`).
+    HardReset,
 }
 
 /// Ordered, deduplicated queue of pending transaction hashes to advertise.
