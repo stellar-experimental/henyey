@@ -1937,9 +1937,9 @@ impl Herder {
         ) = {
             let guard = self.ledger_manager.read();
             if let Some(manager) = guard.as_ref() {
-                let hdr = manager.current_header();
-                let lcl_ct = hdr.scp_value.close_time.0;
-                let max = hdr.max_tx_set_size as usize;
+                let snap = manager.header_snapshot();
+                let lcl_ct = snap.header.scp_value.close_time.0;
+                let max = snap.header.max_tx_set_size as usize;
                 let soroban_max = manager
                     .soroban_network_info()
                     .map(|info| info.ledger_max_tx_count);
@@ -1947,7 +1947,7 @@ impl Herder {
                 // Build one snapshot for both seq-map and validation providers.
                 let providers = match manager.create_snapshot() {
                     Ok(snapshot) => {
-                        let ledger_seq = manager.current_ledger_seq();
+                        let ledger_seq = snap.header.ledger_seq;
                         let seq = self.build_starting_seq_map(&snapshot, ledger_seq);
                         let sp = crate::tx_queue::SnapshotProviders::new(snapshot);
                         Some((seq, sp))
@@ -1967,15 +1967,7 @@ impl Herder {
                     None => (None, None),
                 };
 
-                (
-                    manager.current_header_hash(),
-                    max,
-                    seq,
-                    hdr,
-                    lcl_ct,
-                    soroban_max,
-                    sp,
-                )
+                (snap.hash, max, seq, snap.header, lcl_ct, soroban_max, sp)
             } else {
                 (
                     Hash256::ZERO,

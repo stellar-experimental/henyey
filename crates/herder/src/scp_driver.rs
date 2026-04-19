@@ -825,37 +825,45 @@ impl ScpDriver {
     ) -> ValueValidation {
         let close_time = stellar_value.close_time.0;
 
-        // Get LCL data from ledger manager
-        let (lcl_seq, lcl_close_time) = if let Some(lm) = self.ledger_manager.get() {
-            let header = lm.current_header();
-            (header.ledger_seq as u64, header.scp_value.close_time.0)
-        } else {
-            // No ledger manager available — fall back to externalized data
-            if let Some(latest) =
-                *tracked_read(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized)
-            {
-                if let Some(externalized) =
-                    tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).get(&latest)
-                {
-                    (externalized.slot, externalized.close_time)
-                } else {
-                    (0, 0)
-                }
+        // Get LCL data from ledger manager.
+        // Use header_snapshot() to atomically capture both header fields and
+        // hash, avoiding a race with commit_close() between the reads.
+        let (lcl_seq, lcl_close_time, lcl_hash_from_snapshot) =
+            if let Some(lm) = self.ledger_manager.get() {
+                let snap = lm.header_snapshot();
+                (
+                    snap.header.ledger_seq as u64,
+                    snap.header.scp_value.close_time.0,
+                    Some(snap.hash),
+                )
             } else {
-                let ts = tracked_read(LOCK_TRACKING_STATE, &self.tracking_state);
-                if ts.is_tracking {
-                    // When tracking but no ledger manager or externalized data (e.g., after
-                    // bootstrap), derive the LCL from the tracking consensus index.
-                    // consensus_index is the next slot to close, so LCL = index - 1.
-                    (
-                        ts.consensus_index.saturating_sub(1),
-                        ts.consensus_close_time,
-                    )
+                // No ledger manager available — fall back to externalized data
+                if let Some(latest) =
+                    *tracked_read(LOCK_SCP_LATEST_EXTERNALIZED, &self.latest_externalized)
+                {
+                    if let Some(externalized) =
+                        tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).get(&latest)
+                    {
+                        (externalized.slot, externalized.close_time, None)
+                    } else {
+                        (0, 0, None)
+                    }
                 } else {
-                    (0, 0)
+                    let ts = tracked_read(LOCK_TRACKING_STATE, &self.tracking_state);
+                    if ts.is_tracking {
+                        // When tracking but no ledger manager or externalized data (e.g., after
+                        // bootstrap), derive the LCL from the tracking consensus index.
+                        // consensus_index is the next slot to close, so LCL = index - 1.
+                        (
+                            ts.consensus_index.saturating_sub(1),
+                            ts.consensus_close_time,
+                            None,
+                        )
+                    } else {
+                        (0, 0, None)
+                    }
                 }
-            }
-        };
+            };
 
         let is_current_ledger = slot_index == lcl_seq + 1;
 
@@ -911,9 +919,9 @@ impl ScpDriver {
                     return ValueValidation::Invalid;
                 }
 
-                // Parity: check previousLedgerHash matches the LCL hash
-                let lcl_hash = if let Some(lm) = self.ledger_manager.get() {
-                    let hash = lm.current_header_hash();
+                // Parity: check previousLedgerHash matches the LCL hash.
+                // Uses the hash captured atomically with seq/close_time above.
+                if let Some(hash) = lcl_hash_from_snapshot {
                     if tx_set.previous_ledger_hash != hash {
                         debug!(
                             "Tx set previousLedgerHash mismatch: expected {}, got {}",
@@ -921,10 +929,8 @@ impl ScpDriver {
                         );
                         return ValueValidation::Invalid;
                     }
-                    Some(hash)
-                } else {
-                    None
-                };
+                }
+                let lcl_hash = lcl_hash_from_snapshot;
 
                 // Parity: validate tx set is well-formed (sorted, no duplicates)
                 // For generalized tx sets, per-component sort order is validated
@@ -1062,13 +1068,14 @@ impl ScpDriver {
         // Also validates each upgrade via isValid (apply + nomination)
         // stellar-core: extractValidValue calls isValid with nomination=true
         let lm_ref = self.ledger_manager.get().map(|lm| lm.as_ref());
-        let current_version = lm_ref
-            .map(|lm| lm.current_header().ledger_version)
-            .unwrap_or(0);
+        // Read header once to avoid split reads between ledger_version and close_time.
+        let lcl_header = lm_ref.map(|lm| lm.current_header());
+        let current_version = lcl_header.as_ref().map(|h| h.ledger_version).unwrap_or(0);
         // Use LCL close time (not candidate close_time) for upgrade validity
         // to prevent one-ledger-early activation (#1166).
-        let lcl_close_time = lm_ref
-            .map(|lm| lm.current_header().scp_value.close_time.0)
+        let lcl_close_time = lcl_header
+            .as_ref()
+            .map(|h| h.scp_value.close_time.0)
             .unwrap_or(0);
         let mut valid_upgrades = Vec::new();
         let mut last_upgrade_type = None;
@@ -1121,10 +1128,12 @@ impl ScpDriver {
             Some(lm) => lm,
             None => return true, // No ledger manager — can't validate
         };
-        let current_version = lm_ref.current_header().ledger_version;
+        // Read header once to avoid split reads between ledger_version and close_time.
+        let lcl_header = lm_ref.current_header();
+        let current_version = lcl_header.ledger_version;
 
         // Use LCL close time for upgrade validity, not candidate close_time (#1166).
-        let lcl_close_time = lm_ref.current_header().scp_value.close_time.0;
+        let lcl_close_time = lcl_header.scp_value.close_time.0;
 
         for upgrade_bytes in stellar_value.upgrades.iter() {
             let upgrade = match LedgerUpgrade::from_xdr(

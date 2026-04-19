@@ -1,10 +1,9 @@
 //! Ledger replay logic for catchup: re-executing transactions via close_ledger.
 
 use crate::{verify, HistoryError, Result};
-use henyey_common::Hash256;
 use std::sync::Arc;
 
-use henyey_ledger::{LedgerCloseData, LedgerManager};
+use henyey_ledger::{HeaderSnapshot, LedgerCloseData, LedgerManager};
 use stellar_xdr::curr::{LedgerHeader, LedgerUpgrade, Limits, ReadXdr, WriteXdr};
 use tracing::{debug, info, warn};
 
@@ -111,7 +110,7 @@ impl CatchupManager {
         &mut self,
         target: u32,
         ledger_manager: &LedgerManager,
-    ) -> Result<(LedgerHeader, Hash256, u32)> {
+    ) -> Result<(HeaderSnapshot, u32)> {
         let mut last_error: Option<HistoryError> = None;
 
         for attempt in 0..=REPLAY_RETRY_COUNT {
@@ -129,15 +128,15 @@ impl CatchupManager {
             }
 
             // Recalculate replay start from current LCL (matching resetIter()).
-            let current_lcl = ledger_manager.current_header().ledger_seq;
+            // Use a single atomic snapshot to avoid split reads.
+            let snap = ledger_manager.header_snapshot();
+            let current_lcl = snap.header.ledger_seq;
             let replay_first = current_lcl + 1;
 
             if replay_first > target {
                 // Already past target — previous partial replay succeeded fully.
-                let final_header = ledger_manager.current_header();
-                let final_hash = ledger_manager.current_header_hash();
                 let ledgers_applied = target.saturating_sub(current_lcl);
-                return Ok((final_header, final_hash, ledgers_applied));
+                return Ok((snap, ledgers_applied));
             }
 
             // Download from the checkpoint containing replay_first - 1 (the LCL).
@@ -175,7 +174,7 @@ impl CatchupManager {
         download_from: u32,
         target: u32,
         ledger_manager: &LedgerManager,
-    ) -> Result<(LedgerHeader, Hash256, u32)> {
+    ) -> Result<(HeaderSnapshot, u32)> {
         use henyey_common::NetworkId;
 
         // Download ledger data for replay
@@ -203,11 +202,10 @@ impl CatchupManager {
         let network_id = NetworkId(ledger_manager.network_id().0);
         self.persist_ledger_history(&ledger_data, &network_id)?;
 
-        let final_header = ledger_manager.current_header();
-        let final_hash = ledger_manager.current_header_hash();
-        let ledgers_applied = final_header.ledger_seq.saturating_sub(download_from);
+        let snap = ledger_manager.header_snapshot();
+        let ledgers_applied = snap.header.ledger_seq.saturating_sub(download_from);
 
-        Ok((final_header, final_hash, ledgers_applied))
+        Ok((snap, ledgers_applied))
     }
 
     /// Replay ledgers by calling `LedgerManager::close_ledger()` for each one.

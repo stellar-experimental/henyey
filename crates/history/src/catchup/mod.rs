@@ -466,10 +466,10 @@ impl CatchupManager {
 
             (checkpoint_header.ledger_seq, checkpoint_hash, 0)
         } else {
-            let (header, hash, applied) = self
+            let (snap, applied) = self
                 .download_verify_and_replay_with_retry(target, ledger_manager)
                 .await?;
-            (header.ledger_seq, hash, applied)
+            (snap.header.ledger_seq, snap.hash, applied)
         };
 
         self.update_progress(CatchupStatus::Completed, 7, "Catchup completed");
