@@ -10,9 +10,11 @@ Parse `$ARGUMENTS`:
 # Monitor Loop
 
 Run a henyey mainnet node and monitor it for errors. When bugs are found,
-investigate to root cause, file GitHub issues, and delegate fixes to spawned
-agents. All henyey issues are in scope: node bugs, CI failures, testnet
-parity bugs, performance regressions, infrastructure issues.
+investigate to root cause and file (or comment on) a GitHub issue labeled
+`ready`. A separate downstream process picks up `ready`-labeled issues
+and commits the fix — the monitor never edits code. All henyey issues
+are in scope: node bugs, CI failures, testnet parity bugs, performance
+regressions, infrastructure issues.
 
 **Mainnet operation is explicitly authorized** — this overrides the
 testnet-only guideline in CLAUDE.md.
@@ -23,48 +25,51 @@ testnet-only guideline in CLAUDE.md.
 > Template so that the cron context (which runs without this skill file) has
 > the same rules. Any change here must be mirrored there.
 
-- **NEVER revert commits made by other developers.** If a deployed commit
-  causes a regression (deadlock, crash, sync failure), file a GitHub issue
-  with the details and restart the node on a known-good binary. Do not
-  force-push, revert, or reset commits you didn't author.
-- **CI fixes for others' commits**: Fix compilation errors or clippy
-  issues caused by incomplete refactors, but do NOT revert the original
-  commits. Push a fix-forward commit instead.
-- **Your own commits**: You may revert your own commits if they cause
-  regressions.
+- **The monitor does NOT commit code.** All fixes — node bugs and CI
+  failures — are delegated via `gh issue create --label ready` (or a
+  comment on an existing issue). A separate downstream process picks up
+  `ready`-labeled issues and commits the fix.
+- If a deployed commit causes a regression, file/comment a `ready`-labeled
+  issue and restart the node on the last known-good binary while waiting
+  for the fix.
 
 ## Fix-Routing Policy
 
-Two classes of fix exist in this skill; treat them differently.
+**All fixes — both CI failures and node bugs — are delegated via
+`gh issue` with the `ready` label.** The monitor never implements a
+fix inline. A separate downstream process watches for `ready`-labeled
+issues and drives them to completion.
 
-- **CI fixes — inline, in the monitoring process.** CI failures block deploy
-  and are usually small (typo, clippy, trivial refactor fallout, workflow
-  YAML). Read logs, fix the code in the main checkout, commit, push. The
-  monitoring loop is allowed to do this work directly. This is the one
-  exception to "do not implement fixes inline."
-- **Node bugs — delegated to a spawned Agent that runs `/plan-do-review`
-  on the filed issue.** Hash mismatches, crashes, consensus/sync failures,
-  pruning defects, memory leaks. The monitor's job ends at filing the
-  issue; a spawned Agent takes over and runs the `/plan-do-review <N>`
-  skill, which handles adversarial proposal critique, implementation,
-  review-fix iteration, and landing the change. The monitor does **not**
-  run a separate worktree-Agent, review the diff, or cherry-pick — all
-  of that lives inside `/plan-do-review`. The next redeploy tick rebuilds
-  and restarts the node whenever `/plan-do-review` has landed its fix on
-  main.
+- **CI failures** (build errors, test failures, clippy, workflow YAML,
+  flaky tests, timeouts): investigate to root cause, then file a GH
+  issue with `--label ready`.
+- **Node bugs** (hash mismatches, crashes, consensus/sync failures,
+  pruning defects, memory leaks): investigate to root cause, then file
+  a GH issue with `--label ready`.
 
-If you are unsure whether to delegate at all, err toward filing an issue
-and spawning the `/plan-do-review` Agent.
+In both cases:
+
+1. **Before filing, always check for an existing open issue.** Use
+   `gh issue list --search "<symptom or signature>" --state open` (or
+   `--state all` when relevant) and skim the results. If one already
+   covers the same symptom/subsystem, **comment** on it with the new
+   evidence instead of filing a duplicate. Only file a new issue when
+   the existing one is stale/closed, or when the evidence points at a
+   different root cause (see Recurrence Policy below).
+2. The monitor does **not** spawn agents, open worktrees, review diffs,
+   or cherry-pick. The downstream pickup process handles all of that.
+3. The next redeploy tick rebuilds and restarts the node whenever a
+   fix has landed on main.
+
+If you are unsure whether to file at all, err toward filing (or
+commenting on an existing issue).
 
 Because the monitor is a single-investigator process (only one
 `/monitor-loop` holds the concurrency lock at a time — see Startup step
 1), the investigation phase itself — reading source files, grepping for
-symbols, running `git log`, reading the running node's log — can
-happen directly in the main checkout. The "isolate edits" concern only
-applies to *writing* code: investigation is read-only, and pretending
-otherwise adds ceremony without safety. The moment the work turns into
-code edits, it MUST go through `/plan-do-review` (or the CI-fix inline
-path); never edit the main checkout to fix a node bug.
+symbols, running `git log`, reading the running node's log — happens
+directly in the main checkout. Investigation is read-only; the monitor
+never edits the main checkout.
 
 ## Configurations
 
@@ -105,12 +110,13 @@ doesn't change when it should — you MUST investigate. Specifically:
   is correct, document *why* — citing the specific code path, not just
   a guess.
 - **File issues.** If investigation reveals a bug, file a GitHub issue
-  with the root cause and proposed fix. If it reveals a missing feature
-  or config issue, file it with the code-level explanation. Spawn an
-  agent to implement the fix if appropriate.
+  with `--label ready`, root cause, and a proposed fix. If it reveals a
+  missing feature or config issue, file it with the code-level
+  explanation. Do NOT spawn agents; the downstream pickup process
+  handles the fix.
 - **File everything.** Every anomaly that isn't immediately explained
-  by reading the code should result in a GitHub issue. Even if you
-  can't fix it now, the issue documents the finding for future work.
+  by reading the code should result in a GitHub issue (or comment on an
+  existing one — always search first).
 - **Sync deadline is 15 minutes — with a fresh-start carveout.** A mainnet
   validator with an existing, populated data directory must complete catchup
   and begin closing ledgers in real-time within 15 minutes of startup. If the
@@ -123,103 +129,85 @@ doesn't change when it should — you MUST investigate. Specifically:
   status by checking for the DB file at each tick.
   In the non-fresh case: do not report the 15m breach as a WARNING and wait.
   Investigate the catchup path, the buffered-catchup code, and the checkpoint
-  download logic to find and fix the root cause.
+  download logic, then route through the Bug / CI-Failure Filing Workflow.
 
-## Bug Investigation Workflow
+## Bug / CI-Failure Filing Workflow
 
-When a bug is detected (hash mismatch, error, crash, sync failure):
+Use this workflow for both node bugs and CI failures — they route
+identically now (file a `ready`-labeled GH issue; no inline fix).
 
 1. **Investigate to root cause directly in the main checkout** — read
    source code, check logs, trace code paths, grep, `git log`, read the
    running node's log file. No worktree needed: only one monitor-loop
    runs at a time (concurrency lock) and investigation is read-only.
    Document findings with file:line references.
-2. **File a GitHub issue** with the investigation findings, root cause
-   analysis, and proposed fix approach using `gh issue create`. Capture
-   the issue number `N` returned by `gh`. Write the issue body as a
-   proposal `/plan-do-review` can consume: clear symptom, evidence,
-   suspected root cause, and a concrete fix sketch with file:line
-   references.
-3. **Spawn an Agent that runs `/plan-do-review <N>`** on the filed issue.
-   `/plan-do-review` handles everything downstream — adversarial
-   proposal critique, implementation (in its own isolated workspace),
-   iterative review-fix, and landing the change. The monitor's
-   responsibility ends here: no worktree management, no cherry-pick,
-   no diff review, no merge decision. Those all live inside
-   `/plan-do-review`.
-4. **Do NOT edit the main checkout to fix a node bug.** Investigation
-   reads in the main checkout are fine; code edits for a node-bug fix
-   are not — those go through `/plan-do-review`. CI-only fixes (build
-   errors, test failures, clippy, workflow YAML) are exempt per the
-   Fix-Routing Policy.
+2. **Check for an existing open issue first.** Run
+   `gh issue list --search "<symptom keywords>" --state open` (and
+   optionally `--state all` to catch recently-closed/regressed ones).
+   Read the candidates. If one matches the same symptom/subsystem:
+   - **Comment on it** via `gh issue comment <N>` with the new evidence
+     (ledger number, timestamp, metric deltas, log snippet, etc.).
+   - Do NOT file a duplicate.
+   - If the existing issue is missing the `ready` label and the
+     evidence warrants action, add it:
+     `gh issue edit <N> --add-label ready`.
+3. **Otherwise, file a new issue** using
+   `gh issue create --label ready`. The issue body should be a
+   self-contained proposal (clear symptom, evidence, suspected root
+   cause, concrete fix sketch with file:line references) so the
+   downstream pickup process has everything it needs. Capture the issue
+   number `N` returned by `gh` for the status report.
+4. **Do NOT spawn an agent.** A separate process watches for
+   `ready`-labeled issues and drives them to a fix.
+5. **Do NOT edit the main checkout.** All fixes go through the
+   downstream pickup process — including CI failures.
 
-The next redeploy tick (check 10) will pick up whatever `/plan-do-review`
-lands on main — rebuild, kill, restart. The bug-fix progress itself is
-tracked on the issue and by `/plan-do-review`'s own reporting; the
-monitor does not block on it.
+The next redeploy tick (check 10) will pick up whatever lands on main —
+rebuild, kill, restart. The monitor does not block on the fix.
 
-### Recurrence + new evidence → file a fresh issue, spawn `/plan-do-review` on it
+### Recurrence: comment on existing issue by default, file new issue only when scope shifts
 
-When a previously-filed bug (open, already had one or more `/plan-do-review`
-runs) recurs, the monitor's default is **not** "wait and see"; it is
-"did the recurrence give us new evidence, and if so, file a fresh scoped
-issue and spawn `/plan-do-review <new-N>`". Act when any of the following
-is true versus the state at the last `/plan-do-review` run:
+When a previously-filed bug recurs, the default is **comment on the
+existing issue** with the new evidence. The mandatory existence check
+in the Bug / CI-Failure Filing Workflow (step 2) already enforces this:
+search first, comment if found.
 
-- The bug reproduces on a different commit or a different process,
-  strengthening the "this is deterministic, not a one-off" case.
-- New instrumentation output exists (log lines, stack dumps,
-  `/proc/wchan`, profile data, metric deltas) that the prior run
-  didn't have access to.
-- A negative finding rules out the prior run's root-cause hypothesis
-  (e.g. the prior proposal blamed compute backpressure but fresh
-  telemetry shows zero compute-side warnings).
-- The candidate site set has narrowed (specific locks, functions,
-  ledger numbers) in a way the prior proposal didn't cover.
+File a NEW `ready`-labeled issue ONLY when the recurrence's evidence
+points at a materially different scope than the existing issue —
+specifically:
 
-Do not wait for the user to ask "is there enough information now?" —
-the decision rule is "would the next `/plan-do-review` run have
-strictly more information than the last one?" If yes, act on it.
+- Different named subsystem (e.g. prior issue was about SCP envelope
+  emission; new evidence is about archive-publish backoff).
+- Different phase/mark in the timeline (e.g. prior was `phase=2
+  fetch_resp`; new is `tx_queue_background_wait_ms`).
+- Different root-cause hypothesis (e.g. prior blamed compute
+  backpressure; fresh telemetry rules that out and points at a lock).
+- Different candidate site set (specific functions/files).
 
-**Prefer filing a new issue over piling onto the existing one.** Long
-umbrella issues with many `/plan-do-review` iterations get hard to
-reason about: the original symptom, multiple retired hypotheses, the
-current hypothesis, and landed-fix comments all interleave. A fresh
-`/plan-do-review` Agent given an umbrella-issue number has to
-reconstruct which comments are still load-bearing before it can even
-start, and it often gets this wrong.
+In that case, include `Related to #<prior>` + a one-line scope-diff in
+the new issue body, and post a back-link comment on the prior issue so
+future readers can trace the lineage.
 
-Use this rule when a recurrence brings new evidence:
+**Comment on the existing issue** (do NOT file a duplicate) when the
+recurrence is:
 
-- **File a new scoped issue** whenever the new evidence points at a
-  different named subsystem, a different phase/mark, a different root-
-  cause hypothesis, or a different candidate site set than the prior
-  issue's current scope. Default toward "new issue" when in doubt —
-  splitting is cheap, merging is cheap, but re-scoping a monster issue
-  is expensive. In the new issue body:
-  - State the specific symptom and the evidence backing it (log
-    snippets, metric tables, phase breakdowns).
-  - Name the prior issue as `Related to #<prior>` and summarize the
-    one-line difference in scope (e.g. "#1759 tracked `phase=2
-    fetch_resp` freezes; this issue is scoped to the
-    `tx_queue_background_wait_ms` sub-phase that now dominates after
-    the #1759 fix chain landed").
-  - Write the body as a `/plan-do-review`-consumable proposal (symptom,
-    evidence, suspected root cause, fix sketch with file:line
-    references).
-  - Post a brief back-link comment on the prior issue pointing at the
-    new one so future readers can trace the lineage.
-- **Only append as a comment on the existing issue** when the
-  recurrence is genuinely the same bug at the same site with purely
-  additive incremental data (e.g. "reproduces at L61340500 too with
-  the same stack signature"), AND the existing `/plan-do-review` run
-  hasn't converged yet. This should be the narrower path.
+- Same symptom at the same site with additive incremental data (e.g.
+  "reproduces at L61340500 too with the same stack signature", "also
+  seen at 17:48:06Z with `stuck_duration=124s`").
+- Additional instrumentation output (log lines, metric tables,
+  `/proc/wchan`, stack dumps) that reinforces or refines the existing
+  hypothesis without changing it.
+- A reproduction on a different commit of the same bug — attach the
+  new sha to the existing issue.
 
-Once the issue (new or existing) has the new evidence, spawn a fresh
-Agent on `/plan-do-review <N>` with a brief that points at the
-specific new-evidence anchor. Do not wait for any previously-spawned
-`/plan-do-review` Agent to finish — it was running on the older
-evidence and will be superseded by the new run.
+If the existing issue is CLOSED (a prior fix landed) but the symptom
+returns, file a NEW issue — the old one describes a fixed state and
+re-opening it muddles the history. Reference the closed issue with
+`Related to #<prior> (closed)` and a note on why the prior fix did not
+cover this case.
+
+The monitor does not spawn agents on any issue. The downstream pickup
+process watches for `ready`-labeled issues and handles the fix.
 
 ## Startup
 
@@ -244,8 +232,11 @@ evidence and will be superseded by the new run.
    ```
    Two branches:
 
-   **(a) Process found — attach mode.** Print its PID and ask the user
-   whether to attach or kill+restart. If attaching:
+   **(a) Process found — attach mode (default).** Attach silently to
+   the running process; do NOT kill it. The loop is normally invoked
+   from cron / `/loop` with no user available to prompt, so attaching
+   is the safe default. If the user explicitly wants a fresh restart,
+   they can kill the node themselves first.
    - Recover the session directory from the process's stdout fd:
      ```
      readlink /proc/<pid>/fd/1
@@ -346,7 +337,7 @@ HEALTH CHECKS:
 (1) Log scan — run: tail -n 500 ~/data/<session-id>/logs/monitor.log. Scan for: hash mismatches ("hash mismatch", "HashMismatch", differing expected/actual hashes), panics/crashes ("panic", "thread.*panicked", "SIGABRT", "SIGSEGV"), ERROR-level log lines, assertion failures ("assertion failed").
 (2) Ledger progression & sync deadline — persist ledger progression across ticks so STUCK can be detected by a single invocation: (a) read ~/data/<session-id>/last_ledger (if it exists) — format is "<ledger>|<unix-timestamp>". (b) extract the current ledger from the most recent Heartbeat line in the log tail. (c) if the file exists and its ledger equals the current ledger and the recorded timestamp is more than 600s old, flag STUCK. (d) if the ledger has advanced or the file is missing, overwrite ~/data/<session-id>/last_ledger with "<current-ledger>|<now>". Additionally, check node uptime: run ps -o etime= -p $(pgrep -f 'henyey.*run' | head -1). Compare uptime against the deadline from FRESH_START. If uptime exceeds the deadline and the node is not yet in real-time sync: check the latest Heartbeat for the gap between `ledger` and `latest_ext` — if gap > 5, or if RPC status is "unhealthy", or if `heard_from_quorum=false`, flag as SYNC FAILURE. This is a bug, not a transient condition. Do NOT report it as a WARNING and wait. Investigate the catchup path: check for checkpoint-boundary stalls ("failed to download header"), hash mismatches, or event loop freezes in the log. If FRESH_START=yes and uptime is under 4h, a large gap is expected — report CATCHING UP instead of SYNC FAILURE.
 (3) Process alive — run: pgrep -af 'henyey.*run'. If not running, before relaunching: (i) `rm -f ~/data/mainnet/mainnet.lock` to clear any stale lockfile the dead process left behind; (ii) preserve the prior session's log so its final lines are post-mortem-debuggable — `mv ~/data/<session-id>/logs/monitor.log ~/data/<session-id>/logs/monitor.log.crashed-$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true`; (iii) relaunch with **append** redirection so interleaving restart pathways don't nuke history: RUST_LOG=info nohup ~/data/<session-id>/cargo-target/release/henyey --mainnet run <RUN_FLAGS> -c <CONFIG> >> ~/data/<session-id>/logs/monitor.log 2>&1 &
-(4) Memory — run: ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1) and convert to MB. If RSS > 12 GB, flag HIGH MEMORY. If RSS > 16 GB or free memory < 4 GB, restart the node (kill <PID>, wait 10s, kill -9 if still alive, then relaunch as in check 3).
+(4) Memory — run: ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1) and convert to MB. If RSS > 12 GB, flag HIGH MEMORY. If RSS > 16 GB or system `available` memory (from `free -m`) < 4 GB, restart the node (kill <PID>, wait 10s, kill -9 if still alive, then relaunch as in check 3). Use the `available` column — NOT `free` — to avoid false positives from reclaimable kernel cache (buff/cache).
 (5) Disk — run: df -h ~/data | tail -1. If usage > 85%, flag LOW DISK.
 (6) Session disk — run: du -sh ~/data/<session-id>/ and du -sh ~/data/mainnet/. If combined > 200 GB, flag SESSION DISK HIGH.
 (7) Memory report — run: grep 'Memory report summary' ~/data/<session-id>/logs/monitor.log | tail -1. If grep returns no output, flag WARNING memory-report-missing (log format may have changed). Otherwise extract jemalloc_allocated_mb, jemalloc_resident_mb, fragmentation_pct, heap_components_mb, mmap_mb, unaccounted_mb, unaccounted_sign. If fragmentation_pct > 50, flag HIGH FRAGMENTATION. If unaccounted_mb > 1000 with sign "+", note it (known jemalloc overhead, not a bug — but verify heap_components is stable; if heap_components is growing, investigate).
@@ -354,86 +345,45 @@ HEALTH CHECKS:
 (9) OBSRVR Radar (validator mode only — skip in watcher mode) — get public key from: curl -s http://localhost:<ADMIN_PORT>/info (extract public_key). Then: curl -s https://radar.withobsrvr.com/api/v1/nodes/<PUBLIC_KEY>. Check: isValidating (if false and node running > 30 min, flag NOT VALIDATING), validating24HoursPercentage (if < 50 and running > 6 hours, flag LOW VALIDATION RATE), lag (if > 500, flag HIGH LAG). If API errors, emit "obsrvr: N/A (api-error)" in the status line instead of omitting the field.
 
 REMOTE SYNC & REDEPLOY:
-(10) Remote sync — first sanity-check the working tree: (pre-a) if git status --porcelain reports any output, ABORT the deploy path for this tick — the previous CI-fix commit hasn't been finalized or there are local edits. Report: DEPLOY SKIPPED (dirty tree) with the list of dirty paths. Do not run git pull against a dirty tree; do not kill the node. Fix the dirty tree (commit, stash, or investigate) before the next tick. (a) If clean, run: git fetch origin main. If in detached HEAD state (git symbolic-ref HEAD fails), run git checkout main first. Then compare: git rev-parse HEAD vs git rev-parse origin/main. If they differ (origin/main is ahead): (b) check CI status on origin/main — run: gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'. If any recent run has conclusion "failure", do NOT deploy — instead, immediately investigate and fix the CI failure using the CI FIX WORKFLOW below (check 11). After pushing the fix, wait for the next loop iteration to deploy. (c) If all conclusions are "success" (ignore "" for in-progress and "cancelled"): git pull --rebase, (d) CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey, (e) if build succeeds: kill the node (kill <PID>, wait 10s, kill -9 if still alive), restart with same command from check (3), report: DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>, (f) if build fails: report BUILD FAILED, do NOT restart — the old binary is still running. Route the build error through the CI FIX WORKFLOW below. If HEAD == origin/main: no action (already up to date).
+(10) Remote sync — first sanity-check the working tree: (pre-a) if git status --porcelain reports any output, ABORT the deploy path for this tick — there are local edits that shouldn't exist (the monitor never edits the checkout). Report: DEPLOY SKIPPED (dirty tree) with the list of dirty paths. Do not run git pull against a dirty tree; do not kill the node. Investigate the dirty tree before the next tick. (a) If clean, run: git fetch origin main. If in detached HEAD state (git symbolic-ref HEAD fails), run git checkout main first. Then compare: git rev-parse HEAD vs git rev-parse origin/main. If they differ (origin/main is ahead): (b) check CI status on origin/main — run: gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'. If any recent run has conclusion "failure", do NOT deploy — route the failure through check 11 (file/comment a `ready`-labeled issue) and wait. (c) If all conclusions are "success" (ignore "" for in-progress and "cancelled"): git pull --rebase, (d) CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey, (e) if build succeeds: kill the node (kill <PID>, wait 10s, kill -9 if still alive), restart with same command from check (3), report: DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>, (f) if build fails: report BUILD FAILED, do NOT restart — the old binary is still running. Route the build error through check 11 (file/comment a `ready`-labeled issue). If HEAD == origin/main: no action (already up to date).
 
-COMMIT POLICY (must match the skill body's Commit Policy section; update both together):
-- NEVER revert commits made by other developers. If a deployed commit causes a regression, file a GitHub issue and restart on a known-good binary.
-- CI fixes for others' commits: fix-forward only, do NOT revert.
-- You may revert your own commits if they cause regressions.
+COMMIT POLICY (must match the skill body; update both together):
+- The monitor does NOT commit code. All fixes — node bugs and CI failures — are delegated via `gh issue` with the `ready` label (or a comment on an existing issue). A separate downstream process picks up `ready`-labeled issues and commits the fix.
 
 FIX-ROUTING POLICY (must match the skill body's Fix-Routing Policy section):
-- CI fixes (build errors, test failures, clippy, workflow YAML) are handled INLINE in the main checkout by this loop.
-- Node bugs (hash mismatches, crashes, consensus/sync failures, pruning defects, memory leaks) are DELEGATED: file a GitHub issue, then spawn an Agent whose task is to run `/plan-do-review <N>` on that issue. Do NOT run a separate worktree Agent, review diffs, or cherry-pick — adversarial critique, implementation, review-fix iteration, and landing all live inside `/plan-do-review`. The next redeploy tick (check 10) will pick up whatever it lands on main.
+- All fixes (both CI failures and node bugs) are DELEGATED via `gh issue --label ready`. The monitor never implements a fix inline.
+- ALWAYS check for an existing open issue first via `gh issue list --search "<keywords>" --state open` before creating a new one. If one covers the same symptom/subsystem, comment on it with the new evidence and (if missing) add the `ready` label via `gh issue edit <N> --add-label ready`. Only create a new issue when no existing one matches.
+- Do NOT spawn agents, open worktrees, review diffs, or cherry-pick. The next redeploy tick (check 10) will pick up whatever lands on main.
 
 DEPLOY REGRESSION POLICY:
-If the node fails after a deploy: (a) file a GitHub issue with the regression details (commit range, symptoms, WATCHDOG data), (b) if the regression was from YOUR commits, revert and fix forward, (c) if the regression was from ANOTHER developer's commits, restart the node on the last known-good binary (rebuild from the previous commit) but do NOT revert their commits — file the issue and let them fix it.
+If the node fails after a deploy: (a) file or comment on a `ready`-labeled GitHub issue with the regression details (commit range, symptoms, WATCHDOG data), (b) restart the node on the last known-good binary (rebuild from the previous commit) while waiting for the fix. Do NOT revert commits inline — let the downstream pickup process handle it.
 
-CI FIX WORKFLOW:
+CI CHECK WORKFLOW:
 (11) CI check — scope and levels of detection:
   (11a) Scope: only inspect workflows that run on branch main. Run: gh run list --branch main --limit 10 --json databaseId,name,status,conclusion,headSha,createdAt --jq '.[] | "\(.name)|\(.status)|\(.conclusion)|\(.headSha[:8])|\(.databaseId)|\(.createdAt)"'. Ignore runs triggered by PRs on other branches. Scan for completed runs with conclusion "failure".
   (11b) Job-level (CRITICAL — catches continue-on-error failures): For the latest completed run of EACH distinct workflow name (e.g. ci, quickstart, verify-execution, history-publish — enumerate dynamically from 11a, do NOT hard-code "Quickstart"), check individual jobs: gh run view <ID> --json jobs --jq '.jobs[] | select(.conclusion == "failure") | "\(.name)|\(.conclusion)"'. Workflows with continue-on-error jobs report run-level conclusion "success" even when jobs fail — you MUST check job-level conclusions. If any jobs have conclusion "failure", treat it the same as a run-level failure.
-REPORTING RULE — NEVER report "ci: all green" if ANY job has conclusion "failure", even if the run-level conclusion is "success". The ci: line in the status report MUST reflect the WORST job-level result across all workflows. A continue-on-error job failure is NOT "green" — it is RED. Do not qualify failures as "known", "pre-existing", or "cosmetic". A failure that persists across multiple commits is MORE urgent, not less — it means no one has fixed it.
-Compare createdAt with current UTC time (date -u +%Y-%m-%dT%H:%M:%SZ) — only investigate failures from the last 2 hours. CI failures are bugs — they MUST be investigated and fixed immediately, never deferred to "next cycle". For each failure: (a) gh run view <ID> --log-failed 2>&1 | tail -80, (b) categorize: build error, test failure, timeout, infrastructure, (c) investigate root cause and fix the code. Before committing, verify you are on main: git symbolic-ref --short HEAD must equal "main"; if not, git checkout main first. (d) cargo test --all, commit, push, report: CI FIX — <workflow> failed on <sha>, fixed in <commit>. The goal is all-green CI — no persistent failures are acceptable. If CI is red, this check takes priority over all other checks except process-alive.
+REPORTING RULE — NEVER report "ci: all green" if ANY job has conclusion "failure", even if the run-level conclusion is "success". The ci: line in the status report MUST reflect the WORST job-level result across all workflows. A continue-on-error job failure is NOT "green" — it is RED. Do not qualify failures as "known", "pre-existing", or "cosmetic".
+Compare createdAt with current UTC time (date -u +%Y-%m-%dT%H:%M:%SZ) — only act on failures from the last 2 hours. For each failure: (a) gh run view <ID> --log-failed 2>&1 | tail -80, (b) categorize: build error, test failure, timeout, flaky, infrastructure, (c) **check for an existing open issue** via `gh issue list --search "<workflow name + signature>" --state open`. If one matches, `gh issue comment <N>` with the new evidence (sha, log snippet, timestamp) and ensure it has the `ready` label (`gh issue edit <N> --add-label ready`). (d) Otherwise, file a new issue: `gh issue create --label ready --title "<workflow>: <short signature>" --body "..."` with investigation findings. Do NOT commit a fix. Report: CI ISSUE FILED — <workflow> failed on <sha>, filed/commented #<N>.
 
-INVESTIGATION: For ANY anomaly, investigate to root cause — read source code, check logs, trace code paths. Never dismiss as "expected". File a GitHub issue for every anomaly that isn't immediately explained.
+INVESTIGATION: For ANY anomaly, investigate to root cause — read source code, check logs, trace code paths. Never dismiss as "expected". Produce a `ready`-labeled GitHub issue (or comment on an existing one) for every anomaly that isn't immediately explained.
 
-BUG FIX WORKFLOW (node bugs only — CI fixes go through check 11): If a hash mismatch, error, or crash is found: (1) identify failing ledger and error type, (2) investigate to root cause — read source code, trace code paths, (3) file a GitHub issue with findings using `gh issue create` and capture the returned issue number N; write the body as a proposal that `/plan-do-review` can consume (symptom, evidence, suspected root cause, fix sketch with file:line references), (4) spawn an Agent whose sole task is to run `/plan-do-review <N>` on the filed issue — that skill handles adversarial critique, implementation, review-fix iteration, and landing the change. Do NOT edit the main checkout to fix a node bug. Do NOT run a separate worktree Agent, review the diff yourself, or cherry-pick — all of that lives inside `/plan-do-review`. The next redeploy tick (check 10) will pick up whatever `/plan-do-review` lands on main.
+BUG FILING WORKFLOW (applies to both node bugs and CI failures): (1) identify the failing signature (ledger + error type for node bugs; workflow + job + error type for CI), (2) investigate to root cause — read source code, trace code paths, (3) **check for an existing open issue** via `gh issue list --search "<keywords>" --state open`; if a match exists, `gh issue comment <N>` with the new evidence and ensure the `ready` label is set, and STOP here. (4) If no match, file a new issue using `gh issue create --label ready` with a self-contained proposal body (symptom, evidence, suspected root cause, fix sketch with file:line references) so the downstream pickup process has everything it needs. (5) Do NOT spawn agents. Do NOT edit the main checkout. The next redeploy tick (check 10) will pick up whatever lands on main.
 
-RECURRENCE POLICY: If a previously-filed bug recurs with material new evidence (new instrumentation output, a different commit reproducing it, a negative finding ruling out the prior hypothesis, narrowed candidate sites), **prefer filing a new scoped issue** over piling onto the existing one. Umbrella issues with many /plan-do-review iterations become monsters that confuse the next Agent. File a new issue whenever the evidence points at a different named subsystem, a different phase/mark, a different root-cause hypothesis, or a different candidate site set; include `Related to #<prior>` + one-line scope-diff; post a back-link comment on the prior issue. Only append a comment on the existing issue when the recurrence is genuinely the same bug at the same site with purely additive incremental data AND the prior /plan-do-review run hasn't converged yet. Default toward "new issue" when in doubt.
+RECURRENCE POLICY: If a previously-filed bug recurs with material new evidence, **prefer commenting on the existing issue** when it is the same bug at the same site (the "check for existing issue" path — most recurrences land here). File a new `ready`-labeled issue ONLY when the new evidence points at a different named subsystem, a different phase/mark, a different root-cause hypothesis, or a different candidate site set. In that case include `Related to #<prior>` + one-line scope-diff in the new issue body and post a back-link comment on the prior issue. Do NOT open a duplicate of the same bug.
 
 OUTPUT: Print a multiline status report:
 MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   node:   mode=<MODE> session=<session-id> pid=<PID> fresh_start=<yes|no>
-  sync:   <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|4h>) | SYNC FAILURE (gap=N, uptime=Xm — investigating)>
+  sync:   <synced | CATCHING UP (gap=N, uptime=Xm, deadline=<15m|4h>) | SYNC FAILURE (gap=N, uptime=Xm — filed/commented #<N>)>
   mem:    <RSS_MB>MB rss | alloc=<alloc>MB resident=<resident>MB frag=<pct>%
           heap=<heap>MB mmap=<mmap>MB unaccounted=<sign><unaccounted>MB
   disk:   <used>/<total> (<pct>%) | session+data=<size>
   rpc:    <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
   obsrvr: <validating=<Y/N> val24h=<pct>% lag=<N> | N/A (watcher) | N/A (api-error)>
-  deploy: <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed)>
-  ci:     <all green (run+job level) | WORKFLOW failed | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed>
-Use WARNING for threshold breaches. Use ACTION when a corrective action was taken (restart, deploy, fix). Use SYNC FAILURE (not WARNING) when the node has exceeded the active sync deadline (15m populated / 4h fresh-start) but is not closing ledgers in real-time — this is a bug that requires immediate investigation.
+  deploy: <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
+  ci:     <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
+Use WARNING for threshold breaches. Use ACTION when a corrective action was taken (restart, deploy, filed a new issue, commented on an existing issue). Use SYNC FAILURE (not WARNING) when the node has exceeded the active sync deadline (15m populated / 4h fresh-start) but is not closing ledgers in real-time — this is a bug that requires immediate investigation AND filing/commenting on a `ready`-labeled issue.
 ```
-
-## CI Fix Workflow
-
-When a CI run completes with `conclusion: "failure"` (detected by
-check 11 in the loop, or by check 10 when a deploy is blocked):
-
-1. **Get logs**: `gh run view <ID> --log-failed 2>&1 | tail -80`.
-2. **Categorize** the failure:
-   - **Build error** — compilation failure, missing dependency
-   - **Test failure** — a test assertion failed
-   - **Flaky test** — test passes locally but fails intermittently in CI
-   - **Timeout** — job exceeded time limit
-   - **Infrastructure** — runner issue, network error, GitHub outage
-3. **Fix** based on category:
-   - **Build error**: Read the compiler error, fix the code, run
-     `cargo build --all` locally.
-   - **Test failure**: Reproduce locally with
-     `cargo test -p <crate> <test_name>`. Read the test and the code
-     it exercises. Fix the code (or the test if the test is wrong).
-   - **Flaky test**: Fix the flakiness — increase timeout, add retry
-     logic, fix the race condition. Do NOT disable or `#[ignore]` the
-     test.
-   - **Timeout**: Check if a test is doing too much work or hanging.
-     Fix the root cause.
-   - **Infrastructure**: Fix the workflow config in
-     `.github/workflows/`. If it's a transient GitHub outage, re-run
-     the job: `gh run rerun <ID> --failed`.
-4. **Verify locally**: `cargo test --all`.
-5. **Check branch before pushing.** Run `git symbolic-ref --short HEAD`. It
-   must equal `main`. If it does not, `git checkout main` first. Never
-   push a CI fix from a detached HEAD or a feature branch.
-6. **Commit and push**: Follow CLAUDE.md commit guidelines.
-7. **Verify CI goes green**: `gh run list --branch main --limit 3` after push.
-   If the new run also fails, repeat from step 1.
-7. **Report**: `CI FIX — <workflow> failed on <sha>, root cause:
-   <description>, fixed in <commit>`.
-
-CI failures are treated with the same urgency as node errors. A red
-CI blocks deploys and means the codebase has a known defect. Do not
-defer, do not mark as "will investigate later".
 
 ## Resource Investigation
 
@@ -698,24 +648,22 @@ When stopping (user interrupts):
 3. **Release the concurrency lock** by letting the shell close fd 9
    (it closes automatically on exit; no explicit step required unless
    the lock FD was kept alive by a spawned subshell).
-4. Print a final status: uptime, latest ledger seen, bugs found/fixed.
+4. Print a final status: uptime, latest ledger seen, issues filed/commented.
 5. Do NOT remove logs or cache — they may be useful for debugging.
 
-Any `/plan-do-review` Agents spawned during the session keep running
-independently — tearing down the monitor does not cancel them. That is
-intentional: if the monitor stops, the fix-it pipeline should still
-land its work so the next invocation starts from a better state.
+The monitor does not spawn agents. Node-bug issues filed with the `ready`
+label persist in GitHub and are picked up by a separate downstream
+process regardless of whether the monitor is still running.
 
 ## Guidelines
 
 - Always build with `--release` — debug builds are too slow for mainnet.
-- All commits must include the appropriate `Co-authored-by` trailer per
-  CLAUDE.md.
 - All henyey issues are in scope: mainnet bugs, testnet parity bugs, CI
   failures, performance regressions, infrastructure problems.
-- **Push after every fix commit** — do not accumulate unpushed commits.
-- **Node-bug fixes come from spawned Agents that run `/plan-do-review <N>`
-  on the filed issue.** The monitor's role is to detect, investigate,
-  file, and spawn — not to implement, review, or merge. All of that
-  lives inside `/plan-do-review`.
-- CI-only fixes are inline per the Fix-Routing Policy.
+- **All fixes are delegated** via `gh issue create --label ready` (or a
+  comment on an existing issue). The monitor's role is to detect,
+  investigate, and file — never to commit, push, review, merge, or
+  spawn fix agents. A separate downstream process consumes
+  `ready`-labeled issues.
+- **Always search for an existing issue before filing** — see the
+  Bug / CI-Failure Filing Workflow.
