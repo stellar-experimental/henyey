@@ -1887,18 +1887,15 @@ impl App {
             }
         }
 
-        // Track the highest EXTERNALIZE slot we've observed (Valid or Pending).
-        // Used by submit_transaction() to detect when the node is behind the
-        // network and should reject user-facing tx submissions.  See #1812.
-        if is_externalize {
-            self.max_observed_externalize_slot
-                .fetch_max(slot, Ordering::SeqCst);
-        }
-
         match envelope_result {
             EnvelopeState::Valid => {
                 tracing::debug!(slot, tracking, "SCP envelope accepted (Valid)");
                 if is_externalize {
+                    // Track the highest accepted EXTERNALIZE slot (Valid or Pending only).
+                    // Used by submit_transaction() to gate user-facing submissions when
+                    // the node is behind. Must NOT fire for Invalid/TooOld.  See #1812.
+                    self.max_observed_externalize_slot
+                        .fetch_max(slot, Ordering::SeqCst);
                     tracing::debug!(slot, tracking, "EXTERNALIZE Valid — processing slot");
                     if let Some(tx_set_hash) = tx_set_hash {
                         self.herder.scp_driver().request_tx_set(tx_set_hash, slot);
@@ -1925,6 +1922,8 @@ impl App {
             EnvelopeState::Pending => {
                 tracing::debug!(slot, tracking, "SCP envelope buffered for future slot");
                 if is_externalize {
+                    self.max_observed_externalize_slot
+                        .fetch_max(slot, Ordering::SeqCst);
                     let current_ledger = self.current_ledger_seq() as u64;
                     if slot > current_ledger + 2 {
                         let next_slot = current_ledger as u32 + 1;
