@@ -270,12 +270,7 @@ impl TransactionQueue {
                 a.sequence_number()
                     .cmp(&b.sequence_number())
                     .then_with(|| {
-                        fee_rate_cmp(
-                            b.inclusion_fee as i64,
-                            b.op_count,
-                            a.inclusion_fee as i64,
-                            a.op_count,
-                        )
+                        fee_rate_cmp(b.inclusion_fee, b.op_count, a.inclusion_fee, a.op_count)
                     })
                     .then_with(|| a.hash.0.cmp(&b.hash.0))
             });

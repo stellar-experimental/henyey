@@ -245,7 +245,7 @@ impl EvictionExclusion {
 /// with tie-breaking based on a deterministic hash to ensure consistent ordering.
 #[derive(Clone)]
 pub(crate) struct QueueEntry {
-    inclusion_fee: u64,
+    inclusion_fee: i64,
     op_count: u32,
     tie_breaker: [u8; 32],
     hash: [u8; 32],
@@ -287,11 +287,10 @@ impl PartialOrd for QueueEntry {
 
 impl Ord for QueueEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // inclusion_fee is u64 validated non-negative at construction (from XDR i64).
         let ord = fee_rate_cmp(
-            self.inclusion_fee as i64,
+            self.inclusion_fee,
             self.op_count,
-            other.inclusion_fee as i64,
+            other.inclusion_fee,
             other.op_count,
         );
         if ord != Ordering::Equal {
@@ -713,9 +712,9 @@ impl SurgePricingPriorityQueue {
             };
 
             if fee_rate_cmp(
-                entry.inclusion_fee as i64,
+                entry.inclusion_fee,
                 entry.op_count,
-                tx.inclusion_fee as i64,
+                tx.inclusion_fee,
                 tx.op_count,
             ) != Ordering::Less
             {

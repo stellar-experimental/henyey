@@ -317,20 +317,20 @@ impl TxQueueLimiter {
         let min_fee_to_beat_lane = compute_better_fee(
             evicted_lane_fee.0,
             evicted_lane_fee.1,
-            new_tx.inclusion_fee as i64,
+            new_tx.inclusion_fee,
             new_tx.op_count,
         );
         let min_fee_to_beat_generic = compute_better_fee(
             evicted_generic_fee.0,
             evicted_generic_fee.1,
-            new_tx.inclusion_fee as i64,
+            new_tx.inclusion_fee,
             new_tx.op_count,
         );
         let min_inclusion_fee = min_fee_to_beat_lane.max(min_fee_to_beat_generic);
 
         if min_inclusion_fee > 0 {
             let resource_fee_discount =
-                (new_tx.total_fee as i64).saturating_sub(new_tx.inclusion_fee as i64);
+                (new_tx.total_fee as i64).saturating_sub(new_tx.inclusion_fee);
             return (
                 false,
                 min_inclusion_fee.saturating_add(resource_fee_discount),
@@ -410,12 +410,10 @@ impl TxQueueLimiter {
 
             if *evicted_due_to_lane_limit {
                 // Record in the specific lane
-                self.lane_evicted_inclusion_fee[evict_lane] =
-                    (tx.inclusion_fee as i64, tx.op_count);
+                self.lane_evicted_inclusion_fee[evict_lane] = (tx.inclusion_fee, tx.op_count);
             } else {
                 // Record in generic lane
-                self.lane_evicted_inclusion_fee[GENERIC_LANE] =
-                    (tx.inclusion_fee as i64, tx.op_count);
+                self.lane_evicted_inclusion_fee[GENERIC_LANE] = (tx.inclusion_fee, tx.op_count);
             }
 
             evict(tx);
@@ -527,7 +525,7 @@ mod tests {
             envelope,
             hash: Hash256::from_bytes(hash),
             total_fee: fee,
-            inclusion_fee: fee,
+            inclusion_fee: fee as i64,
             op_count: ops,
             fee_per_op: if ops > 0 { fee / ops as u64 } else { 0 },
             received_at: std::time::Instant::now(),

@@ -351,7 +351,7 @@ pub struct QueuedTransaction {
     /// Declared full fee.
     pub total_fee: u64,
     /// Inclusion fee used for surge pricing and replacement decisions.
-    pub inclusion_fee: u64,
+    pub inclusion_fee: i64,
 }
 
 impl QueuedTransaction {
@@ -378,7 +378,7 @@ impl QueuedTransaction {
     }
 
     /// Extract full fee, inclusion fee, and operation count from the envelope.
-    fn extract_fees_and_ops(envelope: &TransactionEnvelope) -> Result<(u64, u64, u32)> {
+    fn extract_fees_and_ops(envelope: &TransactionEnvelope) -> Result<(u64, i64, u32)> {
         let fee = crate::tx_set_utils::envelope_fee(envelope);
         if fee < 0 {
             return Err(HerderError::Internal(format!(
@@ -394,7 +394,7 @@ impl QueuedTransaction {
             )));
         }
         let ops = crate::tx_set_utils::envelope_num_ops(envelope) as u32;
-        Ok((fee as u64, inclusion_fee as u64, ops))
+        Ok((fee as u64, inclusion_fee, ops))
     }
 
     fn sequence_number(&self) -> i64 {
@@ -418,11 +418,10 @@ impl QueuedTransaction {
 
     /// Compare this transaction's fee rate against a FeeEntry (from the index).
     fn is_better_than_entry(&self, entry: &FeeEntry) -> bool {
-        // inclusion_fee is u64 validated non-negative at construction (from XDR i64).
         match fee_rate_cmp(
-            self.inclusion_fee as i64,
+            self.inclusion_fee,
             self.op_count,
-            entry.inclusion_fee as i64,
+            entry.inclusion_fee,
             entry.op_count,
         ) {
             Ordering::Greater => true,
@@ -471,12 +470,12 @@ const FEE_MULTIPLIER: u64 = 10;
 /// Spec: HERDER_SPEC §16 — TRANSACTION_QUEUE_TIMEOUT_LEDGERS = 4.
 const DEFAULT_PENDING_DEPTH: u32 = 4;
 
-pub(super) fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64, u64, u32)> {
+pub(super) fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64, i64, u32)> {
     QueuedTransaction::extract_fees_and_ops(envelope)
         .ok()
         .map(|(_, inclusion_fee, op_count)| {
             let per_op = if op_count > 0 {
-                inclusion_fee / op_count as u64
+                inclusion_fee as u64 / op_count as u64
             } else {
                 0
             };
@@ -498,11 +497,10 @@ pub(crate) fn fee_rate_cmp(a_fee: i64, a_ops: u32, b_fee: i64, b_ops: u32) -> Or
 }
 
 fn better_fee_ratio(new_tx: &QueuedTransaction, old_tx: &QueuedTransaction) -> bool {
-    // inclusion_fee is u64 validated non-negative at construction (from XDR i64).
     match fee_rate_cmp(
-        new_tx.inclusion_fee as i64,
+        new_tx.inclusion_fee,
         new_tx.op_count,
-        old_tx.inclusion_fee as i64,
+        old_tx.inclusion_fee,
         old_tx.op_count,
     ) {
         Ordering::Greater => true,
@@ -511,29 +509,22 @@ fn better_fee_ratio(new_tx: &QueuedTransaction, old_tx: &QueuedTransaction) -> b
     }
 }
 
-fn compute_better_fee(evicted_fee: u64, evicted_ops: u32, tx_ops: u32) -> u64 {
+fn compute_better_fee(evicted_fee: i64, evicted_ops: u32, tx_ops: u32) -> i64 {
     if evicted_ops == 0 {
         return 0;
     }
-    let numerator = (evicted_fee as u128).saturating_mul(tx_ops as u128);
-    let denominator = evicted_ops as u128;
+    let numerator = (evicted_fee as i128).saturating_mul(tx_ops as i128);
+    let denominator = evicted_ops as i128;
     let base = numerator / denominator;
     let candidate = base.saturating_add(1);
-    u64::try_from(candidate).unwrap_or(u64::MAX)
+    i64::try_from(candidate).unwrap_or(i64::MAX)
 }
 
-fn min_inclusion_fee_to_beat(evicted: (u64, u32), tx: &QueuedTransaction) -> u64 {
+fn min_inclusion_fee_to_beat(evicted: (i64, u32), tx: &QueuedTransaction) -> i64 {
     if evicted.1 == 0 {
         return 0;
     }
-    // inclusion_fee values are u64 validated non-negative at construction (from XDR i64).
-    if fee_rate_cmp(
-        evicted.0 as i64,
-        evicted.1,
-        tx.inclusion_fee as i64,
-        tx.op_count,
-    ) != Ordering::Less
-    {
+    if fee_rate_cmp(evicted.0, evicted.1, tx.inclusion_fee, tx.op_count) != Ordering::Less {
         compute_better_fee(evicted.0, evicted.1, tx.op_count)
     } else {
         0
@@ -544,18 +535,18 @@ fn min_inclusion_fee_to_beat(evicted: (u64, u32), tx: &QueuedTransaction) -> u64
 /// For replace-by-fee to work, the new fee must be at least FEE_MULTIPLIER times the old fee rate.
 /// Returns Ok(()) if replacement is allowed, or Err(min_fee) if the fee is insufficient.
 fn can_replace_by_fee(
-    new_fee: u64,
+    new_fee: i64,
     new_ops: u32,
-    old_fee: u64,
+    old_fee: i64,
     old_ops: u32,
-) -> std::result::Result<(), u64> {
+) -> std::result::Result<(), i64> {
     // newFee / newOps >= FEE_MULTIPLIER * oldFee / oldOps
     // Cross-multiply to avoid division:
     // newFee * oldOps >= FEE_MULTIPLIER * oldFee * newOps
-    let left = (new_fee as u128).saturating_mul(old_ops as u128);
-    let right = (FEE_MULTIPLIER as u128)
-        .saturating_mul(old_fee as u128)
-        .saturating_mul(new_ops as u128);
+    let left = (new_fee as i128).saturating_mul(old_ops as i128);
+    let right = (FEE_MULTIPLIER as i128)
+        .saturating_mul(old_fee as i128)
+        .saturating_mul(new_ops as i128);
 
     if left < right {
         // Calculate minimum fee required:
@@ -563,7 +554,7 @@ fn can_replace_by_fee(
         // minFee >= (FEE_MULTIPLIER * oldFee * newOps) / oldOps + 1 (round up)
         let min_fee = if old_ops > 0 {
             let numerator = right;
-            let denominator = old_ops as u128;
+            let denominator = old_ops as i128;
             let quotient = numerator / denominator;
             let remainder = numerator % denominator;
             let rounded = if remainder > 0 {
@@ -571,7 +562,7 @@ fn can_replace_by_fee(
             } else {
                 quotient
             };
-            u64::try_from(rounded).unwrap_or(u64::MAX)
+            i64::try_from(rounded).unwrap_or(i64::MAX)
         } else {
             0
         };
@@ -594,7 +585,7 @@ pub(super) struct SelectedTxs {
 /// to match the existing `ensure_queue_capacity` eviction semantics.
 #[derive(Clone, Eq, PartialEq, Debug)]
 struct FeeEntry {
-    inclusion_fee: u64,
+    inclusion_fee: i64,
     op_count: u32,
     hash: Hash256,
 }
@@ -611,11 +602,10 @@ impl FeeEntry {
 
 impl Ord for FeeEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // inclusion_fee is u64 validated non-negative at construction (from XDR i64).
         fee_rate_cmp(
-            self.inclusion_fee as i64,
+            self.inclusion_fee,
             self.op_count,
-            other.inclusion_fee as i64,
+            other.inclusion_fee,
             other.op_count,
         )
         .then_with(|| other.hash.0.cmp(&self.hash.0))
@@ -1114,11 +1104,11 @@ fn account_id_from_fee_source_key(key: &[u8]) -> AccountId {
 /// without holding the store lock.
 struct EvictionThresholds {
     /// Lane eviction thresholds for classic queue admission.
-    classic_lane_fees: RwLock<Vec<(u64, u32)>>,
+    classic_lane_fees: RwLock<Vec<(i64, u32)>>,
     /// Lane eviction thresholds for Soroban queue admission.
-    soroban_lane_fees: RwLock<Vec<(u64, u32)>>,
+    soroban_lane_fees: RwLock<Vec<(i64, u32)>>,
     /// Eviction threshold for global queue limits.
-    global_fees: RwLock<(u64, u32)>,
+    global_fees: RwLock<(i64, u32)>,
 }
 
 impl EvictionThresholds {
@@ -1657,7 +1647,7 @@ impl TransactionQueue {
     fn record_lane_evictions(
         &self,
         lane_config: &dyn SurgePricingLaneConfig,
-        lane_fees_lock: &RwLock<Vec<(u64, u32)>>,
+        lane_fees_lock: &RwLock<Vec<(i64, u32)>>,
         evictions: Vec<(QueuedTransaction, bool)>,
         pending_evictions: &mut HashSet<Hash256>,
         pending_eviction_list: &mut Vec<QueuedTransaction>,
@@ -1693,7 +1683,7 @@ impl TransactionQueue {
     fn fee_below_lane_threshold(
         &self,
         lane_config: &dyn SurgePricingLaneConfig,
-        lane_fees: &mut Vec<(u64, u32)>,
+        lane_fees: &mut Vec<(i64, u32)>,
         queued_frame: &henyey_tx::TransactionFrame,
         queued: &QueuedTransaction,
     ) -> bool {
@@ -6667,7 +6657,7 @@ mod tests {
 
         // Verify fee=100 was evicted (lowest fee)
         let store = queue.store.read();
-        let fees: Vec<u64> = store.values().map(|tx| tx.inclusion_fee).collect();
+        let fees: Vec<i64> = store.values().map(|tx| tx.inclusion_fee).collect();
         assert!(
             !fees.contains(&100),
             "lowest-fee tx should have been evicted"
@@ -6717,7 +6707,7 @@ mod tests {
 
         // Verify the new tx is the one in the queue
         let store = queue.store.read();
-        let remaining: Vec<u64> = store.values().map(|tx| tx.inclusion_fee).collect();
+        let remaining: Vec<i64> = store.values().map(|tx| tx.inclusion_fee).collect();
         assert_eq!(remaining, vec![50]);
         store.assert_consistent();
     }
@@ -6764,7 +6754,7 @@ mod tests {
 
         // Verify: expired high-fee (1000) was evicted, live low-fee (10) and new mid (500) remain
         let store = queue.store.read();
-        let mut fees: Vec<u64> = store.values().map(|tx| tx.inclusion_fee).collect();
+        let mut fees: Vec<i64> = store.values().map(|tx| tx.inclusion_fee).collect();
         fees.sort();
         assert_eq!(
             fees,
@@ -8346,5 +8336,102 @@ mod fee_rate_cmp_tests {
     #[should_panic(expected = "fee_rate_cmp: negative fee")]
     fn test_fee_rate_cmp_panics_on_negative_b_fee() {
         fee_rate_cmp(100, 1, -1, 1);
+    }
+}
+
+#[cfg(test)]
+mod inclusion_fee_i64_tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_better_fee_i64_max_saturation() {
+        // Near i64::MAX values should saturate rather than overflow.
+        let result = compute_better_fee(i64::MAX, 1, 2);
+        assert_eq!(result, i64::MAX);
+    }
+
+    #[test]
+    fn test_compute_better_fee_normal() {
+        // evicted_fee=100, evicted_ops=2, tx_ops=4 → base = 200, candidate = 201
+        assert_eq!(compute_better_fee(100, 2, 4), 201);
+    }
+
+    #[test]
+    fn test_compute_better_fee_zero_evicted_ops() {
+        assert_eq!(compute_better_fee(100, 0, 4), 0);
+    }
+
+    #[test]
+    fn test_min_inclusion_fee_to_beat_already_better() {
+        let tx = QueuedTransaction {
+            envelope: make_dummy_envelope(200, 1),
+            hash: Hash256::from_bytes([0u8; 32]),
+            total_fee: 200,
+            inclusion_fee: 200,
+            op_count: 1,
+            fee_per_op: 200,
+            received_at: std::time::Instant::now(),
+        };
+        assert_eq!(min_inclusion_fee_to_beat((100, 1), &tx), 0);
+    }
+
+    #[test]
+    fn test_min_inclusion_fee_to_beat_needs_higher() {
+        let tx = QueuedTransaction {
+            envelope: make_dummy_envelope(50, 1),
+            hash: Hash256::from_bytes([0u8; 32]),
+            total_fee: 50,
+            inclusion_fee: 50,
+            op_count: 1,
+            fee_per_op: 50,
+            received_at: std::time::Instant::now(),
+        };
+        let result = min_inclusion_fee_to_beat((100, 1), &tx);
+        assert_eq!(result, 101);
+    }
+
+    #[test]
+    fn test_can_replace_by_fee_sufficient() {
+        assert!(can_replace_by_fee(1000, 1, 100, 1).is_ok());
+    }
+
+    #[test]
+    fn test_can_replace_by_fee_insufficient() {
+        let result = can_replace_by_fee(999, 1, 100, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_can_replace_by_fee_i64_boundary() {
+        let large = i64::MAX / 20;
+        assert!(can_replace_by_fee(large * 10, 1, large, 1).is_ok());
+    }
+
+    fn make_dummy_envelope(fee: u32, ops: u32) -> TransactionEnvelope {
+        use stellar_xdr::curr::*;
+        let mut operations = Vec::new();
+        for _ in 0..ops {
+            operations.push(Operation {
+                source_account: None,
+                body: OperationBody::Inflation,
+            });
+        }
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([0; 32])),
+                fee,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: operations.try_into().unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0; 4]),
+                signature: Signature(vec![0; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
     }
 }
