@@ -253,19 +253,8 @@ pub struct ScpVerifyMetrics {
     /// Aggregate — kept for backward compatibility.
     pub post_verify_drops: u64,
     /// Per-reason post-verify counters (issue #1733 observability).
-    pub pv_drift_range: u64,
-    pub pv_drift_close_time: u64,
-    pub pv_drift_cannot_receive: u64,
-    pub pv_self_message: u64,
-    pub pv_non_quorum: u64,
-    pub pv_too_far: u64,
-    pub pv_buffer_full: u64,
-    pub pv_accepted: u64,
-    pub pv_buffered: u64,
-    pub pv_duplicate: u64,
-    pub pv_processed_directly: u64,
-    pub pv_invalid_sig: u64,
-    pub pv_panic: u64,
+    /// Indexed by [`PostVerifyReason`] via the [`PostVerifyCounters`] wrapper.
+    pub pv_counters: henyey_herder::scp_verify::PostVerifyCounters<u64>,
     /// Currently used slots in the verifier input channel (event-loop sampled).
     pub verify_input_backlog: u64,
     /// Sampled depth of the verified-output channel (envelopes awaiting the

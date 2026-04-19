@@ -133,22 +133,119 @@ pub struct VerifiedEnvelope {
 /// 4. Non-quorum reject                → `NonQuorum`
 /// 5. `pending_envelopes.add` outcomes → `PendingAdd*`
 /// 6. Accepted (reached SCP / processed directly) → `Accepted`
-#[non_exhaustive]
+#[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostVerifyReason {
-    InvalidSignature,
-    PanicVerdict,
-    GateDriftRange,
-    GateDriftCloseTime,
-    GateDriftCannotReceive,
-    SelfMessage,
-    NonQuorum,
-    PendingAddBuffered,
-    PendingAddDuplicate,
-    PendingAddTooFar,
-    PendingAddBufferFull,
-    PendingAddProcessedDirectly,
-    Accepted,
+    InvalidSignature = 0,
+    PanicVerdict = 1,
+    GateDriftRange = 2,
+    GateDriftCloseTime = 3,
+    GateDriftCannotReceive = 4,
+    SelfMessage = 5,
+    NonQuorum = 6,
+    PendingAddBuffered = 7,
+    PendingAddDuplicate = 8,
+    PendingAddTooFar = 9,
+    PendingAddBufferFull = 10,
+    PendingAddProcessedDirectly = 11,
+    Accepted = 12,
+}
+
+impl PostVerifyReason {
+    /// All variants in discriminant order. This is the single source of truth
+    /// for iteration, counter allocation, and Prometheus label generation.
+    pub const ALL: [Self; 13] = [
+        Self::InvalidSignature,
+        Self::PanicVerdict,
+        Self::GateDriftRange,
+        Self::GateDriftCloseTime,
+        Self::GateDriftCannotReceive,
+        Self::SelfMessage,
+        Self::NonQuorum,
+        Self::PendingAddBuffered,
+        Self::PendingAddDuplicate,
+        Self::PendingAddTooFar,
+        Self::PendingAddBufferFull,
+        Self::PendingAddProcessedDirectly,
+        Self::Accepted,
+    ];
+
+    /// Prometheus metric label for this reason.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::InvalidSignature => "invalid_sig",
+            Self::PanicVerdict => "panic",
+            Self::GateDriftRange => "drift_range",
+            Self::GateDriftCloseTime => "drift_close_time",
+            Self::GateDriftCannotReceive => "drift_cannot_receive",
+            Self::SelfMessage => "self_message",
+            Self::NonQuorum => "non_quorum",
+            Self::PendingAddBuffered => "buffered",
+            Self::PendingAddDuplicate => "duplicate",
+            Self::PendingAddTooFar => "too_far",
+            Self::PendingAddBufferFull => "buffer_full",
+            Self::PendingAddProcessedDirectly => "processed_directly",
+            Self::Accepted => "accepted",
+        }
+    }
+}
+
+// Compile-time: ALL is complete, ordered, and covers every discriminant.
+const _: () = {
+    let mut i = 0;
+    while i < PostVerifyReason::ALL.len() {
+        assert!(PostVerifyReason::ALL[i] as usize == i);
+        i += 1;
+    }
+    // Last discriminant + 1 == ALL.len() — catches a variant added but not in ALL.
+    assert!(PostVerifyReason::ALL.len() == PostVerifyReason::Accepted as usize + 1);
+};
+
+/// Fixed-size counter array indexed by [`PostVerifyReason`].
+///
+/// Wraps `[T; N]` so callers never perform raw ordinal arithmetic.
+/// Used for both the live `AtomicU64` counters in `App` and the
+/// plain `u64` snapshot in `ScpVerifyMetrics`.
+#[derive(Debug)]
+pub struct PostVerifyCounters<T>([T; PostVerifyReason::ALL.len()]);
+
+impl<T: Default> Default for PostVerifyCounters<T> {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| T::default()))
+    }
+}
+
+impl<T: Clone> Clone for PostVerifyCounters<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> PostVerifyCounters<T> {
+    /// Build from a function that maps each reason to a value.
+    pub fn from_fn(mut f: impl FnMut(PostVerifyReason) -> T) -> Self {
+        Self(std::array::from_fn(|i| f(PostVerifyReason::ALL[i])))
+    }
+
+    /// Iterate `(reason, &value)` pairs in discriminant order.
+    pub fn iter(&self) -> impl Iterator<Item = (PostVerifyReason, &T)> {
+        PostVerifyReason::ALL
+            .iter()
+            .map(|&r| (r, &self.0[r as usize]))
+    }
+}
+
+impl<T> std::ops::Index<PostVerifyReason> for PostVerifyCounters<T> {
+    type Output = T;
+    fn index(&self, reason: PostVerifyReason) -> &T {
+        &self.0[reason as usize]
+    }
+}
+
+impl<T> std::ops::IndexMut<PostVerifyReason> for PostVerifyCounters<T> {
+    fn index_mut(&mut self, reason: PostVerifyReason) -> &mut T {
+        &mut self.0[reason as usize]
+    }
 }
 
 /// Synchronous equivalent of the worker's verify step.
