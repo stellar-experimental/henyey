@@ -696,7 +696,7 @@ fn compute_tx_hash(
     network_id: &Hash,
 ) -> Option<Hash> {
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{EnvelopeType, Limits, WriteXdr};
+    use stellar_xdr::curr::EnvelopeType;
 
     let mut hasher = Sha256::new();
     hasher.update(network_id);
@@ -710,15 +710,15 @@ fn compute_tx_hash(
 
     match env {
         stellar_xdr::curr::TransactionEnvelope::TxV0(tx_v0) => {
-            let tx_xdr = tx_v0.tx.to_xdr(Limits::none()).ok()?;
+            let tx_xdr = henyey_common::xdr_to_bytes(&tx_v0.tx);
             hasher.update(&tx_xdr);
         }
         stellar_xdr::curr::TransactionEnvelope::Tx(tx_v1) => {
-            let tx_xdr = tx_v1.tx.to_xdr(Limits::none()).ok()?;
+            let tx_xdr = henyey_common::xdr_to_bytes(&tx_v1.tx);
             hasher.update(&tx_xdr);
         }
         stellar_xdr::curr::TransactionEnvelope::TxFeeBump(tx_bump) => {
-            let tx_xdr = tx_bump.tx.to_xdr(Limits::none()).ok()?;
+            let tx_xdr = henyey_common::xdr_to_bytes(&tx_bump.tx);
             hasher.update(&tx_xdr);
         }
     }

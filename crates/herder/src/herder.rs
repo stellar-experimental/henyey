@@ -2091,7 +2091,7 @@ impl Herder {
         let stellar_value = self
             .make_stellar_value(tx_set.hash, close_time, upgrades)
             .ok()?;
-        let value_bytes = stellar_value.to_xdr(Limits::none()).ok()?;
+        let value_bytes = henyey_common::xdr_to_bytes(&stellar_value);
         let value = Value(value_bytes.try_into().ok()?);
         Some(value)
     }

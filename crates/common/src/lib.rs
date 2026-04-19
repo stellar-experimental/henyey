@@ -73,7 +73,7 @@ pub use network::NetworkId;
 pub use protocol::*;
 pub use resource::*;
 pub use types::{deterministic_seed, *};
-pub use xdr_stream::xdr_encoded_len;
+pub use xdr_stream::{xdr_encoded_len, xdr_to_bytes};
 
 /// Re-export stellar-xdr for convenience.
 ///

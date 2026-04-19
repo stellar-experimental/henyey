@@ -56,15 +56,11 @@ pub enum TxSetData {
 impl TxSetData {
     /// Get the SHA-256 hash of the XDR-encoded transaction set.
     pub fn hash(&self) -> Hash {
-        use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::WriteXdr;
-
-        let bytes = match self {
-            TxSetData::Legacy(tx_set) => tx_set.to_xdr(stellar_xdr::curr::Limits::none()),
-            TxSetData::Generalized(tx_set) => tx_set.to_xdr(stellar_xdr::curr::Limits::none()),
-        }
-        .unwrap_or_default();
-        Hash(Sha256::digest(&bytes).into())
+        let h = match self {
+            TxSetData::Legacy(tx_set) => henyey_common::Hash256::hash_xdr(tx_set),
+            TxSetData::Generalized(tx_set) => henyey_common::Hash256::hash_xdr(tx_set),
+        };
+        Hash(h.0)
     }
 }
 
@@ -256,14 +252,8 @@ impl MessageDispatcher {
     /// Handle a ScpQuorumset response.
     // SECURITY: message size bounded by MAX_MESSAGE_SIZE at frame layer before reaching handler
     fn handle_quorum_set(&self, from_peer: &PeerId, quorum_set: ScpQuorumSet) {
-        use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::WriteXdr;
-
-        let bytes = quorum_set
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap_or_default();
-        let hash_bytes = Sha256::digest(&bytes);
-        let hash = Hash(hash_bytes.into());
+        let h = henyey_common::Hash256::hash_xdr(&quorum_set);
+        let hash = Hash(h.0);
 
         trace!(
             "Received ScpQuorumSet {} from {}",

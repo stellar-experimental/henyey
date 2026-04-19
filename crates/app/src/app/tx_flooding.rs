@@ -460,13 +460,7 @@ impl App {
         // For legacy TransactionSet, hash is SHA-256 of previous_ledger_hash + tx XDR blobs
         let transactions: Vec<_> = tx_set.txs.to_vec();
         let prev_hash = henyey_common::Hash256::from_bytes(tx_set.previous_ledger_hash.0);
-        let hash = match TransactionSet::compute_non_generalized_hash(prev_hash, &transactions) {
-            Some(hash) => hash,
-            None => {
-                tracing::error!("Failed to compute legacy TxSet hash");
-                return;
-            }
-        };
+        let hash = TransactionSet::compute_non_generalized_hash(prev_hash, &transactions);
 
         // Create our internal TransactionSet with correct hash
         let internal_tx_set = TransactionSet::with_hash(prev_hash, hash, transactions);

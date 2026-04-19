@@ -405,4 +405,20 @@ mod tests {
         let seed = deterministic_seed("");
         assert!(seed.iter().all(|&b| b == b'.'));
     }
+
+    #[test]
+    fn test_hash_xdr_and_try_hash_xdr_agree() {
+        use stellar_xdr::curr::Hash;
+        let value = Hash([99u8; 32]);
+        let infallible = Hash256::hash_xdr(&value);
+        let fallible = Hash256::try_hash_xdr(&value).unwrap();
+        assert_eq!(infallible, fallible);
+    }
+
+    #[test]
+    fn test_hash_xdr_deterministic() {
+        use stellar_xdr::curr::Hash;
+        let value = Hash([1u8; 32]);
+        assert_eq!(Hash256::hash_xdr(&value), Hash256::hash_xdr(&value));
+    }
 }

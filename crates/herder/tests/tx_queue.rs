@@ -3,11 +3,11 @@ use henyey_herder::{TransactionQueue, TxQueueConfig};
 use henyey_tx::muxed_to_account_id;
 use stellar_xdr::curr::{
     AccountId, AlphaNum4, Asset, AssetCode4, CreateAccountOp, DecoratedSignature, HostFunction,
-    InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, Limits, ManageSellOfferOp, Memo,
+    InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, ManageSellOfferOp, Memo,
     MuxedAccount, Operation, OperationBody, Preconditions, Price, PublicKey, ScAddress, ScSymbol,
     ScVal, SequenceNumber, Signature as XdrSignature, SignatureHint, SorobanResources,
     SorobanTransactionData, SorobanTransactionDataExt, StringM, Transaction, TransactionEnvelope,
-    TransactionExt, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    TransactionExt, TransactionV1Envelope, Uint256, VecM,
 };
 
 fn make_test_envelope(fee: u32, ops: usize) -> TransactionEnvelope {

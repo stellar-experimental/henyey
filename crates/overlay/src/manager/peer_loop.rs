@@ -416,15 +416,11 @@ enum RecvAction {
 fn log_fetch_message(message: &StellarMessage, peer_id: &PeerId, ping: &mut PingTracker) {
     match message {
         StellarMessage::TxSet(ts) => {
-            let hash_hex =
-                match stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()) {
-                    Ok(bytes) => hex::encode(sha2::Sha256::digest(bytes)),
-                    Err(e) => format!("<encoding failed: {e}>"),
-                };
+            let hash = henyey_common::Hash256::hash_xdr(ts);
             debug!(
                 "OVERLAY: Received TxSet from {} hash={} prev_ledger={}",
                 peer_id,
-                hash_hex,
+                hash,
                 hex::encode(ts.previous_ledger_hash.0)
             );
         }

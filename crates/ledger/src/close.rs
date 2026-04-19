@@ -22,13 +22,13 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use henyey_common::Hash256;
+use henyey_common::{xdr_to_bytes, Hash256};
 use henyey_crypto::Sha256Hasher;
 use stellar_xdr::curr::{
     AccountId, ConfigUpgradeSetKey, GeneralizedTransactionSet, LedgerCloseMeta, LedgerHeader,
-    LedgerHeaderExt, LedgerHeaderExtensionV1, LedgerHeaderExtensionV1Ext, LedgerUpgrade, Limits,
+    LedgerHeaderExt, LedgerHeaderExtensionV1, LedgerHeaderExtensionV1Ext, LedgerUpgrade,
     OperationBody, ScpHistoryEntry, StellarValueExt, TransactionEnvelope, TransactionResultPair,
-    TransactionResultSet, TransactionSet, WriteXdr,
+    TransactionResultSet, TransactionSet,
 };
 
 use crate::close_state::CloseLedgerState;
@@ -315,11 +315,7 @@ impl TransactionSetVariant {
                 let mut hasher = Sha256Hasher::new();
                 hasher.update(&set.previous_ledger_hash.0);
                 for tx in set.txs.iter() {
-                    let bytes = match tx.to_xdr(Limits::none()) {
-                        Ok(bytes) => bytes,
-                        Err(_) => return Hash256::ZERO,
-                    };
-                    hasher.update(&bytes);
+                    hasher.update(&xdr_to_bytes(tx));
                 }
                 hasher.finalize()
             }

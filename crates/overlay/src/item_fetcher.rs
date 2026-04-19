@@ -53,7 +53,7 @@ use crate::PeerId;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use stellar_xdr::curr::{Hash, ScpEnvelope, WriteXdr};
+use stellar_xdr::curr::{Hash, ScpEnvelope};
 use tracing::{debug, trace};
 
 /// Type of item being fetched.
@@ -663,9 +663,7 @@ fn compute_envelope_hash(env: &ScpEnvelope) -> Hash {
     let msg = stellar_xdr::curr::StellarMessage::ScpMessage(env.clone());
 
     // Serialize to XDR
-    let xdr_bytes = msg
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .unwrap_or_default();
+    let xdr_bytes = henyey_common::xdr_to_bytes(&msg);
 
     // Compute BLAKE2b-256 hash (matching stellar-core's xdrBlake2)
     let hash256 = henyey_crypto::blake2(&xdr_bytes);

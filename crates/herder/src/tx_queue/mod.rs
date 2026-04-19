@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use henyey_common::{
-    any_greater, Hash256, NetworkId, Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES,
+    any_greater, xdr_to_bytes, Hash256, NetworkId, Resource, ResourceType, NUM_SOROBAN_TX_RESOURCES,
 };
 use henyey_crypto::Sha256Hasher;
 use stellar_xdr::curr::WriteXdr;
@@ -742,15 +742,11 @@ fn source_account_from_envelope(envelope: &TransactionEnvelope) -> stellar_xdr::
 
 fn account_key(envelope: &TransactionEnvelope) -> Vec<u8> {
     let account_id = henyey_tx::muxed_to_account_id(&source_account_from_envelope(envelope));
-    account_id
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .unwrap_or_default()
+    xdr_to_bytes(&account_id)
 }
 
 pub(crate) fn account_key_from_account_id(account_id: &AccountId) -> Vec<u8> {
-    account_id
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .unwrap_or_default()
+    xdr_to_bytes(account_id)
 }
 
 fn account_id_from_envelope(envelope: &TransactionEnvelope) -> AccountId {
@@ -767,9 +763,7 @@ fn fee_source_key(envelope: &TransactionEnvelope) -> Vec<u8> {
         TransactionEnvelope::TxFeeBump(env) => env.tx.fee_source.clone(),
     };
     let account_id = henyey_tx::muxed_to_account_id(&fee_source);
-    account_id
-        .to_xdr(stellar_xdr::curr::Limits::none())
-        .unwrap_or_default()
+    xdr_to_bytes(&account_id)
 }
 
 /// Check if envelope is a fee-bump transaction.
@@ -3084,7 +3078,7 @@ mod tests {
         }
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx_a, tx_b]);
-        let recomputed = tx_set.recompute_hash().expect("recompute hash");
+        let recomputed = tx_set.recompute_hash();
         assert_eq!(tx_set.hash, recomputed);
     }
 
@@ -3150,7 +3144,7 @@ mod tests {
         queue.try_add(soroban);
 
         let (tx_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 100);
-        let recomputed = tx_set.recompute_hash().expect("recompute hash");
+        let recomputed = tx_set.recompute_hash();
         assert_eq!(tx_set.hash, recomputed);
 
         let gen_hash = Hash256::hash_xdr(&gen);

@@ -28,22 +28,20 @@ impl TransactionSet {
     pub fn compute_non_generalized_hash(
         previous_ledger_hash: Hash256,
         transactions: &[TransactionEnvelope],
-    ) -> Option<Hash256> {
+    ) -> Hash256 {
         let mut hasher = Sha256Hasher::new();
         hasher.update(&previous_ledger_hash.0);
         for tx in transactions {
-            let bytes = tx.to_xdr(Limits::none()).ok()?;
-            hasher.update(&bytes);
+            hasher.update(&xdr_to_bytes(tx));
         }
-        Some(hasher.finalize())
+        hasher.finalize()
     }
 
     /// Create a new transaction set with computed hash (for legacy TransactionSet).
     pub fn new(previous_ledger_hash: Hash256, transactions: Vec<TransactionEnvelope>) -> Self {
         let mut transactions = transactions;
         sort_txs_by_hash(&mut transactions);
-        let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions)
-            .unwrap_or_default();
+        let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions);
 
         Self {
             hash,
@@ -93,10 +91,9 @@ impl TransactionSet {
     }
 
     /// Recompute the transaction set hash from its contents.
-    pub fn recompute_hash(&self) -> Option<Hash256> {
+    pub fn recompute_hash(&self) -> Hash256 {
         if let Some(gen) = &self.generalized_tx_set {
-            let bytes = gen.to_xdr(stellar_xdr::curr::Limits::none()).ok()?;
-            return Some(Hash256::hash(&bytes));
+            return Hash256::hash(&xdr_to_bytes(gen));
         }
         Self::compute_non_generalized_hash(self.previous_ledger_hash, &self.transactions)
     }
@@ -160,8 +157,7 @@ impl TransactionSet {
                 let transactions: Vec<TransactionEnvelope> = legacy.txs.to_vec();
 
                 // Compute hash
-                let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions)
-                    .ok_or_else(|| "Failed to compute tx set hash".to_string())?;
+                let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions);
 
                 Ok(Self {
                     hash,
@@ -290,8 +286,7 @@ impl TransactionSet {
             return Err("Legacy transaction set transactions are not sorted correctly".to_string());
         }
 
-        let hash = Self::compute_non_generalized_hash(previous_ledger_hash, transactions)
-            .ok_or_else(|| "Failed to compute tx set hash".to_string())?;
+        let hash = Self::compute_non_generalized_hash(previous_ledger_hash, transactions);
 
         Ok(Self {
             hash,
@@ -1155,7 +1150,7 @@ mod tests {
             Hash256::ZERO,
             vec![make_tx_envelope(1, 100), make_tx_envelope(2, 200)],
         );
-        assert_eq!(tx_set.recompute_hash(), Some(tx_set.hash));
+        assert_eq!(tx_set.recompute_hash(), tx_set.hash);
     }
 
     // --- Negative base fee rejection tests (parity: TxSetFrame.cpp:1442, 1480) ---

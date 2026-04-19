@@ -284,7 +284,7 @@ pub fn get_ttl_key(key: &LedgerKey) -> Option<LedgerKey> {
     }
 
     // Serialize the key to XDR and hash it
-    let key_bytes = key.to_xdr(Limits::none()).ok()?;
+    let key_bytes = henyey_common::xdr_to_bytes(key);
     let mut hasher = Sha256::new();
     hasher.update(&key_bytes);
     let hash_bytes: [u8; 32] = hasher.finalize().into();

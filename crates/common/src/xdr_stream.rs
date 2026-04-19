@@ -621,4 +621,20 @@ mod tests {
         let bytes_normal = std::fs::read(&path_normal).unwrap();
         assert_eq!(bytes_durable, bytes_normal, "Wire format must be identical");
     }
+
+    #[test]
+    fn test_xdr_to_bytes_roundtrips() {
+        use stellar_xdr::curr::Hash;
+        let hash = Hash([42u8; 32]);
+        let bytes = xdr_to_bytes(&hash);
+        let decoded = Hash::from_xdr(&bytes, Limits::none()).unwrap();
+        assert_eq!(hash, decoded);
+    }
+
+    #[test]
+    fn test_xdr_encoded_len_matches_xdr_to_bytes() {
+        use stellar_xdr::curr::Hash;
+        let hash = Hash([0xABu8; 32]);
+        assert_eq!(xdr_encoded_len(&hash), xdr_to_bytes(&hash).len());
+    }
 }

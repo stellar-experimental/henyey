@@ -902,19 +902,13 @@ impl ScpDriver {
             }
             if let Some(tx_set) = self.tx_tracker.get(&tx_set_hash) {
                 // Parity: verify hash integrity
-                match tx_set.recompute_hash() {
-                    Some(computed) if computed == tx_set_hash => {}
-                    Some(computed) => {
-                        debug!(
-                            "Tx set hash mismatch: expected {}, computed {}",
-                            tx_set_hash, computed
-                        );
-                        return ValueValidation::Invalid;
-                    }
-                    None => {
-                        debug!("Failed to recompute tx set hash");
-                        return ValueValidation::Invalid;
-                    }
+                let computed = tx_set.recompute_hash();
+                if computed != tx_set_hash {
+                    debug!(
+                        "Tx set hash mismatch: expected {}, computed {}",
+                        tx_set_hash, computed
+                    );
+                    return ValueValidation::Invalid;
                 }
 
                 // Parity: check previousLedgerHash matches the LCL hash

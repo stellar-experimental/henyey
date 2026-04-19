@@ -153,17 +153,13 @@ impl TxSetTracker {
     /// are rejected to prevent cache poisoning (AUDIT-080).
     pub fn receive(&self, tx_set: TransactionSet) -> Option<u64> {
         let hash = tx_set.hash;
-        if let Some(recomputed) = tx_set.recompute_hash() {
-            if recomputed != hash {
-                warn!(
-                    expected = %hash,
-                    computed = %recomputed,
-                    "Rejecting tx set with mismatched hash"
-                );
-                return None;
-            }
-        } else {
-            warn!(%hash, "Rejecting tx set without recomputable hash");
+        let recomputed = tx_set.recompute_hash();
+        if recomputed != hash {
+            warn!(
+                expected = %hash,
+                computed = %recomputed,
+                "Rejecting tx set with mismatched hash"
+            );
             return None;
         }
 

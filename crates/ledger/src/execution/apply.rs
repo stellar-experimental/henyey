@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 
 use henyey_crypto::account_id_to_strkey;
 use stellar_xdr::curr::{
-    AccountId, ContractEvent, DiagnosticEvent, LedgerKey, Limits, OperationBody, OperationResult,
-    OperationType, SorobanTransactionData, TransactionResultCode, TrustLineFlags, WriteXdr,
+    AccountId, ContractEvent, DiagnosticEvent, LedgerKey, OperationBody, OperationResult,
+    OperationType, SorobanTransactionData, TransactionResultCode, TrustLineFlags,
 };
 use tracing::debug;
 
@@ -183,11 +183,10 @@ pub(super) fn collect_soroban_restored_entries(
     // HotArchiveBucketList::add_batch only receives data/code entries.
     let ttl_keys: Vec<_> = hot_archive_for_meta
         .iter()
-        .filter_map(|key| {
-            // Compute key hash as SHA256 of key XDR
-            let key_bytes = key.to_xdr(Limits::none()).ok()?;
+        .map(|key| {
+            let key_bytes = henyey_common::xdr_to_bytes(key);
             let key_hash = stellar_xdr::curr::Hash(Sha256::digest(&key_bytes).into());
-            Some(LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash }))
+            LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl { key_hash })
         })
         .collect();
     // Collect data/code keys only for HotArchiveBucketList::add_batch.

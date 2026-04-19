@@ -427,7 +427,7 @@ impl InMemoryIndex {
             }
         }
 
-        let key_bytes = key.to_xdr(Limits::none()).ok()?;
+        let key_bytes = henyey_common::xdr_to_bytes(key);
         self.key_to_offset.get(&key_bytes).copied()
     }
 
