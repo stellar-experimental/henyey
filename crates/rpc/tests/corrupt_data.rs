@@ -5,29 +5,30 @@
 //!   ("XDR data integrity error") when stored body/result/meta XDR is corrupt
 //! - `getEvents` skips corrupt event rows but returns surrounding valid events
 //!
-//! Uses the same simulation harness as `http_dispatch.rs`, with corrupt data
-//! injected directly into the SQLite database via `HistoryQueries` /
+//! Uses the lightweight [`FakeRpcApp`] harness with corrupt data injected
+//! directly into the in-memory SQLite database via `HistoryQueries` /
 //! `EventQueries` trait methods.
 
 mod common;
 
-use std::time::Duration;
-
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use henyey_db::{
-    EventQueries, EventRecord, HistoryQueries, LedgerCloseMetaQueries, StoreTxParams, TxStatus,
+    EventQueries, EventRecord, HistoryQueries, LedgerCloseMetaQueries, LedgerQueries,
+    StoreTxParams, TxStatus,
 };
-use henyey_rpc::RpcServer;
 use serde_json::json;
 use stellar_xdr::curr::{
     ContractEvent, ContractEventBody, ContractEventType, ContractEventV0, ExtensionPoint, Hash,
-    Limits, Memo, MuxedAccount, Preconditions, ScVal, SequenceNumber, Transaction,
-    TransactionEnvelope, TransactionExt, TransactionMeta, TransactionMetaV3, TransactionResult,
-    TransactionResultExt, TransactionResultPair, TransactionResultResult, TransactionV1Envelope,
-    Uint256, WriteXdr,
+    LedgerHeader, LedgerHeaderExt, Limits, Memo, MuxedAccount, Preconditions, ScVal,
+    SequenceNumber, StellarValue, StellarValueExt, TimePoint, Transaction, TransactionEnvelope,
+    TransactionExt, TransactionMeta, TransactionMetaV3, TransactionResult, TransactionResultExt,
+    TransactionResultPair, TransactionResultResult, TransactionV1Envelope, Uint256, WriteXdr,
 };
 
-use common::{assert_envelope, boot_single_node_sim, post_rpc};
+use common::fake_app::{FakeRpcApp, FakeRpcTestHarness};
+use henyey_rpc::RpcAppHandle;
+
+use crate::common::assert_envelope;
 
 // ---------------------------------------------------------------------------
 // XDR fixture builders
@@ -110,29 +111,59 @@ fn assert_xdr_integrity_error(resp: &serde_json::Value, id: &serde_json::Value) 
     );
 }
 
-/// Boot a sim, bind RPC, return (sim, url, client).
-async fn setup_rpc() -> (
-    henyey_simulation::Simulation,
-    String,
-    reqwest::Client,
-    std::sync::Arc<henyey_app::App>,
-    tokio::task::JoinHandle<()>,
-) {
-    let (sim, node_id) = boot_single_node_sim().await;
-    let app = sim.app(&node_id).expect("app");
-    let (running, addr) = RpcServer::new(0, app.clone())
-        .bind()
-        .await
-        .expect("rpc bind");
-    let url = format!("http://{addr}/");
-    let serve_handle = tokio::spawn(async move {
-        let _ = running.serve().await;
-    });
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .expect("reqwest client");
-    (sim, url, client, app, serve_handle)
+/// Build a minimal [`LedgerHeader`] at the given sequence and close time.
+fn test_header(seq: u32, close_time: u64) -> LedgerHeader {
+    LedgerHeader {
+        ledger_version: 25,
+        previous_ledger_hash: Hash([0; 32]),
+        scp_value: StellarValue {
+            tx_set_hash: Hash([0; 32]),
+            close_time: TimePoint(close_time),
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Basic,
+        },
+        tx_set_result_hash: Hash([0; 32]),
+        bucket_list_hash: Hash([0; 32]),
+        ledger_seq: seq,
+        total_coins: 0,
+        fee_pool: 0,
+        inflation_seq: 0,
+        id_pool: 0,
+        base_fee: 100,
+        base_reserve: 5_000_000,
+        max_tx_set_size: 100,
+        skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+        ext: LedgerHeaderExt::V0,
+    }
+}
+
+/// Seed a ledger header row in the DB so `require_close_times()` succeeds.
+fn seed_ledger_header(db: &henyey_db::Database, seq: u32, close_time: u64) {
+    let header = test_header(seq, close_time);
+    let data = header.to_xdr(Limits::none()).unwrap();
+    db.with_connection(|conn| conn.store_ledger_header(&header, &data))
+        .unwrap();
+}
+
+/// Boot a [`FakeRpcTestHarness`] with `ledger_seq` set and a DB header row
+/// seeded at the given sequence. Suitable for getTransaction, getTransactions,
+/// and getEvents tests that use `startLedger`.
+async fn setup_fake_rpc() -> FakeRpcTestHarness {
+    let app = FakeRpcApp::builder().ledger_seq(2).build();
+    let h = FakeRpcTestHarness::start(app).await;
+    seed_ledger_header(h.app.database(), 2, 1_700_000_000);
+    h
+}
+
+/// Boot a [`FakeRpcTestHarness`] with a full header snapshot at the given
+/// sequence, plus a matching DB header row. Suitable for getLatestLedger
+/// and getLedgers tests that depend on `ledger_snapshot().header.ledger_seq`.
+async fn setup_fake_rpc_with_header(seq: u32, close_time: u64) -> FakeRpcTestHarness {
+    let header = test_header(seq, close_time);
+    let app = FakeRpcApp::builder().header_snapshot(header).build();
+    let h = FakeRpcTestHarness::start(app).await;
+    seed_ledger_header(h.app.database(), seq, close_time);
+    h
 }
 
 // ---------------------------------------------------------------------------
@@ -141,10 +172,11 @@ async fn setup_rpc() -> (
 
 #[tokio::test]
 async fn get_transaction_corrupt_body() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc().await;
 
     let tx_id = "corrupt_body_test_hash_001";
-    app.database()
+    h.app
+        .database()
         .with_connection(|conn| {
             conn.store_transaction(&StoreTxParams {
                 ledger_seq: 2,
@@ -159,31 +191,26 @@ async fn get_transaction_corrupt_body() {
         .unwrap();
 
     let id = json!("corrupt-body");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getTransaction",
             "params": {"hash": tx_id}
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 #[tokio::test]
 async fn get_transaction_corrupt_result() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc().await;
 
     let tx_id = "corrupt_result_test_hash_002";
-    app.database()
+    h.app
+        .database()
         .with_connection(|conn| {
             conn.store_transaction(&StoreTxParams {
                 ledger_seq: 2,
@@ -198,31 +225,26 @@ async fn get_transaction_corrupt_result() {
         .unwrap();
 
     let id = json!("corrupt-result");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getTransaction",
             "params": {"hash": tx_id}
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 #[tokio::test]
 async fn get_transaction_corrupt_meta() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc().await;
 
     let tx_id = "corrupt_meta_test_hash_003";
-    app.database()
+    h.app
+        .database()
         .with_connection(|conn| {
             conn.store_transaction(&StoreTxParams {
                 ledger_seq: 2,
@@ -237,23 +259,17 @@ async fn get_transaction_corrupt_meta() {
         .unwrap();
 
     let id = json!("corrupt-meta");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getTransaction",
             "params": {"hash": tx_id}
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,9 +278,10 @@ async fn get_transaction_corrupt_meta() {
 
 #[tokio::test]
 async fn get_transactions_corrupt_body() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc().await;
 
-    app.database()
+    h.app
+        .database()
         .with_connection(|conn| {
             conn.store_transaction(&StoreTxParams {
                 ledger_seq: 2,
@@ -279,30 +296,25 @@ async fn get_transactions_corrupt_body() {
         .unwrap();
 
     let id = json!("txs-corrupt-body");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getTransactions",
             "params": {"startLedger": 2}
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 #[tokio::test]
 async fn get_transactions_corrupt_result() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc().await;
 
-    app.database()
+    h.app
+        .database()
         .with_connection(|conn| {
             conn.store_transaction(&StoreTxParams {
                 ledger_seq: 2,
@@ -317,30 +329,25 @@ async fn get_transactions_corrupt_result() {
         .unwrap();
 
     let id = json!("txs-corrupt-result");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getTransactions",
             "params": {"startLedger": 2}
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 #[tokio::test]
 async fn get_transactions_corrupt_meta() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc().await;
 
-    app.database()
+    h.app
+        .database()
         .with_connection(|conn| {
             conn.store_transaction(&StoreTxParams {
                 ledger_seq: 2,
@@ -355,23 +362,17 @@ async fn get_transactions_corrupt_meta() {
         .unwrap();
 
     let id = json!("txs-corrupt-meta");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getTransactions",
             "params": {"startLedger": 2}
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 // ---------------------------------------------------------------------------
@@ -395,7 +396,7 @@ fn make_event_record(id: &str, ledger_seq: u32, tx_index: u32, event_xdr: &str) 
 
 #[tokio::test]
 async fn get_events_skips_corrupt_xdr() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc().await;
 
     let valid_xdr = valid_event_xdr_b64();
     let event_a = make_event_record("0000000008589934592-0000000001", 2, 0, &valid_xdr);
@@ -408,22 +409,20 @@ async fn get_events_skips_corrupt_xdr() {
         "not-valid-base64!!!",
     );
 
-    app.database()
+    h.app
+        .database()
         .with_connection(|conn| conn.store_events(&[event_a, event_b, event_c]))
         .unwrap();
 
     let id = json!("events-corrupt-xdr");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getEvents",
             "params": {"startLedger": 2}
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_envelope(&resp, &id);
@@ -442,34 +441,29 @@ async fn get_events_skips_corrupt_xdr() {
         result["cursor"], "0000000008589934592-0000000003",
         "cursor should advance past corrupt row"
     );
-
-    handle.abort();
-    drop(sim);
 }
 
 #[tokio::test]
 async fn get_events_all_corrupt_still_advances_cursor() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc().await;
 
     let event_a = make_event_record("0000000008589934592-0000000010", 2, 0, "corrupt-base64-aaa");
     let event_b = make_event_record("0000000008589934592-0000000011", 2, 1, "corrupt-base64-bbb");
 
-    app.database()
+    h.app
+        .database()
         .with_connection(|conn| conn.store_events(&[event_a, event_b]))
         .unwrap();
 
     let id = json!("events-all-corrupt");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getEvents",
             "params": {"startLedger": 2}
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_envelope(&resp, &id);
@@ -481,14 +475,11 @@ async fn get_events_all_corrupt_still_advances_cursor() {
         result["cursor"], "0000000008589934592-0000000011",
         "cursor should still advance past all corrupt rows"
     );
-
-    handle.abort();
-    drop(sim);
 }
 
 #[tokio::test]
 async fn get_events_skips_corrupt_topic_json_mode() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc().await;
 
     let valid_xdr = valid_event_xdr_b64();
     // Valid topic: a base64-encoded ScVal
@@ -522,22 +513,20 @@ async fn get_events_skips_corrupt_topic_json_mode() {
         in_successful_contract_call: true,
     };
 
-    app.database()
+    h.app
+        .database()
         .with_connection(|conn| conn.store_events(&[event_a, event_b]))
         .unwrap();
 
     let id = json!("events-corrupt-topic");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getEvents",
             "params": {"startLedger": 2, "xdrFormat": "json"}
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_envelope(&resp, &id);
@@ -549,9 +538,6 @@ async fn get_events_skips_corrupt_topic_json_mode() {
         "corrupt-topic event should be skipped in JSON mode"
     );
     assert_eq!(events[0]["id"], "0000000008589934592-0000000020");
-
-    handle.abort();
-    drop(sim);
 }
 
 // ---------------------------------------------------------------------------
@@ -560,54 +546,50 @@ async fn get_events_skips_corrupt_topic_json_mode() {
 
 #[tokio::test]
 async fn get_latest_ledger_corrupt_metadata() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc_with_header(2, 1_700_000_000).await;
 
     // Overwrite the current ledger's LedgerCloseMeta with corrupt bytes.
-    let ledger_num = app.ledger_summary().num;
-    app.database()
-        .with_connection(|conn| conn.store_ledger_close_meta(ledger_num, CORRUPT_BYTES))
+    h.app
+        .database()
+        .with_connection(|conn| conn.store_ledger_close_meta(2, CORRUPT_BYTES))
         .unwrap();
 
     let id = json!("latest-corrupt-meta");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getLatestLedger"
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 #[tokio::test]
 async fn get_latest_ledger_missing_metadata() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc_with_header(2, 1_700_000_000).await;
 
-    // Delete the current ledger's LedgerCloseMeta row so it appears missing.
-    let ledger_num = app.ledger_summary().num;
-    app.database()
-        .with_connection(|conn| conn.delete_old_ledger_close_meta(ledger_num, 1000))
+    // Seed valid metadata then delete it, so it appears "missing" for a
+    // ledger that did exist — matching the original sim-backed behavior.
+    let valid_lcm = valid_lcm_bytes(2);
+    h.app
+        .database()
+        .with_connection(|conn| {
+            conn.store_ledger_close_meta(2, &valid_lcm)?;
+            conn.delete_old_ledger_close_meta(2, 1000)
+        })
         .unwrap();
 
     let id = json!("latest-missing-meta");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getLatestLedger"
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_envelope(&resp, &id);
@@ -619,9 +601,6 @@ async fn get_latest_ledger_missing_metadata() {
     // Other fields should still be present.
     assert!(result["sequence"].as_u64().unwrap() > 0);
     assert!(!result["headerXdr"].as_str().unwrap().is_empty());
-
-    handle.abort();
-    drop(sim);
 }
 
 // ---------------------------------------------------------------------------
@@ -630,32 +609,26 @@ async fn get_latest_ledger_missing_metadata() {
 
 #[tokio::test]
 async fn get_ledgers_corrupt_metadata() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc_with_header(2, 1_700_000_000).await;
 
     // Overwrite ledger 2's LedgerCloseMeta with corrupt bytes.
-    let ledger_num = app.ledger_summary().num;
-    app.database()
-        .with_connection(|conn| conn.store_ledger_close_meta(ledger_num, CORRUPT_BYTES))
+    h.app
+        .database()
+        .with_connection(|conn| conn.store_ledger_close_meta(2, CORRUPT_BYTES))
         .unwrap();
 
     let id = json!("ledgers-corrupt-meta");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getLedgers",
-            "params": {"startLedger": ledger_num}
-        }),
-    )
-    .await;
+            "params": {"startLedger": 2}
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 // ---------------------------------------------------------------------------
@@ -709,64 +682,52 @@ fn valid_lcm_bytes(seq: u32) -> Vec<u8> {
 
 #[tokio::test]
 async fn get_ledgers_sequence_mismatch() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc_with_header(2, 1_700_000_000).await;
 
     // Store a valid LCM whose embedded sequence (9999) differs from the DB key.
-    let ledger_num = app.ledger_summary().num;
     let wrong_seq_lcm = valid_lcm_bytes(9999);
-    app.database()
-        .with_connection(|conn| conn.store_ledger_close_meta(ledger_num, &wrong_seq_lcm))
+    h.app
+        .database()
+        .with_connection(|conn| conn.store_ledger_close_meta(2, &wrong_seq_lcm))
         .unwrap();
 
     let id = json!("ledgers-seq-mismatch");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getLedgers",
-            "params": {"startLedger": ledger_num}
-        }),
-    )
-    .await;
+            "params": {"startLedger": 2}
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 #[tokio::test]
 async fn get_latest_ledger_sequence_mismatch() {
-    let (sim, url, client, app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc_with_header(2, 1_700_000_000).await;
 
     // Store a valid LCM whose embedded sequence (9999) differs from the
     // current ledger number used by getLatestLedger.
-    let ledger_num = app.ledger_summary().num;
     let wrong_seq_lcm = valid_lcm_bytes(9999);
-    app.database()
-        .with_connection(|conn| conn.store_ledger_close_meta(ledger_num, &wrong_seq_lcm))
+    h.app
+        .database()
+        .with_connection(|conn| conn.store_ledger_close_meta(2, &wrong_seq_lcm))
         .unwrap();
 
     let id = json!("latest-seq-mismatch");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getLatestLedger"
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_xdr_integrity_error(&resp, &id);
-
-    handle.abort();
-    drop(sim);
 }
 
 // ---------------------------------------------------------------------------
@@ -783,21 +744,25 @@ async fn get_latest_ledger_sequence_mismatch() {
 #[tokio::test]
 async fn get_latest_ledger_fields_consistent_with_header_xdr() {
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{LedgerHeader, ReadXdr};
+    use stellar_xdr::curr::{LedgerHeader as XdrLedgerHeader, ReadXdr};
 
-    let (sim, url, client, _app, handle) = setup_rpc().await;
+    let h = setup_fake_rpc_with_header(2, 1_700_000_000).await;
+
+    // Store a valid LCM at seq 2 so metadataXdr is populated.
+    let valid_lcm = valid_lcm_bytes(2);
+    h.app
+        .database()
+        .with_connection(|conn| conn.store_ledger_close_meta(2, &valid_lcm))
+        .unwrap();
 
     let id = json!("consistency-check");
-    let (status, resp) = post_rpc(
-        &client,
-        &url,
-        json!({
+    let (status, resp) = h
+        .post_rpc(json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "getLatestLedger"
-        }),
-    )
-    .await;
+        }))
+        .await;
 
     assert_eq!(status, 200);
     assert_envelope(&resp, &id);
@@ -809,7 +774,7 @@ async fn get_latest_ledger_fields_consistent_with_header_xdr() {
         .expect("headerXdr must be a string");
     let header_bytes = BASE64.decode(header_b64).expect("valid base64");
     let header =
-        LedgerHeader::from_xdr(&header_bytes, Limits::none()).expect("valid LedgerHeader XDR");
+        XdrLedgerHeader::from_xdr(&header_bytes, Limits::none()).expect("valid LedgerHeader XDR");
 
     // Assert all in-memory fields match the decoded header
     let resp_seq = result["sequence"].as_u64().expect("sequence");
@@ -842,7 +807,4 @@ async fn get_latest_ledger_fields_consistent_with_header_xdr() {
         resp_id, computed_hex,
         "response id must equal SHA-256 of headerXdr bytes"
     );
-
-    handle.abort();
-    drop(sim);
 }

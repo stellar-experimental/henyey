@@ -11,10 +11,11 @@ use henyey_app::app::AppInfo;
 use henyey_app::config::AppConfig;
 use henyey_app::{AppState, LedgerSummary};
 use henyey_bucket::BucketSnapshotManager;
+use henyey_common::Hash256;
 use henyey_herder::TxQueueResult;
 use henyey_ledger::{HeaderSnapshot, LedgerManager, LedgerManagerConfig, SorobanNetworkInfo};
 use henyey_rpc::{RpcAppHandle, RpcServer};
-use stellar_xdr::curr::TransactionEnvelope;
+use stellar_xdr::curr::{LedgerHeader, Limits, TransactionEnvelope, WriteXdr};
 use tokio::sync::broadcast;
 
 // ---------------------------------------------------------------------------
@@ -137,6 +138,7 @@ pub struct FakeRpcAppBuilder {
     close_time: Option<u64>,
     protocol_version: Option<u32>,
     base_fee: Option<u32>,
+    header_snapshot: Option<LedgerHeader>,
 }
 
 impl Default for FakeRpcAppBuilder {
@@ -149,6 +151,7 @@ impl Default for FakeRpcAppBuilder {
             close_time: None,
             protocol_version: None,
             base_fee: None,
+            header_snapshot: None,
         }
     }
 }
@@ -192,6 +195,18 @@ impl FakeRpcAppBuilder {
         self
     }
 
+    /// Set a custom [`LedgerHeader`] on the underlying [`LedgerManager`].
+    ///
+    /// The header hash is computed automatically from the XDR encoding.
+    /// When set, `ledger_summary()` derives `num`, `close_time`, and
+    /// `version` from this header (unless explicitly overridden), keeping
+    /// `ledger_summary()` and `ledger_snapshot()` consistent.
+    #[allow(dead_code)]
+    pub fn header_snapshot(mut self, header: LedgerHeader) -> Self {
+        self.header_snapshot = Some(header);
+        self
+    }
+
     pub fn build(self) -> FakeRpcApp {
         let mut config = AppConfig::testnet();
         config.rpc.enabled = true;
@@ -201,6 +216,23 @@ impl FakeRpcAppBuilder {
             self.network_passphrase,
             LedgerManagerConfig::default(),
         ));
+
+        // Apply the header snapshot if provided, and derive overrides from it.
+        let (ledger_seq_override, close_time_override, protocol_version_override) =
+            if let Some(ref header) = self.header_snapshot {
+                let xdr_bytes = header.to_xdr(Limits::none()).expect("header XDR encoding");
+                let hash = Hash256::hash(&xdr_bytes);
+                ledger_manager.set_header_for_test(header.clone(), hash);
+                // Derive overrides from the header; explicit builder values take
+                // precedence so callers can still tweak individual fields.
+                (
+                    Some(self.ledger_seq.unwrap_or(header.ledger_seq)),
+                    Some(self.close_time.unwrap_or(header.scp_value.close_time.0)),
+                    Some(self.protocol_version.unwrap_or(header.ledger_version)),
+                )
+            } else {
+                (self.ledger_seq, self.close_time, self.protocol_version)
+            };
 
         let database =
             henyey_db::Database::open_in_memory().expect("in-memory database must succeed");
@@ -217,9 +249,9 @@ impl FakeRpcAppBuilder {
             shutdown_tx,
             state: self.state,
             submit_result: self.submit_result,
-            ledger_seq_override: self.ledger_seq,
-            close_time_override: self.close_time,
-            protocol_version_override: self.protocol_version,
+            ledger_seq_override,
+            close_time_override,
+            protocol_version_override,
             base_fee_override: self.base_fee,
         }
     }
@@ -238,6 +270,7 @@ impl FakeRpcApp {
 /// A running RPC server backed by a [`FakeRpcApp`], with cleanup on drop.
 pub struct FakeRpcTestHarness {
     pub url: String,
+    pub app: Arc<FakeRpcApp>,
     pub shutdown_tx: broadcast::Sender<()>,
     pub serve_handle: tokio::task::JoinHandle<()>,
     pub client: reqwest::Client,
@@ -249,7 +282,7 @@ impl FakeRpcTestHarness {
         let shutdown_tx = app.shutdown_tx.clone();
         let app = Arc::new(app);
 
-        let (running, addr) = RpcServer::new(0, app)
+        let (running, addr) = RpcServer::new(0, app.clone())
             .bind()
             .await
             .expect("fake RPC server bind");
@@ -267,6 +300,7 @@ impl FakeRpcTestHarness {
 
         Self {
             url,
+            app,
             shutdown_tx,
             serve_handle,
             client,
