@@ -7,7 +7,7 @@
 use super::*;
 
 pub(super) fn sort_txs_by_hash(txs: &mut [TransactionEnvelope]) {
-    txs.sort_by_cached_key(|tx| Hash256::hash_xdr(tx).unwrap_or_default().0);
+    txs.sort_by_cached_key(|tx| Hash256::hash_xdr(tx).0);
 }
 
 /// A set of transactions for a ledger.
@@ -404,8 +404,8 @@ fn validate_parallel_component(
     for stage in parallel.execution_stages.iter() {
         // Check clusters within this stage are sorted by first-TX hash
         let cluster_sorted = stage.windows(2).all(|pair| {
-            let hash_a = Hash256::hash_xdr(&pair[0][0]).unwrap_or_default();
-            let hash_b = Hash256::hash_xdr(&pair[1][0]).unwrap_or_default();
+            let hash_a = Hash256::hash_xdr(&pair[0][0]);
+            let hash_b = Hash256::hash_xdr(&pair[1][0]);
             hash_a.0 < hash_b.0
         });
         if !cluster_sorted {
@@ -417,8 +417,8 @@ fn validate_parallel_component(
     // Check stages are sorted by first-TX-of-first-cluster hash
     let stages = &parallel.execution_stages;
     let stages_sorted = stages.windows(2).all(|pair| {
-        let hash_a = Hash256::hash_xdr(&pair[0][0][0]).unwrap_or_default();
-        let hash_b = Hash256::hash_xdr(&pair[1][0][0]).unwrap_or_default();
+        let hash_a = Hash256::hash_xdr(&pair[0][0][0]);
+        let hash_b = Hash256::hash_xdr(&pair[1][0][0]);
         hash_a.0 < hash_b.0
     });
     if !stages_sorted {
@@ -543,8 +543,8 @@ fn validate_tx_fee(env: &TransactionEnvelope) -> std::result::Result<(), String>
 /// Check if a slice of transaction envelopes is sorted by hash.
 fn is_sorted_by_hash(txs: &[TransactionEnvelope]) -> bool {
     txs.windows(2).all(|pair| {
-        let hash_a = Hash256::hash_xdr(&pair[0]).unwrap_or_default();
-        let hash_b = Hash256::hash_xdr(&pair[1]).unwrap_or_default();
+        let hash_a = Hash256::hash_xdr(&pair[0]);
+        let hash_b = Hash256::hash_xdr(&pair[1]);
         hash_a.0 <= hash_b.0
     })
 }
@@ -895,15 +895,9 @@ mod tests {
             make_tx_envelope(3, 100),
         ];
         sort_txs_by_hash(&mut txs);
-        let sorted_once: Vec<[u8; 32]> = txs
-            .iter()
-            .map(|t| Hash256::hash_xdr(t).unwrap_or_default().0)
-            .collect();
+        let sorted_once: Vec<[u8; 32]> = txs.iter().map(|t| Hash256::hash_xdr(t).0).collect();
         sort_txs_by_hash(&mut txs);
-        let sorted_twice: Vec<[u8; 32]> = txs
-            .iter()
-            .map(|t| Hash256::hash_xdr(t).unwrap_or_default().0)
-            .collect();
+        let sorted_twice: Vec<[u8; 32]> = txs.iter().map(|t| Hash256::hash_xdr(t).0).collect();
         assert_eq!(sorted_once, sorted_twice);
     }
 
@@ -1054,8 +1048,8 @@ mod tests {
     fn test_validate_parallel_component_rejects_unsorted_clusters() {
         let tx_a = make_tx_envelope(1, 100);
         let tx_b = make_tx_envelope(2, 100);
-        let hash_a = Hash256::hash_xdr(&tx_a).unwrap_or_default();
-        let hash_b = Hash256::hash_xdr(&tx_b).unwrap_or_default();
+        let hash_a = Hash256::hash_xdr(&tx_a);
+        let hash_b = Hash256::hash_xdr(&tx_b);
 
         let (first, second) = if hash_a.0 < hash_b.0 {
             (tx_b, tx_a)
@@ -1088,8 +1082,8 @@ mod tests {
     fn test_validate_parallel_component_rejects_unsorted_stages() {
         let tx_a = make_tx_envelope(1, 100);
         let tx_b = make_tx_envelope(2, 100);
-        let hash_a = Hash256::hash_xdr(&tx_a).unwrap_or_default();
-        let hash_b = Hash256::hash_xdr(&tx_b).unwrap_or_default();
+        let hash_a = Hash256::hash_xdr(&tx_a);
+        let hash_b = Hash256::hash_xdr(&tx_b);
 
         let (stage0_tx, stage1_tx) = if hash_a.0 < hash_b.0 {
             (tx_b, tx_a)

@@ -323,7 +323,7 @@ pub trait SCPDriver: Send + Sync {
     /// This is used to reference quorum sets by hash in SCP messages.
     fn hash_quorum_set(&self, quorum_set: &ScpQuorumSet) -> Hash256 {
         // Default implementation using XDR serialization
-        Hash256::hash_xdr(quorum_set).unwrap_or(Hash256::ZERO)
+        Hash256::hash_xdr(quorum_set)
     }
 
     /// Get the weight of a node in quorum calculations.

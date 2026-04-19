@@ -430,8 +430,7 @@ fn native_asset_contract_id(network_id: &NetworkId) -> ContractId {
         network_id: Hash::from(network_id.0),
         contract_id_preimage: ContractIdPreimage::Asset(stellar_xdr::curr::Asset::Native),
     });
-    let hash = henyey_common::Hash256::hash_xdr(&preimage)
-        .unwrap_or_else(|_| henyey_common::Hash256::ZERO);
+    let hash = henyey_common::Hash256::hash_xdr(&preimage);
     ContractId(Hash::from(hash))
 }
 

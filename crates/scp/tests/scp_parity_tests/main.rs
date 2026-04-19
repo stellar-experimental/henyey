@@ -84,7 +84,7 @@ struct TestSCPDriver {
 
 impl TestSCPDriver {
     fn new(node_id: NodeId, quorum_set: ScpQuorumSet) -> Self {
-        let qs_hash = Hash256::hash_xdr(&quorum_set).unwrap_or(Hash256::ZERO);
+        let qs_hash = Hash256::hash_xdr(&quorum_set);
         let mut quorum_sets = HashMap::new();
         quorum_sets.insert(qs_hash, quorum_set.clone());
         Self {
@@ -108,7 +108,7 @@ impl TestSCPDriver {
     }
 
     fn store_quorum_set(&self, qs: &ScpQuorumSet) {
-        let hash = Hash256::hash_xdr(qs).unwrap_or(Hash256::ZERO);
+        let hash = Hash256::hash_xdr(qs);
         self.quorum_sets.write().unwrap().insert(hash, qs.clone());
     }
 
@@ -529,7 +529,7 @@ fn make_core3_quorum_set() -> ScpQuorumSet {
 }
 
 fn quorum_set_hash(qs: &ScpQuorumSet) -> Hash256 {
-    Hash256::hash_xdr(qs).unwrap_or(Hash256::ZERO)
+    Hash256::hash_xdr(qs)
 }
 
 // ---------------------------------------------------------------------------

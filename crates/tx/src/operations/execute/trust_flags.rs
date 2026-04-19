@@ -498,8 +498,7 @@ fn get_revoke_id(
         liquidity_pool_id: pool_id.clone(),
         asset: asset.clone(),
     });
-    let hash = henyey_common::Hash256::hash_xdr(&preimage)
-        .map_err(|e| crate::TxError::Internal(format!("revoke id hash error: {}", e)))?;
+    let hash = henyey_common::Hash256::hash_xdr(&preimage);
     Ok(ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(hash.0)))
 }
 

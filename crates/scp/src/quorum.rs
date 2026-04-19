@@ -348,7 +348,7 @@ pub fn find_closest_v_blocking(
 /// in SCP messages, allowing efficient comparison and storage.
 pub fn hash_quorum_set(quorum_set: &ScpQuorumSet) -> Hash256 {
     // INVARIANT: XDR serialization of valid SCP values cannot fail; hash always succeeds
-    Hash256::hash_xdr(quorum_set).unwrap_or(Hash256::ZERO)
+    Hash256::hash_xdr(quorum_set)
 }
 
 /// Normalize a quorum set by sorting validators and inner sets.

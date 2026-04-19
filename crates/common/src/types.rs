@@ -99,10 +99,21 @@ impl Hash256 {
     /// an intermediate buffer. This is significantly faster for large
     /// structures (e.g. transaction sets with thousands of entries).
     ///
-    /// # Errors
+    /// # Panics
     ///
-    /// Returns an error if XDR serialization fails.
-    pub fn hash_xdr<T: stellar_xdr::curr::WriteXdr>(
+    /// Panics if XDR serialization fails. For in-memory, already-validated
+    /// values encoded with `Limits::none()`, this is an internal invariant
+    /// violation and should never happen in practice.
+    pub fn hash_xdr<T: stellar_xdr::curr::WriteXdr>(value: &T) -> Self {
+        Self::try_hash_xdr(value).expect("XDR encoding of in-memory value must not fail")
+    }
+
+    /// Fallible version of [`hash_xdr`] — returns `Err` instead of panicking.
+    ///
+    /// Prefer [`hash_xdr`] in production code where encoding failure is an
+    /// invariant violation. Use this only when the caller genuinely needs to
+    /// handle the error (e.g. encoding untrusted or partially-constructed data).
+    pub fn try_hash_xdr<T: stellar_xdr::curr::WriteXdr>(
         value: &T,
     ) -> Result<Self, stellar_xdr::curr::Error> {
         use stellar_xdr::curr::Limited;

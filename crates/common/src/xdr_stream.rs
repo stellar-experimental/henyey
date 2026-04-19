@@ -23,6 +23,19 @@ use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
 const FRAME_CONTINUATION_BIT: u8 = 0x80;
 const MAX_FRAME_SIZE: u32 = 0x8000_0000;
 
+/// Encode a value to XDR bytes.
+///
+/// # Panics
+///
+/// Panics if XDR serialization fails. For in-memory, already-validated
+/// values encoded with `Limits::none()`, this is an internal invariant
+/// violation and should never happen in practice.
+pub fn xdr_to_bytes<T: WriteXdr>(value: &T) -> Vec<u8> {
+    value
+        .to_xdr(Limits::none())
+        .expect("XDR encoding of in-memory value must not fail")
+}
+
 fn open_truncated_output_file(path: impl AsRef<Path>) -> io::Result<File> {
     std::fs::OpenOptions::new()
         .write(true)
@@ -49,7 +62,9 @@ pub fn xdr_encoded_len(val: &impl WriteXdr) -> usize {
         }
     }
     let mut w = stellar_xdr::curr::Limited::new(CountingWriter(0), Limits::none());
-    val.write_xdr(&mut w).map(|_| w.inner.0).unwrap_or(0)
+    val.write_xdr(&mut w)
+        .expect("XDR encoding of in-memory value must not fail");
+    w.inner.0
 }
 
 #[inline]

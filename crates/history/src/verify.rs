@@ -437,7 +437,7 @@ pub fn verify_scp_history_entries(entries: &[ScpHistoryEntry]) -> Result<()> {
         let ScpHistoryEntry::V0(v0) = entry;
         let mut qset_hashes = std::collections::HashSet::new();
         for qset in v0.quorum_sets.iter() {
-            qset_hashes.insert(Hash256::hash_xdr(qset)?);
+            qset_hashes.insert(Hash256::hash_xdr(qset));
         }
 
         for envelope in v0.ledger_messages.messages.iter() {

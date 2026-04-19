@@ -71,7 +71,7 @@ fn sort_changes(changes: &mut LedgerEntryChanges) -> Result<(), stellar_xdr::cur
 
     for change in changes.0.iter().cloned() {
         let key = change_key(&change);
-        let change_hash = Hash256::hash_xdr(&change)?.0;
+        let change_hash = Hash256::hash_xdr(&change).0;
         let order = change_type_order(&change);
         entries.push((key, order, change_hash, change));
     }

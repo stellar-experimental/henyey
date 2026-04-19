@@ -365,8 +365,7 @@ fn generate_claimable_balance_id(tx_id: &TxIdentity<'_>) -> Result<ClaimableBala
         seq_num: SequenceNumber(tx_id.seq),
         op_num: tx_id.op_index,
     });
-    let hash = henyey_common::Hash256::hash_xdr(&preimage)
-        .map_err(|e| TxError::Internal(format!("claimable balance id hash error: {}", e)))?;
+    let hash = henyey_common::Hash256::hash_xdr(&preimage);
     Ok(ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash(hash.0)))
 }
 

@@ -551,8 +551,8 @@ fn build_with_stage_count(
         match crate::tx_queue::fee_rate_cmp(b_fee as u64, b_ops, a_fee as u64, a_ops) {
             std::cmp::Ordering::Equal => {
                 // Ascending hash for determinism
-                let a_hash = Hash256::hash_xdr(&txs[a]).unwrap_or_default();
-                let b_hash = Hash256::hash_xdr(&txs[b]).unwrap_or_default();
+                let a_hash = Hash256::hash_xdr(&txs[a]);
+                let b_hash = Hash256::hash_xdr(&txs[b]);
                 a_hash.0.cmp(&b_hash.0)
             }
             other => other,
@@ -733,19 +733,18 @@ pub fn stages_to_xdr_phase(
                     // 1. Sort transactions within each cluster by hash.
                     // Pre-compute hashes to avoid redundant XDR serialization
                     // during comparisons (O(N log N) comparisons → O(N) hashes).
-                    cluster.sort_by_cached_key(|tx| Hash256::hash_xdr(tx).unwrap_or_default().0);
+                    cluster.sort_by_cached_key(|tx| Hash256::hash_xdr(tx).0);
                     cluster
                 })
                 .collect();
             // 2. Sort clusters within each stage by first-TX hash
-            sorted_clusters
-                .sort_by_cached_key(|cluster| Hash256::hash_xdr(&cluster[0]).unwrap_or_default().0);
+            sorted_clusters.sort_by_cached_key(|cluster| Hash256::hash_xdr(&cluster[0]).0);
             sorted_clusters
         })
         .collect();
 
     // 3. Sort stages by first-TX-of-first-cluster hash
-    sorted_stages.sort_by_cached_key(|stage| Hash256::hash_xdr(&stage[0][0]).unwrap_or_default().0);
+    sorted_stages.sort_by_cached_key(|stage| Hash256::hash_xdr(&stage[0][0]).0);
 
     let execution_stages: Vec<ParallelTxExecutionStage> = sorted_stages
         .into_iter()
@@ -1610,7 +1609,7 @@ mod stages_to_xdr_phase_tests {
     }
 
     fn tx_hash(tx: &TransactionEnvelope) -> Hash256 {
-        Hash256::hash_xdr(tx).unwrap_or_default()
+        Hash256::hash_xdr(tx)
     }
 
     // =========================================================================
@@ -2641,10 +2640,8 @@ mod stellar_core_parity_tests {
             }
 
             // Collect input TX hashes for conservation check.
-            let input_hashes: HashSet<[u8; 32]> = txs
-                .iter()
-                .map(|tx| Hash256::hash_xdr(tx).expect("hash input tx").0)
-                .collect();
+            let input_hashes: HashSet<[u8; 32]> =
+                txs.iter().map(|tx| Hash256::hash_xdr(tx).0).collect();
             assert_eq!(
                 input_hashes.len(),
                 500,
@@ -2717,7 +2714,7 @@ mod stellar_core_parity_tests {
                 for stage in &stages {
                     for cluster in stage {
                         for tx in cluster {
-                            let h = Hash256::hash_xdr(tx).expect("hash output tx").0;
+                            let h = Hash256::hash_xdr(tx).0;
                             assert!(
                                 input_hashes.contains(&h),
                                 "{ctx}: output TX not found in input set"

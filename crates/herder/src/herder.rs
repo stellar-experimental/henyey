@@ -356,7 +356,7 @@ impl Herder {
         // Pre-cache the local quorum set in fetching_envelopes so envelopes
         // referencing it don't wait for fetching.
         if let Some(ref quorum_set) = config.local_quorum_set {
-            let qs_hash = Hash256::hash_xdr(quorum_set).unwrap_or(Hash256::ZERO);
+            let qs_hash = Hash256::hash_xdr(quorum_set);
             fetching_envelopes.cache_quorum_set(qs_hash, quorum_set.clone());
         }
 

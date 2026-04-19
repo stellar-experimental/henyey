@@ -1140,7 +1140,7 @@ impl App {
             }
 
             StellarMessage::Transaction(tx_env) => {
-                let tx_hash = Hash256::hash_xdr(&tx_env).ok();
+                let tx_hash = Some(Hash256::hash_xdr(&tx_env));
                 match self.herder.receive_transaction(tx_env.clone()) {
                     henyey_herder::TxQueueResult::Added => {
                         tracing::debug!(peer = %msg.from_peer, "Transaction added to queue");
@@ -1321,10 +1321,13 @@ impl App {
 
             StellarMessage::TxSet(tx_set) => {
                 // Compute hash for logging
-                let xdr_bytes =
-                    stellar_xdr::curr::WriteXdr::to_xdr(&tx_set, stellar_xdr::curr::Limits::none())
-                        .unwrap_or_default();
-                let computed_hash = henyey_common::Hash256::hash(&xdr_bytes);
+                let computed_hash = match stellar_xdr::curr::WriteXdr::to_xdr(
+                    &tx_set,
+                    stellar_xdr::curr::Limits::none(),
+                ) {
+                    Ok(xdr_bytes) => format!("{}", henyey_common::Hash256::hash(&xdr_bytes)),
+                    Err(e) => format!("<encoding failed: {e}>"),
+                };
                 tracing::info!(
                     peer = %msg.from_peer,
                     computed_hash = %computed_hash,
@@ -1337,12 +1340,13 @@ impl App {
 
             StellarMessage::GeneralizedTxSet(gen_tx_set) => {
                 // Compute hash for logging
-                let xdr_bytes = stellar_xdr::curr::WriteXdr::to_xdr(
+                let computed_hash = match stellar_xdr::curr::WriteXdr::to_xdr(
                     &gen_tx_set,
                     stellar_xdr::curr::Limits::none(),
-                )
-                .unwrap_or_default();
-                let computed_hash = henyey_common::Hash256::hash(&xdr_bytes);
+                ) {
+                    Ok(xdr_bytes) => format!("{}", henyey_common::Hash256::hash(&xdr_bytes)),
+                    Err(e) => format!("<encoding failed: {e}>"),
+                };
                 tracing::debug!(
                     peer = %msg.from_peer,
                     computed_hash = %computed_hash,

@@ -224,8 +224,7 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
                 );
             }
 
-            let tx_result_hash =
-                Hash256::hash_xdr(&tx_result_entry.tx_result_set).unwrap_or(Hash256::ZERO);
+            let tx_result_hash = Hash256::hash_xdr(&tx_result_entry.tx_result_set);
             let expected_tx_result = Hash256::from(header.tx_set_result_hash.0);
             if tx_result_hash != expected_tx_result {
                 anyhow::bail!(

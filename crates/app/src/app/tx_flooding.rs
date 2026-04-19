@@ -17,10 +17,7 @@ impl App {
     }
 
     pub(super) async fn enqueue_tx_advert(&self, tx_env: &stellar_xdr::curr::TransactionEnvelope) {
-        let Some(hash) = Hash256::hash_xdr(tx_env).ok() else {
-            tracing::debug!("Failed to hash transaction for advert");
-            return;
-        };
+        let hash = Hash256::hash_xdr(tx_env);
 
         self.tx_advert_queue.write().await.insert(hash);
     }

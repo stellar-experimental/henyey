@@ -351,22 +351,12 @@ impl InMemorySorobanState {
 
     /// Compute the TTL key hash for a CONTRACT_DATA key.
     pub fn contract_data_key_hash(key: &LedgerKeyContractData) -> Hash {
-        // TTL key hash is the SHA-256 of the contract data key.
-        Hash(
-            Hash256::hash_xdr(&LedgerKey::ContractData(key.clone()))
-                .map(|h| *h.as_bytes())
-                .unwrap_or([0u8; 32]),
-        )
+        Hash(*Hash256::hash_xdr(&LedgerKey::ContractData(key.clone())).as_bytes())
     }
 
     /// Compute the TTL key hash for a CONTRACT_CODE key.
     pub fn contract_code_key_hash(key: &LedgerKeyContractCode) -> Hash {
-        // TTL key hash is the SHA-256 of the contract code key.
-        Hash(
-            Hash256::hash_xdr(&LedgerKey::ContractCode(key.clone()))
-                .map(|h| *h.as_bytes())
-                .unwrap_or([0u8; 32]),
-        )
+        Hash(*Hash256::hash_xdr(&LedgerKey::ContractCode(key.clone())).as_bytes())
     }
 
     /// Compute the map key from a TTL key.

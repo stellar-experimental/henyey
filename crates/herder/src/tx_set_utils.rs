@@ -695,9 +695,7 @@ pub fn get_invalid_tx_list_with_fee_map(
         )
         .is_err()
         {
-            if let Ok(h) = Hash256::hash_xdr(tx) {
-                seen_invalid.insert(h);
-            }
+            seen_invalid.insert(Hash256::hash_xdr(tx));
             invalid_txs.push(tx.clone());
             continue;
         }
@@ -706,9 +704,7 @@ pub fn get_invalid_tx_list_with_fee_map(
         let upper_result = validate_basic(&frame, &upper_ledger_ctx);
 
         if upper_result.is_err() {
-            if let Ok(h) = Hash256::hash_xdr(tx) {
-                seen_invalid.insert(h);
-            }
+            seen_invalid.insert(Hash256::hash_xdr(tx));
             invalid_txs.push(tx.clone());
             continue;
         }
@@ -718,9 +714,7 @@ pub fn get_invalid_tx_list_with_fee_map(
         if need_lower_check {
             let lower_ledger_ctx = ctx.to_ledger_context(lower_close_time);
             if validate_basic(&frame, &lower_ledger_ctx).is_err() {
-                if let Ok(h) = Hash256::hash_xdr(tx) {
-                    seen_invalid.insert(h);
-                }
+                seen_invalid.insert(Hash256::hash_xdr(tx));
                 invalid_txs.push(tx.clone());
                 continue;
             }
@@ -730,9 +724,7 @@ pub fn get_invalid_tx_list_with_fee_map(
         // Mirrors stellar-core's checkValid() path within getInvalidTxListWithErrors.
         if let Some(provider) = account_provider {
             if !validate_tx_for_tx_set(&frame, ctx, lower_close_time, provider) {
-                if let Ok(h) = Hash256::hash_xdr(tx) {
-                    seen_invalid.insert(h);
-                }
+                seen_invalid.insert(Hash256::hash_xdr(tx));
                 invalid_txs.push(tx.clone());
                 continue;
             }
@@ -752,10 +744,8 @@ pub fn get_invalid_tx_list_with_fee_map(
     if let Some(provider) = fee_balance_provider {
         for tx in txs {
             // Skip transactions already marked invalid.
-            if let Ok(h) = Hash256::hash_xdr(tx) {
-                if seen_invalid.contains(&h) {
-                    continue;
-                }
+            if seen_invalid.contains(&Hash256::hash_xdr(tx)) {
+                continue;
             }
 
             let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);
@@ -766,9 +756,7 @@ pub fn get_invalid_tx_list_with_fee_map(
 
             if available < total_fee {
                 invalid_txs.push(tx.clone());
-                if let Ok(h) = Hash256::hash_xdr(tx) {
-                    seen_invalid.insert(h);
-                }
+                seen_invalid.insert(Hash256::hash_xdr(tx));
                 tracing::debug!(
                     fee_source = ?fee_source,
                     available_balance = available,
@@ -836,15 +824,11 @@ fn remove_txs(
 ) -> Vec<TransactionEnvelope> {
     let remove_set: HashSet<Hash256> = txs_to_remove
         .iter()
-        .filter_map(|tx| Hash256::hash_xdr(tx).ok())
+        .map(|tx| Hash256::hash_xdr(tx))
         .collect();
 
     txs.iter()
-        .filter(|tx| {
-            Hash256::hash_xdr(*tx)
-                .map(|h| !remove_set.contains(&h))
-                .unwrap_or(true)
-        })
+        .filter(|tx| !remove_set.contains(&Hash256::hash_xdr(*tx)))
         .cloned()
         .collect()
 }
@@ -1303,8 +1287,7 @@ fn check_stage_footprint_conflicts(stage: &stellar_xdr::curr::ParallelTxExecutio
 
 /// Serialize a LedgerKey to bytes for use as a hash set key.
 fn key_to_bytes(key: &stellar_xdr::curr::LedgerKey) -> Vec<u8> {
-    use stellar_xdr::curr::{Limits, WriteXdr};
-    key.to_xdr(Limits::none()).unwrap_or_default()
+    henyey_common::xdr_stream::xdr_to_bytes(key)
 }
 
 /// Collect all transaction envelopes from a phase.
@@ -1835,12 +1818,9 @@ mod tests {
         assert_eq!(invalid.len(), 2, "should have 2 invalid transactions");
 
         // Verify the valid transactions are the ones we expect (by hash)
-        let valid_hashes: HashSet<Hash256> = valid
-            .iter()
-            .filter_map(|tx| Hash256::hash_xdr(tx).ok())
-            .collect();
-        let expected_valid1 = Hash256::hash_xdr(&valid1).unwrap();
-        let expected_valid2 = Hash256::hash_xdr(&valid2).unwrap();
+        let valid_hashes: HashSet<Hash256> = valid.iter().map(|tx| Hash256::hash_xdr(tx)).collect();
+        let expected_valid1 = Hash256::hash_xdr(&valid1);
+        let expected_valid2 = Hash256::hash_xdr(&valid2);
         assert!(
             valid_hashes.contains(&expected_valid1),
             "first valid tx should be in valid set"
@@ -1883,13 +1863,13 @@ mod tests {
         assert_eq!(valid.len(), 3);
 
         // Verify order is preserved
-        let hash1 = Hash256::hash_xdr(&tx1).unwrap();
-        let hash2 = Hash256::hash_xdr(&tx2).unwrap();
-        let hash3 = Hash256::hash_xdr(&tx3).unwrap();
+        let hash1 = Hash256::hash_xdr(&tx1);
+        let hash2 = Hash256::hash_xdr(&tx2);
+        let hash3 = Hash256::hash_xdr(&tx3);
 
-        assert_eq!(Hash256::hash_xdr(&valid[0]).unwrap(), hash1);
-        assert_eq!(Hash256::hash_xdr(&valid[1]).unwrap(), hash2);
-        assert_eq!(Hash256::hash_xdr(&valid[2]).unwrap(), hash3);
+        assert_eq!(Hash256::hash_xdr(&valid[0]), hash1);
+        assert_eq!(Hash256::hash_xdr(&valid[1]), hash2);
+        assert_eq!(Hash256::hash_xdr(&valid[2]), hash3);
     }
 
     // --- CloseTimeBounds tests ---
@@ -1960,13 +1940,11 @@ mod tests {
         let result = remove_txs(&txs, &to_remove);
         assert_eq!(result.len(), 2);
 
-        let result_hashes: HashSet<Hash256> = result
-            .iter()
-            .filter_map(|tx| Hash256::hash_xdr(tx).ok())
-            .collect();
-        assert!(result_hashes.contains(&Hash256::hash_xdr(&tx1).unwrap()));
-        assert!(!result_hashes.contains(&Hash256::hash_xdr(&tx2).unwrap()));
-        assert!(result_hashes.contains(&Hash256::hash_xdr(&tx3).unwrap()));
+        let result_hashes: HashSet<Hash256> =
+            result.iter().map(|tx| Hash256::hash_xdr(tx)).collect();
+        assert!(result_hashes.contains(&Hash256::hash_xdr(&tx1)));
+        assert!(!result_hashes.contains(&Hash256::hash_xdr(&tx2)));
+        assert!(result_hashes.contains(&Hash256::hash_xdr(&tx3)));
     }
 
     // --- Integration-style test: time bounds with offsets ---

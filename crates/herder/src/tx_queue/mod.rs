@@ -357,8 +357,7 @@ pub struct QueuedTransaction {
 impl QueuedTransaction {
     /// Create a new queued transaction.
     pub fn new(envelope: TransactionEnvelope) -> Result<Self> {
-        let hash = Hash256::hash_xdr(&envelope)
-            .map_err(|e| HerderError::Internal(format!("Failed to hash transaction: {}", e)))?;
+        let hash = Hash256::hash_xdr(&envelope);
 
         let (total_fee, inclusion_fee, op_count) = Self::extract_fees_and_ops(&envelope)?;
         let fee_per_op = if op_count > 0 {
@@ -2122,7 +2121,7 @@ impl TransactionQueue {
             }
 
             // Ban the applied tx hash
-            let applied_hash = Hash256::hash_xdr(envelope).unwrap_or_default();
+            let applied_hash = Hash256::hash_xdr(envelope);
             if let Some(newest) = banned.back_mut() {
                 newest.insert(applied_hash);
             }
@@ -2699,7 +2698,7 @@ mod tests {
     }
 
     fn full_hash(envelope: &TransactionEnvelope) -> Hash256 {
-        Hash256::hash_xdr(envelope).expect("hash tx")
+        Hash256::hash_xdr(envelope)
     }
 
     fn set_source(envelope: &mut TransactionEnvelope, seed: u8) {
@@ -2746,10 +2745,10 @@ mod tests {
 
         // Create two transactions
         let tx1 = make_test_envelope(200, 1);
-        let hash1 = Hash256::hash_xdr(&tx1).unwrap();
+        let hash1 = Hash256::hash_xdr(&tx1);
         let mut tx2 = make_test_envelope(200, 1);
         set_source(&mut tx2, 2);
-        let hash2 = Hash256::hash_xdr(&tx2).unwrap();
+        let hash2 = Hash256::hash_xdr(&tx2);
 
         // Add tx1 to the queue
         assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
@@ -2782,7 +2781,7 @@ mod tests {
         let queue = TransactionQueue::with_ban_depth(TxQueueConfig::default(), 3);
 
         let tx = make_test_envelope(200, 1);
-        let hash = Hash256::hash_xdr(&tx).unwrap();
+        let hash = Hash256::hash_xdr(&tx);
         queue.ban(&[hash]);
         assert!(queue.is_banned(&hash));
 
@@ -2806,7 +2805,7 @@ mod tests {
         // Ban tx1 in ledger 1
         let mut tx1 = make_test_envelope(200, 1);
         set_source(&mut tx1, 1);
-        let hash1 = Hash256::hash_xdr(&tx1).unwrap();
+        let hash1 = Hash256::hash_xdr(&tx1);
         queue.ban(&[hash1]);
 
         queue.shift(); // ledger 2
@@ -2814,7 +2813,7 @@ mod tests {
         // Ban tx2 in ledger 2
         let mut tx2 = make_test_envelope(200, 1);
         set_source(&mut tx2, 2);
-        let hash2 = Hash256::hash_xdr(&tx2).unwrap();
+        let hash2 = Hash256::hash_xdr(&tx2);
         queue.ban(&[hash2]);
 
         queue.shift(); // ledger 3
@@ -2822,7 +2821,7 @@ mod tests {
         // Ban tx3 in ledger 3
         let mut tx3 = make_test_envelope(200, 1);
         set_source(&mut tx3, 3);
-        let hash3 = Hash256::hash_xdr(&tx3).unwrap();
+        let hash3 = Hash256::hash_xdr(&tx3);
         queue.ban(&[hash3]);
 
         // All should be banned
@@ -3154,7 +3153,7 @@ mod tests {
         let recomputed = tx_set.recompute_hash().expect("recompute hash");
         assert_eq!(tx_set.hash, recomputed);
 
-        let gen_hash = Hash256::hash_xdr(&gen).expect("hash generalized");
+        let gen_hash = Hash256::hash_xdr(&gen);
         assert_eq!(tx_set.hash, gen_hash);
     }
 
@@ -5951,7 +5950,7 @@ mod tests {
         // All txs need different sources to avoid per-account limit
         let mut tx1 = make_test_envelope(100, 1); // low fee — eviction candidate
         set_source(&mut tx1, 1);
-        let hash1 = Hash256::hash_xdr(&tx1).unwrap();
+        let hash1 = Hash256::hash_xdr(&tx1);
         let mut tx2 = make_test_envelope(200, 1);
         set_source(&mut tx2, 2);
         let mut tx3 = make_test_envelope(300, 1);
@@ -5980,7 +5979,7 @@ mod tests {
         let queue = TransactionQueue::with_ban_depth(TxQueueConfig::default(), 3);
 
         let tx1 = make_test_envelope(200, 1);
-        let hash1 = Hash256::hash_xdr(&tx1).unwrap();
+        let hash1 = Hash256::hash_xdr(&tx1);
 
         assert_eq!(queue.try_add(tx1.clone()), TxQueueResult::Added);
 
@@ -6010,7 +6009,7 @@ mod tests {
 
         let mut tx = make_test_envelope(200, 1);
         set_source(&mut tx, 10);
-        let hash = Hash256::hash_xdr(&tx).unwrap();
+        let hash = Hash256::hash_xdr(&tx);
 
         assert_eq!(queue.try_add(tx), TxQueueResult::Added);
         assert!(queue.seen.read().contains(&hash));
@@ -6043,7 +6042,7 @@ mod tests {
 
         let mut tx = make_test_envelope(200, 1);
         set_source(&mut tx, 20);
-        let hash = Hash256::hash_xdr(&tx).unwrap();
+        let hash = Hash256::hash_xdr(&tx);
 
         assert_eq!(queue.try_add(tx.clone()), TxQueueResult::Added);
         assert!(queue.seen.read().contains(&hash));
@@ -6065,7 +6064,7 @@ mod tests {
 
         let mut tx = make_test_envelope(200, 1);
         set_source(&mut tx, 30);
-        let hash = Hash256::hash_xdr(&tx).unwrap();
+        let hash = Hash256::hash_xdr(&tx);
 
         assert_eq!(queue.try_add(tx), TxQueueResult::Added);
         assert!(queue.seen.read().contains(&hash));
@@ -6476,7 +6475,7 @@ mod pending_depth_tests {
 
         let mut tx = make_test_envelope(200, 1);
         set_source(&mut tx, 50);
-        let hash = Hash256::hash_xdr(&tx).unwrap();
+        let hash = Hash256::hash_xdr(&tx);
 
         assert_eq!(queue.try_add(tx), TxQueueResult::Added);
         assert_eq!(queue.len(), 1);
@@ -6508,7 +6507,7 @@ mod pending_depth_tests {
 
         let mut tx = make_test_envelope(200, 1);
         set_source(&mut tx, 51);
-        let hash = Hash256::hash_xdr(&tx).unwrap();
+        let hash = Hash256::hash_xdr(&tx);
 
         assert_eq!(queue.try_add(tx.clone()), TxQueueResult::Added);
 
@@ -6542,7 +6541,7 @@ mod pending_depth_tests {
 
         let mut tx = make_test_envelope(200, 1);
         set_source(&mut tx, 52);
-        let hash = Hash256::hash_xdr(&tx).unwrap();
+        let hash = Hash256::hash_xdr(&tx);
 
         assert_eq!(queue.try_add(tx), TxQueueResult::Added);
 
@@ -6560,7 +6559,7 @@ mod pending_depth_tests {
         // Add TX A
         let mut tx_a = make_test_envelope(200, 1);
         set_source(&mut tx_a, 60);
-        let hash_a = Hash256::hash_xdr(&tx_a).unwrap();
+        let hash_a = Hash256::hash_xdr(&tx_a);
         assert_eq!(queue.try_add(tx_a), TxQueueResult::Added);
 
         // Shift once (TX A age = 1)
@@ -6569,7 +6568,7 @@ mod pending_depth_tests {
         // Add TX B (TX A age = 1, TX B age = 0)
         let mut tx_b = make_test_envelope(200, 1);
         set_source(&mut tx_b, 61);
-        let hash_b = Hash256::hash_xdr(&tx_b).unwrap();
+        let hash_b = Hash256::hash_xdr(&tx_b);
         assert_eq!(queue.try_add(tx_b), TxQueueResult::Added);
 
         // Shift twice more (TX A age = 3, TX B age = 2)
@@ -6596,7 +6595,7 @@ mod pending_depth_tests {
 
         let mut tx = make_test_envelope(200, 1);
         set_source(&mut tx, 70);
-        let hash = Hash256::hash_xdr(&tx).unwrap();
+        let hash = Hash256::hash_xdr(&tx);
 
         // Ban the TX
         queue.ban(&[hash]);

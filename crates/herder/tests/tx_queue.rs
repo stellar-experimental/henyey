@@ -183,11 +183,11 @@ fn account_key_from_envelope(envelope: &TransactionEnvelope) -> Vec<u8> {
         },
     };
     let account_id = muxed_to_account_id(&source);
-    account_id.to_xdr(Limits::none()).unwrap_or_default()
+    henyey_common::xdr_stream::xdr_to_bytes(&account_id)
 }
 
 fn full_hash(envelope: &TransactionEnvelope) -> Hash256 {
-    Hash256::hash_xdr(envelope).expect("hash tx")
+    Hash256::hash_xdr(envelope)
 }
 
 #[test]

@@ -796,7 +796,7 @@ impl FetchingEnvelopes {
 
     /// Compute hash of an envelope for deduplication.
     fn compute_envelope_hash(envelope: &ScpEnvelope) -> Hash256 {
-        Hash256::hash_xdr(envelope).unwrap_or(Hash256::ZERO)
+        Hash256::hash_xdr(envelope)
     }
 }
 

@@ -106,7 +106,7 @@ impl BucketEntryCounters {
     /// Records a bucket entry.
     pub fn record_entry(&mut self, entry: &BucketEntry) {
         // Compute XDR size of the full BucketEntry for type-size tracking.
-        let xdr_size = entry.to_xdr_bytes().map(|v| v.len() as u64).unwrap_or(0);
+        let xdr_size = henyey_common::xdr_stream::xdr_encoded_len(entry) as u64;
 
         match entry {
             BucketEntry::Liveentry(e) => {
@@ -263,7 +263,9 @@ impl AssetPoolIdMap {
 
     /// Computes a hash for an asset for use as a map key.
     fn hash_asset(asset: &Asset) -> Hash256 {
-        let asset_bytes = asset.to_xdr(Limits::none()).unwrap_or_default();
+        let asset_bytes = asset
+            .to_xdr(Limits::none())
+            .expect("XDR encoding of Asset must not fail");
         Hash256::hash(&asset_bytes)
     }
 }
@@ -362,7 +364,9 @@ impl InMemoryIndex {
                 }
 
                 // Serialize key for index
-                let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+                let key_bytes = key
+                    .to_xdr(Limits::none())
+                    .expect("XDR encoding of LedgerKey must not fail");
                 key_to_offset.insert(key_bytes.clone(), offset);
 
                 // Compute bloom hash

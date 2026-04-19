@@ -416,25 +416,27 @@ enum RecvAction {
 fn log_fetch_message(message: &StellarMessage, peer_id: &PeerId, ping: &mut PingTracker) {
     match message {
         StellarMessage::TxSet(ts) => {
+            let hash_hex =
+                match stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none()) {
+                    Ok(bytes) => hex::encode(sha2::Sha256::digest(bytes)),
+                    Err(e) => format!("<encoding failed: {e}>"),
+                };
             debug!(
                 "OVERLAY: Received TxSet from {} hash={} prev_ledger={}",
                 peer_id,
-                hex::encode(sha2::Sha256::digest(
-                    stellar_xdr::curr::WriteXdr::to_xdr(ts, stellar_xdr::curr::Limits::none())
-                        .unwrap_or_default()
-                )),
+                hash_hex,
                 hex::encode(ts.previous_ledger_hash.0)
             );
         }
         StellarMessage::GeneralizedTxSet(ts) => {
-            let hash = henyey_common::Hash256::hash_xdr(ts).unwrap_or(henyey_common::Hash256::ZERO);
+            let hash = henyey_common::Hash256::hash_xdr(ts);
             debug!(
                 "OVERLAY: Received GeneralizedTxSet from {} hash={}",
                 peer_id, hash
             );
         }
         StellarMessage::ScpQuorumset(qs) => {
-            let hash = henyey_common::Hash256::hash_xdr(qs).unwrap_or(henyey_common::Hash256::ZERO);
+            let hash = henyey_common::Hash256::hash_xdr(qs);
             ping.check_response(&Uint256(hash.0), peer_id);
             debug!(
                 "OVERLAY: Received ScpQuorumset from {} hash={}",

@@ -151,7 +151,9 @@ impl BucketBloomFilter {
     ///
     /// This matches the stellar-core hash computation for bloom filter keys.
     pub fn hash_key(key: &LedgerKey, seed: &HashSeed) -> u64 {
-        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+        let key_bytes = key
+            .to_xdr(Limits::none())
+            .expect("XDR encoding of LedgerKey must not fail");
         Self::hash_bytes(&key_bytes, seed)
     }
 

@@ -1652,7 +1652,10 @@ fn generate_live_entries(
         }
         *current_key += 1;
 
-        let ttl_key_hash = Hash256::hash(&le.to_xdr(Limits::none()).unwrap_or_default());
+        let ttl_key_hash = Hash256::hash(
+            &le.to_xdr(Limits::none())
+                .expect("XDR encoding of LedgerEntry must not fail"),
+        );
         let ttl_entry = LedgerEntry {
             last_modified_ledger_seq: ledger_seq,
             data: LedgerEntryData::Ttl(stellar_xdr::curr::TtlEntry {

@@ -132,9 +132,7 @@ fn config_upgrade_data_key(upgrade_key: &ConfigUpgradeSetKey) -> LedgerKey {
 /// Build a TTL key for the given data key.
 fn ttl_key_for(data_key: &LedgerKey) -> LedgerKey {
     LedgerKey::Ttl(LedgerKeyTtl {
-        key_hash: Hash256::hash_xdr(data_key)
-            .map(|h| Hash(h.0))
-            .unwrap_or(Hash([0u8; 32])),
+        key_hash: Hash(Hash256::hash_xdr(data_key).0),
     })
 }
 
@@ -167,9 +165,7 @@ fn make_config_upgrade_entry(
 
 /// Create a TTL entry that is live until the given ledger.
 fn make_ttl_entry(data_key: &LedgerKey, live_until: u32) -> LedgerEntry {
-    let key_hash = Hash256::hash_xdr(data_key)
-        .map(|h| Hash(h.0))
-        .unwrap_or(Hash([0u8; 32]));
+    let key_hash = Hash(Hash256::hash_xdr(data_key).0);
     LedgerEntry {
         last_modified_ledger_seq: 1,
         data: LedgerEntryData::Ttl(TtlEntry {

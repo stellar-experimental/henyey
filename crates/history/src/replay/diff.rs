@@ -31,8 +31,8 @@ pub(super) fn log_tx_result_mismatch(
     for (idx, (expected_item, actual_item)) in
         expected.iter().zip(actual.iter()).take(limit).enumerate()
     {
-        let expected_hash = Hash256::hash_xdr(expected_item).unwrap_or(Hash256::ZERO);
-        let actual_hash = Hash256::hash_xdr(actual_item).unwrap_or(Hash256::ZERO);
+        let expected_hash = Hash256::hash_xdr(expected_item);
+        let actual_hash = Hash256::hash_xdr(actual_item);
         if expected_hash != actual_hash {
             let expected_tx_hash = Hash256::from(expected_item.transaction_hash.0).to_hex();
             let actual_tx_hash = Hash256::from(actual_item.transaction_hash.0).to_hex();

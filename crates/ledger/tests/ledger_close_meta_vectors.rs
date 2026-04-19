@@ -535,7 +535,7 @@ fn ledger_close_meta_header_hash_vectors() {
             ext: LedgerHeaderHistoryEntryExt::V0,
         };
         let expected = Hash256::from(entry.hash);
-        let got = Hash256::hash_xdr(&entry.header).expect("hash ledger header");
+        let got = Hash256::hash_xdr(&entry.header);
         assert_eq!(got, expected, "header hash mismatch for {}", name);
     }
 }
@@ -574,7 +574,7 @@ fn ledger_close_meta_tx_result_hash_vectors() {
             v2.get("txProcessing")
                 .unwrap_or_else(|| panic!("LedgerCloseMeta.v2.txProcessing missing in {}", name)),
         );
-        let got = Hash256::hash_xdr(&tx_result_set).expect("hash tx result set");
+        let got = Hash256::hash_xdr(&tx_result_set);
         let expected = Hash256::from(expected_hash);
         assert_eq!(got, expected, "tx result hash mismatch for {}", name);
     }

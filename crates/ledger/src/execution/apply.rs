@@ -741,8 +741,8 @@ impl TransactionExecutor {
             hot_archive_restored_keys: {
                 let mut keys: Vec<_> = collected_hot_archive_keys.into_iter().collect();
                 keys.sort_by(|a, b| {
-                    let a_bytes = a.to_xdr(Limits::none()).unwrap_or_default();
-                    let b_bytes = b.to_xdr(Limits::none()).unwrap_or_default();
+                    let a_bytes = henyey_common::xdr_stream::xdr_to_bytes(a);
+                    let b_bytes = henyey_common::xdr_stream::xdr_to_bytes(b);
                     a_bytes.cmp(&b_bytes)
                 });
                 keys

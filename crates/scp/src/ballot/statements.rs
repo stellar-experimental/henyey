@@ -230,7 +230,7 @@ impl BallotProtocol {
     ) {
         let key = (
             ballot.counter,
-            ballot.value.to_xdr(Limits::none()).unwrap_or_default(),
+            henyey_common::xdr_stream::xdr_to_bytes(&ballot.value),
         );
         if seen.insert(key) {
             candidates.push(ballot);

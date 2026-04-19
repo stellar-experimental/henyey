@@ -425,14 +425,7 @@ impl ScpPersistenceManager {
             for qs_result in state.get_quorum_sets() {
                 match qs_result {
                     Ok(qs) => {
-                        let hash = henyey_common::Hash256::hash_xdr(&qs)
-                            .map(|h| Hash(*h.as_bytes()))
-                            .map_err(|e| {
-                                HerderError::InvalidEnvelope(format!(
-                                    "failed to hash quorum set: {}",
-                                    e
-                                ))
-                            })?;
+                        let hash = Hash(*henyey_common::Hash256::hash_xdr(&qs).as_bytes());
                         restored.quorum_sets.push((hash, qs));
                     }
                     Err(e) => {

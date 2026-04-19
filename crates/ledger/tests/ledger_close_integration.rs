@@ -77,7 +77,7 @@ fn test_ledger_close_with_empty_tx_set() {
     let empty_results = TransactionResultSet {
         results: VecM::default(),
     };
-    let expected_hash = Hash256::hash_xdr(&empty_results).expect("result hash");
+    let expected_hash = Hash256::hash_xdr(&empty_results);
     assert_eq!(
         Hash256::from(result.header.tx_set_result_hash),
         expected_hash
@@ -400,7 +400,7 @@ async fn test_close_ledger_from_spawn_blocking() {
     let empty_results = TransactionResultSet {
         results: VecM::default(),
     };
-    let expected_hash = Hash256::hash_xdr(&empty_results).expect("result hash");
+    let expected_hash = Hash256::hash_xdr(&empty_results);
     assert_eq!(
         Hash256::from(result.header.tx_set_result_hash),
         expected_hash

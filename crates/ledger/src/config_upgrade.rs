@@ -243,9 +243,7 @@ impl ConfigUpgradeSetFrame {
     /// Get the TTL key for a CONTRACT_DATA entry.
     fn get_ttl_key(data_key: &LedgerKey) -> LedgerKey {
         LedgerKey::Ttl(stellar_xdr::curr::LedgerKeyTtl {
-            key_hash: Hash256::hash_xdr(data_key)
-                .map(|h| Hash(h.0))
-                .unwrap_or(Hash([0u8; 32])),
+            key_hash: Hash(Hash256::hash_xdr(data_key).0),
         })
     }
 

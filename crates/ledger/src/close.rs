@@ -323,9 +323,7 @@ impl TransactionSetVariant {
                 }
                 hasher.finalize()
             }
-            TransactionSetVariant::Generalized(set) => {
-                Hash256::hash_xdr(set).unwrap_or(Hash256::ZERO)
-            }
+            TransactionSetVariant::Generalized(set) => Hash256::hash_xdr(set),
         }
     }
 
@@ -488,7 +486,7 @@ impl TransactionSetVariant {
 }
 
 fn tx_hash(tx: &TransactionEnvelope) -> Hash256 {
-    Hash256::hash_xdr(tx).unwrap_or(Hash256::ZERO)
+    Hash256::hash_xdr(tx)
 }
 
 fn less_than_xored(left: &Hash256, right: &Hash256, x: &Hash256) -> bool {
@@ -1098,7 +1096,7 @@ impl LedgerCloseResult {
     /// Compute the hash of transaction results.
     pub fn tx_result_hash(&self) -> Hash256 {
         let result_set = self.tx_result_set();
-        Hash256::hash_xdr(&result_set).unwrap_or(Hash256::ZERO)
+        Hash256::hash_xdr(&result_set)
     }
 }
 
@@ -1538,7 +1536,7 @@ mod tests {
     }
 
     fn tx_hash(tx: &TransactionEnvelope) -> Hash256 {
-        Hash256::hash_xdr(tx).unwrap_or(Hash256::ZERO)
+        Hash256::hash_xdr(tx)
     }
 
     #[test]
@@ -1817,7 +1815,7 @@ mod tests {
             phases: vec![classic_phase, soroban_phase].try_into().unwrap(),
         });
 
-        let set_hash = Hash256::hash_xdr(&gen_set).unwrap_or(Hash256::ZERO);
+        let set_hash = Hash256::hash_xdr(&gen_set);
         let classic_expected = expected_apply_order(vec![classic_a, classic_b], set_hash, false);
         // Must match XDR cluster order: stage_one = [cluster_b(soroban_c),
         // cluster_a(soroban_b, soroban_a)], stage_two = [cluster_c(soroban_d)],
@@ -1880,7 +1878,7 @@ mod tests {
                     .try_into()
                     .unwrap(),
                 });
-                let set_hash = Hash256::hash_xdr(&gen_set).unwrap_or(Hash256::ZERO);
+                let set_hash = Hash256::hash_xdr(&gen_set);
 
                 // Check if sorting would reverse the cluster order
                 let cmp = apply_sort_cmp(&tx_a, &tx_b, &set_hash);

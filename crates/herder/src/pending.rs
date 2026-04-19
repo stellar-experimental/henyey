@@ -85,7 +85,7 @@ impl PendingEnvelope {
     /// Create a new pending envelope.
     pub fn new(envelope: ScpEnvelope) -> Self {
         // Compute envelope hash for deduplication
-        let hash = Hash256::hash_xdr(&envelope).unwrap_or(Hash256::ZERO);
+        let hash = Hash256::hash_xdr(&envelope);
         Self {
             envelope,
             received_at: Instant::now(),

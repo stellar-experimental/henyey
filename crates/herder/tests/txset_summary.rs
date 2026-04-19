@@ -31,7 +31,7 @@ struct TxSetSummary {
 }
 
 fn tx_hash(tx: &TransactionEnvelope) -> Hash256 {
-    Hash256::hash_xdr(tx).expect("hash tx")
+    Hash256::hash_xdr(tx)
 }
 
 fn make_classic_payment(fee: u32) -> TransactionEnvelope {

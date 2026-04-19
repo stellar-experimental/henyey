@@ -1303,9 +1303,7 @@ impl ScpDriver {
         // Step 1: Compute candidates hash (XOR of all candidate hashes) for tiebreaking
         let mut candidates_hash = [0u8; 32];
         for sv in &decoded {
-            let val_bytes = sv
-                .to_xdr(stellar_xdr::curr::Limits::none())
-                .unwrap_or_default();
+            let val_bytes = henyey_common::xdr_stream::xdr_to_bytes(sv);
             let hash = Hash256::hash(&val_bytes);
             for (i, byte) in candidates_hash.iter_mut().enumerate() {
                 *byte ^= hash.as_bytes()[i];
@@ -1466,9 +1464,9 @@ impl ScpDriver {
             return true;
         }
 
-        let mut prev_hash = Hash256::hash_xdr(&txs[0]).unwrap_or(Hash256::ZERO);
+        let mut prev_hash = Hash256::hash_xdr(&txs[0]);
         for tx in &txs[1..] {
-            let hash = Hash256::hash_xdr(tx).unwrap_or(Hash256::ZERO);
+            let hash = Hash256::hash_xdr(tx);
             if hash.0 <= prev_hash.0 {
                 // Not strictly ascending — either unsorted or duplicate
                 return false;
@@ -1576,18 +1574,12 @@ impl ScpDriver {
     /// sums the XDR-encoded size of all transactions.
     fn tx_set_encoded_size(tx_set: &TransactionSet) -> usize {
         if let Some(ref gen) = tx_set.generalized_tx_set {
-            gen.to_xdr(stellar_xdr::curr::Limits::none())
-                .map(|bytes| bytes.len())
-                .unwrap_or(0)
+            henyey_common::xdr_stream::xdr_to_bytes(gen).len()
         } else {
             tx_set
                 .transactions
                 .iter()
-                .map(|tx| {
-                    tx.to_xdr(stellar_xdr::curr::Limits::none())
-                        .map(|bytes| bytes.len())
-                        .unwrap_or(0)
-                })
+                .map(|tx| henyey_common::xdr_stream::xdr_to_bytes(tx).len())
                 .sum()
         }
     }
@@ -2430,9 +2422,7 @@ impl HerderScpCallback {
     }
 
     fn xdr_bytes<T: stellar_xdr::curr::WriteXdr>(value: &T) -> Vec<u8> {
-        value
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap_or_default()
+        henyey_common::xdr_stream::xdr_to_bytes(value)
     }
 }
 
@@ -3564,8 +3554,8 @@ mod tests {
         let mut txs: Vec<stellar_xdr::curr::TransactionEnvelope> =
             (1..=5).map(|i| make_simple_tx(i)).collect();
         txs.sort_by(|a, b| {
-            let ha = Hash256::hash_xdr(a).unwrap_or(Hash256::ZERO);
-            let hb = Hash256::hash_xdr(b).unwrap_or(Hash256::ZERO);
+            let ha = Hash256::hash_xdr(a);
+            let hb = Hash256::hash_xdr(b);
             ha.0.cmp(&hb.0)
         });
 
@@ -3579,8 +3569,8 @@ mod tests {
         let mut txs: Vec<stellar_xdr::curr::TransactionEnvelope> =
             (1..=5).map(|i| make_simple_tx(i)).collect();
         txs.sort_by(|a, b| {
-            let ha = Hash256::hash_xdr(a).unwrap_or(Hash256::ZERO);
-            let hb = Hash256::hash_xdr(b).unwrap_or(Hash256::ZERO);
+            let ha = Hash256::hash_xdr(a);
+            let hb = Hash256::hash_xdr(b);
             ha.0.cmp(&hb.0)
         });
         // Swap first two to guarantee out-of-order
@@ -3647,7 +3637,7 @@ mod tests {
             .try_into()
             .unwrap(),
         });
-        let gen_hash = Hash256::hash_xdr(&gen).unwrap();
+        let gen_hash = Hash256::hash_xdr(&gen);
         let gen_set =
             TransactionSet::with_generalized(Hash256::ZERO, gen_hash, fee_priority_order, gen);
 
@@ -4064,7 +4054,7 @@ mod compare_tx_sets_tests {
             .unwrap(),
         });
 
-        let hash = Hash256::hash_xdr(&gen).unwrap();
+        let hash = Hash256::hash_xdr(&gen);
         TransactionSet::with_generalized(Hash256::ZERO, hash, vec![tx], gen)
     }
 

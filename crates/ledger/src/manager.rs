@@ -1809,18 +1809,24 @@ impl LedgerManager {
 
             // Compute recomputed hash to verify
             use stellar_xdr::curr::{Limits, WriteXdr};
-            let header_xdr = state.header.to_xdr(Limits::none()).unwrap_or_default();
-            let header_xdr_hex = Hash256::from_bytes({
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&header_xdr[..std::cmp::min(32, header_xdr.len())]);
-                arr
-            })
-            .to_hex();
-            tracing::error!(
-                header_xdr_first_32_bytes = %header_xdr_hex,
-                header_xdr_len = header_xdr.len(),
-                "Header XDR bytes for debugging"
-            );
+            match state.header.to_xdr(Limits::none()) {
+                Ok(header_xdr) => {
+                    let header_xdr_hex = Hash256::from_bytes({
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&header_xdr[..std::cmp::min(32, header_xdr.len())]);
+                        arr
+                    })
+                    .to_hex();
+                    tracing::error!(
+                        header_xdr_first_32_bytes = %header_xdr_hex,
+                        header_xdr_len = header_xdr.len(),
+                        "Header XDR bytes for debugging"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Failed to encode header XDR for debugging: {e}");
+                }
+            }
 
             // Debug: Log header details to help diagnose hash mismatch
             let skip_list_0 = Hash256::from_bytes(state.header.skip_list[0].0).to_hex();
@@ -2390,8 +2396,7 @@ impl LedgerManager {
             key: _cd.key.clone(),
             durability: _cd.durability,
         });
-        let key_hash = Hash256::hash_xdr(&data_key)
-            .map_err(|e| LedgerError::Internal(format!("Failed to hash LedgerKey: {}", e)))?;
+        let key_hash = Hash256::hash_xdr(&data_key);
         let ttl_key = stellar_xdr::curr::LedgerKeyTtl {
             key_hash: stellar_xdr::curr::Hash(key_hash.0),
         };
@@ -4155,7 +4160,9 @@ impl LedgerCloseContext<'_> {
                 LedgerUpgrade::Version(_) => (version_upgrade_succeeded, version_changes.clone()),
                 LedgerUpgrade::Config(key) => {
                     if config_upgrade_succeeded {
-                        let key_bytes = key.to_xdr(Limits::none()).unwrap_or_default();
+                        let key_bytes = key
+                            .to_xdr(Limits::none())
+                            .expect("XDR encoding of ConfigSettingId must not fail");
                         let changes = per_config_changes
                             .remove(&key_bytes)
                             .unwrap_or_else(|| LedgerEntryChanges(VecM::default()));

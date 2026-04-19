@@ -163,7 +163,7 @@ impl CatchupManager {
                     conn.store_scp_history(ledger_seq, &envelopes)?;
 
                     for qset in v0.quorum_sets.iter() {
-                        let hash = Hash256::hash_xdr(qset)?;
+                        let hash = Hash256::hash_xdr(qset);
                         conn.store_scp_quorum_set(&hash, ledger_seq, qset)?;
                     }
                 }

@@ -33,8 +33,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use stellar_xdr::curr::{
-    Limits, NodeId, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementPledges,
-    Value, WriteXdr,
+    NodeId, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementPledges, Value,
 };
 
 use crate::driver::{SCPDriver, ValidationLevel};
@@ -723,7 +722,7 @@ impl NominationProtocol {
     }
 
     fn value_key(value: &Value) -> Vec<u8> {
-        value.to_xdr(Limits::none()).unwrap_or_default()
+        henyey_common::xdr_stream::xdr_to_bytes(value)
     }
 
     fn sorted_values(values: &[Value]) -> Vec<Value> {

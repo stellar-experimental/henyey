@@ -48,8 +48,8 @@ use std::sync::Arc;
 const MAX_PROTOCOL_TRANSITIONS: u32 = 50;
 
 use stellar_xdr::curr::{
-    Limits, NodeId, ScpBallot, ScpEnvelope, ScpQuorumSet, ScpStatement, ScpStatementConfirm,
-    ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare, Value, WriteXdr,
+    NodeId, ScpBallot, ScpEnvelope, ScpQuorumSet, ScpStatement, ScpStatementConfirm,
+    ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare, Value,
 };
 
 use crate::driver::{SCPDriver, ValidationLevel};

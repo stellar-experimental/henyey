@@ -1874,9 +1874,7 @@ impl App {
                     | TransactionResultResult::TxFeeBumpInnerSuccess(_)
             );
             if !is_success {
-                if let Some(hash) = Hash256::hash_xdr(tx).ok() {
-                    failed_hashes.push(hash);
-                }
+                failed_hashes.push(Hash256::hash_xdr(tx));
             }
         }
         timer.mark("build_persist_inputs_ms");
@@ -2179,10 +2177,8 @@ impl App {
                     }
                 };
                 if !invalid.is_empty() {
-                    let invalid_hashes: Vec<Hash256> = invalid
-                        .iter()
-                        .filter_map(|env| Hash256::hash_xdr(env).ok())
-                        .collect();
+                    let invalid_hashes: Vec<Hash256> =
+                        invalid.iter().map(|env| Hash256::hash_xdr(env)).collect();
                     invalid_banned = invalid_hashes.len();
                     herder.tx_queue().ban(&invalid_hashes);
                 }
