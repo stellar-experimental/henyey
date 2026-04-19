@@ -648,6 +648,10 @@ gh issue create \
 ## What needs to happen
 <concrete description of the work>
 
+## Dependencies
+<list any issues that must be completed before this one can start, or state "None">
+- Blocked by #NNN — <short reason why this depends on that issue>
+
 ## References
 - Parent issue: #$ISSUE
 - Implementation commit(s): <commit hashes>" \
@@ -665,6 +669,13 @@ Guidelines for deferred-work issues:
   crate-specific labels).
 - If a deferred item is trivial or speculative, skip it — only file issues for
   work that genuinely should be done.
+- **State dependencies explicitly.** If a deferred issue depends on another
+  issue (including other deferred issues being filed in the same batch), say so
+  in the Dependencies section with "Blocked by #NNN" and a short reason. If
+  multiple deferred items form a sequence (e.g., Phase 1 → Phase 2 → Phase 3),
+  each later phase must list the earlier one as a blocker. An issue with no
+  prerequisites should say "None". This is critical for the blocker-ancestor
+  resolution in this skill to work correctly.
 
 Update the completion comment's "What was deferred" section to include the
 newly created issue links (edit the comment or post a follow-up).
