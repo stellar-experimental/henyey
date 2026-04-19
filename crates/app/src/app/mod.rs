@@ -140,6 +140,18 @@ const RECOVERY_ESCALATION_SCP_REQUEST: u64 = 6;
 /// equals ~6s.
 const RECOVERY_ESCALATION_CATCHUP: u64 = 6;
 
+/// Maximum slot gap between the highest observed EXTERNALIZE and our
+/// current ledger before `submit_transaction()` rejects with TryAgainLater.
+///
+/// When the node has seen an EXTERNALIZE message more than this many slots
+/// ahead of its applied ledger, it knows its state is stale and any tx
+/// validation would run against outdated account state (producing terminal
+/// errors like `TxBadSeq` for what is actually a transient condition).
+///
+/// This gate is purely in the user-facing submission path — overlay tx
+/// intake bypasses it. See #1812.
+const TX_SUBMISSION_MAX_BEHIND: u64 = 2;
+
 /// Timeout for pending tx_set requests with no response from any peer.
 /// If we've been requesting a tx_set for this long with zero responses
 /// (no GeneralizedTxSet AND no DontHave), assume peers silently dropped
@@ -533,6 +545,12 @@ pub struct App {
 
     /// Total number of times the node lost sync.
     lost_sync_count: AtomicU64,
+
+    /// Highest EXTERNALIZE slot observed from any SCP envelope (Valid or
+    /// Pending). Used by `submit_transaction()` to detect when the node is
+    /// behind the network and should reject tx submissions with
+    /// TryAgainLater. Updated from lifecycle.rs envelope processing.
+    max_observed_externalize_slot: AtomicU64,
     /// Number of ledger closes that contained at least one transaction.
     /// Mirrors stellar-core's `ledger.transaction.count` histogram `.count`.
     ledger_tx_count: AtomicU64,
@@ -847,6 +865,7 @@ impl App {
             recovery_attempts_without_progress: AtomicU64::new(0),
             recovery_baseline_ledger: AtomicU64::new(0),
             lost_sync_count: AtomicU64::new(0),
+            max_observed_externalize_slot: AtomicU64::new(0),
             ledger_tx_count: AtomicU64::new(0),
             max_tx_size_bytes: AtomicU32::new(
                 henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES,
@@ -1462,6 +1481,29 @@ impl App {
         &self,
         tx: TransactionEnvelope,
     ) -> henyey_herder::TxQueueResult {
+        // If the node has observed EXTERNALIZE messages significantly ahead
+        // of its current ledger, it knows its state is stale.  Reject with
+        // TryAgainLater rather than validating against stale state (which
+        // produces terminal errors like TxBadSeq for transient conditions).
+        //
+        // This gate intentionally applies to all callers of
+        // submit_transaction (RPC sendTransaction, compat /tx, loadgen).
+        // Overlay tx intake bypasses this method and uses
+        // herder.receive_transaction() directly, which is correct — overlay
+        // flooding should continue even when behind.  See #1812.
+        let current = self.current_ledger_seq() as u64;
+        let max_ext = self.max_observed_externalize_slot.load(Ordering::SeqCst);
+        if max_ext > current + TX_SUBMISSION_MAX_BEHIND {
+            tracing::debug!(
+                current_ledger = current,
+                max_observed_ext = max_ext,
+                gap = max_ext - current,
+                "Rejecting tx submission: node is behind network (gap > {})",
+                TX_SUBMISSION_MAX_BEHIND,
+            );
+            return henyey_herder::TxQueueResult::TryAgainLater;
+        }
+
         let result = self.herder.receive_transaction(tx.clone());
         // Flood the transaction to peers so validators can include it.
         // Without this, transactions submitted via HTTP /tx stay local.
@@ -5903,6 +5945,131 @@ mod tests {
         assert!(
             pipeline.is_idle(),
             "pipeline should be idle after second cycle"
+        );
+    }
+
+    // ── submit_transaction freshness gate tests (#1812) ───────────────
+
+    /// Build a minimal tx envelope for freshness gate tests.
+    /// The tx will fail validation (no real account), but the freshness
+    /// gate fires before validation, so the tx content doesn't matter.
+    fn make_dummy_tx_envelope() -> TransactionEnvelope {
+        use stellar_xdr::curr::{
+            CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
+            Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionExt,
+            TransactionV1Envelope, Uint256,
+        };
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([1u8; 32])),
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::CreateAccount(CreateAccountOp {
+                    destination: stellar_xdr::curr::AccountId(
+                        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])),
+                    ),
+                    starting_balance: 1_000_000_000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    /// Helper: create a minimal test App for submit_transaction tests.
+    async fn mk_test_app_for_tx_freshness() -> App {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("tx-freshness-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        // Put herder in Tracking so the existing can_receive_transactions gate
+        // doesn't reject before our freshness check fires.
+        app.herder.set_state(henyey_herder::HerderState::Tracking);
+        app
+    }
+
+    #[tokio::test]
+    async fn test_submit_transaction_rejected_when_behind_network() {
+        let app = mk_test_app_for_tx_freshness().await;
+
+        // Simulate: network has externalized slot 110, node is at ledger 0.
+        // Gap of 110 >> TX_SUBMISSION_MAX_BEHIND (2).
+        app.max_observed_externalize_slot
+            .store(110, Ordering::SeqCst);
+
+        let result = app.submit_transaction(make_dummy_tx_envelope()).await;
+        assert_eq!(
+            result,
+            henyey_herder::TxQueueResult::TryAgainLater,
+            "should reject when node is far behind the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_transaction_accepted_when_within_threshold() {
+        let app = mk_test_app_for_tx_freshness().await;
+
+        // max_observed_externalize_slot defaults to 0.
+        // current_ledger_seq() is also 0.  Gap = 0, within threshold.
+        assert_eq!(app.max_observed_externalize_slot.load(Ordering::SeqCst), 0);
+
+        let result = app.submit_transaction(make_dummy_tx_envelope()).await;
+        // The tx may fail validation (no account loaded, etc.) but it should
+        // NOT be rejected by the freshness gate.
+        assert_ne!(
+            result,
+            henyey_herder::TxQueueResult::TryAgainLater,
+            "should not reject when node is current with the network"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_transaction_accepted_at_threshold_boundary() {
+        let app = mk_test_app_for_tx_freshness().await;
+        let current = app.current_ledger_seq() as u64;
+
+        // Gap of exactly TX_SUBMISSION_MAX_BEHIND should NOT trigger.
+        // The check is `max_ext > current + TX_SUBMISSION_MAX_BEHIND` (strict >).
+        app.max_observed_externalize_slot
+            .store(current + TX_SUBMISSION_MAX_BEHIND, Ordering::SeqCst);
+
+        let result = app.submit_transaction(make_dummy_tx_envelope()).await;
+        assert_ne!(
+            result,
+            henyey_herder::TxQueueResult::TryAgainLater,
+            "gap == threshold should pass (gate fires only when gap > threshold)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_submit_transaction_rejected_just_above_threshold() {
+        let app = mk_test_app_for_tx_freshness().await;
+        let current = app.current_ledger_seq() as u64;
+
+        // Gap of TX_SUBMISSION_MAX_BEHIND + 1 should trigger.
+        app.max_observed_externalize_slot
+            .store(current + TX_SUBMISSION_MAX_BEHIND + 1, Ordering::SeqCst);
+
+        let result = app.submit_transaction(make_dummy_tx_envelope()).await;
+        assert_eq!(
+            result,
+            henyey_herder::TxQueueResult::TryAgainLater,
+            "gap just above threshold should trigger freshness gate"
         );
     }
 }

@@ -1887,6 +1887,14 @@ impl App {
             }
         }
 
+        // Track the highest EXTERNALIZE slot we've observed (Valid or Pending).
+        // Used by submit_transaction() to detect when the node is behind the
+        // network and should reject user-facing tx submissions.  See #1812.
+        if is_externalize {
+            self.max_observed_externalize_slot
+                .fetch_max(slot, Ordering::SeqCst);
+        }
+
         match envelope_result {
             EnvelopeState::Valid => {
                 tracing::debug!(slot, tracking, "SCP envelope accepted (Valid)");
