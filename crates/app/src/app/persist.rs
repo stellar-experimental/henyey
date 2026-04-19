@@ -625,9 +625,11 @@ mod tests {
     /// # Architectural invariant
     ///
     /// `spawn_persist_task` must use exactly one `spawn_blocking` call that
-    /// runs the entire pipeline synchronously. The type system enforces this:
-    /// `run_blocking` is a synchronous `fn`, not `async fn`, so it cannot
-    /// call `spawn_blocking` internally without creating a nested runtime.
+    /// runs the entire pipeline synchronously. `run_blocking` is a synchronous
+    /// `fn` (not `async fn`), which makes nested `spawn_blocking` unnatural
+    /// but not impossible — the companion test
+    /// [`test_multi_spawn_blocking_stalls_with_interleaved_contention`]
+    /// provides the runtime discriminator.
     ///
     /// # Flush paths
     ///
@@ -733,6 +735,123 @@ mod tests {
                 meta.as_deref(),
                 Some(test_meta.as_slice()),
                 "LedgerCloseMeta must be persisted"
+            );
+        });
+    }
+
+    /// Discriminator test: proves the pre-fix multi-`spawn_blocking` pattern
+    /// stalls when an interloper task grabs the blocking slot between steps.
+    ///
+    /// With `max_blocking_threads(1)`, the blocking-pool queue is roughly
+    /// FIFO. The old persist pattern queued step 1, then after step 1
+    /// completed and the async task resumed, queued step 2. An interloper
+    /// task queued between steps 1 and 2 gets the slot before step 2,
+    /// stalling the pipeline. The current single-`spawn_blocking` design
+    /// runs all work atomically on one thread, so no interloper can
+    /// interleave.
+    ///
+    /// This test exercises the old pattern directly: if someone reverts
+    /// `spawn_persist_task` to use multiple sequential `spawn_blocking`
+    /// calls, this test would also need updating (making the regression
+    /// visible in code review).
+    #[test]
+    fn test_multi_spawn_blocking_stalls_with_interleaved_contention() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{mpsc, Barrier};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            // Phase 1: saturate the single blocking thread.
+            let (blocker_started_tx, blocker_started_rx) = mpsc::channel::<()>();
+            let blocker_release = Arc::new(Barrier::new(2));
+            let br = blocker_release.clone();
+            tokio::task::spawn_blocking(move || {
+                blocker_started_tx.send(()).unwrap();
+                br.wait();
+            });
+            blocker_started_rx.recv().unwrap();
+
+            // Phase 2: queue the old pattern — 2 sequential spawn_blocking
+            // calls inside tokio::spawn. Step 1 is queued immediately;
+            // step 2 is queued only after step 1 completes and the async
+            // task resumes.
+            let step_counter = Arc::new(AtomicUsize::new(0));
+            let sc = step_counter.clone();
+            let (step1_queued_tx, step1_queued_rx) = tokio::sync::oneshot::channel::<()>();
+            let mut old_pattern = tokio::spawn(async move {
+                let sc1 = sc.clone();
+                let h = tokio::task::spawn_blocking(move || {
+                    sc1.fetch_add(1, Ordering::SeqCst);
+                });
+                // Signal that step 1 is queued before awaiting it.
+                let _ = step1_queued_tx.send(());
+                h.await.unwrap();
+                // Step 2: queued AFTER step 1 completes.
+                let sc2 = sc;
+                tokio::task::spawn_blocking(move || {
+                    sc2.fetch_add(1, Ordering::SeqCst);
+                })
+                .await
+                .unwrap();
+            });
+
+            // Wait for step 1 to be queued, then queue the interloper.
+            step1_queued_rx.await.unwrap();
+
+            // Phase 3: queue an interloper that blocks on its own barrier.
+            // Queue order is now: [blocker(running), step1, interloper].
+            // After blocker releases → step1 runs → interloper runs (before
+            // step2, which hasn't been queued yet).
+            let (interloper_started_tx, interloper_started_rx) = mpsc::channel::<()>();
+            let interloper_release = Arc::new(Barrier::new(2));
+            let ir = interloper_release.clone();
+            tokio::task::spawn_blocking(move || {
+                interloper_started_tx.send(()).unwrap();
+                ir.wait();
+            });
+
+            // Phase 4: release the initial blocker.
+            std::thread::spawn(move || {
+                blocker_release.wait();
+            });
+
+            // Wait for the interloper to actually start (it holds the slot).
+            interloper_started_rx.recv().unwrap();
+
+            // Step 1 ran, step 2 is stuck behind the interloper.
+            assert_eq!(
+                step_counter.load(Ordering::SeqCst),
+                1,
+                "step 1 completed but step 2 must be blocked by the interloper"
+            );
+
+            // Phase 5: the old pattern must NOT complete while interloper
+            // holds the slot — this is the discriminator.
+            let timed_out =
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut old_pattern)
+                    .await
+                    .is_err();
+            assert!(
+                timed_out,
+                "multi-spawn_blocking pattern must stall when interloper holds \
+                 the slot between steps — this is the pre-fix regression scenario"
+            );
+
+            // Phase 6: release interloper, let step 2 complete.
+            std::thread::spawn(move || {
+                interloper_release.wait();
+            });
+            old_pattern.await.unwrap();
+            assert_eq!(
+                step_counter.load(Ordering::SeqCst),
+                2,
+                "both steps must complete after interloper releases"
             );
         });
     }
