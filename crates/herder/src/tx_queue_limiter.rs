@@ -358,7 +358,13 @@ impl TxQueueLimiter {
             return (false, 0);
         };
 
-        match txs.can_fit_with_eviction(new_tx, old_tx_discount, &self.network_id, ledger_version) {
+        match txs.can_fit_with_eviction(
+            new_tx,
+            old_tx_discount,
+            &self.network_id,
+            ledger_version,
+            None,
+        ) {
             Some(evictions) => {
                 *txs_to_evict = evictions;
                 (true, 0)

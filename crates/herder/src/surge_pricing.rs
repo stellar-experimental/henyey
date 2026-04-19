@@ -50,10 +50,10 @@
 //! across nodes.
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
-use henyey_common::NUM_CLASSIC_TX_RESOURCES;
 use henyey_common::{any_greater, subtract_non_negative, Resource, NUM_CLASSIC_TX_BYTES_RESOURCES};
+use henyey_common::{Hash256, NUM_CLASSIC_TX_RESOURCES};
 use henyey_tx::TransactionFrame;
 
 use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
@@ -72,7 +72,7 @@ pub(crate) const DEX_LANE: usize = 1;
 /// - How to classify transactions into lanes (based on operation types, etc.)
 /// - What resource limits apply to each lane
 /// - How to measure a transaction's resource consumption
-pub(crate) trait SurgePricingLaneConfig {
+pub(crate) trait SurgePricingLaneConfig: Send + Sync {
     /// Determine which lane a transaction belongs to based on its contents.
     fn get_lane(&self, frame: &TransactionFrame) -> usize;
 
@@ -205,6 +205,36 @@ impl SurgePricingLaneConfig for OpsOnlyLaneConfig {
 
     fn update_generic_lane_limit(&mut self, limit: Resource) {
         self.lane_limits[GENERIC_LANE] = limit;
+    }
+}
+
+/// Exclusion context for `can_fit_with_eviction`.
+///
+/// When checking whether a candidate tx fits in a persistent eviction queue,
+/// some entries may be logically absent (e.g., replaced-by-fee txs, or txs
+/// already selected for eviction by a prior lane-config pass). This struct
+/// lets the caller specify which entries to skip and how much to discount
+/// from the queue's resource accounting.
+pub(crate) struct EvictionExclusion {
+    /// Hashes to skip during cursor iteration.
+    pub hashes: HashSet<Hash256>,
+    /// Per-lane resource discount from excluded txs.
+    /// `lane_resource_discount[i]` is subtracted from `lane_current_count[i]`.
+    pub lane_resource_discount: Vec<Resource>,
+}
+
+impl EvictionExclusion {
+    #[allow(dead_code)] // Used in tx_queue/mod.rs after refactor
+    pub(crate) fn new(num_lanes: usize, resource_dim: usize) -> Self {
+        Self {
+            hashes: HashSet::new(),
+            lane_resource_discount: vec![Resource::make_empty(resource_dim); num_lanes],
+        }
+    }
+
+    #[allow(dead_code)] // Used in tx_queue/mod.rs after refactor
+    pub(crate) fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
     }
 }
 
@@ -345,6 +375,19 @@ impl SurgePricingPriorityQueue {
         self.lane_limits.len()
     }
 
+    /// Number of lanes in this queue (alias for EvictionExclusion sizing).
+    pub(crate) fn lane_count(&self) -> usize {
+        self.lane_limits.len()
+    }
+
+    /// Dimensionality of the resource vectors in this queue.
+    pub(crate) fn resource_dim(&self) -> usize {
+        self.lane_limits
+            .first()
+            .map(|l| l.size())
+            .unwrap_or(NUM_CLASSIC_TX_RESOURCES)
+    }
+
     /// Update the generic lane limit to match current max resources.
     ///
     /// Parity: stellar-core calls `updateGenericLaneLimit()` in `canAddTx()`
@@ -390,6 +433,10 @@ impl SurgePricingPriorityQueue {
 
     pub(crate) fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource {
         self.lane_config.tx_resources(frame, ledger_version)
+    }
+
+    pub(crate) fn get_lane(&self, frame: &TransactionFrame) -> usize {
+        self.lane_config.get_lane(frame)
     }
 
     fn erase(
@@ -518,6 +565,7 @@ impl SurgePricingPriorityQueue {
         tx_discount: Option<Resource>,
         network_id: &henyey_common::NetworkId,
         ledger_version: u32,
+        exclusion: Option<&EvictionExclusion>,
     ) -> Option<Vec<(QueuedTransaction, bool)>> {
         let frame = TransactionFrame::from_owned_with_network(tx.envelope.clone(), *network_id);
         let lane = self.lane_config.get_lane(&frame);
@@ -526,20 +574,42 @@ impl SurgePricingPriorityQueue {
             tx_resources = subtract_non_negative(&tx_resources, &discount);
         }
 
+        // Compute effective resource counts, accounting for excluded entries.
+        let effective_lane_count: Vec<Resource> = if let Some(excl) = exclusion {
+            self.lane_current_count
+                .iter()
+                .enumerate()
+                .map(|(i, count)| {
+                    if i < excl.lane_resource_discount.len() {
+                        subtract_non_negative(count, &excl.lane_resource_discount[i])
+                    } else {
+                        count.clone()
+                    }
+                })
+                .collect()
+        } else {
+            self.lane_current_count.clone()
+        };
+
+        let effective_total = effective_lane_count.iter().fold(
+            Resource::make_empty(self.lane_limits[0].size()),
+            |acc, r| acc + r.clone(),
+        );
+
         if any_greater(&tx_resources, &self.lane_limits[GENERIC_LANE])
             || any_greater(&tx_resources, &self.lane_limits[lane])
         {
             return None;
         }
 
-        if !self.total_resources().can_add(&tx_resources)
-            || !self.lane_current_count[lane].can_add(&tx_resources)
+        if !effective_total.can_add(&tx_resources)
+            || !effective_lane_count[lane].can_add(&tx_resources)
         {
             return None;
         }
 
-        let new_total = self.total_resources() + tx_resources.clone();
-        let new_lane = self.lane_current_count[lane].clone() + tx_resources.clone();
+        let new_total = effective_total + tx_resources.clone();
+        let new_lane = effective_lane_count[lane].clone() + tx_resources.clone();
         if new_total.leq(&self.lane_limits[GENERIC_LANE]) && new_lane.leq(&self.lane_limits[lane]) {
             return Some(Vec::new());
         }
@@ -575,15 +645,26 @@ impl SurgePricingPriorityQueue {
             }
         }
 
+        let exclude_hashes = exclusion.map(|e| &e.hashes);
         let mut cursors: Vec<LaneCursor> = self
             .lanes
             .iter()
             .enumerate()
-            .map(|(lane, set)| LaneCursor {
-                lane,
-                entries: set.iter().collect(),
-                index: 0,
-                active: !set.is_empty(),
+            .map(|(lane, set)| {
+                let entries: Vec<&QueueEntry> = if let Some(excl) = exclude_hashes {
+                    set.iter()
+                        .filter(|e| !excl.contains(&Hash256::from_bytes(e.hash)))
+                        .collect()
+                } else {
+                    set.iter().collect()
+                };
+                let active = !entries.is_empty();
+                LaneCursor {
+                    lane,
+                    entries,
+                    index: 0,
+                    active,
+                }
             })
             .collect();
 

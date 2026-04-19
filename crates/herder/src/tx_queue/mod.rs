@@ -61,8 +61,8 @@ use stellar_xdr::curr::{
 
 use crate::error::HerderError;
 use crate::surge_pricing::{
-    DexLimitingLaneConfig, OpsOnlyLaneConfig, SorobanGenericLaneConfig, SurgePricingLaneConfig,
-    SurgePricingPriorityQueue, GENERIC_LANE,
+    DexLimitingLaneConfig, EvictionExclusion, OpsOnlyLaneConfig, QueueEntry,
+    SorobanGenericLaneConfig, SurgePricingLaneConfig, SurgePricingPriorityQueue, GENERIC_LANE,
 };
 use crate::Result;
 use henyey_tx::envelope_sequence_number;
@@ -616,25 +616,91 @@ impl PartialOrd for FeeEntry {
 struct QueueStore {
     by_hash: HashMap<Hash256, QueuedTransaction>,
     fee_index: std::collections::BTreeSet<FeeEntry>,
+    /// Persistent eviction queue for classic txs (DexLimitingLaneConfig).
+    /// Lazy-initialized when classic lane config is available.
+    classic_eviction_queue: Option<SurgePricingPriorityQueue>,
+    /// Persistent eviction queue for soroban txs (SorobanGenericLaneConfig).
+    /// Lazy-initialized when soroban resource limits are available.
+    soroban_eviction_queue: Option<SurgePricingPriorityQueue>,
+    /// Persistent eviction queue for global ops limit (OpsOnlyLaneConfig).
+    /// Lazy-initialized when max_queue_ops is configured.
+    global_ops_queue: Option<SurgePricingPriorityQueue>,
+    /// Fixed seed for eviction queue tie-breaking. Set once at creation,
+    /// regenerated on reset_and_rebuild. Matches stellar-core's per-reset seed.
+    eviction_seed: u64,
+    /// Network ID for TransactionFrame creation during queue operations.
+    network_id: NetworkId,
 }
 
 impl QueueStore {
-    fn new() -> Self {
+    fn new(network_id: NetworkId) -> Self {
+        let seed = if cfg!(test) {
+            0
+        } else {
+            rand::thread_rng().gen()
+        };
         Self {
             by_hash: HashMap::new(),
             fee_index: std::collections::BTreeSet::new(),
+            classic_eviction_queue: None,
+            soroban_eviction_queue: None,
+            global_ops_queue: None,
+            eviction_seed: seed,
+            network_id,
         }
     }
 
-    fn insert(&mut self, tx: QueuedTransaction) {
+    fn insert(&mut self, tx: QueuedTransaction, ledger_version: u32) {
         let entry = FeeEntry::from_queued(&tx);
+
+        // Update eviction queues before inserting into by_hash.
+        let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+            tx.envelope.clone(),
+            self.network_id,
+        );
+        let is_soroban = frame.is_soroban();
+
+        if is_soroban {
+            if let Some(ref mut queue) = self.soroban_eviction_queue {
+                queue.add(tx.clone(), &self.network_id, ledger_version);
+            }
+        } else if let Some(ref mut queue) = self.classic_eviction_queue {
+            queue.add(tx.clone(), &self.network_id, ledger_version);
+        }
+        if let Some(ref mut queue) = self.global_ops_queue {
+            queue.add(tx.clone(), &self.network_id, ledger_version);
+        }
+
         self.by_hash.insert(tx.hash, tx);
         self.fee_index.insert(entry);
     }
 
-    fn remove(&mut self, hash: &Hash256) -> Option<QueuedTransaction> {
+    fn remove(&mut self, hash: &Hash256, ledger_version: u32) -> Option<QueuedTransaction> {
         if let Some(tx) = self.by_hash.remove(hash) {
             self.fee_index.remove(&FeeEntry::from_queued(&tx));
+
+            // Remove from eviction queues.
+            let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                tx.envelope.clone(),
+                self.network_id,
+            );
+            let entry = QueueEntry::new(tx.clone(), self.eviction_seed);
+            let is_soroban = frame.is_soroban();
+
+            if is_soroban {
+                if let Some(ref mut queue) = self.soroban_eviction_queue {
+                    let lane = queue.get_lane(&frame);
+                    queue.remove_entry(lane, &entry, ledger_version, &self.network_id);
+                }
+            } else if let Some(ref mut queue) = self.classic_eviction_queue {
+                let lane = queue.get_lane(&frame);
+                queue.remove_entry(lane, &entry, ledger_version, &self.network_id);
+            }
+            if let Some(ref mut queue) = self.global_ops_queue {
+                let lane = queue.get_lane(&frame);
+                queue.remove_entry(lane, &entry, ledger_version, &self.network_id);
+            }
+
             Some(tx)
         } else {
             None
@@ -644,6 +710,9 @@ impl QueueStore {
     fn clear(&mut self) {
         self.by_hash.clear();
         self.fee_index.clear();
+        self.classic_eviction_queue = None;
+        self.soroban_eviction_queue = None;
+        self.global_ops_queue = None;
     }
 
     fn get(&self, hash: &Hash256) -> Option<&QueuedTransaction> {
@@ -676,12 +745,6 @@ impl QueueStore {
         self.by_hash.iter()
     }
 
-    /// Direct read access to the underlying HashMap for iteration patterns
-    /// that need a `&HashMap` reference (e.g., `EvictionScan`).
-    fn as_hash_map(&self) -> &HashMap<Hash256, QueuedTransaction> {
-        &self.by_hash
-    }
-
     /// Peek the lowest-fee entry from the index. O(log n).
     fn lowest_fee(&self) -> Option<&FeeEntry> {
         self.fee_index.iter().next()
@@ -705,6 +768,71 @@ impl QueueStore {
             );
         }
     }
+
+    /// Ensure the classic eviction queue exists, building it from scratch if needed.
+    fn ensure_classic_queue(
+        &mut self,
+        lane_config: DexLimitingLaneConfig,
+        ledger_version: u32,
+    ) -> &SurgePricingPriorityQueue {
+        if self.classic_eviction_queue.is_none() {
+            let mut queue =
+                SurgePricingPriorityQueue::new(Box::new(lane_config), self.eviction_seed);
+            for tx in self.by_hash.values() {
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                    tx.envelope.clone(),
+                    self.network_id,
+                );
+                if !frame.is_soroban() {
+                    queue.add(tx.clone(), &self.network_id, ledger_version);
+                }
+            }
+            self.classic_eviction_queue = Some(queue);
+        }
+        self.classic_eviction_queue.as_ref().unwrap()
+    }
+
+    /// Ensure the soroban eviction queue exists, building it from scratch if needed.
+    fn ensure_soroban_queue(
+        &mut self,
+        limit: Resource,
+        ledger_version: u32,
+    ) -> &SurgePricingPriorityQueue {
+        if self.soroban_eviction_queue.is_none() {
+            let lane_config = SorobanGenericLaneConfig::new(limit);
+            let mut queue =
+                SurgePricingPriorityQueue::new(Box::new(lane_config), self.eviction_seed);
+            for tx in self.by_hash.values() {
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                    tx.envelope.clone(),
+                    self.network_id,
+                );
+                if frame.is_soroban() {
+                    queue.add(tx.clone(), &self.network_id, ledger_version);
+                }
+            }
+            self.soroban_eviction_queue = Some(queue);
+        }
+        self.soroban_eviction_queue.as_ref().unwrap()
+    }
+
+    /// Ensure the global ops eviction queue exists, building it from scratch if needed.
+    fn ensure_global_ops_queue(
+        &mut self,
+        limit: i64,
+        ledger_version: u32,
+    ) -> &SurgePricingPriorityQueue {
+        if self.global_ops_queue.is_none() {
+            let lane_config = OpsOnlyLaneConfig::new(Resource::new(vec![limit]));
+            let mut queue =
+                SurgePricingPriorityQueue::new(Box::new(lane_config), self.eviction_seed);
+            for tx in self.by_hash.values() {
+                queue.add(tx.clone(), &self.network_id, ledger_version);
+            }
+            self.global_ops_queue = Some(queue);
+        }
+        self.global_ops_queue.as_ref().unwrap()
+    }
 }
 
 /// Bundled properties of a transaction being evaluated for queue admission.
@@ -715,14 +843,52 @@ struct EvictionCandidate<'a> {
     ledger_version: u32,
 }
 
-struct EvictionScan<'a, F> {
-    by_hash: &'a HashMap<Hash256, QueuedTransaction>,
-    queued: &'a QueuedTransaction,
-    lane_config: Box<dyn SurgePricingLaneConfig>,
+/// Build an `EvictionExclusion` for a persistent eviction queue query.
+///
+/// Excludes the RBF-replaced tx (if any) and any cross-queue evictions from
+/// prior passes, adjusting per-lane resource discounts accordingly.
+fn build_eviction_exclusion(
+    queue: &SurgePricingPriorityQueue,
+    by_hash: &HashMap<Hash256, QueuedTransaction>,
+    replaced_tx: Option<&QueuedTransaction>,
+    cross_queue_evictions: &HashSet<Hash256>,
+    network_id: NetworkId,
     ledger_version: u32,
-    exclude: &'a HashSet<Hash256>,
-    filter: F,
-    seed: u64,
+) -> EvictionExclusion {
+    let num_lanes = queue.lane_count();
+    let resource_dim = queue.resource_dim();
+    let mut excl = EvictionExclusion::new(num_lanes, resource_dim);
+
+    // Add replaced tx (RBF). stellar-core subtracts the old tx's resources
+    // before calling canFitWithEviction.
+    if let Some(old_tx) = replaced_tx {
+        excl.hashes.insert(old_tx.hash);
+        let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+            old_tx.envelope.clone(),
+            network_id,
+        );
+        let lane = queue.get_lane(&frame);
+        let resources = queue.tx_resources(&frame, ledger_version);
+        excl.lane_resource_discount[lane] = excl.lane_resource_discount[lane].clone() + resources;
+    }
+
+    // Add cross-queue evictions from prior passes
+    for hash in cross_queue_evictions {
+        if excl.hashes.insert(*hash) {
+            if let Some(tx) = by_hash.get(hash) {
+                let frame = henyey_tx::TransactionFrame::from_owned_with_network(
+                    tx.envelope.clone(),
+                    network_id,
+                );
+                let lane = queue.get_lane(&frame);
+                let resources = queue.tx_resources(&frame, ledger_version);
+                excl.lane_resource_discount[lane] =
+                    excl.lane_resource_discount[lane].clone() + resources;
+            }
+        }
+    }
+
+    excl
 }
 
 /// Get the source account (inner for fee-bump) as a MuxedAccount.
@@ -876,8 +1042,8 @@ impl TransactionQueue {
         }
 
         Self {
+            store: RwLock::new(QueueStore::new(config.network_id)),
             config,
-            store: RwLock::new(QueueStore::new()),
             seen: RwLock::new(HashSet::new()),
             validation_context: RwLock::new(ctx),
             classic_lane_evicted_inclusion_fee: RwLock::new(Vec::new()),
@@ -935,6 +1101,9 @@ impl TransactionQueue {
     /// the pool ledger multiplier.
     pub fn update_soroban_resource_limits(&self, resources: Resource) {
         *self.dynamic_queue_soroban_resources.write() = Some(resources);
+        // Invalidate the persistent soroban eviction queue so it gets rebuilt
+        // with the new limits on next admission.
+        self.store.write().soroban_eviction_queue = None;
     }
 
     /// Update Soroban resource limits for tx-set selection (1x ledger max).
@@ -997,7 +1166,8 @@ impl TransactionQueue {
             return false;
         };
         let hash = queued.hash;
-        self.store.write().insert(queued);
+        let ledger_version = self.validation_context.read().protocol_version;
+        self.store.write().insert(queued, ledger_version);
         self.seen.write().insert(hash);
         true
     }
@@ -1230,37 +1400,6 @@ impl TransactionQueue {
         Ok(())
     }
 
-    fn collect_evictions_for_lane_config<F>(
-        &self,
-        scan: EvictionScan<'_, F>,
-    ) -> Option<Vec<(QueuedTransaction, bool)>>
-    where
-        F: Fn(&QueuedTransaction) -> bool,
-    {
-        let EvictionScan {
-            by_hash,
-            queued,
-            lane_config,
-            ledger_version,
-            exclude,
-            filter,
-            seed,
-        } = scan;
-
-        let mut queue = SurgePricingPriorityQueue::new(lane_config, seed);
-        for tx in by_hash.values() {
-            if exclude.contains(&tx.hash) {
-                continue;
-            }
-            if filter(tx) {
-                queue.add(tx.clone(), &self.config.network_id, ledger_version);
-            }
-        }
-        queue
-            .can_fit_with_eviction(queued, None, &self.config.network_id, ledger_version)
-            .map(|evictions| evictions.into_iter().collect())
-    }
-
     /// Check per-account limit: one pending transaction per sequence-number source.
     ///
     /// Returns `Ok(None)` if no existing transaction, `Ok(Some(replaced))` if a
@@ -1402,9 +1541,8 @@ impl TransactionQueue {
     /// Returns the list of transactions to evict, or an early rejection result.
     fn check_and_collect_evictions(
         &self,
-        by_hash: &HashMap<Hash256, QueuedTransaction>,
+        store: &mut QueueStore,
         candidate: &EvictionCandidate,
-        seed: u64,
         replaced_tx: Option<&QueuedTransaction>,
     ) -> std::result::Result<Vec<QueuedTransaction>, TxQueueResult> {
         // Phase 1: Check minimum inclusion fee for each lane (cheap, read-only)
@@ -1444,35 +1582,39 @@ impl TransactionQueue {
             }
         }
 
-        // Phase 2: Collect evictions (more expensive, involves scanning queue)
+        // Phase 2: Collect evictions using persistent queues (O(k) where k=evictions)
         let mut pending_evictions: HashSet<Hash256> = HashSet::new();
         let mut pending_eviction_list: Vec<QueuedTransaction> = Vec::new();
-
-        // If this is a replace-by-fee, pre-exclude the old tx from capacity
-        // calculations. stellar-core's TxQueueLimiter subtracts the old tx's
-        // resources before calling canFitWithEviction.
-        if let Some(old_tx) = replaced_tx {
-            pending_evictions.insert(old_tx.hash);
-        }
+        let network_id = self.config.network_id;
 
         if !candidate.is_soroban {
             if let Some(lane_config) = self.build_classic_lane_config() {
-                let filter = |tx: &QueuedTransaction| {
-                    let frame = henyey_tx::TransactionFrame::from_owned_with_network(
-                        tx.envelope.clone(),
-                        self.config.network_id,
-                    );
-                    !frame.is_soroban()
+                store.ensure_classic_queue(lane_config.clone(), candidate.ledger_version);
+                let exclusion = build_eviction_exclusion(
+                    store.classic_eviction_queue.as_ref().unwrap(),
+                    &store.by_hash,
+                    replaced_tx,
+                    &pending_evictions,
+                    network_id,
+                    candidate.ledger_version,
+                );
+                let excl_ref = if exclusion.is_empty() {
+                    None
+                } else {
+                    Some(&exclusion)
                 };
-                let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
-                    by_hash,
-                    queued: candidate.queued,
-                    lane_config: Box::new(lane_config.clone()),
-                    ledger_version: candidate.ledger_version,
-                    exclude: &pending_evictions,
-                    filter,
-                    seed,
-                }) else {
+                let Some(evictions) = store
+                    .classic_eviction_queue
+                    .as_ref()
+                    .unwrap()
+                    .can_fit_with_eviction(
+                        candidate.queued,
+                        None,
+                        &network_id,
+                        candidate.ledger_version,
+                        excl_ref,
+                    )
+                else {
                     return Err(TxQueueResult::QueueFull);
                 };
                 self.record_lane_evictions(
@@ -1487,28 +1629,37 @@ impl TransactionQueue {
 
         if candidate.is_soroban {
             if let Some(limit) = self.effective_queue_soroban_resources() {
-                let lane_config = SorobanGenericLaneConfig::new(limit.clone());
-                let filter = |tx: &QueuedTransaction| {
-                    let frame = henyey_tx::TransactionFrame::from_owned_with_network(
-                        tx.envelope.clone(),
-                        self.config.network_id,
-                    );
-                    frame.is_soroban()
+                store.ensure_soroban_queue(limit.clone(), candidate.ledger_version);
+                let exclusion = build_eviction_exclusion(
+                    store.soroban_eviction_queue.as_ref().unwrap(),
+                    &store.by_hash,
+                    replaced_tx,
+                    &pending_evictions,
+                    network_id,
+                    candidate.ledger_version,
+                );
+                let excl_ref = if exclusion.is_empty() {
+                    None
+                } else {
+                    Some(&exclusion)
                 };
-                let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
-                    by_hash,
-                    queued: candidate.queued,
-                    lane_config: Box::new(lane_config),
-                    ledger_version: candidate.ledger_version,
-                    exclude: &pending_evictions,
-                    filter,
-                    seed,
-                }) else {
+                let Some(evictions) = store
+                    .soroban_eviction_queue
+                    .as_ref()
+                    .unwrap()
+                    .can_fit_with_eviction(
+                        candidate.queued,
+                        None,
+                        &network_id,
+                        candidate.ledger_version,
+                        excl_ref,
+                    )
+                else {
                     return Err(TxQueueResult::QueueFull);
                 };
-                let lane_config = SorobanGenericLaneConfig::new(limit);
+                let lane_config_for_record = SorobanGenericLaneConfig::new(limit);
                 self.record_lane_evictions(
-                    &lane_config,
+                    &lane_config_for_record,
                     &self.soroban_lane_evicted_inclusion_fee,
                     evictions,
                     &mut pending_evictions,
@@ -1518,17 +1669,32 @@ impl TransactionQueue {
         }
 
         if let Some(limit) = self.config.max_queue_ops {
-            let lane_config = OpsOnlyLaneConfig::new(Resource::new(vec![limit as i64]));
-            let filter = |_tx: &QueuedTransaction| true;
-            let Some(evictions) = self.collect_evictions_for_lane_config(EvictionScan {
-                by_hash,
-                queued: candidate.queued,
-                lane_config: Box::new(lane_config),
-                ledger_version: candidate.ledger_version,
-                exclude: &pending_evictions,
-                filter,
-                seed,
-            }) else {
+            store.ensure_global_ops_queue(limit as i64, candidate.ledger_version);
+            let exclusion = build_eviction_exclusion(
+                store.global_ops_queue.as_ref().unwrap(),
+                &store.by_hash,
+                replaced_tx,
+                &pending_evictions,
+                network_id,
+                candidate.ledger_version,
+            );
+            let excl_ref = if exclusion.is_empty() {
+                None
+            } else {
+                Some(&exclusion)
+            };
+            let Some(evictions) = store
+                .global_ops_queue
+                .as_ref()
+                .unwrap()
+                .can_fit_with_eviction(
+                    candidate.queued,
+                    None,
+                    &network_id,
+                    candidate.ledger_version,
+                    excl_ref,
+                )
+            else {
                 return Err(TxQueueResult::QueueFull);
             };
             for (evicted, _evicted_due_to_lane_limit) in evictions {
@@ -1628,12 +1794,6 @@ impl TransactionQueue {
                 Err(result) => return result,
             };
 
-        let seed = if cfg!(test) {
-            0
-        } else {
-            rand::thread_rng().gen()
-        };
-
         let candidate = EvictionCandidate {
             queued: &queued,
             is_soroban: queued_is_soroban,
@@ -1641,27 +1801,26 @@ impl TransactionQueue {
             ledger_version,
         };
 
-        let pending_eviction_list = match self.check_and_collect_evictions(
-            store.as_hash_map(),
-            &candidate,
-            seed,
-            replaced_tx.as_ref(),
-        ) {
-            Ok(evictions) => evictions,
-            Err(result) => return result,
-        };
+        let pending_eviction_list =
+            match self.check_and_collect_evictions(&mut store, &candidate, replaced_tx.as_ref()) {
+                Ok(evictions) => evictions,
+                Err(result) => return result,
+            };
 
-        // Check queue size (accounting for pending evictions) and evict if needed.
+        // Fee balance validation (pure check, no side effects — run before capacity eviction)
         if let Err(result) =
-            self.ensure_queue_capacity(&mut store, pending_eviction_list.len(), &queued)
+            self.validate_fee_balance(&queued, &new_fee_source_key, replaced_tx.as_ref())
         {
             return result;
         }
 
-        // Fee balance validation
-        if let Err(result) =
-            self.validate_fee_balance(&queued, &new_fee_source_key, replaced_tx.as_ref())
-        {
+        // Check queue size (accounting for pending evictions) and evict if needed.
+        if let Err(result) = self.ensure_queue_capacity(
+            &mut store,
+            pending_eviction_list.len(),
+            &queued,
+            ledger_version,
+        ) {
             return result;
         }
 
@@ -1671,7 +1830,7 @@ impl TransactionQueue {
         // Parity: stellar-core TransactionQueue.cpp:733-739 bans each evicted
         // victim so it cannot be re-submitted immediately.
         for evicted in &pending_eviction_list {
-            store.remove(&evicted.hash);
+            store.remove(&evicted.hash, ledger_version);
         }
         if !pending_eviction_list.is_empty() {
             let mut seen = self.seen.write();
@@ -1692,7 +1851,7 @@ impl TransactionQueue {
         // Handle fee-bump replacement if applicable
         if let Some(ref old_tx) = replaced_tx {
             // Remove the old transaction from store and seen
-            store.remove(&old_tx.hash);
+            store.remove(&old_tx.hash, ledger_version);
             self.seen.write().remove(&old_tx.hash);
 
             // If the old tx has a different fee-source, release the fee from that account
@@ -1751,7 +1910,7 @@ impl TransactionQueue {
             }
         }
 
-        store.insert(queued);
+        store.insert(queued, ledger_version);
         self.seen.write().insert(hash);
 
         TxQueueResult::Added
@@ -1766,6 +1925,7 @@ impl TransactionQueue {
         store: &mut QueueStore,
         pending_eviction_count: usize,
         queued: &QueuedTransaction,
+        ledger_version: u32,
     ) -> std::result::Result<(), TxQueueResult> {
         let effective_len = store.len().saturating_sub(pending_eviction_count);
         if effective_len < self.config.max_size {
@@ -1779,7 +1939,7 @@ impl TransactionQueue {
             .find(|(_, tx)| tx.is_expired(self.config.max_age_secs))
             .map(|(h, _)| *h);
         if let Some(hash) = expired_hash {
-            let evicted = store.remove(&hash).unwrap();
+            let evicted = store.remove(&hash, ledger_version).unwrap();
             self.seen.write().remove(&hash);
             let mut account_states = self.account_states.write();
             Self::drop_transaction(&mut account_states, &evicted);
@@ -1790,7 +1950,7 @@ impl TransactionQueue {
         if let Some(min_entry) = store.lowest_fee().cloned() {
             if queued.is_better_than_entry(&min_entry) {
                 let evict_hash = min_entry.hash;
-                let evicted = store.remove(&evict_hash).unwrap();
+                let evicted = store.remove(&evict_hash, ledger_version).unwrap();
                 self.seen.write().remove(&evict_hash);
                 let mut account_states = self.account_states.write();
                 Self::drop_transaction(&mut account_states, &evicted);
@@ -1934,6 +2094,7 @@ impl TransactionQueue {
         let mut store = self.store.write();
         let mut account_states = self.account_states.write();
         let max_age = self.config.max_age_secs;
+        let ledger_version = self.validation_context.read().protocol_version;
         // Collect expired transactions, then remove them so account_states
         // are properly cleaned up (fee release + empty entry removal).
         let expired_hashes: Vec<Hash256> = store
@@ -1942,7 +2103,7 @@ impl TransactionQueue {
             .map(|(hash, _)| *hash)
             .collect();
         for hash in &expired_hashes {
-            if let Some(removed) = store.remove(hash) {
+            if let Some(removed) = store.remove(hash, ledger_version) {
                 Self::drop_transaction(&mut account_states, &removed);
             }
         }
@@ -1997,8 +2158,9 @@ impl TransactionQueue {
         let mut store = self.store.write();
         let mut account_states = self.account_states.write();
         let mut seen = self.seen.write();
+        let ledger_version = self.validation_context.read().protocol_version;
         for hash in tx_hashes {
-            if let Some(removed) = store.remove(hash) {
+            if let Some(removed) = store.remove(hash, ledger_version) {
                 Self::drop_transaction(&mut account_states, &removed);
             }
             seen.remove(hash);
@@ -2073,6 +2235,7 @@ impl TransactionQueue {
         let mut account_states = self.account_states.write();
         let mut store = self.store.write();
         let mut banned = self.banned_transactions.write();
+        let ledger_version = self.validation_context.read().protocol_version;
 
         // Collect fee releases to apply after processing all transactions
         let mut fee_releases: Vec<(Vec<u8>, i64)> = Vec::new();
@@ -2100,7 +2263,7 @@ impl TransactionQueue {
                     if queued_tx.sequence_number() <= *applied_seq {
                         // Remove from store
                         let removed_hash = queued_tx.hash;
-                        store.remove(&removed_hash);
+                        store.remove(&removed_hash, ledger_version);
                         removed_hashes.push(removed_hash);
 
                         // Collect fee release info
@@ -2166,6 +2329,7 @@ impl TransactionQueue {
         let mut banned = self.banned_transactions.write();
         let mut account_states = self.account_states.write();
         let mut store = self.store.write();
+        let ledger_version = self.validation_context.read().protocol_version;
 
         // Remove the oldest set (front) to unban those transactions
         let unbanned_count = banned.pop_front().map(|s| s.len()).unwrap_or(0);
@@ -2192,7 +2356,7 @@ impl TransactionQueue {
                         newest.insert(queued_tx.hash);
                     }
                     // Remove from store and track for seen cleanup
-                    store.remove(&queued_tx.hash);
+                    store.remove(&queued_tx.hash, ledger_version);
                     evicted_hashes.push(queued_tx.hash);
 
                     // Track fee release for the fee-source account
