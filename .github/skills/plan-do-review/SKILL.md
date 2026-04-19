@@ -6,6 +6,8 @@ argument-hint: "<issue-number> [--model <model>] [--max-proposal-rounds N] [--ma
 
 Parse `$ARGUMENTS`:
 - The first argument is a GitHub issue number. Replace `$ISSUE` with it.
+  Also set `$ORIGINAL_ISSUE` = `$ISSUE` (preserved for redirect comments if
+  blocker-ancestor resolution changes the target).
 - `--model <model>`: Model for critic and review agents (default: `"gpt-5.4"`).
 - `--max-proposal-rounds N`: Max proposal↔critic iterations (default: 5).
 - `--max-review-rounds N`: Max implement↔review-fix iterations (default: 3).
@@ -80,13 +82,67 @@ Extract:
 - **Comments**: any existing discussion (prior reviews, context)
 - **State**: must be open (if closed, stop and report)
 
+### Blocker-Ancestor Resolution
+
+Before triaging readiness, check whether the issue is **blocked by** another
+open issue. If it is, walk up the dependency chain and switch to the first
+unblocked ancestor so that useful work gets done instead of bailing with
+`not-ready`.
+
+**Procedure** (start with `visited = {}`, `depth = 0`):
+
+1. Read the current issue's body and comments. Using your understanding of the
+   text, identify any issue numbers that this issue is **blocked by** — look
+   for patterns like "blocked by #N", "depends on #N", "requires #N first",
+   tasklist items `- [ ] #N`, or similar contextual references that indicate
+   a prerequisite relationship. **Only** extract issues that are genuine
+   blockers; ignore issues that are merely referenced or related.
+
+2. For each candidate blocker, fetch it:
+   ```bash
+   gh issue view <N> --json number,state,title,body,comments
+   ```
+   Filter to only **open** issues. If no open blockers remain, the current
+   issue is not actually blocked — continue with it as the target.
+
+3. If open blocker(s) exist, pick the **first** one (by order of mention in
+   the body/comments). Add the current `$ISSUE` to `visited`, set
+   `$ISSUE = <blocker number>`, increment `depth`, and go back to step 1.
+
+4. **Cycle detection**: if the blocker is already in `visited`, skip it and
+   try the next blocker. If all blockers are in `visited`, the current issue
+   is in a dependency cycle — fall through to Readiness Triage as-is.
+
+5. **Depth cap**: if `depth >= 10`, stop walking and fall through to
+   Readiness Triage for the current issue.
+
+**When the target changes** (i.e., `$ISSUE != $ORIGINAL_ISSUE` after
+resolution):
+
+1. Post a redirect comment on the **original** issue:
+   ```bash
+   gh issue comment $ORIGINAL_ISSUE --body "⏩ This issue is blocked by #$ISSUE. Working on #$ISSUE first."
+   ```
+2. Assign yourself to the new target issue:
+   ```bash
+   gh issue edit $ISSUE --add-assignee @me
+   ```
+3. Unassign yourself from the original issue (the loop script or caller
+   assigned you):
+   ```bash
+   gh issue edit $ORIGINAL_ISSUE --remove-assignee @me
+   ```
+
+Now continue with `$ISSUE` (which may have changed) into Readiness Triage.
+
+---
+
 ### Readiness Triage
 
 Before proceeding, assess whether the issue is actionable. An issue is **not
 ready** if any of these are true:
 
 - The body is empty or contains only a vague one-liner with no concrete proposal
-- It depends on another issue that is still open
 - It requires information or decisions that are not yet available
 - It describes a problem but proposes no approach and the correct approach is
   unclear even after reading the referenced code
