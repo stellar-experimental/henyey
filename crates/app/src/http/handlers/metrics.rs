@@ -47,6 +47,16 @@ mod tests {
             "missing HELP for hard_reset_total"
         );
 
+        // TYPE lines must be correct.
+        assert!(
+            output.contains("# TYPE stellar_ledger_sequence gauge"),
+            "wrong TYPE for ledger_sequence"
+        );
+        assert!(
+            output.contains("# TYPE henyey_scp_prefilter_rejects_total counter"),
+            "wrong TYPE for prefilter_rejects_total"
+        );
+
         // All prefilter reason labels present.
         use henyey_herder::scp_verify::PreFilterRejectReason;
         for reason in PreFilterRejectReason::ALL {

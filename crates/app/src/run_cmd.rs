@@ -206,13 +206,19 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
         shutdown_app.shutdown();
     });
 
+    // Ensure a Prometheus recorder is installed. If the caller provided a
+    // handle (e.g. from main.rs), use it; otherwise install one now so that
+    // library consumers using `RunOptions::default()` still get /metrics.
+    let prometheus_handle = options
+        .prometheus_handle
+        .clone()
+        .unwrap_or_else(crate::metrics::install_recorder);
+
     // Start the HTTP status server if enabled
     let http_handle = if http_enabled {
         #[cfg_attr(not(feature = "loadgen"), allow(unused_mut))]
         let mut status_server = StatusServer::new(http_port, http_address.clone(), app.clone());
-        if let Some(handle) = options.prometheus_handle.clone() {
-            status_server.set_prometheus_handle(handle);
-        }
+        status_server.set_prometheus_handle(prometheus_handle);
         #[cfg(feature = "loadgen")]
         if let Some(ref factory) = options.loadgen_runner_factory {
             status_server.set_loadgen_runner(factory(app.clone()));

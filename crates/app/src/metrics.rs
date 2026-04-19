@@ -88,6 +88,11 @@ pub fn describe_metrics() {
         SCP_VERIFIER_THREAD_STATE,
         "Worker thread state (0=Running, 1=Stopping, 2=Dead)"
     );
+    // SCP verify latency — formerly exposed as a synthetic Prometheus
+    // "summary" (`# TYPE henyey_scp_verify_latency_us summary` with _sum
+    // and _count sub-metrics). The `metrics` crate has no native summary
+    // type, so these are now separate gauges. Consumers computing average
+    // latency as sum/count continue to work unchanged.
     describe_gauge!(
         SCP_VERIFY_LATENCY_US_SUM,
         "Enqueue-to-post-verify latency microseconds (cumulative sum)"
@@ -226,7 +231,12 @@ pub fn ensure_test_recorder() -> &'static PrometheusHandle {
 /// Install the production metrics recorder.
 ///
 /// Returns the `PrometheusHandle` for use by the `/metrics` endpoint.
-/// Panics if a recorder is already installed (call only once from main).
+///
+/// This is safe to call from `main()` before constructing `RunOptions`, or
+/// from `run_node()` as a fallback when no handle was provided. If a
+/// recorder is already installed (e.g. by a library consumer), this panics
+/// — callers who need tolerance for that should pre-install and pass the
+/// handle via `RunOptions::prometheus_handle`.
 pub fn install_recorder() -> PrometheusHandle {
     let handle = PrometheusBuilder::new()
         .set_buckets(&[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0])
@@ -269,6 +279,46 @@ mod tests {
         assert!(
             output.contains("# HELP henyey_post_catchup_hard_reset_total"),
             "missing HELP for hard_reset_total"
+        );
+    }
+
+    #[test]
+    fn test_type_annotations_present() {
+        let handle = ensure_test_recorder();
+        describe_metrics();
+        register_label_series();
+        let output = handle.render();
+
+        // Gauges must have TYPE gauge.
+        assert!(
+            output.contains("# TYPE stellar_ledger_sequence gauge"),
+            "missing TYPE gauge for ledger_sequence"
+        );
+        assert!(
+            output.contains("# TYPE stellar_peer_count gauge"),
+            "missing TYPE gauge for peer_count"
+        );
+        assert!(
+            output.contains("# TYPE henyey_scp_verify_latency_us_sum gauge"),
+            "missing TYPE gauge for latency_us_sum"
+        );
+        assert!(
+            output.contains("# TYPE henyey_scp_verify_latency_us_count gauge"),
+            "missing TYPE gauge for latency_us_count"
+        );
+
+        // Counters must have TYPE counter.
+        assert!(
+            output.contains("# TYPE stellar_uptime_seconds counter"),
+            "missing TYPE counter for uptime_seconds"
+        );
+        assert!(
+            output.contains("# TYPE henyey_scp_prefilter_rejects_total counter"),
+            "missing TYPE counter for prefilter_rejects_total"
+        );
+        assert!(
+            output.contains("# TYPE henyey_post_catchup_hard_reset_total counter"),
+            "missing TYPE counter for hard_reset_total"
         );
     }
 
