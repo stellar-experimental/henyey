@@ -2592,8 +2592,6 @@ mod stellar_core_parity_tests {
         use std::collections::HashSet;
         use stellar_xdr::curr::{Limits, ReadXdr, WriteXdr};
 
-        let mut variable_multistage_count = 0u32;
-
         for iter in 0..10u64 {
             let seed = 42 + iter;
             let mut rng = StdRng::seed_from_u64(seed);
@@ -2681,13 +2679,17 @@ mod stellar_core_parity_tests {
                         "{ctx}: fixed mode should produce exactly STAGE_COUNT stages"
                     );
                 } else {
+                    // With 500 TXs drawn from a key space of 50-1000 with
+                    // 1-10 keys each, conflicts are virtually guaranteed,
+                    // so we expect >1 stages — matching stellar-core's assertion.
+                    assert!(
+                        stages.len() > 1,
+                        "{ctx}: variable mode should produce >1 stages with 500 random TXs"
+                    );
                     assert!(
                         stages.len() <= STAGE_COUNT as usize,
                         "{ctx}: variable mode should produce at most STAGE_COUNT stages"
                     );
-                    if stages.len() > 1 {
-                        variable_multistage_count += 1;
-                    }
                 }
 
                 // 2. No intra-stage footprint conflicts.
@@ -2732,22 +2734,37 @@ mod stellar_core_parity_tests {
                 );
 
                 // 5. had_drop / base_fee consistency.
+                let output_count = output_hashes.len();
                 if !had_drop {
                     assert_eq!(
-                        output_hashes.len(),
-                        500,
+                        output_count, 500,
                         "{ctx}: had_drop=false but not all TXs included"
-                    );
-                    assert_eq!(
-                        compute_base_fee(&stages, false),
-                        LEDGER_BASE_FEE,
-                        "{ctx}: base_fee should be LEDGER_BASE_FEE when no TXs dropped"
                     );
                 } else {
                     assert!(
-                        output_hashes.len() < 500,
+                        output_count < 500,
                         "{ctx}: had_drop=true but all TXs included"
                     );
+                    // When TXs are dropped, base_fee should equal the minimum
+                    // inclusion fee among surviving TXs (fee-priority ordering
+                    // means the builder keeps higher-fee TXs).
+                    let base_fee = compute_base_fee(&stages, true);
+                    assert!(
+                        base_fee >= LEDGER_BASE_FEE,
+                        "{ctx}: base_fee {base_fee} below LEDGER_BASE_FEE when TXs dropped"
+                    );
+                    // Verify all surviving TXs have inclusion_fee >= base_fee.
+                    for stage in &stages {
+                        for cluster in stage {
+                            for tx in cluster {
+                                let tx_fee = crate::tx_set_utils::envelope_inclusion_fee(tx);
+                                assert!(
+                                    tx_fee >= base_fee,
+                                    "{ctx}: surviving TX has fee {tx_fee} < base_fee {base_fee}"
+                                );
+                            }
+                        }
+                    }
                 }
 
                 // 6. XDR roundtrip via stages_to_xdr_phase.
@@ -2767,11 +2784,5 @@ mod stellar_core_parity_tests {
                 );
             }
         }
-
-        // Across 10 iterations, variable mode should produce >1 stages at least once.
-        assert!(
-            variable_multistage_count > 0,
-            "variable mode never produced >1 stages across 10 seeded iterations"
-        );
     }
 }
