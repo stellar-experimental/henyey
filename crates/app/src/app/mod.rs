@@ -2055,9 +2055,10 @@ impl App {
 
     /// SCP timing for the most recently externalized slot.
     pub fn scp_timing(&self) -> Option<crate::app::types::ScpTimingMetrics> {
-        let duration = self.herder.scp_timing()?;
+        let snapshot = self.herder.scp_timing()?;
         Some(crate::app::types::ScpTimingMetrics {
-            externalize_duration_secs: Some(duration.as_secs_f64()),
+            externalize_duration_secs: Some(snapshot.externalize_duration.as_secs_f64()),
+            nomination_duration_secs: snapshot.nomination_duration.map(|d| d.as_secs_f64()),
         })
     }
 }

@@ -177,6 +177,7 @@ pub const QUORUM_FAIL_AT: &str = "stellar_quorum_fail_at";
 
 // Phase 4 — SCP timing.
 pub const SCP_TIMING_EXTERNALIZED_SECONDS: &str = "stellar_scp_timing_externalized_seconds";
+pub const SCP_TIMING_NOMINATED_SECONDS: &str = "stellar_scp_timing_nominated_seconds";
 
 // ── Registration ───────────────────────────────────────────────────────
 
@@ -628,6 +629,10 @@ pub fn describe_metrics() {
         SCP_TIMING_EXTERNALIZED_SECONDS,
         "Time from slot creation to externalize (seconds, last slot)"
     );
+    describe_gauge!(
+        SCP_TIMING_NOMINATED_SECONDS,
+        "Time from first local nomination to externalize (seconds, last slot)"
+    );
 }
 
 /// Pre-register all metrics with initial values so that every metric appears
@@ -790,6 +795,7 @@ pub fn register_label_series() {
 
     // Phase 4: SCP timing.
     gauge!(SCP_TIMING_EXTERNALIZED_SECONDS).set(0.0);
+    gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
     // Note: histogram (LEDGER_CLOSE_DURATION_SECONDS) is not pre-registered —
     // it is recorded in the ledger close path, not at scrape time.
 }
@@ -1033,6 +1039,11 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     if let Some(timing) = state.app.scp_timing() {
         if let Some(ext_secs) = timing.externalize_duration_secs {
             gauge!(SCP_TIMING_EXTERNALIZED_SECONDS).set(ext_secs);
+        }
+        if let Some(nom_secs) = timing.nomination_duration_secs {
+            gauge!(SCP_TIMING_NOMINATED_SECONDS).set(nom_secs);
+        } else {
+            gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
         }
     }
 }

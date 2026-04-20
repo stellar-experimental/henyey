@@ -2546,9 +2546,9 @@ impl Herder {
         Some((agree, missing, 0, fail_at))
     }
 
-    /// Duration of the most recently externalized slot.
-    pub fn scp_timing(&self) -> Option<std::time::Duration> {
-        self.scp_driver.last_externalize_duration()
+    /// Timing snapshot for the most recently externalized slot.
+    pub fn scp_timing(&self) -> Option<crate::scp_driver::ExternalizeTimingSnapshot> {
+        self.scp_driver.last_externalize_timing()
     }
 
     // --- FetchingEnvelopes integration ---

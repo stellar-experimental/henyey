@@ -271,8 +271,24 @@ pub struct ScpDriver {
     test_clock: Arc<AtomicU64>,
     /// First time we observed activity for each slot (for timing metrics).
     slot_first_seen: RwLock<HashMap<SlotIndex, std::time::Instant>>,
-    /// Duration of the most recently externalized slot (first-seen → externalized).
-    last_externalize_duration: RwLock<Option<std::time::Duration>>,
+    /// First time we nominated a value for each slot (for nomination timing metric).
+    /// Recorded from the `nominating_value` SCP callback on the first invocation per slot.
+    nomination_started_at: RwLock<HashMap<SlotIndex, std::time::Instant>>,
+    /// Timing snapshot for the most recently externalized slot.
+    last_externalize_timing: RwLock<Option<ExternalizeTimingSnapshot>>,
+}
+
+/// Timing snapshot for the most recently externalized slot.
+/// Both durations are guaranteed to describe the same slot.
+#[derive(Clone, Copy, Debug)]
+pub struct ExternalizeTimingSnapshot {
+    /// The slot this snapshot describes.
+    pub slot: SlotIndex,
+    /// Duration from slot-first-seen to externalization.
+    pub externalize_duration: std::time::Duration,
+    /// Duration from first local nomination vote to externalization.
+    /// `None` if this node did not nominate for the slot (watcher/catchup path).
+    pub nomination_duration: Option<std::time::Duration>,
 }
 
 impl ScpDriver {
@@ -301,7 +317,8 @@ impl ScpDriver {
             tracking_state,
             test_clock: Arc::new(AtomicU64::new(0)),
             slot_first_seen: RwLock::new(HashMap::new()),
-            last_externalize_duration: RwLock::new(None),
+            nomination_started_at: RwLock::new(HashMap::new()),
+            last_externalize_timing: RwLock::new(None),
         }
     }
 
@@ -539,9 +556,25 @@ impl ScpDriver {
         map.entry(slot).or_insert_with(std::time::Instant::now);
     }
 
+    /// Record that nomination started for a slot.
+    /// Only the first call per slot is recorded; subsequent calls are no-ops.
+    /// Called from the `nominating_value` SCP callback when the nomination
+    /// protocol first adds a local vote for the slot.
+    pub fn record_nomination_start(&self, slot: SlotIndex) {
+        let mut map = self.nomination_started_at.write();
+        map.entry(slot).or_insert_with(std::time::Instant::now);
+    }
+
     /// Duration of the most recently externalized slot (first-seen → externalized).
     pub fn last_externalize_duration(&self) -> Option<std::time::Duration> {
-        *self.last_externalize_duration.read()
+        self.last_externalize_timing
+            .read()
+            .map(|s| s.externalize_duration)
+    }
+
+    /// Full timing snapshot for the most recently externalized slot.
+    pub fn last_externalize_timing(&self) -> Option<ExternalizeTimingSnapshot> {
+        *self.last_externalize_timing.read()
     }
 
     /// Get an externalized slot.
@@ -1741,9 +1774,22 @@ impl ScpDriver {
             externalized_at: now,
         };
 
-        // Compute slot duration from first-seen to externalized.
-        if let Some(first_seen) = self.slot_first_seen.read().get(&slot) {
-            *self.last_externalize_duration.write() = Some(now - *first_seen);
+        // Compute timing snapshot only on first externalization for this slot.
+        let is_first = !tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).contains_key(&slot);
+        if is_first {
+            if let Some(first_seen) = self.slot_first_seen.read().get(&slot).copied() {
+                let externalize_duration = now - first_seen;
+                let nomination_duration = self
+                    .nomination_started_at
+                    .read()
+                    .get(&slot)
+                    .map(|&started| now - started);
+                *self.last_externalize_timing.write() = Some(ExternalizeTimingSnapshot {
+                    slot,
+                    externalize_duration,
+                    nomination_duration,
+                });
+            }
         }
 
         tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized).insert(slot, externalized);
@@ -1754,9 +1800,13 @@ impl ScpDriver {
             *latest = Some(slot);
         }
 
-        // Clean up old slot_first_seen entries (keep only recent slots).
+        // Clean up old slot_first_seen and nomination_started_at entries (keep only recent slots).
         {
             let mut map = self.slot_first_seen.write();
+            map.retain(|&s, _| slot.saturating_sub(s) <= 10);
+        }
+        {
+            let mut map = self.nomination_started_at.write();
             map.retain(|&s, _| slot.saturating_sub(s) <= 10);
         }
 
@@ -1855,6 +1905,8 @@ impl ScpDriver {
         self.tx_tracker.clear_all();
         tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized).clear();
         self.qset_tracker.clear_validated_preserving_local();
+        self.slot_first_seen.write().clear();
+        self.nomination_started_at.write().clear();
 
         if tx_sizes.cache > 0
             || tx_sizes.pending > 0
@@ -1887,6 +1939,12 @@ impl ScpDriver {
             let mut externalized = tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized);
             externalized.retain(|slot, _| *slot > keep_after_slot);
         }
+        self.slot_first_seen
+            .write()
+            .retain(|&s, _| s > keep_after_slot);
+        self.nomination_started_at
+            .write()
+            .retain(|&s, _| s > keep_after_slot);
 
         let kept_pending = self.tx_tracker.pending_count();
         let kept_externalized = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len();
@@ -1918,6 +1976,10 @@ impl ScpDriver {
                 externalized.remove(&s);
             }
         }
+
+        // Clean up timing maps for old slots
+        self.slot_first_seen.write().retain(|&s, _| s >= slot);
+        self.nomination_started_at.write().retain(|&s, _| s >= slot);
 
         // Clean up pending tx set requests for old slots
         self.cleanup_old_pending_slots(slot);
@@ -2506,8 +2568,8 @@ impl SCPDriver for HerderScpCallback {
         self.driver.get_quorum_set_by_hash(hash)
     }
 
-    fn nominating_value(&self, _slot_index: u64, _value: &Value) {
-        // Logging only
+    fn nominating_value(&self, slot_index: u64, _value: &Value) {
+        self.driver.record_nomination_start(slot_index);
     }
 
     fn value_externalized(&self, slot_index: u64, value: &Value) {
@@ -2741,6 +2803,127 @@ mod tests {
         assert!(!externalized.contains_key(&5));
         assert!(externalized.contains_key(&6));
         assert!(externalized.contains_key(&10));
+    }
+
+    #[test]
+    fn test_nomination_timing_normal_flow() {
+        let driver = make_test_driver();
+
+        driver.record_slot_activity(100);
+        driver.record_nomination_start(100);
+        driver.record_externalized(100, Value::default());
+
+        let snapshot = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot.slot, 100);
+        assert!(snapshot.externalize_duration.as_nanos() > 0);
+        assert!(snapshot.nomination_duration.is_some());
+        assert!(snapshot.nomination_duration.unwrap() <= snapshot.externalize_duration);
+    }
+
+    #[test]
+    fn test_nomination_timing_no_nomination_watcher() {
+        let driver = make_test_driver();
+
+        driver.record_slot_activity(100);
+        driver.record_externalized(100, Value::default());
+
+        let snapshot = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot.slot, 100);
+        assert!(snapshot.externalize_duration.as_nanos() > 0);
+        assert!(snapshot.nomination_duration.is_none());
+    }
+
+    #[test]
+    fn test_nomination_timing_duplicate_externalization() {
+        let driver = make_test_driver();
+
+        driver.record_slot_activity(100);
+        driver.record_nomination_start(100);
+        driver.record_externalized(100, Value::default());
+
+        let snapshot1 = driver.last_externalize_timing().unwrap();
+
+        driver.record_externalized(100, Value::default());
+
+        let snapshot2 = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot1.slot, snapshot2.slot);
+        assert_eq!(
+            snapshot1.externalize_duration,
+            snapshot2.externalize_duration
+        );
+        assert_eq!(snapshot1.nomination_duration, snapshot2.nomination_duration);
+    }
+
+    #[test]
+    fn test_nomination_start_first_call_guard() {
+        let driver = make_test_driver();
+
+        driver.record_nomination_start(100);
+        let first_time = *driver.nomination_started_at.read().get(&100).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        driver.record_nomination_start(100);
+        let second_time = *driver.nomination_started_at.read().get(&100).unwrap();
+
+        assert_eq!(first_time, second_time);
+    }
+
+    #[test]
+    fn test_nomination_timing_cleanup() {
+        let driver = make_test_driver();
+
+        for slot in 90..=100 {
+            driver.record_slot_activity(slot);
+            driver.record_nomination_start(slot);
+        }
+
+        driver.record_slot_activity(200);
+        driver.record_externalized(200, Value::default());
+
+        let map = driver.nomination_started_at.read();
+        assert!(map.is_empty() || map.keys().all(|&s| 200u64.saturating_sub(s) <= 10));
+    }
+
+    #[test]
+    fn test_last_externalize_duration_backward_compat() {
+        let driver = make_test_driver();
+
+        driver.record_slot_activity(100);
+        driver.record_externalized(100, Value::default());
+
+        let duration = driver.last_externalize_duration();
+        assert!(duration.is_some());
+        assert!(duration.unwrap().as_nanos() > 0);
+    }
+
+    #[test]
+    fn test_nomination_timing_purge_slots_below() {
+        let driver = make_test_driver();
+
+        driver.record_slot_activity(50);
+        driver.record_nomination_start(50);
+        driver.record_slot_activity(100);
+        driver.record_nomination_start(100);
+
+        driver.purge_slots_below(80);
+
+        let map = driver.nomination_started_at.read();
+        assert!(!map.contains_key(&50));
+        assert!(map.contains_key(&100));
+    }
+
+    #[test]
+    fn test_nomination_timing_clear_all_caches() {
+        let driver = make_test_driver();
+
+        driver.record_slot_activity(100);
+        driver.record_nomination_start(100);
+
+        driver.clear_all_caches();
+
+        assert!(driver.nomination_started_at.read().is_empty());
+        assert!(driver.slot_first_seen.read().is_empty());
     }
 
     #[test]

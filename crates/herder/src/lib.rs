@@ -140,8 +140,8 @@ pub use herder::{EnvelopeState, Herder, HerderConfig, HerderStats, LedgerCloseIn
 pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 pub use quorum_tracker::{ExpandError, QuorumTracker, SlotQuorumTracker};
 pub use scp_driver::{
-    CachedTxSet, ExternalizedSlot, HerderScpCallback, PendingTxSet, ScpDriver, ScpDriverCacheSizes,
-    ScpDriverConfig, ValueValidation,
+    CachedTxSet, ExternalizeTimingSnapshot, ExternalizedSlot, HerderScpCallback, PendingTxSet,
+    ScpDriver, ScpDriverCacheSizes, ScpDriverConfig, ValueValidation,
 };
 pub use state::HerderState;
 pub use tx_queue::{
