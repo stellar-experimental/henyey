@@ -6,7 +6,7 @@ argument-hint: "[--run-id <id>] [--shard <name>] [--no-build]"
 
 Parse `$ARGUMENTS`:
 - `--run-id <id>` — explicit Quickstart run ID to investigate. Default: most recent main-branch Quickstart run that has ≥1 failed job.
-- `--shard <name>` — focus a single shard (`local/rpc`, `testnet/core,rpc,horizon`, etc.). Default: all failed shards in the chosen run.
+- `--shard <name>` — focus a single shard (`local/rpc`, `testnet/core,horizon`, etc.). Default: all failed shards in the chosen run.
 - `--no-build` — skip `cargo build --release -p henyey` in Stage 3. Useful when iterating locally.
 
 # Quickstart Fix
@@ -16,7 +16,7 @@ or delegation → green. The Quickstart workflow
 (`.github/workflows/quickstart.yml`) is the project's most complex CI
 surface: it builds a `stellar/quickstart` image with henyey replacing
 `stellar-core`, then runs a matrix of shards (`local/core`, `local/rpc`,
-`local/core,rpc,horizon`, `local/galexie`, `testnet/core,rpc,horizon`,
+`local/core,rpc,horizon`, `local/galexie`, `testnet/core,horizon`,
 `pubnet/core,rpc,horizon`). `continue-on-error` was removed in
 `981da2e7` so every shard must pass — this skill is how we get back to
 green.

@@ -198,8 +198,8 @@ Match the CI configuration as closely as possible:
 # Same services as CI quickstart
 ./scripts/quickstart-local.sh --enable core,rpc,horizon
 
-# Testnet mode (matches CI testnet job)
-./scripts/quickstart-local.sh --network testnet --enable core,rpc,horizon
+# Testnet mode (matches CI testnet job — RPC temporarily disabled, see #1848)
+./scripts/quickstart-local.sh --network testnet --enable core,horizon
 ```
 
 ### Inspecting Container Logs
