@@ -325,22 +325,32 @@ mod tests {
 
     #[test]
     fn test_should_check() {
-        let tracker = DeadNodeTracker::with_interval(Duration::from_millis(10));
+        let interval = Duration::from_secs(60);
+        let mut tracker = DeadNodeTracker::with_interval(interval);
 
-        // Initially should not need to check
+        // Freshly constructed — should not need to check
         assert!(!tracker.should_check());
 
-        // After interval passes, should check
-        std::thread::sleep(Duration::from_millis(15));
+        // Backdate last_check past the interval
+        tracker.last_check = Instant::now() - interval;
         assert!(tracker.should_check());
     }
 
     #[test]
     fn test_time_until_next_check() {
-        let tracker = DeadNodeTracker::with_interval(Duration::from_secs(60));
-
+        let mut tracker = DeadNodeTracker::with_interval(Duration::from_secs(60));
+        // Backdate last_check by exactly 10 seconds
+        tracker.last_check = Instant::now() - Duration::from_secs(10);
         let remaining = tracker.time_until_next_check();
-        assert!(remaining <= Duration::from_secs(60));
-        assert!(remaining > Duration::from_secs(59));
+        // Should be close to 50s (60 - 10).
+        // Generous 2s tolerance absorbs any scheduling jitter.
+        assert!(
+            remaining <= Duration::from_secs(51),
+            "remaining={remaining:?}"
+        );
+        assert!(
+            remaining >= Duration::from_secs(49),
+            "remaining={remaining:?}"
+        );
     }
 }

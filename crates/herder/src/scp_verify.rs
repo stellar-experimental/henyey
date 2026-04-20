@@ -469,16 +469,20 @@ pub(crate) fn scp_verify_worker(
                 tracing::error!("scp-verify worker caught panic during verification");
                 // Emit a Panic verdict for this envelope so the event loop can
                 // account for it, then terminate the worker.
+                // Increment heartbeat before send so that recv() on the other
+                // end guarantees the heartbeat is visible (sequenced-before on
+                // this thread + channel synchronization = happens-before).
+                heartbeat.fetch_add(1, Ordering::Relaxed);
                 let _ = verified_tx.send(VerifiedEnvelope {
                     intake,
                     verdict: Verdict::Panic,
                 });
-                heartbeat.fetch_add(1, Ordering::Relaxed);
                 state.store(VerifierState::Dead as u8, Ordering::Relaxed);
                 return;
             }
         };
 
+        heartbeat.fetch_add(1, Ordering::Relaxed);
         if verified_tx
             .send(VerifiedEnvelope { intake, verdict })
             .is_err()
@@ -486,7 +490,6 @@ pub(crate) fn scp_verify_worker(
             // Event loop dropped its receiver — shut down cleanly.
             break;
         }
-        heartbeat.fetch_add(1, Ordering::Relaxed);
     }
 
     state.store(VerifierState::Dead as u8, Ordering::Relaxed);
@@ -495,7 +498,6 @@ pub(crate) fn scp_verify_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn network_id() -> Hash256 {
         Hash256::from_bytes([7u8; 32])
@@ -532,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn test_worker_heartbeat_advances_and_dies_on_close() {
+    fn test_worker_heartbeat_advances() {
         let spawned = spawn_scp_verifier(network_id(), 16).expect("spawn");
         let h = spawned.handle.clone();
         let mut verified_rx = spawned.verified_rx;
@@ -547,27 +549,13 @@ mod tests {
         assert_eq!(h.state(), VerifierState::Running);
         h.tx.blocking_send(intake).unwrap();
 
-        // Wait for heartbeat to advance
-        let start = std::time::Instant::now();
-        while h.heartbeat() == 0 && start.elapsed() < Duration::from_secs(2) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(h.heartbeat() >= 1, "heartbeat should advance");
-
-        // Drain verdict
+        // Drain verdict — heartbeat is incremented before send in the worker,
+        // so receiving a verdict deterministically proves heartbeat advanced.
         let ve = verified_rx.blocking_recv().expect("verified envelope");
-        // Invalid dummy signature → InvalidSignature
+        assert!(
+            h.heartbeat() >= 1,
+            "heartbeat should advance after processing"
+        );
         assert!(matches!(ve.verdict, Verdict::InvalidSignature));
-
-        // Drop sender to close input channel, worker should die
-        drop(h.tx.clone()); // clone not enough
-        drop(spawned.handle);
-        // Give thread time to exit
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(2) {
-            // Can't drop h completely since we still hold h; remove h
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        // We can't test Dead here without dropping all handles - covered elsewhere.
     }
 }
