@@ -3979,4 +3979,235 @@ mod tests {
             );
         }
     }
+
+    // ================================================================
+    // #1844: Call-site regression tests for the archive-behind +
+    //        cooldown livelock scenario fixed by #1843
+    // ================================================================
+
+    /// Helper: create a valid StellarValue XDR blob for seeding externalized slots.
+    fn mk_stellar_value_xdr_for_slot(tx_set_hash: [u8; 32]) -> Vec<u8> {
+        use stellar_xdr::curr::{
+            Hash, Limits, StellarValue, StellarValueExt, TimePoint, VecM, WriteXdr,
+        };
+        let sv = StellarValue {
+            tx_set_hash: Hash(tx_set_hash),
+            close_time: TimePoint(12345),
+            upgrades: VecM::default(),
+            ext: StellarValueExt::Basic,
+        };
+        sv.to_xdr(Limits::none()).unwrap()
+    }
+
+    /// Helper: wrap XDR bytes into a Value for record_externalized.
+    fn mk_value_for_slot(xdr_bytes: Vec<u8>) -> stellar_xdr::curr::Value {
+        stellar_xdr::curr::Value(
+            xdr_bytes
+                .try_into()
+                .expect("StellarValue XDR fits in Value"),
+        )
+    }
+
+    /// Shared setup for #1844 cooldown livelock regression tests.
+    ///
+    /// Creates an App seeded into the exact post-catchup livelock state:
+    /// - archive behind, recovery exhausted, stuck for 60s
+    /// - recently caught up (mirrors real post-catchup scenario)
+    /// - schedule_due=true (last_recovery_attempt 15s ago)
+    ///
+    /// Caller sets `last_hard_reset_offset` to control cooldown state.
+    async fn mk_app_for_cooldown_livelock_scenario() -> (App, tempfile::TempDir) {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("cooldown-livelock-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // 1. Herder: set tracking and record externalized slot 50.
+        //    Gap = 50 - 0 = 50 > TX_SET_REQUEST_WINDOW (12).
+        app.herder.set_state(henyey_herder::HerderState::Tracking);
+        let xdr = mk_stellar_value_xdr_for_slot([0x50; 32]);
+        app.herder
+            .scp_driver()
+            .record_externalized(50, mk_value_for_slot(xdr));
+
+        // 2. syncing_ledgers: one entry at slot 50 (no tx_set).
+        //    50 % 64 ≠ 0 → not checkpoint boundary → can_trigger_immediate=false.
+        //    last_buffered=50 < trigger=65 → enters stuck-timeout path.
+        {
+            let mut buf = app.syncing_ledgers.write().await;
+            buf.insert(
+                50,
+                henyey_herder::LedgerCloseInfo {
+                    slot: 50,
+                    close_time: 0,
+                    tx_set_hash: henyey_common::Hash256::from_bytes([0x50; 32]),
+                    tx_set: None,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                },
+            );
+        }
+
+        // 3. archive_behind_until: far in the future.
+        {
+            let mut guard = app.archive_behind_until.write().await;
+            *guard = Some(app.clock.now() + Duration::from_secs(600));
+        }
+
+        // 4. last_catchup_completed_at: 60s ago → recently_caught_up=true
+        //    (within POST_CATCHUP_RECOVERY_WINDOW_SECS=300s).
+        {
+            let mut guard = app.last_catchup_completed_at.write().await;
+            *guard = Some(app.clock.now() - Duration::from_secs(60));
+        }
+
+        // 5. consensus_stuck_state: recovery exhausted, stuck 60s, schedule due.
+        //    stuck_duration=60 < HARD_RESET_STALL_SECS=120 → isolates
+        //    RecoveryExhausted as the only HardReset trigger.
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger: 0,
+                first_buffered: 50,
+                recovery_attempts: MAX_POST_CATCHUP_RECOVERY_ATTEMPTS,
+                stuck_start: app.clock.now() - Duration::from_secs(60),
+                last_recovery_attempt: app.clock.now() - Duration::from_secs(15),
+                catchup_triggered: false,
+            });
+        }
+
+        // recovery_attempts_without_progress stays at 0 (default),
+        // below RECOVERY_ESCALATION_CATCHUP=6.
+
+        (app, dir)
+    }
+
+    /// #1844 regression: when HardReset cooldown is active, the livelock
+    /// scenario routes to AttemptRecovery instead of returning None.
+    /// Two ticks prove the node keeps making recovery progress.
+    #[tokio::test]
+    async fn test_cooldown_active_routes_to_attempt_recovery() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        let (app, _dir) = mk_app_for_cooldown_livelock_scenario().await;
+
+        // Activate cooldown: store a recent hard-reset offset.
+        // max(1) because 0 is the sentinel for "no previous reset".
+        let now_offset = app.start_instant.elapsed().as_secs().max(1);
+        app.last_hard_reset_offset
+            .store(now_offset, Ordering::Relaxed);
+        app.last_hard_reset_gap.store(50, Ordering::Relaxed);
+
+        // Snapshot the seeded last_recovery_attempt for comparison.
+        let seeded_last_recovery = {
+            let guard = app.consensus_stuck_state.read().await;
+            guard.as_ref().unwrap().last_recovery_attempt
+        };
+
+        // --- Tick 1 ---
+        let _result = app.maybe_start_buffered_catchup().await;
+
+        // AttemptRecovery should have fired:
+        {
+            let guard = app.consensus_stuck_state.read().await;
+            let state = guard.as_ref().expect("stuck state should still exist");
+            assert_eq!(
+                state.recovery_attempts,
+                MAX_POST_CATCHUP_RECOVERY_ATTEMPTS + 1,
+                "AttemptRecovery should increment recovery_attempts from MAX to MAX+1"
+            );
+            assert!(
+                !state.catchup_triggered,
+                "catchup_triggered should remain false in recovery path"
+            );
+            assert!(
+                state.last_recovery_attempt > seeded_last_recovery,
+                "last_recovery_attempt should have advanced"
+            );
+        }
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            0,
+            "HardReset should NOT have fired (cooldown active)"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            1,
+            "out_of_sync_recovery should have incremented the counter"
+        );
+        assert!(
+            app.archive_behind_until.read().await.is_some(),
+            "archive_behind_until should NOT be cleared (only HardReset clears it)"
+        );
+
+        // --- Tick 2: re-arm schedule timer and verify recovery continues ---
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            let state = guard.as_mut().unwrap();
+            state.last_recovery_attempt = app.clock.now() - Duration::from_secs(15);
+        }
+
+        let _result2 = app.maybe_start_buffered_catchup().await;
+
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            2,
+            "second tick should also route to recovery (no livelock)"
+        );
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            0,
+            "HardReset should still not have fired after two ticks"
+        );
+    }
+
+    /// #1844 control: without a previous hard reset (no cooldown),
+    /// the same scenario routes to HardReset(RecoveryExhausted).
+    #[tokio::test]
+    async fn test_no_previous_reset_routes_to_hard_reset() {
+        use std::sync::atomic::Ordering;
+
+        let (app, _dir) = mk_app_for_cooldown_livelock_scenario().await;
+
+        // last_hard_reset_offset stays at 0 (default) → "no previous reset"
+        // → cooldown is inactive → HardReset fires.
+
+        let _result = app.maybe_start_buffered_catchup().await;
+
+        // HardReset should have fired:
+        assert_eq!(
+            app.post_catchup_hard_reset_total.load(Ordering::Relaxed),
+            1,
+            "HardReset should fire when cooldown is inactive"
+        );
+        {
+            let guard = app.consensus_stuck_state.read().await;
+            let state = guard.as_ref().expect("stuck state should still exist");
+            assert_eq!(
+                state.recovery_attempts, 0,
+                "HardReset resets recovery_attempts to 0"
+            );
+            assert!(
+                !state.catchup_triggered,
+                "HardReset resets catchup_triggered to false"
+            );
+        }
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            0,
+            "HardReset resets recovery_attempts_without_progress"
+        );
+        assert!(
+            app.archive_behind_until.read().await.is_none(),
+            "HardReset clears archive_behind_until"
+        );
+    }
 }
