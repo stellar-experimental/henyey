@@ -88,6 +88,15 @@ impl LedgerRelation {
             _ => None,
         }
     }
+
+    /// Returns `true` when the node is ahead of consensus AND has never
+    /// externalized (`latest_externalized == 0`). This is the startup state
+    /// for captive-core: it closes ledgers from the validator's EXTERNALIZE
+    /// messages but never externalizes itself, so recovery needs an
+    /// escalation path to catchup instead of looping on SCP state requests.
+    pub fn is_ahead_without_externalization(&self, latest_externalized: u64) -> bool {
+        matches!(self, Self::Ahead) && latest_externalized == 0
+    }
 }
 
 impl App {
@@ -234,7 +243,7 @@ impl App {
         // closes ledgers from the validator's EXTERNALIZE messages but never
         // externalizes itself, so without this escalation the recovery loop
         // would request SCP state forever without converging.
-        let ahead_no_ext = matches!(relation, LedgerRelation::Ahead) && latest_externalized == 0;
+        let ahead_no_ext = relation.is_ahead_without_externalization(latest_externalized);
         if attempts >= RECOVERY_ESCALATION_CATCHUP && (relation.is_behind() || ahead_no_ext) {
             self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
             return self
@@ -315,7 +324,7 @@ impl App {
                 // peers' caches; Ahead (latest_ext=0) because captive-core does
                 // not participate in SCP consensus.
                 let at_tip_or_ahead_no_ext = matches!(relation, LedgerRelation::AtTip)
-                    || (matches!(relation, LedgerRelation::Ahead) && latest_externalized == 0);
+                    || relation.is_ahead_without_externalization(latest_externalized);
                 if attempts >= 1 && scp_total > 0 && at_tip_or_ahead_no_ext {
                     tracing::warn!(
                         current_ledger,
@@ -1364,5 +1373,32 @@ mod tests {
             classify_cannot_apply_reason(0, 0),
             CannotApplyReason::MissingTxSets
         );
+    }
+
+    // ── is_ahead_without_externalization tests ──────────────────────────
+
+    #[test]
+    fn test_ahead_no_ext_true_for_startup_state() {
+        let rel = LedgerRelation::from_ledgers(29, 0);
+        assert!(rel.is_ahead_without_externalization(0));
+    }
+
+    #[test]
+    fn test_ahead_no_ext_false_for_ahead_with_nonzero_ext() {
+        // Ahead but latest_ext > 0 → NOT the startup livelock case.
+        let rel = LedgerRelation::from_ledgers(100, 50);
+        assert!(!rel.is_ahead_without_externalization(50));
+    }
+
+    #[test]
+    fn test_ahead_no_ext_false_for_at_tip() {
+        let rel = LedgerRelation::from_ledgers(0, 0);
+        assert!(!rel.is_ahead_without_externalization(0));
+    }
+
+    #[test]
+    fn test_ahead_no_ext_false_for_behind() {
+        let rel = LedgerRelation::from_ledgers(50, 100);
+        assert!(!rel.is_ahead_without_externalization(100));
     }
 }

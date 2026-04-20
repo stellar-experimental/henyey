@@ -6765,7 +6765,7 @@ mod tests {
     /// ahead of SCP but has previously externalized — this is a transient
     /// state that should resolve via SCP state requests, not catchup.
     #[tokio::test]
-    async fn test_recovery_escalation_skipped_when_ahead_of_consensus() {
+    async fn test_recovery_escalation_skipped_at_tip() {
         let dir = tempfile::tempdir().expect("temp dir");
         let db_path = dir.path().join("rs-stellar-test.db");
         let config = crate::config::ConfigBuilder::new()
@@ -6773,17 +6773,8 @@ mod tests {
             .build();
         let app = App::new(config).await.unwrap();
 
-        // Simulate a node that has externalized up to slot 5 but advanced
-        // to ledger 10 — ahead of SCP but with non-zero latest_ext.
-        // We can't easily set latest_externalized on the herder, so we use
-        // the fresh-herder default (latest_ext=0) but set current_ledger=0
-        // to create a non-Ahead state (AtTip). Actually, to test the
-        // "Ahead with non-zero latest_ext" scenario we need a different
-        // approach — for now we verify that the Ahead-no-ext case DOES
-        // escalate (tested in the next test).
-        //
-        // This test verifies that AtTip (gap=0, latest_ext==current_ledger)
-        // does NOT trigger the escalation guard.
+        // AtTip (current_ledger=0, latest_ext=0) must NOT trigger the
+        // escalation guard — only Behind or Ahead-no-ext should.
         let current_ledger = 0u32;
         let latest = app.herder.latest_externalized_slot().unwrap_or(0);
         assert_eq!(
@@ -6803,6 +6794,13 @@ mod tests {
         assert!(
             result.is_none(),
             "escalation must be skipped when node is at tip"
+        );
+
+        // App state must remain Initializing — escalation was NOT taken.
+        assert_eq!(
+            app.state().await,
+            AppState::Initializing,
+            "state must not change to CatchingUp when escalation is skipped"
         );
 
         // Counter must NOT be reset to 0 by the escalation path.
@@ -6855,12 +6853,21 @@ mod tests {
 
         let result = app.out_of_sync_recovery(current_ledger).await;
 
-        // The escalation gate should fire for Ahead-no-ext.
         // spawn_catchup returns None on test App (no self_arc), but the
-        // escalation path was taken (verified by catchup_in_progress toggle).
+        // escalation path was taken.
         assert!(
             result.is_none(),
             "spawn_catchup returns None on test App, but escalation path was taken"
+        );
+
+        // Key assertion: spawn_catchup transitions to CatchingUp before
+        // the self_arc check fails, so the app state proves escalation
+        // was entered. Without the Ahead-no-ext fix, this would remain
+        // Initializing because the escalation guard would skip catchup.
+        assert_eq!(
+            app.state().await,
+            AppState::CatchingUp,
+            "escalation path must transition state to CatchingUp"
         );
 
         // Verify catchup_in_progress was NOT left stuck on.
@@ -6903,11 +6910,18 @@ mod tests {
 
         let result = app.out_of_sync_recovery(current_ledger).await;
 
-        // Fast-track fires → trigger_recovery_catchup called.
-        // spawn_catchup returns None on test App, but path was taken.
+        // Fast-track fires → trigger_recovery_catchup called → spawn_catchup
+        // transitions to CatchingUp before self_arc fails.
         assert!(
             result.is_none(),
             "spawn_catchup returns None on test App, but fast-track was taken"
+        );
+
+        // State proves the fast-track catchup path was entered.
+        assert_eq!(
+            app.state().await,
+            AppState::CatchingUp,
+            "fast-track path must transition state to CatchingUp"
         );
 
         // Verify catchup_in_progress was NOT left stuck on.
