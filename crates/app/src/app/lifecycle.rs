@@ -1908,7 +1908,7 @@ impl App {
                         self.sync_recovery_pending.store(true, Ordering::SeqCst);
                         if slot > current_ledger + 2 {
                             self.recovery_attempts_without_progress
-                                .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                                .fetch_max(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
                         }
                     }
                 }
@@ -1944,7 +1944,7 @@ impl App {
                                 "Pending EXTERNALIZE far ahead — fast-tracking catchup"
                             );
                             self.recovery_attempts_without_progress
-                                .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                                .fetch_max(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
                             self.sync_recovery_pending.store(true, Ordering::SeqCst);
                         }
                     }

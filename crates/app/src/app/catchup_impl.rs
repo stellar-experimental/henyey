@@ -1183,6 +1183,25 @@ impl App {
         );
     }
 
+    /// Check if the HardReset cooldown is active.
+    ///
+    /// Returns `true` when a HardReset should NOT fire (cooldown active).
+    /// Shared by both `maybe_start_buffered_catchup` (to populate
+    /// `StuckSignals`) and `force_post_catchup_hard_reset` (to gate the
+    /// actual reset). Single source of truth for cooldown policy — see #1843.
+    fn is_hard_reset_on_cooldown(&self, current_gap: u64) -> bool {
+        let last = self.last_hard_reset_offset.load(Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let elapsed = self.start_instant.elapsed().as_secs().saturating_sub(last);
+        let last_gap = self.last_hard_reset_gap.load(Ordering::Relaxed);
+        let gap_grew = current_gap.saturating_sub(last_gap) >= HARD_RESET_GAP_ESCALATION;
+        let min_elapsed = elapsed >= HARD_RESET_MIN_COOLDOWN_SECS;
+        let max_elapsed = elapsed >= HARD_RESET_MAX_COOLDOWN_SECS;
+        !(max_elapsed || min_elapsed && gap_grew)
+    }
+
     /// Unified decision function for the consensus-stuck state machine.
     ///
     /// Pure function; takes a [`StuckSignals`] snapshot and returns the
@@ -1192,20 +1211,24 @@ impl App {
     /// (see #1831).
     ///
     /// Decision table (archive_behind gates HardReset; when archive is OK,
-    /// normal TriggerCatchup is preferred):
+    /// normal TriggerCatchup is preferred; when HardReset cooldown is active,
+    /// falls back to AttemptRecovery — see #1843):
     ///
-    /// | catchup_triggered | archive_behind | rec_exhausted | tx_set_ex | stuck≥120s | schedule_due | Action |
-    /// |---|---|---|---|---|---|---|
-    /// | true  | *     | *    | *     | *     | true (ab)  | AttemptRecovery |
-    /// | true  | *     | *    | *     | *     | false      | Wait |
-    /// | false | true  | true | -     | -     | true       | HardReset(RecoveryExhausted) |
-    /// | false | true  | -    | true  | -     | true       | HardReset(TxSetExhausted) |
-    /// | false | true  | -    | -     | true  | true       | HardReset(StallWallClock) |
-    /// | false | true  | false| false | false | true       | AttemptRecovery |
-    /// | false | true  | *    | *     | *     | false      | Wait |
-    /// | false | false | true | *     | *     | -          | TriggerCatchup |
-    /// | false | false | false| *     | *     | true       | AttemptRecovery |
-    /// | false | false | false| *     | *     | false      | Wait |
+    /// | catchup_triggered | archive_behind | rec_exhausted | tx_set_ex | stuck≥120s | cooldown | schedule_due | Action |
+    /// |---|---|---|---|---|---|---|---|
+    /// | true  | *     | *    | *     | *     | *    | true (ab)  | AttemptRecovery |
+    /// | true  | *     | *    | *     | *     | *    | false      | Wait |
+    /// | false | true  | true | -     | -     | false| true       | HardReset(RecoveryExhausted) |
+    /// | false | true  | true | -     | -     | true | true       | AttemptRecovery |
+    /// | false | true  | -    | true  | -     | false| true       | HardReset(TxSetExhausted) |
+    /// | false | true  | -    | true  | -     | true | true       | AttemptRecovery |
+    /// | false | true  | -    | -     | true  | false| true       | HardReset(StallWallClock) |
+    /// | false | true  | -    | -     | true  | true | true       | AttemptRecovery |
+    /// | false | true  | false| false | false | *    | true       | AttemptRecovery |
+    /// | false | true  | *    | *     | *     | *    | false      | Wait |
+    /// | false | false | true | *     | *     | *    | -          | TriggerCatchup |
+    /// | false | false | false| *     | *     | *    | true       | AttemptRecovery |
+    /// | false | false | false| *     | *     | *    | false      | Wait |
     fn decide_consensus_stuck_action(s: StuckSignals) -> ConsensusStuckAction {
         let recovery_exhausted = s.recovery_attempts >= MAX_POST_CATCHUP_RECOVERY_ATTEMPTS;
 
@@ -1223,8 +1246,24 @@ impl App {
             // Archive is behind — normal TriggerCatchup would just be
             // skipped. Check for HardReset escalation, otherwise keep
             // running peer-SCP recovery.
+            //
+            // When the HardReset cooldown is active (#1843), fall back to
+            // AttemptRecovery instead of returning HardReset. This prevents
+            // the livelock where the decision keeps choosing HardReset but
+            // force_post_catchup_hard_reset() blocks it, causing
+            // maybe_start_buffered_catchup() to return None on every tick.
             if s.schedule_due {
-                if recovery_exhausted {
+                let would_hard_reset = recovery_exhausted
+                    || s.tx_set_exhausted
+                    || s.stuck_duration >= HARD_RESET_STALL_SECS;
+
+                if would_hard_reset && s.hard_reset_cooldown_active {
+                    // Cooldown active — fall back to peer-SCP recovery
+                    // while waiting for the archive to publish. The first
+                    // HardReset already cleared stale state; repeating it
+                    // before the cooldown expires is futile.
+                    ConsensusStuckAction::AttemptRecovery
+                } else if recovery_exhausted {
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
                 } else if s.tx_set_exhausted {
                     ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindTxSetExhausted)
@@ -1281,30 +1320,22 @@ impl App {
         reason: HardResetReason,
     ) -> Option<PendingCatchup> {
         let now_offset = self.start_instant.elapsed().as_secs();
-        let last = self.last_hard_reset_offset.load(Ordering::Relaxed);
         let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
         let current_gap = latest_ext.saturating_sub(current_ledger as u64);
 
-        // Progress-bound cooldown check.
-        if last != 0 {
+        // Progress-bound cooldown check (shared helper — see #1843).
+        if self.is_hard_reset_on_cooldown(current_gap) {
+            let last = self.last_hard_reset_offset.load(Ordering::Relaxed);
             let elapsed = now_offset.saturating_sub(last);
-            let last_gap = self.last_hard_reset_gap.load(Ordering::Relaxed);
-            let gap_grew = current_gap.saturating_sub(last_gap) >= HARD_RESET_GAP_ESCALATION;
-            let min_elapsed = elapsed >= HARD_RESET_MIN_COOLDOWN_SECS;
-            let max_elapsed = elapsed >= HARD_RESET_MAX_COOLDOWN_SECS;
-
-            if !(max_elapsed || min_elapsed && gap_grew) {
-                tracing::warn!(
-                    current_ledger,
-                    cooldown_remaining = HARD_RESET_MAX_COOLDOWN_SECS.saturating_sub(elapsed),
-                    current_gap,
-                    last_gap,
-                    elapsed,
-                    "Hard reset cooldown active; consensus-stuck persists — \
-                     manual intervention may be required"
-                );
-                return None;
-            }
+            tracing::debug!(
+                current_ledger,
+                cooldown_remaining = HARD_RESET_MAX_COOLDOWN_SECS.saturating_sub(elapsed),
+                current_gap,
+                elapsed,
+                "Hard reset cooldown active — decision function should have \
+                 fallen back to AttemptRecovery (see #1843)"
+            );
+            return None;
         }
 
         // Lock order: archive_behind_until → syncing_ledgers → consensus_stuck_state
@@ -1693,6 +1724,16 @@ impl App {
                                 since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS
                             };
 
+                            // Compute HardReset cooldown using the shared
+                            // helper (#1843). Prevents the livelock where
+                            // decide returns HardReset every tick but the
+                            // cooldown in force_post_catchup_hard_reset
+                            // blocks it.
+                            let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
+                            let current_gap = latest_ext.saturating_sub(current_ledger as u64);
+                            let hard_reset_cooldown_active =
+                                self.is_hard_reset_on_cooldown(current_gap);
+
                             let signals = StuckSignals {
                                 catchup_triggered: state.catchup_triggered,
                                 archive_behind,
@@ -1700,6 +1741,7 @@ impl App {
                                 schedule_due,
                                 stuck_duration,
                                 recovery_attempts: effective_attempts,
+                                hard_reset_cooldown_active,
                             };
 
                             let decision = Self::decide_consensus_stuck_action(signals);
@@ -2503,6 +2545,7 @@ mod tests {
             schedule_due: since_recovery >= OUT_OF_SYNC_RECOVERY_TIMER_SECS,
             stuck_duration: 0,
             recovery_attempts,
+            hard_reset_cooldown_active: false,
         })
     }
 
@@ -2597,6 +2640,7 @@ mod tests {
             schedule_due: true,
             stuck_duration: 30,
             recovery_attempts: 0,
+            hard_reset_cooldown_active: false,
         });
         assert!(matches!(
             action,
@@ -2614,6 +2658,7 @@ mod tests {
             schedule_due: true,
             stuck_duration: HARD_RESET_STALL_SECS,
             recovery_attempts: 0,
+            hard_reset_cooldown_active: false,
         });
         assert!(matches!(
             action,
@@ -2631,6 +2676,7 @@ mod tests {
             schedule_due: true,
             stuck_duration: 60,
             recovery_attempts: 0,
+            hard_reset_cooldown_active: false,
         });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
@@ -2645,6 +2691,7 @@ mod tests {
             schedule_due: true,
             stuck_duration: HARD_RESET_STALL_SECS + 100,
             recovery_attempts: MAX,
+            hard_reset_cooldown_active: false,
         });
         assert_eq!(action, ConsensusStuckAction::TriggerCatchup);
     }
@@ -2659,6 +2706,7 @@ mod tests {
             schedule_due: true,
             stuck_duration: 0,
             recovery_attempts: MAX,
+            hard_reset_cooldown_active: false,
         });
         assert!(matches!(
             action,
@@ -2676,6 +2724,7 @@ mod tests {
             schedule_due: false,
             stuck_duration: HARD_RESET_STALL_SECS + 100,
             recovery_attempts: MAX,
+            hard_reset_cooldown_active: false,
         });
         assert_eq!(action, ConsensusStuckAction::Wait);
     }
@@ -2689,6 +2738,7 @@ mod tests {
             schedule_due: true,
             stuck_duration: HARD_RESET_STALL_SECS + 100,
             recovery_attempts: MAX,
+            hard_reset_cooldown_active: false,
         });
         assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
@@ -2709,6 +2759,7 @@ mod tests {
             schedule_due: true,
             stuck_duration: 130,
             recovery_attempts: 7, // from atomic counter (> MAX_POST_CATCHUP_RECOVERY_ATTEMPTS)
+            hard_reset_cooldown_active: false,
         });
         assert!(matches!(action, ConsensusStuckAction::HardReset(_)));
     }
@@ -2724,6 +2775,7 @@ mod tests {
             schedule_due: true,
             stuck_duration: HARD_RESET_STALL_SECS + 10,
             recovery_attempts: MAX,
+            hard_reset_cooldown_active: false,
         });
         // recovery_exhausted wins because it's checked first.
         assert!(matches!(
@@ -2739,6 +2791,7 @@ mod tests {
             schedule_due: true,
             stuck_duration: HARD_RESET_STALL_SECS + 10,
             recovery_attempts: 0,
+            hard_reset_cooldown_active: false,
         });
         // tx_set_exhausted wins over wall_clock.
         assert!(matches!(
@@ -2759,6 +2812,7 @@ mod tests {
                 schedule_due: due,
                 stuck_duration: sd,
                 recovery_attempts: re,
+                hard_reset_cooldown_active: false,
             })
         };
 
@@ -3651,6 +3705,7 @@ mod tests {
             tx_set_exhausted: false,
             stuck_duration: 0,
             catchup_triggered: false,
+            hard_reset_cooldown_active: false,
         };
         let action = App::decide_consensus_stuck_action(signals_stuck_higher);
         // With recovery_attempts=8 (> MAX_RECOVERY_ATTEMPTS=6) and
@@ -3677,6 +3732,7 @@ mod tests {
             tx_set_exhausted: false,
             stuck_duration: 0,
             catchup_triggered: false,
+            hard_reset_cooldown_active: false,
         };
         let action = App::decide_consensus_stuck_action(signals_atomic_higher);
         assert!(
@@ -3687,6 +3743,128 @@ mod tests {
             "injected recovery_attempts=10 → should be HardReset, got {:?}",
             action
         );
+    }
+
+    // ================================================================
+    // #1843: Cooldown-aware fallback from HardReset to AttemptRecovery
+    // ================================================================
+
+    #[test]
+    fn test_cooldown_active_downgrades_hard_reset_recovery_exhausted() {
+        // archive_behind + recovery_exhausted + cooldown_active →
+        // AttemptRecovery instead of HardReset.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 0,
+            recovery_attempts: MAX,
+            hard_reset_cooldown_active: true,
+        });
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "cooldown should downgrade HardReset(RecoveryExhausted) to AttemptRecovery"
+        );
+    }
+
+    #[test]
+    fn test_cooldown_active_downgrades_hard_reset_tx_set_exhausted() {
+        // archive_behind + tx_set_exhausted + cooldown_active →
+        // AttemptRecovery.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: true,
+            schedule_due: true,
+            stuck_duration: 30,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: true,
+        });
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "cooldown should downgrade HardReset(TxSetExhausted) to AttemptRecovery"
+        );
+    }
+
+    #[test]
+    fn test_cooldown_active_downgrades_hard_reset_stall_wall_clock() {
+        // archive_behind + stuck >= HARD_RESET_STALL_SECS + cooldown_active →
+        // AttemptRecovery.
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS + 10,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: true,
+        });
+        assert_eq!(
+            action,
+            ConsensusStuckAction::AttemptRecovery,
+            "cooldown should downgrade HardReset(StallWallClock) to AttemptRecovery"
+        );
+    }
+
+    #[test]
+    fn test_cooldown_inactive_still_hard_resets() {
+        // archive_behind + recovery_exhausted + cooldown_NOT_active →
+        // HardReset (unchanged behavior).
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 0,
+            recovery_attempts: MAX,
+            hard_reset_cooldown_active: false,
+        });
+        assert!(
+            matches!(
+                action,
+                ConsensusStuckAction::HardReset(HardResetReason::ArchiveBehindRecoveryExhausted)
+            ),
+            "without cooldown, HardReset should fire normally"
+        );
+    }
+
+    #[test]
+    fn test_cooldown_active_no_effect_when_archive_ok() {
+        // archive_behind=false + cooldown_active → TriggerCatchup
+        // (cooldown flag is irrelevant when archive is reachable).
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: false,
+            tx_set_exhausted: true,
+            schedule_due: true,
+            stuck_duration: HARD_RESET_STALL_SECS + 100,
+            recovery_attempts: MAX,
+            hard_reset_cooldown_active: true,
+        });
+        assert_eq!(
+            action,
+            ConsensusStuckAction::TriggerCatchup,
+            "cooldown flag should not affect archive-ok path"
+        );
+    }
+
+    #[test]
+    fn test_cooldown_active_no_effect_on_attempt_recovery() {
+        // archive_behind + no hard-reset conditions + cooldown_active →
+        // still AttemptRecovery (cooldown doesn't change non-HardReset paths).
+        let action = App::decide_consensus_stuck_action(StuckSignals {
+            catchup_triggered: false,
+            archive_behind: true,
+            tx_set_exhausted: false,
+            schedule_due: true,
+            stuck_duration: 30,
+            recovery_attempts: 0,
+            hard_reset_cooldown_active: true,
+        });
+        assert_eq!(action, ConsensusStuckAction::AttemptRecovery);
     }
 
     #[tokio::test]

@@ -532,6 +532,12 @@ pub(super) struct StuckSignals {
     pub schedule_due: bool,
     pub stuck_duration: u64,
     pub recovery_attempts: u32,
+    /// When `true`, the HardReset cooldown is active (a recent HardReset
+    /// already fired). Used by `decide_consensus_stuck_action` to fall back
+    /// to `AttemptRecovery` instead of returning `HardReset` when the
+    /// archive is behind — prevents the livelock described in #1843 where
+    /// the decision keeps choosing HardReset but the cooldown blocks it.
+    pub hard_reset_cooldown_active: bool,
 }
 
 /// Actions to take when consensus is stuck.

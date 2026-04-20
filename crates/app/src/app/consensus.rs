@@ -516,7 +516,7 @@ impl App {
                     "No tx_sets available for any buffered slot — forcing catchup"
                 );
                 self.recovery_attempts_without_progress
-                    .store(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+                    .fetch_max(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
                 return Some(None); // Wait for next tick to trigger escalation.
             }
         }
@@ -820,21 +820,7 @@ impl App {
             return None;
         }
 
-        tracing::info!(
-            current_ledger,
-            latest_externalized,
-            gap,
-            attempts,
-            "Recovery stalled for too long — forcing catchup"
-        );
-
-        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
-
-        // Archive-behind backoff: if a previous tick already learned the
-        // archive is behind `next_cp`, skip the redundant query. The archive
-        // publishes checkpoints every ~5 minutes, so re-asking every 10s is
-        // guaranteed waste (and creates a "Querying history archives" log
-        // storm during a stall). We still run the peer-SCP fallback below.
+        // Read backoff state early so the entry log can be demoted (#1843).
         self.set_phase_sub(super::phase::PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ);
         let backoff_active = {
             let guard = self.archive_behind_until.read().await;
@@ -843,6 +829,26 @@ impl App {
                 None => false,
             }
         };
+
+        if backoff_active {
+            tracing::debug!(
+                current_ledger,
+                latest_externalized,
+                gap,
+                attempts,
+                "Recovery stalled (archive-behind backoff active)"
+            );
+        } else {
+            tracing::info!(
+                current_ledger,
+                latest_externalized,
+                gap,
+                attempts,
+                "Recovery stalled for too long — forcing catchup"
+            );
+        }
+
+        let next_cp = henyey_history::checkpoint::checkpoint_containing(current_ledger + 1);
 
         // NOTE (#1755 debug, 2026-04-18): Previously this branch called
         // `archive_checkpoint_cache.clear()` with the stated goal of
@@ -928,13 +934,25 @@ impl App {
         let archive_latest = match archive_latest {
             Some(latest) => latest,
             None => {
-                tracing::info!(
-                    current_ledger,
-                    next_checkpoint = next_cp,
-                    backoff_active,
-                    "Recovery catchup skipped: archive hasn't published checkpoint yet \
-                     — requesting SCP state from peers as fallback"
-                );
+                // Demote to debug when backoff is already active (#1843):
+                // the first "skipped" log is useful; repeating it every 10s
+                // for up to 5 minutes is pure noise.
+                if backoff_active {
+                    tracing::debug!(
+                        current_ledger,
+                        next_checkpoint = next_cp,
+                        "Recovery catchup skipped: archive behind (backoff active) \
+                         — requesting SCP state from peers"
+                    );
+                } else {
+                    tracing::info!(
+                        current_ledger,
+                        next_checkpoint = next_cp,
+                        backoff_active,
+                        "Recovery catchup skipped: archive hasn't published checkpoint yet \
+                         — requesting SCP state from peers as fallback"
+                    );
+                }
 
                 // While waiting for the archive, actively request SCP state
                 // from peers. Some peers may still have tx_sets cached for
