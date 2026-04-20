@@ -149,17 +149,21 @@ impl Default for ScpDriverConfig {
 pub struct CachedTxSet {
     /// The transaction set.
     pub tx_set: TransactionSet,
-    /// When this was cached.
+    /// When this was cached (diagnostic only — not used for eviction).
     pub cached_at: std::time::Instant,
+    /// Monotonic sequence number for deterministic LRU eviction.
+    /// Updated on both insertion and `get()` refresh.
+    pub(crate) touch_seq: u64,
     /// Number of times this was requested.
     pub request_count: u64,
 }
 
 impl CachedTxSet {
-    pub(crate) fn new(tx_set: TransactionSet) -> Self {
+    pub(crate) fn new(tx_set: TransactionSet, touch_seq: u64) -> Self {
         Self {
             tx_set,
             cached_at: std::time::Instant::now(),
+            touch_seq,
             request_count: 0,
         }
     }
@@ -1944,8 +1948,6 @@ mod cache_tests {
     use super::*;
     use crate::tx_queue::TransactionSet;
     use henyey_scp::hash_quorum_set;
-    use std::thread;
-    use std::time::Duration;
 
     fn make_config(max_cache: usize) -> ScpDriverConfig {
         ScpDriverConfig {
@@ -1974,7 +1976,6 @@ mod cache_tests {
         let second = make_tx_set(2);
 
         driver.cache_tx_set(first.clone());
-        thread::sleep(Duration::from_millis(1));
         driver.cache_tx_set(second.clone());
 
         assert!(!driver.has_tx_set(&first.hash));

@@ -4,6 +4,7 @@
 //! three independent DashMaps in [`ScpDriver`]: the parsed tx-set cache,
 //! pending fetch requests, and the validity cache.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -34,6 +35,9 @@ pub struct TxSetTracker {
     valid_cache: DashMap<(Hash256, Hash256, u64), bool>,
     /// Maximum cache size.
     max_cache_size: usize,
+    /// Monotonic counter for deterministic LRU eviction ordering.
+    /// Relaxed ordering suffices — uniqueness is all we need.
+    next_seq: AtomicU64,
 }
 
 impl TxSetTracker {
@@ -43,6 +47,7 @@ impl TxSetTracker {
             pending: DashMap::new(),
             valid_cache: DashMap::new(),
             max_cache_size,
+            next_seq: AtomicU64::new(0),
         }
     }
 
@@ -126,17 +131,33 @@ impl TxSetTracker {
 
     // --- Cache management ---
 
-    /// Cache a parsed tx set, evicting oldest if at capacity.
+    /// Cache a parsed tx set, evicting the least-recently-touched if at capacity.
+    ///
+    /// Under concurrent access, eviction is best-effort LRU — capacity may
+    /// briefly be exceeded and a stale victim may be chosen. Ordering is
+    /// deterministic for single-threaded access.
+    ///
     /// `pub(crate)` to ensure network-received tx sets go through `receive()`,
     /// which enforces the pending check (AUDIT-080).
     pub(crate) fn store(&self, tx_set: TransactionSet) {
         let hash = tx_set.hash;
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+
+        // If already cached, replace in-place without evicting another entry.
+        if self.cache.contains_key(&hash) {
+            self.cache.insert(hash, CachedTxSet::new(tx_set, seq));
+            return;
+        }
+
+        if self.max_cache_size == 0 {
+            return;
+        }
 
         if self.cache.len() >= self.max_cache_size {
             // Collect the key to evict before calling remove, to avoid holding
             // a DashMap shard read-lock while remove acquires a write-lock.
             let to_evict: Option<Hash256> = {
-                let oldest = self.cache.iter().min_by_key(|e| e.cached_at);
+                let oldest = self.cache.iter().min_by_key(|e| e.touch_seq);
                 oldest.map(|e| *e.key())
             };
             if let Some(k) = to_evict {
@@ -144,7 +165,7 @@ impl TxSetTracker {
             }
         }
 
-        self.cache.insert(hash, CachedTxSet::new(tx_set));
+        self.cache.insert(hash, CachedTxSet::new(tx_set, seq));
     }
 
     /// Receive a parsed tx set from the network. Verifies hash integrity,
@@ -177,12 +198,13 @@ impl TxSetTracker {
     }
 
     /// Get a cached parsed tx set, refreshing its recency and incrementing
-    /// request count. Refreshing `cached_at` prevents actively-used entries
-    /// from being evicted by unsolicited cache churn (AUDIT-080).
+    /// request count. Refreshing `touch_seq` and `cached_at` prevents
+    /// actively-used entries from being evicted by cache churn (AUDIT-080).
     pub fn get(&self, hash: &Hash256) -> Option<TransactionSet> {
         self.cache.get_mut(hash).map(|mut entry| {
             entry.request_count += 1;
             entry.cached_at = Instant::now();
+            entry.touch_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
             entry.tx_set.clone()
         })
     }
@@ -436,18 +458,25 @@ mod tests {
 
     #[test]
     fn test_store_evicts_oldest() {
-        let tracker = TxSetTracker::new(1);
+        let tracker = TxSetTracker::new(2);
 
         let ts1 = make_tx_set(1);
         let hash1 = ts1.hash;
         tracker.store(ts1);
-        assert!(tracker.is_cached(&hash1));
 
         let ts2 = make_tx_set(2);
         let hash2 = ts2.hash;
         tracker.store(ts2);
+        assert!(tracker.is_cached(&hash1));
         assert!(tracker.is_cached(&hash2));
-        assert!(!tracker.is_cached(&hash1)); // evicted
+
+        // Third insert at capacity — should evict ts1 (lowest touch_seq)
+        let ts3 = make_tx_set(3);
+        let hash3 = ts3.hash;
+        tracker.store(ts3);
+        assert!(!tracker.is_cached(&hash1), "first entry should be evicted");
+        assert!(tracker.is_cached(&hash2));
+        assert!(tracker.is_cached(&hash3));
     }
 
     #[test]
@@ -513,13 +542,13 @@ mod tests {
         assert_eq!(tracker.sizes().cache, 1);
     }
 
-    /// Regression test for AUDIT-080: get() refreshes cached_at so actively-used
+    /// Regression test for AUDIT-080: get() refreshes touch_seq so actively-used
     /// entries are not evicted by cache pressure.
     #[test]
     fn test_audit_080_get_refreshes_cached_at() {
         let tracker = TxSetTracker::new(4);
 
-        // Fill cache to capacity with 4 entries
+        // Fill cache to capacity with 4 entries (seq 0, 1, 2, 3)
         for i in 0..4u8 {
             let ts = make_tx_set(i);
             let hash = ts.hash;
@@ -528,11 +557,11 @@ mod tests {
         }
         assert_eq!(tracker.sizes().cache, 4);
 
-        // Access the first entry to refresh its cached_at
+        // Access entry 0 to refresh its touch_seq (now highest)
         let first_hash = make_tx_set(0).hash;
         assert!(tracker.get(&first_hash).is_some());
 
-        // Add a 5th entry — should evict the OLDEST (entry 1, not entry 0 which was refreshed)
+        // Add a 5th entry — should evict entry 1 (lowest touch_seq after refresh)
         let new_ts = make_tx_set(99);
         let new_hash = new_ts.hash;
         tracker.request(new_hash, 200);
@@ -544,7 +573,52 @@ mod tests {
             tracker.is_cached(&first_hash),
             "refreshed entry should survive eviction"
         );
+        // Entry 1 should be evicted (lowest touch_seq)
+        let second_hash = make_tx_set(1).hash;
+        assert!(
+            !tracker.is_cached(&second_hash),
+            "entry 1 should be the eviction victim"
+        );
         // The new entry should be cached
         assert!(tracker.is_cached(&new_hash));
+    }
+
+    /// Re-storing an already-cached hash at capacity should replace in-place
+    /// without evicting another entry.
+    #[test]
+    fn test_store_duplicate_hash_no_spurious_eviction() {
+        let tracker = TxSetTracker::new(2);
+
+        let ts1 = make_tx_set(1);
+        let hash1 = ts1.hash;
+        tracker.store(ts1);
+
+        let ts2 = make_tx_set(2);
+        let hash2 = ts2.hash;
+        tracker.store(ts2);
+        assert_eq!(tracker.sizes().cache, 2);
+
+        // Re-store ts1 — should replace in-place, not evict ts2
+        let ts1_again = make_tx_set(1);
+        tracker.store(ts1_again);
+        assert_eq!(tracker.sizes().cache, 2);
+        assert!(tracker.is_cached(&hash1));
+        assert!(
+            tracker.is_cached(&hash2),
+            "duplicate-hash store should not evict other entries"
+        );
+    }
+
+    /// A tracker with max_cache_size == 0 should never cache anything.
+    #[test]
+    fn test_store_zero_capacity() {
+        let tracker = TxSetTracker::new(0);
+
+        let ts = make_tx_set(1);
+        let hash = ts.hash;
+        tracker.store(ts);
+
+        assert!(!tracker.is_cached(&hash));
+        assert_eq!(tracker.sizes().cache, 0);
     }
 }
