@@ -46,6 +46,50 @@ pub(super) fn classify_cannot_apply_reason(
     }
 }
 
+/// Relationship between the node's current ledger and the latest externalized
+/// SCP slot, eliminating the `saturating_sub` ambiguity where `gap == 0` could
+/// mean either "caught up" or "ahead of consensus" (see issue #1861).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LedgerRelation {
+    /// The node is behind consensus by `gap` ledgers (gap > 0).
+    Behind { gap: u64 },
+    /// The node is at the tip of consensus (`current_ledger == latest_externalized`).
+    AtTip,
+    /// The node is ahead of the latest externalized slot (e.g., `latest_externalized == 0`
+    /// on startup, or consensus hasn't reported a slot yet).
+    Ahead,
+}
+
+impl LedgerRelation {
+    /// Compute the relation from the node's current ledger and the latest
+    /// externalized SCP slot.
+    pub fn from_ledgers(current_ledger: u32, latest_externalized: u64) -> Self {
+        let current = current_ledger as u64;
+        if latest_externalized > current {
+            Self::Behind {
+                gap: latest_externalized - current,
+            }
+        } else if latest_externalized == current {
+            Self::AtTip
+        } else {
+            Self::Ahead
+        }
+    }
+
+    /// Returns `true` if the node is behind consensus.
+    pub fn is_behind(&self) -> bool {
+        matches!(self, Self::Behind { .. })
+    }
+
+    /// Returns `Some(gap)` if the node is behind consensus, `None` otherwise.
+    pub fn behind_gap(&self) -> Option<u64> {
+        match self {
+            Self::Behind { gap } => Some(*gap),
+            _ => None,
+        }
+    }
+}
+
 impl App {
     /// Try to trigger consensus for the next ledger (validators only).
     ///
@@ -133,7 +177,7 @@ impl App {
         let buffer_count = tracked_lock::tracked_read("syncing_ledgers", &self.syncing_ledgers)
             .await
             .len();
-        let gap = latest_externalized.saturating_sub(current_ledger as u64);
+        let relation = LedgerRelation::from_ledgers(current_ledger, latest_externalized);
 
         // Track consecutive recovery attempts without progress.
         let baseline = self.recovery_baseline_ledger.load(Ordering::SeqCst);
@@ -160,7 +204,7 @@ impl App {
             last_processed,
             pending_tx_sets = pending_tx_sets.len(),
             buffer_count,
-            gap,
+            gap = relation.behind_gap().unwrap_or(0),
             attempts,
             "Performing out-of-sync recovery"
         );
@@ -185,12 +229,10 @@ impl App {
 
         // --- Escalation: after many failed attempts, force catchup ---
         // Only escalate when the node is genuinely behind consensus.
-        // `gap` uses `saturating_sub` so `gap == 0` conflates "caught up"
-        // with "ahead of consensus" — use the explicit comparison instead.
-        if attempts >= RECOVERY_ESCALATION_CATCHUP && latest_externalized > current_ledger as u64 {
+        if attempts >= RECOVERY_ESCALATION_CATCHUP && relation.is_behind() {
             self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
             return self
-                .trigger_recovery_catchup(current_ledger, latest_externalized, gap, attempts)
+                .trigger_recovery_catchup(current_ledger, latest_externalized, relation, attempts)
                 .await;
         }
 
@@ -207,7 +249,10 @@ impl App {
         //   it immediately. Every 5 seconds the gap grows by 1 slot, and peers
         //   only cache ~12 slots (~60s). Waiting 60s to escalate guarantees the
         //   EXTERNALIZE is evicted from peers by the time we ask.
-        if gap <= TX_SET_REQUEST_WINDOW {
+        if relation
+            .behind_gap()
+            .map_or(true, |g| g <= TX_SET_REQUEST_WINDOW)
+        {
             // Check if the next slot's EXTERNALIZE is missing
             let next_slot = current_ledger as u64 + 1;
             let next_slot_missing = latest_externalized > next_slot
@@ -244,7 +289,7 @@ impl App {
                 tracing::warn!(
                     current_ledger,
                     latest_externalized,
-                    gap,
+                    gap = relation.behind_gap().unwrap_or(0),
                     attempts,
                     "Next slot EXTERNALIZE missing — requesting SCP state immediately"
                 );
@@ -258,11 +303,11 @@ impl App {
                 // validator in quickstart/local mode where the validator closes
                 // ledgers every second.
                 let scp_total = self.scp_messages_received.load(Ordering::Relaxed);
-                if attempts >= 1 && scp_total > 0 && latest_externalized == current_ledger as u64 {
+                if attempts >= 1 && scp_total > 0 && matches!(relation, LedgerRelation::AtTip) {
                     tracing::warn!(
                         current_ledger,
                         latest_externalized,
-                        gap,
+                        gap = relation.behind_gap().unwrap_or(0),
                         attempts,
                         scp_total,
                         "Receiving SCP messages but no externalization — \
@@ -274,7 +319,7 @@ impl App {
                         .trigger_recovery_catchup(
                             current_ledger,
                             latest_externalized,
-                            gap,
+                            relation,
                             attempts,
                         )
                         .await;
@@ -283,7 +328,7 @@ impl App {
                 tracing::debug!(
                     current_ledger,
                     latest_externalized,
-                    gap,
+                    gap = relation.behind_gap().unwrap_or(0),
                     attempts,
                     "Essentially caught up — waiting for fresh EXTERNALIZE"
                 );
@@ -293,7 +338,7 @@ impl App {
                 tracing::warn!(
                     current_ledger,
                     latest_externalized,
-                    gap,
+                    gap = relation.behind_gap().unwrap_or(0),
                     attempts,
                     "Essentially caught up but no progress — requesting SCP state from peers"
                 );
@@ -304,7 +349,7 @@ impl App {
         // Detect gaps in externalized slots and potentially trigger catchup.
         self.set_phase_sub(PHASE_13_8_OUT_OF_SYNC_ANALYZE_GAPS);
         if let Some(result) = self
-            .analyze_externalized_gaps(current_ledger, latest_externalized, gap, attempts)
+            .analyze_externalized_gaps(current_ledger, latest_externalized, relation, attempts)
             .await
         {
             return result;
@@ -325,7 +370,7 @@ impl App {
         &self,
         current_ledger: u32,
         latest_externalized: u64,
-        gap: u64,
+        relation: LedgerRelation,
         attempts: u64,
     ) -> Option<Option<PendingCatchup>> {
         let next_slot = current_ledger as u64 + 1;
@@ -350,7 +395,7 @@ impl App {
                     current_ledger,
                     next_slot,
                     latest_externalized,
-                    gap,
+                    gap = relation.behind_gap().unwrap_or(0),
                     attempts,
                     "Next slot EXTERNALIZE in-flight (waiting for tx_set fetch) — waiting"
                 );
@@ -406,7 +451,7 @@ impl App {
                         next_slot,
                         target_checkpoint,
                         latest_externalized,
-                        gap,
+                        gap = relation.behind_gap().unwrap_or(0),
                         attempts,
                         "Already at target checkpoint — waiting for escalation"
                     );
@@ -416,7 +461,7 @@ impl App {
                         current_ledger,
                         next_slot,
                         latest_externalized,
-                        gap,
+                        gap = relation.behind_gap().unwrap_or(0),
                         "Next slot permanently missing — triggering catchup to skip gap"
                     );
                     {
@@ -429,7 +474,7 @@ impl App {
                         self.trigger_recovery_catchup(
                             current_ledger,
                             latest_externalized,
-                            gap,
+                            relation,
                             attempts,
                         )
                         .await,
@@ -815,7 +860,7 @@ impl App {
         &self,
         current_ledger: u32,
         latest_externalized: u64,
-        gap: u64,
+        relation: LedgerRelation,
         attempts: u64,
     ) -> Option<PendingCatchup> {
         // Fatal-failure guard (spec §13.3): block further catchup after a
@@ -842,7 +887,7 @@ impl App {
             tracing::debug!(
                 current_ledger,
                 latest_externalized,
-                gap,
+                gap = relation.behind_gap().unwrap_or(0),
                 attempts,
                 "Recovery stalled (archive-behind backoff active)"
             );
@@ -853,11 +898,11 @@ impl App {
             // Demote to debug when the node is not actually behind consensus.
             // The fast-track caller already emits its own WARN before entering
             // this function, so the INFO here is redundant noise at gap=0.
-            if latest_externalized <= current_ledger as u64 {
+            if !relation.is_behind() {
                 tracing::debug!(
                     current_ledger,
                     latest_externalized,
-                    gap,
+                    gap = relation.behind_gap().unwrap_or(0),
                     attempts,
                     ?cache_age_secs,
                     urgent,
@@ -867,7 +912,7 @@ impl App {
                 tracing::info!(
                     current_ledger,
                     latest_externalized,
-                    gap,
+                    gap = relation.behind_gap().unwrap_or(0),
                     attempts,
                     ?cache_age_secs,
                     urgent,
@@ -1170,7 +1215,86 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_cannot_apply_reason, CannotApplyReason};
+    use super::{classify_cannot_apply_reason, CannotApplyReason, LedgerRelation};
+
+    // ── LedgerRelation tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_ledger_relation_behind() {
+        assert_eq!(
+            LedgerRelation::from_ledgers(100, 150),
+            LedgerRelation::Behind { gap: 50 }
+        );
+    }
+
+    #[test]
+    fn test_ledger_relation_at_tip() {
+        assert_eq!(
+            LedgerRelation::from_ledgers(100, 100),
+            LedgerRelation::AtTip
+        );
+    }
+
+    #[test]
+    fn test_ledger_relation_ahead() {
+        assert_eq!(LedgerRelation::from_ledgers(100, 50), LedgerRelation::Ahead);
+    }
+
+    #[test]
+    fn test_ledger_relation_ahead_startup() {
+        // On startup, latest_externalized is 0 while current_ledger >= 1.
+        assert_eq!(LedgerRelation::from_ledgers(1, 0), LedgerRelation::Ahead);
+    }
+
+    #[test]
+    fn test_ledger_relation_behind_by_one() {
+        assert_eq!(
+            LedgerRelation::from_ledgers(100, 101),
+            LedgerRelation::Behind { gap: 1 }
+        );
+    }
+
+    #[test]
+    fn test_ledger_relation_at_tip_zero() {
+        assert_eq!(LedgerRelation::from_ledgers(0, 0), LedgerRelation::AtTip);
+    }
+
+    #[test]
+    fn test_ledger_relation_at_tip_u32_max() {
+        assert_eq!(
+            LedgerRelation::from_ledgers(u32::MAX, u32::MAX as u64),
+            LedgerRelation::AtTip
+        );
+    }
+
+    #[test]
+    fn test_ledger_relation_behind_max() {
+        assert_eq!(
+            LedgerRelation::from_ledgers(0, u64::MAX),
+            LedgerRelation::Behind { gap: u64::MAX }
+        );
+    }
+
+    #[test]
+    fn test_behind_gap_returns_some_for_behind() {
+        let r = LedgerRelation::Behind { gap: 42 };
+        assert_eq!(r.behind_gap(), Some(42));
+    }
+
+    #[test]
+    fn test_behind_gap_returns_none_for_at_tip_and_ahead() {
+        assert_eq!(LedgerRelation::AtTip.behind_gap(), None);
+        assert_eq!(LedgerRelation::Ahead.behind_gap(), None);
+    }
+
+    #[test]
+    fn test_is_behind() {
+        assert!(LedgerRelation::Behind { gap: 1 }.is_behind());
+        assert!(!LedgerRelation::AtTip.is_behind());
+        assert!(!LedgerRelation::Ahead.is_behind());
+    }
+
+    // ── classify_cannot_apply_reason tests ──────────────────────────────
 
     /// Regression for issue #1759 (the original production symptom):
     /// `without_tx_set = 0, sequence_gap > 0` must classify as
