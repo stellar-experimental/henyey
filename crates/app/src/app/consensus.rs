@@ -548,6 +548,10 @@ impl App {
             return;
         }
 
+        // Record timestamp before spawning so heartbeat/gap throttle sees
+        // this attempt and does not immediately duplicate it.
+        *self.last_scp_state_request_at.write().await = self.clock.now();
+
         let overlay_clone = Arc::clone(&overlay);
         let envelope_count = envelopes.len();
         tokio::spawn(async move {
@@ -976,6 +980,9 @@ impl App {
                 // the network tip. Without this, the node sits idle for 1-5
                 // minutes until the next checkpoint publishes.
                 if let Some(overlay) = self.overlay().await {
+                    // Record timestamp before spawning so heartbeat/gap throttle
+                    // sees this attempt and does not immediately duplicate it.
+                    *self.last_scp_state_request_at.write().await = self.clock.now();
                     let overlay_clone = std::sync::Arc::clone(&overlay);
                     let ledger = current_ledger;
                     tokio::spawn(async move {

@@ -2226,6 +2226,9 @@ impl App {
                     // ledgers that are already ready.
                     if let Some(overlay) = self.overlay().await {
                         let current_ledger = self.current_ledger_seq();
+                        // Record timestamp before spawning so heartbeat/gap
+                        // throttle sees this attempt and does not duplicate it.
+                        *self.last_scp_state_request_at.write().await = self.clock.now();
                         tokio::spawn(async move {
                             let _ = overlay.request_scp_state(current_ledger).await;
                         });
