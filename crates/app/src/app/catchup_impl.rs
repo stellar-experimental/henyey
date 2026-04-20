@@ -1446,8 +1446,7 @@ impl App {
                 // Re-bootstrap consensus pipeline: without fresh EXTERNALIZE
                 // messages, syncing_ledgers stays empty and the node deadlocks
                 // (see #1851).
-                *self.last_scp_state_request_at.write().await = self.clock.now();
-                self.request_scp_state_from_peers().await;
+                self.request_scp_state_and_record().await;
                 None
             }
             None => {
@@ -1460,8 +1459,7 @@ impl App {
                 // target ASAP for the next recovery cycle.
                 self.archive_checkpoint_cache.set_urgent(true);
                 // Re-bootstrap consensus pipeline (see #1851).
-                *self.last_scp_state_request_at.write().await = self.clock.now();
-                self.request_scp_state_from_peers().await;
+                self.request_scp_state_and_record().await;
                 None
             }
         }

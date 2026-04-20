@@ -69,7 +69,7 @@ impl App {
 
         // Wait a short time for initial peer connections, then request SCP state
         self.clock.sleep(Duration::from_millis(500)).await;
-        self.request_scp_state_from_peers().await;
+        self.request_scp_state_and_record().await;
 
         // Set state based on validator mode
         self.restore_operational_state().await;
@@ -731,10 +731,7 @@ impl App {
                                         missing_slot = next,
                                         "Gap detected: next slot EXTERNALIZE missing, requesting SCP state"
                                     );
-                                    if let Some(overlay) = self.overlay().await {
-                                        let _ = overlay.request_scp_state(cl).await;
-                                    }
-                                    *self.last_scp_state_request_at.write().await = self.clock.now();
+                                    self.request_scp_state_and_record().await;
                                 }
                             }
                         }
@@ -921,8 +918,7 @@ impl App {
                                     next_slot_missing,
                                     "SCP externalization stalled; requesting SCP state"
                                 );
-                                *self.last_scp_state_request_at.write().await = now;
-                                self.request_scp_state_from_peers().await;
+                                self.request_scp_state_and_record().await;
                             }
                         }
                     }
@@ -984,10 +980,7 @@ impl App {
             latest_ext,
             "Rapid close cycle ended; requesting SCP state from peers"
         );
-        if let Some(overlay) = self.overlay().await {
-            let _ = overlay.request_scp_state(current_ledger).await;
-        }
-        *self.last_scp_state_request_at.write().await = self.clock.now();
+        self.request_scp_state_and_record().await;
     }
 
     /// Start the overlay network.

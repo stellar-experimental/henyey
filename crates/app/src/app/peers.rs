@@ -174,7 +174,7 @@ impl App {
         if reconnected {
             // Give peers time to complete handshake
             self.clock.sleep(Duration::from_millis(200)).await;
-            self.request_scp_state_from_peers().await;
+            self.request_scp_state_and_record().await;
         }
     }
 

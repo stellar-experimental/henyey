@@ -425,7 +425,7 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
                     // Wait for peers to complete handshake
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     tracing::info!("Requesting SCP state during catchup");
-                    app_clone.request_scp_state_from_peers().await;
+                    app_clone.request_scp_state_and_record().await;
                 })
             };
 

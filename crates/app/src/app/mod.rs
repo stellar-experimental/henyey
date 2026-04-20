@@ -1840,6 +1840,17 @@ impl App {
         self.overlay.read().await.clone()
     }
 
+    /// Request SCP state from peers and record the attempt timestamp.
+    ///
+    /// This is the standard entry point for all sites that participate in
+    /// the heartbeat throttle window. Records the timestamp before the
+    /// network call so that even failed attempts (no overlay, no peers)
+    /// prevent immediate retry bursts.
+    pub async fn request_scp_state_and_record(&self) {
+        *self.last_scp_state_request_at.write().await = self.clock.now();
+        self.request_scp_state_from_peers().await;
+    }
+
     /// Request SCP state from all connected peers.
     pub async fn request_scp_state_from_peers(&self) {
         let Some(overlay) = self.overlay().await else {
