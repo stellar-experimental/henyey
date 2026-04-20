@@ -228,8 +228,14 @@ impl App {
         }
 
         // --- Escalation: after many failed attempts, force catchup ---
-        // Only escalate when the node is genuinely behind consensus.
-        if attempts >= RECOVERY_ESCALATION_CATCHUP && relation.is_behind() {
+        // Escalate when the node is behind consensus, OR when the node is
+        // in the "Ahead" state with no SCP externalization yet (latest_ext=0).
+        // The latter case covers captive-core in quickstart/local mode: it
+        // closes ledgers from the validator's EXTERNALIZE messages but never
+        // externalizes itself, so without this escalation the recovery loop
+        // would request SCP state forever without converging.
+        let ahead_no_ext = matches!(relation, LedgerRelation::Ahead) && latest_externalized == 0;
+        if attempts >= RECOVERY_ESCALATION_CATCHUP && (relation.is_behind() || ahead_no_ext) {
             self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
             return self
                 .trigger_recovery_catchup(current_ledger, latest_externalized, relation, attempts)
@@ -303,7 +309,14 @@ impl App {
                 // validator in quickstart/local mode where the validator closes
                 // ledgers every second.
                 let scp_total = self.scp_messages_received.load(Ordering::Relaxed);
-                if attempts >= 1 && scp_total > 0 && matches!(relation, LedgerRelation::AtTip) {
+                // Fast-track fires for both AtTip and the Ahead-no-externalization
+                // case. In both scenarios, the node has received SCP messages
+                // but cannot externalize: AtTip because tx_sets are evicted from
+                // peers' caches; Ahead (latest_ext=0) because captive-core does
+                // not participate in SCP consensus.
+                let at_tip_or_ahead_no_ext = matches!(relation, LedgerRelation::AtTip)
+                    || (matches!(relation, LedgerRelation::Ahead) && latest_externalized == 0);
+                if attempts >= 1 && scp_total > 0 && at_tip_or_ahead_no_ext {
                     tracing::warn!(
                         current_ledger,
                         latest_externalized,
