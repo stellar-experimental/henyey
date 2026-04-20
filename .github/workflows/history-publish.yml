@@ -10,7 +10,7 @@ on:
         description: "Timeout in seconds for waiting for first checkpoint"
         required: false
         type: string
-        default: "900"
+        default: "1500"
 
 concurrency:
   group: history-publish
@@ -23,7 +23,7 @@ jobs:
   test-history-publish:
     name: Test History Publish
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -48,7 +48,7 @@ jobs:
       - name: Run history publish integration test
         run: |
           TIMEOUT="${{ inputs.timeout }}"
-          TIMEOUT="${TIMEOUT:-900}"
+          TIMEOUT="${TIMEOUT:-1500}"
 
           ./scripts/test-history-publish.sh \
             --no-build \

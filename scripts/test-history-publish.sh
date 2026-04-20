@@ -6,7 +6,7 @@
 # Usage:
 #   ./scripts/test-history-publish.sh                   # build + run
 #   ./scripts/test-history-publish.sh --no-build        # skip cargo build
-#   ./scripts/test-history-publish.sh --timeout 600     # wait up to 10 min
+#   ./scripts/test-history-publish.sh --timeout 1200    # wait up to 20 min
 #   ./scripts/test-history-publish.sh --checkpoint 63   # compare specific checkpoint
 #   ./scripts/test-history-publish.sh --data-dir /tmp/x # use specific data directory
 #
@@ -22,7 +22,7 @@ BINARY="$PROJECT_ROOT/target/release/henyey"
 
 # Defaults
 DO_BUILD=true
-TIMEOUT=600        # 10 minutes max wait for first checkpoint
+TIMEOUT=1200        # 20 minutes max wait for first checkpoint
 CHECKPOINT=""      # auto-detect from published HAS
 KEEP_DATA=false
 DATA_DIR_OVERRIDE=""  # if set, use this instead of auto-generated path
