@@ -130,8 +130,7 @@ impl TransactionExecutor {
         // Phase 3: Fee validation
         // SECURITY: fee computation overflow prevented by tx validation bounds (max_fee * max_ops fits i64)
         if frame.is_fee_bump() {
-            let outer_op_count = frame.resource_operation_count() as i64;
-            let outer_min_inclusion_fee = base_fee as i64 * outer_op_count;
+            let outer_min_inclusion_fee = frame.min_inclusion_fee(base_fee as i64);
             let outer_inclusion_fee = frame.inclusion_fee();
 
             if outer_inclusion_fee < outer_min_inclusion_fee {
@@ -141,21 +140,25 @@ impl TransactionExecutor {
                 )));
             }
 
-            let (inner_inclusion_fee, inner_is_soroban) = match frame.envelope() {
+            let (inner_inclusion_fee, inner_min_inclusion_fee, inner_is_soroban) = match frame
+                .envelope()
+            {
                 TransactionEnvelope::TxFeeBump(env) => match &env.tx.inner_tx {
                     stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
                         let inner_env = TransactionEnvelope::Tx(inner.clone());
                         let inner_frame =
                             TransactionFrame::from_owned_with_network(inner_env, self.network_id);
-                        (inner_frame.inclusion_fee(), inner_frame.is_soroban())
+                        (
+                            inner_frame.inclusion_fee(),
+                            inner_frame.min_inclusion_fee(base_fee as i64),
+                            inner_frame.is_soroban(),
+                        )
                     }
                 },
-                _ => (0, false),
+                _ => (0, base_fee as i64, false),
             };
 
             if inner_inclusion_fee >= 0 {
-                let inner_min_inclusion_fee =
-                    base_fee as i64 * std::cmp::max(1_i64, frame.operation_count() as i64);
                 let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
                 let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
                 if v1 < v2 {

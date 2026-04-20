@@ -1684,27 +1684,18 @@ impl TransactionExecutor {
             ));
         }
 
-        // Compute fee using the same logic as execute_transaction_with_fee_mode
-        let num_ops = std::cmp::max(1, frame.resource_operation_count() as i64);
-        let required_fee = base_fee as i64 * num_ops;
-        let inclusion_fee = frame.inclusion_fee();
-        // For Soroban, the resource fee is charged in full, plus the inclusion fee up to required.
-        // For classic transactions, charge up to the required_fee (base_fee * num_ops).
-        let mut fee = if frame.is_soroban() {
-            frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
-        } else {
-            std::cmp::min(inclusion_fee, required_fee)
-        };
+        // Compute fee using TransactionFrame::fee_to_charge
+        let mut fee = frame.fee_to_charge(base_fee as i64);
 
         if frame.is_fee_bump() {
             tracing::debug!(
                 is_fee_bump = true,
                 total_fee = frame.total_fee(),
                 inner_fee = frame.inner_fee(),
-                inclusion_fee = inclusion_fee,
+                inclusion_fee = frame.inclusion_fee(),
                 base_fee = base_fee,
                 operation_count = frame.operation_count(),
-                required_fee = required_fee,
+                min_inclusion_fee = frame.min_inclusion_fee(base_fee as i64),
                 fee_charged = fee,
                 "Fee bump transaction fee calculation"
             );
@@ -1891,16 +1882,7 @@ impl TransactionExecutor {
 
         let validation_us = tx_timing_start.elapsed().as_micros() as u64;
 
-        let num_ops = std::cmp::max(1, frame.resource_operation_count() as i64);
-        let required_fee = base_fee as i64 * num_ops;
-        let inclusion_fee = frame.inclusion_fee();
-        // For Soroban, the resource fee is charged in full, plus the inclusion fee up to required.
-        // For classic transactions, charge up to the required_fee (base_fee * num_ops).
-        let mut fee = if frame.is_soroban() {
-            frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
-        } else {
-            std::cmp::min(inclusion_fee, required_fee)
-        };
+        let mut fee = frame.fee_to_charge(base_fee as i64);
 
         let fee_deduct_start = std::time::Instant::now();
         let mut preflight_failure = None;
@@ -3102,12 +3084,8 @@ fn pre_deduct_soroban_fees(
                 let frame = TransactionFrame::with_network(tx.clone(), network_id);
                 let fee_source = fee_source_account_id(tx);
 
-                // Compute the fee using the same logic as execute_transaction_with_fee_mode.
-                let num_ops = std::cmp::max(1, frame.resource_operation_count() as i64);
-                let required_fee = tx_fee as i64 * num_ops;
-                let inclusion_fee = frame.inclusion_fee();
-                let computed_fee = frame.declared_soroban_resource_fee()
-                    + std::cmp::min(inclusion_fee, required_fee);
+                // Compute the fee using TransactionFrame::fee_to_charge.
+                let computed_fee = frame.fee_to_charge(tx_fee as i64);
 
                 let (charged_fee, fee_changes) = delta.deduct_fee_from_account(
                     &fee_source,

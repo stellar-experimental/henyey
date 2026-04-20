@@ -249,7 +249,8 @@ pub fn process_fee_seq_num(
     let protocol_version = ctx.protocol_version();
 
     // Calculate the fee to charge (before borrowing state mutably)
-    let fee = calculate_fee_to_charge(frame, protocol_version, base_fee);
+    let effective_base_fee = base_fee.unwrap_or(crate::NETWORK_MIN_BASE_FEE);
+    let fee = frame.fee_to_charge(effective_base_fee);
 
     // Load source account and get balance
     let available_balance = {
@@ -307,37 +308,6 @@ pub fn process_fee_seq_num(
         should_apply,
         tx_result,
     })
-}
-
-/// Calculate the fee to charge for a transaction.
-/// Calculate the fee to charge for a transaction.
-///
-/// This matches stellar-core's `TransactionFrame::getFee()` behavior:
-/// - For Soroban: resourceFee + min(inclusionFee, adjustedFee)
-/// - For Classic: min(inclusionFee, adjustedFee)
-///
-/// Where adjustedFee = baseFee * numOperations and inclusionFee is the
-/// declared fee (minus resource fee for Soroban).
-fn calculate_fee_to_charge(
-    frame: &TransactionFrame,
-    _protocol_version: u32,
-    base_fee_override: Option<i64>,
-) -> i64 {
-    let base_fee = base_fee_override.unwrap_or(crate::NETWORK_MIN_BASE_FEE);
-    let op_count = std::cmp::max(1, frame.resource_operation_count() as i64);
-    let adjusted_fee = base_fee * op_count;
-
-    if frame.is_soroban() {
-        // Soroban: resourceFee + min(inclusionFee, adjustedFee)
-        let resource_fee = frame.declared_soroban_resource_fee();
-        let inclusion_fee = frame.inclusion_fee();
-        resource_fee + std::cmp::min(inclusion_fee, adjusted_fee)
-    } else {
-        // Classic: min(inclusionFee, adjustedFee)
-        // The inclusion fee equals the full declared fee for classic transactions.
-        let inclusion_fee = frame.fee() as i64;
-        std::cmp::min(inclusion_fee, adjusted_fee)
-    }
 }
 
 /// Charge fee to an account (deduct from balance).
@@ -1126,12 +1096,12 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_fee_to_charge_classic() {
+    fn test_fee_to_charge_classic() {
         // Test 1: Declared fee (50) is less than base_fee * ops (100 * 1 = 100)
         // Fee charged should be min(50, 100) = 50
         let account_id = create_test_account_id(1);
         let frame = make_test_frame(account_id, 50, 1);
-        let fee = calculate_fee_to_charge(&frame, 21, Some(100));
+        let fee = frame.fee_to_charge(100);
         assert_eq!(
             fee, 50,
             "Classic: min(declared=50, required=100) should be 50"
@@ -1140,18 +1110,16 @@ mod tests {
         // Test 2: Declared fee (200) is greater than base_fee * ops (100 * 1 = 100)
         // Fee charged should be min(200, 100) = 100
         let frame2 = make_test_frame(create_test_account_id(1), 200, 1);
-        let fee2 = calculate_fee_to_charge(&frame2, 21, Some(100));
+        let fee2 = frame2.fee_to_charge(100);
         assert_eq!(
             fee2, 100,
             "Classic: min(declared=200, required=100) should be 100"
         );
 
-        // Test 3: Declared fee (500) with 3 operations, base fee 100
-        // required_fee = 100 * 3 = 300
-        // Fee charged should be min(500, 300) = 300
+        // Test 3: Declared fee (500) with 1 operation, base fee 100
+        // Fee charged should be min(500, 100) = 100
         let frame3 = make_test_frame(create_test_account_id(1), 500, 1);
-        // Note: make_test_frame creates 1 op, so we use fee 500 for a single op tx
-        let fee3 = calculate_fee_to_charge(&frame3, 21, Some(100));
+        let fee3 = frame3.fee_to_charge(100);
         assert_eq!(
             fee3, 100,
             "Classic: min(declared=500, required=100) should be 100"
@@ -1159,7 +1127,7 @@ mod tests {
 
         // Test 4: Declared fee exactly matches base_fee * ops
         let frame4 = make_test_frame(create_test_account_id(1), 100, 1);
-        let fee4 = calculate_fee_to_charge(&frame4, 21, Some(100));
+        let fee4 = frame4.fee_to_charge(100);
         assert_eq!(
             fee4, 100,
             "Classic: min(declared=100, required=100) should be 100"
@@ -1170,11 +1138,8 @@ mod tests {
     /// This matches stellar-core's TransactionFrame::getFee() behavior when applying=true
     #[test]
     fn test_classic_fee_uses_min_not_max() {
-        // A user declaring a fee of 1,000,000 stroops for a 1-op transaction
-        // should only be charged base_fee * 1 = 100 stroops (assuming base_fee=100),
-        // NOT the full 1,000,000 they declared.
         let frame = make_test_frame(create_test_account_id(1), 1_000_000, 1);
-        let fee = calculate_fee_to_charge(&frame, 21, Some(100));
+        let fee = frame.fee_to_charge(100);
         assert_eq!(
             fee, 100,
             "Classic tx should charge min(1000000, 100*1)=100, not the declared fee"
@@ -1335,20 +1300,20 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_fee_to_charge_with_zero_base_fee() {
+    fn test_fee_to_charge_with_zero_base_fee() {
         let account_id = create_test_account_id(1);
         let frame = make_test_frame(account_id, 100, 1);
 
         // With base_fee=0, required_fee = 0 * 1 = 0
         // Fee charged should be min(100, 0) = 0
-        let fee = calculate_fee_to_charge(&frame, 21, Some(0));
+        let fee = frame.fee_to_charge(0);
         assert_eq!(fee, 0, "With base_fee=0, fee should be 0");
     }
 
     /// Regression test for #1821: fee-bump transactions must use resource_operation_count()
     /// (inner ops + 1) for fee calculation, not plain operation_count().
     #[test]
-    fn test_calculate_fee_to_charge_fee_bump() {
+    fn test_fee_to_charge_fee_bump() {
         use stellar_xdr::curr::{
             DecoratedSignature, FeeBumpTransaction, FeeBumpTransactionEnvelope,
             FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
@@ -1403,7 +1368,7 @@ mod tests {
 
         // base_fee=100, resource ops=2 → adjusted_fee = 200
         // declared outer fee = 1000 (classic path: min(1000, 200) = 200)
-        let fee = calculate_fee_to_charge(&frame, 21, Some(100));
+        let fee = frame.fee_to_charge(100);
         assert_eq!(
             fee, 200,
             "Fee-bump with 1 inner op should charge base_fee * 2 = 200, not base_fee * 1 = 100"

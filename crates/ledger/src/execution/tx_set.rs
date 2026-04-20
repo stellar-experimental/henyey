@@ -877,14 +877,7 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
         let frame = TransactionFrame::with_network(Arc::clone(tx), network_id);
         let fee_source = fee_source_account_id(tx);
 
-        let num_ops = std::cmp::max(1, frame.resource_operation_count() as i64);
-        let required_fee = tx_fee as i64 * num_ops;
-        let inclusion_fee = frame.inclusion_fee();
-        let computed_fee = if frame.is_soroban() {
-            frame.declared_soroban_resource_fee() + std::cmp::min(inclusion_fee, required_fee)
-        } else {
-            std::cmp::min(inclusion_fee, required_fee)
-        };
+        let computed_fee = frame.fee_to_charge(tx_fee as i64);
 
         let (charged_fee, fee_changes) =
             delta.deduct_fee_from_account(&fee_source, computed_fee, snapshot, ledger_seq)?;
@@ -907,11 +900,7 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
                 let frame = TransactionFrame::with_network(Arc::clone(tx), network_id);
                 let fee_source = fee_source_account_id(tx);
 
-                let num_ops = std::cmp::max(1, frame.resource_operation_count() as i64);
-                let required_fee = tx_fee as i64 * num_ops;
-                let inclusion_fee = frame.inclusion_fee();
-                let computed_fee = frame.declared_soroban_resource_fee()
-                    + std::cmp::min(inclusion_fee, required_fee);
+                let computed_fee = frame.fee_to_charge(tx_fee as i64);
 
                 let (charged_fee, fee_changes) = delta.deduct_fee_from_account(
                     &fee_source,

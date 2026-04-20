@@ -414,6 +414,33 @@ impl TransactionFrame {
         }
     }
 
+    /// Minimum inclusion fee at the given base fee.
+    ///
+    /// Returns `base_fee * max(1, resource_operation_count())` using
+    /// saturating arithmetic.  Matches stellar-core's
+    /// `getMinInclusionFee()` (`TransactionUtils.cpp`).
+    pub fn min_inclusion_fee(&self, base_fee: i64) -> i64 {
+        base_fee.saturating_mul(std::cmp::max(1, self.resource_operation_count() as i64))
+    }
+
+    /// Fee to charge when applying this transaction.
+    ///
+    /// - **Soroban**: `resource_fee + min(inclusion_fee, min_inclusion_fee)`
+    /// - **Classic**: `min(inclusion_fee, min_inclusion_fee)`
+    ///
+    /// Matches stellar-core's `TransactionFrame::getFee(header, baseFee,
+    /// /*applying=*/true)` and
+    /// `FeeBumpTransactionFrame::getFee(header, baseFee, /*applying=*/true)`.
+    pub fn fee_to_charge(&self, base_fee: i64) -> i64 {
+        let adjusted_fee = self.min_inclusion_fee(base_fee);
+        if self.is_soroban() {
+            self.declared_soroban_resource_fee()
+                .saturating_add(std::cmp::min(self.inclusion_fee(), adjusted_fee))
+        } else {
+            std::cmp::min(self.inclusion_fee(), adjusted_fee)
+        }
+    }
+
     /// Returns the transaction size in bytes for resource accounting.
     ///
     /// For fee-bump transactions, returns the inner envelope XDR size,
@@ -2031,5 +2058,124 @@ mod tests {
             resources.try_get_val(ResourceType::Instructions).unwrap(),
             inner_size
         );
+    }
+
+    // ---- min_inclusion_fee / fee_to_charge unit tests ----
+
+    #[test]
+    fn test_min_inclusion_fee_classic() {
+        // Regular 1-op classic tx: min_inclusion_fee = 100 * 1 = 100
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        assert_eq!(frame.min_inclusion_fee(100), 100);
+        assert_eq!(frame.min_inclusion_fee(200), 200);
+        assert_eq!(frame.min_inclusion_fee(0), 0);
+    }
+
+    #[test]
+    fn test_min_inclusion_fee_fee_bump() {
+        // Fee-bump: resource_operation_count = inner_ops + 1 = 2
+        let frame = TransactionFrame::from_owned(create_classic_fee_bump(100, 500));
+        assert_eq!(frame.resource_operation_count(), 2);
+        assert_eq!(frame.min_inclusion_fee(100), 200); // 100 * 2
+    }
+
+    #[test]
+    fn test_min_inclusion_fee_soroban() {
+        // Soroban: 1 op, resource_operation_count = 1
+        let frame = TransactionFrame::from_owned(create_soroban_transaction_with_fees(50, 200));
+        assert_eq!(frame.resource_operation_count(), 1);
+        assert_eq!(frame.min_inclusion_fee(100), 100);
+    }
+
+    #[test]
+    fn test_min_inclusion_fee_saturating() {
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        // Should saturate instead of overflowing
+        assert_eq!(frame.min_inclusion_fee(i64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn test_fee_to_charge_classic_simple() {
+        // fee=100, base_fee=100, 1 op → min(100, 100) = 100
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        assert_eq!(frame.fee_to_charge(100), 100);
+    }
+
+    #[test]
+    fn test_fee_to_charge_classic_fee_lower_than_required() {
+        // fee=50, base_fee=100, 1 op → min(50, 100) = 50
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let tx = Transaction {
+            source_account: source,
+            fee: 50,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: MuxedAccount::Ed25519(Uint256([1u8; 32])),
+                    asset: Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+        let frame = TransactionFrame::from_owned(envelope);
+        assert_eq!(frame.fee_to_charge(100), 50);
+    }
+
+    #[test]
+    fn test_fee_to_charge_fee_bump_classic() {
+        // inner_fee=100, outer_fee=500, 1 inner op, resource_op_count=2
+        // inclusion_fee = total_fee - resource_fee = 500 - 0 = 500 (classic)
+        // min_inclusion_fee = 100 * 2 = 200
+        // fee_to_charge = min(500, 200) = 200
+        let frame = TransactionFrame::from_owned(create_classic_fee_bump(100, 500));
+        assert_eq!(frame.fee_to_charge(100), 200);
+    }
+
+    #[test]
+    fn test_fee_to_charge_soroban() {
+        // resource_fee=50, total_fee=200
+        // inclusion_fee = 200 - 50 = 150
+        // min_inclusion_fee = 100 * 1 = 100
+        // fee_to_charge = 50 + min(150, 100) = 150
+        let frame = TransactionFrame::from_owned(create_soroban_transaction_with_fees(50, 200));
+        assert_eq!(frame.fee_to_charge(100), 150);
+    }
+
+    #[test]
+    fn test_fee_to_charge_soroban_low_inclusion() {
+        // resource_fee=150, total_fee=200
+        // inclusion_fee = 200 - 150 = 50
+        // min_inclusion_fee = 100 * 1 = 100
+        // fee_to_charge = 150 + min(50, 100) = 200
+        let frame = TransactionFrame::from_owned(create_soroban_transaction_with_fees(150, 200));
+        assert_eq!(frame.fee_to_charge(100), 200);
+    }
+
+    #[test]
+    fn test_fee_to_charge_fee_bump_soroban() {
+        // inner: resource_fee=150, total_fee=600
+        // outer_fee=900, resource_op_count = 2
+        // inclusion_fee = 900 - 150 = 750
+        // min_inclusion_fee = 100 * 2 = 200
+        // fee_to_charge = 150 + min(750, 200) = 350
+        let frame = TransactionFrame::from_owned(create_fee_bump_soroban(600, 150, 900));
+        assert_eq!(frame.fee_to_charge(100), 350);
+    }
+
+    #[test]
+    fn test_fee_to_charge_zero_base_fee() {
+        let frame = TransactionFrame::from_owned(create_test_transaction());
+        // base_fee=0 → min_inclusion_fee=0 → min(100, 0) = 0
+        assert_eq!(frame.fee_to_charge(0), 0);
     }
 }

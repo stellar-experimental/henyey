@@ -350,8 +350,7 @@ pub fn validate_fee_bump(
 ) -> std::result::Result<(), FeeBumpError> {
     // Validate inclusion fee against min fee and ensure the fee bump is actually bumping.
     // This mirrors stellar-core FeeBumpTransactionFrame::commonValidPreSeqNum logic.
-    let outer_op_count = frame.frame().resource_operation_count() as i64;
-    let outer_min_inclusion_fee = outer_op_count * context.base_fee as i64;
+    let outer_min_inclusion_fee = frame.frame().min_inclusion_fee(context.base_fee as i64);
     let outer_inclusion_fee = frame.frame().inclusion_fee();
 
     if outer_inclusion_fee < outer_min_inclusion_fee {
@@ -363,8 +362,9 @@ pub fn validate_fee_bump(
 
     let inner_inclusion_fee = frame.inner_frame().inclusion_fee();
     if inner_inclusion_fee >= 0 {
-        let inner_min_inclusion_fee =
-            std::cmp::max(1_i64, frame.operation_count() as i64) * context.base_fee as i64;
+        let inner_min_inclusion_fee = frame
+            .inner_frame()
+            .min_inclusion_fee(context.base_fee as i64);
         let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
         let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
         if v1 < v2 {
