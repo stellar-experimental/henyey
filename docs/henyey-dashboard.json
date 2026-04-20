@@ -182,7 +182,7 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Ledger Sequence",
+      "title": "Ledger Seq",
       "description": "Current ledger number. Useful for cross-referencing with network explorers and other validators.",
       "gridPos": {
         "h": 4,
@@ -234,7 +234,7 @@
     {
       "id": 4,
       "type": "stat",
-      "title": "Herder State",
+      "title": "Herder",
       "description": "Internal herder state machine position. Indicates whether the node is tracking consensus, catching up, or in another state.",
       "gridPos": {
         "h": 4,
@@ -309,7 +309,7 @@
     {
       "id": 5,
       "type": "stat",
-      "title": "Peer Count",
+      "title": "Peers",
       "description": "Total connected peers. Below 3 risks network partition; below 8 is degraded connectivity.",
       "gridPos": {
         "h": 4,
@@ -368,7 +368,7 @@
     {
       "id": 6,
       "type": "stat",
-      "title": "Quorum Fail At",
+      "title": "Fail At",
       "description": "Number of additional quorum nodes that can fail before this validator loses quorum. Zero means quorum loss is imminent. This is the single most critical safety metric.",
       "gridPos": {
         "h": 4,
@@ -427,7 +427,7 @@
     {
       "id": 7,
       "type": "stat",
-      "title": "Quorum Missing",
+      "title": "Missing",
       "description": "Number of quorum peers not responding. Any non-zero value warrants investigation.",
       "gridPos": {
         "h": 4,
@@ -482,7 +482,7 @@
     {
       "id": 8,
       "type": "stat",
-      "title": "Is Validator",
+      "title": "Validator",
       "description": "Whether this node is configured as a validator (participating in consensus, not just observing).",
       "gridPos": {
         "h": 4,
@@ -565,7 +565,7 @@
       },
       "targets": [
         {
-          "expr": "time() - stellar_uptime_seconds{job=\"henyey\", instance=~\"$instance\"}",
+          "expr": "stellar_uptime_seconds{job=\"henyey\", instance=~\"$instance\"}",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
@@ -617,7 +617,7 @@
       },
       "targets": [
         {
-          "expr": "henyey_process_open_fds{job=\"henyey\", instance=~\"$instance\"} / henyey_process_max_fds{job=\"henyey\", instance=~\"$instance\"} * 100",
+          "expr": "henyey_process_open_fds{job=\"henyey\", instance=~\"$instance\"} / henyey_process_max_fds{job=\"henyey\", instance=~\"$instance\"}",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
@@ -627,7 +627,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "percent",
+          "unit": "percentunit",
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -637,11 +637,11 @@
               },
               {
                 "color": "yellow",
-                "value": 60
+                "value": 0.6
               },
               {
                 "color": "red",
-                "value": 80
+                "value": 0.8
               }
             ]
           },
