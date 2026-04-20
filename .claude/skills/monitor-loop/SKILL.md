@@ -114,9 +114,19 @@ doesn't change when it should — you MUST investigate. Specifically:
   missing feature or config issue, file it with the code-level
   explanation. Do NOT spawn agents; the downstream pickup process
   handles the fix.
-- **File everything.** Every anomaly that isn't immediately explained
-  by reading the code should result in a GitHub issue (or comment on an
-  existing one — always search first).
+- **File everything, including non-critical misbehavior.** Every anomaly
+  that is not literal expected-correct behavior results in a GitHub issue
+  (or a comment on an existing one — always search first). This includes
+  low-severity oddities that do not require action right now: spurious log
+  lines, metrics that drift without visible effect, counters that reset
+  when they shouldn't, log levels that seem wrong for the observed state,
+  and any other "huh, that's odd" finding. **Do NOT decide a thing is
+  too small to file.** Rationale: today's harmless noise is tomorrow's
+  diagnostic confusion — a spurious `Recovery stalled` log hides a real
+  stall the next time it fires; a wrongly-named metric breaks a dashboard
+  panel silently. Filing keeps institutional memory out of any single
+  operator's head. Prefix such issues `Non-critical:` in the title so
+  triage can prioritize, but file them.
 - **Sync deadline is 15 minutes — with a fresh-start carveout.** A mainnet
   validator with an existing, populated data directory must complete catchup
   and begin closing ledgers in real-time within 15 minutes of startup. If the
