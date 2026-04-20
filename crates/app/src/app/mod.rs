@@ -6326,117 +6326,270 @@ mod tests {
         }
     }
 
-    /// Regression test: the out-of-sync recovery path escalates only when
-    /// there are buffered slots but none of them have tx_sets.
-    ///
-    /// Guard condition at consensus.rs `out_of_sync_recovery`:
-    ///   `with_tx_set == 0 && total > 0`
-    #[test]
-    fn test_out_of_sync_escalation_guard_conditions() {
-        // Positive: buffered slots exist but none have tx_sets → escalate
-        let total = 5u64;
-        let with_tx_set = 0u64;
-        assert!(
-            with_tx_set == 0 && total > 0,
-            "should escalate when buffered slots have no tx_sets"
+    /// Regression test: the out-of-sync recovery path in `consensus.rs`
+    /// escalates only when there are buffered slots but none have tx_sets.
+    /// Exercises the actual production pattern: guard → `escalate_recovery_to_catchup()`.
+    #[tokio::test]
+    async fn test_out_of_sync_escalation_guard_and_counter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Replicate the production pattern from consensus.rs:512-519:
+        //   if with_tx_set == 0 && total > 0 {
+        //       self.escalate_recovery_to_catchup();
+        //   }
+
+        // Case 1: counter already above threshold, guard fires → must preserve
+        let pre_existing = RECOVERY_ESCALATION_CATCHUP + 3; // e.g., 9
+        app.recovery_attempts_without_progress
+            .store(pre_existing, Ordering::SeqCst);
+        let (with_tx_set, total) = (0u64, 5u64);
+        if with_tx_set == 0 && total > 0 {
+            app.escalate_recovery_to_catchup();
+        }
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            pre_existing,
+            "counter above threshold must be preserved when guard fires"
         );
 
-        // Negative: no buffered slots at all → do NOT escalate
-        let total = 0u64;
-        let with_tx_set = 0u64;
-        assert!(
-            !(with_tx_set == 0 && total > 0),
-            "should NOT escalate when no buffered slots exist"
+        // Case 2: counter below threshold, guard fires → raised to threshold
+        app.recovery_attempts_without_progress
+            .store(2, Ordering::SeqCst);
+        let (with_tx_set, total) = (0u64, 5u64);
+        if with_tx_set == 0 && total > 0 {
+            app.escalate_recovery_to_catchup();
+        }
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            RECOVERY_ESCALATION_CATCHUP,
+            "counter below threshold must be raised when guard fires"
         );
 
-        // Negative: some slots have tx_sets → do NOT escalate
-        let total = 5u64;
-        let with_tx_set = 3u64;
-        assert!(
-            !(with_tx_set == 0 && total > 0),
-            "should NOT escalate when some slots have tx_sets"
+        // Case 3: guard does NOT fire (total == 0) → counter untouched
+        app.recovery_attempts_without_progress
+            .store(2, Ordering::SeqCst);
+        let (with_tx_set, total) = (0u64, 0u64);
+        if with_tx_set == 0 && total > 0 {
+            app.escalate_recovery_to_catchup();
+        }
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            2,
+            "counter must not change when guard does not fire (no buffered slots)"
+        );
+
+        // Case 4: guard does NOT fire (with_tx_set > 0) → counter untouched
+        app.recovery_attempts_without_progress
+            .store(2, Ordering::SeqCst);
+        let (with_tx_set, total) = (3u64, 5u64);
+        if with_tx_set == 0 && total > 0 {
+            app.escalate_recovery_to_catchup();
+        }
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            2,
+            "counter must not change when guard does not fire (some tx_sets present)"
         );
     }
 
-    /// Regression test: Valid EXTERNALIZE escalates only when the slot is
-    /// more than 2 ahead of current_ledger.
-    ///
-    /// Guard condition at lifecycle.rs (Valid EXTERNALIZE path):
-    ///   `slot > current_ledger + 2` → escalate
-    ///   `slot > current_ledger + 1` → sync_recovery_pending only (no escalation)
-    #[test]
-    fn test_valid_externalize_escalation_guard_conditions() {
+    /// Regression test: Valid EXTERNALIZE in `lifecycle.rs` escalates only
+    /// when the slot is more than 2 ahead of current_ledger.
+    /// Exercises the actual production pattern: guard → `escalate_recovery_to_catchup()`.
+    #[tokio::test]
+    async fn test_valid_externalize_escalation_guard_and_counter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Replicate the production pattern from lifecycle.rs:1907-1911:
+        //   if slot > current_ledger + 1 {
+        //       self.sync_recovery_pending.store(true, ...);
+        //       if slot > current_ledger + 2 {
+        //           self.escalate_recovery_to_catchup();
+        //       }
+        //   }
+
         let current_ledger = 100u64;
 
-        // Positive: slot far ahead (gap=3) → both sync_recovery_pending AND escalation
+        // Case 1: gap=3, counter above threshold → escalation fires, counter preserved
+        let pre_existing = RECOVERY_ESCALATION_CATCHUP + 2;
+        app.recovery_attempts_without_progress
+            .store(pre_existing, Ordering::SeqCst);
+        app.sync_recovery_pending.store(false, Ordering::SeqCst);
         let slot = current_ledger + 3;
+        if slot > current_ledger + 1 {
+            app.sync_recovery_pending.store(true, Ordering::SeqCst);
+            if slot > current_ledger + 2 {
+                app.escalate_recovery_to_catchup();
+            }
+        }
         assert!(
-            slot > current_ledger + 2,
-            "gap of 3 should trigger escalation"
+            app.sync_recovery_pending.load(Ordering::SeqCst),
+            "sync_recovery_pending must be set at gap=3"
         );
-        assert!(
-            slot > current_ledger + 1,
-            "gap of 3 should also set sync_recovery_pending"
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            pre_existing,
+            "counter above threshold must be preserved at gap=3"
         );
 
-        // Negative: slot at boundary (gap=2) → sync_recovery_pending only
+        // Case 2: gap=2, counter below threshold → sync_recovery_pending only, no escalation
+        app.recovery_attempts_without_progress
+            .store(2, Ordering::SeqCst);
+        app.sync_recovery_pending.store(false, Ordering::SeqCst);
         let slot = current_ledger + 2;
+        if slot > current_ledger + 1 {
+            app.sync_recovery_pending.store(true, Ordering::SeqCst);
+            if slot > current_ledger + 2 {
+                app.escalate_recovery_to_catchup();
+            }
+        }
         assert!(
-            !(slot > current_ledger + 2),
-            "gap of exactly 2 should NOT trigger escalation"
+            app.sync_recovery_pending.load(Ordering::SeqCst),
+            "sync_recovery_pending must be set at gap=2"
         );
-        assert!(
-            slot > current_ledger + 1,
-            "gap of 2 should still set sync_recovery_pending"
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            2,
+            "counter must not change at gap=2 (boundary — no escalation)"
         );
 
-        // Negative: normal next slot (gap=1) → neither
+        // Case 3: gap=1 → neither sync_recovery_pending nor escalation
+        app.recovery_attempts_without_progress
+            .store(2, Ordering::SeqCst);
+        app.sync_recovery_pending.store(false, Ordering::SeqCst);
         let slot = current_ledger + 1;
+        if slot > current_ledger + 1 {
+            app.sync_recovery_pending.store(true, Ordering::SeqCst);
+            if slot > current_ledger + 2 {
+                app.escalate_recovery_to_catchup();
+            }
+        }
         assert!(
-            !(slot > current_ledger + 2),
-            "gap of 1 should NOT trigger escalation"
+            !app.sync_recovery_pending.load(Ordering::SeqCst),
+            "sync_recovery_pending must NOT be set at gap=1"
         );
-        assert!(
-            !(slot > current_ledger + 1),
-            "gap of 1 should NOT set sync_recovery_pending"
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            2,
+            "counter must not change at gap=1"
         );
     }
 
-    /// Regression test: Pending EXTERNALIZE escalates only when far ahead
-    /// AND the next slot does NOT have a buffered tx_set.
-    ///
-    /// Guard condition at lifecycle.rs (Pending EXTERNALIZE path):
-    ///   `slot > current_ledger + 2 && !have_next` → escalate
-    ///   `slot > current_ledger + 2 && have_next`  → skip (let rapid close proceed)
+    /// Regression test: Pending EXTERNALIZE in `lifecycle.rs` escalates only
+    /// when far ahead AND the next slot does NOT have a buffered tx_set.
+    /// Exercises the actual production pattern: guard → `escalate_recovery_to_catchup()`.
     ///
     /// `have_next` means `syncing_ledgers[next_slot].tx_set.is_some()` — a
     /// buffered entry WITHOUT a tx_set still triggers escalation.
-    #[test]
-    fn test_pending_externalize_escalation_guard_conditions() {
+    #[tokio::test]
+    async fn test_pending_externalize_escalation_guard_and_counter() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Replicate the production pattern from lifecycle.rs:1921-1947:
+        //   if slot > current_ledger + 2 {
+        //       if have_next { /* skip */ } else {
+        //           self.escalate_recovery_to_catchup();
+        //           self.sync_recovery_pending.store(true, ...);
+        //       }
+        //   }
+
         let current_ledger = 100u64;
 
-        // Positive: far ahead and next slot NOT buffered with tx_set → escalate
+        // Case 1: far ahead, no next slot, counter above threshold → preserved
+        let pre_existing = RECOVERY_ESCALATION_CATCHUP + 4;
+        app.recovery_attempts_without_progress
+            .store(pre_existing, Ordering::SeqCst);
+        app.sync_recovery_pending.store(false, Ordering::SeqCst);
         let slot = current_ledger + 5;
-        let have_next = false; // next slot missing or has no tx_set
+        let have_next = false;
+        if slot > current_ledger + 2 {
+            if have_next {
+                // skip — let rapid close proceed
+            } else {
+                app.escalate_recovery_to_catchup();
+                app.sync_recovery_pending.store(true, Ordering::SeqCst);
+            }
+        }
         assert!(
-            slot > current_ledger + 2 && !have_next,
-            "far ahead without buffered next slot should escalate"
+            app.sync_recovery_pending.load(Ordering::SeqCst),
+            "sync_recovery_pending must be set when far ahead and no next slot"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            pre_existing,
+            "counter above threshold must be preserved"
         );
 
-        // Negative: far ahead but next slot HAS a buffered tx_set → skip
+        // Case 2: far ahead, next slot HAS tx_set → no escalation
+        app.recovery_attempts_without_progress
+            .store(2, Ordering::SeqCst);
+        app.sync_recovery_pending.store(false, Ordering::SeqCst);
         let slot = current_ledger + 5;
-        let have_next = true; // next slot buffered WITH tx_set
+        let have_next = true;
+        if slot > current_ledger + 2 {
+            if have_next {
+                // skip — let rapid close proceed
+            } else {
+                app.escalate_recovery_to_catchup();
+                app.sync_recovery_pending.store(true, Ordering::SeqCst);
+            }
+        }
         assert!(
-            !(slot > current_ledger + 2 && !have_next),
-            "far ahead with buffered next slot should NOT escalate"
+            !app.sync_recovery_pending.load(Ordering::SeqCst),
+            "sync_recovery_pending must NOT be set when next slot is buffered"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            2,
+            "counter must not change when next slot is buffered"
         );
 
-        // Negative: not far ahead → skip regardless of buffer state
+        // Case 3: not far ahead → no escalation regardless
+        app.recovery_attempts_without_progress
+            .store(2, Ordering::SeqCst);
+        app.sync_recovery_pending.store(false, Ordering::SeqCst);
         let slot = current_ledger + 2;
         let have_next = false;
+        if slot > current_ledger + 2 {
+            if have_next {
+                // skip
+            } else {
+                app.escalate_recovery_to_catchup();
+                app.sync_recovery_pending.store(true, Ordering::SeqCst);
+            }
+        }
         assert!(
-            !(slot > current_ledger + 2 && !have_next),
-            "gap of exactly 2 should NOT trigger escalation"
+            !app.sync_recovery_pending.load(Ordering::SeqCst),
+            "sync_recovery_pending must NOT be set at gap=2"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            2,
+            "counter must not change at gap=2"
         );
     }
 }
