@@ -3472,8 +3472,9 @@ mod tests {
             next_peer_offset: 0,
         };
 
-        // first_requested should be set at creation time
-        assert!(state.first_requested.elapsed().as_millis() < 100);
+        // Verify all struct fields are initialized correctly
+        assert_eq!(state.first_requested, now);
+        assert_eq!(state.last_request, now);
         assert_eq!(state.next_peer_offset, 0);
     }
 
