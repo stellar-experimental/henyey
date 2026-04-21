@@ -1932,7 +1932,7 @@ impl App {
                             self.escalate_recovery_to_catchup();
                             self.sync_recovery_pending.store(true, Ordering::SeqCst);
 
-                            if self.far_ahead_log.should_log(current_ledger) {
+                            if self.recovery_throttles.far_ahead.should_log(current_ledger) {
                                 tracing::info!(
                                     slot,
                                     current_ledger,

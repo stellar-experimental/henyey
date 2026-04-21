@@ -606,16 +606,9 @@ pub struct App {
     /// Total number of times the node lost sync.
     lost_sync_count: AtomicU64,
 
-    // ── Log throttles (issue #1860) ──────────────────────────────────
-    /// Rate-limits "Pending EXTERNALIZE far ahead" info log to once per
-    /// distinct `current_ledger` value.
-    far_ahead_log: log_throttle::LogOncePerLedger,
-    /// Rate-limits "cannot apply — buffered sequence gap" warn to once per
-    /// 10 seconds.
-    cannot_apply_gap_log: log_throttle::LogThrottleSecs,
-    /// Rate-limits "cannot apply — missing tx_sets" warn to once per
-    /// 10 seconds.
-    cannot_apply_txset_log: log_throttle::LogThrottleSecs,
+    // ── Log throttles (issue #1860, #1869) ─────────────────────────────
+    /// All recovery-related log throttles, grouped to avoid per-field growth.
+    recovery_throttles: log_throttle::RecoveryLogThrottles,
 
     /// Highest EXTERNALIZE slot observed from any SCP envelope (Valid or
     /// Pending). Used by `submit_transaction()` to detect when the node is
@@ -958,9 +951,7 @@ impl App {
             jitter_seed,
             start_instant,
             lost_sync_count: AtomicU64::new(0),
-            far_ahead_log: log_throttle::LogOncePerLedger::new(),
-            cannot_apply_gap_log: log_throttle::LogThrottleSecs::new(10),
-            cannot_apply_txset_log: log_throttle::LogThrottleSecs::new(10),
+            recovery_throttles: log_throttle::RecoveryLogThrottles::new(),
             max_observed_externalize_slot: AtomicU64::new(0),
             ledger_tx_count: AtomicU64::new(0),
             max_tx_size_bytes: AtomicU32::new(
@@ -1225,9 +1216,7 @@ impl App {
         }
         // Reset log throttles so a fresh sync-loss episode produces fresh
         // info/warn-level logs.
-        self.far_ahead_log.reset();
-        self.cannot_apply_gap_log.reset();
-        self.cannot_apply_txset_log.reset();
+        self.recovery_throttles.reset_all();
     }
 
     /// Reset all tx-set tracking state so the main loop can make fresh requests.

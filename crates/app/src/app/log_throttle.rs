@@ -70,6 +70,77 @@ impl LogThrottleSecs {
     }
 }
 
+/// Default throttle interval for new recovery warnings (30 seconds).
+///
+/// The recovery tick fires every 10s (`OUT_OF_SYNC_RECOVERY_TIMER_SECS`).
+/// A 10s throttle barely suppresses; 30s means the first occurrence fires
+/// immediately, then the next 2 ticks are demoted to `debug!`.
+const RECOVERY_THROTTLE_SECS: u64 = 30;
+
+/// Groups all recovery-related log throttles into a single struct to avoid
+/// per-field growth on [`super::App`].
+///
+/// All `LogThrottleSecs` fields use a 30-second interval except the two
+/// original `cannot_apply_*` throttles from issue #1860 which keep their
+/// deployed 10-second interval for backward compatibility.
+///
+/// The spawned-task warning in `broadcast_recovery_scp_state` (line ~693)
+/// and the watchdog SCP verifier errors are excluded: both are already
+/// naturally rate-limited to at most once per 10s tick.
+pub(crate) struct RecoveryLogThrottles {
+    /// Rate-limits "Pending EXTERNALIZE far ahead" to once per distinct ledger.
+    pub far_ahead: LogOncePerLedger,
+    /// Rate-limits "cannot apply — buffered sequence gap" (10s, #1860).
+    pub cannot_apply_gap: LogThrottleSecs,
+    /// Rate-limits "cannot apply — missing tx_sets" (10s, #1860).
+    pub cannot_apply_txset: LogThrottleSecs,
+    /// "Next slot EXTERNALIZE missing — requesting SCP state immediately"
+    pub next_slot_missing: LogThrottleSecs,
+    /// "Receiving SCP messages but no externalization — fast-tracking catchup"
+    pub scp_no_externalization: LogThrottleSecs,
+    /// "Essentially caught up but no progress — requesting SCP state"
+    pub caught_up_no_progress: LogThrottleSecs,
+    /// "Detected gap in externalized slots"
+    pub gap_in_externalized: LogThrottleSecs,
+    /// "Next slot permanently missing — triggering catchup"
+    pub permanently_missing: LogThrottleSecs,
+    /// "No tx_sets available for any buffered slot — forcing catchup"
+    pub no_txsets_forcing: LogThrottleSecs,
+    /// "Recovery escalation blocked: previous fatal catchup failure"
+    pub fatal_catchup_blocked: LogThrottleSecs,
+}
+
+impl RecoveryLogThrottles {
+    pub fn new() -> Self {
+        Self {
+            far_ahead: LogOncePerLedger::new(),
+            cannot_apply_gap: LogThrottleSecs::new(10),
+            cannot_apply_txset: LogThrottleSecs::new(10),
+            next_slot_missing: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            scp_no_externalization: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            caught_up_no_progress: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            gap_in_externalized: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            permanently_missing: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            no_txsets_forcing: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+            fatal_catchup_blocked: LogThrottleSecs::new(RECOVERY_THROTTLE_SECS),
+        }
+    }
+
+    /// Reset all throttles so the next sync-loss episode produces fresh logs.
+    pub fn reset_all(&self) {
+        self.far_ahead.reset();
+        self.cannot_apply_gap.reset();
+        self.cannot_apply_txset.reset();
+        self.next_slot_missing.reset();
+        self.scp_no_externalization.reset();
+        self.caught_up_no_progress.reset();
+        self.gap_in_externalized.reset();
+        self.permanently_missing.reset();
+        self.no_txsets_forcing.reset();
+        self.fatal_catchup_blocked.reset();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +217,56 @@ mod tests {
         // Even at time 0, first call should return true (sentinel is u64::MAX).
         let throttle = LogThrottleSecs::new(10);
         assert!(throttle.should_log(0));
+    }
+
+    #[test]
+    fn test_recovery_throttles_reset_all() {
+        let t = RecoveryLogThrottles::new();
+
+        // Fire all throttles once.
+        assert!(t.far_ahead.should_log(100));
+        assert!(t.cannot_apply_gap.should_log(0));
+        assert!(t.cannot_apply_txset.should_log(0));
+        assert!(t.next_slot_missing.should_log(0));
+        assert!(t.scp_no_externalization.should_log(0));
+        assert!(t.caught_up_no_progress.should_log(0));
+        assert!(t.gap_in_externalized.should_log(0));
+        assert!(t.permanently_missing.should_log(0));
+        assert!(t.no_txsets_forcing.should_log(0));
+        assert!(t.fatal_catchup_blocked.should_log(0));
+
+        // All suppressed on immediate retry.
+        assert!(!t.far_ahead.should_log(100));
+        assert!(!t.cannot_apply_gap.should_log(0));
+        assert!(!t.next_slot_missing.should_log(0));
+
+        // After reset_all, all re-arm.
+        t.reset_all();
+        assert!(t.far_ahead.should_log(100));
+        assert!(t.cannot_apply_gap.should_log(0));
+        assert!(t.cannot_apply_txset.should_log(0));
+        assert!(t.next_slot_missing.should_log(0));
+        assert!(t.scp_no_externalization.should_log(0));
+        assert!(t.caught_up_no_progress.should_log(0));
+        assert!(t.gap_in_externalized.should_log(0));
+        assert!(t.permanently_missing.should_log(0));
+        assert!(t.no_txsets_forcing.should_log(0));
+        assert!(t.fatal_catchup_blocked.should_log(0));
+    }
+
+    #[test]
+    fn test_recovery_throttle_30s_cadence() {
+        // Simulates 10s recovery tick cadence with 30s throttle.
+        let t = RecoveryLogThrottles::new();
+        // First call: fires.
+        assert!(t.next_slot_missing.should_log(0));
+        // +10s: suppressed.
+        assert!(!t.next_slot_missing.should_log(10));
+        // +20s: suppressed.
+        assert!(!t.next_slot_missing.should_log(20));
+        // +30s: fires again.
+        assert!(t.next_slot_missing.should_log(30));
+        // +40s: suppressed.
+        assert!(!t.next_slot_missing.should_log(40));
     }
 }

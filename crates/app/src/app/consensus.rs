@@ -303,13 +303,29 @@ impl App {
                 // The next slot's EXTERNALIZE was missed (network blip, peer
                 // disconnection, etc.). Request SCP state immediately — peers
                 // should still have it cached if we act quickly.
-                tracing::warn!(
-                    current_ledger,
-                    latest_externalized,
-                    gap = relation.behind_gap().unwrap_or(0),
-                    attempts,
-                    "Next slot EXTERNALIZE missing — requesting SCP state immediately"
-                );
+                let now_secs = self.start_instant.elapsed().as_secs();
+                if self
+                    .recovery_throttles
+                    .next_slot_missing
+                    .should_log(now_secs)
+                {
+                    tracing::warn!(
+                        current_ledger,
+                        latest_externalized,
+                        gap = relation.behind_gap().unwrap_or(0),
+                        attempts,
+                        "Next slot EXTERNALIZE missing — requesting SCP state immediately"
+                    );
+                } else {
+                    tracing::debug!(
+                        current_ledger,
+                        latest_externalized,
+                        gap = relation.behind_gap().unwrap_or(0),
+                        attempts,
+                        "Next slot EXTERNALIZE missing — requesting SCP state immediately \
+                         (repeated)"
+                    );
+                }
                 // Fall through to the SCP state request below
             } else if attempts < RECOVERY_ESCALATION_SCP_REQUEST {
                 // Fast-track: If we're receiving SCP messages but none result in
@@ -328,15 +344,32 @@ impl App {
                 let at_tip_or_ahead_no_ext = matches!(relation, LedgerRelation::AtTip)
                     || relation.is_ahead_without_externalization(latest_externalized);
                 if attempts >= 1 && scp_total > 0 && at_tip_or_ahead_no_ext {
-                    tracing::warn!(
-                        current_ledger,
-                        latest_externalized,
-                        gap = relation.behind_gap().unwrap_or(0),
-                        attempts,
-                        scp_total,
-                        "Receiving SCP messages but no externalization — \
-                         tx_sets evicted from peers, fast-tracking catchup"
-                    );
+                    let now_secs = self.start_instant.elapsed().as_secs();
+                    if self
+                        .recovery_throttles
+                        .scp_no_externalization
+                        .should_log(now_secs)
+                    {
+                        tracing::warn!(
+                            current_ledger,
+                            latest_externalized,
+                            gap = relation.behind_gap().unwrap_or(0),
+                            attempts,
+                            scp_total,
+                            "Receiving SCP messages but no externalization — \
+                             tx_sets evicted from peers, fast-tracking catchup"
+                        );
+                    } else {
+                        tracing::debug!(
+                            current_ledger,
+                            latest_externalized,
+                            gap = relation.behind_gap().unwrap_or(0),
+                            attempts,
+                            scp_total,
+                            "Receiving SCP messages but no externalization — \
+                             fast-tracking catchup (repeated)"
+                        );
+                    }
                     // Jump directly to catchup instead of waiting 6 cycles
                     self.set_phase_sub(PHASE_13_10_TRIGGER_RECOVERY_CATCHUP);
                     return self
@@ -359,13 +392,29 @@ impl App {
                 return None;
             } else {
                 // Escalation: request SCP state despite small gap
-                tracing::warn!(
-                    current_ledger,
-                    latest_externalized,
-                    gap = relation.behind_gap().unwrap_or(0),
-                    attempts,
-                    "Essentially caught up but no progress — requesting SCP state from peers"
-                );
+                let now_secs = self.start_instant.elapsed().as_secs();
+                if self
+                    .recovery_throttles
+                    .caught_up_no_progress
+                    .should_log(now_secs)
+                {
+                    tracing::warn!(
+                        current_ledger,
+                        latest_externalized,
+                        gap = relation.behind_gap().unwrap_or(0),
+                        attempts,
+                        "Essentially caught up but no progress — requesting SCP state from peers"
+                    );
+                } else {
+                    tracing::debug!(
+                        current_ledger,
+                        latest_externalized,
+                        gap = relation.behind_gap().unwrap_or(0),
+                        attempts,
+                        "Essentially caught up but no progress — requesting SCP state \
+                         (repeated)"
+                    );
+                }
                 // Fall through to the SCP state request below
             }
         }
@@ -425,15 +474,31 @@ impl App {
                 );
                 // Fall through to SCP state request for other missing slots.
             } else {
-                tracing::warn!(
-                    current_ledger,
-                    latest_externalized,
-                    missing_count,
-                    first_missing,
-                    last_missing,
-                    missing_slots = ?if missing_count <= 10 { missing_slots.clone() } else { vec![] },
-                    "Detected gap in externalized slots - missing EXTERNALIZE messages"
-                );
+                let now_secs = self.start_instant.elapsed().as_secs();
+                if self
+                    .recovery_throttles
+                    .gap_in_externalized
+                    .should_log(now_secs)
+                {
+                    tracing::warn!(
+                        current_ledger,
+                        latest_externalized,
+                        missing_count,
+                        first_missing,
+                        last_missing,
+                        missing_slots = ?if missing_count <= 10 { missing_slots.clone() } else { vec![] },
+                        "Detected gap in externalized slots - missing EXTERNALIZE messages"
+                    );
+                } else {
+                    tracing::debug!(
+                        current_ledger,
+                        latest_externalized,
+                        missing_count,
+                        first_missing,
+                        last_missing,
+                        "Detected gap in externalized slots (repeated)"
+                    );
+                }
             }
 
             // If the very next slot is truly missing (not in-flight),
@@ -481,13 +546,28 @@ impl App {
                     );
                     // Fall through to SCP broadcast.
                 } else {
-                    tracing::warn!(
-                        current_ledger,
-                        next_slot,
-                        latest_externalized,
-                        gap = relation.behind_gap().unwrap_or(0),
-                        "Next slot permanently missing — triggering catchup to skip gap"
-                    );
+                    let now_secs = self.start_instant.elapsed().as_secs();
+                    if self
+                        .recovery_throttles
+                        .permanently_missing
+                        .should_log(now_secs)
+                    {
+                        tracing::warn!(
+                            current_ledger,
+                            next_slot,
+                            latest_externalized,
+                            gap = relation.behind_gap().unwrap_or(0),
+                            "Next slot permanently missing — triggering catchup to skip gap"
+                        );
+                    } else {
+                        tracing::debug!(
+                            current_ledger,
+                            next_slot,
+                            latest_externalized,
+                            gap = relation.behind_gap().unwrap_or(0),
+                            "Next slot permanently missing — triggering catchup (repeated)"
+                        );
+                    }
                     {
                         let mut buffer =
                             tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers)
@@ -551,7 +631,11 @@ impl App {
             match classify_cannot_apply_reason(without_tx_set, sequence_gap) {
                 CannotApplyReason::BufferedSequenceGap => {
                     let now_secs = self.start_instant.elapsed().as_secs();
-                    if self.cannot_apply_gap_log.should_log(now_secs) {
+                    if self
+                        .recovery_throttles
+                        .cannot_apply_gap
+                        .should_log(now_secs)
+                    {
                         tracing::warn!(
                             current_ledger,
                             latest_externalized,
@@ -580,7 +664,11 @@ impl App {
                 }
                 CannotApplyReason::MissingTxSets => {
                     let now_secs = self.start_instant.elapsed().as_secs();
-                    if self.cannot_apply_txset_log.should_log(now_secs) {
+                    if self
+                        .recovery_throttles
+                        .cannot_apply_txset
+                        .should_log(now_secs)
+                    {
                         tracing::warn!(
                             current_ledger,
                             latest_externalized,
@@ -612,11 +700,25 @@ impl App {
             }
 
             if with_tx_set == 0 && total > 0 {
-                tracing::warn!(
-                    current_ledger,
-                    latest_externalized,
-                    "No tx_sets available for any buffered slot — forcing catchup"
-                );
+                let now_secs = self.start_instant.elapsed().as_secs();
+                if self
+                    .recovery_throttles
+                    .no_txsets_forcing
+                    .should_log(now_secs)
+                {
+                    tracing::warn!(
+                        current_ledger,
+                        latest_externalized,
+                        "No tx_sets available for any buffered slot — forcing catchup"
+                    );
+                } else {
+                    tracing::debug!(
+                        current_ledger,
+                        latest_externalized,
+                        "No tx_sets available for any buffered slot — forcing catchup \
+                         (repeated)"
+                    );
+                }
                 self.escalate_recovery_to_catchup();
                 return Some(None); // Wait for next tick to trigger escalation.
             }
@@ -918,10 +1020,21 @@ impl App {
         // Fatal-failure guard (spec §13.3): block further catchup after a
         // verification/integrity failure.
         if self.catchup_fatal_failure.load(Ordering::SeqCst) {
-            tracing::warn!(
-                "Recovery escalation blocked: previous fatal catchup failure — \
-                 manual intervention required"
-            );
+            let now_secs = self.start_instant.elapsed().as_secs();
+            if self
+                .recovery_throttles
+                .fatal_catchup_blocked
+                .should_log(now_secs)
+            {
+                tracing::warn!(
+                    "Recovery escalation blocked: previous fatal catchup failure — \
+                     manual intervention required"
+                );
+            } else {
+                tracing::debug!(
+                    "Recovery escalation blocked: previous fatal catchup failure (repeated)"
+                );
+            }
             return None;
         }
 
