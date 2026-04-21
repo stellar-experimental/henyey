@@ -1904,7 +1904,7 @@ impl ScpDriver {
     /// Clears tx sets, externalized values, and timing maps.
     /// Does NOT clear quorum set caches (they are not slot-scoped
     /// and clearing them breaks heard_from_quorum — see #1874).
-    pub fn clear_all_caches(&self) {
+    pub fn clear_slot_scoped_caches(&self) {
         let tx_sizes = self.tx_tracker.sizes();
         let externalized_count = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len();
 
@@ -1921,7 +1921,7 @@ impl ScpDriver {
                 tx_set_count = tx_sizes.cache,
                 pending_count = tx_sizes.pending,
                 externalized_count,
-                "Cleared scp_driver caches"
+                "Cleared slot-scoped scp_driver caches"
             );
         }
     }
@@ -2920,13 +2920,13 @@ mod tests {
     }
 
     #[test]
-    fn test_nomination_timing_clear_all_caches() {
+    fn test_nomination_timing_clear_slot_scoped_caches() {
         let driver = make_test_driver();
 
         driver.record_slot_activity(100);
         driver.record_nomination_start(100);
 
-        driver.clear_all_caches();
+        driver.clear_slot_scoped_caches();
 
         assert!(driver.nomination_started_at.read().is_empty());
         assert!(driver.slot_first_seen.read().is_empty());

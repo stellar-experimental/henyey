@@ -2298,10 +2298,11 @@ impl Herder {
         self.scp_driver.clear_tx_set_cache();
     }
 
-    /// Clear all scp_driver caches to release memory.
-    /// Called after catchup to release stale cached data.
-    pub fn clear_scp_driver_caches(&self) {
-        self.scp_driver.clear_all_caches();
+    /// Clear slot-scoped scp_driver caches (tx sets, externalized values,
+    /// timing maps) while preserving quorum set caches.
+    /// See #1874 for why quorum set caches must not be cleared.
+    pub fn clear_slot_scoped_scp_caches(&self) {
+        self.scp_driver.clear_slot_scoped_caches();
     }
 
     /// Trim stale scp_driver caches while preserving data for future slots.
@@ -2309,12 +2310,6 @@ impl Herder {
     /// requests and externalized data for slots after catchup.
     pub fn trim_scp_driver_caches(&self, keep_after_slot: SlotIndex) {
         self.scp_driver.trim_stale_caches(keep_after_slot);
-    }
-
-    /// Clear all fetching caches to release memory.
-    /// Called after catchup to release stale cached data.
-    pub fn clear_fetching_caches(&self) {
-        self.fetching_envelopes.clear_all();
     }
 
     /// Trim stale fetching caches while preserving tx_sets for future slots.
@@ -4099,9 +4094,9 @@ mod tests {
         );
     }
 
-    /// Same as above but exercises the clear_all_caches path.
+    /// Same as above but exercises the clear_slot_scoped_scp_caches path.
     #[test]
-    fn test_issue_1874_heard_from_quorum_survives_clear_all_caches() {
+    fn test_issue_1874_heard_from_quorum_survives_clear_slot_scoped_scp_caches() {
         let local_seed = [7u8; 32];
         let local_secret = SecretKey::from_seed(&local_seed);
         let local_public = local_secret.public_key();
@@ -4140,8 +4135,8 @@ mod tests {
 
         assert!(herder.heard_from_quorum(slot));
 
-        // clear_all_caches also used to clear quorum sets.
-        herder.clear_scp_driver_caches();
+        // clear_slot_scoped_scp_caches clears slot-scoped data but preserves quorum sets.
+        herder.clear_slot_scoped_scp_caches();
 
         // Quorum sets should survive the clear.
         let new_slot = 101u64;
@@ -4153,7 +4148,7 @@ mod tests {
 
         assert!(
             herder.heard_from_quorum(new_slot),
-            "heard_from_quorum must survive clear_all_caches (#1874)"
+            "heard_from_quorum must survive clear_slot_scoped_scp_caches (#1874)"
         );
     }
 

@@ -446,29 +446,6 @@ impl FetchingEnvelopes {
         self.stats.read().clone()
     }
 
-    /// Clear all caches and slot state.
-    /// Called after catchup to release memory from stale data.
-    pub fn clear_all(&self) {
-        let tx_set_count = self.tx_set_cache.len();
-        let quorum_set_count = self.quorum_set_cache.len();
-        let slots_count = self.slots.len();
-
-        self.tx_set_cache.clear();
-        self.quorum_set_cache.clear();
-        self.slots.clear();
-        self.tx_set_fetcher.clear();
-        self.quorum_set_fetcher.clear();
-
-        if tx_set_count > 0 || quorum_set_count > 0 || slots_count > 0 {
-            tracing::info!(
-                tx_set_count,
-                quorum_set_count,
-                slots_count,
-                "Cleared fetching_envelopes caches"
-            );
-        }
-    }
-
     /// Trim stale data while preserving tx_sets for slots after catchup.
     /// Called after catchup to release memory from stale data while keeping
     /// tx_sets that will be needed for the ledgers immediately after catchup.
