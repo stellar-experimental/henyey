@@ -78,7 +78,7 @@ Since this is currently a single-node deployment, the instance variable exists f
 ### Panel 1.9: Uptime
 - **Type:** stat
 - **Unit:** duration (auto, e.g. "3d 4h")
-- **Query:** `time() - stellar_uptime_seconds{job="henyey", instance=~"$instance"}`
+- **Query:** `stellar_uptime_seconds{job="henyey", instance=~"$instance"}`
 - **Thresholds:** none
 - **Description:** Time since the Henyey process started. Useful for spotting unexpected restarts.
 

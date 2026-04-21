@@ -192,7 +192,7 @@ pub fn describe_metrics() {
     describe_gauge!(LEDGER_SEQUENCE, "Current ledger sequence number");
     describe_gauge!(PEER_COUNT, "Number of connected peers");
     describe_gauge!(PENDING_TRANSACTIONS, "Number of pending transactions");
-    describe_counter!(UPTIME_SECONDS, "Node uptime in seconds");
+    describe_gauge!(UPTIME_SECONDS, "Node uptime in seconds");
     describe_gauge!(IS_VALIDATOR, "Whether this node is a validator");
     describe_counter!(
         META_STREAM_BYTES_TOTAL,
@@ -656,7 +656,7 @@ pub fn register_label_series() {
     gauge!(LEDGER_SEQUENCE).set(0.0);
     gauge!(PEER_COUNT).set(0.0);
     gauge!(PENDING_TRANSACTIONS).set(0.0);
-    counter!(UPTIME_SECONDS).absolute(0);
+    gauge!(UPTIME_SECONDS).set(0.0);
     gauge!(IS_VALIDATOR).set(0.0);
     // Note: meta stream counters are intentionally NOT pre-registered —
     // they only appear when the meta stream is active (matching current behavior).
@@ -828,7 +828,7 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     gauge!(LEDGER_SEQUENCE).set(ledger_seq as f64);
     gauge!(PEER_COUNT).set(peer_count as f64);
     gauge!(PENDING_TRANSACTIONS).set(pending_txs as f64);
-    counter!(UPTIME_SECONDS).absolute(uptime);
+    gauge!(UPTIME_SECONDS).set(uptime as f64);
     gauge!(IS_VALIDATOR).set(if snap.is_validator { 1.0 } else { 0.0 });
 
     // Meta stream counters — only set when active (matching current conditional behavior).
@@ -1246,8 +1246,8 @@ mod tests {
 
         // Counters must have TYPE counter.
         assert!(
-            output.contains("# TYPE stellar_uptime_seconds counter"),
-            "missing TYPE counter for uptime_seconds"
+            output.contains("# TYPE stellar_uptime_seconds gauge"),
+            "missing TYPE gauge for uptime_seconds"
         );
         assert!(
             output.contains("# TYPE henyey_scp_prefilter_rejects_total counter"),
