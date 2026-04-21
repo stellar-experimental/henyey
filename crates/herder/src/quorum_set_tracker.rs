@@ -189,31 +189,6 @@ impl QuorumSetTracker {
 
     // --- Cleanup ---
 
-    /// Clear validated qset maps (by_node, by_hash), preserving only
-    /// the local node's entry. Does NOT clear pending.
-    pub fn clear_validated_preserving_local(&self) {
-        let local_qs = self.get_local();
-
-        let prev_by_node = self.by_node.len();
-        let prev_by_hash = self.by_hash.len();
-
-        self.by_node.clear();
-        self.by_hash.clear();
-
-        if let Some(qs) = local_qs {
-            let hash = hash_quorum_set(&qs);
-            self.by_node.insert(self.local_node_key, qs.clone());
-            self.by_hash.insert(hash, qs);
-        }
-
-        if prev_by_node > 1 || prev_by_hash > 1 {
-            debug!(
-                prev_by_node,
-                prev_by_hash, "Cleared quorum set caches, preserving local"
-            );
-        }
-    }
-
     // --- Diagnostics ---
 
     pub fn sizes(&self) -> QuorumSetTrackerSizes {
@@ -370,40 +345,6 @@ mod tests {
 
         tracker.clear_pending(&hash);
         assert_eq!(tracker.pending_count(), 0);
-    }
-
-    #[test]
-    fn test_clear_validated_preserving_local() {
-        let local_qs = make_qset(1);
-        let tracker = QuorumSetTracker::new(node_key(0), Some(local_qs.clone()));
-
-        // Add non-local data
-        tracker.store(&make_node_id(10), make_qset(2));
-        tracker.store(&make_node_id(20), make_qset(3));
-        // Add a pending entry
-        tracker.request(Hash256::from_bytes([99; 32]), make_node_id(30));
-
-        assert!(tracker.by_node_count() >= 3);
-        assert_eq!(tracker.pending_count(), 1);
-
-        tracker.clear_validated_preserving_local();
-
-        // Local preserved
-        assert_eq!(tracker.by_node_count(), 1);
-        assert!(tracker.get_by_node(&make_node_id(0)).is_some());
-        // Pending NOT cleared
-        assert_eq!(tracker.pending_count(), 1);
-    }
-
-    #[test]
-    fn test_clear_validated_no_local() {
-        let tracker = QuorumSetTracker::new(node_key(0), None);
-        tracker.store(&make_node_id(10), make_qset(1));
-
-        tracker.clear_validated_preserving_local();
-
-        assert_eq!(tracker.by_node_count(), 0);
-        assert_eq!(tracker.by_hash_count(), 0);
     }
 
     #[test]

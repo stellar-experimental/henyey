@@ -1899,30 +1899,28 @@ impl ScpDriver {
         self.tx_tracker.clear_cache();
     }
 
-    /// Clear all caches in scp_driver.
-    /// Called after catchup to release stale cached data.
+    /// Clear slot-scoped caches in scp_driver.
+    ///
+    /// Clears tx sets, externalized values, and timing maps.
+    /// Does NOT clear quorum set caches (they are not slot-scoped
+    /// and clearing them breaks heard_from_quorum — see #1874).
     pub fn clear_all_caches(&self) {
         let tx_sizes = self.tx_tracker.sizes();
-        let qset_sizes = self.qset_tracker.sizes();
         let externalized_count = tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).len();
 
         self.tx_tracker.clear_all();
         tracked_write(LOCK_SCP_EXTERNALIZED, &self.externalized).clear();
-        self.qset_tracker.clear_validated_preserving_local();
+        // NOTE: We intentionally do NOT clear qset_tracker here.
+        // Quorum sets are not slot-scoped and clearing them breaks
+        // heard_from_quorum(). See #1874.
         self.slot_first_seen.write().clear();
         self.nomination_started_at.write().clear();
 
-        if tx_sizes.cache > 0
-            || tx_sizes.pending > 0
-            || externalized_count > 0
-            || qset_sizes.by_node > 1
-        {
+        if tx_sizes.cache > 0 || tx_sizes.pending > 0 || externalized_count > 0 {
             tracing::info!(
                 tx_set_count = tx_sizes.cache,
                 pending_count = tx_sizes.pending,
                 externalized_count,
-                qs_count = qset_sizes.by_node,
-                qs_hash_count = qset_sizes.by_hash,
                 "Cleared scp_driver caches"
             );
         }
@@ -1988,8 +1986,12 @@ impl ScpDriver {
         // Clean up pending tx set requests for old slots
         self.cleanup_old_pending_slots(slot);
 
-        // Clean up quorum set caches to prevent unbounded growth.
-        self.qset_tracker.clear_validated_preserving_local();
+        // NOTE: We intentionally do NOT clear qset_tracker here.
+        // Quorum sets are not slot-scoped — they map node_id → quorum_set
+        // and are bounded by the number of active validators (~30).
+        // Clearing them here breaks heard_from_quorum() because is_quorum()
+        // needs get_quorum_set(node_id) to return Some for remote nodes.
+        // See #1874.
     }
 
     /// Get local SCP envelopes for a slot.

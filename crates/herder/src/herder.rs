@@ -4015,6 +4015,148 @@ mod tests {
         );
     }
 
+    /// Regression test for #1874: heard_from_quorum must survive purge_slots_below.
+    ///
+    /// Before the fix, `purge_slots_below` cleared the quorum set cache
+    /// (`qset_tracker.clear_validated_preserving_local()`), which wiped all
+    /// remote validators' quorum sets. This caused `heard_from_quorum()` to
+    /// return false permanently after catchup, because `is_quorum()` prunes
+    /// nodes whose quorum set lookup returns None.
+    #[test]
+    fn test_issue_1874_heard_from_quorum_survives_purge_slots_below() {
+        // Set up a herder with a 2-of-2 quorum set (local + remote).
+        let local_seed = [7u8; 32];
+        let local_secret = SecretKey::from_seed(&local_seed);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let remote_secret = SecretKey::from_seed(&[8u8; 32]);
+        let remote_public = remote_secret.public_key();
+        let remote_node_id = node_id_from_public_key(&remote_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![local_node_id.clone(), remote_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, local_secret);
+
+        // Store quorum sets for both nodes (simulates having learned them
+        // from SCP message exchange before the purge).
+        herder.store_quorum_set(&local_node_id, quorum_set.clone());
+        herder.store_quorum_set(&remote_node_id, quorum_set.clone());
+
+        // Record SCP envelopes from both nodes for slot 100.
+        let slot = 100u64;
+        {
+            let mut tracker = herder.slot_quorum_tracker.write();
+            tracker.record_envelope(slot, local_node_id.clone());
+            tracker.record_envelope(slot, remote_node_id.clone());
+        }
+
+        // Before purge: quorum should be satisfied.
+        assert!(
+            herder.heard_from_quorum(slot),
+            "heard_from_quorum should be true before purge"
+        );
+        assert!(
+            herder.is_v_blocking(slot),
+            "is_v_blocking should be true before purge"
+        );
+
+        // Purge slots below 100 — this is the operation that triggered the
+        // bug. Before the fix, it cleared the quorum set cache.
+        herder.purge_slots_below(slot);
+
+        // Record envelopes for a NEW slot above the purge point.
+        let new_slot = 101u64;
+        {
+            let mut tracker = herder.slot_quorum_tracker.write();
+            tracker.record_envelope(new_slot, local_node_id.clone());
+            tracker.record_envelope(new_slot, remote_node_id.clone());
+        }
+
+        // After purge: quorum should STILL be satisfied for the new slot.
+        // Before the fix, this returned false because get_quorum_set()
+        // returned None for the remote node (cache was cleared).
+        assert!(
+            herder.heard_from_quorum(new_slot),
+            "heard_from_quorum must survive purge_slots_below (#1874)"
+        );
+        assert!(
+            herder.is_v_blocking(new_slot),
+            "is_v_blocking must survive purge_slots_below"
+        );
+    }
+
+    /// Same as above but exercises the clear_all_caches path.
+    #[test]
+    fn test_issue_1874_heard_from_quorum_survives_clear_all_caches() {
+        let local_seed = [7u8; 32];
+        let local_secret = SecretKey::from_seed(&local_seed);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let remote_secret = SecretKey::from_seed(&[8u8; 32]);
+        let remote_public = remote_secret.public_key();
+        let remote_node_id = node_id_from_public_key(&remote_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![local_node_id.clone(), remote_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, local_secret);
+
+        herder.store_quorum_set(&local_node_id, quorum_set.clone());
+        herder.store_quorum_set(&remote_node_id, quorum_set.clone());
+
+        let slot = 100u64;
+        {
+            let mut tracker = herder.slot_quorum_tracker.write();
+            tracker.record_envelope(slot, local_node_id.clone());
+            tracker.record_envelope(slot, remote_node_id.clone());
+        }
+
+        assert!(herder.heard_from_quorum(slot));
+
+        // clear_all_caches also used to clear quorum sets.
+        herder.clear_scp_driver_caches();
+
+        // Quorum sets should survive the clear.
+        let new_slot = 101u64;
+        {
+            let mut tracker = herder.slot_quorum_tracker.write();
+            tracker.record_envelope(new_slot, local_node_id.clone());
+            tracker.record_envelope(new_slot, remote_node_id.clone());
+        }
+
+        assert!(
+            herder.heard_from_quorum(new_slot),
+            "heard_from_quorum must survive clear_all_caches (#1874)"
+        );
+    }
+
     /// Regression test for AUDIT-104 Bug B: store_quorum_set must drain the
     /// ready queue after notifying FetchingEnvelopes, so envelopes unblocked
     /// by quorum-set arrival are fed to SCP immediately (not left in the
