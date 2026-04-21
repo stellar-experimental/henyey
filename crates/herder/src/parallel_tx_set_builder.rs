@@ -16,8 +16,6 @@
 //!    inclusion fee.
 
 use henyey_common::types::Hash256;
-use henyey_common::NetworkId;
-use henyey_tx::TransactionFrame;
 use stellar_xdr::curr::{
     DependentTxCluster, GeneralizedTransactionSet, Hash, LedgerKey, Limits,
     ParallelTxExecutionStage, ParallelTxsComponent, TransactionEnvelope, TransactionPhase,
@@ -513,7 +511,6 @@ fn tx_inclusion_fee(tx: &TransactionEnvelope) -> i64 {
 /// Returns (stages, total_inclusion_fee) where stages[i][j] = cluster j of stage i.
 fn build_with_stage_count(
     txs: &[TransactionEnvelope],
-    network_id: NetworkId,
     ledger_max_instructions: i64,
     ledger_max_dependent_tx_clusters: u32,
     stage_count: u32,
@@ -521,12 +518,12 @@ fn build_with_stage_count(
     let conflicts = detect_conflicts(txs);
     let n = txs.len();
 
-    // Build BuilderTx representations.
+    // Build BuilderTx representations — extract instructions directly from
+    // envelopes via soroban_data_from_envelope() instead of constructing
+    // full TransactionFrame objects (which would clone each envelope).
     let builder_txs: Vec<BuilderTx> = (0..n)
         .map(|id| {
-            let frame = TransactionFrame::from_owned_with_network(txs[id].clone(), network_id);
-            let instructions = frame
-                .soroban_data()
+            let instructions = soroban_data_from_envelope(&txs[id])
                 .map(|d| d.resources.instructions)
                 .unwrap_or(0);
             BuilderTx {
@@ -626,7 +623,6 @@ const MAX_INCLUSION_FEE_TOLERANCE: f64 = 0.999;
 /// # Arguments
 ///
 /// * `soroban_txs` - Soroban transactions to partition
-/// * `network_id` - Network ID for transaction frame construction
 /// * `ledger_max_instructions` - From ContractComputeV0 config setting
 /// * `ledger_max_dependent_tx_clusters` - From ContractParallelComputeV0
 /// * `min_stage_count` - Minimum number of stages to try (typically 1)
@@ -640,7 +636,6 @@ const MAX_INCLUSION_FEE_TOLERANCE: f64 = 0.999;
 ///   Matches stellar-core's `hadTxNotFittingLane` feedback.
 pub fn build_parallel_soroban_phase(
     mut soroban_txs: Vec<TransactionEnvelope>,
-    network_id: NetworkId,
     ledger_max_instructions: i64,
     ledger_max_dependent_tx_clusters: u32,
     min_stage_count: u32,
@@ -660,7 +655,6 @@ pub fn build_parallel_soroban_phase(
     for sc in min_stage_count..=max_stage_count {
         let result = build_with_stage_count(
             &soroban_txs,
-            network_id,
             ledger_max_instructions,
             ledger_max_dependent_tx_clusters,
             sc,
@@ -881,10 +875,6 @@ mod tests {
         Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
     };
 
-    fn test_network_id() -> NetworkId {
-        NetworkId(henyey_common::Hash256([0u8; 32]))
-    }
-
     /// Create a Soroban transaction with the specified footprint keys and instructions.
     fn make_soroban_tx(
         seed: u8,
@@ -1068,7 +1058,6 @@ mod tests {
 
         let stages = build_parallel_soroban_phase(
             vec![tx_a, tx_b, tx_c],
-            test_network_id(),
             100_000, // ledger max instructions
             8,       // clusters per stage
             1,
@@ -1092,8 +1081,7 @@ mod tests {
         let tx_a = make_soroban_tx(1, 1, vec![], vec![key1], 1000);
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key2], 1000);
 
-        let stages =
-            build_parallel_soroban_phase(vec![tx_a, tx_b], test_network_id(), 100_000, 8, 1, 1).0;
+        let stages = build_parallel_soroban_phase(vec![tx_a, tx_b], 100_000, 8, 1, 1).0;
 
         // No conflicts: both TXs fit in the same bin (execution thread)
         assert_eq!(stages.len(), 1);
@@ -1115,7 +1103,6 @@ mod tests {
         // With 1 stage and 1 cluster: stage limit = 100k, only 1 TX fits
         let stages = build_parallel_soroban_phase(
             vec![tx_a.clone(), tx_b.clone()],
-            test_network_id(),
             100_000,
             1, // only 1 cluster per stage
             1,
@@ -1129,8 +1116,7 @@ mod tests {
         // With 2 stages and 1 cluster each: instructions_per_cluster = 100k/2 = 50k
         // Each TX is 60k > 50k, so neither fits. Use higher ledger max instead.
         // ledger_max=120k, 2 stages, 1 cluster each: cluster limit = 60k, stage limit = 60k.
-        let stages =
-            build_parallel_soroban_phase(vec![tx_a, tx_b], test_network_id(), 120_000, 1, 2, 2).0;
+        let stages = build_parallel_soroban_phase(vec![tx_a, tx_b], 120_000, 1, 2, 2).0;
 
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 2);
@@ -1146,7 +1132,6 @@ mod tests {
 
         let (stages, total_inclusion_fee) = build_with_stage_count(
             &[tx_low_inclusion.clone(), tx_high_inclusion.clone()],
-            test_network_id(),
             100_000,
             1,
             1,
@@ -1194,8 +1179,7 @@ mod tests {
 
         // Only room for 1 tx (instruction limit). Per-op rate ordering should
         // pick tx_normal (rate=800) over fee_bump (rate=500).
-        let (stages, _) =
-            build_with_stage_count(&[fee_bump, tx_normal], test_network_id(), 100_000, 1, 1);
+        let (stages, _) = build_with_stage_count(&[fee_bump, tx_normal], 100_000, 1, 1);
 
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].len(), 1);
@@ -1204,6 +1188,49 @@ mod tests {
             stages[0][0],
             vec![1],
             "per-op rate ordering should prefer normal tx"
+        );
+    }
+
+    /// Verify that `soroban_data_from_envelope` extracts the same instruction
+    /// count from a fee-bump Soroban envelope as `TransactionFrame::soroban_data`.
+    #[test]
+    fn test_fee_bump_instruction_extraction_matches_frame() {
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
+
+        let expected_instructions: u32 = 42_000;
+        let inner_tx = make_soroban_tx_with_fees(
+            3,
+            1,
+            vec![contract_key(1)],
+            vec![contract_key(2)],
+            expected_instructions,
+            500,
+            100,
+        );
+        let inner_env = match inner_tx {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx envelope"),
+        };
+        let fee_bump = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([99; 32])),
+                fee: 1000,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: Default::default(),
+        });
+
+        // Extract via the optimized path (soroban_data_from_envelope).
+        let extracted = soroban_data_from_envelope(&fee_bump)
+            .map(|d| d.resources.instructions)
+            .unwrap_or(0);
+        assert_eq!(
+            extracted, expected_instructions,
+            "soroban_data_from_envelope must extract instructions from fee-bump envelopes"
         );
     }
 
@@ -1274,8 +1301,7 @@ mod tests {
 
     #[test]
     fn test_empty_input() {
-        let (stages, had_drop) =
-            build_parallel_soroban_phase(vec![], test_network_id(), 100_000, 8, 1, 4);
+        let (stages, had_drop) = build_parallel_soroban_phase(vec![], 100_000, 8, 1, 4);
         assert!(stages.is_empty());
         assert!(!had_drop);
     }
@@ -1291,7 +1317,7 @@ mod tests {
             })
             .collect();
 
-        let stages = build_parallel_soroban_phase(txs, test_network_id(), 1_000_000, 8, 1, 4).0;
+        let stages = build_parallel_soroban_phase(txs, 1_000_000, 8, 1, 4).0;
 
         // Should use 1 stage since all fit
         assert_eq!(stages.len(), 1);
@@ -1329,7 +1355,6 @@ mod tests {
 
         let (stages, had_tx_not_fitting) = build_parallel_soroban_phase(
             vec![tx_a, tx_b],
-            test_network_id(),
             100_000,
             1, // 1 cluster per stage
             1,
@@ -1353,7 +1378,7 @@ mod tests {
         let tx_b = make_soroban_tx(2, 1, vec![], vec![key2], 1_000);
 
         let (stages, had_tx_not_fitting) =
-            build_parallel_soroban_phase(vec![tx_a, tx_b], test_network_id(), 1_000_000, 8, 1, 1);
+            build_parallel_soroban_phase(vec![tx_a, tx_b], 1_000_000, 8, 1, 1);
 
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
         assert_eq!(total_txs, 2);
@@ -1587,8 +1612,7 @@ mod tests {
         let tx2 =
             make_fee_bump_soroban_tx(2, 1, vec![], vec![contract_key(2)], 50_000, i64::MAX, 0);
 
-        let (stages, total_inclusion_fee) =
-            build_with_stage_count(&[tx1, tx2], test_network_id(), 200_000, 4, 1);
+        let (stages, total_inclusion_fee) = build_with_stage_count(&[tx1, tx2], 200_000, 4, 1);
 
         // Both txs should be added (enough instruction budget).
         let total_txs: usize = stages.iter().flat_map(|s| s.iter()).map(|c| c.len()).sum();
@@ -1614,7 +1638,7 @@ mod tests {
         // Try stage counts 1..=2. Both should fit all txs and produce
         // saturated fee totals. The builder should prefer fewer stages.
         let (stages, had_not_fitting) =
-            build_parallel_soroban_phase(vec![tx1, tx2], test_network_id(), 200_000, 4, 1, 2);
+            build_parallel_soroban_phase(vec![tx1, tx2], 200_000, 4, 1, 2);
 
         assert!(!had_not_fitting, "all txs should fit");
         assert!(!stages.is_empty(), "should produce at least one stage");
@@ -1639,14 +1663,7 @@ mod tests {
             make_soroban_tx_with_fees(2, 1, vec![], vec![contract_key(2)], 10_000, 1000, 100);
 
         // This should panic because the sort encounters a negative inclusion fee.
-        build_parallel_soroban_phase(
-            vec![negative_fee_tx, normal_tx],
-            test_network_id(),
-            100_000,
-            8,
-            1,
-            1,
-        );
+        build_parallel_soroban_phase(vec![negative_fee_tx, normal_tx], 100_000, 8, 1, 1);
     }
 }
 
@@ -1922,10 +1939,6 @@ mod stellar_core_parity_tests {
     const LEDGER_MAX_INSTRUCTIONS: i64 = 400_000_000;
     const LEDGER_BASE_FEE: i64 = 100;
 
-    fn test_network_id() -> NetworkId {
-        NetworkId(henyey_common::Hash256([0u8; 32]))
-    }
-
     /// Generate a contract data ledger key from an i32 ID.
     /// Durability alternates: even=Persistent, odd=Temporary (matches stellar-core).
     fn contract_data_key(id: i32) -> LedgerKey {
@@ -2101,14 +2114,8 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                LEDGER_MAX_INSTRUCTIONS,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, had_drop) =
+                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
 
             if variable {
                 // With variable stages: 1 stage, 2 clusters (bin-packed), 4 txs each
@@ -2143,14 +2150,8 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                LEDGER_MAX_INSTRUCTIONS,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, had_drop) =
+                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
 
             if variable {
                 validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
@@ -2178,14 +2179,8 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                LEDGER_MAX_INSTRUCTIONS,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, had_drop) =
+                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
 
             if variable {
                 validate_shape(
@@ -2218,14 +2213,8 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                LEDGER_MAX_INSTRUCTIONS,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, had_drop) =
+                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
 
             if variable {
                 validate_shape(
@@ -2267,14 +2256,8 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                ledger_max_instructions,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, had_drop) =
+                build_parallel_soroban_phase(txs, ledger_max_instructions, CLUSTER_COUNT, min, max);
 
             if variable {
                 validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
@@ -2311,14 +2294,8 @@ mod stellar_core_parity_tests {
                 .collect();
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                LEDGER_MAX_INSTRUCTIONS,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, had_drop) =
+                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
 
             if variable {
                 validate_shape(&stages, 1, 1, STAGE_COUNT as usize);
@@ -2347,7 +2324,6 @@ mod stellar_core_parity_tests {
             // Chain of conflicts always produces STAGE_COUNT stages regardless of min
             let (stages, _had_drop) = build_parallel_soroban_phase(
                 txs,
-                test_network_id(),
                 LEDGER_MAX_INSTRUCTIONS,
                 CLUSTER_COUNT,
                 1,
@@ -2378,14 +2354,8 @@ mod stellar_core_parity_tests {
             }
 
             let (min, max) = stage_range(variable);
-            let (stages, _had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                LEDGER_MAX_INSTRUCTIONS,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, _had_drop) =
+                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
 
             if variable {
                 validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
@@ -2416,14 +2386,8 @@ mod stellar_core_parity_tests {
             }
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                LEDGER_MAX_INSTRUCTIONS,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, had_drop) =
+                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
 
             if variable {
                 validate_shape(&stages, 1, CLUSTER_COUNT as usize, STAGE_COUNT as usize);
@@ -2481,14 +2445,8 @@ mod stellar_core_parity_tests {
             }
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                LEDGER_MAX_INSTRUCTIONS,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, had_drop) =
+                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
 
             if variable {
                 validate_shape(
@@ -2526,7 +2484,6 @@ mod stellar_core_parity_tests {
             // Both variable and fixed produce the same shape here
             let (stages, _had_drop) = build_parallel_soroban_phase(
                 txs,
-                test_network_id(),
                 LEDGER_MAX_INSTRUCTIONS,
                 CLUSTER_COUNT,
                 1,
@@ -2565,14 +2522,8 @@ mod stellar_core_parity_tests {
             }
 
             let (min, max) = stage_range(variable);
-            let (stages, had_drop) = build_parallel_soroban_phase(
-                txs,
-                test_network_id(),
-                LEDGER_MAX_INSTRUCTIONS,
-                CLUSTER_COUNT,
-                min,
-                max,
-            );
+            let (stages, had_drop) =
+                build_parallel_soroban_phase(txs, LEDGER_MAX_INSTRUCTIONS, CLUSTER_COUNT, min, max);
 
             // Custom shape assertion: one stage has the high-fee TX alone,
             // other stages have CLUSTER_COUNT clusters of small TXs.
@@ -2768,7 +2719,6 @@ mod stellar_core_parity_tests {
 
                 let (stages, had_drop) = build_parallel_soroban_phase(
                     txs.clone(),
-                    test_network_id(),
                     LEDGER_MAX_INSTRUCTIONS,
                     CLUSTER_COUNT,
                     min_stages,

@@ -581,7 +581,6 @@ fn build_soroban_phase_with_base_fee(
         let (stages, had_tx_not_fitting) =
             crate::parallel_tx_set_builder::build_parallel_soroban_phase(
                 soroban_txs,
-                config.network_id,
                 config.ledger_max_instructions,
                 config.ledger_max_dependent_tx_clusters,
                 config.soroban_phase_min_stage_count,

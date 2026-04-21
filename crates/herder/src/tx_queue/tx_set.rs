@@ -536,12 +536,22 @@ fn validate_tx_fee(env: &TransactionEnvelope) -> std::result::Result<(), String>
 }
 
 /// Check if a slice of transaction envelopes is sorted by hash.
+///
+/// Uses a rolling previous-hash to compute exactly N hashes with no
+/// heap allocation (the old `windows(2)` approach hashed interior
+/// elements twice).
 fn is_sorted_by_hash(txs: &[TransactionEnvelope]) -> bool {
-    txs.windows(2).all(|pair| {
-        let hash_a = Hash256::hash_xdr(&pair[0]);
-        let hash_b = Hash256::hash_xdr(&pair[1]);
-        hash_a.0 <= hash_b.0
-    })
+    let mut prev = None;
+    for tx in txs {
+        let hash = Hash256::hash_xdr(tx);
+        if let Some(ref p) = prev {
+            if hash.0 < *p {
+                return false;
+            }
+        }
+        prev = Some(hash.0);
+    }
+    true
 }
 
 /// Validate a set of wire-format transaction envelopes.
