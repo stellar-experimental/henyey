@@ -5302,6 +5302,33 @@ impl LedgerCloseContext<'_> {
             }
         };
 
+        // Snapshot SnapshotHandle lookup stats (how effective the prefetch/read-through cache was)
+        let snapshot_cache_perf = {
+            let (snap_hits, prefetch_hits, fallback) = self.ltx.snapshot().lookup_stats().read();
+            let total = snap_hits + prefetch_hits + fallback;
+            let hit_ratio = if total > 0 {
+                (snap_hits + prefetch_hits) as f64 / total as f64
+            } else {
+                0.0
+            };
+            tracing::debug!(
+                ledger_seq = new_header.ledger_seq,
+                snapshot_cache_hits = snap_hits,
+                prefetch_cache_hits = prefetch_hits,
+                fallback_lookups = fallback,
+                hit_ratio = format!("{:.1}%", hit_ratio * 100.0),
+                prefetch_cache_entries = self.ltx.snapshot().prefetch_cache_len(),
+                "Snapshot cache stats"
+            );
+            crate::close::SnapshotCachePerf {
+                snapshot_cache_hits: snap_hits,
+                prefetch_cache_hits: prefetch_hits,
+                fallback_lookups: fallback,
+                hit_ratio,
+                prefetch_cache_entries: self.ltx.snapshot().prefetch_cache_len(),
+            }
+        };
+
         // Compute average Soroban state size from the LiveSorobanStateSizeWindow.
         // Parity: NetworkConfig.cpp:1812 — average of all window entries.
         // Gate on prev_version (initialLedgerVers) to match stellar-core L1693.
@@ -5412,6 +5439,7 @@ impl LedgerCloseContext<'_> {
             tx_timings,
             tx_count: self.stats.tx_count,
             cache: cache_perf,
+            snapshot_cache: snapshot_cache_perf,
             rss_before_bytes: rss_before,
             rss_after_bytes: rss_after,
             soroban_stage_count: self.soroban_stage_count,

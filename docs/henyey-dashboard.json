@@ -1264,8 +1264,8 @@
     {
       "id": 19,
       "type": "timeseries",
-      "title": "Prefetch Hit Ratio",
-      "description": "Ratio of ledger entry prefetch cache hits. Low values mean the prefetcher is not predicting access patterns well. Henyey-specific metric.",
+      "title": "Bucket Cache Hit Ratio",
+      "description": "Per-bucket RandomEvictionCache hit ratio (Account entries only). Low values are expected because the SnapshotHandle prefetch cache absorbs most lookups. Henyey-specific metric.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -1278,12 +1278,88 @@
       },
       "targets": [
         {
-          "expr": "henyey_ledger_prefetch_hit_ratio{job=\"henyey\", instance=~\"$instance\"}",
+          "expr": "henyey_bucket_cache_hit_ratio{job=\"henyey\", instance=~\"$instance\"}",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
           },
-          "legendFormat": "Hit ratio",
+          "legendFormat": "Bucket cache hit ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "pointSize": 5,
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 0.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi"
+        },
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "min",
+            "max",
+            "mean",
+            "lastNotNull"
+          ]
+        }
+      }
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Snapshot Cache Hit Ratio",
+      "description": "Fraction of SnapshotHandle lookups served from local caches (snapshot + prefetch/read-through) without dispatching to fallback. Primary cache effectiveness metric. Henyey-specific metric.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "000000001"
+      },
+      "targets": [
+        {
+          "expr": "henyey_snapshot_cache_hit_ratio{job=\"henyey\", instance=~\"$instance\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "000000001"
+          },
+          "legendFormat": "Snapshot cache hit ratio",
           "refId": "A"
         }
       ],

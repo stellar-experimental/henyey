@@ -981,6 +981,21 @@ pub struct CachePerfStats {
     pub hit_rate: f64,
 }
 
+/// SnapshotHandle lookup statistics for a single ledger close.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotCachePerf {
+    /// Lookups served from the built-in snapshot cache.
+    pub snapshot_cache_hits: u64,
+    /// Lookups served from the prefetch/read-through cache.
+    pub prefetch_cache_hits: u64,
+    /// Lookups dispatched to the fallback (lookup_fn / batch_lookup_fn).
+    pub fallback_lookups: u64,
+    /// (snapshot_cache_hits + prefetch_cache_hits) / total_lookups.
+    pub hit_ratio: f64,
+    /// Number of entries in the prefetch cache at end of close.
+    pub prefetch_cache_entries: usize,
+}
+
 /// Performance metrics collected during ledger close.
 #[derive(Debug, Clone, Default)]
 pub struct LedgerClosePerf {
@@ -1015,6 +1030,9 @@ pub struct LedgerClosePerf {
 
     /// Cache stats for this ledger.
     pub cache: CachePerfStats,
+
+    /// SnapshotHandle lookup stats for this ledger.
+    pub snapshot_cache: SnapshotCachePerf,
 
     /// RSS in bytes at start and end of ledger close.
     pub rss_before_bytes: u64,

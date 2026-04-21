@@ -261,7 +261,9 @@ pub struct AppMetricsSnapshot {
     // Phase 3: last-close phase timing (lightweight — no Vec clone).
     pub soroban_exec_us: u64,
     pub classic_exec_us: u64,
-    pub prefetch_hit_ratio: f64,
+    pub bucket_cache_hit_ratio: f64,
+    pub snapshot_cache_hit_ratio: f64,
+    pub snapshot_cache_fallback_lookups: u64,
 }
 
 /// Metrics for the overlay fetch-response channel (issue #1741).

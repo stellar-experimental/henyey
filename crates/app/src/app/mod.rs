@@ -1997,11 +1997,21 @@ impl App {
                 .read()
                 .as_ref()
                 .map_or(0, |p| p.classic_exec_us),
-            prefetch_hit_ratio: self
+            bucket_cache_hit_ratio: self
                 .last_close_perf
                 .read()
                 .as_ref()
                 .map_or(0.0, |p| p.cache.hit_rate),
+            snapshot_cache_hit_ratio: self
+                .last_close_perf
+                .read()
+                .as_ref()
+                .map_or(0.0, |p| p.snapshot_cache.hit_ratio),
+            snapshot_cache_fallback_lookups: self
+                .last_close_perf
+                .read()
+                .as_ref()
+                .map_or(0, |p| p.snapshot_cache.fallback_lookups),
         }
     }
 

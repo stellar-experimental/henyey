@@ -154,7 +154,9 @@ pub const SOROBAN_CONFIG_FEE_WRITE_1KB: &str = "stellar_soroban_config_fee_write
 // Phase 3 — Henyey-specific observability.
 pub const LEDGER_SOROBAN_EXEC_US: &str = "henyey_ledger_soroban_exec_us";
 pub const LEDGER_CLASSIC_EXEC_US: &str = "henyey_ledger_classic_exec_us";
-pub const LEDGER_PREFETCH_HIT_RATIO: &str = "henyey_ledger_prefetch_hit_ratio";
+pub const LEDGER_BUCKET_CACHE_HIT_RATIO: &str = "henyey_bucket_cache_hit_ratio";
+pub const LEDGER_SNAPSHOT_CACHE_HIT_RATIO: &str = "henyey_snapshot_cache_hit_ratio";
+pub const LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS: &str = "henyey_snapshot_cache_fallback_lookups";
 
 // Phase 4 — Ledger close histogram.
 pub const LEDGER_CLOSE_DURATION_SECONDS: &str = "stellar_ledger_close_duration_seconds";
@@ -583,8 +585,16 @@ pub fn describe_metrics() {
         "Classic phase execution time in microseconds (last close)"
     );
     describe_gauge!(
-        LEDGER_PREFETCH_HIT_RATIO,
-        "Ledger entry prefetch cache hit ratio (0.0-1.0, last close)"
+        LEDGER_BUCKET_CACHE_HIT_RATIO,
+        "Per-bucket RandomEvictionCache hit ratio (0.0-1.0, Account entries only, last close)"
+    );
+    describe_gauge!(
+        LEDGER_SNAPSHOT_CACHE_HIT_RATIO,
+        "SnapshotHandle local cache hit ratio (0.0-1.0, last close)"
+    );
+    describe_gauge!(
+        LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS,
+        "Lookups dispatched to fallback (not served by snapshot local caches, last close)"
     );
 
     // Phase 4: Ledger close histogram.
@@ -775,7 +785,9 @@ pub fn register_label_series() {
     // Phase 3: Henyey-specific gauges.
     gauge!(LEDGER_SOROBAN_EXEC_US).set(0.0);
     gauge!(LEDGER_CLASSIC_EXEC_US).set(0.0);
-    gauge!(LEDGER_PREFETCH_HIT_RATIO).set(0.0);
+    gauge!(LEDGER_BUCKET_CACHE_HIT_RATIO).set(0.0);
+    gauge!(LEDGER_SNAPSHOT_CACHE_HIT_RATIO).set(0.0);
+    gauge!(LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS).set(0.0);
 
     // Phase 4: Overlay connection breakdown.
     gauge!(OVERLAY_INBOUND_AUTHENTICATED).set(0.0);
@@ -999,7 +1011,9 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     // Phase 3: Henyey-specific observability.
     gauge!(LEDGER_SOROBAN_EXEC_US).set(snap.soroban_exec_us as f64);
     gauge!(LEDGER_CLASSIC_EXEC_US).set(snap.classic_exec_us as f64);
-    gauge!(LEDGER_PREFETCH_HIT_RATIO).set(snap.prefetch_hit_ratio);
+    gauge!(LEDGER_BUCKET_CACHE_HIT_RATIO).set(snap.bucket_cache_hit_ratio);
+    gauge!(LEDGER_SNAPSHOT_CACHE_HIT_RATIO).set(snap.snapshot_cache_hit_ratio);
+    gauge!(LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS).set(snap.snapshot_cache_fallback_lookups as f64);
 
     // Phase 4: Overlay connection breakdown.
     if let Some(breakdown) = state.app.overlay_connection_breakdown().await {
@@ -1586,7 +1600,9 @@ mod tests {
         let gauge_metrics = [
             LEDGER_SOROBAN_EXEC_US,
             LEDGER_CLASSIC_EXEC_US,
-            LEDGER_PREFETCH_HIT_RATIO,
+            LEDGER_BUCKET_CACHE_HIT_RATIO,
+            LEDGER_SNAPSHOT_CACHE_HIT_RATIO,
+            LEDGER_SNAPSHOT_CACHE_FALLBACK_LOOKUPS,
         ];
         for name in &gauge_metrics {
             assert!(

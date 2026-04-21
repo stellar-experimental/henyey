@@ -24,10 +24,36 @@
 use crate::{LedgerError, Result};
 use henyey_common::Hash256;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use stellar_xdr::curr::{
     AccountEntry, AccountId, LedgerEntry, LedgerEntryData, LedgerHeader, LedgerKey, PoolId,
 };
+
+/// Lookup statistics for SnapshotHandle cache layers.
+///
+/// Tracks hits at each cache layer and fallback lookups. Shared across
+/// clones of the same SnapshotHandle via `Arc`.
+#[derive(Debug, Default)]
+pub struct SnapshotLookupStats {
+    /// Lookups served by the built-in snapshot cache (`inner.get_entry()`).
+    pub snapshot_cache_hits: AtomicU64,
+    /// Lookups served by the prefetch/read-through cache.
+    pub prefetch_cache_hits: AtomicU64,
+    /// Lookups dispatched to `lookup_fn` / `batch_lookup_fn` (not in either local cache).
+    pub fallback_lookups: AtomicU64,
+}
+
+impl SnapshotLookupStats {
+    /// Read all counters (snapshot_hits, prefetch_hits, fallback_lookups).
+    pub fn read(&self) -> (u64, u64, u64) {
+        (
+            self.snapshot_cache_hits.load(Ordering::Relaxed),
+            self.prefetch_cache_hits.load(Ordering::Relaxed),
+            self.fallback_lookups.load(Ordering::Relaxed),
+        )
+    }
+}
 
 /// Statistics from a prefetch operation.
 #[derive(Debug, Default)]
@@ -267,6 +293,8 @@ pub struct SnapshotHandle {
     /// Cache populated by prefetch, checked before falling through to lookup_fn.
     /// Uses Arc<RwLock> so clones of SnapshotHandle share the same cache.
     prefetch_cache: Arc<parking_lot::RwLock<HashMap<LedgerKey, LedgerEntry>>>,
+    /// Lookup statistics shared across clones.
+    stats: Arc<SnapshotLookupStats>,
 }
 
 impl SnapshotHandle {
@@ -280,6 +308,7 @@ impl SnapshotHandle {
             offers_by_account_asset_fn: None,
             pool_share_tls_by_account_fn: None,
             prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            stats: Arc::new(SnapshotLookupStats::default()),
         }
     }
 
@@ -377,8 +406,14 @@ impl SnapshotHandle {
         let prefetch = self.prefetch_cache.read();
         for key in keys {
             if let Some(entry) = self.inner.get_entry(key) {
+                self.stats
+                    .snapshot_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 result.push(entry.clone());
             } else if let Some(entry) = prefetch.get(key) {
+                self.stats
+                    .prefetch_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 result.push(entry.clone());
             } else {
                 remaining.push(key.clone());
@@ -389,6 +424,11 @@ impl SnapshotHandle {
         if remaining.is_empty() {
             return Ok(result);
         }
+
+        // Count all remaining keys as fallback lookups (regardless of result)
+        self.stats
+            .fallback_lookups
+            .fetch_add(remaining.len() as u64, Ordering::Relaxed);
 
         // Use batch lookup if available; cache all loaded entries for future callers
         let loaded = if let Some(ref batch_fn) = self.batch_lookup_fn {
@@ -448,18 +488,25 @@ impl SnapshotHandle {
     pub fn get_entry(&self, key: &LedgerKey) -> Result<Option<LedgerEntry>> {
         // 1. Check snapshot's built-in cache
         if let Some(entry) = self.inner.get_entry(key) {
+            self.stats
+                .snapshot_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
             return Ok(Some(entry.clone()));
         }
 
         // 2. Check prefetch cache
         {
             if let Some(entry) = self.prefetch_cache.read().get(key) {
+                self.stats
+                    .prefetch_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
                 return Ok(Some(entry.clone()));
             }
         }
 
         // 3. Fall back to lookup function if available; cache the result for future callers
         if let Some(ref lookup_fn) = self.lookup_fn {
+            self.stats.fallback_lookups.fetch_add(1, Ordering::Relaxed);
             let result = lookup_fn(key)?;
             if let Some(ref entry) = result {
                 self.prefetch_cache
@@ -469,6 +516,8 @@ impl SnapshotHandle {
             return Ok(result);
         }
 
+        // 4. No lookup function — uncached key with no way to resolve
+        self.stats.fallback_lookups.fetch_add(1, Ordering::Relaxed);
         Ok(None)
     }
 
@@ -535,6 +584,16 @@ impl SnapshotHandle {
             requested: needed.len(),
             loaded,
         })
+    }
+
+    /// Return the shared lookup statistics.
+    pub fn lookup_stats(&self) -> &SnapshotLookupStats {
+        &self.stats
+    }
+
+    /// Return the number of entries in the prefetch/read-through cache.
+    pub fn prefetch_cache_len(&self) -> usize {
+        self.prefetch_cache.read().len()
     }
 }
 
@@ -896,5 +955,198 @@ mod tests {
 
         // This ensures that when the executor creates new offers during replay,
         // they will get IDs starting from 20681, 20682, etc. instead of 1, 2, etc.
+    }
+
+    // ------------------------------------------------------------------
+    // SnapshotLookupStats tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_get_entry_stats_snapshot_cache_hit() {
+        let (key, entry) = create_test_account(1);
+        let snapshot = SnapshotBuilder::new(1)
+            .add_entry(key.clone(), entry)
+            .build_with_default_header();
+        let handle = SnapshotHandle::new(snapshot);
+
+        let result = handle.get_entry(&key).unwrap();
+        assert!(result.is_some());
+
+        let (snap_hits, prefetch_hits, fallback) = handle.lookup_stats().read();
+        assert_eq!(snap_hits, 1);
+        assert_eq!(prefetch_hits, 0);
+        assert_eq!(fallback, 0);
+    }
+
+    #[test]
+    fn test_get_entry_stats_prefetch_cache_hit() {
+        let (key, entry) = create_test_account(1);
+        let snapshot = LedgerSnapshot::empty(1);
+        let handle = SnapshotHandle::new(snapshot);
+
+        // Manually populate the prefetch cache
+        handle
+            .prefetch_cache
+            .write()
+            .insert(key.clone(), entry.clone());
+
+        let result = handle.get_entry(&key).unwrap();
+        assert!(result.is_some());
+
+        let (snap_hits, prefetch_hits, fallback) = handle.lookup_stats().read();
+        assert_eq!(snap_hits, 0);
+        assert_eq!(prefetch_hits, 1);
+        assert_eq!(fallback, 0);
+    }
+
+    #[test]
+    fn test_get_entry_stats_fallback_lookup() {
+        let (key, entry) = create_test_account(1);
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+
+        let entry_clone = entry.clone();
+        handle.set_lookup(Arc::new(move |_k| Ok(Some(entry_clone.clone()))));
+
+        let result = handle.get_entry(&key).unwrap();
+        assert!(result.is_some());
+
+        let (snap_hits, prefetch_hits, fallback) = handle.lookup_stats().read();
+        assert_eq!(snap_hits, 0);
+        assert_eq!(prefetch_hits, 0);
+        assert_eq!(fallback, 1);
+    }
+
+    #[test]
+    fn test_get_entry_stats_no_lookup_fn() {
+        let (key, _) = create_test_account(1);
+        let snapshot = LedgerSnapshot::empty(1);
+        let handle = SnapshotHandle::new(snapshot);
+
+        // No lookup_fn configured — should still count as fallback
+        let result = handle.get_entry(&key).unwrap();
+        assert!(result.is_none());
+
+        let (snap_hits, prefetch_hits, fallback) = handle.lookup_stats().read();
+        assert_eq!(snap_hits, 0);
+        assert_eq!(prefetch_hits, 0);
+        assert_eq!(fallback, 1);
+    }
+
+    #[test]
+    fn test_get_entry_stats_read_through_becomes_prefetch_hit() {
+        let (key, entry) = create_test_account(1);
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+
+        let entry_clone = entry.clone();
+        handle.set_lookup(Arc::new(move |_k| Ok(Some(entry_clone.clone()))));
+
+        // First call: fallback lookup (caches result via read-through)
+        handle.get_entry(&key).unwrap();
+        let (_, _, fallback1) = handle.lookup_stats().read();
+        assert_eq!(fallback1, 1);
+
+        // Second call: served from prefetch cache
+        handle.get_entry(&key).unwrap();
+        let (snap_hits, prefetch_hits, fallback2) = handle.lookup_stats().read();
+        assert_eq!(snap_hits, 0);
+        assert_eq!(prefetch_hits, 1);
+        assert_eq!(fallback2, 1); // no new fallback
+    }
+
+    #[test]
+    fn test_cloned_handles_share_stats() {
+        let (key1, entry1) = create_test_account(1);
+        let (key2, entry2) = create_test_account(2);
+
+        let snapshot = SnapshotBuilder::new(1)
+            .add_entry(key1.clone(), entry1)
+            .build_with_default_header();
+        let handle = SnapshotHandle::new(snapshot);
+        let clone = handle.clone();
+
+        // Lookup via original
+        handle.get_entry(&key1).unwrap();
+        // Populate prefetch cache on clone
+        clone
+            .prefetch_cache
+            .write()
+            .insert(key2.clone(), entry2.clone());
+        clone.get_entry(&key2).unwrap();
+
+        // Both share the same stats
+        let (snap_hits, prefetch_hits, _) = handle.lookup_stats().read();
+        assert_eq!(snap_hits, 1);
+        assert_eq!(prefetch_hits, 1);
+
+        // Same values from clone's perspective
+        let (snap_hits2, prefetch_hits2, _) = clone.lookup_stats().read();
+        assert_eq!(snap_hits2, 1);
+        assert_eq!(prefetch_hits2, 1);
+    }
+
+    #[test]
+    fn test_load_entries_stats_batch_fallback_count() {
+        let (key1, entry1) = create_test_account(1);
+        let (key2, entry2) = create_test_account(2);
+        let (key3, _) = create_test_account(3); // will not be found
+
+        let snapshot = SnapshotBuilder::new(1)
+            .add_entry(key1.clone(), entry1)
+            .build_with_default_header();
+        let mut handle = SnapshotHandle::new(snapshot);
+
+        // Batch lookup returns only key2's entry (key3 not found)
+        let entry2_clone = entry2.clone();
+        handle.set_batch_lookup(Arc::new(move |_keys| Ok(vec![entry2_clone.clone()])));
+
+        let loaded = handle
+            .load_entries(&[key1.clone(), key2.clone(), key3.clone()])
+            .unwrap();
+        // key1 from snapshot, key2 from batch, key3 not found
+        assert_eq!(loaded.len(), 2);
+
+        let (snap_hits, prefetch_hits, fallback) = handle.lookup_stats().read();
+        assert_eq!(snap_hits, 1); // key1 from snapshot
+        assert_eq!(prefetch_hits, 0);
+        assert_eq!(fallback, 2); // key2 + key3 both went to batch (remaining.len() = 2)
+    }
+
+    #[test]
+    fn test_load_entries_stats_fallback_none_returns() {
+        let (key1, _) = create_test_account(1);
+        let (key2, _) = create_test_account(2);
+
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+
+        // Lookup always returns None (simulates OFFER keys skipped by bucket list)
+        handle.set_lookup(Arc::new(|_k| Ok(None)));
+
+        let loaded = handle.load_entries(&[key1, key2]).unwrap();
+        assert_eq!(loaded.len(), 0);
+
+        let (snap_hits, prefetch_hits, fallback) = handle.lookup_stats().read();
+        assert_eq!(snap_hits, 0);
+        assert_eq!(prefetch_hits, 0);
+        assert_eq!(fallback, 2); // both keys counted despite returning None
+    }
+
+    #[test]
+    fn test_prefetch_cache_len() {
+        let (key1, entry1) = create_test_account(1);
+        let (key2, entry2) = create_test_account(2);
+
+        let snapshot = LedgerSnapshot::empty(1);
+        let handle = SnapshotHandle::new(snapshot);
+
+        assert_eq!(handle.prefetch_cache_len(), 0);
+
+        handle.prefetch_cache.write().insert(key1, entry1);
+        assert_eq!(handle.prefetch_cache_len(), 1);
+
+        handle.prefetch_cache.write().insert(key2, entry2);
+        assert_eq!(handle.prefetch_cache_len(), 2);
     }
 }

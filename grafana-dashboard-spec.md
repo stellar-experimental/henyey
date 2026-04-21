@@ -159,12 +159,25 @@ Since this is currently a single-node deployment, the instance variable exists f
 - **Y-axis:** count
 - **Description:** Ledger entry churn per close. High creation rates indicate growth; deletion spikes may correlate with TTL expiry or state archival.
 
-### Panel 2.9: Prefetch Hit Ratio
+### Panel 2.9: Bucket Cache Hit Ratio
 - **Type:** timeseries
-- **Query:** `henyey_ledger_prefetch_hit_ratio{job="henyey", instance=~"$instance"}`
+- **Query:** `henyey_bucket_cache_hit_ratio{job="henyey", instance=~"$instance"}`
 - **Y-axis:** ratio (0-1), format as percent
 - **Thresholds:** <0.5 = red line
-- **Description:** Ratio of ledger entry prefetch cache hits. Low values mean the prefetcher is not predicting access patterns well, increasing read latency. **Henyey-specific metric.**
+- **Description:** Per-bucket RandomEvictionCache hit ratio (Account entries only). Low values are expected because the SnapshotHandle prefetch cache absorbs most lookups before they reach the bucket layer. **Henyey-specific metric.**
+
+### Panel 2.9b: Snapshot Cache Hit Ratio
+- **Type:** timeseries
+- **Query:** `henyey_snapshot_cache_hit_ratio{job="henyey", instance=~"$instance"}`
+- **Y-axis:** ratio (0-1), format as percent
+- **Thresholds:** <0.5 = red line
+- **Description:** Fraction of SnapshotHandle lookups served from local caches (snapshot + prefetch/read-through) without dispatching to the fallback lookup function. This is the primary cache effectiveness metric. **Henyey-specific metric.**
+
+### Panel 2.9c: Snapshot Cache Fallback Lookups
+- **Type:** timeseries
+- **Query:** `henyey_snapshot_cache_fallback_lookups{job="henyey", instance=~"$instance"}`
+- **Y-axis:** count
+- **Description:** Number of SnapshotHandle lookups per ledger that were not served by local caches and had to be dispatched to the fallback (bucket list / Soroban state). **Henyey-specific metric.**
 
 ### Panel 2.10: Total Fees
 - **Type:** timeseries
