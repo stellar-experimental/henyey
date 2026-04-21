@@ -2016,10 +2016,10 @@ impl App {
         current_ledger: u32,
         first_buffered: u32,
     ) -> bool {
-        // Non-blocking read: `None` means cold/stale cache — mirror the
-        // existing `Err(e)` branch and skip this tick (arming backoff),
-        // letting the background refresh warm the cache before the next
-        // recovery cycle 10 s later.
+        // Non-blocking read: `None` means the cache is cold (never
+        // populated).  `get_cached()` already spawns a background refresh,
+        // so we skip this tick and let the next recovery cycle (~10 s)
+        // pick up the result.
         match self.get_cached_archive_checkpoint_nonblocking() {
             Some(latest_checkpoint) => {
                 if latest_checkpoint <= current_ledger {
@@ -2041,15 +2041,17 @@ impl App {
                 true
             }
             None => {
-                // Cold/stale cache — transient state with a refresh in
-                // flight. Skip this tick WITHOUT arming the 60 s backoff
-                // (see `clear_catchup_triggered_on_skip` rationale); the
-                // next recovery tick (10 s later) will see the refreshed
-                // cache and can re-evaluate.
+                // Cold cache — never populated; `get_cached()` has already
+                // spawned a background refresh.  Skip this tick WITHOUT
+                // arming the 60 s backoff (see `clear_catchup_triggered_on_skip`
+                // rationale).  Expedite subsequent refreshes by switching to
+                // urgent TTL (10 s instead of 60 s) — same pattern as the
+                // HardReset and Externalized catchup cold paths (#1862, #1863).
                 tracing::debug!(
                     current_ledger,
-                    "Archive checkpoint cache cold/stale; skipping catchup (will retry next tick)"
+                    "Archive checkpoint cache cold; skipping catchup (will retry next tick)"
                 );
+                self.archive_checkpoint_cache.set_urgent(true);
                 self.clear_catchup_triggered_on_skip().await;
                 false
             }
@@ -3089,6 +3091,60 @@ mod tests {
         assert!(
             !state.catchup_triggered,
             "SKIP must clear catchup_triggered"
+        );
+    }
+
+    /// Regression for #1864: when the archive checkpoint cache is cold
+    /// (never populated), `validate_archive_has_newer_checkpoint` must
+    /// skip the tick, clear `catchup_triggered`, NOT stamp completion,
+    /// NOT arm the 60 s backoff, and set urgent mode on the cache so
+    /// subsequent refreshes use the 10 s TTL.
+    #[tokio::test]
+    async fn test_validate_archive_cold_cache_sets_urgent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Do NOT seed the cache — leave it cold (None).
+        let current_ledger: u32 = 5_000;
+
+        {
+            let mut guard = app.consensus_stuck_state.write().await;
+            *guard = Some(ConsensusStuckState {
+                current_ledger,
+                first_buffered: current_ledger + 1,
+                stuck_start: app.clock.now(),
+                last_recovery_attempt: app.clock.now(),
+                recovery_attempts: 0,
+                catchup_triggered: true,
+            });
+        }
+
+        let ok = app
+            .validate_archive_has_newer_checkpoint(current_ledger, current_ledger + 1)
+            .await;
+        assert!(!ok, "cold-cache path must return false");
+
+        assert!(
+            app.last_catchup_completed_at.read().await.is_none(),
+            "cold-cache must NOT stamp last_catchup_completed_at"
+        );
+        assert!(
+            app.archive_behind_until.read().await.is_none(),
+            "cold-cache must NOT arm archive_behind_until backoff"
+        );
+        let state = app.consensus_stuck_state.read().await;
+        let state = state.as_ref().expect("stuck state must still exist");
+        assert!(
+            !state.catchup_triggered,
+            "cold-cache must clear catchup_triggered"
+        );
+        assert!(
+            app.archive_checkpoint_cache.is_urgent(),
+            "cold-cache must set urgent mode on cache (#1864)"
         );
     }
 
