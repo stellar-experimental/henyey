@@ -1539,8 +1539,12 @@ impl App {
             }
         }
 
-        let mut overlay = self.overlay.write().await;
-        if let Some(overlay_arc) = overlay.take() {
+        // Take the overlay out and drop the write guard before calling
+        // shutdown().await — holding the guard across the await would block
+        // all concurrent readers for the duration of connection teardown.
+        // After take(), concurrent readers see None (same as post-shutdown).
+        let overlay_arc = self.overlay.write().await.take();
+        if let Some(overlay_arc) = overlay_arc {
             match Arc::try_unwrap(overlay_arc) {
                 Ok(mut overlay_owned) => {
                     if let Err(err) = overlay_owned.shutdown().await {
@@ -1760,14 +1764,19 @@ impl App {
         // envelope admit to post-verify handling) including any time the
         // envelope spent queued on the verifier. Pre-verify bookkeeping
         // would undercount under verifier backpressure.
-        {
+        // Scope scp_latency so the write guard is dropped before acquiring
+        // survey_data — matching the pattern at ~602-609. Holding both locks
+        // simultaneously is a latent deadlock if a future code path acquires
+        // them in reverse order.
+        let self_to_other_ms = {
             let mut latency = self.scp_latency.write().await;
             let now = self.clock.now();
             latency.record_first_seen(slot, now);
-            if let Some(ms) = latency.record_other_after_self(slot, now) {
-                let mut survey_data = self.survey_data.write().await;
-                survey_data.record_scp_self_to_other_latency(ms);
-            }
+            latency.record_other_after_self(slot, now)
+        };
+        if let Some(ms) = self_to_other_ms {
+            let mut survey_data = self.survey_data.write().await;
+            survey_data.record_scp_self_to_other_latency(ms);
         }
 
         // Fast-path reject surfaced by the worker (invalid signature or

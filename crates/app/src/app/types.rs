@@ -723,6 +723,78 @@ pub(super) struct PingInfo {
     pub sent_at: Instant,
 }
 
+/// Unified state for in-flight ping tracking.
+///
+/// Merges what was previously two separate `RwLock<HashMap<...>>` fields
+/// (`ping_inflight` and `peer_ping_inflight`) into a single struct behind
+/// one lock, eliminating the nested lock-ordering hazard where both maps
+/// were always acquired together.
+#[derive(Debug, Default)]
+pub(super) struct PingState {
+    /// In-flight ping requests keyed by hash.
+    by_hash: HashMap<Hash256, PingInfo>,
+    /// In-flight ping hash per peer (bidirectional index).
+    by_peer: HashMap<PeerId, Hash256>,
+}
+
+impl PingState {
+    /// Remove expired entries older than `timeout` from `sent_at`.
+    pub fn expire_timeouts(&mut self, now: Instant, timeout: Duration) {
+        self.by_hash.retain(|hash, info| {
+            if now.duration_since(info.sent_at) > timeout {
+                if let Some(existing) = self.by_peer.get(&info.peer_id) {
+                    if existing == hash {
+                        self.by_peer.remove(&info.peer_id);
+                    }
+                }
+                return false;
+            }
+            true
+        });
+    }
+
+    /// Try to record a sent ping for `peer_id`. Returns `false` if the peer
+    /// already has an outstanding ping.
+    pub fn try_mark_sent(&mut self, peer_id: PeerId, hash: Hash256, now: Instant) -> bool {
+        if self.by_peer.contains_key(&peer_id) {
+            return false;
+        }
+        self.by_peer.insert(peer_id.clone(), hash);
+        self.by_hash.insert(
+            hash,
+            PingInfo {
+                peer_id,
+                sent_at: now,
+            },
+        );
+        true
+    }
+
+    /// Remove a ping response by hash. Returns the `PingInfo` so the caller
+    /// can verify the responding peer and compute latency.
+    pub fn remove_response(&mut self, hash: &Hash256) -> Option<PingInfo> {
+        let info = self.by_hash.remove(hash)?;
+        if let Some(existing) = self.by_peer.get(&info.peer_id) {
+            if existing == hash {
+                self.by_peer.remove(&info.peer_id);
+            }
+        }
+        Some(info)
+    }
+
+    /// Clean up after a failed send: remove the hash entry and the peer
+    /// mapping, but only if the peer's current hash still matches (they
+    /// may have been re-pinged with a new hash).
+    pub fn cleanup_failed_send(&mut self, peer_id: &PeerId, hash: &Hash256) {
+        self.by_hash.remove(hash);
+        if let Some(existing) = self.by_peer.get(peer_id) {
+            if existing == hash {
+                self.by_peer.remove(peer_id);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ScpLatencyTracker {
     pub first_seen: HashMap<u64, Instant>,
@@ -1212,5 +1284,124 @@ mod tests {
     fn test_query_info_zero_limit_rejects_all() {
         let mut info = QueryInfo::new();
         assert!(!info.allow(Duration::from_secs(60), 0));
+    }
+
+    // --- PingState tests ---
+
+    fn make_peer(id: u8) -> PeerId {
+        PeerId::from_bytes([id; 32])
+    }
+
+    fn make_hash(id: u8) -> Hash256 {
+        Hash256::from_bytes([id; 32])
+    }
+
+    #[test]
+    fn test_ping_state_expire_timeouts() {
+        let mut state = PingState::default();
+        let now = Instant::now();
+        let timeout = Duration::from_secs(60);
+
+        let peer_a = make_peer(1);
+        let hash_a = make_hash(1);
+        // Insert an entry that's already old (by using `now` and then
+        // expiring at `now + timeout + 1s`).
+        state.try_mark_sent(peer_a.clone(), hash_a, now);
+
+        let peer_b = make_peer(2);
+        let hash_b = make_hash(2);
+        let fresh_time = now + timeout + Duration::from_secs(1);
+        state.try_mark_sent(peer_b.clone(), hash_b, fresh_time);
+
+        // Expire at fresh_time — peer_a's entry is >60s old, peer_b's is 0s old.
+        state.expire_timeouts(fresh_time, timeout);
+
+        // peer_a should be gone, peer_b should remain.
+        assert!(state.remove_response(&hash_a).is_none());
+        assert!(state.remove_response(&hash_b).is_some());
+    }
+
+    #[test]
+    fn test_ping_state_try_mark_sent_rejects_duplicate_peer() {
+        let mut state = PingState::default();
+        let peer = make_peer(1);
+
+        assert!(state.try_mark_sent(peer.clone(), make_hash(1), Instant::now()));
+        // Same peer, different hash — should be rejected.
+        assert!(!state.try_mark_sent(peer, make_hash(2), Instant::now()));
+    }
+
+    #[test]
+    fn test_ping_state_remove_response_cleans_peer_mapping() {
+        let mut state = PingState::default();
+        let peer = make_peer(1);
+        let hash = make_hash(1);
+        state.try_mark_sent(peer.clone(), hash, Instant::now());
+
+        let info = state.remove_response(&hash).unwrap();
+        assert_eq!(info.peer_id, peer);
+
+        // Peer should now be available for a new ping.
+        assert!(state.try_mark_sent(peer, make_hash(2), Instant::now()));
+    }
+
+    #[test]
+    fn test_ping_state_cleanup_failed_send_preserves_new_hash() {
+        let mut state = PingState::default();
+        let peer = make_peer(1);
+        let old_hash = make_hash(1);
+        state.try_mark_sent(peer.clone(), old_hash, Instant::now());
+
+        // Simulate the peer being re-pinged with a new hash (e.g., after
+        // the old one was removed by process_ping_response).
+        state.remove_response(&old_hash);
+        let new_hash = make_hash(2);
+        state.try_mark_sent(peer.clone(), new_hash, Instant::now());
+
+        // cleanup_failed_send for the OLD hash should NOT remove the peer's
+        // new mapping.
+        state.cleanup_failed_send(&peer, &old_hash);
+
+        // The new hash should still be tracked.
+        let info = state.remove_response(&new_hash).unwrap();
+        assert_eq!(info.peer_id, peer);
+    }
+
+    #[test]
+    fn test_ping_state_no_orphans_after_mixed_operations() {
+        let mut state = PingState::default();
+        let peer_a = make_peer(1);
+        let peer_b = make_peer(2);
+        let hash_a = make_hash(1);
+        let hash_b = make_hash(2);
+
+        state.try_mark_sent(peer_a.clone(), hash_a, Instant::now());
+        state.try_mark_sent(peer_b.clone(), hash_b, Instant::now());
+
+        // Remove peer_a via response.
+        state.remove_response(&hash_a);
+
+        // Clean up peer_b via failed send.
+        state.cleanup_failed_send(&peer_b, &hash_b);
+
+        // Both peers should be available for new pings.
+        assert!(state.try_mark_sent(peer_a, make_hash(3), Instant::now()));
+        assert!(state.try_mark_sent(peer_b, make_hash(4), Instant::now()));
+    }
+
+    #[test]
+    fn test_ping_state_wrong_peer_response() {
+        let mut state = PingState::default();
+        let real_peer = make_peer(1);
+        let hash = make_hash(1);
+        state.try_mark_sent(real_peer.clone(), hash, Instant::now());
+
+        // Simulate response from a different peer — remove_response still
+        // returns the PingInfo with the original peer_id so the caller can
+        // detect the mismatch (matching peers.rs:282-284 semantics).
+        let info = state.remove_response(&hash).unwrap();
+        assert_eq!(info.peer_id, real_peer);
+        // The caller would compare info.peer_id != responding_peer_id and
+        // discard the response — tested here to document the invariant.
     }
 }

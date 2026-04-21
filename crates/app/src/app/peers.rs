@@ -201,35 +201,15 @@ impl App {
         // Phase 2: Build the to_ping list (no overlay lock needed).
         let now = self.clock.now();
         let to_ping = {
-            let mut inflight = self.ping_inflight.write().await;
-            let mut peer_inflight = self.peer_ping_inflight.write().await;
-            inflight.retain(|hash, info| {
-                if now.duration_since(info.sent_at) > PING_TIMEOUT {
-                    if let Some(existing) = peer_inflight.get(&info.peer_id) {
-                        if existing == hash {
-                            peer_inflight.remove(&info.peer_id);
-                        }
-                    }
-                    return false;
-                }
-                true
-            });
+            let mut pings = self.ping_state.lock().await;
+            pings.expire_timeouts(now, PING_TIMEOUT);
 
             let mut to_ping = Vec::new();
             for snapshot in snapshots {
-                if peer_inflight.contains_key(&snapshot.info.peer_id) {
-                    continue;
-                }
                 let hash = self.next_ping_hash();
-                peer_inflight.insert(snapshot.info.peer_id.clone(), hash);
-                inflight.insert(
-                    hash,
-                    PingInfo {
-                        peer_id: snapshot.info.peer_id.clone(),
-                        sent_at: self.clock.now(),
-                    },
-                );
-                to_ping.push((snapshot.info.peer_id, hash));
+                if pings.try_mark_sent(snapshot.info.peer_id.clone(), hash, self.clock.now()) {
+                    to_ping.push((snapshot.info.peer_id, hash));
+                }
             }
             to_ping
         };
@@ -243,14 +223,10 @@ impl App {
             let msg = StellarMessage::GetScpQuorumset(stellar_xdr::curr::Uint256(hash.0));
             if overlay.try_send_to(&peer, msg).is_err() {
                 tracing::debug!(peer = %peer, "Failed to send ping");
-                let mut inflight = self.ping_inflight.write().await;
-                inflight.remove(&hash);
-                let mut peer_inflight = self.peer_ping_inflight.write().await;
-                if let Some(existing) = peer_inflight.get(&peer) {
-                    if *existing == hash {
-                        peer_inflight.remove(&peer);
-                    }
-                }
+                self.ping_state
+                    .lock()
+                    .await
+                    .cleanup_failed_send(&peer, &hash);
             }
         }
     }
@@ -261,23 +237,11 @@ impl App {
         hash: [u8; 32],
     ) {
         let hash = Hash256::from_bytes(hash);
-        let info = {
-            let mut inflight = self.ping_inflight.write().await;
-            inflight.remove(&hash)
-        };
+        let info = self.ping_state.lock().await.remove_response(&hash);
 
         let Some(info) = info else {
             return;
         };
-
-        {
-            let mut peer_inflight = self.peer_ping_inflight.write().await;
-            if let Some(existing) = peer_inflight.get(&info.peer_id) {
-                if *existing == hash {
-                    peer_inflight.remove(&info.peer_id);
-                }
-            }
-        }
 
         if &info.peer_id != peer_id {
             return;

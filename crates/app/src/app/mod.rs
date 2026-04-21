@@ -623,10 +623,8 @@ pub struct App {
     max_tx_size_bytes: AtomicU32,
     /// Monotonic counter used for ping IDs.
     ping_counter: AtomicU64,
-    /// In-flight ping requests keyed by hash.
-    ping_inflight: RwLock<HashMap<Hash256, PingInfo>>,
-    /// In-flight ping hash per peer.
-    peer_ping_inflight: RwLock<HashMap<henyey_overlay::PeerId, Hash256>>,
+    /// Unified in-flight ping state (hash→info + peer→hash).
+    ping_state: tokio::sync::Mutex<PingState>,
 
     /// Per-peer `GET_SCP_STATE` rate limiter.
     ///
@@ -958,8 +956,7 @@ impl App {
                 henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES,
             ),
             ping_counter: AtomicU64::new(0),
-            ping_inflight: RwLock::new(HashMap::new()),
-            peer_ping_inflight: RwLock::new(HashMap::new()),
+            ping_state: tokio::sync::Mutex::new(PingState::default()),
             scp_state_query_info: RwLock::new(HashMap::new()),
             tx_set_query_info: RwLock::new(HashMap::new()),
             qset_query_info: RwLock::new(HashMap::new()),
@@ -1403,8 +1400,7 @@ impl App {
     }
 
     pub async fn add_peer(&self, addr: henyey_overlay::PeerAddress) -> anyhow::Result<bool> {
-        let overlay = self.overlay.read().await;
-        let Some(overlay) = overlay.as_ref() else {
+        let Some(overlay) = self.overlay().await else {
             anyhow::bail!("overlay not started")
         };
         overlay
