@@ -4792,52 +4792,69 @@ mod tests {
         );
     }
 
-    /// Issue #1873: Verify the lock-scope refactor — consensus_stuck_state
-    /// is NOT held across `.await` points.  We do this by blocking
-    /// `archive_behind_until` from another task and confirming that
-    /// `consensus_stuck_state` can still be read (i.e. is not locked).
-    #[tokio::test]
+    /// Issue #1873: Verify the lock-scope refactor — `maybe_start_buffered_catchup`
+    /// does NOT hold `consensus_stuck_state` while awaiting `archive_behind_until`.
+    ///
+    /// We set up the stuck-state scenario, hold `archive_behind_until.write()` from
+    /// a spawned task to block any reader, then call `maybe_start_buffered_catchup`
+    /// with a timeout. In the old code this would deadlock (the function held
+    /// `consensus_stuck_state.write()` while awaiting `archive_behind_until.read()`).
+    /// With the fix, the function reads `archive_behind_until` in its own scope
+    /// before touching `consensus_stuck_state`, so it blocks on the held write
+    /// guard but does NOT block `consensus_stuck_state`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_consensus_stuck_state_not_held_across_await() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let db_path = dir.path().join("lock-scope-test.db");
-        let config = crate::config::ConfigBuilder::new()
-            .database_path(db_path)
-            .build();
-        let app = Arc::new(App::new(config).await.unwrap());
+        use std::time::Duration;
+        use tokio::sync::Notify;
 
-        // Hold a write guard on archive_behind_until — this will block any
-        // reader that awaits `.read()` on this lock.
-        let _blocker = app.archive_behind_until.write().await;
+        let (app, _dir) = mk_app_for_cooldown_livelock_scenario().await;
+        let app = Arc::new(app);
 
-        // In the old code, maybe_start_buffered_catchup would hold
-        // consensus_stuck_state.write() THEN await archive_behind_until.read(),
-        // which would block. With the refactored code, the reads happen
-        // independently, so consensus_stuck_state should be freely accessible.
-        //
-        // Verify we can read (and write) consensus_stuck_state without
-        // blocking. If the old pattern were in use and the event loop were
-        // blocked on archive_behind_until while holding consensus_stuck_state,
-        // this would deadlock.
-        let read_guard = app.consensus_stuck_state.read().await;
-        assert!(read_guard.is_none(), "initially no stuck state");
-        drop(read_guard);
+        // Shared signal: the spawned task holds `archive_behind_until.write()`
+        // and notifies when it's ready.
+        let ready = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
 
-        let mut write_guard = app.consensus_stuck_state.write().await;
-        *write_guard = Some(ConsensusStuckState {
-            current_ledger: 100,
-            first_buffered: 101,
-            stuck_start: std::time::Instant::now(),
-            last_recovery_attempt: std::time::Instant::now(),
-            recovery_attempts: 0,
-            catchup_triggered: false,
+        // Spawned task: hold archive_behind_until.write() until signalled.
+        let app2 = Arc::clone(&app);
+        let ready2 = Arc::clone(&ready);
+        let release2 = Arc::clone(&release);
+        let blocker = tokio::spawn(async move {
+            let _guard = app2.archive_behind_until.write().await;
+            ready2.notify_one();
+            release2.notified().await;
         });
-        drop(write_guard);
 
-        let read_guard = app.consensus_stuck_state.read().await;
-        assert_eq!(
-            read_guard.as_ref().map(|s| s.current_ledger),
-            Some(100),
-            "should be able to write and read consensus_stuck_state while archive_behind_until is blocked"
+        // Wait for the blocker to acquire the write lock.
+        ready.notified().await;
+
+        // Now `archive_behind_until.read()` will block. In the old code,
+        // `maybe_start_buffered_catchup` would hold `consensus_stuck_state.write()`
+        // while blocked on that read, preventing anyone else from accessing
+        // `consensus_stuck_state`. Spawn the function call with a timeout.
+        let app3 = Arc::clone(&app);
+        let func_handle = tokio::spawn(async move { app3.maybe_start_buffered_catchup().await });
+
+        // Give the function a moment to reach the `archive_behind_until.read()` await.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Key assertion: `consensus_stuck_state` must be freely accessible
+        // even though `maybe_start_buffered_catchup` is blocked on
+        // `archive_behind_until`. With the old code this would deadlock.
+        let css_result =
+            tokio::time::timeout(Duration::from_millis(200), app.consensus_stuck_state.read())
+                .await;
+        assert!(
+            css_result.is_ok(),
+            "consensus_stuck_state must not be held while archive_behind_until is blocked (#1873)"
         );
+
+        // Clean up: release the blocker so the function can proceed.
+        release.notify_one();
+        blocker.await.unwrap();
+
+        // Let the function finish (it will complete now that
+        // archive_behind_until is released).
+        let _ = tokio::time::timeout(Duration::from_secs(2), func_handle).await;
     }
 }
