@@ -477,9 +477,10 @@ impl App {
                 .seed_stale(caught_up_checkpoint);
         }
 
-        // Clear archive-behind backoff — a successful catchup proves the
-        // archive is now publishing, so the next recovery cycle (if any)
-        // should query freshly.
+        // Clear archive-behind backoff and confirmed-behind signal (#1867) —
+        // a successful catchup proves the archive is now publishing, so the
+        // next recovery cycle (if any) should query freshly.
+        self.archive_confirmed_behind.store(false, Ordering::SeqCst);
         {
             let mut guard = self.archive_behind_until.write().await;
             *guard = None;
@@ -1357,7 +1358,8 @@ impl App {
         // Lock order: archive_behind_until → syncing_ledgers → consensus_stuck_state
         // (matches existing precedent at consensus.rs trigger_recovery_catchup).
 
-        // 1. Clear archive-behind backoff.
+        // 1. Clear archive-behind backoff and confirmed-behind signal (#1867).
+        self.archive_confirmed_behind.store(false, Ordering::SeqCst);
         let archive_behind_until_was_armed = {
             let mut guard = self.archive_behind_until.write().await;
             let was = guard.is_some();
@@ -1737,12 +1739,19 @@ impl App {
                             // checkpoint? When true, suppress TriggerCatchup —
                             // spawning catchup would only hit the skip path
                             // and spin. HardReset is the escape hatch.
+                            //
+                            // Two sources: the dedicated `archive_confirmed_behind`
+                            // flag set by `trigger_recovery_catchup` (#1867),
+                            // and the query-suppression deadline set by the
+                            // catchup validation paths.  Either is sufficient.
                             self.set_phase_sub(PHASE_13_5_BUFFERED_ARCHIVE_BEHIND_READ);
-                            let archive_behind = self
-                                .archive_behind_until
-                                .read()
-                                .await
-                                .is_some_and(|deadline| self.clock.now() < deadline);
+                            let archive_behind =
+                                self.archive_confirmed_behind.load(Ordering::SeqCst)
+                                    || self
+                                        .archive_behind_until
+                                        .read()
+                                        .await
+                                        .is_some_and(|deadline| self.clock.now() < deadline);
 
                             // Unified recovery counter: max of the per-stuck
                             // counter and the consensus-tick atomic. See #1831.

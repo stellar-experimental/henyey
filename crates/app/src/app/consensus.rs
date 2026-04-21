@@ -196,9 +196,10 @@ impl App {
                 .store(current_ledger as u64, Ordering::SeqCst);
             self.recovery_attempts_without_progress
                 .store(0, Ordering::SeqCst);
-            // Also clear any archive-behind backoff and urgent cache mode —
-            // the node is advancing again, so the next stall (if any) should
-            // query fresh.
+            // Also clear any archive-behind backoff, the confirmed-behind
+            // signal (#1867), and urgent cache mode — the node is advancing
+            // again, so the next stall (if any) should query fresh.
+            self.archive_confirmed_behind.store(false, Ordering::SeqCst);
             let mut guard = self.archive_behind_until.write().await;
             *guard = None;
             self.archive_checkpoint_cache.set_urgent(false);
@@ -984,8 +985,9 @@ impl App {
         } else {
             match self.get_cached_archive_checkpoint_nonblocking() {
                 Some(latest) if latest >= next_cp => {
-                    // Archive is current enough — clear any prior backoff
-                    // and urgent mode.
+                    // Archive is current enough — clear any prior backoff,
+                    // urgent mode, and the confirmed-behind signal (#1867).
+                    self.archive_confirmed_behind.store(false, Ordering::SeqCst);
                     let mut guard = self.archive_behind_until.write().await;
                     *guard = None;
                     self.archive_checkpoint_cache.set_urgent(false);
@@ -1000,18 +1002,25 @@ impl App {
                     // window — delaying detection of a newly-published
                     // checkpoint by up to 120 s (see #1847).
                     //
-                    // Instead, enable urgent-mode on the cache so the TTL
+                    // Instead, signal the stuck state machine via the
+                    // dedicated `archive_confirmed_behind` flag (#1867)
+                    // so it can see `archive_behind=true` on the next
+                    // evaluation without waiting for the slower
+                    // TriggerCatchup→validation→backoff pipeline.
+                    //
+                    // Also enable urgent-mode on the cache so the TTL
                     // drops to ~10 s, and let the normal recovery timer
                     // (10 s) drive the re-check cadence.  The catchup_impl
                     // validation paths still arm their own backoff
                     // independently (see `arm_archive_behind_backoff`).
+                    self.archive_confirmed_behind.store(true, Ordering::SeqCst);
                     if self.tx_set_all_peers_exhausted.load(Ordering::SeqCst) {
                         self.archive_checkpoint_cache.set_urgent(true);
                     }
                     tracing::debug!(
                         archive_latest = latest,
                         next_checkpoint = next_cp,
-                        "Archive behind next checkpoint — relying on cache TTL"
+                        "Archive behind next checkpoint — signaled stuck state machine"
                     );
                     None
                 }

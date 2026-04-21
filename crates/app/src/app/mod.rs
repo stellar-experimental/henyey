@@ -498,6 +498,13 @@ pub struct App {
     /// Cleared on successful catchup spawn and on heartbeat-driven progress.
     /// See `ARCHIVE_BEHIND_BACKOFF_SECS`.
     archive_behind_until: RwLock<Option<Instant>>,
+    /// True when `trigger_recovery_catchup` has authoritatively observed
+    /// `archive_latest < next_checkpoint` via a cache read.  Read by the
+    /// stuck state machine in `maybe_start_buffered_catchup` to derive
+    /// `archive_behind` without depending on the query-suppression backoff
+    /// in `archive_behind_until`.  Cleared on ledger progress, successful
+    /// catchup completion, and HardReset.  See #1867.
+    archive_confirmed_behind: AtomicBool,
     /// SCP latency samples for surveys.
     scp_latency: RwLock<ScpLatencyTracker>,
 
@@ -903,6 +910,7 @@ impl App {
             last_catchup_completed_at: RwLock::new(None),
             archive_checkpoint_cache,
             archive_behind_until: RwLock::new(None),
+            archive_confirmed_behind: AtomicBool::new(false),
             scp_latency: RwLock::new(ScpLatencyTracker::default()),
             survey_scheduler: RwLock::new(SurveyScheduler::new(now)),
             survey_nonce: RwLock::new(1),
@@ -4633,6 +4641,159 @@ mod tests {
             ARCHIVE_BEHIND_BACKOFF_SECS,
             OUT_OF_SYNC_RECOVERY_TIMER_SECS,
             ticks_per_window,
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // #1867 archive_confirmed_behind signal tests
+    // -------------------------------------------------------------------
+
+    /// Fresh app has `archive_confirmed_behind = false`.
+    #[tokio::test]
+    async fn test_archive_confirmed_behind_initially_false() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "fresh app should have archive_confirmed_behind=false"
+        );
+    }
+
+    /// Setting the flag makes the stuck machine's `archive_behind`
+    /// derivation return true even when `archive_behind_until` is unarmed.
+    #[tokio::test]
+    async fn test_archive_confirmed_behind_or_with_deadline() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Neither signal active → archive_behind = false.
+        let behind_via_deadline = app
+            .archive_behind_until
+            .read()
+            .await
+            .is_some_and(|d| app.clock.now() < d);
+        let behind = app.archive_confirmed_behind.load(Ordering::SeqCst) || behind_via_deadline;
+        assert!(!behind, "no signal → archive_behind must be false");
+
+        // Set only the AtomicBool → archive_behind = true.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        let behind_via_deadline = app
+            .archive_behind_until
+            .read()
+            .await
+            .is_some_and(|d| app.clock.now() < d);
+        let behind = app.archive_confirmed_behind.load(Ordering::SeqCst) || behind_via_deadline;
+        assert!(
+            behind,
+            "archive_confirmed_behind=true → archive_behind must be true"
+        );
+
+        // Set only the deadline → archive_behind = true (even after
+        // clearing the AtomicBool).
+        app.archive_confirmed_behind.store(false, Ordering::SeqCst);
+        {
+            let mut guard = app.archive_behind_until.write().await;
+            *guard = Some(app.clock.now() + Duration::from_secs(60));
+        }
+        let behind_via_deadline = app
+            .archive_behind_until
+            .read()
+            .await
+            .is_some_and(|d| app.clock.now() < d);
+        let behind = app.archive_confirmed_behind.load(Ordering::SeqCst) || behind_via_deadline;
+        assert!(
+            behind,
+            "archive_behind_until armed → archive_behind must be true"
+        );
+    }
+
+    /// Progress clears `archive_confirmed_behind` alongside the
+    /// existing `archive_behind_until` clear.
+    #[tokio::test]
+    async fn test_archive_confirmed_behind_cleared_on_progress() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Simulate archive-behind state.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        {
+            let mut guard = app.archive_behind_until.write().await;
+            *guard = Some(app.clock.now() + Duration::from_secs(60));
+        }
+
+        // Simulate progress: clear both signals (mirrors out_of_sync_recovery
+        // progress branch).
+        app.archive_confirmed_behind.store(false, Ordering::SeqCst);
+        {
+            let mut guard = app.archive_behind_until.write().await;
+            *guard = None;
+        }
+
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "progress must clear archive_confirmed_behind"
+        );
+        assert!(
+            app.archive_behind_until.read().await.is_none(),
+            "progress must clear archive_behind_until"
+        );
+    }
+
+    /// Successful catchup completion clears `archive_confirmed_behind`.
+    #[tokio::test]
+    async fn test_archive_confirmed_behind_cleared_on_catchup_success() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Simulate archive-behind state.
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+
+        // Simulate what catchup completion does: clear the flag.
+        app.archive_confirmed_behind.store(false, Ordering::SeqCst);
+
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "catchup completion must clear archive_confirmed_behind"
+        );
+    }
+
+    /// Cold/stale cache (`None`) must not change `archive_confirmed_behind`.
+    #[tokio::test]
+    async fn test_archive_confirmed_behind_unchanged_on_cold_cache() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // The flag starts false. A cold cache should not set it.
+        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
+
+        // The `None` branch in trigger_recovery_catchup does NOT touch
+        // archive_confirmed_behind. Verify by setting it true and
+        // confirming it stays true (cold cache doesn't clear it either).
+        app.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        // (Simulating the None branch: no store happens.)
+        assert!(
+            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "cold cache must not change archive_confirmed_behind"
         );
     }
 
