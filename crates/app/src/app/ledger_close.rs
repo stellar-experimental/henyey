@@ -2131,13 +2131,15 @@ impl App {
                 std::thread::sleep(std::time::Duration::from_millis(inject_blocking_ms));
             }
 
-            // === Closure-local field extraction (was preamble pre-#1780) =====
+            // === Sub-phase 0: Closure-local field extraction ================
             //
             // All of the following computations used to run on the event
             // loop between the `overlay_bookkeeping_ms` and
             // `spawn_blocking_setup_ms` marks. They are pure sync CPU with
             // no `.await`/lock requirements, so they moved inside
             // `spawn_blocking` to free ~670 ms of event-loop time (#1780).
+            let prep_start = std::time::Instant::now();
+
             let ledger_flags = match &result_header.ext {
                 stellar_xdr::curr::LedgerHeaderExt::V0 => 0,
                 stellar_xdr::curr::LedgerHeaderExt::V1(ext) => ext.flags,
@@ -2190,9 +2192,11 @@ impl App {
             let upper_bound_offset =
                 expected_close_secs * EXPECTED_CLOSE_TIME_MULT + close_time_drift;
 
-            // Sub-phase 1: herder.ledger_closed + ban failed txs.
-            // `herder.ledger_closed` runs `tx_queue.remove_applied`, cleanup,
-            // scp purge, and fetching-envelopes erase. All sync.
+            metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_PREP_SECONDS)
+                .record(prep_start.elapsed().as_secs_f64());
+
+            // === Sub-phase 1: herder.ledger_closed + ban failed txs ==========
+            let phase1_start = std::time::Instant::now();
             herder.ledger_closed(
                 ledger_seq as u64,
                 &applied_txs,
@@ -2206,8 +2210,11 @@ impl App {
                 );
                 herder.tx_queue().ban(&failed_hashes_for_ban);
             }
+            metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS)
+                .record(phase1_start.elapsed().as_secs_f64());
 
-            // Sub-phase 2: tx_queue invalidation.
+            // === Sub-phase 2: validation context update + shift ==============
+            let phase2_start = std::time::Instant::now();
             herder.tx_queue().update_validation_context(
                 ledger_seq,
                 close_time_ctx,
@@ -2224,8 +2231,12 @@ impl App {
             }
 
             let shift_result = herder.tx_queue().shift();
+            metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS)
+                .record(phase2_start.elapsed().as_secs_f64());
 
-            let pending_envs = herder.tx_queue().pending_envelopes();
+            // === Sub-phase 3: snapshot build + Sub-phase 4: invalidation =====
+            let phase3_start = std::time::Instant::now();
+            let pending_envs = herder.tx_queue().pending_hashed_envelopes();
             let mut invalid_banned = 0usize;
             if !pending_envs.is_empty() {
                 let ctx = TxSetValidationContext {
@@ -2257,8 +2268,13 @@ impl App {
                 // passing `None` providers). We must NOT fall back to
                 // the per-call providers — that would silently
                 // re-introduce the quadratic path.
-                let invalid = match SnapshotValidationProviders::new(&ledger_manager) {
-                    Ok(providers) => get_invalid_tx_list(
+                let snapshot_result = SnapshotValidationProviders::new(&ledger_manager);
+                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_SECONDS)
+                    .record(phase3_start.elapsed().as_secs_f64());
+
+                let phase4_start = std::time::Instant::now();
+                let invalid = match snapshot_result {
+                    Ok(providers) => henyey_herder::get_invalid_hashed_tx_list(
                         &pending_envs,
                         &ctx,
                         &CloseTimeBounds::with_offsets(0, upper_bound_offset),
@@ -2277,10 +2293,19 @@ impl App {
                 };
                 if !invalid.is_empty() {
                     let invalid_hashes: Vec<Hash256> =
-                        invalid.iter().map(|env| Hash256::hash_xdr(env)).collect();
+                        invalid.iter().map(|htx| htx.hash()).collect();
                     invalid_banned = invalid_hashes.len();
                     herder.tx_queue().ban(&invalid_hashes);
                 }
+                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_INVALIDATION_SECONDS)
+                    .record(phase4_start.elapsed().as_secs_f64());
+            } else {
+                // Queue empty: record the pending_hashed_envelopes() cost
+                // in snapshot, and zero for invalidation.
+                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_SNAPSHOT_SECONDS)
+                    .record(phase3_start.elapsed().as_secs_f64());
+                metrics::histogram!(crate::metrics::CLOSE_TX_QUEUE_INVALIDATION_SECONDS)
+                    .record(0.0);
             }
 
             (shift_result, invalid_banned)

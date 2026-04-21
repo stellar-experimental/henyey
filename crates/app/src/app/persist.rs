@@ -269,6 +269,8 @@ impl PersistJob {
                 ledger_manager,
                 bucket_dir,
             } => {
+                let persist_start = std::time::Instant::now();
+
                 flush_hot_archive_and_buckets_sync(&ledger_manager, &bucket_dir);
 
                 if let Err(e) = write_fn(&db) {
@@ -285,6 +287,9 @@ impl PersistJob {
                         );
                     }
                 }
+
+                metrics::histogram!(crate::metrics::PERSIST_LEDGER_CLOSE_SECONDS)
+                    .record(persist_start.elapsed().as_secs_f64());
             }
         }
     }

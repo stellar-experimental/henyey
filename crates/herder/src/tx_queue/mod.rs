@@ -1260,6 +1260,21 @@ impl TransactionQueue {
         store.values().map(|qt| qt.envelope.clone()).collect()
     }
 
+    /// Return all queued transactions as pre-hashed pairs (Phase 6 optimization).
+    ///
+    /// Avoids redundant `Hash256::hash_xdr()` in the post-close invalidation
+    /// path by reusing the hash computed at queue admission time.
+    pub fn pending_hashed_envelopes(&self) -> Vec<crate::tx_set_utils::HashedTx> {
+        let store = self.store.read();
+        store
+            .values()
+            .map(|qt| crate::tx_set_utils::HashedTx {
+                hash: qt.hash,
+                envelope: qt.envelope.clone(),
+            })
+            .collect()
+    }
+
     /// Update Soroban resource limits dynamically after ledger close.
     ///
     /// Called with limits derived from `SorobanNetworkInfo` multiplied by
@@ -4954,6 +4969,36 @@ mod tests {
 
         let pending = queue.pending_envelopes();
         assert_eq!(pending.len(), 2);
+    }
+
+    /// `pending_hashed_envelopes` returns correct hashes matching `Hash256::hash_xdr`.
+    #[test]
+    fn test_pending_hashed_envelopes_returns_correct_hashes() {
+        let queue = TransactionQueue::with_defaults();
+
+        let mut tx1 = make_test_envelope(200, 1);
+        set_source(&mut tx1, 10);
+        let mut tx2 = make_test_envelope(300, 1);
+        set_source(&mut tx2, 20);
+
+        let hash1 = Hash256::hash_xdr(&tx1);
+        let hash2 = Hash256::hash_xdr(&tx2);
+
+        assert_eq!(queue.try_add(tx1), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx2), TxQueueResult::Added);
+
+        let pending = queue.pending_hashed_envelopes();
+        assert_eq!(pending.len(), 2);
+
+        let returned_hashes: std::collections::HashSet<Hash256> =
+            pending.iter().map(|htx| htx.hash()).collect();
+        assert!(returned_hashes.contains(&hash1));
+        assert!(returned_hashes.contains(&hash2));
+
+        // Verify each hash matches hash_xdr of its envelope.
+        for htx in &pending {
+            assert_eq!(htx.hash(), Hash256::hash_xdr(htx.envelope()));
+        }
     }
 
     /// Dynamic Soroban resource limits override static config.

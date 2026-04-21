@@ -251,6 +251,15 @@ impl App {
                     }
                 } => {
                     self.set_phase(6); // 6 = pending_close
+                    // Phase 6: Record close-cycle metric (deferred pipeline only).
+                    {
+                        let mut last_start = self.close_cycle_last_start.lock();
+                        if let Some(prev) = *last_start {
+                            metrics::histogram!(crate::metrics::CLOSE_CYCLE_SECONDS)
+                                .record(prev.elapsed().as_secs_f64());
+                        }
+                        *last_start = Some(std::time::Instant::now());
+                    }
                     tracing::debug!(select_iteration, "BRANCH: pending_close completed");
                     let pending = close_pipeline.take_close();
                     let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();

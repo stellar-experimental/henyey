@@ -66,7 +66,6 @@ use henyey_db::schema::state_keys;
 use henyey_herder::{
     drift_tracker::CloseTimeDriftTracker,
     flow_control::compute_max_tx_size,
-    get_invalid_tx_list,
     sync_recovery::{SyncRecoveryCallback, SyncRecoveryHandle, SyncRecoveryManager},
     CloseTimeBounds, EnvelopeState, Herder, HerderConfig, HerderStats, TxQueueConfig,
     TxSetValidationContext,
@@ -559,6 +558,11 @@ pub struct App {
     /// Whether ledger application is currently in progress (for sync recovery).
     is_applying_ledger: AtomicBool,
 
+    /// Wall-clock of the last deferred-pipeline close-complete entry.
+    /// Used to compute `henyey_close_cycle_seconds` — the time between
+    /// consecutive production close-complete events.
+    close_cycle_last_start: parking_lot::Mutex<Option<std::time::Instant>>,
+
     /// Test-only: injects a synthetic blocking sleep (in milliseconds) inside
     /// the post-close tx-queue update `spawn_blocking` closure (#1775 Phase 2).
     ///
@@ -936,6 +940,7 @@ impl App {
             last_soroban_max_cluster_count: AtomicU64::new(0),
             sync_recovery_handle: parking_lot::RwLock::new(None), // Initialized in run() when needed
             is_applying_ledger: AtomicBool::new(false),
+            close_cycle_last_start: parking_lot::Mutex::new(None),
             #[cfg(test)]
             close_complete_inject_blocking_ms: AtomicU64::new(0),
             #[cfg(test)]

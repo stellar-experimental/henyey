@@ -209,6 +209,18 @@ pub const CLOSE_COMPLETE_TX_QUEUE_SECONDS: &str = "henyey_close_complete_tx_queu
 pub const CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS: &str =
     "henyey_close_complete_post_close_bookkeeping_seconds";
 
+// Phase 6 — Sub-phase instrumentation inside tx_queue spawn_blocking.
+pub const CLOSE_TX_QUEUE_PREP_SECONDS: &str = "henyey_close_tx_queue_prep_seconds";
+pub const CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS: &str =
+    "henyey_close_tx_queue_ledger_closed_seconds";
+pub const CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS: &str = "henyey_close_tx_queue_shift_update_seconds";
+pub const CLOSE_TX_QUEUE_SNAPSHOT_SECONDS: &str = "henyey_close_tx_queue_snapshot_seconds";
+pub const CLOSE_TX_QUEUE_INVALIDATION_SECONDS: &str = "henyey_close_tx_queue_invalidation_seconds";
+
+// Phase 6 — Persist and close-cycle instrumentation.
+pub const PERSIST_LEDGER_CLOSE_SECONDS: &str = "henyey_persist_ledger_close_seconds";
+pub const CLOSE_CYCLE_SECONDS: &str = "henyey_close_cycle_seconds";
+
 // Phase 5 — Slot-to-close latency histogram.
 pub const SLOT_TO_CLOSE_LATENCY_SECONDS: &str = "henyey_slot_to_close_latency_seconds";
 
@@ -766,6 +778,38 @@ pub fn describe_metrics() {
     describe_histogram!(
         CLOSE_COMPLETE_POST_CLOSE_BOOKKEEPING_SECONDS,
         "Close-complete post_close_bookkeeping phase (seconds)"
+    );
+
+    // Phase 6: Sub-phase instrumentation inside tx_queue spawn_blocking.
+    describe_histogram!(
+        CLOSE_TX_QUEUE_PREP_SECONDS,
+        "tx_queue spawn_blocking closure-local prep (Soroban limits, close-time math) (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_TX_QUEUE_LEDGER_CLOSED_SECONDS,
+        "tx_queue spawn_blocking herder.ledger_closed + ban failed txs (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_TX_QUEUE_SHIFT_UPDATE_SECONDS,
+        "tx_queue spawn_blocking validation context update + Soroban limits + shift (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_TX_QUEUE_SNAPSHOT_SECONDS,
+        "tx_queue spawn_blocking pending_hashed_envelopes + snapshot build (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_TX_QUEUE_INVALIDATION_SECONDS,
+        "tx_queue spawn_blocking get_invalid_hashed_tx_list + ban invalid (seconds)"
+    );
+
+    // Phase 6: Persist and close-cycle instrumentation.
+    describe_histogram!(
+        PERSIST_LEDGER_CLOSE_SECONDS,
+        "PersistJob::LedgerClose wall-clock duration (seconds, excludes scheduling delay)"
+    );
+    describe_histogram!(
+        CLOSE_CYCLE_SECONDS,
+        "Wall-clock between consecutive deferred-pipeline close-complete events (seconds)"
     );
 
     // Phase 5: Slot-to-close latency.

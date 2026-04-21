@@ -28,6 +28,40 @@ use tracing::{debug, warn};
 
 use crate::tx_queue::{AccountProvider, FeeBalanceProvider};
 
+/// A transaction envelope paired with its pre-computed hash.
+///
+/// Used by the post-close invalidation hot path to avoid redundant
+/// `Hash256::hash_xdr()` calls. The hash is pre-computed at queue
+/// admission time in `QueuedTransaction::new()`.
+///
+/// Fields are private to enforce the invariant that `hash` always
+/// matches `Hash256::hash_xdr(&envelope)`.
+#[derive(Debug, Clone)]
+pub struct HashedTx {
+    pub(crate) hash: Hash256,
+    pub(crate) envelope: TransactionEnvelope,
+}
+
+impl HashedTx {
+    /// Create a new `HashedTx` by computing the hash from the envelope.
+    pub fn new(envelope: TransactionEnvelope) -> Self {
+        let hash = Hash256::hash_xdr(&envelope);
+        Self { hash, envelope }
+    }
+
+    pub fn hash(&self) -> Hash256 {
+        self.hash
+    }
+
+    pub fn envelope(&self) -> &TransactionEnvelope {
+        &self.envelope
+    }
+
+    pub fn into_envelope(self) -> TransactionEnvelope {
+        self.envelope
+    }
+}
+
 /// Unified account + fee-balance provider backed by a single ledger snapshot.
 ///
 /// Creates one snapshot at construction time and reuses it for all lookups,
@@ -661,17 +695,82 @@ pub fn get_invalid_tx_list_with_fee_map(
     account_provider: Option<&dyn AccountProvider>,
     account_fee_map: &mut HashMap<AccountId, i64>,
 ) -> Vec<TransactionEnvelope> {
+    let hashed: Vec<HashedTx> = txs
+        .iter()
+        .map(|tx| HashedTx {
+            hash: Hash256::hash_xdr(tx),
+            envelope: tx.clone(),
+        })
+        .collect();
+    let invalid_hashed = get_invalid_hashed_core(
+        &hashed,
+        ctx,
+        close_time_bounds,
+        fee_balance_provider,
+        account_provider,
+        account_fee_map,
+    );
+    invalid_hashed.into_iter().map(|htx| htx.envelope).collect()
+}
+
+/// Invalidation for pre-hashed transactions (queue path).
+///
+/// Same logic as [`get_invalid_tx_list_with_fee_map`] but accepts `&[HashedTx]`
+/// to avoid redundant hash computation. Returns `Vec<HashedTx>` so callers
+/// get hashes without re-computation (e.g. for banning).
+pub fn get_invalid_hashed_tx_list_with_fee_map(
+    txs: &[HashedTx],
+    ctx: &TxSetValidationContext,
+    close_time_bounds: &CloseTimeBounds,
+    fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_provider: Option<&dyn AccountProvider>,
+    account_fee_map: &mut HashMap<AccountId, i64>,
+) -> Vec<HashedTx> {
+    get_invalid_hashed_core(
+        txs,
+        ctx,
+        close_time_bounds,
+        fee_balance_provider,
+        account_provider,
+        account_fee_map,
+    )
+}
+
+/// Convenience wrapper that creates a local fee map.
+pub fn get_invalid_hashed_tx_list(
+    txs: &[HashedTx],
+    ctx: &TxSetValidationContext,
+    close_time_bounds: &CloseTimeBounds,
+    fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_provider: Option<&dyn AccountProvider>,
+) -> Vec<HashedTx> {
+    let mut account_fee_map: HashMap<AccountId, i64> = HashMap::new();
+    get_invalid_hashed_core(
+        txs,
+        ctx,
+        close_time_bounds,
+        fee_balance_provider,
+        account_provider,
+        &mut account_fee_map,
+    )
+}
+
+/// Private core: validates transactions and returns invalid ones with hashes.
+///
+/// Accepts pre-hashed transactions. In pass 1, caches `fee_source_id` from the
+/// `TransactionFrame` constructed for validation. In pass 2, looks up fee source
+/// from the cache instead of constructing a new frame.
+fn get_invalid_hashed_core(
+    txs: &[HashedTx],
+    ctx: &TxSetValidationContext,
+    close_time_bounds: &CloseTimeBounds,
+    fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+    account_provider: Option<&dyn AccountProvider>,
+    account_fee_map: &mut HashMap<AccountId, i64>,
+) -> Vec<HashedTx> {
     let mut invalid_txs = Vec::new();
     let mut seen_invalid: HashSet<Hash256> = HashSet::new();
 
-    // For time bounds validation during nomination, upstream uses the
-    // upper bound close time for max_time checks and lower bound for
-    // min_time checks. We approximate this by validating with the upper
-    // bound close time (which is the more permissive direction for max_time)
-    // and then checking again with the lower bound for min_time.
-    //
-    // When both offsets are 0 (post-close validation), this simplifies to
-    // a single validation with the exact close time.
     let upper_close_time = ctx
         .close_time
         .saturating_add(close_time_bounds.upper_bound_offset);
@@ -680,11 +779,13 @@ pub fn get_invalid_tx_list_with_fee_map(
         .saturating_add(close_time_bounds.lower_bound_offset);
 
     let upper_ledger_ctx = ctx.to_ledger_context(upper_close_time);
-    // Only build lower context if offsets differ (optimization for common case).
     let need_lower_check = lower_close_time != upper_close_time;
 
-    for tx in txs {
-        let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);
+    // Pass-1 fee_source cache: avoids TransactionFrame construction in pass 2.
+    let mut fee_source_cache: HashMap<Hash256, AccountId> = HashMap::new();
+
+    for htx in txs {
+        let frame = TransactionFrame::from_owned_with_network(htx.envelope.clone(), ctx.network_id);
 
         // Stateless structural + per-op validation (shared with queue admission).
         if check_valid_pre_seq_num_with_config(
@@ -695,8 +796,8 @@ pub fn get_invalid_tx_list_with_fee_map(
         )
         .is_err()
         {
-            seen_invalid.insert(Hash256::hash_xdr(tx));
-            invalid_txs.push(tx.clone());
+            seen_invalid.insert(htx.hash);
+            invalid_txs.push(htx.clone());
             continue;
         }
 
@@ -704,28 +805,26 @@ pub fn get_invalid_tx_list_with_fee_map(
         let upper_result = validate_basic(&frame, &upper_ledger_ctx);
 
         if upper_result.is_err() {
-            seen_invalid.insert(Hash256::hash_xdr(tx));
-            invalid_txs.push(tx.clone());
+            seen_invalid.insert(htx.hash);
+            invalid_txs.push(htx.clone());
             continue;
         }
 
-        // If offsets differ, also validate with lower bound close time
-        // (catches min_time violations).
+        // If offsets differ, also validate with lower bound close time.
         if need_lower_check {
             let lower_ledger_ctx = ctx.to_ledger_context(lower_close_time);
             if validate_basic(&frame, &lower_ledger_ctx).is_err() {
-                seen_invalid.insert(Hash256::hash_xdr(tx));
-                invalid_txs.push(tx.clone());
+                seen_invalid.insert(htx.hash);
+                invalid_txs.push(htx.clone());
                 continue;
             }
         }
 
         // Stateful validation: sequence, auth, and signature checks.
-        // Mirrors stellar-core's checkValid() path within getInvalidTxListWithErrors.
         if let Some(provider) = account_provider {
             if !validate_tx_for_tx_set(&frame, ctx, lower_close_time, provider) {
-                seen_invalid.insert(Hash256::hash_xdr(tx));
-                invalid_txs.push(tx.clone());
+                seen_invalid.insert(htx.hash);
+                invalid_txs.push(htx.clone());
                 continue;
             }
         }
@@ -734,29 +833,32 @@ pub fn get_invalid_tx_list_with_fee_map(
         if fee_balance_provider.is_some() {
             let fee_source = frame.fee_source_account_id();
             let full_fee = frame.total_fee();
-            let entry = account_fee_map.entry(fee_source).or_insert(0i64);
+            let entry = account_fee_map.entry(fee_source.clone()).or_insert(0i64);
             // Saturating add to avoid overflow (matches stellar-core).
             *entry = entry.saturating_add(full_fee);
+            // Cache fee_source for pass-2 lookup.
+            fee_source_cache.insert(htx.hash, fee_source);
         }
     }
 
     // --- Pass 2: fee-source affordability check ---
     if let Some(provider) = fee_balance_provider {
-        for tx in txs {
-            // Skip transactions already marked invalid.
-            if seen_invalid.contains(&Hash256::hash_xdr(tx)) {
+        for htx in txs {
+            if seen_invalid.contains(&htx.hash) {
                 continue;
             }
 
-            let frame = TransactionFrame::from_owned_with_network(tx.clone(), ctx.network_id);
-            let fee_source = frame.fee_source_account_id();
+            let fee_source = match fee_source_cache.get(&htx.hash) {
+                Some(fs) => fs,
+                None => continue,
+            };
 
-            let available = provider.get_available_balance(&fee_source).unwrap_or(0);
-            let total_fee = account_fee_map.get(&fee_source).copied().unwrap_or(0);
+            let available = provider.get_available_balance(fee_source).unwrap_or(0);
+            let total_fee = account_fee_map.get(fee_source).copied().unwrap_or(0);
 
             if available < total_fee {
-                invalid_txs.push(tx.clone());
-                seen_invalid.insert(Hash256::hash_xdr(tx));
+                invalid_txs.push(htx.clone());
+                seen_invalid.insert(htx.hash);
                 tracing::debug!(
                     fee_source = ?fee_source,
                     available_balance = available,
@@ -3594,6 +3696,202 @@ mod tests {
         assert!(
             invalid.is_empty(),
             "without account provider, sequence check is skipped (documents pre-fix gap)"
+        );
+    }
+
+    // ── Phase 6: HashedTx + hashed invalidation tests ──────────────────
+
+    #[test]
+    fn test_hashed_invalidation_parity_with_envelope_api() {
+        // Verify that get_invalid_hashed_tx_list produces identical results
+        // to get_invalid_tx_list for the same inputs.
+        let valid_env = make_valid_envelope(100, 1);
+        let low_fee_env = make_low_fee_envelope(1);
+        let expired_env = make_expired_time_envelope(1);
+        let txs = vec![valid_env.clone(), low_fee_env.clone(), expired_env.clone()];
+
+        let ctx = TxSetValidationContext {
+            next_ledger_seq: 100,
+            close_time: 1000,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            protocol_version: 21,
+            network_id: NetworkId::testnet(),
+            ledger_flags: 0,
+            max_contract_size_bytes: None,
+        };
+        let bounds = CloseTimeBounds::with_offsets(0, 0);
+
+        // Get results from both APIs.
+        let invalid_envelopes = get_invalid_tx_list(&txs, &ctx, &bounds, None, None);
+        let hashed_txs: Vec<HashedTx> = txs
+            .iter()
+            .map(|tx| HashedTx {
+                hash: Hash256::hash_xdr(tx),
+                envelope: tx.clone(),
+            })
+            .collect();
+        let invalid_hashed = get_invalid_hashed_tx_list(&hashed_txs, &ctx, &bounds, None, None);
+
+        // Same count.
+        assert_eq!(invalid_envelopes.len(), invalid_hashed.len());
+
+        // Same hashes.
+        let env_hashes: HashSet<Hash256> = invalid_envelopes
+            .iter()
+            .map(|e| Hash256::hash_xdr(e))
+            .collect();
+        let hashed_hashes: HashSet<Hash256> = invalid_hashed.iter().map(|h| h.hash).collect();
+        assert_eq!(env_hashes, hashed_hashes);
+    }
+
+    #[test]
+    fn test_hashed_tx_hash_matches_hash_xdr() {
+        // Verify that HashedTx::new() computes the correct hash.
+        let env = make_valid_envelope(200, 42);
+        let expected_hash = Hash256::hash_xdr(&env);
+        let htx = HashedTx::new(env.clone());
+        assert_eq!(htx.hash(), expected_hash);
+        assert_eq!(Hash256::hash_xdr(htx.envelope()), expected_hash);
+    }
+
+    #[test]
+    fn test_hashed_invalidation_fee_source_affordability() {
+        // Submit multiple txs from the same source whose combined fees
+        // exceed the available balance. All should pass pass-1 validation
+        // but the fee-source affordability check in pass-2 should catch them.
+        let key_bytes = [0u8; 32];
+        let env1 = make_valid_envelope(6_000_000, 1); // fee = 6M
+        let env2 = make_valid_envelope(6_000_000, 2); // fee = 6M, total = 12M
+
+        let mut fee_provider = MockFeeBalanceProvider::new();
+        fee_provider.set_balance(key_bytes, 10_000_000); // only 10M available
+
+        let ctx = TxSetValidationContext {
+            next_ledger_seq: 100,
+            close_time: 1000,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            protocol_version: 21,
+            network_id: NetworkId::testnet(),
+            ledger_flags: 0,
+            max_contract_size_bytes: None,
+        };
+        let bounds = CloseTimeBounds::with_offsets(0, 0);
+
+        // Test with hashed API.
+        let hashed_txs: Vec<HashedTx> = [env1.clone(), env2.clone()]
+            .iter()
+            .map(|tx| HashedTx {
+                hash: Hash256::hash_xdr(tx),
+                envelope: tx.clone(),
+            })
+            .collect();
+        let invalid = get_invalid_hashed_tx_list(
+            &hashed_txs,
+            &ctx,
+            &bounds,
+            Some(&fee_provider as &dyn FeeBalanceProvider),
+            None,
+        );
+        // At least one tx should be marked invalid due to fee affordability.
+        assert!(
+            !invalid.is_empty(),
+            "expected fee-source affordability to reject at least one tx"
+        );
+    }
+
+    #[test]
+    fn test_hashed_invalidation_cross_phase_fee_sharing() {
+        // Verify get_invalid_hashed_tx_list_with_fee_map correctly
+        // accumulates fees across phases via the shared fee map.
+        let key_bytes = [0u8; 32];
+        let env1 = make_valid_envelope(4_000_000, 1);
+        let env2 = make_valid_envelope(4_000_000, 2);
+
+        let mut fee_provider = MockFeeBalanceProvider::new();
+        fee_provider.set_balance(key_bytes, 6_000_000); // 6M available
+
+        let ctx = TxSetValidationContext {
+            next_ledger_seq: 100,
+            close_time: 1000,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            protocol_version: 21,
+            network_id: NetworkId::testnet(),
+            ledger_flags: 0,
+            max_contract_size_bytes: None,
+        };
+        let bounds = CloseTimeBounds::with_offsets(0, 0);
+
+        // Phase 1: first tx consumes 4M.
+        let mut shared_fee_map: HashMap<AccountId, i64> = HashMap::new();
+        let hashed1 = vec![HashedTx {
+            hash: Hash256::hash_xdr(&env1),
+            envelope: env1.clone(),
+        }];
+        let invalid1 = get_invalid_hashed_tx_list_with_fee_map(
+            &hashed1,
+            &ctx,
+            &bounds,
+            Some(&fee_provider as &dyn FeeBalanceProvider),
+            None,
+            &mut shared_fee_map,
+        );
+        assert!(invalid1.is_empty(), "first phase: 4M fee within 6M balance");
+
+        // Phase 2: second tx adds another 4M → total 8M > 6M available.
+        let hashed2 = vec![HashedTx {
+            hash: Hash256::hash_xdr(&env2),
+            envelope: env2.clone(),
+        }];
+        let invalid2 = get_invalid_hashed_tx_list_with_fee_map(
+            &hashed2,
+            &ctx,
+            &bounds,
+            Some(&fee_provider as &dyn FeeBalanceProvider),
+            None,
+            &mut shared_fee_map,
+        );
+        assert!(
+            !invalid2.is_empty(),
+            "second phase: 8M cumulative fee exceeds 6M balance"
+        );
+    }
+
+    #[test]
+    fn test_hashed_invalidation_duplicate_hash_handling() {
+        // Verify correct behavior when duplicate envelopes appear in the input.
+        let env = make_valid_envelope(100, 1);
+        let hash = Hash256::hash_xdr(&env);
+        let hashed_txs = vec![
+            HashedTx {
+                hash,
+                envelope: env.clone(),
+            },
+            HashedTx {
+                hash,
+                envelope: env.clone(),
+            },
+        ];
+
+        let ctx = TxSetValidationContext {
+            next_ledger_seq: 100,
+            close_time: 1000,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            protocol_version: 21,
+            network_id: NetworkId::testnet(),
+            ledger_flags: 0,
+            max_contract_size_bytes: None,
+        };
+        let bounds = CloseTimeBounds::with_offsets(0, 0);
+
+        // Without fee provider, both duplicates should pass (no dedup in this function).
+        let invalid = get_invalid_hashed_tx_list(&hashed_txs, &ctx, &bounds, None, None);
+        assert!(
+            invalid.is_empty(),
+            "valid duplicates should both pass when no fee provider"
         );
     }
 }
