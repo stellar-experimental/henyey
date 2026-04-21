@@ -288,7 +288,7 @@ impl OverlayManager {
         let pool = Arc::clone(&self.inbound_pool);
         let peer_handles = Arc::clone(&self.peer_handles);
         let auth_timeout = self.config.auth_timeout_secs;
-        let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
+        let mut shutdown_rx = self.shutdown_tx.lock().as_ref().unwrap().subscribe();
 
         let handle = tokio::spawn(async move {
             loop {

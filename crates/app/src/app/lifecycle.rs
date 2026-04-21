@@ -956,10 +956,20 @@ impl App {
 
         // Drain the close pipeline before shutdown (parity: stellar-core
         // joins the ledger-close thread first in idempotentShutdown).
+        let drain_start = std::time::Instant::now();
         self.drain_close_pipeline(&mut close_pipeline).await;
+        tracing::info!(
+            elapsed_ms = drain_start.elapsed().as_millis() as u64,
+            "Close pipeline drained"
+        );
 
         self.set_state(AppState::ShuttingDown).await;
+        let shutdown_start = std::time::Instant::now();
         self.shutdown_internal().await?;
+        tracing::info!(
+            elapsed_ms = shutdown_start.elapsed().as_millis() as u64,
+            "Shutdown cleanup complete"
+        );
 
         Ok(())
     }
@@ -1538,12 +1548,13 @@ impl App {
                     }
                 }
                 Err(arc) => {
-                    // Other references still exist; just drop and let the
-                    // OverlayManager's Drop impl clean up.
+                    // Other references still exist; signal shutdown through
+                    // &self so peers still receive the shutdown message even
+                    // though we can't join handles without &mut ownership.
                     tracing::warn!(
-                        "Overlay still has outstanding references at shutdown, dropping"
+                        "Overlay still has outstanding references at shutdown, signaling"
                     );
-                    drop(arc);
+                    arc.signal_shutdown();
                 }
             }
         }

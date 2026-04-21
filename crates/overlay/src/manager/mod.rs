@@ -47,7 +47,7 @@ use crate::{
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, Result,
 };
 use dashmap::DashMap;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::seq::SliceRandom;
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -59,7 +59,7 @@ use stellar_xdr::curr::{
 };
 use tokio::sync::{broadcast, mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 
 /// Maximum number of known peer addresses kept in memory.
 ///
@@ -429,8 +429,9 @@ pub struct OverlayManager {
     pub(super) dropped_authenticated_peers: Arc<std::sync::atomic::AtomicU64>,
     /// Banned peers by node ID.
     pub(super) banned_peers: Arc<RwLock<HashSet<PeerId>>>,
-    /// Shutdown signal.
-    pub(super) shutdown_tx: Option<broadcast::Sender<()>>,
+    /// Shutdown signal. Wrapped in `Mutex` for interior mutability so
+    /// `signal_shutdown(&self)` can take it through a shared reference.
+    pub(super) shutdown_tx: Mutex<Option<broadcast::Sender<()>>>,
     /// Cache of peer info for connected peers (lock-free access).
     pub(super) peer_info_cache: Arc<DashMap<PeerId, PeerInfo>>,
     /// Dedicated unbounded channel for SCP messages.
@@ -564,7 +565,7 @@ impl OverlayManager {
             added_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dropped_authenticated_peers: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             banned_peers: Arc::new(RwLock::new(HashSet::new())),
-            shutdown_tx: Some(shutdown_tx),
+            shutdown_tx: Mutex::new(Some(shutdown_tx)),
             peer_info_cache: Arc::new(DashMap::new()),
             scp_message_tx,
             scp_message_rx: Arc::new(TokioMutex::new(Some(scp_message_rx))),
@@ -1206,23 +1207,28 @@ impl OverlayManager {
         true
     }
 
-    /// Stop the overlay network.
-    pub async fn shutdown(&mut self) -> Result<()> {
-        if !self.running.load(Ordering::Relaxed) {
-            return Ok(());
+    /// Timeout for joining overlay handles (listener, connector, peers)
+    /// during shutdown. A single shared deadline — not additive per handle.
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Send the shutdown signal without joining any handles.
+    ///
+    /// Idempotent: the `running` atomic swap ensures the signal logic runs
+    /// at most once. Safe to call through `&self` (and thus through
+    /// `Arc<Self>`) when `Arc::try_unwrap` fails in the app shutdown path.
+    pub fn signal_shutdown(&self) {
+        if !self.running.swap(false, Ordering::SeqCst) {
+            return; // already signaled
         }
 
-        info!("Shutting down overlay manager");
-        self.running.store(false, Ordering::Relaxed);
+        info!("Signaling overlay shutdown");
 
-        // Send shutdown signal
-        if let Some(tx) = self.shutdown_tx.take() {
+        // Broadcast shutdown to listener/connector/tick tasks.
+        if let Some(tx) = self.shutdown_tx.lock().take() {
             let _ = tx.send(());
         }
 
-        // Send shutdown to all peer tasks via their channels.
-        // Use try_send to avoid blocking: the `running` flag (set to false
-        // above) ensures peer_loops exit on their next iteration regardless.
+        // Send shutdown to all peer tasks via their outbound channels.
         let senders: Vec<_> = self
             .peers
             .iter()
@@ -1232,32 +1238,85 @@ impl OverlayManager {
             let _ = tx.try_send(OutboundMessage::Shutdown);
         }
         self.peers.clear();
+    }
 
-        // Wait for tasks to complete
+    /// Join listener, connector, and peer handles under a single shared
+    /// deadline. Handles that don't finish in time are aborted.
+    async fn join_handles(&mut self) {
+        let start = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + Self::SHUTDOWN_TIMEOUT;
+
+        // Listener
         if let Some(handle) = self.listener_handle.take() {
-            let _ = handle.await;
+            if tokio::time::timeout_at(deadline, handle).await.is_err() {
+                warn!("Listener handle join timed out");
+            }
         }
+
+        // Connector
         if let Some(handle) = self.connector_handle.take() {
-            let _ = handle.await;
+            if tokio::time::timeout_at(deadline, handle).await.is_err() {
+                warn!("Connector handle join timed out");
+            }
         }
 
-        // Wait for peer handles
+        // Peer handles — join concurrently, abort any that exceed the deadline
         let handles: Vec<_> = std::mem::take(&mut *self.peer_handles.write());
-        for handle in handles {
-            let _ = handle.await;
+        let peer_count = handles.len();
+        if !handles.is_empty() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                warn!(
+                    peer_count,
+                    "No time remaining for peer handles, aborting all"
+                );
+                for handle in &handles {
+                    handle.abort();
+                }
+            } else {
+                // Wrap each handle in an abort-on-timeout future so we can
+                // join_all on owned futures while still aborting stragglers.
+                let futs: Vec<_> = handles
+                    .into_iter()
+                    .map(|h| async move {
+                        if tokio::time::timeout_at(deadline, h).await.is_err() {
+                            // Handle didn't finish in time — already dropped
+                            // (JoinHandle::drop aborts the task).
+                        }
+                    })
+                    .collect();
+                futures::future::join_all(futs).await;
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                if elapsed_ms > Self::SHUTDOWN_TIMEOUT.as_millis() as u64 {
+                    warn!(
+                        peer_count,
+                        elapsed_ms, "Peer handle joins exceeded deadline"
+                    );
+                } else {
+                    info!(peer_count, elapsed_ms, "All peer handles joined");
+                }
+            }
         }
+    }
 
-        info!("Overlay manager shutdown complete");
+    /// Stop the overlay network.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.signal_shutdown();
+
+        let start = std::time::Instant::now();
+        self.join_handles().await;
+        info!(
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "Overlay manager shutdown complete"
+        );
+
         Ok(())
     }
 }
 
 impl Drop for OverlayManager {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
+        self.signal_shutdown();
     }
 }
 
@@ -2066,5 +2125,118 @@ mod tests {
             shared.fetch_channel_depth_max.load(Ordering::Relaxed) >= n,
             "max must advance to at least the observed depth"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_signal_shutdown_idempotent() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // First call should signal
+        manager.signal_shutdown();
+        assert!(!manager.running.load(Ordering::SeqCst));
+        // shutdown_tx should have been taken
+        assert!(manager.shutdown_tx.lock().is_none());
+
+        // Second call should be a no-op (no panic)
+        manager.signal_shutdown();
+        assert!(!manager.running.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_fast_with_no_handles() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let mut manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // Shutdown with no handles should complete instantly
+        let start = tokio::time::Instant::now();
+        manager.shutdown().await.unwrap();
+        assert!(!manager.running.load(Ordering::SeqCst));
+        // With paused time, should be essentially zero
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_timeout_aborts_slow_handles() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let mut manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // Add some handles that will never complete on their own
+        {
+            let mut handles = manager.peer_handles.write();
+            for _ in 0..5 {
+                handles.push(tokio::spawn(async {
+                    // Sleep much longer than the 5s timeout
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }));
+            }
+        }
+
+        let start = tokio::time::Instant::now();
+        manager.shutdown().await.unwrap();
+        // Should complete at or near the 5s deadline, not wait 3600s
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed <= Duration::from_secs(6),
+            "shutdown took {elapsed:?}, expected <= 6s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_fast_handles_complete_before_timeout() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let mut manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // Add handles that complete quickly
+        {
+            let mut handles = manager.peer_handles.write();
+            for _ in 0..3 {
+                handles.push(tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }));
+            }
+        }
+
+        let start = tokio::time::Instant::now();
+        manager.shutdown().await.unwrap();
+        // Should complete well under the 5s timeout
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "shutdown took {elapsed:?}, expected < 1s"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_signal_shutdown_through_arc() {
+        let config = OverlayConfig::default();
+        let secret = SecretKey::generate();
+        let local_node = LocalNode::new_testnet(secret);
+
+        let manager = OverlayManager::new(config, local_node).unwrap();
+        manager.running.store(true, Ordering::SeqCst);
+
+        // Wrap in Arc — simulates the Arc::try_unwrap failure path
+        let arc = Arc::new(manager);
+
+        // signal_shutdown should work through &self (via Arc)
+        arc.signal_shutdown();
+        assert!(!arc.running.load(Ordering::SeqCst));
     }
 }

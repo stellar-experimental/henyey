@@ -169,7 +169,7 @@ impl OverlayManager {
         let preferred_peers = self.config.preferred_peers.clone();
         let max_outbound = self.config.max_outbound_peers;
         let config_known_peers = self.config.known_peers.clone();
-        let mut shutdown_rx = self.shutdown_tx.as_ref().unwrap().subscribe();
+        let mut shutdown_rx = self.shutdown_tx.lock().as_ref().unwrap().subscribe();
         let ctx = TickConnectCtx {
             local_node: self.local_node.clone(),
             connect_timeout: self.config.connect_timeout_secs,
