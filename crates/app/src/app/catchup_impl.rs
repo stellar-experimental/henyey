@@ -1,5 +1,6 @@
 //! Catchup logic: driving ledger replay from history archives to reach the network tip.
 
+use super::archive_cache::CacheResult;
 use super::*;
 
 impl App {
@@ -604,19 +605,21 @@ impl App {
     /// Return the latest cached archive checkpoint WITHOUT blocking.
     ///
     /// Intended for event-loop callers (phase=13 buffered catchup,
-    /// phase=11 externalized catchup, consensus.rs recovery). If the cache
-    /// is cold or older than `ARCHIVE_CHECKPOINT_CACHE_SECS`, the call
-    /// returns immediately with the current (stale or `None`) value and
-    /// kicks off a background refresh — which completes by the next
-    /// recovery tick (10 s later).
+    /// phase=11 externalized catchup, consensus.rs recovery). Returns a
+    /// [`CacheResult`](super::archive_cache::CacheResult):
+    /// - `Cold` — cache never populated; background refresh spawned.
+    /// - `Stale(v)` — TTL expired; stale value returned, refresh spawned.
+    /// - `Fresh(v)` — within TTL; value is current.
     ///
-    /// Returning `None` means "unknown — skip this tick"; callers MUST NOT
-    /// block to discover the fresh value.
+    /// Callers MUST handle `Cold` explicitly (typically skip this tick or
+    /// set urgent mode). Do NOT block to discover the fresh value.
     ///
     /// This replaces the previous `get_cached_archive_checkpoint` whose
     /// fall-through path awaited `fetch_root_has()` inline on the event
     /// loop, causing up to 89 s freezes (issue #1784).
-    pub(super) fn get_cached_archive_checkpoint_nonblocking(&self) -> Option<u32> {
+    pub(super) fn get_cached_archive_checkpoint_nonblocking(
+        &self,
+    ) -> super::archive_cache::CacheResult {
         self.archive_checkpoint_cache.get_cached()
     }
 
@@ -1441,7 +1444,7 @@ impl App {
         // would immediately re-arm archive_behind_until), we actively
         // target the latest known checkpoint.
         match self.get_cached_archive_checkpoint_nonblocking() {
-            Some(latest) if latest > current_ledger => {
+            CacheResult::Fresh(latest) | CacheResult::Stale(latest) if latest > current_ledger => {
                 tracing::warn!(
                     current_ledger,
                     archive_latest = latest,
@@ -1455,16 +1458,18 @@ impl App {
                 )
                 .await
             }
-            stale_or_cold => {
-                // #1862: Nonblocking cache is stale or cold — the archive may
-                // have published a new checkpoint that the background refresher
-                // hasn't picked up yet. Spawn an escalation catchup that does a
+            other => {
+                // #1862: Cache is cold, stale-but-behind, or fresh-but-behind
+                // — the archive may have published a new checkpoint that we
+                // haven't seen yet. Spawn an escalation catchup that does a
                 // fresh blocking HTTP fetch inside the spawned task. If the
                 // archive is truly not ahead, the catchup errors out gracefully
                 // and the node returns to its normal recovery cycle.
-                let cache_desc = match stale_or_cold {
-                    Some(v) => format!("stale (latest={})", v),
-                    None => "cold".to_string(),
+                let cache_desc = match other {
+                    CacheResult::Fresh(v) | CacheResult::Stale(v) => {
+                        format!("at/behind (latest={})", v)
+                    }
+                    CacheResult::Cold => "cold".to_string(),
                 };
                 tracing::warn!(
                     current_ledger,
@@ -1979,12 +1984,12 @@ impl App {
     /// trapped in the "recently caught up" decision branch (see #1753).
     async fn validate_target_checkpoint_published(&self, current_ledger: u32, target: u32) -> bool {
         let target_checkpoint = henyey_history::checkpoint::checkpoint_containing(target);
-        // Non-blocking read: a `None` result means the cache is cold or
-        // stale (a background refresh has been spawned). Mirror the
-        // existing `Err(e)` branch: proceed anyway — the spawned catchup
-        // task itself queries the archive and will fail fast if unreachable.
+        // Non-blocking read: a `Cold` result means the cache has never been
+        // populated (a background refresh has been spawned). Proceed anyway —
+        // the spawned catchup task itself queries the archive and will fail
+        // fast if unreachable.
         match self.get_cached_archive_checkpoint_nonblocking() {
-            Some(archive_latest) => {
+            CacheResult::Fresh(archive_latest) | CacheResult::Stale(archive_latest) => {
                 if archive_latest < target_checkpoint {
                     tracing::info!(
                         current_ledger,
@@ -1998,8 +2003,10 @@ impl App {
                 }
                 true
             }
-            None => {
-                tracing::debug!("Archive checkpoint cache cold/stale; proceeding (catchup will query archive itself)");
+            CacheResult::Cold => {
+                tracing::debug!(
+                    "Archive checkpoint cache cold; proceeding (catchup will query archive itself)"
+                );
                 true // Proceed anyway — let catchup fail fast if archive unreachable
             }
         }
@@ -2016,12 +2023,12 @@ impl App {
         current_ledger: u32,
         first_buffered: u32,
     ) -> bool {
-        // Non-blocking read: `None` means the cache is cold (never
-        // populated).  `get_cached()` already spawns a background refresh,
+        // Non-blocking read: `Cold` means the cache has never been
+        // populated.  `get_cached()` already spawns a background refresh,
         // so we skip this tick and let the next recovery cycle (~10 s)
         // pick up the result.
         match self.get_cached_archive_checkpoint_nonblocking() {
-            Some(latest_checkpoint) => {
+            CacheResult::Fresh(latest_checkpoint) | CacheResult::Stale(latest_checkpoint) => {
                 if latest_checkpoint <= current_ledger {
                     tracing::debug!(
                         current_ledger,
@@ -2040,7 +2047,7 @@ impl App {
                 );
                 true
             }
-            None => {
+            CacheResult::Cold => {
                 // Cold cache — never populated; `get_cached()` has already
                 // spawned a background refresh.  Skip this tick WITHOUT
                 // arming the 60 s backoff (see `clear_catchup_triggered_on_skip`
@@ -2407,7 +2414,7 @@ impl App {
         // checkpoint to avoid blocking the event loop with 404 retries (~50s).
         if target_checkpoint > latest_externalized as u32 {
             match self.get_cached_archive_checkpoint_nonblocking() {
-                Some(archive_latest) => {
+                CacheResult::Fresh(archive_latest) | CacheResult::Stale(archive_latest) => {
                     if archive_latest <= current_ledger {
                         // Archive is at or behind us. Don't stamp
                         // last_catchup_completed_at — no catchup was done.
@@ -2426,7 +2433,7 @@ impl App {
                         return None;
                     }
                 }
-                None => {
+                CacheResult::Cold => {
                     // #1863: Cache is cold (never populated) — the archive may
                     // have a checkpoint that we haven't fetched yet. Spawn a
                     // ProbeAhead catchup that does a fresh blocking HTTP fetch
@@ -3677,7 +3684,7 @@ mod tests {
         app.archive_checkpoint_cache.seed(archive_latest);
         assert_eq!(
             app.get_cached_archive_checkpoint_nonblocking(),
-            Some(archive_latest),
+            CacheResult::Fresh(archive_latest),
             "precondition: cache should be warm"
         );
 
@@ -3710,8 +3717,8 @@ mod tests {
         );
 
         // With a warm cache (latest=10000 > current=5000), the code
-        // enters the `Some(latest) if latest > current_ledger` branch
-        // and calls spawn_catchup. spawn_catchup sets catchup_in_progress
+        // enters the `Fresh(latest) | Stale(latest) if latest > current_ledger`
+        // branch and calls spawn_catchup. spawn_catchup sets catchup_in_progress
         // to true as its first action (atomic swap). Even if it returns
         // None later (self_arc not set up in unit test), the flag proves
         // we entered the spawn path rather than the cold-cache path.
@@ -3735,7 +3742,7 @@ mod tests {
         // available (hard reset doesn't clear the checkpoint cache).
         assert_eq!(
             app.get_cached_archive_checkpoint_nonblocking(),
-            Some(archive_latest),
+            CacheResult::Fresh(archive_latest),
             "archive cache should be preserved after hard reset"
         );
     }
@@ -4361,7 +4368,7 @@ mod tests {
         app.archive_checkpoint_cache.seed(current_ledger);
         assert_eq!(
             app.get_cached_archive_checkpoint_nonblocking(),
-            Some(current_ledger),
+            CacheResult::Fresh(current_ledger),
             "precondition: cache should be warm at current_ledger"
         );
 
@@ -4436,7 +4443,7 @@ mod tests {
         // Precondition: cache is cold (no seed).
         assert_eq!(
             app.get_cached_archive_checkpoint_nonblocking(),
-            None,
+            CacheResult::Cold,
             "precondition: cache should be cold"
         );
 
@@ -4543,7 +4550,7 @@ mod tests {
         // Precondition: cache is cold.
         assert_eq!(
             app.get_cached_archive_checkpoint_nonblocking(),
-            None,
+            CacheResult::Cold,
             "precondition: cache should be cold"
         );
 
@@ -4594,7 +4601,7 @@ mod tests {
         app.archive_checkpoint_cache.seed(0);
         assert_eq!(
             app.get_cached_archive_checkpoint_nonblocking(),
-            Some(0),
+            CacheResult::Fresh(0),
             "precondition: cache should be warm at 0"
         );
 
@@ -4653,12 +4660,13 @@ mod tests {
         // is <= current_ledger (0).
         app.archive_checkpoint_cache.seed(0);
 
-        // Verify the stale path still returns Some(0) (stale values are
-        // still returned by the nonblocking API).
+        // Verify the cache returns Fresh(0) (seed() creates a fresh entry;
+        // the test validates the archive-behind behavior regardless of
+        // fresh vs stale status).
         assert_eq!(
             app.get_cached_archive_checkpoint_nonblocking(),
-            Some(0),
-            "precondition: cache should return stale value"
+            CacheResult::Fresh(0),
+            "precondition: cache should return value"
         );
 
         let result = app

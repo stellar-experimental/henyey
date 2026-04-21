@@ -1,5 +1,6 @@
 //! SCP consensus: triggering rounds, out-of-sync recovery, and quorum set management.
 
+use super::archive_cache::CacheResult;
 use super::*;
 
 /// Why the node cannot apply the next buffered slot even though the herder
@@ -984,7 +985,7 @@ impl App {
             None
         } else {
             match self.get_cached_archive_checkpoint_nonblocking() {
-                Some(latest) if latest >= next_cp => {
+                CacheResult::Fresh(latest) | CacheResult::Stale(latest) if latest >= next_cp => {
                     // Archive is current enough — clear any prior backoff,
                     // urgent mode, and the confirmed-behind signal (#1867).
                     self.archive_confirmed_behind.store(false, Ordering::SeqCst);
@@ -993,7 +994,7 @@ impl App {
                     self.archive_checkpoint_cache.set_urgent(false);
                     Some(latest)
                 }
-                Some(latest) => {
+                CacheResult::Fresh(latest) | CacheResult::Stale(latest) => {
                     // Archive responded but is still behind the next
                     // checkpoint.  Do NOT arm `archive_behind_until` here:
                     // the cache's own TTL already throttles actual HTTP
@@ -1024,12 +1025,12 @@ impl App {
                     );
                     None
                 }
-                None => {
-                    // Cache cold/stale — a background refresh has been
-                    // spawned and will complete within a few seconds. Do
-                    // NOT arm `archive_behind_until`: that backoff exists
-                    // to suppress redundant queries against a known-behind
-                    // archive, and `None` is a transient state (refresh in
+                CacheResult::Cold => {
+                    // Cache cold — a background refresh has been spawned
+                    // and will complete within a few seconds. Do NOT arm
+                    // `archive_behind_until`: that backoff exists to
+                    // suppress redundant queries against a known-behind
+                    // archive, and `Cold` is a transient state (refresh in
                     // flight), not a confirmed "archive behind" signal.
                     // Armoring 60s would force a skip across ~5 recovery
                     // ticks even after the refresh completes on tick 2.
@@ -1037,7 +1038,7 @@ impl App {
                     // (10 s later) will see the refreshed cache.
                     tracing::debug!(
                         next_checkpoint = next_cp,
-                        "Archive checkpoint cache cold/stale — \
+                        "Archive checkpoint cache cold — \
                          falling through to peer-SCP while refresh completes"
                     );
                     None

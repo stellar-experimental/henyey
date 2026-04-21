@@ -7,11 +7,12 @@
 //! `HistoryArchive::fetch_root_has()` for up to 89 s.
 //!
 //! [`ArchiveCheckpointCache`] exposes a synchronous [`get_cached`] accessor
-//! that returns immediately, kicking off a background refresh via
-//! [`maybe_spawn_refresh`] when the cache is cold or older than
-//! [`ARCHIVE_CHECKPOINT_CACHE_SECS`]. Callers on the event loop must treat
-//! `None` as "unknown — skip this tick"; the next recovery tick (10 s later)
-//! will see the refreshed value.
+//! that returns immediately with a [`CacheResult`] — `Cold` (never populated),
+//! `Stale` (TTL expired, stale value returned), or `Fresh` (within TTL) —
+//! kicking off a background refresh via [`maybe_spawn_refresh`] when the cache
+//! is cold or stale. Callers on the event loop must treat `Cold` as
+//! "unknown — skip this tick"; the next recovery tick (10 s later) will see
+//! the refreshed value.
 //!
 //! Off-loop callers (startup wait, catchup worker) use [`fetch_blocking`],
 //! which awaits the underlying fetcher directly and may take up to
@@ -178,6 +179,24 @@ impl ArchiveCheckpointFetcher for ArchiveHttpFetcher {
     }
 }
 
+/// Result of a non-blocking cache read, distinguishing cold (never
+/// populated), stale (TTL expired, background refresh spawned), and
+/// fresh (within TTL) states.
+///
+/// Callers should exhaustively match all three variants rather than
+/// collapsing `Fresh`/`Stale` into a single arm — this strongly encourages
+/// handling the cold state explicitly and prevents the class of bug where
+/// `set_urgent(true)` is forgotten on cold cache (#1864).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CacheResult {
+    /// Cache never populated; background refresh spawned.
+    Cold,
+    /// TTL expired; stale value returned, background refresh spawned.
+    Stale(u32),
+    /// Within TTL; value is current.
+    Fresh(u32),
+}
+
 /// Snapshot of a cached archive-checkpoint observation.
 #[derive(Debug, Clone, Copy)]
 struct CachedCheckpoint {
@@ -231,12 +250,13 @@ impl ArchiveCheckpointCache {
 
     /// Return the latest cached archive checkpoint without blocking.
     ///
-    /// If the cache is cold or older than
-    /// [`ARCHIVE_CHECKPOINT_CACHE_SECS`], spawn (at most one) background
-    /// refresh and return the current (stale or `None`) value immediately.
+    /// Returns [`CacheResult::Cold`] when the cache has never been populated,
+    /// [`CacheResult::Stale`] when the TTL has expired (stale value returned,
+    /// background refresh spawned), or [`CacheResult::Fresh`] when the value
+    /// is within the TTL.
     ///
-    /// Event-loop callers MUST treat `None` as "unknown — skip this tick".
-    pub(super) fn get_cached(self: &Arc<Self>) -> Option<u32> {
+    /// Event-loop callers MUST treat `Cold` as "unknown — skip this tick".
+    pub(super) fn get_cached(self: &Arc<Self>) -> CacheResult {
         let effective_ttl = self.effective_ttl_secs();
         let (value, needs_refresh) = {
             let guard = self.value.read();
@@ -250,17 +270,23 @@ impl ArchiveCheckpointCache {
             }
         };
 
-        if value.is_none() {
-            self.cold_returns.fetch_add(1, Ordering::Relaxed);
-        } else if needs_refresh {
-            self.stale_returns.fetch_add(1, Ordering::Relaxed);
-        }
+        let result = match (value, needs_refresh) {
+            (None, _) => {
+                self.cold_returns.fetch_add(1, Ordering::Relaxed);
+                CacheResult::Cold
+            }
+            (Some(v), true) => {
+                self.stale_returns.fetch_add(1, Ordering::Relaxed);
+                CacheResult::Stale(v)
+            }
+            (Some(v), false) => CacheResult::Fresh(v),
+        };
 
         if needs_refresh {
             self.maybe_spawn_refresh();
         }
 
-        value
+        result
     }
 
     /// Await a fresh fetch. Acceptable callers only: startup
@@ -529,7 +555,11 @@ mod tests {
 
         let before = cache.stale_returns();
         let got = cache.get_cached();
-        assert_eq!(got, Some(999), "fresh cache returns seeded value");
+        assert_eq!(
+            got,
+            CacheResult::Fresh(999),
+            "fresh cache returns seeded value"
+        );
         assert_eq!(
             cache.stale_returns(),
             before,
@@ -559,7 +589,7 @@ mod tests {
         // awaiting the background refresh. The ordering proof is:
         // got == None (not the fetched 77) + is_refreshing() + call_count == 1.
         let got = cache.get_cached();
-        assert_eq!(got, None, "cold cache returns None");
+        assert_eq!(got, CacheResult::Cold, "cold cache returns Cold");
         assert_eq!(cache.cold_returns(), 1, "cold return counter incremented");
 
         // Observe that exactly one refresh is in flight.
@@ -587,7 +617,7 @@ mod tests {
 
         // Subsequent call returns the fetched value.
         let got = cache.get_cached();
-        assert_eq!(got, Some(77));
+        assert_eq!(got, CacheResult::Fresh(77));
     }
 
     /// Concurrent callers on a cold cache spawn exactly one refresh.
@@ -606,7 +636,7 @@ mod tests {
             handles.push(tokio::spawn(async move { c.get_cached() }));
         }
         for h in handles {
-            assert_eq!(h.await.unwrap(), None);
+            assert_eq!(h.await.unwrap(), CacheResult::Cold);
         }
 
         // Yield so the spawned refresh runs.
@@ -632,7 +662,11 @@ mod tests {
         cache.seed_with_queried_at(100, stale_at);
 
         let got = cache.get_cached();
-        assert_eq!(got, Some(100), "stale cache returns the stale value");
+        assert_eq!(
+            got,
+            CacheResult::Stale(100),
+            "stale cache returns the stale value"
+        );
         assert_eq!(cache.stale_returns(), 1);
 
         // Refresh should complete — drain.
@@ -648,7 +682,7 @@ mod tests {
 
         // Subsequent call returns the fresh value.
         let got = cache.get_cached();
-        assert_eq!(got, Some(200));
+        assert_eq!(got, CacheResult::Fresh(200));
     }
 
     /// Refresh timeout fires, clears `refreshing`, and increments the
@@ -659,7 +693,7 @@ mod tests {
         let (cache, _fetcher) = mk_cache(MockResponse::Hang);
 
         let got = cache.get_cached();
-        assert_eq!(got, None);
+        assert_eq!(got, CacheResult::Cold);
         // Give the spawned task a chance to start and register the
         // timeout future with the paused runtime.
         tokio::task::yield_now().await;
@@ -727,7 +761,7 @@ mod tests {
         assert!(!cache.is_urgent());
         let stale_before = cache.stale_returns();
         let val = cache.get_cached();
-        assert_eq!(val, Some(100));
+        assert_eq!(val, CacheResult::Fresh(100));
         assert_eq!(
             cache.stale_returns(),
             stale_before,
@@ -739,7 +773,11 @@ mod tests {
         assert!(cache.is_urgent());
         let stale_before = cache.stale_returns();
         let val = cache.get_cached();
-        assert_eq!(val, Some(100), "returns stale value immediately");
+        assert_eq!(
+            val,
+            CacheResult::Stale(100),
+            "returns stale value immediately"
+        );
         assert_eq!(
             cache.stale_returns(),
             stale_before + 1,
@@ -806,7 +844,11 @@ mod tests {
 
         // The value should be readable.
         let val = cache.get_cached();
-        assert_eq!(val, Some(128), "seed_stale value should be readable");
+        assert_eq!(
+            val,
+            CacheResult::Stale(128),
+            "seed_stale value should be readable"
+        );
 
         // get_cached should have counted it as stale and spawned a refresh.
         assert_eq!(cache.stale_returns(), 1, "should be counted as stale");
@@ -824,7 +866,7 @@ mod tests {
         let refreshed = cache.get_cached();
         assert_eq!(
             refreshed,
-            Some(newer_checkpoint),
+            CacheResult::Fresh(newer_checkpoint),
             "cache should be updated to fetcher's value after refresh"
         );
     }
@@ -836,13 +878,13 @@ mod tests {
 
         // Seed with a higher value first.
         cache.seed_stale(200);
-        assert_eq!(cache.get_cached(), Some(200));
+        assert_eq!(cache.get_cached(), CacheResult::Stale(200));
 
         // Attempt to seed with a lower value — should be ignored.
         cache.seed_stale(100);
         assert_eq!(
             cache.get_cached(),
-            Some(200),
+            CacheResult::Stale(200),
             "seed_stale must not regress the cached value"
         );
 
@@ -850,7 +892,7 @@ mod tests {
         cache.seed_stale(300);
         assert_eq!(
             cache.get_cached(),
-            Some(300),
+            CacheResult::Stale(300),
             "seed_stale should accept a higher value"
         );
     }
@@ -866,12 +908,12 @@ mod tests {
         cache.seed(200);
         // Verify it's fresh (no refresh triggered on next read).
         let val = cache.get_cached();
-        assert_eq!(val, Some(200));
+        assert_eq!(val, CacheResult::Fresh(200));
 
         // Now seed_stale with the same value (simulates post-catchup seeding).
         cache.seed_stale(200);
         // The value should still be readable.
-        assert_eq!(cache.get_cached(), Some(200));
+        assert_eq!(cache.get_cached(), CacheResult::Stale(200));
 
         // The key assertion: the cache should now be stale, meaning a
         // background refresh was spawned. We verify by checking the
@@ -898,11 +940,15 @@ mod tests {
         let (cache, _fetcher) = mk_cache(MockResponse::Ok(50));
 
         // Cache starts cold.
-        assert_eq!(cache.get_cached(), None);
+        assert_eq!(cache.get_cached(), CacheResult::Cold);
 
         // Seed with a value higher than the fetcher returns.
         cache.seed_stale(128);
         let val = cache.get_cached();
-        assert_eq!(val, Some(128), "seed_stale should populate a cold cache");
+        assert_eq!(
+            val,
+            CacheResult::Stale(128),
+            "seed_stale should populate a cold cache"
+        );
     }
 }
