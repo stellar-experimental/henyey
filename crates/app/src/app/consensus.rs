@@ -550,36 +550,64 @@ impl App {
 
             match classify_cannot_apply_reason(without_tx_set, sequence_gap) {
                 CannotApplyReason::BufferedSequenceGap => {
-                    // tx_sets are all present — the real blocker is a gap
-                    // in buffered ledger sequences.
-                    tracing::warn!(
-                        current_ledger,
-                        latest_externalized,
-                        total_buffered = total,
-                        first_buffered,
-                        last_buffered,
-                        required_first,
-                        sequence_gap,
-                        "All slots externalized but cannot apply - buffered sequence gap \
-                         (tx_sets present, but missing ledgers between current_ledger+1 \
-                         and first_buffered)"
-                    );
+                    let now_secs = self.start_instant.elapsed().as_secs();
+                    if self.cannot_apply_gap_log.should_log(now_secs) {
+                        tracing::warn!(
+                            current_ledger,
+                            latest_externalized,
+                            total_buffered = total,
+                            first_buffered,
+                            last_buffered,
+                            required_first,
+                            sequence_gap,
+                            "All slots externalized but cannot apply - buffered sequence \
+                             gap (tx_sets present, but missing ledgers between \
+                             current_ledger+1 and first_buffered)"
+                        );
+                    } else {
+                        tracing::debug!(
+                            current_ledger,
+                            latest_externalized,
+                            total_buffered = total,
+                            first_buffered,
+                            last_buffered,
+                            required_first,
+                            sequence_gap,
+                            "All slots externalized but cannot apply - buffered sequence \
+                             gap (repeated)"
+                        );
+                    }
                 }
                 CannotApplyReason::MissingTxSets => {
-                    // At least one buffered slot is missing its tx_set, so the
-                    // original diagnostic is accurate.
-                    tracing::warn!(
-                        current_ledger,
-                        latest_externalized,
-                        total_buffered = total,
-                        with_tx_set,
-                        without_tx_set,
-                        first_buffered,
-                        last_buffered,
-                        required_first,
-                        sequence_gap,
-                        "All slots externalized but cannot apply - missing tx_sets"
-                    );
+                    let now_secs = self.start_instant.elapsed().as_secs();
+                    if self.cannot_apply_txset_log.should_log(now_secs) {
+                        tracing::warn!(
+                            current_ledger,
+                            latest_externalized,
+                            total_buffered = total,
+                            with_tx_set,
+                            without_tx_set,
+                            first_buffered,
+                            last_buffered,
+                            required_first,
+                            sequence_gap,
+                            "All slots externalized but cannot apply - missing tx_sets"
+                        );
+                    } else {
+                        tracing::debug!(
+                            current_ledger,
+                            latest_externalized,
+                            total_buffered = total,
+                            with_tx_set,
+                            without_tx_set,
+                            first_buffered,
+                            last_buffered,
+                            required_first,
+                            sequence_gap,
+                            "All slots externalized but cannot apply - missing tx_sets \
+                             (repeated)"
+                        );
+                    }
                 }
             }
 

@@ -1929,14 +1929,25 @@ impl App {
                                  letting rapid close proceed"
                             );
                         } else {
-                            tracing::info!(
-                                slot,
-                                current_ledger,
-                                gap = slot - current_ledger,
-                                "Pending EXTERNALIZE far ahead — fast-tracking catchup"
-                            );
                             self.escalate_recovery_to_catchup();
                             self.sync_recovery_pending.store(true, Ordering::SeqCst);
+
+                            if self.far_ahead_log.should_log(current_ledger) {
+                                tracing::info!(
+                                    slot,
+                                    current_ledger,
+                                    gap = slot - current_ledger,
+                                    "Pending EXTERNALIZE far ahead — fast-tracking catchup"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    slot,
+                                    current_ledger,
+                                    gap = slot - current_ledger,
+                                    "Pending EXTERNALIZE far ahead — fast-tracking catchup \
+                                     (repeated)"
+                                );
+                            }
                         }
                     }
                 }
