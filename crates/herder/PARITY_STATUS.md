@@ -81,7 +81,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `getMinLedgerSeqToRemember()` | `get_min_ledger_seq_to_remember()` | Full |
 | `isNewerNominationOrBallotSt()` | _(not implemented)_ | None |
 | `getMostRecentCheckpointSeq()` | `get_most_recent_checkpoint_seq()` | Full |
-| `triggerNextLedger()` | `trigger_next_ledger()` | Full |
+| `triggerNextLedger()` | `trigger_next_ledger()` | Full | Henyey adds an `is_nominating` idempotency guard that skips duplicate triggers while nomination is active. stellar-core logs and continues on duplicate calls but never invokes them in a retry loop. Observable SCP behavior is unchanged. |
 | Nomination value caching (timer lambda capture) | `cached_nomination_value` field + `handle_nomination_timeout()` | Full |
 | `setInSyncAndTriggerNextLedger()` | `trigger_next_ledger()` | Full |
 | `resolveNodeID()` | _(not implemented)_ | None |

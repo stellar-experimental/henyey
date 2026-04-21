@@ -1700,6 +1700,22 @@ impl Herder {
         }
 
         let slot = ledger_seq as u64;
+
+        // If we have already started nominating for this slot, skip re-triggering.
+        // Re-calling scp.nominate(timedout=false) would advance the nomination round
+        // counter and disrupt SCP convergence. This makes trigger_next_ledger
+        // idempotent for the active nomination phase, protecting against repeated
+        // calls from manual_close_until's retry loop or periodic try_trigger_consensus.
+        if let Some(state) = self.scp.get_slot_state(slot) {
+            if state.is_nominating {
+                tracing::debug!(
+                    slot,
+                    "Skipping duplicate trigger: nomination already active"
+                );
+                return Ok(());
+            }
+        }
+
         tracing::debug!("Triggering consensus for ledger {}", ledger_seq);
 
         // Record when we first started processing this slot (for timing metrics).
@@ -3678,6 +3694,83 @@ mod tests {
                 order(&w[1]),
             );
         }
+    }
+
+    /// Regression test for #1879: repeated trigger_next_ledger calls must not
+    /// advance the SCP nomination round counter.
+    ///
+    /// With a multi-node quorum (2-of-3), the first trigger starts nomination
+    /// but cannot externalize (no peer messages). A second call should be
+    /// skipped by the is_nominating guard, leaving nomination_round at 1.
+    #[tokio::test]
+    async fn test_trigger_next_ledger_idempotent_during_nomination() {
+        // Create a validator with a 2-of-3 quorum set so the slot stays in
+        // nominating state (cannot self-externalize).
+        let seed = [7u8; 32];
+        let secret = SecretKey::from_seed(&seed);
+        let public = secret.public_key();
+        let local_node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256(*public.as_bytes()),
+            ));
+        let fake_peer1 =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256([1u8; 32]),
+            ));
+        let fake_peer2 =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256([2u8; 32]),
+            ));
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![local_node_id, fake_peer1, fake_peer2]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, secret);
+        herder.bootstrap(1);
+
+        // First trigger: starts nomination, round should be 1.
+        let result1 = herder.trigger_next_ledger(2).await;
+        assert!(result1.is_ok(), "first trigger should succeed");
+
+        let state1 = herder.scp().get_slot_state(2).expect("slot 2 should exist");
+        assert!(state1.is_nominating, "slot should be in nominating state");
+        assert_eq!(
+            state1.nomination_round, 1,
+            "first trigger: round should be 1"
+        );
+
+        // Second trigger: should be skipped by the is_nominating guard.
+        let result2 = herder.trigger_next_ledger(2).await;
+        assert!(result2.is_ok(), "second trigger should succeed (no-op)");
+
+        let state2 = herder
+            .scp()
+            .get_slot_state(2)
+            .expect("slot 2 should still exist");
+        assert_eq!(
+            state2.nomination_round, 1,
+            "second trigger should NOT advance nomination round"
+        );
+
+        // Third trigger for good measure.
+        let result3 = herder.trigger_next_ledger(2).await;
+        assert!(result3.is_ok());
+        let state3 = herder.scp().get_slot_state(2).expect("slot 2 exists");
+        assert_eq!(
+            state3.nomination_round, 1,
+            "third trigger should NOT advance nomination round"
+        );
     }
 
     /// Regression test for Task 7: genesis-adjacent close-time relaxation.
