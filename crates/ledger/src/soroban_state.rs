@@ -223,10 +223,15 @@ pub struct InMemorySorobanState {
     ///
     /// Uses the TTL key hash as index to enable lookup by either
     /// CONTRACT_DATA key or TTL key without key duplication.
-    contract_data_entries: HashMap<Hash, ContractDataMapEntry>,
+    ///
+    /// Wrapped in `Arc` for O(1) snapshot creation via `Arc::clone`.
+    /// Mutations use `Arc::make_mut` for copy-on-write semantics.
+    contract_data_entries: Arc<HashMap<Hash, ContractDataMapEntry>>,
 
     /// Contract code entries indexed by TTL key hash.
-    contract_code_entries: HashMap<Hash, ContractCodeMapEntry>,
+    ///
+    /// Wrapped in `Arc` for O(1) snapshot creation (see `contract_data_entries`).
+    contract_code_entries: Arc<HashMap<Hash, ContractCodeMapEntry>>,
 
     /// ConfigSetting entries indexed by ConfigSettingId.
     ///
@@ -260,8 +265,8 @@ impl InMemorySorobanState {
     /// Create a new empty in-memory Soroban state.
     pub fn new() -> Self {
         Self {
-            contract_data_entries: HashMap::new(),
-            contract_code_entries: HashMap::new(),
+            contract_data_entries: Arc::new(HashMap::new()),
+            contract_code_entries: Arc::new(HashMap::new()),
             config_settings: HashMap::new(),
             pending_ttls: HashMap::new(),
             last_closed_ledger_seq: 0,
@@ -280,16 +285,18 @@ impl InMemorySorobanState {
 
     /// Create a frozen, point-in-time clone of this state for snapshot lookups.
     ///
-    /// The clone shares `Arc<LedgerEntry>` pointers with the original, so it is
-    /// cheap (O(n) Arc increments, no deep copies).  The snapshot is used by
-    /// `create_snapshot()` to ensure that Soroban entry lookups return data
-    /// consistent with the header captured at the same instant, preventing a
-    /// race where a concurrent `commit()` updates entries before the header is
-    /// published.
+    /// The clone shares map data with the original via `Arc`, making this O(1)
+    /// instead of O(n). The first mutation after a snapshot uses copy-on-write
+    /// (`Arc::make_mut`) to detach the live state from the frozen snapshot.
+    ///
+    /// The snapshot is used by `create_snapshot()` to ensure that Soroban entry
+    /// lookups return data consistent with the header captured at the same
+    /// instant, preventing a race where a concurrent `commit()` updates entries
+    /// before the header is published.
     pub fn snapshot(&self) -> Self {
         Self {
-            contract_data_entries: self.contract_data_entries.clone(),
-            contract_code_entries: self.contract_code_entries.clone(),
+            contract_data_entries: Arc::clone(&self.contract_data_entries),
+            contract_code_entries: Arc::clone(&self.contract_code_entries),
             config_settings: self.config_settings.clone(),
             pending_ttls: HashMap::new(),
             last_closed_ledger_seq: self.last_closed_ledger_seq,
@@ -484,7 +491,7 @@ impl InMemorySorobanState {
         };
 
         self.contract_data_state_size += map_entry.xdr_size() as i64;
-        self.contract_data_entries.insert(key_hash, map_entry);
+        Arc::make_mut(&mut self.contract_data_entries).insert(key_hash, map_entry);
 
         trace!("Created contract data entry");
         Ok(())
@@ -513,8 +520,8 @@ impl InMemorySorobanState {
 
         let key_hash = Self::contract_data_key_hash(&key);
 
-        let old_entry = self
-            .contract_data_entries
+        let map = Arc::make_mut(&mut self.contract_data_entries);
+        let old_entry = map
             .remove(&key_hash)
             .ok_or_else(|| LedgerError::InvalidEntry("contract data does not exist".into()))?;
 
@@ -527,7 +534,7 @@ impl InMemorySorobanState {
         let new_size = new_entry.xdr_size();
 
         self.contract_data_state_size += (new_size as i64) - (old_size as i64);
-        self.contract_data_entries.insert(key_hash, new_entry);
+        map.insert(key_hash, new_entry);
 
         trace!("Updated contract data entry");
         Ok(())
@@ -541,8 +548,7 @@ impl InMemorySorobanState {
     pub fn delete_contract_data(&mut self, key: &LedgerKeyContractData) -> Result<()> {
         let key_hash = Self::contract_data_key_hash(key);
 
-        let old_entry = self
-            .contract_data_entries
+        let old_entry = Arc::make_mut(&mut self.contract_data_entries)
             .remove(&key_hash)
             .ok_or_else(|| LedgerError::InvalidEntry("contract data does not exist".into()))?;
 
@@ -600,7 +606,7 @@ impl InMemorySorobanState {
         };
 
         self.contract_code_state_size += map_entry.size_bytes as i64;
-        self.contract_code_entries.insert(key_hash, map_entry);
+        Arc::make_mut(&mut self.contract_code_entries).insert(key_hash, map_entry);
 
         trace!("Created contract code entry");
         Ok(())
@@ -632,13 +638,13 @@ impl InMemorySorobanState {
 
         let key_hash = Self::contract_code_key_hash(&key);
 
-        let old_entry = self
-            .contract_code_entries
+        // Calculate new size before taking mutable borrow on the map.
+        let new_size = self.calculate_code_size(&entry, protocol_version, rent_config);
+
+        let map = Arc::make_mut(&mut self.contract_code_entries);
+        let old_entry = map
             .remove(&key_hash)
             .ok_or_else(|| LedgerError::InvalidEntry("contract code does not exist".into()))?;
-
-        // Calculate new size for rent
-        let new_size = self.calculate_code_size(&entry, protocol_version, rent_config);
 
         let new_entry = ContractCodeMapEntry {
             ledger_entry: Arc::new(entry),
@@ -648,7 +654,7 @@ impl InMemorySorobanState {
 
         // Update size tracking
         self.contract_code_state_size += (new_size as i64) - (old_entry.size_bytes as i64);
-        self.contract_code_entries.insert(key_hash, new_entry);
+        map.insert(key_hash, new_entry);
 
         trace!("Updated contract code entry");
         Ok(())
@@ -662,8 +668,7 @@ impl InMemorySorobanState {
     pub fn delete_contract_code(&mut self, key: &LedgerKeyContractCode) -> Result<()> {
         let key_hash = Self::contract_code_key_hash(key);
 
-        let old_entry = self
-            .contract_code_entries
+        let old_entry = Arc::make_mut(&mut self.contract_code_entries)
             .remove(&key_hash)
             .ok_or_else(|| LedgerError::InvalidEntry("contract code does not exist".into()))?;
 
@@ -679,7 +684,7 @@ impl InMemorySorobanState {
     /// the TTL inline. Otherwise, stores in pending_ttls to be adopted later.
     pub fn create_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
         // Try to update inline in contract data
-        if let Some(entry) = self.contract_data_entries.get_mut(&key.key_hash) {
+        if let Some(entry) = Arc::make_mut(&mut self.contract_data_entries).get_mut(&key.key_hash) {
             if entry.ttl_data.is_initialized() {
                 return Err(LedgerError::InvalidEntry(
                     "contract data TTL already initialized".into(),
@@ -691,7 +696,7 @@ impl InMemorySorobanState {
         }
 
         // Try to update inline in contract code
-        if let Some(entry) = self.contract_code_entries.get_mut(&key.key_hash) {
+        if let Some(entry) = Arc::make_mut(&mut self.contract_code_entries).get_mut(&key.key_hash) {
             if entry.ttl_data.is_initialized() {
                 return Err(LedgerError::InvalidEntry(
                     "contract code TTL already initialized".into(),
@@ -717,13 +722,13 @@ impl InMemorySorobanState {
     ///
     /// Returns an error if the corresponding data/code entry does not exist.
     pub fn update_ttl(&mut self, key: &LedgerKeyTtl, ttl_data: TtlData) -> Result<()> {
-        if let Some(entry) = self.contract_data_entries.get_mut(&key.key_hash) {
+        if let Some(entry) = Arc::make_mut(&mut self.contract_data_entries).get_mut(&key.key_hash) {
             entry.ttl_data = ttl_data;
             trace!("Updated TTL inline for contract data");
             return Ok(());
         }
 
-        if let Some(entry) = self.contract_code_entries.get_mut(&key.key_hash) {
+        if let Some(entry) = Arc::make_mut(&mut self.contract_code_entries).get_mut(&key.key_hash) {
             entry.ttl_data = ttl_data;
             trace!("Updated TTL inline for contract code");
             return Ok(());
@@ -953,7 +958,7 @@ impl InMemorySorobanState {
         // Build the budget once outside the loop for efficiency
         let budget = build_rent_budget(rent_config);
 
-        for entry in self.contract_code_entries.values_mut() {
+        for entry in Arc::make_mut(&mut self.contract_code_entries).values_mut() {
             let xdr_size = entry
                 .ledger_entry
                 .to_xdr(Limits::none())
@@ -1001,8 +1006,8 @@ impl InMemorySorobanState {
 
     /// Clear all state.
     pub fn clear(&mut self) {
-        self.contract_data_entries.clear();
-        self.contract_code_entries.clear();
+        Arc::make_mut(&mut self.contract_data_entries).clear();
+        Arc::make_mut(&mut self.contract_code_entries).clear();
         self.pending_ttls.clear();
         self.last_closed_ledger_seq = 0;
         self.contract_data_state_size = 0;
@@ -1610,5 +1615,120 @@ mod tests {
             snap.get(&key2).is_none(),
             "snapshot must NOT contain entry2"
         );
+    }
+
+    /// Test Arc-based COW snapshot isolation across all mutation types.
+    ///
+    /// Verifies that after taking a snapshot, mutations via Arc::make_mut
+    /// (create, update, delete, TTL update, clear) only affect the live
+    /// state while the snapshot remains frozen.
+    #[test]
+    fn test_arc_cow_snapshot_isolation() {
+        let mut state = InMemorySorobanState::new();
+        state.set_last_closed_ledger_seq(100);
+
+        // Populate initial state: 2 data entries + 1 code entry.
+        let data1 = make_contract_data_entry([1u8; 32]);
+        let data2 = make_contract_data_entry([2u8; 32]);
+        let code1 = make_contract_code_entry([3u8; 32]);
+        state.process_entry_create(&data1, 25, None).unwrap();
+        state.process_entry_create(&data2, 25, None).unwrap();
+        state.process_entry_create(&code1, 25, None).unwrap();
+        assert_eq!(state.contract_data_count(), 2);
+        assert_eq!(state.contract_code_count(), 1);
+        let pre_snap_data_size = state.contract_data_state_size();
+        let pre_snap_code_size = state.contract_code_state_size();
+
+        // --- Take snapshot ---
+        let snap = state.snapshot();
+        assert_eq!(snap.contract_data_count(), 2);
+        assert_eq!(snap.contract_code_count(), 1);
+
+        // 1) CREATE a new data entry on live state.
+        let data3 = make_contract_data_entry([4u8; 32]);
+        state.process_entry_create(&data3, 25, None).unwrap();
+        assert_eq!(state.contract_data_count(), 3);
+        assert_eq!(
+            snap.contract_data_count(),
+            2,
+            "snapshot must not see new create"
+        );
+
+        // 2) UPDATE data2 on live state.
+        let data2_updated = {
+            let mut e = data2.clone();
+            if let LedgerEntryData::ContractData(ref mut cd) = e.data {
+                cd.val = ScVal::I32(999);
+            }
+            e
+        };
+        state.update_contract_data(data2_updated).unwrap();
+        // Snapshot should still see original data2 value.
+        let snap_data2 = snap.get(&make_data_key(&data2)).unwrap();
+        if let LedgerEntryData::ContractData(cd) = &snap_data2.data {
+            assert_eq!(cd.val, ScVal::I32(42), "snapshot must see original value");
+        }
+
+        // 3) DELETE data1 on live state.
+        let data1_key = match &data1.data {
+            LedgerEntryData::ContractData(cd) => LedgerKeyContractData {
+                contract: cd.contract.clone(),
+                key: cd.key.clone(),
+                durability: cd.durability,
+            },
+            _ => unreachable!(),
+        };
+        state.delete_contract_data(&data1_key).unwrap();
+        assert_eq!(state.contract_data_count(), 2); // data2 + data3
+        assert_eq!(
+            snap.contract_data_count(),
+            2,
+            "snapshot must still have data1"
+        );
+        assert!(snap.get(&make_data_key(&data1)).is_some());
+
+        // 4) UPDATE TTL on code1 in live state.
+        let code1_key_hash = InMemorySorobanState::contract_code_key_hash(&LedgerKeyContractCode {
+            hash: Hash([3u8; 32]),
+        });
+        let ttl_key = LedgerKeyTtl {
+            key_hash: code1_key_hash,
+        };
+        // First set a TTL so we can update it.
+        state.create_ttl(&ttl_key, TtlData::new(200, 100)).unwrap();
+        state.update_ttl(&ttl_key, TtlData::new(999, 100)).unwrap();
+        // Snapshot code entry should have default TTL (uninitialized).
+        let snap_code = snap
+            .get_contract_code(&LedgerKeyContractCode {
+                hash: Hash([3u8; 32]),
+            })
+            .unwrap();
+        assert!(
+            !snap_code.ttl_data.is_initialized(),
+            "snapshot TTL must remain uninitialized"
+        );
+
+        // 5) CLEAR live state.
+        state.clear();
+        assert_eq!(state.contract_data_count(), 0);
+        assert_eq!(state.contract_code_count(), 0);
+        // Snapshot must be entirely unaffected.
+        assert_eq!(snap.contract_data_count(), 2);
+        assert_eq!(snap.contract_code_count(), 1);
+        assert_eq!(snap.contract_data_state_size(), pre_snap_data_size);
+        assert_eq!(snap.contract_code_state_size(), pre_snap_code_size);
+    }
+
+    /// Helper to make a LedgerKey from a contract data LedgerEntry.
+    fn make_data_key(entry: &LedgerEntry) -> LedgerKey {
+        if let LedgerEntryData::ContractData(cd) = &entry.data {
+            LedgerKey::ContractData(LedgerKeyContractData {
+                contract: cd.contract.clone(),
+                key: cd.key.clone(),
+                durability: cd.durability,
+            })
+        } else {
+            panic!("expected ContractData");
+        }
     }
 }
