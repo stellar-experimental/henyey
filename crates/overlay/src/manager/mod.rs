@@ -1240,24 +1240,39 @@ impl OverlayManager {
         self.peers.clear();
     }
 
+    /// Await `handle` up to `deadline`; if it doesn't finish, abort it.
+    ///
+    /// `JoinHandle::drop` only detaches a task (does NOT cancel it), so we
+    /// poll via `&mut` to retain ownership and call `abort()` explicitly on
+    /// timeout.
+    async fn join_or_abort_handle(
+        mut handle: JoinHandle<()>,
+        deadline: tokio::time::Instant,
+        label: &str,
+    ) {
+        tokio::select! {
+            _ = &mut handle => {}
+            _ = tokio::time::sleep_until(deadline) => {
+                warn!("{label} handle join timed out, aborting");
+                handle.abort();
+            }
+        }
+    }
+
     /// Join listener, connector, and peer handles under a single shared
-    /// deadline. Handles that don't finish in time are aborted.
+    /// deadline. Handles that don't finish in time are explicitly aborted.
     async fn join_handles(&mut self) {
         let start = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + Self::SHUTDOWN_TIMEOUT;
 
         // Listener
         if let Some(handle) = self.listener_handle.take() {
-            if tokio::time::timeout_at(deadline, handle).await.is_err() {
-                warn!("Listener handle join timed out");
-            }
+            Self::join_or_abort_handle(handle, deadline, "Listener").await;
         }
 
         // Connector
         if let Some(handle) = self.connector_handle.take() {
-            if tokio::time::timeout_at(deadline, handle).await.is_err() {
-                warn!("Connector handle join timed out");
-            }
+            Self::join_or_abort_handle(handle, deadline, "Connector").await;
         }
 
         // Peer handles — join concurrently, abort any that exceed the deadline
@@ -1274,16 +1289,9 @@ impl OverlayManager {
                     handle.abort();
                 }
             } else {
-                // Wrap each handle in an abort-on-timeout future so we can
-                // join_all on owned futures while still aborting stragglers.
                 let futs: Vec<_> = handles
                     .into_iter()
-                    .map(|h| async move {
-                        if tokio::time::timeout_at(deadline, h).await.is_err() {
-                            // Handle didn't finish in time — already dropped
-                            // (JoinHandle::drop aborts the task).
-                        }
-                    })
+                    .map(|h| Self::join_or_abort_handle(h, deadline, "Peer"))
                     .collect();
                 futures::future::join_all(futs).await;
                 let elapsed_ms = start.elapsed().as_millis() as u64;
@@ -2173,13 +2181,20 @@ mod tests {
         let mut manager = OverlayManager::new(config, local_node).unwrap();
         manager.running.store(true, Ordering::SeqCst);
 
-        // Add some handles that will never complete on their own
+        // Track whether each task was actually cancelled (not just detached).
+        let cancelled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         {
             let mut handles = manager.peer_handles.write();
             for _ in 0..5 {
-                handles.push(tokio::spawn(async {
-                    // Sleep much longer than the 5s timeout
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                let cancelled = Arc::clone(&cancelled);
+                handles.push(tokio::spawn(async move {
+                    match tokio::time::sleep(Duration::from_secs(3600)).await {
+                        () => {} // Would only reach here if not aborted
+                    }
+                    // If the task completes normally (not aborted), this
+                    // wouldn't run because sleep(3600) in paused-time
+                    // only resolves via time advance. Abort cancels it.
+                    drop(cancelled); // prevent "unused" warning
                 }));
             }
         }
@@ -2191,6 +2206,17 @@ mod tests {
         assert!(
             elapsed <= Duration::from_secs(6),
             "shutdown took {elapsed:?}, expected <= 6s"
+        );
+
+        // Verify the tasks were truly aborted: after a short yield, the
+        // Arc refcount should have dropped to 1 (only our local `cancelled`
+        // clone remains). If tasks were merely detached, they'd still hold
+        // their clone.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            Arc::strong_count(&cancelled),
+            1,
+            "timed-out tasks should have been aborted, not detached"
         );
     }
 
