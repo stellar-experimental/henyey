@@ -167,24 +167,19 @@ fn compute_xdr_size(entry: &LedgerEntry) -> u32 {
 
 /// A contract data entry with co-located TTL.
 ///
-/// All fields are private to enforce the cache invariant: `cached_xdr_size`
-/// always equals the XDR-encoded length of `ledger_entry`. Construction is
-/// only through [`ContractDataMapEntry::new`].
+/// Fields are private; construction is only through [`ContractDataMapEntry::new`].
 #[derive(Debug, Clone)]
 pub struct ContractDataMapEntry {
     ledger_entry: Arc<LedgerEntry>,
     ttl_data: TtlData,
-    cached_xdr_size: u32,
 }
 
 impl ContractDataMapEntry {
-    /// Create a new entry, computing and caching the XDR size.
+    /// Create a new entry.
     pub(crate) fn new(ledger_entry: Arc<LedgerEntry>, ttl_data: TtlData) -> Self {
-        let cached_xdr_size = compute_xdr_size(&ledger_entry);
         Self {
             ledger_entry,
             ttl_data,
-            cached_xdr_size,
         }
     }
 
@@ -198,9 +193,15 @@ impl ContractDataMapEntry {
         self.ttl_data
     }
 
-    /// Cached XDR-encoded byte length (computed once at construction).
+    /// XDR-encoded byte length, computed on demand via [`compute_xdr_size`]
+    /// (zero-alloc counting writer).
+    ///
+    /// Cost is O(entry_size) per call. This is acceptable for the internal
+    /// call sites (create/update/delete accounting) which invoke it at most
+    /// once per mutation. External callers should avoid calling this in tight
+    /// loops over large entry sets.
     pub fn xdr_size(&self) -> u32 {
-        self.cached_xdr_size
+        compute_xdr_size(&self.ledger_entry)
     }
 }
 
@@ -1767,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_xdr_size_matches_serialization() {
+    fn test_xdr_size_matches_serialization() {
         use stellar_xdr::curr::{Limits, WriteXdr};
 
         // Contract data entry
@@ -1863,12 +1864,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cached_xdr_size_preserved_on_clone() {
+    fn test_xdr_size_consistent_across_clone() {
+        // Data entry: xdr_size() is computed on demand from the shared Arc<LedgerEntry>,
+        // so clones produce the same result.
         let entry = make_contract_data_entry([1u8; 32]);
         let map_entry = ContractDataMapEntry::new(Arc::new(entry), TtlData::default());
         let cloned = map_entry.clone();
         assert_eq!(cloned.xdr_size(), map_entry.xdr_size());
+        assert!(map_entry.xdr_size() > 0);
 
+        // Code entry: xdr_size() is cached at construction, preserved on clone.
         let code_entry = make_contract_code_entry([2u8; 32]);
         let code_map_entry =
             ContractCodeMapEntry::new(Arc::new(code_entry), TtlData::default(), 100);
@@ -1877,7 +1882,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_preserves_cached_sizes() {
+    fn test_snapshot_preserves_sizes() {
         use stellar_xdr::curr::{Limits, WriteXdr};
 
         let mut state = InMemorySorobanState::new();
