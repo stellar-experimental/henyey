@@ -86,7 +86,7 @@ impl TransactionQueue {
         &self,
         previous_ledger_hash: Hash256,
         max_ops: usize,
-    ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
+    ) -> TransactionSet {
         self.build_generalized_tx_set_with_starting_seq(previous_ledger_hash, max_ops, None, 0)
     }
 
@@ -96,7 +96,7 @@ impl TransactionQueue {
         max_ops: usize,
         starting_seq: Option<&HashMap<Vec<u8>, i64>>,
         close_time_offset: u64,
-    ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
+    ) -> TransactionSet {
         self.build_generalized_tx_set_with_providers(
             previous_ledger_hash,
             max_ops,
@@ -108,11 +108,6 @@ impl TransactionQueue {
     }
 
     /// Build a GeneralizedTransactionSet with caller-supplied snapshot providers.
-    ///
-    /// When `override_fee_provider` / `override_account_provider` are `Some`,
-    /// they are used for the `trim_invalid_two_phase` pass instead of the
-    /// queue's stored per-call providers. This avoids creating O(N) snapshots
-    /// on batch paths (nomination, post-close re-validation).
     pub fn build_generalized_tx_set_with_providers(
         &self,
         previous_ledger_hash: Hash256,
@@ -121,7 +116,7 @@ impl TransactionQueue {
         close_time_offset: u64,
         override_fee_provider: Option<&dyn FeeBalanceProvider>,
         override_account_provider: Option<&dyn AccountProvider>,
-    ) -> (TransactionSet, stellar_xdr::curr::GeneralizedTransactionSet) {
+    ) -> TransactionSet {
         use stellar_xdr::curr::{GeneralizedTransactionSet, WriteXdr};
 
         let SelectedTxs {
@@ -218,8 +213,6 @@ impl TransactionQueue {
         let (soroban_phase, _soroban_base_fee) =
             build_soroban_phase_with_base_fee(soroban_txs, soroban_limited, base_fee, &self.config);
 
-        let trimmed_transactions = collect_phase_transactions(&classic_phase, &soroban_phase);
-
         let gen_tx_set = GeneralizedTransactionSet::V1(stellar_xdr::curr::TransactionSetV1 {
             previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
             phases: vec![classic_phase, soroban_phase]
@@ -234,13 +227,8 @@ impl TransactionQueue {
             Hash256::ZERO
         };
 
-        let tx_set = TransactionSet::with_generalized(
-            previous_ledger_hash,
-            hash,
-            trimmed_transactions,
-            gen_tx_set.clone(),
-        );
-        (tx_set, gen_tx_set)
+        let tx_set = TransactionSet::new_generalized(hash, gen_tx_set);
+        tx_set
     }
 
     #[cfg(test)]
@@ -668,33 +656,6 @@ fn compute_soroban_base_fee(
     } else {
         Some(ledger_base_fee)
     }
-}
-
-/// Collect all transaction envelopes from classic and soroban phases.
-fn collect_phase_transactions(
-    classic_phase: &stellar_xdr::curr::TransactionPhase,
-    soroban_phase: &stellar_xdr::curr::TransactionPhase,
-) -> Vec<TransactionEnvelope> {
-    use stellar_xdr::curr::TransactionPhase;
-
-    let mut all = Vec::new();
-    if let TransactionPhase::V0(components) = classic_phase {
-        for comp in components.iter() {
-            match comp {
-                stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
-                    all.extend(c.txs.iter().cloned());
-                }
-            }
-        }
-    }
-    if let TransactionPhase::V1(component) = soroban_phase {
-        for stage in component.execution_stages.iter() {
-            for cluster in stage.0.iter() {
-                all.extend(cluster.0.iter().cloned());
-            }
-        }
-    }
-    all
 }
 
 fn build_classic_phase(

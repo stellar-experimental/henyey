@@ -240,7 +240,8 @@ fn test_mixed_classic_soroban_txset_deterministic() {
             "forward-order try_add must succeed"
         );
     }
-    let (tx_set1, gen1) = queue1.build_generalized_tx_set(Hash256::ZERO, 100);
+    let tx_set1 = queue1.build_generalized_tx_set(Hash256::ZERO, 100);
+    let gen1 = tx_set1.generalized_tx_set().unwrap().clone();
 
     // --- Determinism: build reverse-order set ---
     let queue2 = TransactionQueue::with_defaults();
@@ -251,7 +252,8 @@ fn test_mixed_classic_soroban_txset_deterministic() {
             "reverse-order try_add must succeed"
         );
     }
-    let (tx_set2, gen2) = queue2.build_generalized_tx_set(Hash256::ZERO, 100);
+    let tx_set2 = queue2.build_generalized_tx_set(Hash256::ZERO, 100);
+    let gen2 = tx_set2.generalized_tx_set().unwrap().clone();
 
     let gen1_bytes = xdr_bytes(&gen1);
     let gen2_bytes = xdr_bytes(&gen2);
@@ -260,7 +262,8 @@ fn test_mixed_classic_soroban_txset_deterministic() {
         "GeneralizedTransactionSet XDR must be identical regardless of insertion order"
     );
     assert_eq!(
-        tx_set1.hash, tx_set2.hash,
+        *tx_set1.hash(),
+        *tx_set2.hash(),
         "TransactionSet hashes must match"
     );
 
@@ -299,7 +302,7 @@ fn test_mixed_classic_soroban_txset_deterministic() {
 
     // --- Three-way envelope consistency ---
     assert_eq!(
-        tx_set1.transactions.len(),
+        tx_set1.len(),
         5,
         "tx_set.transactions must contain all 5 txs"
     );
@@ -313,7 +316,7 @@ fn test_mixed_classic_soroban_txset_deterministic() {
 
     // Compare flattened hashes vs tx_set.transactions hashes (ordered).
     let flattened_hashes: Vec<Hash256> = flattened.iter().map(tx_hash).collect();
-    let tx_set_hashes: Vec<Hash256> = tx_set1.transactions.iter().map(tx_hash).collect();
+    let tx_set_hashes: Vec<Hash256> = tx_set1.iter_transactions().map(tx_hash).collect();
     assert_eq!(
         flattened_hashes, tx_set_hashes,
         "flattened gen-set envelope hashes must match tx_set.transactions hashes in order"
@@ -328,10 +331,10 @@ fn test_mixed_classic_soroban_txset_deterministic() {
 
     // --- generalized_tx_set field ---
     assert!(
-        tx_set1.generalized_tx_set.is_some(),
+        tx_set1.generalized_tx_set().is_some(),
         "generalized_tx_set must be Some"
     );
-    let embedded_gen_bytes = xdr_bytes(tx_set1.generalized_tx_set.as_ref().unwrap());
+    let embedded_gen_bytes = xdr_bytes(tx_set1.generalized_tx_set().unwrap());
     assert_eq!(
         embedded_gen_bytes, gen1_bytes,
         "embedded generalized_tx_set XDR must equal separately returned one"
@@ -340,7 +343,8 @@ fn test_mixed_classic_soroban_txset_deterministic() {
     // --- Hash consistency ---
     let recomputed_hash = Hash256::hash_xdr(&gen1);
     assert_eq!(
-        tx_set1.hash, recomputed_hash,
+        *tx_set1.hash(),
+        recomputed_hash,
         "tx_set.hash must equal SHA-256 of GeneralizedTransactionSet XDR"
     );
 
@@ -352,7 +356,8 @@ fn test_mixed_classic_soroban_txset_deterministic() {
         159, 84, 147, 241, 7, 193, 17, 198, 159, 220, 134, 30, 138,
     ]);
     assert_eq!(
-        tx_set1.hash, expected_hash,
+        *tx_set1.hash(),
+        expected_hash,
         "canonical hash must match fixed oracle value"
     );
 
@@ -361,10 +366,11 @@ fn test_mixed_classic_soroban_txset_deterministic() {
     let round_tripped =
         henyey_herder::TransactionSet::from_xdr_stored_set(&stored).expect("round-trip decode");
     assert_eq!(
-        round_tripped.hash, tx_set1.hash,
+        *round_tripped.hash(),
+        *tx_set1.hash(),
         "round-tripped hash must match original"
     );
-    let rt_gen_bytes = xdr_bytes(round_tripped.generalized_tx_set.as_ref().unwrap());
+    let rt_gen_bytes = xdr_bytes(round_tripped.generalized_tx_set().unwrap());
     assert_eq!(
         rt_gen_bytes, gen1_bytes,
         "round-tripped generalized_tx_set XDR must equal original"
@@ -374,7 +380,8 @@ fn test_mixed_classic_soroban_txset_deterministic() {
         .prepare_for_apply(NetworkId::testnet())
         .expect("prepare_for_apply must succeed on a well-formed tx set");
     assert_eq!(
-        prepared.hash, tx_set1.hash,
+        *prepared.hash(),
+        *tx_set1.hash(),
         "prepared set hash must match original"
     );
 }

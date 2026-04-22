@@ -215,7 +215,7 @@ fn test_dex_lane_limit_deterministic_selection() {
     let hash_dex_a = full_hash(&dex_a);
     let hash_dex_b = full_hash(&dex_b);
     let hash_classic = full_hash(&classic);
-    let hashes: Vec<_> = set.transactions.iter().map(full_hash).collect();
+    let hashes: Vec<_> = set.iter_transactions().map(full_hash).collect();
     assert!(hashes.contains(&hash_classic));
     assert!(hashes.contains(&hash_dex_a) || hashes.contains(&hash_dex_b));
 }
@@ -308,8 +308,7 @@ fn test_sequence_gap_blocks_following() {
 
     let set = queue.get_transaction_set(Hash256::ZERO, 10);
     let seqs: Vec<i64> = set
-        .transactions
-        .iter()
+        .iter_transactions()
         .map(|tx| match tx {
             TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
             TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,
@@ -341,7 +340,7 @@ fn test_duplicate_sequence_prefers_higher_fee() {
 
     // Both transactions should be in the set now (different accounts)
     let set = queue.get_transaction_set(Hash256::ZERO, 10);
-    let hashes: Vec<_> = set.transactions.iter().map(full_hash).collect();
+    let hashes: Vec<_> = set.iter_transactions().map(full_hash).collect();
     assert!(hashes.contains(&low_hash));
     assert!(hashes.contains(&high_hash));
 }
@@ -367,8 +366,7 @@ fn test_starting_sequence_excludes_prior() {
 
     let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
     let seqs: Vec<i64> = set
-        .transactions
-        .iter()
+        .iter_transactions()
         .map(|tx| match tx {
             TransactionEnvelope::Tx(env) => env.tx.seq_num.0,
             TransactionEnvelope::TxV0(env) => env.tx.seq_num.0,

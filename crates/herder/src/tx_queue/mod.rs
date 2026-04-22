@@ -3218,7 +3218,7 @@ mod tests {
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 3);
 
-        let mut fees: Vec<u64> = set.transactions.iter().map(envelope_fee).collect();
+        let mut fees: Vec<u64> = set.iter_transactions().map(envelope_fee).collect();
         fees.sort_by(|a, b| b.cmp(a));
         assert_eq!(fees, vec![300, 200, 100]);
     }
@@ -3251,8 +3251,7 @@ mod tests {
             vec![hash_b, hash_a]
         };
         let got: Vec<Hash256> = set
-            .transactions
-            .iter()
+            .iter_transactions()
             .map(|tx| {
                 henyey_tx::TransactionFrame::from_owned_with_network(tx.clone(), network_id)
                     .hash(&network_id)
@@ -3280,7 +3279,7 @@ mod tests {
 
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
         assert_eq!(set.len(), 1);
-        assert_eq!(envelope_seq(&set.transactions[0]), 1);
+        assert_eq!(envelope_seq(&set.as_legacy_transactions().unwrap()[0]), 1);
     }
 
     #[test]
@@ -3303,7 +3302,7 @@ mod tests {
         queue.try_add(tx_b);
 
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
-        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.iter_transactions().map(envelope_seq).collect();
         seqs.sort();
         assert_eq!(seqs, vec![1, 2]);
     }
@@ -3329,7 +3328,7 @@ mod tests {
         assert_eq!(queue.try_add(soroban), TxQueueResult::Added);
 
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
-        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.iter_transactions().map(envelope_seq).collect();
         seqs.sort();
         assert_eq!(seqs, vec![1, 2]);
     }
@@ -3360,7 +3359,7 @@ mod tests {
         assert_eq!(queue.try_add(soroban_b), TxQueueResult::Added);
 
         let set = queue.get_transaction_set(Hash256::ZERO, 10);
-        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.iter_transactions().map(envelope_seq).collect();
         seqs.sort();
         assert_eq!(seqs, vec![1, 2, 3]);
     }
@@ -3390,7 +3389,7 @@ mod tests {
         starting.insert(account_key_from_account_id(&account_id), 5);
 
         let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
-        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.iter_transactions().map(envelope_seq).collect();
         seqs.sort();
         // tx_a with seq 5 is filtered (starting_seq >= 5), only tx_b with seq 6 remains
         assert_eq!(seqs, vec![6]);
@@ -3422,7 +3421,7 @@ mod tests {
         starting.insert(account_key_from_account_id(&account_id), starting_seq);
 
         let set = queue.get_transaction_set_with_starting_seq(Hash256::ZERO, 10, Some(&starting));
-        let mut seqs: Vec<i64> = set.transactions.iter().map(envelope_seq).collect();
+        let mut seqs: Vec<i64> = set.iter_transactions().map(envelope_seq).collect();
         seqs.sort();
         // tx_starting is filtered (starting_seq >= starting_seq), only tx_next remains
         assert_eq!(seqs, vec![starting_seq + 1]);
@@ -3443,7 +3442,7 @@ mod tests {
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx_a, tx_b]);
         let recomputed = tx_set.recompute_hash();
-        assert_eq!(tx_set.hash, recomputed);
+        assert_eq!(*tx_set.hash(), recomputed);
     }
 
     #[test]
@@ -3455,7 +3454,8 @@ mod tests {
         queue.try_add(classic.clone());
         queue.try_add(soroban.clone());
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 100);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 100);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
         assert_eq!(v1.phases.len(), 2);
 
@@ -3507,12 +3507,13 @@ mod tests {
         queue.try_add(classic);
         queue.try_add(soroban);
 
-        let (tx_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 100);
+        let tx_set = queue.build_generalized_tx_set(Hash256::ZERO, 100);
+        let gen = tx_set.generalized_tx_set().unwrap().clone();
         let recomputed = tx_set.recompute_hash();
-        assert_eq!(tx_set.hash, recomputed);
+        assert_eq!(*tx_set.hash(), recomputed);
 
         let gen_hash = Hash256::hash_xdr(&gen);
-        assert_eq!(tx_set.hash, gen_hash);
+        assert_eq!(*tx_set.hash(), gen_hash);
     }
 
     #[test]
@@ -3523,7 +3524,8 @@ mod tests {
         queue.try_add(make_test_envelope(200, 1));
         queue.try_add(make_test_envelope(300, 1));
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
         let base_fee = match &v1.phases[0] {
             stellar_xdr::curr::TransactionPhase::V0(components) => {
@@ -3545,7 +3547,8 @@ mod tests {
         queue.try_add(make_soroban_envelope(200));
         queue.try_add(make_soroban_envelope(300));
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
         let base_fee = match &v1.phases[1] {
             stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel.base_fee,
@@ -3567,7 +3570,8 @@ mod tests {
         queue.try_add(tx_b.clone());
         queue.try_add(tx_a.clone());
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
 
         let txs = match &v1.phases[0] {
@@ -3596,7 +3600,8 @@ mod tests {
         queue.try_add(tx_b.clone());
         queue.try_add(tx_a.clone());
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
 
         let mut txs = Vec::new();
@@ -3649,7 +3654,8 @@ mod tests {
         assert!(classic_limited);
         assert_eq!(transactions.len(), 1);
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 100);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 100);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
         let base_fee = match &v1.phases[0] {
             stellar_xdr::curr::TransactionPhase::V0(components) => match &components[0] {
@@ -3761,7 +3767,7 @@ mod tests {
         assert_eq!(set.len(), 2);
 
         let mut dex_count = 0;
-        for tx in &set.transactions {
+        for tx in set.iter_transactions() {
             let frame = henyey_tx::TransactionFrame::from_owned_with_network(
                 tx.clone(),
                 NetworkId::testnet(),
@@ -3806,7 +3812,7 @@ mod tests {
 
         let mut expected = vec![hash_classic, included_dex];
         expected.sort_by_key(|a| a.0);
-        let hashes: Vec<_> = set.transactions.iter().map(full_hash).collect();
+        let hashes: Vec<_> = set.iter_transactions().map(full_hash).collect();
         assert_eq!(hashes, expected);
     }
 
@@ -4041,7 +4047,8 @@ mod tests {
         queue.try_add(classic_high.clone());
         queue.try_add(classic_low.clone());
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(tx_set) = gen;
         let phases = &tx_set.phases;
         let components = match &phases[0] {
@@ -4352,7 +4359,8 @@ mod tests {
         queue.try_add(dex_low);
         queue.try_add(classic);
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 200);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 200);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
         let components = match &v1.phases[0] {
             stellar_xdr::curr::TransactionPhase::V0(comps) => comps,
@@ -4461,7 +4469,8 @@ mod tests {
         queue.try_add(high_fee);
         queue.try_add(low_fee);
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
         let base_fee = match &v1.phases[1] {
             stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel.base_fee,
@@ -4491,7 +4500,8 @@ mod tests {
         queue.try_add(highest_inclusion.clone());
         queue.try_add(next_highest_inclusion.clone());
 
-        let (_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let _set = queue.build_generalized_tx_set(Hash256::ZERO, 10);
+        let gen = _set.generalized_tx_set().unwrap().clone();
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(v1) = gen;
         let parallel = match &v1.phases[1] {
             stellar_xdr::curr::TransactionPhase::V1(parallel) => parallel,
@@ -7125,7 +7135,7 @@ mod snapshot_providers_tests {
         let account_provider = CountingAccountProvider::new();
 
         // Build tx set with override providers — should NOT panic.
-        let (_tx_set, _gen_tx_set) = queue.build_generalized_tx_set_with_providers(
+        let _tx_set = queue.build_generalized_tx_set_with_providers(
             Hash256::ZERO,
             100,
             None,
@@ -7158,7 +7168,7 @@ mod snapshot_providers_tests {
         }
 
         // Build without override — should use queue's stored providers.
-        let (_tx_set, _gen_tx_set) =
+        let _tx_set =
             queue.build_generalized_tx_set_with_providers(Hash256::ZERO, 100, None, 0, None, None);
 
         assert!(
@@ -7433,7 +7443,8 @@ mod resource_limit_parity_tests {
         let expected_survivor_count =
             expected_stages * expected_clusters * expected_txs_per_cluster;
         let max_ops = 1000;
-        let (_tx_set, gen_tx_set) = queue.build_generalized_tx_set(Hash256::ZERO, max_ops);
+        let _tx_set = queue.build_generalized_tx_set(Hash256::ZERO, max_ops);
+        let gen_tx_set = _tx_set.generalized_tx_set().unwrap().clone();
 
         validate_phase_shape(
             &gen_tx_set,

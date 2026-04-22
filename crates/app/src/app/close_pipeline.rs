@@ -151,18 +151,7 @@ mod tests {
         PendingLedgerClose {
             handle,
             ledger_seq: seq,
-            tx_set: henyey_herder::TransactionSet {
-                hash: Hash256::default(),
-                previous_ledger_hash: Hash256::default(),
-                transactions: Vec::new(),
-                generalized_tx_set: None,
-            },
-            tx_set_variant: henyey_ledger::TransactionSetVariant::Classic(
-                stellar_xdr::curr::TransactionSet {
-                    previous_ledger_hash: stellar_xdr::curr::Hash::default(),
-                    txs: Vec::new().try_into().unwrap(),
-                },
-            ),
+            tx_set: henyey_herder::TransactionSet::new_legacy(Hash256::default(), Vec::new()),
             close_time: 0,
             upgrades: Vec::new(),
         }

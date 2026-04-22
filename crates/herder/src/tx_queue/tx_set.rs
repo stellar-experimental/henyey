@@ -17,20 +17,34 @@ pub(super) fn sort_hashed_txs(txs: &mut [crate::tx_set_utils::HashedTx]) {
     txs.sort_by_key(|htx| htx.hash().0);
 }
 
+/// The body of a transaction set — either legacy or generalized.
+///
+/// Exactly one variant is active; invalid combinations are impossible by construction.
+#[derive(Debug, Clone)]
+pub enum TxSetBody {
+    /// Legacy (pre-protocol-20) transaction set: a flat sorted list.
+    Legacy {
+        previous_ledger_hash: Hash256,
+        transactions: Vec<TransactionEnvelope>,
+    },
+    /// Generalized transaction set (protocol 20+): phased/component XDR structure.
+    /// `previous_ledger_hash` lives inside `GeneralizedTransactionSet::V1.previous_ledger_hash`.
+    Generalized(GeneralizedTransactionSet),
+}
+
 /// A set of transactions for a ledger.
+///
+/// All fields are private. Construction only through provided constructors,
+/// which enforce the hash-is-correct invariant.
 #[derive(Debug, Clone)]
 pub struct TransactionSet {
-    /// Hash of this transaction set.
-    pub hash: Hash256,
-    /// Previous ledger hash.
-    pub previous_ledger_hash: Hash256,
-    /// Transactions in the set.
-    pub transactions: Vec<TransactionEnvelope>,
-    /// Generalized transaction set (protocol 20+), if available.
-    pub generalized_tx_set: Option<GeneralizedTransactionSet>,
+    hash: Hash256,
+    body: TxSetBody,
 }
 
 impl TransactionSet {
+    // ── Constructors ──────────────────────────────────────────────────
+
     /// Compute the legacy TransactionSet contents hash (non-generalized).
     pub fn compute_non_generalized_hash(
         previous_ledger_hash: Hash256,
@@ -44,115 +58,332 @@ impl TransactionSet {
         hasher.finalize()
     }
 
-    /// Create a new transaction set with computed hash (for legacy TransactionSet).
-    pub fn new(previous_ledger_hash: Hash256, transactions: Vec<TransactionEnvelope>) -> Self {
+    /// Build a legacy tx set. Sorts transactions by hash and computes the hash.
+    pub fn new_legacy(
+        previous_ledger_hash: Hash256,
+        transactions: Vec<TransactionEnvelope>,
+    ) -> Self {
         let mut transactions = transactions;
         sort_txs_by_hash(&mut transactions);
         let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions);
 
         Self {
             hash,
-            previous_ledger_hash,
-            transactions,
-            generalized_tx_set: None,
+            body: TxSetBody::Legacy {
+                previous_ledger_hash,
+                transactions,
+            },
         }
     }
 
-    /// Create a transaction set with a pre-computed hash (for GeneralizedTransactionSet).
-    /// The hash should be SHA-256 of the XDR-encoded GeneralizedTransactionSet.
+    /// Build a legacy tx set from wire/archive data.
+    ///
+    /// Hash is caller-provided, transactions are stored as-is (may be unsorted
+    /// or have duplicates). Validation happens later in `is_tx_set_well_formed`
+    /// / `prepare_for_apply`.
+    pub(crate) fn from_wire_legacy(
+        previous_ledger_hash: Hash256,
+        hash: Hash256,
+        transactions: Vec<TransactionEnvelope>,
+    ) -> Self {
+        Self {
+            hash,
+            body: TxSetBody::Legacy {
+                previous_ledger_hash,
+                transactions,
+            },
+        }
+    }
+
+    /// Build a generalized tx set from wire/archive data.
+    ///
+    /// Hash is the SHA-256 of the XDR encoding (caller-provided).
+    /// `previous_ledger_hash` is extracted from `GeneralizedTransactionSet::V1`.
+    pub(crate) fn from_wire_generalized(
+        hash: Hash256,
+        generalized_tx_set: GeneralizedTransactionSet,
+    ) -> Self {
+        Self {
+            hash,
+            body: TxSetBody::Generalized(generalized_tx_set),
+        }
+    }
+
+    /// Build a generalized tx set from selection (internal construction).
+    pub fn new_generalized(hash: Hash256, generalized_tx_set: GeneralizedTransactionSet) -> Self {
+        Self {
+            hash,
+            body: TxSetBody::Generalized(generalized_tx_set),
+        }
+    }
+
+    // ── Backward-compat aliases (deprecated, used during migration) ───
+
+    /// Alias for `new_legacy`.
+    #[doc(hidden)]
+    pub fn new(previous_ledger_hash: Hash256, transactions: Vec<TransactionEnvelope>) -> Self {
+        Self::new_legacy(previous_ledger_hash, transactions)
+    }
+
+    /// Alias for `from_wire_legacy`.
+    #[doc(hidden)]
     pub fn with_hash(
         previous_ledger_hash: Hash256,
         hash: Hash256,
         transactions: Vec<TransactionEnvelope>,
     ) -> Self {
-        Self {
-            hash,
-            previous_ledger_hash,
-            transactions,
-            generalized_tx_set: None,
+        Self::from_wire_legacy(previous_ledger_hash, hash, transactions)
+    }
+
+    /// Alias for `from_wire_generalized` (ignores redundant previous_ledger_hash
+    /// and transactions args — they are derived from the generalized body).
+    #[doc(hidden)]
+    pub fn with_generalized(
+        _previous_ledger_hash: Hash256,
+        hash: Hash256,
+        _transactions: Vec<TransactionEnvelope>,
+        generalized_tx_set: GeneralizedTransactionSet,
+    ) -> Self {
+        Self::from_wire_generalized(hash, generalized_tx_set)
+    }
+
+    // ── Accessors ─────────────────────────────────────────────────────
+
+    /// Cached hash of this transaction set.
+    pub fn hash(&self) -> &Hash256 {
+        &self.hash
+    }
+
+    /// Previous ledger hash (derived from body, zero duplication).
+    pub fn previous_ledger_hash(&self) -> Hash256 {
+        match &self.body {
+            TxSetBody::Legacy {
+                previous_ledger_hash,
+                ..
+            } => *previous_ledger_hash,
+            TxSetBody::Generalized(gen) => {
+                let GeneralizedTransactionSet::V1(v1) = gen;
+                Hash256::from_bytes(v1.previous_ledger_hash.0)
+            }
         }
     }
 
-    pub fn with_generalized(
-        previous_ledger_hash: Hash256,
-        hash: Hash256,
-        transactions: Vec<TransactionEnvelope>,
-        generalized_tx_set: GeneralizedTransactionSet,
-    ) -> Self {
-        Self {
-            hash,
-            previous_ledger_hash,
-            transactions,
-            generalized_tx_set: Some(generalized_tx_set),
+    /// Whether this is a generalized (protocol 20+) tx set.
+    pub fn is_generalized(&self) -> bool {
+        matches!(&self.body, TxSetBody::Generalized(_))
+    }
+
+    /// Get a reference to the generalized tx set body, if present.
+    pub fn generalized_tx_set(&self) -> Option<&GeneralizedTransactionSet> {
+        match &self.body {
+            TxSetBody::Generalized(gen) => Some(gen),
+            TxSetBody::Legacy { .. } => None,
+        }
+    }
+
+    /// Get a reference to the legacy transactions, if this is a legacy set.
+    pub fn as_legacy_transactions(&self) -> Option<&[TransactionEnvelope]> {
+        match &self.body {
+            TxSetBody::Legacy { transactions, .. } => Some(transactions),
+            TxSetBody::Generalized(_) => None,
+        }
+    }
+
+    /// Iterate over all transaction envelopes (borrowed).
+    ///
+    /// **Order contract** (load-bearing — result vectors are zipped with this):
+    /// - Generalized: phases in XDR order → components in XDR order →
+    ///   transactions in component order.
+    ///   - V0 phases: components iterated sequentially.
+    ///   - V1 phases: execution_stages → clusters → transactions.
+    /// - Legacy: stored order (sorted-by-hash after `new_legacy`).
+    pub fn iter_transactions(&self) -> Box<dyn Iterator<Item = &TransactionEnvelope> + '_> {
+        match &self.body {
+            TxSetBody::Legacy { transactions, .. } => Box::new(transactions.iter()),
+            TxSetBody::Generalized(gen) => {
+                let GeneralizedTransactionSet::V1(v1) = gen;
+                let iter = v1.phases.iter().flat_map(|phase| match phase {
+                    stellar_xdr::curr::TransactionPhase::V0(components) => {
+                        let iter = components.iter().flat_map(|comp| match comp {
+                            stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                                c,
+                            ) => c.txs.iter(),
+                        });
+                        Box::new(iter) as Box<dyn Iterator<Item = &TransactionEnvelope>>
+                    }
+                    stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                        let iter = parallel
+                            .execution_stages
+                            .iter()
+                            .flat_map(|stage| stage.iter().flat_map(|cluster| cluster.0.iter()));
+                        Box::new(iter) as Box<dyn Iterator<Item = &TransactionEnvelope>>
+                    }
+                });
+                Box::new(iter)
+            }
         }
     }
 
     /// Get the number of transactions.
     pub fn len(&self) -> usize {
-        self.transactions.len()
+        match &self.body {
+            TxSetBody::Legacy { transactions, .. } => transactions.len(),
+            TxSetBody::Generalized(gen) => {
+                let GeneralizedTransactionSet::V1(v1) = gen;
+                let mut count = 0;
+                for phase in v1.phases.iter() {
+                    match phase {
+                        stellar_xdr::curr::TransactionPhase::V0(components) => {
+                            for comp in components.iter() {
+                                match comp {
+                                    stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(c) => {
+                                        count += c.txs.len();
+                                    }
+                                }
+                            }
+                        }
+                        stellar_xdr::curr::TransactionPhase::V1(parallel) => {
+                            for stage in parallel.execution_stages.iter() {
+                                for cluster in stage.iter() {
+                                    count += cluster.0.len();
+                                }
+                            }
+                        }
+                    }
+                }
+                count
+            }
+        }
     }
 
     /// Check if the set is empty.
     pub fn is_empty(&self) -> bool {
-        self.transactions.is_empty()
+        self.len() == 0
     }
+
+    // ── Conversion APIs ───────────────────────────────────────────────
+
+    /// Get owned copies of all transactions (explicit clone).
+    pub fn transactions_owned(&self) -> Vec<TransactionEnvelope> {
+        self.iter_transactions().cloned().collect()
+    }
+
+    /// Convert into a `TransactionSetVariant` for ledger close (moves, no clone).
+    pub fn into_variant(self) -> henyey_ledger::TransactionSetVariant {
+        match self.body {
+            TxSetBody::Legacy {
+                previous_ledger_hash,
+                transactions,
+            } => {
+                let xdr_set = stellar_xdr::curr::TransactionSet {
+                    previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
+                    txs: transactions.try_into().unwrap_or_default(),
+                };
+                henyey_ledger::TransactionSetVariant::Classic(xdr_set)
+            }
+            TxSetBody::Generalized(gen) => henyey_ledger::TransactionSetVariant::Generalized(gen),
+        }
+    }
+
+    /// Take the generalized body, consuming self.
+    pub fn into_generalized(self) -> Option<GeneralizedTransactionSet> {
+        match self.body {
+            TxSetBody::Generalized(gen) => Some(gen),
+            TxSetBody::Legacy { .. } => None,
+        }
+    }
+
+    /// Convert to `GeneralizedTransactionSet` for wire transmission.
+    ///
+    /// - Generalized: clones the existing body.
+    /// - Legacy: wraps in a minimal V1 envelope with a single V0 phase
+    ///   containing one `TxsetCompTxsMaybeDiscountedFee` component. This is
+    ///   ONLY for peer flooding, NOT for consensus validation (which expects
+    ///   2-phase sets from selection.rs).
+    pub fn to_generalized_tx_set(&self) -> Option<GeneralizedTransactionSet> {
+        use stellar_xdr::curr::{
+            TransactionPhase, TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+        };
+
+        match &self.body {
+            TxSetBody::Generalized(gen) => Some(gen.clone()),
+            TxSetBody::Legacy {
+                previous_ledger_hash,
+                transactions,
+            } => {
+                let component = TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                    TxSetComponentTxsMaybeDiscountedFee {
+                        base_fee: None,
+                        txs: transactions.clone().try_into().ok()?,
+                    },
+                );
+                let phase = TransactionPhase::V0(vec![component].try_into().ok()?);
+                Some(GeneralizedTransactionSet::V1(TransactionSetV1 {
+                    previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
+                    phases: vec![phase].try_into().ok()?,
+                }))
+            }
+        }
+    }
+
+    // ── Existing methods ──────────────────────────────────────────────
 
     /// Recompute the transaction set hash from its contents.
     pub fn recompute_hash(&self) -> Hash256 {
-        if let Some(gen) = &self.generalized_tx_set {
-            return Hash256::hash(&xdr_to_bytes(gen));
+        match &self.body {
+            TxSetBody::Generalized(gen) => Hash256::hash(&xdr_to_bytes(gen)),
+            TxSetBody::Legacy {
+                previous_ledger_hash,
+                transactions,
+            } => Self::compute_non_generalized_hash(*previous_ledger_hash, transactions),
         }
-        Self::compute_non_generalized_hash(self.previous_ledger_hash, &self.transactions)
     }
 
     /// Summarize the transaction set for logging/debugging.
     pub fn summary(&self) -> String {
-        if self.transactions.is_empty() {
+        if self.is_empty() {
             return "empty tx set".to_string();
         }
 
-        if let Some(gen) = &self.generalized_tx_set {
-            return summary_generalized_tx_set(gen);
+        match &self.body {
+            TxSetBody::Generalized(gen) => summary_generalized_tx_set(gen),
+            TxSetBody::Legacy { transactions, .. } => {
+                let tx_count = transactions.len();
+                let op_count: i64 = transactions.iter().map(tx_operation_count).sum();
+                let base_fee = transactions
+                    .iter()
+                    .map(tx_inclusion_fee)
+                    .zip(transactions.iter().map(tx_operation_count))
+                    .filter(|(_, ops)| *ops > 0)
+                    .map(|(fee, ops)| fee / ops)
+                    .min()
+                    .unwrap_or(0);
+
+                format!("txs:{}, ops:{}, base_fee:{}", tx_count, op_count, base_fee)
+            }
         }
-
-        let tx_count = self.transactions.len();
-        let op_count: i64 = self.transactions.iter().map(tx_operation_count).sum();
-        let base_fee = self
-            .transactions
-            .iter()
-            .map(tx_inclusion_fee)
-            .zip(self.transactions.iter().map(tx_operation_count))
-            .filter(|(_, ops)| *ops > 0)
-            .map(|(fee, ops)| fee / ops)
-            .min()
-            .unwrap_or(0);
-
-        format!("txs:{}, ops:{}, base_fee:{}", tx_count, op_count, base_fee)
     }
 
     /// Convert to StoredTransactionSet XDR for persistence.
-    ///
-    /// Uses the generalized format (v1) if available, otherwise falls back to legacy (v0).
     pub fn to_xdr_stored_set(&self) -> stellar_xdr::curr::StoredTransactionSet {
         use stellar_xdr::curr::StoredTransactionSet;
 
-        if let Some(ref gen) = self.generalized_tx_set {
-            StoredTransactionSet::V1(gen.clone())
-        } else {
-            // Build legacy TransactionSet
-            let legacy = stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash(self.previous_ledger_hash.0),
-                txs: self.transactions.clone().try_into().unwrap_or_default(),
-            };
-            StoredTransactionSet::V0(legacy)
+        match &self.body {
+            TxSetBody::Generalized(gen) => StoredTransactionSet::V1(gen.clone()),
+            TxSetBody::Legacy {
+                previous_ledger_hash,
+                transactions,
+            } => {
+                let legacy = stellar_xdr::curr::TransactionSet {
+                    previous_ledger_hash: stellar_xdr::curr::Hash(previous_ledger_hash.0),
+                    txs: transactions.clone().try_into().unwrap_or_default(),
+                };
+                StoredTransactionSet::V0(legacy)
+            }
         }
     }
 
     /// Create from StoredTransactionSet XDR.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error description if the transaction set cannot be decoded.
     pub fn from_xdr_stored_set(
         stored: &stellar_xdr::curr::StoredTransactionSet,
     ) -> std::result::Result<Self, String> {
@@ -162,28 +393,17 @@ impl TransactionSet {
             StoredTransactionSet::V0(legacy) => {
                 let previous_ledger_hash = Hash256::from_bytes(legacy.previous_ledger_hash.0);
                 let transactions: Vec<TransactionEnvelope> = legacy.txs.to_vec();
-
-                // Compute hash
                 let hash = Self::compute_non_generalized_hash(previous_ledger_hash, &transactions);
 
                 Ok(Self {
                     hash,
-                    previous_ledger_hash,
-                    transactions,
-                    generalized_tx_set: None,
+                    body: TxSetBody::Legacy {
+                        previous_ledger_hash,
+                        transactions,
+                    },
                 })
             }
             StoredTransactionSet::V1(gen) => {
-                let previous_ledger_hash = match gen {
-                    GeneralizedTransactionSet::V1(v1) => {
-                        Hash256::from_bytes(v1.previous_ledger_hash.0)
-                    }
-                };
-
-                // Extract transactions from phases
-                let transactions = extract_transactions_from_generalized(gen);
-
-                // Compute hash from generalized format
                 let hash = gen
                     .to_xdr(Limits::none())
                     .map(|bytes| Hash256::hash(&bytes))
@@ -191,9 +411,7 @@ impl TransactionSet {
 
                 Ok(Self {
                     hash,
-                    previous_ledger_hash,
-                    transactions,
-                    generalized_tx_set: Some(gen.clone()),
+                    body: TxSetBody::Generalized(gen.clone()),
                 })
             }
         }
@@ -201,23 +419,14 @@ impl TransactionSet {
 
     /// Prepare a transaction set for ledger application.
     ///
-    /// This corresponds to upstream `TxSetXDRFrame::prepareForApply()`. It validates
-    /// the XDR structure of the generalized transaction set, deserializes transaction
-    /// envelopes, validates that each transaction has a valid fee structure, checks
-    /// that transactions are properly sorted within components/clusters, and verifies
-    /// that classic and Soroban transactions are in the correct phases.
-    ///
-    /// For legacy (non-generalized) transaction sets, only basic fee validation and
-    /// sort order checks are performed.
+    /// This corresponds to upstream `TxSetXDRFrame::prepareForApply()`.
     pub fn prepare_for_apply(&self, network_id: NetworkId) -> std::result::Result<Self, String> {
-        if let Some(ref gen) = self.generalized_tx_set {
-            Self::prepare_generalized_for_apply(gen, network_id)
-        } else {
-            Self::prepare_legacy_for_apply(
-                self.previous_ledger_hash,
-                &self.transactions,
-                network_id,
-            )
+        match &self.body {
+            TxSetBody::Generalized(gen) => Self::prepare_generalized_for_apply(gen, network_id),
+            TxSetBody::Legacy {
+                previous_ledger_hash,
+                transactions,
+            } => Self::prepare_legacy_for_apply(*previous_ledger_hash, transactions, network_id),
         }
     }
 
@@ -229,7 +438,6 @@ impl TransactionSet {
         validate_generalized_tx_set_xdr_structure(gen)?;
 
         let GeneralizedTransactionSet::V1(v1) = gen;
-        let mut all_transactions = Vec::new();
 
         for (phase_id, phase) in v1.phases.iter().enumerate() {
             let expect_soroban = phase_id == 1;
@@ -239,7 +447,6 @@ impl TransactionSet {
                         match component {
                             TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
                                 validate_wire_txs(&comp.txs, network_id, expect_soroban)?;
-                                all_transactions.extend(comp.txs.iter().cloned());
                             }
                         }
                     }
@@ -248,7 +455,6 @@ impl TransactionSet {
                     for stage in parallel.execution_stages.iter() {
                         for cluster in stage.iter() {
                             validate_wire_txs(cluster.as_slice(), network_id, expect_soroban)?;
-                            all_transactions.extend(cluster.iter().cloned());
                         }
                     }
                 }
@@ -257,6 +463,7 @@ impl TransactionSet {
 
         // HERDER_SPEC §8.3 / §6.5: No two transactions across ALL phases may
         // share the same source account in a generalized transaction set.
+        let all_transactions: Vec<TransactionEnvelope> = extract_transactions_from_generalized(gen);
         check_no_duplicate_source_accounts(&all_transactions)?;
 
         let hash = gen
@@ -264,13 +471,9 @@ impl TransactionSet {
             .map(|bytes| Hash256::hash(&bytes))
             .map_err(|e| format!("Failed to encode generalized tx set: {}", e))?;
 
-        let previous_ledger_hash = Hash256::from_bytes(v1.previous_ledger_hash.0);
-
         Ok(Self {
             hash,
-            previous_ledger_hash,
-            transactions: all_transactions,
-            generalized_tx_set: Some(gen.clone()),
+            body: TxSetBody::Generalized(gen.clone()),
         })
     }
 
@@ -297,9 +500,10 @@ impl TransactionSet {
 
         Ok(Self {
             hash,
-            previous_ledger_hash,
-            transactions: transactions.to_vec(),
-            generalized_tx_set: None,
+            body: TxSetBody::Legacy {
+                previous_ledger_hash,
+                transactions: transactions.to_vec(),
+            },
         })
     }
 }
@@ -1137,10 +1341,11 @@ mod tests {
         let tx1 = make_tx_envelope(5, 100);
         let tx2 = make_tx_envelope(1, 100);
         let tx3 = make_tx_envelope(3, 100);
-        let tx_set = TransactionSet::new(Hash256::ZERO, vec![tx1, tx2, tx3]);
+        let tx_set = TransactionSet::new_legacy(Hash256::ZERO, vec![tx1, tx2, tx3]);
 
         // Verify transactions are sorted by hash after construction
-        assert!(is_sorted_by_hash(&tx_set.transactions));
+        let txs = tx_set.transactions_owned();
+        assert!(is_sorted_by_hash(&txs));
     }
 
     #[test]
@@ -1149,25 +1354,25 @@ mod tests {
         let tx2 = make_tx_envelope(2, 100);
 
         // Same inputs should produce same hash regardless of input order
-        let set_a = TransactionSet::new(Hash256::ZERO, vec![tx1.clone(), tx2.clone()]);
-        let set_b = TransactionSet::new(Hash256::ZERO, vec![tx2, tx1]);
-        assert_eq!(set_a.hash, set_b.hash);
+        let set_a = TransactionSet::new_legacy(Hash256::ZERO, vec![tx1.clone(), tx2.clone()]);
+        let set_b = TransactionSet::new_legacy(Hash256::ZERO, vec![tx2, tx1]);
+        assert_eq!(set_a.hash(), set_b.hash());
     }
 
     #[test]
     fn test_transaction_set_empty() {
-        let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set = TransactionSet::new_legacy(Hash256::ZERO, vec![]);
         assert!(tx_set.is_empty());
         assert_eq!(tx_set.len(), 0);
     }
 
     #[test]
     fn test_transaction_set_recompute_hash_matches() {
-        let tx_set = TransactionSet::new(
+        let tx_set = TransactionSet::new_legacy(
             Hash256::ZERO,
             vec![make_tx_envelope(1, 100), make_tx_envelope(2, 200)],
         );
-        assert_eq!(tx_set.recompute_hash(), tx_set.hash);
+        assert_eq!(tx_set.recompute_hash(), *tx_set.hash());
     }
 
     // --- Negative base fee rejection tests (parity: TxSetFrame.cpp:1442, 1480) ---

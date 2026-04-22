@@ -86,7 +86,8 @@ impl LedgerCloseData {
     ) -> Self {
         // Verify the tx set hash matches the value's tx_set_hash
         debug_assert_eq!(
-            tx_set.hash.0, value.tx_set_hash.0,
+            tx_set.hash().0,
+            value.tx_set_hash.0,
             "Transaction set hash mismatch"
         );
 
@@ -110,7 +111,8 @@ impl LedgerCloseData {
         expected_results: Option<TransactionResultSet>,
     ) -> Self {
         debug_assert_eq!(
-            tx_set.hash.0, value.tx_set_hash.0,
+            tx_set.hash().0,
+            value.tx_set_hash.0,
             "Transaction set hash mismatch"
         );
 
@@ -161,7 +163,7 @@ impl LedgerCloseData {
 
     /// Get the transaction set hash.
     pub fn tx_set_hash(&self) -> Hash256 {
-        self.tx_set.hash
+        *self.tx_set.hash()
     }
 
     /// Serialize to StoredDebugTransactionSet XDR.
@@ -189,7 +191,7 @@ impl LedgerCloseData {
             .map_err(LedgerCloseDataError::TxSetDecodeError)?;
 
         // Verify hash matches
-        if tx_set.hash.0 != sts.scp_value.tx_set_hash.0 {
+        if tx_set.hash().0 != sts.scp_value.tx_set_hash.0 {
             return Err(LedgerCloseDataError::TxSetHashMismatch);
         }
 
@@ -337,7 +339,7 @@ mod tests {
         let prev_hash = [1u8; 32];
         let tx_set = TransactionSet::new(Hash256::from_bytes(prev_hash), Vec::new());
         // Use the computed hash from the tx_set
-        let value = make_test_value(tx_set.hash.0, 1000);
+        let value = make_test_value(tx_set.hash().0, 1000);
 
         let lcd = LedgerCloseData::new(100, tx_set, value, None);
 
@@ -352,7 +354,7 @@ mod tests {
         let expected = Hash256::from_bytes([3u8; 32]);
         let tx_set = TransactionSet::new(Hash256::from_bytes(prev_hash), Vec::new());
         // Use the computed hash from the tx_set
-        let value = make_test_value(tx_set.hash.0, 2000);
+        let value = make_test_value(tx_set.hash().0, 2000);
 
         let lcd = LedgerCloseData::new(200, tx_set, value, Some(expected));
 

@@ -2615,16 +2615,10 @@ mod tests {
         PendingLedgerClose {
             handle,
             ledger_seq: seq,
-            tx_set: henyey_herder::TransactionSet {
-                hash: henyey_common::Hash256::ZERO,
-                previous_ledger_hash: henyey_common::Hash256::ZERO,
-                transactions: Vec::new(),
-                generalized_tx_set: None,
-            },
-            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
-            }),
+            tx_set: henyey_herder::TransactionSet::new_legacy(
+                henyey_common::Hash256::ZERO,
+                Vec::new(),
+            ),
             close_time: seq as u64,
             upgrades: Vec::new(),
         }
@@ -3282,16 +3276,10 @@ mod tests {
         let pending = PendingLedgerClose {
             handle: tokio::task::spawn_blocking(|| Err("simulated error".to_string())),
             ledger_seq: 1,
-            tx_set: henyey_herder::TransactionSet {
-                hash: henyey_common::Hash256::ZERO,
-                previous_ledger_hash: henyey_common::Hash256::ZERO,
-                transactions: Vec::new(),
-                generalized_tx_set: None,
-            },
-            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
-            }),
+            tx_set: henyey_herder::TransactionSet::new_legacy(
+                henyey_common::Hash256::ZERO,
+                Vec::new(),
+            ),
             close_time: 1,
             upgrades: Vec::new(),
         };
@@ -3330,16 +3318,10 @@ mod tests {
                 panic!("simulated panic");
             }),
             ledger_seq: 1,
-            tx_set: henyey_herder::TransactionSet {
-                hash: henyey_common::Hash256::ZERO,
-                previous_ledger_hash: henyey_common::Hash256::ZERO,
-                transactions: Vec::new(),
-                generalized_tx_set: None,
-            },
-            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
-            }),
+            tx_set: henyey_herder::TransactionSet::new_legacy(
+                henyey_common::Hash256::ZERO,
+                Vec::new(),
+            ),
             close_time: 1,
             upgrades: Vec::new(),
         };
@@ -3394,16 +3376,10 @@ mod tests {
                 || Err("previous ledger hash mismatch".to_string()),
             ),
             ledger_seq: 1,
-            tx_set: henyey_herder::TransactionSet {
-                hash: henyey_common::Hash256::ZERO,
-                previous_ledger_hash: henyey_common::Hash256::ZERO,
-                transactions: Vec::new(),
-                generalized_tx_set: None,
-            },
-            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
-            }),
+            tx_set: henyey_herder::TransactionSet::new_legacy(
+                henyey_common::Hash256::ZERO,
+                Vec::new(),
+            ),
             close_time: 1,
             upgrades: Vec::new(),
         };
@@ -3446,16 +3422,10 @@ mod tests {
         let pending = PendingLedgerClose {
             handle: tokio::task::spawn_blocking(|| Err("simulated error".to_string())),
             ledger_seq: 42,
-            tx_set: henyey_herder::TransactionSet {
-                hash: henyey_common::Hash256::ZERO,
-                previous_ledger_hash: henyey_common::Hash256::ZERO,
-                transactions: Vec::new(),
-                generalized_tx_set: None,
-            },
-            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
-            }),
+            tx_set: henyey_herder::TransactionSet::new_legacy(
+                henyey_common::Hash256::ZERO,
+                Vec::new(),
+            ),
             close_time: 1,
             upgrades: Vec::new(),
         };
@@ -3516,16 +3486,10 @@ mod tests {
                 Err("simulated error after persist".to_string())
             }),
             ledger_seq: 42,
-            tx_set: henyey_herder::TransactionSet {
-                hash: henyey_common::Hash256::ZERO,
-                previous_ledger_hash: henyey_common::Hash256::ZERO,
-                transactions: Vec::new(),
-                generalized_tx_set: None,
-            },
-            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
-            }),
+            tx_set: henyey_herder::TransactionSet::new_legacy(
+                henyey_common::Hash256::ZERO,
+                Vec::new(),
+            ),
             close_time: 1,
             upgrades: Vec::new(),
         };
@@ -3669,12 +3633,10 @@ mod tests {
                 henyey_herder::LedgerCloseInfo {
                     slot: 102,
                     tx_set_hash: Hash256::ZERO,
-                    tx_set: Some(henyey_herder::TransactionSet {
-                        hash: Hash256::ZERO,
-                        previous_ledger_hash: Hash256::ZERO,
-                        transactions: Vec::new(),
-                        generalized_tx_set: None,
-                    }),
+                    tx_set: Some(henyey_herder::TransactionSet::new_legacy(
+                        Hash256::ZERO,
+                        Vec::new(),
+                    )),
                     close_time: 3,
                     upgrades: Vec::new(),
                     stellar_value_ext: StellarValueExt::Basic,
@@ -5313,16 +5275,10 @@ mod tests {
                 })
             }),
             ledger_seq: 1,
-            tx_set: henyey_herder::TransactionSet {
-                hash: henyey_common::Hash256::ZERO,
-                previous_ledger_hash: henyey_common::Hash256::ZERO,
-                transactions: Vec::new(),
-                generalized_tx_set: None,
-            },
-            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
-            }),
+            tx_set: henyey_herder::TransactionSet::new_legacy(
+                henyey_common::Hash256::ZERO,
+                Vec::new(),
+            ),
             close_time: 1,
             upgrades: Vec::new(),
         };
@@ -5528,16 +5484,10 @@ mod tests {
                 })
             }),
             ledger_seq: 1,
-            tx_set: henyey_herder::TransactionSet {
-                hash: henyey_common::Hash256::ZERO,
-                previous_ledger_hash: henyey_common::Hash256::ZERO,
-                transactions: Vec::new(),
-                generalized_tx_set: None,
-            },
-            tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
-                previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                txs: stellar_xdr::curr::VecM::default(),
-            }),
+            tx_set: henyey_herder::TransactionSet::new_legacy(
+                henyey_common::Hash256::ZERO,
+                Vec::new(),
+            ),
             close_time: 1,
             upgrades: Vec::new(),
         };
@@ -5714,16 +5664,10 @@ mod tests {
                     })
                 }),
                 ledger_seq: 1,
-                tx_set: henyey_herder::TransactionSet {
-                    hash: henyey_common::Hash256::ZERO,
-                    previous_ledger_hash: henyey_common::Hash256::ZERO,
-                    transactions: Vec::new(),
-                    generalized_tx_set: None,
-                },
-                tx_set_variant: TransactionSetVariant::Classic(stellar_xdr::curr::TransactionSet {
-                    previous_ledger_hash: stellar_xdr::curr::Hash([0u8; 32]),
-                    txs: stellar_xdr::curr::VecM::default(),
-                }),
+                tx_set: henyey_herder::TransactionSet::new_legacy(
+                    henyey_common::Hash256::ZERO,
+                    Vec::new(),
+                ),
                 close_time: 1,
                 upgrades: Vec::new(),
             };

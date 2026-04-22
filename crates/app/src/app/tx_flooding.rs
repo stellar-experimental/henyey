@@ -469,21 +469,21 @@ impl App {
         let internal_tx_set = TransactionSet::with_hash(prev_hash, hash, transactions);
         {
             let mut map = self.tx_set_dont_have.write().await;
-            map.remove(&internal_tx_set.hash);
+            map.remove(internal_tx_set.hash());
         }
         {
             let mut map = self.tx_set_last_request.write().await;
-            map.remove(&internal_tx_set.hash);
+            map.remove(internal_tx_set.hash());
         }
 
         tracing::info!(
-            hash = %internal_tx_set.hash,
-            tx_count = internal_tx_set.transactions.len(),
+            hash = %internal_tx_set.hash(),
+            tx_count = internal_tx_set.len(),
             "Processing TxSet"
         );
 
-        if !self.herder.needs_tx_set(&internal_tx_set.hash) {
-            tracing::info!(hash = %internal_tx_set.hash, "TxSet not pending");
+        if !self.herder.needs_tx_set(internal_tx_set.hash()) {
+            tracing::info!(hash = %internal_tx_set.hash(), "TxSet not pending");
         }
 
         // `receive_tx_set` is async as of #1773: the envelope-drain phase
@@ -669,11 +669,11 @@ impl App {
             TransactionSet::with_generalized(prev_hash, hash, transactions, gen_tx_set);
         {
             let mut map = self.tx_set_dont_have.write().await;
-            map.remove(&internal_tx_set.hash);
+            map.remove(internal_tx_set.hash());
         }
         {
             let mut map = self.tx_set_last_request.write().await;
-            map.remove(&internal_tx_set.hash);
+            map.remove(internal_tx_set.hash());
         }
 
         // `receive_tx_set` is async as of #1773: the envelope-drain phase
@@ -746,9 +746,9 @@ impl App {
         // from the current header would be wrong for nodes that haven't yet closed
         // the ledger at the newer protocol version.
         if let Some(gen_tx_set) = tx_set
-            .generalized_tx_set
-            .clone()
-            .or_else(|| build_generalized_tx_set(&tx_set))
+            .generalized_tx_set()
+            .cloned()
+            .or_else(|| tx_set.to_generalized_tx_set())
         {
             let gen_hash = match gen_tx_set.to_xdr(stellar_xdr::curr::Limits::none()) {
                 Ok(bytes) => henyey_common::Hash256::hash(&bytes),
@@ -772,10 +772,10 @@ impl App {
         }
 
         // Convert to legacy XDR TransactionSet
-        let prev_hash = tx_set.previous_ledger_hash;
+        let prev_hash = tx_set.previous_ledger_hash();
         let xdr_tx_set = stellar_xdr::curr::TransactionSet {
             previous_ledger_hash: Hash::from(prev_hash),
-            txs: tx_set.transactions.try_into().unwrap_or_default(),
+            txs: tx_set.transactions_owned().try_into().unwrap_or_default(),
         };
 
         let message = StellarMessage::TxSet(xdr_tx_set);

@@ -396,7 +396,7 @@ impl ScpDriver {
         lcl_hash: Hash256,
         close_time_offset: u64,
     ) -> bool {
-        let cache_key = (lcl_hash, tx_set.hash, close_time_offset);
+        let cache_key = (lcl_hash, *tx_set.hash(), close_time_offset);
 
         // Check cache
         if let Some(cached) = self.tx_tracker.check_valid(&cache_key) {
@@ -419,7 +419,7 @@ impl ScpDriver {
         };
 
         // For generalized tx sets, run full content validation
-        let result = if let Some(ref gen) = prepared.generalized_tx_set {
+        let result = if let Some(gen) = prepared.generalized_tx_set() {
             if let Some(lm) = self.ledger_manager.get() {
                 let lcl_header = lm.current_header();
 
@@ -987,10 +987,11 @@ impl ScpDriver {
                 // Parity: check previousLedgerHash matches the LCL hash.
                 // Uses the hash captured atomically with seq/close_time above.
                 if let Some(hash) = lcl_hash_from_snapshot {
-                    if tx_set.previous_ledger_hash != hash {
+                    if tx_set.previous_ledger_hash() != hash {
                         debug!(
                             "Tx set previousLedgerHash mismatch: expected {}, got {}",
-                            hash, tx_set.previous_ledger_hash
+                            hash,
+                            tx_set.previous_ledger_hash()
                         );
                         return ValueValidation::Invalid;
                     }
@@ -1001,7 +1002,7 @@ impl ScpDriver {
                 // For generalized tx sets, per-component sort order is validated
                 // during extraction (tx_set.rs:validate_component). The global
                 // hash-sort check only applies to legacy (non-generalized) sets.
-                if tx_set.generalized_tx_set.is_none() && !Self::is_tx_set_well_formed(&tx_set) {
+                if tx_set.generalized_tx_set().is_none() && !Self::is_tx_set_well_formed(&tx_set) {
                     debug!("Legacy tx set is not well-formed (unsorted or has duplicates)");
                     return ValueValidation::Invalid;
                 }
@@ -1360,7 +1361,7 @@ impl ScpDriver {
             decoded.retain(|sv| {
                 let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
                 let tx_set = self.tx_tracker.get(&tx_set_hash).unwrap();
-                tx_set.previous_ledger_hash == lcl_hash
+                tx_set.previous_ledger_hash() == lcl_hash
             });
             if decoded.is_empty() {
                 // All candidates filtered out — fall back to first value
@@ -1527,7 +1528,9 @@ impl ScpDriver {
     ///
     /// Parity: stellar-core `TxSetUtils::checkValid()` verifies structural integrity.
     fn is_tx_set_well_formed(tx_set: &TransactionSet) -> bool {
-        let txs = &tx_set.transactions;
+        let Some(txs) = tx_set.as_legacy_transactions() else {
+            return true;
+        };
         if txs.len() <= 1 {
             return true;
         }
@@ -1548,8 +1551,7 @@ impl ScpDriver {
     /// Count total number of operations in a transaction set.
     fn tx_set_num_ops(tx_set: &TransactionSet) -> usize {
         tx_set
-            .transactions
-            .iter()
+            .iter_transactions()
             .map(|env| Self::envelope_num_ops(env))
             .sum()
     }
@@ -1561,8 +1563,7 @@ impl ScpDriver {
     /// - Soroban: fullFee - declaredSorobanResourceFee
     fn tx_set_total_inclusion_fees(tx_set: &TransactionSet) -> i64 {
         tx_set
-            .transactions
-            .iter()
+            .iter_transactions()
             // Saturate to prevent wrapping on adversarial fee values.
             .map(|env| crate::tx_set_utils::envelope_inclusion_fee(env))
             .fold(0i64, i64::saturating_add)
@@ -1598,12 +1599,11 @@ impl ScpDriver {
     /// - Soroban with baseFee: resourceFee + min(inclusionFee, baseFee * numOps)
     /// - No baseFee: fullFee
     fn tx_set_total_fees(tx_set: &TransactionSet) -> i64 {
-        let Some(ref gen) = tx_set.generalized_tx_set else {
+        let Some(gen) = tx_set.generalized_tx_set() else {
             // Legacy tx set: applying fee == full fee.
             // Saturate to prevent wrapping on adversarial fee values.
             return tx_set
-                .transactions
-                .iter()
+                .iter_transactions()
                 .map(|env| crate::tx_set_utils::envelope_fee(env))
                 .fold(0i64, i64::saturating_add);
         };
@@ -1644,12 +1644,11 @@ impl ScpDriver {
     /// For generalized tx sets, encodes the generalized set. For legacy,
     /// sums the XDR-encoded size of all transactions.
     fn tx_set_encoded_size(tx_set: &TransactionSet) -> usize {
-        if let Some(ref gen) = tx_set.generalized_tx_set {
+        if let Some(gen) = tx_set.generalized_tx_set() {
             henyey_common::xdr_stream::xdr_to_bytes(gen).len()
         } else {
             tx_set
-                .transactions
-                .iter()
+                .iter_transactions()
                 .map(|tx| henyey_common::xdr_stream::xdr_to_bytes(tx).len())
                 .sum()
         }
@@ -2088,8 +2087,8 @@ mod cache_tests {
         driver.cache_tx_set(first.clone());
         driver.cache_tx_set(second.clone());
 
-        assert!(!driver.has_tx_set(&first.hash));
-        assert!(driver.has_tx_set(&second.hash));
+        assert!(!driver.has_tx_set(first.hash()));
+        assert!(driver.has_tx_set(second.hash()));
     }
 
     #[test]
@@ -2102,15 +2101,15 @@ mod cache_tests {
         let tx_set = make_tx_set(3);
         let slot = 12u64;
 
-        assert!(driver.request_tx_set(tx_set.hash, slot));
-        assert!(!driver.request_tx_set(tx_set.hash, slot));
-        assert!(driver.needs_tx_set(&tx_set.hash));
-        assert_eq!(driver.get_pending_tx_set_hashes(), vec![tx_set.hash]);
+        assert!(driver.request_tx_set(*tx_set.hash(), slot));
+        assert!(!driver.request_tx_set(*tx_set.hash(), slot));
+        assert!(driver.needs_tx_set(tx_set.hash()));
+        assert_eq!(driver.get_pending_tx_set_hashes(), vec![*tx_set.hash()]);
 
         let received = driver.receive_tx_set(tx_set.clone());
         assert_eq!(received, Some(slot));
-        assert!(!driver.needs_tx_set(&tx_set.hash));
-        assert!(driver.get_tx_set(&tx_set.hash).is_some());
+        assert!(!driver.needs_tx_set(tx_set.hash()));
+        assert!(driver.get_tx_set(tx_set.hash()).is_some());
     }
 
     #[test]
@@ -2122,7 +2121,8 @@ mod cache_tests {
         );
         let tx_set = make_tx_set(4);
         let bad_hash = Hash256::from_bytes([9; 32]);
-        let bad_set = TransactionSet::with_hash(tx_set.previous_ledger_hash, bad_hash, Vec::new());
+        let bad_set =
+            TransactionSet::with_hash(tx_set.previous_ledger_hash(), bad_hash, Vec::new());
 
         let received = driver.receive_tx_set(bad_set);
         assert_eq!(received, None);
@@ -2139,14 +2139,14 @@ mod cache_tests {
         let tx_set_a = make_tx_set(5);
         let tx_set_b = make_tx_set(6);
 
-        driver.request_tx_set(tx_set_a.hash, 10);
-        driver.request_tx_set(tx_set_b.hash, 12);
+        driver.request_tx_set(*tx_set_a.hash(), 10);
+        driver.request_tx_set(*tx_set_b.hash(), 12);
 
         let removed = driver.cleanup_old_pending_slots(12);
         assert_eq!(removed, 1);
 
         let pending = driver.get_pending_tx_sets();
-        assert_eq!(pending, vec![(tx_set_b.hash, 12)]);
+        assert_eq!(pending, vec![(*tx_set_b.hash(), 12)]);
     }
 
     #[test]
@@ -2157,7 +2157,7 @@ mod cache_tests {
             default_tracking(),
         );
         let tx_set = make_tx_set(7);
-        driver.request_tx_set(tx_set.hash, 20);
+        driver.request_tx_set(*tx_set.hash(), 20);
 
         driver.cleanup_pending_tx_sets(0);
         assert!(driver.get_pending_tx_set_hashes().is_empty());
@@ -2294,10 +2294,10 @@ mod cache_tests {
         let tx_set_future1 = make_tx_set(3);
         let tx_set_future2 = make_tx_set(4);
 
-        driver.request_tx_set(tx_set_old.hash, 98);
-        driver.request_tx_set(tx_set_boundary.hash, 100);
-        driver.request_tx_set(tx_set_future1.hash, 101);
-        driver.request_tx_set(tx_set_future2.hash, 105);
+        driver.request_tx_set(*tx_set_old.hash(), 98);
+        driver.request_tx_set(*tx_set_boundary.hash(), 100);
+        driver.request_tx_set(*tx_set_future1.hash(), 101);
+        driver.request_tx_set(*tx_set_future2.hash(), 105);
 
         // Add externalized slots
         {
@@ -2317,13 +2317,13 @@ mod cache_tests {
         assert_eq!(pending.len(), 2);
         assert!(pending
             .iter()
-            .any(|(h, s)| *h == tx_set_future1.hash && *s == 101));
+            .any(|(h, s)| *h == *tx_set_future1.hash() && *s == 101));
         assert!(pending
             .iter()
-            .any(|(h, s)| *h == tx_set_future2.hash && *s == 105));
+            .any(|(h, s)| *h == *tx_set_future2.hash() && *s == 105));
         // Old and boundary slots should be removed
-        assert!(!pending.iter().any(|(h, _)| *h == tx_set_old.hash));
-        assert!(!pending.iter().any(|(h, _)| *h == tx_set_boundary.hash));
+        assert!(!pending.iter().any(|(h, _)| *h == *tx_set_old.hash()));
+        assert!(!pending.iter().any(|(h, _)| *h == *tx_set_boundary.hash()));
 
         // Verify externalized slots
         let ext_slots = driver.get_externalized_slots_in_range(0, 200);
@@ -2341,9 +2341,9 @@ mod cache_tests {
         let tx_set_b = make_tx_set(11);
         let tx_set_c = make_tx_set(12);
 
-        driver.request_tx_set(tx_set_a.hash, 100);
-        driver.request_tx_set(tx_set_b.hash, 101);
-        driver.request_tx_set(tx_set_c.hash, 102);
+        driver.request_tx_set(*tx_set_a.hash(), 100);
+        driver.request_tx_set(*tx_set_b.hash(), 101);
+        driver.request_tx_set(*tx_set_c.hash(), 102);
         assert_eq!(driver.get_pending_tx_sets().len(), 3);
 
         driver.clear_pending_tx_sets();
@@ -2375,18 +2375,18 @@ mod cache_tests {
         let tx_set = make_tx_set(20);
 
         // Request and then receive the tx_set (puts it in cache)
-        driver.request_tx_set(tx_set.hash, 200);
+        driver.request_tx_set(*tx_set.hash(), 200);
         driver.receive_tx_set(tx_set.clone());
-        assert!(driver.has_tx_set(&tx_set.hash));
+        assert!(driver.has_tx_set(tx_set.hash()));
 
         // Add another pending request
         let tx_set_b = make_tx_set(21);
-        driver.request_tx_set(tx_set_b.hash, 201);
+        driver.request_tx_set(*tx_set_b.hash(), 201);
 
         // Clear pending — should not affect the cached tx_set
         driver.clear_pending_tx_sets();
-        assert!(driver.has_tx_set(&tx_set.hash));
-        assert!(driver.get_tx_set(&tx_set.hash).is_some());
+        assert!(driver.has_tx_set(tx_set.hash()));
+        assert!(driver.get_tx_set(tx_set.hash()).is_some());
         assert!(driver.get_pending_tx_sets().is_empty());
     }
 
@@ -2489,7 +2489,7 @@ mod cache_tests {
         let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
         // The tx_set created by TransactionSet::new computes its own hash,
         // so we need to use that hash in the value
-        let tx_set_hash_real = tx_set.hash;
+        let tx_set_hash_real = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let value2 = make_signed_stellar_value(&network_id, &secret, tx_set_hash_real.0, now);
@@ -2777,7 +2777,7 @@ mod tests {
         let driver = make_test_driver();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
-        let hash = tx_set.hash;
+        let hash = *tx_set.hash();
 
         driver.cache_tx_set(tx_set);
         assert!(driver.has_tx_set(&hash));
@@ -2983,7 +2983,7 @@ mod tests {
         let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let now = std::time::SystemTime::now()
@@ -3012,7 +3012,7 @@ mod tests {
         let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::with_hash(Hash256::ZERO, Hash256::ZERO, vec![]);
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let now = std::time::SystemTime::now()
@@ -3040,7 +3040,7 @@ mod tests {
         let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let base_close_time = 100;
@@ -3081,7 +3081,7 @@ mod tests {
         let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let now = std::time::SystemTime::now()
@@ -3125,7 +3125,7 @@ mod tests {
         let driver = make_test_driver();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let now = std::time::SystemTime::now()
@@ -3154,7 +3154,7 @@ mod tests {
         let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let now = std::time::SystemTime::now()
@@ -3190,7 +3190,7 @@ mod tests {
         let (driver, secret_key) = make_test_driver_with_key();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let now = std::time::SystemTime::now()
@@ -3244,7 +3244,7 @@ mod tests {
         let driver = make_test_driver();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let now = std::time::SystemTime::now()
@@ -3296,11 +3296,11 @@ mod tests {
 
         // Create and cache real tx sets so the cache filter keeps them
         let tx_set_1 = TransactionSet::new(Hash256::ZERO, vec![]);
-        let hash_1 = tx_set_1.hash;
+        let hash_1 = *tx_set_1.hash();
         driver.cache_tx_set(tx_set_1);
 
         let tx_set_2 = TransactionSet::new(Hash256::from_bytes([1u8; 32]), vec![]);
-        let hash_2 = tx_set_2.hash;
+        let hash_2 = *tx_set_2.hash();
         driver.cache_tx_set(tx_set_2);
 
         // Candidate 1: version upgrade
@@ -3351,11 +3351,11 @@ mod tests {
 
         // Create and cache real tx sets
         let tx_set_1 = TransactionSet::new(Hash256::ZERO, vec![]);
-        let hash_1 = tx_set_1.hash;
+        let hash_1 = *tx_set_1.hash();
         driver.cache_tx_set(tx_set_1);
 
         let tx_set_2 = TransactionSet::new(Hash256::from_bytes([1u8; 32]), vec![]);
-        let hash_2 = tx_set_2.hash;
+        let hash_2 = *tx_set_2.hash();
         driver.cache_tx_set(tx_set_2);
 
         // Candidate 1: version 24
@@ -3732,7 +3732,7 @@ mod tests {
             .as_secs();
 
         let tx_set = TransactionSet::new(Hash256::ZERO, vec![]);
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
 
         let sv = make_signed_stellar_value(
@@ -3897,13 +3897,13 @@ mod tests {
             TransactionSet::with_generalized(Hash256::ZERO, gen_hash, fee_priority_order, gen);
 
         // The generalized tx set has a generalized_tx_set field
-        assert!(gen_set.generalized_tx_set.is_some());
+        assert!(gen_set.generalized_tx_set().is_some());
 
         // The guard should skip is_tx_set_well_formed for generalized sets.
         // We can verify the guard logic directly: generalized_tx_set.is_none() is false,
         // so the well-formed check is skipped.
         assert!(
-            gen_set.generalized_tx_set.is_some(),
+            gen_set.generalized_tx_set().is_some(),
             "AUDIT-013: Generalized tx sets should bypass global hash-sort check"
         );
     }
@@ -4220,7 +4220,7 @@ mod compare_tx_sets_tests {
     }
 
     fn cache_tx_set(driver: &ScpDriver, tx_set: TransactionSet) -> Hash256 {
-        let hash = tx_set.hash;
+        let hash = *tx_set.hash();
         driver.cache_tx_set(tx_set);
         hash
     }
@@ -4497,13 +4497,13 @@ mod compare_tx_sets_tests {
         let tx_set_b = TransactionSet::new(Hash256::ZERO, vec![make_tx(2, 100, 1)]);
 
         let sv_a = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_a.hash.0),
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_a.hash().0),
             close_time: TimePoint(1_700_000_000),
             upgrades: Default::default(),
             ext: StellarValueExt::Basic,
         };
         let sv_b = StellarValue {
-            tx_set_hash: stellar_xdr::curr::Hash(tx_set_b.hash.0),
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_b.hash().0),
             close_time: TimePoint(1_700_000_000),
             upgrades: Default::default(),
             ext: StellarValueExt::Basic,
@@ -4519,7 +4519,8 @@ mod compare_tx_sets_tests {
         let full_result = driver.combine_candidates_impl(1, &values);
         let full_sv = StellarValue::from_xdr(&full_result.0, Limits::none()).unwrap();
         assert_eq!(
-            full_sv.tx_set_hash.0, tx_set_a.hash.0,
+            full_sv.tx_set_hash.0,
+            tx_set_a.hash().0,
             "A should win with both cached"
         );
 
@@ -4531,7 +4532,8 @@ mod compare_tx_sets_tests {
         // The key assertion: with A missing from cache, the result should be B
         // (not a silently degraded XOR tiebreak that might pick A)
         assert_eq!(
-            partial_sv.tx_set_hash.0, tx_set_b.hash.0,
+            partial_sv.tx_set_hash.0,
+            tx_set_b.hash().0,
             "AUDIT-014: Missing tx set A should be filtered out, B should win"
         );
     }

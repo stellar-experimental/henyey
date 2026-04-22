@@ -2018,7 +2018,7 @@ impl Herder {
 
         // 3. Build & cache tx set, trimming against proposed close time.
         // Use the pre-built snapshot providers for O(1) snapshot creation.
-        let (tx_set, _gen_tx_set) = self.tx_queue.build_generalized_tx_set_with_providers(
+        let tx_set = self.tx_queue.build_generalized_tx_set_with_providers(
             previous_hash,
             max_txs,
             starting_seq.as_ref(),
@@ -2031,7 +2031,7 @@ impl Herder {
                 .map(|sp| sp as &dyn crate::tx_queue::AccountProvider),
         );
         debug!(
-            hash = %tx_set.hash,
+            hash = %tx_set.hash(),
             tx_count = tx_set.len(),
             "Proposing transaction set"
         );
@@ -2104,7 +2104,7 @@ impl Herder {
 
         // 5. Sign & encode
         let stellar_value = self
-            .make_stellar_value(tx_set.hash, close_time, upgrades)
+            .make_stellar_value(*tx_set.hash(), close_time, upgrades)
             .ok()?;
         let value_bytes = henyey_common::xdr_to_bytes(&stellar_value);
         let value = Value(value_bytes.try_into().ok()?);
@@ -2414,7 +2414,7 @@ impl Herder {
     ///   the fix landed.
     pub async fn receive_tx_set(self: Arc<Self>, tx_set: TransactionSet) -> Option<SlotIndex> {
         let mut timer = crate::tracked_lock::PhaseTimer::start();
-        let hash = tx_set.hash;
+        let hash = *tx_set.hash();
 
         let slot = self.scp_driver.receive_tx_set(tx_set);
         timer.mark("tracker_receive_ms");
@@ -2490,7 +2490,7 @@ impl Herder {
     /// This also notifies the fetching envelopes manager, which may
     /// process any waiting envelopes.
     pub fn cache_tx_set(&self, tx_set: TransactionSet) {
-        let hash = tx_set.hash;
+        let hash = *tx_set.hash();
         self.scp_driver.cache_tx_set(tx_set);
 
         // Notify fetching envelopes and process any that become ready
@@ -2744,7 +2744,7 @@ mod tests {
 
     fn make_valid_value_with_cached_tx_set(herder: &Herder, secret_key: &SecretKey) -> Value {
         let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
-        let tx_set_hash = tx_set.hash;
+        let tx_set_hash = *tx_set.hash();
         herder.scp_driver.cache_tx_set(tx_set);
 
         let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);

@@ -1447,11 +1447,11 @@ impl App {
         let mut buffer =
             tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
         if let Some(entry) = buffer.get_mut(&slot) {
-            if tx_set.hash != entry.tx_set_hash {
+            if *tx_set.hash() != entry.tx_set_hash {
                 tracing::warn!(
                     slot,
                     expected = %entry.tx_set_hash.to_hex(),
-                    found = %tx_set.hash.to_hex(),
+                    found = %tx_set.hash().to_hex(),
                     "Buffered tx set hash mismatch (dropping)"
                 );
                 return;
@@ -1470,9 +1470,9 @@ impl App {
         let mut buffer =
             tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
         for (slot, entry) in buffer.iter_mut() {
-            if entry.tx_set.is_none() && entry.tx_set_hash == tx_set.hash {
+            if entry.tx_set.is_none() && entry.tx_set_hash == *tx_set.hash() {
                 entry.tx_set = Some(tx_set.clone());
-                tracing::debug!(slot, hash = %tx_set.hash, "Attached tx set to buffered slot");
+                tracing::debug!(slot, hash = %tx_set.hash(), "Attached tx set to buffered slot");
                 return true;
             }
         }
@@ -1485,7 +1485,7 @@ impl App {
     ) -> bool {
         let Some(slot) = self
             .herder
-            .find_externalized_slot_by_tx_set_hash(&tx_set.hash)
+            .find_externalized_slot_by_tx_set_hash(tx_set.hash())
         else {
             return false;
         };
@@ -1501,7 +1501,7 @@ impl App {
             .await;
         tracing::debug!(
             slot,
-            hash = %tx_set.hash,
+            hash = %tx_set.hash(),
             "Buffered tx set after externalized lookup"
         );
         true
@@ -1606,22 +1606,22 @@ impl App {
 
         let tx_set = close_info.tx_set.clone().expect("tx set present");
         let our_header_hash = self.ledger_manager.current_header_hash();
-        if our_header_hash != tx_set.previous_ledger_hash {
+        if our_header_hash != tx_set.previous_ledger_hash() {
             tracing::error!(
                 ledger_seq = next_seq,
                 our_header_hash = %our_header_hash.to_hex(),
-                network_prev_hash = %tx_set.previous_ledger_hash.to_hex(),
+                network_prev_hash = %tx_set.previous_ledger_hash().to_hex(),
                 "FATAL: pre-close hash mismatch — our header hash does not match \
                  the network's previous ledger hash. This means our ledger state \
                  has diverged from the network. Shutting down."
             );
             std::process::exit(1);
         }
-        if tx_set.hash != close_info.tx_set_hash {
+        if *tx_set.hash() != close_info.tx_set_hash {
             tracing::error!(
                 ledger_seq = next_seq,
                 expected = %close_info.tx_set_hash.to_hex(),
-                found = %tx_set.hash.to_hex(),
+                found = %tx_set.hash().to_hex(),
                 "Buffered tx set hash mismatch"
             );
             let mut buffer =
@@ -1634,31 +1634,15 @@ impl App {
 
         tracing::debug!(
             ledger_seq = next_seq,
-            tx_count = tx_set.transactions.len(),
+            tx_count = tx_set.len(),
             close_time = close_info.close_time,
-            prev_ledger_hash = %tx_set.previous_ledger_hash.to_hex(),
+            prev_ledger_hash = %tx_set.previous_ledger_hash().to_hex(),
             "Starting background ledger close"
         );
 
         // Build LedgerCloseData (same as HerderCallback::close_ledger).
-        let prev_hash = tx_set.previous_ledger_hash;
-        let tx_set_variant = if let Some(gen_tx_set) = tx_set.generalized_tx_set.clone() {
-            TransactionSetVariant::Generalized(gen_tx_set)
-        } else {
-            TransactionSetVariant::Classic(TransactionSet {
-                previous_ledger_hash: Hash::from(prev_hash),
-                txs: match tx_set.transactions.clone().try_into() {
-                    Ok(txs) => txs,
-                    Err(_) => {
-                        tracing::error!(
-                            ledger_seq = next_seq,
-                            "Failed to create tx set for background close"
-                        );
-                        return None;
-                    }
-                },
-            })
-        };
+        let prev_hash = tx_set.previous_ledger_hash();
+        let tx_set_variant = tx_set.clone().into_variant();
 
         let decoded_upgrades = decode_upgrades(close_info.upgrades.clone());
         let close_time = close_info.close_time;
@@ -1694,7 +1678,6 @@ impl App {
             handle: join_handle,
             ledger_seq: next_seq,
             tx_set,
-            tx_set_variant,
             close_time,
             upgrades: close_info.upgrades.clone(),
         })
@@ -1929,9 +1912,10 @@ impl App {
         // SQLite transaction) is deferred to a background task to avoid
         // blocking the event loop (#1713/#1518).
         let tx_metas = result.meta.as_ref().map(Self::extract_tx_metas);
+        let tx_set_variant = pending.tx_set.clone().into_variant();
         let persist_data = self.build_persist_inputs(
             &result.header,
-            &pending.tx_set_variant,
+            &tx_set_variant,
             &result.tx_results,
             tx_metas.as_deref(),
         );
@@ -1947,8 +1931,7 @@ impl App {
         let mut failed_hashes = Vec::new();
         for (tx, tx_result) in pending
             .tx_set
-            .transactions
-            .iter()
+            .iter_transactions()
             .zip(result.tx_results.iter())
         {
             let seq_num = envelope_sequence_number(tx);
@@ -1971,7 +1954,7 @@ impl App {
         );
 
         // Track non-empty ledger closes for the `ledger.transaction.count` metric.
-        if !pending.tx_set.transactions.is_empty() {
+        if !pending.tx_set.is_empty() {
             self.ledger_tx_count.fetch_add(1, Ordering::Relaxed);
         }
 

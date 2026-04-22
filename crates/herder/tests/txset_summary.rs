@@ -289,8 +289,9 @@ fn test_txset_summary_smoke() {
     queue.try_add(dex.clone());
     queue.try_add(soroban.clone());
 
-    let (tx_set, gen) = queue.build_generalized_tx_set(Hash256::ZERO, 100);
-    let summary = summary_for_set(&tx_set.transactions, &gen);
+    let tx_set = queue.build_generalized_tx_set(Hash256::ZERO, 100);
+    let gen = tx_set.generalized_tx_set().unwrap();
+    let summary = summary_for_set(&tx_set.transactions_owned(), gen);
 
     assert_eq!(summary.classic_ops, 2);
     assert_eq!(summary.soroban_ops, 1);
@@ -320,7 +321,7 @@ fn test_txset_summary_string() {
     queue.try_add(dex.clone());
     queue.try_add(soroban.clone());
 
-    let (tx_set, _gen) = queue.build_generalized_tx_set(Hash256::ZERO, 100);
+    let tx_set = queue.build_generalized_tx_set(Hash256::ZERO, 100);
     let summary = tx_set.summary();
 
     assert!(summary.contains("classic phase"));

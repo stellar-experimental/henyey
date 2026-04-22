@@ -140,7 +140,7 @@ impl TxSetTracker {
     /// `pub(crate)` to ensure network-received tx sets go through `receive()`,
     /// which enforces the pending check (AUDIT-080).
     pub(crate) fn store(&self, tx_set: TransactionSet) {
-        let hash = tx_set.hash;
+        let hash = *tx_set.hash();
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
         // If already cached, replace in-place without evicting another entry.
@@ -173,7 +173,7 @@ impl TxSetTracker {
     /// Only caches tx sets that were actually pending — unsolicited tx sets
     /// are rejected to prevent cache poisoning (AUDIT-080).
     pub fn receive(&self, tx_set: TransactionSet) -> Option<u64> {
-        let hash = tx_set.hash;
+        let hash = *tx_set.hash();
         let recomputed = tx_set.recompute_hash();
         if recomputed != hash {
             warn!(
@@ -321,7 +321,7 @@ mod tests {
     fn test_request_cached_returns_false() {
         let tracker = TxSetTracker::new(256);
         let ts = make_tx_set(1);
-        let hash = ts.hash;
+        let hash = *ts.hash();
         tracker.store(ts);
         assert!(!tracker.request(hash, 100));
         assert_eq!(tracker.pending_count(), 0);
@@ -339,7 +339,7 @@ mod tests {
     fn test_needs_false_when_cached() {
         let tracker = TxSetTracker::new(256);
         let ts = make_tx_set(1);
-        let hash = ts.hash;
+        let hash = *ts.hash();
         tracker.request(hash, 100);
         tracker.store(ts);
         assert!(!tracker.needs(&hash));
@@ -349,7 +349,7 @@ mod tests {
     fn test_receive_removes_pending() {
         let tracker = TxSetTracker::new(256);
         let ts = make_tx_set(1);
-        let hash = ts.hash;
+        let hash = *ts.hash();
         tracker.request(hash, 42);
 
         let slot = tracker.receive(ts);
@@ -461,18 +461,18 @@ mod tests {
         let tracker = TxSetTracker::new(2);
 
         let ts1 = make_tx_set(1);
-        let hash1 = ts1.hash;
+        let hash1 = *ts1.hash();
         tracker.store(ts1);
 
         let ts2 = make_tx_set(2);
-        let hash2 = ts2.hash;
+        let hash2 = *ts2.hash();
         tracker.store(ts2);
         assert!(tracker.is_cached(&hash1));
         assert!(tracker.is_cached(&hash2));
 
         // Third insert at capacity — should evict ts1 (lowest touch_seq)
         let ts3 = make_tx_set(3);
-        let hash3 = ts3.hash;
+        let hash3 = *ts3.hash();
         tracker.store(ts3);
         assert!(!tracker.is_cached(&hash1), "first entry should be evicted");
         assert!(tracker.is_cached(&hash2));
@@ -516,7 +516,7 @@ mod tests {
 
         // Register one pending tx set and receive it — should be cached
         let wanted = make_tx_set(1);
-        let wanted_hash = wanted.hash;
+        let wanted_hash = *wanted.hash();
         tracker.request(wanted_hash, 100);
         let slot = tracker.receive(wanted.clone());
         assert_eq!(slot, Some(100));
@@ -525,7 +525,7 @@ mod tests {
         // Send 10 unsolicited tx sets — none should be cached
         for i in 10..20u8 {
             let unsolicited = make_tx_set(i);
-            let unsolicited_hash = unsolicited.hash;
+            let unsolicited_hash = *unsolicited.hash();
             let slot = tracker.receive(unsolicited);
             assert_eq!(slot, None, "unsolicited tx set should return None");
             assert!(
@@ -551,19 +551,19 @@ mod tests {
         // Fill cache to capacity with 4 entries (seq 0, 1, 2, 3)
         for i in 0..4u8 {
             let ts = make_tx_set(i);
-            let hash = ts.hash;
+            let hash = *ts.hash();
             tracker.request(hash, 100 + i as u64);
             tracker.receive(ts);
         }
         assert_eq!(tracker.sizes().cache, 4);
 
         // Access entry 0 to refresh its touch_seq (now highest)
-        let first_hash = make_tx_set(0).hash;
+        let first_hash = *make_tx_set(0).hash();
         assert!(tracker.get(&first_hash).is_some());
 
         // Add a 5th entry — should evict entry 1 (lowest touch_seq after refresh)
         let new_ts = make_tx_set(99);
-        let new_hash = new_ts.hash;
+        let new_hash = *new_ts.hash();
         tracker.request(new_hash, 200);
         tracker.receive(new_ts);
         assert_eq!(tracker.sizes().cache, 4);
@@ -574,7 +574,7 @@ mod tests {
             "refreshed entry should survive eviction"
         );
         // Entry 1 should be evicted (lowest touch_seq)
-        let second_hash = make_tx_set(1).hash;
+        let second_hash = *make_tx_set(1).hash();
         assert!(
             !tracker.is_cached(&second_hash),
             "entry 1 should be the eviction victim"
@@ -590,11 +590,11 @@ mod tests {
         let tracker = TxSetTracker::new(2);
 
         let ts1 = make_tx_set(1);
-        let hash1 = ts1.hash;
+        let hash1 = *ts1.hash();
         tracker.store(ts1);
 
         let ts2 = make_tx_set(2);
-        let hash2 = ts2.hash;
+        let hash2 = *ts2.hash();
         tracker.store(ts2);
         assert_eq!(tracker.sizes().cache, 2);
 
@@ -615,7 +615,7 @@ mod tests {
         let tracker = TxSetTracker::new(0);
 
         let ts = make_tx_set(1);
-        let hash = ts.hash;
+        let hash = *ts.hash();
         tracker.store(ts);
 
         assert!(!tracker.is_cached(&hash));

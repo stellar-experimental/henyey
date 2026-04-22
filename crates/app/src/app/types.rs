@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use henyey_common::Hash256;
 use henyey_herder::{AccountProvider, FeeBalanceProvider, Herder};
-use henyey_ledger::{LedgerManager, TransactionSetVariant};
+use henyey_ledger::LedgerManager;
 use henyey_overlay::{PeerId, ScpQueueCallback};
 use stellar_xdr::curr::{
     Hash, LedgerUpgrade, ReadXdr, TopologyResponseBodyV2, TransactionEnvelope, UpgradeType,
@@ -470,8 +470,6 @@ pub(super) struct PendingLedgerClose {
     pub ledger_seq: u32,
     /// The transaction set used for closing.
     pub tx_set: henyey_herder::TransactionSet,
-    /// Variant of the tx set (classic or generalized).
-    pub tx_set_variant: TransactionSetVariant,
     /// Close time for the ledger.
     pub close_time: u64,
     /// Upgrades included in the externalized StellarValue (used for clearing
@@ -1070,26 +1068,6 @@ impl FeeBalanceProvider for SnapshotValidationProviders {
 }
 
 // ── Free functions ─────────────────────────────────────────────────────
-
-pub(super) fn build_generalized_tx_set(
-    tx_set: &henyey_herder::TransactionSet,
-) -> Option<stellar_xdr::curr::GeneralizedTransactionSet> {
-    use stellar_xdr::curr::{
-        GeneralizedTransactionSet, TransactionPhase, TransactionSetV1, TxSetComponent,
-        TxSetComponentTxsMaybeDiscountedFee,
-    };
-
-    let component =
-        TxSetComponent::TxsetCompTxsMaybeDiscountedFee(TxSetComponentTxsMaybeDiscountedFee {
-            base_fee: None,
-            txs: tx_set.transactions.clone().try_into().ok()?,
-        });
-    let phase = TransactionPhase::V0(vec![component].try_into().ok()?);
-    Some(GeneralizedTransactionSet::V1(TransactionSetV1 {
-        previous_ledger_hash: stellar_xdr::curr::Hash(tx_set.previous_ledger_hash.0),
-        phases: vec![phase].try_into().ok()?,
-    }))
-}
 
 /// Extract the previous ledger hash and transactions from a `GeneralizedTransactionSet`.
 ///

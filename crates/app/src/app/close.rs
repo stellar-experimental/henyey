@@ -6,8 +6,7 @@
 use std::sync::atomic::Ordering;
 
 use henyey_herder::{sync_recovery::SyncRecoveryCallback, HerderCallback};
-use henyey_ledger::TransactionSetVariant;
-use stellar_xdr::curr::{Hash, ScpEnvelope, StellarValueExt, TransactionSet, UpgradeType};
+use stellar_xdr::curr::{ScpEnvelope, StellarValueExt, UpgradeType};
 
 use super::types::{decode_upgrades, PendingLedgerClose};
 use super::App;
@@ -20,7 +19,7 @@ impl HerderCallback for App {
     async fn close_ledger(
         &self,
         ledger_seq: u32,
-        mut tx_set: henyey_herder::TransactionSet,
+        tx_set: henyey_herder::TransactionSet,
         close_time: u64,
         upgrades: Vec<UpgradeType>,
         stellar_value_ext: StellarValueExt,
@@ -28,32 +27,20 @@ impl HerderCallback for App {
         let tx_summary = tx_set.summary();
         tracing::info!(
             ledger_seq,
-            tx_count = tx_set.transactions.len(),
+            tx_count = tx_set.len(),
             close_time,
             summary = %tx_summary,
             "Closing ledger"
         );
 
         // Get the previous ledger hash
-        let prev_hash = tx_set.previous_ledger_hash;
-
-        // Create the transaction set
-        let tx_set_variant = if let Some(gen_tx_set) = tx_set.generalized_tx_set.take() {
-            TransactionSetVariant::Generalized(gen_tx_set)
-        } else {
-            TransactionSetVariant::Classic(TransactionSet {
-                previous_ledger_hash: Hash::from(prev_hash),
-                txs: tx_set.transactions.clone().try_into().map_err(|_| {
-                    henyey_herder::HerderError::Internal("Failed to create tx set".into())
-                })?,
-            })
-        };
+        let prev_hash = tx_set.previous_ledger_hash();
 
         // Create close data
         let decoded_upgrades = decode_upgrades(upgrades);
         let mut close_data = henyey_ledger::LedgerCloseData::new(
             ledger_seq,
-            tx_set_variant.clone(),
+            tx_set.clone().into_variant(),
             close_time,
             prev_hash,
         )
@@ -79,7 +66,6 @@ impl HerderCallback for App {
             handle: join_handle,
             ledger_seq,
             tx_set,
-            tx_set_variant,
             close_time,
             upgrades: Vec::new(),
         };
