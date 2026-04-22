@@ -324,6 +324,7 @@ done
 - Baseline acceptance on mainnet: ~10-20%. <5% sustained = nearly nothing reaching SCP.
 - On breach: increment `scp_breach_streak`. If streak ≥ 3, route through Bug Filing Workflow
   (investigate verifier thread, stale envelopes, sync state).
+- **On healthy tick** (ratio ≥ 0.05 with sufficient volume): reset `scp_breach_streak` to 0.
 
 **Check 2: Transaction apply failure rate**
 - Numerator delta: `delta(apply_failure)`
@@ -333,17 +334,32 @@ done
 - On breach: increment `apply_breach_streak`. If streak ≥ 3, investigate in same tick.
   If evidence points to henyey apply-engine bug, file/comment via Bug Filing Workflow.
   If expected bad-tx traffic (spam wave, known rejections), report as WARNING without filing.
+- **On healthy tick** (ratio ≤ 0.50 with sufficient volume): reset `apply_breach_streak` to 0.
+
+**Per-check state machine** (each check independently):
+- **Skip** (global skip, low volume, or missing data) → reset that check's streak to 0
+- **Healthy** (ratio within threshold, sufficient volume) → reset streak to 0
+- **Breach** (ratio exceeds threshold, sufficient volume) → increment streak
 
 **Per-check low-volume:** When only one check's denominator delta is below its
 minimum, that check skips (streak resets to 0) and the other proceeds normally.
 
 **Thresholds are provisional** — tune after 1-2 weeks of production data.
 
-**Status report:** After computing both ratios, add to the status output:
+**Status report:** Each check independently reports one of: `ok (value)`,
+`skipped (reason)`, `WARNING value (N ticks)`, or `collecting baseline`.
+Compose the `metrics_ratio:` line by joining both check statuses:
+
 ```
-  metrics_ratio: <ok (scp_accept=X%, apply_fail=Y%) | skipped (reason) | WARNING scp_accept=X%<5% (N ticks) | WARNING apply_fail=Y%>50% (N ticks) — investigating | collecting baseline>
+  metrics_ratio: scp <scp_status>, apply <apply_status>
 ```
-When both checks fire: `metrics_ratio: WARNING scp_accept=3%<5% (3 ticks), apply_fail=55%>50% (3 ticks) — investigating`
+
+Examples:
+- Both healthy: `metrics_ratio: scp ok (accept=15%), apply ok (fail=8%)`
+- One warning: `metrics_ratio: scp ok (accept=12%), apply WARNING fail=55%>50% (3 ticks) — investigating`
+- One skipped: `metrics_ratio: scp skipped (low volume), apply ok (fail=5%)`
+- Both skipped: `metrics_ratio: skipped (not in sync)`
+- Collecting: `metrics_ratio: collecting baseline`
 
 ### Firing alerts — cooldown + filing
 
@@ -495,7 +511,7 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   rpc:     <healthy|unhealthy|N/A> oldestL=<X> latestL=<Y> window=<Z>
   obsrvr:  <validating=<Y/N> val24h=<pct>% lag=<N> | N/A (watcher) | N/A (api-error)>
   metrics: <clean | N alerts (<metric1>,<metric2>,...) — filed/commented #<N>,#<M> | N alerts, K suppressed by cooldown>
-  metrics_ratio: <ok (scp_accept=X%, apply_fail=Y%) | skipped (reason) | WARNING scp_accept=X%<5% (N ticks) | WARNING apply_fail=Y%>50% (N ticks) — investigating | collecting baseline>
+  metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating> | collecting baseline
   deploy:  <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
   ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
 ```
