@@ -603,29 +603,17 @@ fn validate_parallel_component(
         }
     }
     // HERDER_SPEC §7.7: Validate canonical ordering for parallel phases.
-    // Clusters within each stage must be sorted by first-TX hash (ascending).
-    // Stages must be sorted by first-TX-of-first-cluster hash (ascending).
+    // Clusters within each stage must be in nondecreasing first-TX hash order.
+    // Stages must be in nondecreasing first-TX-of-first-cluster hash order.
+    // (Matches C++ std::is_sorted with hashTxSorter strict-less-than comparator.)
     for stage in parallel.execution_stages.iter() {
-        // Check clusters within this stage are sorted by first-TX hash
-        let cluster_sorted = stage.windows(2).all(|pair| {
-            let hash_a = Hash256::hash_xdr(&pair[0][0]);
-            let hash_b = Hash256::hash_xdr(&pair[1][0]);
-            hash_a.0 < hash_b.0
-        });
-        if !cluster_sorted {
+        if !is_nondecreasing_by_xdr_hash(stage.as_slice(), |cluster| &cluster[0]) {
             return Err(
                 "Clusters within stage are not in canonical order (by first-TX hash)".to_string(),
             );
         }
     }
-    // Check stages are sorted by first-TX-of-first-cluster hash
-    let stages = &parallel.execution_stages;
-    let stages_sorted = stages.windows(2).all(|pair| {
-        let hash_a = Hash256::hash_xdr(&pair[0][0][0]);
-        let hash_b = Hash256::hash_xdr(&pair[1][0][0]);
-        hash_a.0 < hash_b.0
-    });
-    if !stages_sorted {
+    if !is_nondecreasing_by_xdr_hash(parallel.execution_stages.as_slice(), |stage| &stage[0][0]) {
         return Err(
             "Stages are not in canonical order (by first-TX-of-first-cluster hash)".to_string(),
         );
@@ -744,15 +732,16 @@ fn validate_tx_fee(env: &TransactionEnvelope) -> std::result::Result<(), String>
     Ok(())
 }
 
-/// Check if a slice of transaction envelopes is sorted by hash.
+/// Check that items are in nondecreasing order by the XDR hash of a
+/// caller-chosen key.  Matches C++ `std::is_sorted` semantics with a
+/// strict-less-than comparator: adjacent equal hashes are accepted.
 ///
-/// Uses a rolling previous-hash to compute exactly N hashes with no
-/// heap allocation (the old `windows(2)` approach hashed interior
-/// elements twice).
-fn is_sorted_by_hash(txs: &[TransactionEnvelope]) -> bool {
-    let mut prev = None;
-    for tx in txs {
-        let hash = Hash256::hash_xdr(tx);
+/// Uses a rolling previous-hash so each element is hashed exactly once
+/// (the old `windows(2)` approach hashed interior elements twice).
+fn is_nondecreasing_by_xdr_hash<T, H: WriteXdr>(items: &[T], key: impl Fn(&T) -> &H) -> bool {
+    let mut prev: Option<[u8; 32]> = None;
+    for item in items {
+        let hash = Hash256::hash_xdr(key(item));
         if let Some(ref p) = prev {
             if hash.0 < *p {
                 return false;
@@ -761,6 +750,11 @@ fn is_sorted_by_hash(txs: &[TransactionEnvelope]) -> bool {
         prev = Some(hash.0);
     }
     true
+}
+
+/// Check if a slice of transaction envelopes is in nondecreasing hash order.
+fn is_sorted_by_hash(txs: &[TransactionEnvelope]) -> bool {
+    is_nondecreasing_by_xdr_hash(txs, |tx| tx)
 }
 
 /// Validate a set of wire-format transaction envelopes.
@@ -1327,6 +1321,52 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("Stages are not in canonical order"));
+    }
+
+    #[test]
+    fn test_validate_parallel_component_accepts_equal_cluster_hashes() {
+        // Two clusters whose first TX is identical → equal hashes.
+        // Nondecreasing order (matching C++ std::is_sorted) must accept this.
+        let tx = make_tx_envelope(1, 100);
+        let parallel = ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![ParallelTxExecutionStage(
+                vec![
+                    DependentTxCluster(vec![tx.clone()].try_into().unwrap()),
+                    DependentTxCluster(vec![tx].try_into().unwrap()),
+                ]
+                .try_into()
+                .unwrap(),
+            )]
+            .try_into()
+            .unwrap(),
+        };
+        assert!(validate_parallel_component(&parallel).is_ok());
+    }
+
+    #[test]
+    fn test_validate_parallel_component_accepts_equal_stage_hashes() {
+        // Two stages whose first-TX-of-first-cluster is identical → equal hashes.
+        // Nondecreasing order (matching C++ std::is_sorted) must accept this.
+        let tx = make_tx_envelope(1, 100);
+        let parallel = ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![
+                ParallelTxExecutionStage(
+                    vec![DependentTxCluster(vec![tx.clone()].try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                ),
+                ParallelTxExecutionStage(
+                    vec![DependentTxCluster(vec![tx].try_into().unwrap())]
+                        .try_into()
+                        .unwrap(),
+                ),
+            ]
+            .try_into()
+            .unwrap(),
+        };
+        assert!(validate_parallel_component(&parallel).is_ok());
     }
 
     // =========================================================================
