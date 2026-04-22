@@ -13,8 +13,7 @@
 //!
 //! This module corresponds to `TxQueueLimiter.h` in stellar-core v25.
 
-use henyey_common::{NetworkId, Resource};
-use henyey_tx::TransactionFrame;
+use henyey_common::Resource;
 
 use crate::surge_pricing::{
     DexLimitingLaneConfig, QueueEntry, SorobanGenericLaneConfig, SurgePricingLaneConfig,
@@ -104,8 +103,6 @@ pub struct TxQueueLimiter {
     txs_to_flood: Option<SurgePricingPriorityQueue>,
     /// Maximum evicted inclusion fee per lane (fee, ops)
     lane_evicted_inclusion_fee: Vec<(i64, u32)>,
-    /// Network ID for transaction hashing
-    network_id: NetworkId,
 }
 
 impl TxQueueLimiter {
@@ -122,10 +119,6 @@ impl TxQueueLimiter {
 
     fn make_queue(&self, seed: u64) -> SurgePricingPriorityQueue {
         SurgePricingPriorityQueue::new(self.lane_config(), seed)
-    }
-
-    fn frame_for(&self, tx: &QueuedTransaction) -> TransactionFrame {
-        TransactionFrame::with_network(tx.envelope.clone(), self.network_id)
     }
 
     fn queue_entry(tx: &QueuedTransaction) -> QueueEntry {
@@ -146,7 +139,6 @@ impl TxQueueLimiter {
         max_ledger_resources: Resource,
         is_soroban: bool,
         max_dex_ops: Option<u64>,
-        network_id: NetworkId,
     ) -> Self {
         let max_resources = scale_resource(&max_ledger_resources, multiplier as i64);
         let max_dex_operations = if !is_soroban {
@@ -163,7 +155,6 @@ impl TxQueueLimiter {
             lane_config: None,
             txs_to_flood: None,
             lane_evicted_inclusion_fee: Vec::new(),
-            network_id,
         }
     }
 
@@ -215,9 +206,8 @@ impl TxQueueLimiter {
     /// Panics if the transaction type (Soroban vs classic) doesn't match
     /// the limiter configuration.
     pub fn add_transaction(&mut self, tx: &QueuedTransaction, ledger_version: u32) {
-        let frame = self.frame_for(tx);
         assert_eq!(
-            frame.is_soroban(),
+            henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope),
             self.is_soroban,
             "Transaction type mismatch"
         );
@@ -225,30 +215,28 @@ impl TxQueueLimiter {
         self.ensure_initialized(ledger_version);
 
         if let Some(ref mut txs) = self.txs {
-            txs.add(tx.clone(), &self.network_id, ledger_version);
+            txs.add(tx.clone(), ledger_version);
         }
         if let Some(ref mut flood) = self.txs_to_flood {
-            flood.add(tx.clone(), &self.network_id, ledger_version);
+            flood.add(tx.clone(), ledger_version);
         }
     }
 
     /// Remove a transaction from the limiter.
     pub fn remove_transaction(&mut self, tx: &QueuedTransaction, ledger_version: u32) {
-        let frame = self.frame_for(tx);
         let lane = self
             .lane_config
             .as_ref()
-            .map(|c| c.get_lane(&frame))
+            .map(|c| c.get_lane(&tx.envelope))
             .unwrap_or(GENERIC_LANE);
 
         if let Some(ref mut txs) = self.txs {
-            // Create a queue entry to find and remove
             let entry = Self::queue_entry(tx);
-            txs.remove_entry(lane, &entry, ledger_version, &self.network_id);
+            txs.remove_entry(lane, &entry, ledger_version);
         }
         if let Some(ref mut flood) = self.txs_to_flood {
             let entry = Self::queue_entry(tx);
-            flood.remove_entry(lane, &entry, ledger_version, &self.network_id);
+            flood.remove_entry(lane, &entry, ledger_version);
         }
     }
 
@@ -277,18 +265,13 @@ impl TxQueueLimiter {
         ledger_version: u32,
         broadcast_seed: u64,
     ) -> (bool, i64) {
-        let frame = self.frame_for(new_tx);
-        assert_eq!(
-            frame.is_soroban(),
-            self.is_soroban,
-            "Transaction type mismatch"
-        );
+        let new_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&new_tx.envelope);
+        assert_eq!(new_is_soroban, self.is_soroban, "Transaction type mismatch");
 
         if let Some(old) = old_tx {
-            let old_frame = self.frame_for(old);
+            let old_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&old.envelope);
             assert_eq!(
-                old_frame.is_soroban(),
-                frame.is_soroban(),
+                old_is_soroban, new_is_soroban,
                 "Old and new transaction type mismatch"
             );
         }
@@ -299,7 +282,7 @@ impl TxQueueLimiter {
         let lane = self
             .lane_config
             .as_ref()
-            .map(|c| c.get_lane(&frame))
+            .map(|c| c.get_lane(&new_tx.envelope))
             .unwrap_or(GENERIC_LANE);
 
         // Check if the new transaction beats any evicted fees
@@ -339,10 +322,9 @@ impl TxQueueLimiter {
 
         // Calculate old tx discount for replace-by-fee
         let old_tx_discount = old_tx.map(|old| {
-            let old_frame = self.frame_for(old);
             self.lane_config
                 .as_ref()
-                .map(|c| c.tx_resources(&old_frame, ledger_version))
+                .map(|c| c.tx_resources(&old.envelope, ledger_version))
                 .unwrap_or_else(|| Resource::new(vec![old.op_count as i64]))
         });
 
@@ -356,13 +338,7 @@ impl TxQueueLimiter {
             return (false, 0);
         };
 
-        match txs.can_fit_with_eviction(
-            new_tx,
-            old_tx_discount,
-            &self.network_id,
-            ledger_version,
-            None,
-        ) {
+        match txs.can_fit_with_eviction(new_tx, old_tx_discount, ledger_version, None) {
             Some(evictions) => {
                 *txs_to_evict = evictions;
                 (true, 0)
@@ -387,25 +363,23 @@ impl TxQueueLimiter {
     ) where
         F: FnMut(&QueuedTransaction),
     {
-        let frame = self.frame_for(tx_to_fit);
         let tx_to_fit_lane = self
             .lane_config
             .as_ref()
-            .map(|c| c.get_lane(&frame))
+            .map(|c| c.get_lane(&tx_to_fit.envelope))
             .unwrap_or(GENERIC_LANE);
 
         let resources_to_fit = self
             .lane_config
             .as_ref()
-            .map(|c| c.tx_resources(&frame, ledger_version))
+            .map(|c| c.tx_resources(&tx_to_fit.envelope, ledger_version))
             .unwrap_or_else(|| Resource::new(vec![tx_to_fit.op_count as i64]));
 
         for (tx, evicted_due_to_lane_limit) in txs_to_evict {
-            let evict_frame = self.frame_for(tx);
             let evict_lane = self
                 .lane_config
                 .as_ref()
-                .map(|c| c.get_lane(&evict_frame))
+                .map(|c| c.get_lane(&tx.envelope))
                 .unwrap_or(GENERIC_LANE);
 
             if *evicted_due_to_lane_limit {
@@ -457,7 +431,7 @@ impl TxQueueLimiter {
     /// Mark a transaction for flooding.
     pub fn mark_tx_for_flood(&mut self, tx: &QueuedTransaction, ledger_version: u32) {
         if let Some(ref mut flood) = self.txs_to_flood {
-            flood.add(tx.clone(), &self.network_id, ledger_version);
+            flood.add(tx.clone(), ledger_version);
         }
     }
 
@@ -471,8 +445,7 @@ impl TxQueueLimiter {
         F: FnMut(&QueuedTransaction) -> VisitTxResult,
     {
         if let Some(ref mut flood) = self.txs_to_flood {
-            let result =
-                flood.pop_top_txs(false, &self.network_id, ledger_version, |tx| visitor(tx));
+            let result = flood.pop_top_txs(false, ledger_version, |tx| visitor(tx));
             *lane_resources_left = result.lane_left_until_limit;
         }
     }
@@ -535,18 +508,16 @@ mod tests {
 
     #[test]
     fn test_limiter_creation() {
-        let network_id = NetworkId::testnet();
         let max_resources = Resource::new(vec![1000]);
-        let limiter = TxQueueLimiter::new(4, max_resources.clone(), false, None, network_id);
+        let limiter = TxQueueLimiter::new(4, max_resources.clone(), false, None);
 
         assert!(!limiter.is_soroban);
     }
 
     #[test]
     fn test_add_and_size() {
-        let network_id = NetworkId::testnet();
         let max_resources = Resource::new(vec![100]);
-        let mut limiter = TxQueueLimiter::new(1, max_resources, false, None, network_id);
+        let mut limiter = TxQueueLimiter::new(1, max_resources, false, None);
 
         let tx1 = make_test_tx(1000, 5, 1);
         let tx2 = make_test_tx(2000, 3, 2);
@@ -560,9 +531,8 @@ mod tests {
 
     #[test]
     fn test_can_add_tx_fits() {
-        let network_id = NetworkId::testnet();
         let max_resources = Resource::new(vec![100]);
-        let mut limiter = TxQueueLimiter::new(1, max_resources, false, None, network_id);
+        let mut limiter = TxQueueLimiter::new(1, max_resources, false, None);
 
         let tx = make_test_tx(1000, 5, 1);
         let mut evictions = Vec::new();
@@ -576,9 +546,8 @@ mod tests {
 
     #[test]
     fn test_eviction_tracking() {
-        let network_id = NetworkId::testnet();
         let max_resources = Resource::new(vec![10]);
-        let mut limiter = TxQueueLimiter::new(1, max_resources, false, None, network_id);
+        let mut limiter = TxQueueLimiter::new(1, max_resources, false, None);
 
         // Add a transaction
         let tx1 = make_test_tx(100, 5, 1);

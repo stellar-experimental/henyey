@@ -54,7 +54,11 @@ use std::collections::{BTreeSet, HashSet};
 
 use henyey_common::{any_greater, subtract_non_negative, Resource, NUM_CLASSIC_TX_BYTES_RESOURCES};
 use henyey_common::{Hash256, NUM_CLASSIC_TX_RESOURCES};
-use henyey_tx::TransactionFrame;
+use henyey_tx::envelope_utils::{
+    envelope_operation_count, has_dex_operations_envelope, is_soroban_envelope,
+    resources_from_envelope,
+};
+use stellar_xdr::curr::TransactionEnvelope;
 
 use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
 
@@ -73,14 +77,14 @@ pub(crate) const DEX_LANE: usize = 1;
 /// - What resource limits apply to each lane
 /// - How to measure a transaction's resource consumption
 pub(crate) trait SurgePricingLaneConfig: Send + Sync {
-    /// Determine which lane a transaction belongs to based on its contents.
-    fn get_lane(&self, frame: &TransactionFrame) -> usize;
+    /// Determine which lane a transaction belongs to based on its envelope contents.
+    fn get_lane(&self, env: &TransactionEnvelope) -> usize;
 
     /// Get the resource limits for each lane.
     fn lane_limits(&self) -> &[Resource];
 
     /// Calculate the resources consumed by a transaction.
-    fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource;
+    fn tx_resources(&self, env: &TransactionEnvelope, ledger_version: u32) -> Resource;
 
     /// Update the generic lane (lane 0) limit.
     ///
@@ -114,8 +118,8 @@ impl DexLimitingLaneConfig {
 }
 
 impl SurgePricingLaneConfig for DexLimitingLaneConfig {
-    fn get_lane(&self, frame: &TransactionFrame) -> usize {
-        if self.lane_limits.len() > DEX_LANE && frame.has_dex_operations() {
+    fn get_lane(&self, env: &TransactionEnvelope) -> usize {
+        if self.lane_limits.len() > DEX_LANE && has_dex_operations_envelope(env) {
             DEX_LANE
         } else {
             GENERIC_LANE
@@ -126,8 +130,8 @@ impl SurgePricingLaneConfig for DexLimitingLaneConfig {
         &self.lane_limits
     }
 
-    fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource {
-        frame.resources(self.use_byte_limit, ledger_version)
+    fn tx_resources(&self, env: &TransactionEnvelope, ledger_version: u32) -> Resource {
+        resources_from_envelope(env, self.use_byte_limit, ledger_version)
     }
 
     fn update_generic_lane_limit(&mut self, limit: Resource) {
@@ -153,8 +157,8 @@ impl SorobanGenericLaneConfig {
 }
 
 impl SurgePricingLaneConfig for SorobanGenericLaneConfig {
-    fn get_lane(&self, frame: &TransactionFrame) -> usize {
-        if !frame.is_soroban() {
+    fn get_lane(&self, env: &TransactionEnvelope) -> usize {
+        if !is_soroban_envelope(env) {
             panic!("non-soroban tx in soroban lane config");
         }
         GENERIC_LANE
@@ -164,8 +168,8 @@ impl SurgePricingLaneConfig for SorobanGenericLaneConfig {
         &self.lane_limits
     }
 
-    fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource {
-        frame.resources(false, ledger_version)
+    fn tx_resources(&self, env: &TransactionEnvelope, ledger_version: u32) -> Resource {
+        resources_from_envelope(env, false, ledger_version)
     }
 
     fn update_generic_lane_limit(&mut self, limit: Resource) {
@@ -190,7 +194,7 @@ impl OpsOnlyLaneConfig {
 }
 
 impl SurgePricingLaneConfig for OpsOnlyLaneConfig {
-    fn get_lane(&self, _frame: &TransactionFrame) -> usize {
+    fn get_lane(&self, _env: &TransactionEnvelope) -> usize {
         GENERIC_LANE
     }
 
@@ -198,8 +202,8 @@ impl SurgePricingLaneConfig for OpsOnlyLaneConfig {
         &self.lane_limits
     }
 
-    fn tx_resources(&self, frame: &TransactionFrame, _ledger_version: u32) -> Resource {
-        let ops = i64::try_from(frame.resource_operation_count()).unwrap_or(i64::MAX);
+    fn tx_resources(&self, env: &TransactionEnvelope, _ledger_version: u32) -> Resource {
+        let ops = i64::try_from(envelope_operation_count(env)).unwrap_or(i64::MAX);
         Resource::new(vec![ops])
     }
 
@@ -412,15 +416,9 @@ impl SurgePricingPriorityQueue {
         self.lane_current_count[lane].clone()
     }
 
-    pub(crate) fn add(
-        &mut self,
-        tx: QueuedTransaction,
-        network_id: &henyey_common::NetworkId,
-        ledger_version: u32,
-    ) {
-        let frame = TransactionFrame::with_network(tx.envelope.clone(), *network_id);
-        let lane = self.lane_config.get_lane(&frame);
-        let resources = self.lane_config.tx_resources(&frame, ledger_version);
+    pub(crate) fn add(&mut self, tx: QueuedTransaction, ledger_version: u32) {
+        let lane = self.lane_config.get_lane(&tx.envelope);
+        let resources = self.lane_config.tx_resources(&tx.envelope, ledger_version);
         let inserted = self
             .lanes
             .get_mut(lane)
@@ -431,28 +429,23 @@ impl SurgePricingPriorityQueue {
         }
     }
 
-    pub(crate) fn tx_resources(&self, frame: &TransactionFrame, ledger_version: u32) -> Resource {
-        self.lane_config.tx_resources(frame, ledger_version)
+    pub(crate) fn tx_resources(&self, env: &TransactionEnvelope, ledger_version: u32) -> Resource {
+        self.lane_config.tx_resources(env, ledger_version)
     }
 
-    pub(crate) fn get_lane(&self, frame: &TransactionFrame) -> usize {
-        self.lane_config.get_lane(frame)
+    pub(crate) fn get_lane(&self, env: &TransactionEnvelope) -> usize {
+        self.lane_config.get_lane(env)
     }
 
-    fn erase(
-        &mut self,
-        lane: usize,
-        entry: &QueueEntry,
-        ledger_version: u32,
-        network_id: &henyey_common::NetworkId,
-    ) {
+    fn erase(&mut self, lane: usize, entry: &QueueEntry, ledger_version: u32) {
         // Match stellar-core ordering: get stored element → compute resources →
         // assert → subtract → remove (SurgePricingUtils.cpp:279-287).
         let Some(stored) = self.lanes[lane].get(entry) else {
             return;
         };
-        let frame = TransactionFrame::with_network(stored.tx.envelope.clone(), *network_id);
-        let resources = self.lane_config.tx_resources(&frame, ledger_version);
+        let resources = self
+            .lane_config
+            .tx_resources(&stored.tx.envelope, ledger_version);
         assert!(
             resources.leq(&self.lane_current_count[lane]),
             "erase: resources exceed lane current count"
@@ -483,14 +476,8 @@ impl SurgePricingPriorityQueue {
         best
     }
 
-    pub(crate) fn remove_entry(
-        &mut self,
-        lane: usize,
-        entry: &QueueEntry,
-        ledger_version: u32,
-        network_id: &henyey_common::NetworkId,
-    ) {
-        self.erase(lane, entry, ledger_version, network_id);
+    pub(crate) fn remove_entry(&mut self, lane: usize, entry: &QueueEntry, ledger_version: u32) {
+        self.erase(lane, entry, ledger_version);
     }
 
     /// Return ordered entry hashes for the given lane (ascending by fee rate).
@@ -504,7 +491,6 @@ impl SurgePricingPriorityQueue {
     pub(crate) fn pop_top_txs(
         &mut self,
         allow_gaps: bool,
-        network_id: &henyey_common::NetworkId,
         ledger_version: u32,
         mut visitor: impl FnMut(&QueuedTransaction) -> VisitTxResult,
     ) -> PopResult {
@@ -534,14 +520,15 @@ impl SurgePricingPriorityQueue {
                 break;
             };
 
-            let frame = TransactionFrame::with_network(entry.tx.envelope.clone(), *network_id);
-            let resources = self.lane_config.tx_resources(&frame, ledger_version);
+            let resources = self
+                .lane_config
+                .tx_resources(&entry.tx.envelope, ledger_version);
             let exceeds_lane = any_greater(&resources, &lane_left_until_limit[lane]);
             let exceeds_generic = any_greater(&resources, &lane_left_until_limit[GENERIC_LANE]);
 
             if exceeds_lane || exceeds_generic {
                 if allow_gaps {
-                    self.erase(lane, &entry, ledger_version, network_id);
+                    self.erase(lane, &entry, ledger_version);
                     continue;
                 } else if lane != GENERIC_LANE && exceeds_lane {
                     lane_active[lane] = false;
@@ -558,7 +545,7 @@ impl SurgePricingPriorityQueue {
                     lane_left_until_limit[lane] -= resources;
                 }
             }
-            self.erase(lane, &entry, ledger_version, network_id);
+            self.erase(lane, &entry, ledger_version);
         }
         PopResult {
             lane_left_until_limit,
@@ -569,13 +556,11 @@ impl SurgePricingPriorityQueue {
         &self,
         tx: &QueuedTransaction,
         tx_discount: Option<Resource>,
-        network_id: &henyey_common::NetworkId,
         ledger_version: u32,
         exclusion: Option<&EvictionExclusion>,
     ) -> Option<Vec<(QueuedTransaction, bool)>> {
-        let frame = TransactionFrame::with_network(tx.envelope.clone(), *network_id);
-        let lane = self.lane_config.get_lane(&frame);
-        let mut tx_resources = self.lane_config.tx_resources(&frame, ledger_version);
+        let lane = self.lane_config.get_lane(&tx.envelope);
+        let mut tx_resources = self.lane_config.tx_resources(&tx.envelope, ledger_version);
         if let Some(discount) = tx_discount {
             tx_resources = subtract_non_negative(&tx_resources, &discount);
         }
@@ -723,9 +708,9 @@ impl SurgePricingPriorityQueue {
                 return None;
             }
 
-            let evict_frame =
-                TransactionFrame::with_network(entry.tx.envelope.clone(), *network_id);
-            let evict_resources = self.lane_config.tx_resources(&evict_frame, ledger_version);
+            let evict_resources = self
+                .lane_config
+                .tx_resources(&entry.tx.envelope, ledger_version);
             evictions.push((entry.tx.clone(), evicted_due_to_lane_limit));
 
             needed_total = subtract_non_negative(&needed_total, &evict_resources);
@@ -810,14 +795,12 @@ mod tests {
     #[should_panic(expected = "erase: resources exceed lane current count")]
     fn test_erase_panics_when_resources_exceed_lane_count() {
         use crate::tx_queue::QueuedTransaction;
-        use henyey_common::NetworkId;
         use stellar_xdr::curr::{
             DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
             SequenceNumber, Signature, SignatureHint, Transaction, TransactionEnvelope,
             TransactionV1Envelope, Uint256,
         };
 
-        let network_id = NetworkId::testnet();
         let config = Box::new(OpsOnlyLaneConfig::new(Resource::new(vec![100])));
         let mut queue = SurgePricingPriorityQueue::new(config, 42);
 
@@ -856,7 +839,7 @@ mod tests {
         };
 
         // Add the transaction (lane_current_count[0] becomes Resource([1])).
-        queue.add(queued.clone(), &network_id, 22);
+        queue.add(queued.clone(), 22);
         assert_eq!(
             queue.lane_current_count[GENERIC_LANE],
             Resource::new(vec![1])
@@ -869,6 +852,6 @@ mod tests {
         let entry = QueueEntry::new(queued, queue.seed);
 
         // erase() should panic: resources (1 op) > lane_current_count (0).
-        queue.erase(GENERIC_LANE, &entry, 22, &network_id);
+        queue.erase(GENERIC_LANE, &entry, 22);
     }
 }

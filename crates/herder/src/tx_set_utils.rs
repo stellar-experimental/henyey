@@ -119,20 +119,8 @@ pub(crate) fn envelope_inclusion_fee(env: &TransactionEnvelope) -> i64 {
 
 /// Get the number of operations from a transaction envelope.
 ///
-/// For fee-bump transactions, returns the inner transaction's operation count
-/// plus 1 for the fee-bump wrapper itself, matching stellar-core's
-/// `FeeBumpTransactionFrame::getNumOperations()`.
-pub(crate) fn envelope_num_ops(env: &TransactionEnvelope) -> usize {
-    match env {
-        TransactionEnvelope::TxV0(e) => e.tx.operations.len(),
-        TransactionEnvelope::Tx(e) => e.tx.operations.len(),
-        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => {
-                inner.tx.operations.len() + 1
-            }
-        },
-    }
-}
+/// Re-exported from the canonical source in henyey_tx::envelope_utils.
+pub(crate) use henyey_tx::envelope_utils::envelope_operation_count as envelope_num_ops;
 
 /// Parameters for close-time bounds validation.
 ///
@@ -1078,64 +1066,10 @@ pub fn trim_invalid_two_phase(
 // TX set content validation functions (AUDIT-033)
 // ---------------------------------------------------------------------------
 
-/// Check if a transaction envelope is a Soroban transaction.
-pub(crate) fn is_soroban_envelope(env: &TransactionEnvelope) -> bool {
-    let ops = envelope_operations(env);
-    ops.iter().any(|op| {
-        matches!(
-            op.body,
-            stellar_xdr::curr::OperationBody::InvokeHostFunction(_)
-                | stellar_xdr::curr::OperationBody::ExtendFootprintTtl(_)
-                | stellar_xdr::curr::OperationBody::RestoreFootprint(_)
-        )
-    })
-}
-
-/// Check if a transaction envelope contains DEX-related operations.
-///
-/// Mirrors `TransactionFrame::has_dex_operations()` for use without
-/// constructing a full frame.
-pub(crate) fn has_dex_operations_envelope(env: &TransactionEnvelope) -> bool {
-    let ops = envelope_operations(env);
-    ops.iter().any(|op| {
-        matches!(
-            op.body,
-            stellar_xdr::curr::OperationBody::ManageSellOffer(_)
-                | stellar_xdr::curr::OperationBody::ManageBuyOffer(_)
-                | stellar_xdr::curr::OperationBody::CreatePassiveSellOffer(_)
-                | stellar_xdr::curr::OperationBody::PathPaymentStrictSend(_)
-                | stellar_xdr::curr::OperationBody::PathPaymentStrictReceive(_)
-        )
-    })
-}
-
-/// Extract operations from a transaction envelope without constructing a frame.
-fn envelope_operations(env: &TransactionEnvelope) -> &[stellar_xdr::curr::Operation] {
-    match env {
-        TransactionEnvelope::TxV0(e) => &e.tx.operations,
-        TransactionEnvelope::Tx(e) => &e.tx.operations,
-        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.operations,
-        },
-    }
-}
-
-/// Extract `SorobanResources` from a transaction envelope (for Soroban TXs).
-fn envelope_soroban_resources(
-    env: &TransactionEnvelope,
-) -> Option<&stellar_xdr::curr::SorobanResources> {
-    let ext = match env {
-        TransactionEnvelope::Tx(e) => &e.tx.ext,
-        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx.ext,
-        },
-        TransactionEnvelope::TxV0(_) => return None,
-    };
-    match ext {
-        stellar_xdr::curr::TransactionExt::V1(data) => Some(&data.resources),
-        _ => None,
-    }
-}
+// Re-export envelope classification helpers from the canonical source in henyey_tx.
+pub(crate) use henyey_tx::envelope_utils::envelope_soroban_resources;
+pub(crate) use henyey_tx::envelope_utils::has_dex_operations_envelope;
+pub(crate) use henyey_tx::envelope_utils::is_soroban_envelope;
 
 /// Validate that component base fees and per-TX inclusion fees meet minimums.
 ///

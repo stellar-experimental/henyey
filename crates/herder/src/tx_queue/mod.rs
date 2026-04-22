@@ -635,12 +635,10 @@ struct QueueStore {
     /// Seed for eviction queue tie-breaking. Regenerated on clear() and shift()
     /// to match stellar-core's per-reset/per-ledger seed lifecycle.
     eviction_seed: u64,
-    /// Network ID for TransactionFrame creation during queue operations.
-    network_id: NetworkId,
 }
 
 impl QueueStore {
-    fn new(network_id: NetworkId) -> Self {
+    fn new() -> Self {
         let seed = if cfg!(test) {
             0
         } else {
@@ -653,7 +651,6 @@ impl QueueStore {
             soroban_eviction_queue: None,
             global_ops_queue: None,
             eviction_seed: seed,
-            network_id,
         }
     }
 
@@ -661,18 +658,17 @@ impl QueueStore {
         let entry = FeeEntry::from_queued(&tx);
 
         // Update eviction queues before inserting into by_hash.
-        let frame = henyey_tx::TransactionFrame::with_network(tx.envelope.clone(), self.network_id);
-        let is_soroban = frame.is_soroban();
+        let is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope);
 
         if is_soroban {
             if let Some(ref mut queue) = self.soroban_eviction_queue {
-                queue.add(tx.clone(), &self.network_id, ledger_version);
+                queue.add(tx.clone(), ledger_version);
             }
         } else if let Some(ref mut queue) = self.classic_eviction_queue {
-            queue.add(tx.clone(), &self.network_id, ledger_version);
+            queue.add(tx.clone(), ledger_version);
         }
         if let Some(ref mut queue) = self.global_ops_queue {
-            queue.add(tx.clone(), &self.network_id, ledger_version);
+            queue.add(tx.clone(), ledger_version);
         }
 
         self.by_hash.insert(tx.hash, tx);
@@ -692,23 +688,21 @@ impl QueueStore {
             self.fee_index.remove(&FeeEntry::from_queued(&tx));
 
             // Remove from eviction queues.
-            let frame =
-                henyey_tx::TransactionFrame::with_network(tx.envelope.clone(), self.network_id);
             let entry = QueueEntry::new(tx.clone(), self.eviction_seed);
-            let is_soroban = frame.is_soroban();
+            let is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope);
 
             if is_soroban {
                 if let Some(ref mut queue) = self.soroban_eviction_queue {
-                    let lane = queue.get_lane(&frame);
-                    queue.remove_entry(lane, &entry, ledger_version, &self.network_id);
+                    let lane = queue.get_lane(&tx.envelope);
+                    queue.remove_entry(lane, &entry, ledger_version);
                 }
             } else if let Some(ref mut queue) = self.classic_eviction_queue {
-                let lane = queue.get_lane(&frame);
-                queue.remove_entry(lane, &entry, ledger_version, &self.network_id);
+                let lane = queue.get_lane(&tx.envelope);
+                queue.remove_entry(lane, &entry, ledger_version);
             }
             if let Some(ref mut queue) = self.global_ops_queue {
-                let lane = queue.get_lane(&frame);
-                queue.remove_entry(lane, &entry, ledger_version, &self.network_id);
+                let lane = queue.get_lane(&tx.envelope);
+                queue.remove_entry(lane, &entry, ledger_version);
             }
 
             Some(tx)
@@ -816,10 +810,8 @@ impl QueueStore {
                 self.eviction_seed,
             );
             for tx in self.by_hash.values() {
-                let frame =
-                    henyey_tx::TransactionFrame::with_network(tx.envelope.clone(), self.network_id);
-                if !frame.is_soroban() {
-                    fresh.add(tx.clone(), &self.network_id, ledger_version);
+                if !henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope) {
+                    fresh.add(tx.clone(), ledger_version);
                 }
             }
             assert_eq!(
@@ -850,10 +842,8 @@ impl QueueStore {
                 self.eviction_seed,
             );
             for tx in self.by_hash.values() {
-                let frame =
-                    henyey_tx::TransactionFrame::with_network(tx.envelope.clone(), self.network_id);
-                if frame.is_soroban() {
-                    fresh.add(tx.clone(), &self.network_id, ledger_version);
+                if henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope) {
+                    fresh.add(tx.clone(), ledger_version);
                 }
             }
             assert_eq!(
@@ -877,7 +867,7 @@ impl QueueStore {
                 self.eviction_seed,
             );
             for tx in self.by_hash.values() {
-                fresh.add(tx.clone(), &self.network_id, ledger_version);
+                fresh.add(tx.clone(), ledger_version);
             }
             assert_eq!(
                 queue.total_resources(),
@@ -904,10 +894,8 @@ impl QueueStore {
             let mut queue =
                 SurgePricingPriorityQueue::new(Box::new(lane_config), self.eviction_seed);
             for tx in self.by_hash.values() {
-                let frame =
-                    henyey_tx::TransactionFrame::with_network(tx.envelope.clone(), self.network_id);
-                if !frame.is_soroban() {
-                    queue.add(tx.clone(), &self.network_id, ledger_version);
+                if !henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope) {
+                    queue.add(tx.clone(), ledger_version);
                 }
             }
             self.classic_eviction_queue = Some(queue);
@@ -926,10 +914,8 @@ impl QueueStore {
             let mut queue =
                 SurgePricingPriorityQueue::new(Box::new(lane_config), self.eviction_seed);
             for tx in self.by_hash.values() {
-                let frame =
-                    henyey_tx::TransactionFrame::with_network(tx.envelope.clone(), self.network_id);
-                if frame.is_soroban() {
-                    queue.add(tx.clone(), &self.network_id, ledger_version);
+                if henyey_tx::envelope_utils::is_soroban_envelope(&tx.envelope) {
+                    queue.add(tx.clone(), ledger_version);
                 }
             }
             self.soroban_eviction_queue = Some(queue);
@@ -948,7 +934,7 @@ impl QueueStore {
             let mut queue =
                 SurgePricingPriorityQueue::new(Box::new(lane_config), self.eviction_seed);
             for tx in self.by_hash.values() {
-                queue.add(tx.clone(), &self.network_id, ledger_version);
+                queue.add(tx.clone(), ledger_version);
             }
             self.global_ops_queue = Some(queue);
         }
@@ -960,7 +946,6 @@ impl QueueStore {
 struct EvictionCandidate<'a> {
     queued: &'a QueuedTransaction,
     is_soroban: bool,
-    frame: &'a henyey_tx::TransactionFrame,
     ledger_version: u32,
 }
 
@@ -973,7 +958,6 @@ fn build_eviction_exclusion(
     by_hash: &HashMap<Hash256, QueuedTransaction>,
     replaced_tx: Option<&QueuedTransaction>,
     cross_queue_evictions: &HashSet<Hash256>,
-    network_id: NetworkId,
     ledger_version: u32,
 ) -> EvictionExclusion {
     let num_lanes = queue.lane_count();
@@ -984,9 +968,8 @@ fn build_eviction_exclusion(
     // before calling canFitWithEviction.
     if let Some(old_tx) = replaced_tx {
         excl.hashes.insert(old_tx.hash);
-        let frame = henyey_tx::TransactionFrame::with_network(old_tx.envelope.clone(), network_id);
-        let lane = queue.get_lane(&frame);
-        let resources = queue.tx_resources(&frame, ledger_version);
+        let lane = queue.get_lane(&old_tx.envelope);
+        let resources = queue.tx_resources(&old_tx.envelope, ledger_version);
         excl.lane_resource_discount[lane] = excl.lane_resource_discount[lane].clone() + resources;
     }
 
@@ -994,10 +977,8 @@ fn build_eviction_exclusion(
     for hash in cross_queue_evictions {
         if excl.hashes.insert(*hash) {
             if let Some(tx) = by_hash.get(hash) {
-                let frame =
-                    henyey_tx::TransactionFrame::with_network(tx.envelope.clone(), network_id);
-                let lane = queue.get_lane(&frame);
-                let resources = queue.tx_resources(&frame, ledger_version);
+                let lane = queue.get_lane(&tx.envelope);
+                let resources = queue.tx_resources(&tx.envelope, ledger_version);
                 excl.lane_resource_discount[lane] =
                     excl.lane_resource_discount[lane].clone() + resources;
             }
@@ -1049,9 +1030,7 @@ fn fee_source_key(envelope: &TransactionEnvelope) -> Vec<u8> {
 }
 
 /// Check if envelope is a fee-bump transaction.
-fn is_fee_bump_envelope(envelope: &TransactionEnvelope) -> bool {
-    matches!(envelope, TransactionEnvelope::TxFeeBump(_))
-}
+use henyey_tx::envelope_utils::is_fee_bump_envelope;
 
 /// Convert an XDR-encoded account key back to AccountId.
 fn account_id_from_fee_source_key(key: &[u8]) -> AccountId {
@@ -1191,7 +1170,7 @@ impl TransactionQueue {
         }
 
         Self {
-            store: RwLock::new(QueueStore::new(config.network_id)),
+            store: RwLock::new(QueueStore::new()),
             config,
             seen: RwLock::new(HashSet::new()),
             validation_context: RwLock::new(ctx),
@@ -1497,7 +1476,7 @@ impl TransactionQueue {
     /// Parity: stellar-core `TransactionFrame::checkSorobanResources()`.
     fn check_soroban_resources(
         &self,
-        frame: &henyey_tx::TransactionFrame,
+        env: &stellar_xdr::curr::TransactionEnvelope,
     ) -> std::result::Result<(), String> {
         let ctx = self.validation_context.read();
         let Some(ref limits) = ctx.soroban_limits else {
@@ -1505,7 +1484,7 @@ impl TransactionQueue {
             return Ok(());
         };
 
-        let Some(data) = frame.soroban_data() else {
+        let Some(data) = henyey_tx::envelope_utils::envelope_soroban_data(env) else {
             return Err("missing soroban transaction data".to_string());
         };
 
@@ -1550,7 +1529,7 @@ impl TransactionQueue {
             ));
         }
 
-        let tx_size = frame.resource_tx_size_bytes() as u64;
+        let tx_size = henyey_tx::envelope_utils::envelope_tx_size_bytes(env) as u64;
         if tx_size > limits.tx_max_size_bytes {
             return Err(format!(
                 "tx size {} exceeds limit {}",
@@ -1653,11 +1632,7 @@ impl TransactionQueue {
             if !pending_evictions.insert(evicted.hash) {
                 continue;
             }
-            let frame = henyey_tx::TransactionFrame::with_network(
-                evicted.envelope.clone(),
-                self.config.network_id,
-            );
-            let lane = lane_config.get_lane(&frame);
+            let lane = lane_config.get_lane(&evicted.envelope);
             {
                 let mut lane_fees = lane_fees_lock.write();
                 if lane_fees.len() != lane_config.lane_limits().len() {
@@ -1681,10 +1656,10 @@ impl TransactionQueue {
         &self,
         lane_config: &dyn SurgePricingLaneConfig,
         lane_fees: &mut Vec<(i64, u32)>,
-        queued_frame: &henyey_tx::TransactionFrame,
+        envelope: &stellar_xdr::curr::TransactionEnvelope,
         queued: &QueuedTransaction,
     ) -> bool {
-        let lane = lane_config.get_lane(queued_frame);
+        let lane = lane_config.get_lane(envelope);
         if lane_fees.len() != lane_config.lane_limits().len() {
             lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
         }
@@ -1713,7 +1688,7 @@ impl TransactionQueue {
                 if self.fee_below_lane_threshold(
                     &lane_config,
                     &mut lane_fees,
-                    candidate.frame,
+                    &candidate.queued.envelope,
                     candidate.queued,
                 ) {
                     return Err(TxQueueResult::FeeTooLow);
@@ -1728,7 +1703,7 @@ impl TransactionQueue {
                 if self.fee_below_lane_threshold(
                     &lane_config,
                     &mut lane_fees,
-                    candidate.frame,
+                    &candidate.queued.envelope,
                     candidate.queued,
                 ) {
                     return Err(TxQueueResult::FeeTooLow);
@@ -1746,7 +1721,6 @@ impl TransactionQueue {
         // Phase 2: Collect evictions using persistent queues (O(k) where k=evictions)
         let mut pending_evictions: HashSet<Hash256> = HashSet::new();
         let mut pending_eviction_list: Vec<QueuedTransaction> = Vec::new();
-        let network_id = self.config.network_id;
 
         if !candidate.is_soroban {
             if let Some(lane_config) = self.build_classic_lane_config() {
@@ -1756,7 +1730,6 @@ impl TransactionQueue {
                     &store.by_hash,
                     replaced_tx,
                     &pending_evictions,
-                    network_id,
                     candidate.ledger_version,
                 );
                 let excl_ref = if exclusion.is_empty() {
@@ -1771,7 +1744,6 @@ impl TransactionQueue {
                     .can_fit_with_eviction(
                         candidate.queued,
                         None,
-                        &network_id,
                         candidate.ledger_version,
                         excl_ref,
                     )
@@ -1796,7 +1768,6 @@ impl TransactionQueue {
                     &store.by_hash,
                     replaced_tx,
                     &pending_evictions,
-                    network_id,
                     candidate.ledger_version,
                 );
                 let excl_ref = if exclusion.is_empty() {
@@ -1811,7 +1782,6 @@ impl TransactionQueue {
                     .can_fit_with_eviction(
                         candidate.queued,
                         None,
-                        &network_id,
                         candidate.ledger_version,
                         excl_ref,
                     )
@@ -1836,7 +1806,6 @@ impl TransactionQueue {
                 &store.by_hash,
                 replaced_tx,
                 &pending_evictions,
-                network_id,
                 candidate.ledger_version,
             );
             let excl_ref = if exclusion.is_empty() {
@@ -1848,13 +1817,7 @@ impl TransactionQueue {
                 .global_ops_queue
                 .as_ref()
                 .unwrap()
-                .can_fit_with_eviction(
-                    candidate.queued,
-                    None,
-                    &network_id,
-                    candidate.ledger_version,
-                    excl_ref,
-                )
+                .can_fit_with_eviction(candidate.queued, None, candidate.ledger_version, excl_ref)
             else {
                 return Err(TxQueueResult::QueueFull);
             };
@@ -1918,15 +1881,11 @@ impl TransactionQueue {
 
         let mut store = self.store.write();
         let ledger_version = self.validation_context.read().protocol_version;
-        let queued_frame = henyey_tx::TransactionFrame::with_network(
-            queued.envelope.clone(),
-            self.config.network_id,
-        );
-        let queued_is_soroban = queued_frame.is_soroban();
+        let queued_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&queued.envelope);
 
         // Parity: check Soroban resource limits against network config
         if queued_is_soroban {
-            if let Err(reason) = self.check_soroban_resources(&queued_frame) {
+            if let Err(reason) = self.check_soroban_resources(&queued.envelope) {
                 tracing::debug!(
                     hash = %queued.hash,
                     reason = %reason,
@@ -1958,7 +1917,6 @@ impl TransactionQueue {
         let candidate = EvictionCandidate {
             queued: &queued,
             is_soroban: queued_is_soroban,
-            frame: &queued_frame,
             ledger_version,
         };
 
@@ -6177,7 +6135,7 @@ mod tests {
         write_bytes: u32,
         read_only_entries: usize,
         read_write_entries: usize,
-    ) -> henyey_tx::TransactionFrame {
+    ) -> TransactionEnvelope {
         use stellar_xdr::curr::LedgerKey;
         let source = MuxedAccount::Ed25519(Uint256([50u8; 32]));
         let host_function = HostFunction::InvokeContract(InvokeContractArgs {
@@ -6244,7 +6202,7 @@ mod tests {
             .unwrap(),
         });
 
-        henyey_tx::TransactionFrame::from_owned_with_network(envelope, NetworkId::testnet())
+        envelope
     }
 
     fn make_queue_with_soroban_limits(limits: SorobanTxLimits) -> TransactionQueue {

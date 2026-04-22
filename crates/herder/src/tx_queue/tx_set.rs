@@ -481,13 +481,11 @@ impl TransactionSet {
     fn prepare_legacy_for_apply(
         previous_ledger_hash: Hash256,
         transactions: &[TransactionEnvelope],
-        network_id: NetworkId,
+        _network_id: NetworkId,
     ) -> std::result::Result<Self, String> {
         for env in transactions {
             validate_tx_fee(env)?;
-            let frame =
-                henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
-            if frame.is_soroban() {
+            if henyey_tx::envelope_utils::is_soroban_envelope(env) {
                 return Err("Legacy transaction set contains Soroban transaction".to_string());
             }
         }
@@ -768,14 +766,13 @@ fn is_sorted_by_hash(txs: &[TransactionEnvelope]) -> bool {
 /// Validate a set of wire-format transaction envelopes.
 fn validate_wire_txs(
     txs: &[TransactionEnvelope],
-    network_id: NetworkId,
+    _network_id: NetworkId,
     expect_soroban: bool,
 ) -> std::result::Result<(), String> {
     for env in txs {
         validate_tx_fee(env)?;
 
-        let frame = henyey_tx::TransactionFrame::from_owned_with_network(env.clone(), network_id);
-        if frame.is_soroban() != expect_soroban {
+        if henyey_tx::envelope_utils::is_soroban_envelope(env) != expect_soroban {
             if expect_soroban {
                 return Err("Classic transaction found in Soroban phase".to_string());
             } else {

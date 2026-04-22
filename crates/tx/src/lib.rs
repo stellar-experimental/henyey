@@ -128,6 +128,7 @@ pub(crate) const MAX_OPS_PER_TX: usize = 100;
 pub(crate) const NETWORK_MIN_BASE_FEE: i64 = 100;
 
 mod apply;
+pub mod envelope_utils;
 mod error;
 mod events;
 pub(crate) mod fee_bump;

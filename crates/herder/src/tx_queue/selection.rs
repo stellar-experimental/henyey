@@ -12,12 +12,12 @@ fn seed_account_queue(
     queue: &mut SurgePricingPriorityQueue,
     accounts: &AccountTransactions,
     positions: &mut HashMap<Vec<u8>, usize>,
-    network_id: &NetworkId,
+    _network_id: &NetworkId,
     ledger_version: u32,
 ) {
     for (account, txs) in accounts {
         if let Some(first) = txs.first() {
-            queue.add(first.clone(), network_id, ledger_version);
+            queue.add(first.clone(), ledger_version);
             positions.insert(account.clone(), 0);
         }
     }
@@ -28,7 +28,7 @@ fn push_next_account_tx(
     accounts: &AccountTransactions,
     positions: &mut HashMap<Vec<u8>, usize>,
     account: &[u8],
-    network_id: &NetworkId,
+    _network_id: &NetworkId,
     ledger_version: u32,
 ) {
     let Some(txs) = accounts.get(account) else {
@@ -42,7 +42,7 @@ fn push_next_account_tx(
         .saturating_add(1);
     if next_index < txs.len() {
         positions.insert(account.to_vec(), next_index);
-        queue.add(txs[next_index].clone(), network_id, ledger_version);
+        queue.add(txs[next_index].clone(), ledger_version);
     }
 }
 
@@ -355,11 +355,7 @@ impl TransactionQueue {
             .collect();
         classic_had_not_fitting.resize(lane_count, false);
         while let Some((lane, entry)) = classic_queue.peek_top() {
-            let frame = henyey_tx::TransactionFrame::with_network(
-                entry.tx.envelope.clone(),
-                self.config.network_id,
-            );
-            let resources = classic_queue.tx_resources(&frame, ledger_version);
+            let resources = classic_queue.tx_resources(&entry.tx.envelope, ledger_version);
             let exceeds_lane = any_greater(&resources, &classic_lane_left[lane]);
             let exceeds_generic = any_greater(&resources, &classic_lane_left[GENERIC_LANE]);
             if exceeds_lane || exceeds_generic {
@@ -368,7 +364,7 @@ impl TransactionQueue {
                 } else {
                     classic_had_not_fitting[GENERIC_LANE] = true;
                 }
-                classic_queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
+                classic_queue.remove_entry(lane, &entry, ledger_version);
                 continue;
             }
 
@@ -378,7 +374,7 @@ impl TransactionQueue {
                 classic_lane_left[lane] -= resources;
             }
 
-            classic_queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
+            classic_queue.remove_entry(lane, &entry, ledger_version);
             let account = account_key(&entry.tx.envelope);
             push_next_account_tx(
                 &mut classic_queue,
@@ -444,20 +440,16 @@ impl TransactionQueue {
             let mut selected = Vec::new();
             let mut lane_left = [queue.lane_limits(GENERIC_LANE)];
             while let Some((lane, entry)) = queue.peek_top() {
-                let frame = henyey_tx::TransactionFrame::with_network(
-                    entry.tx.envelope.clone(),
-                    self.config.network_id,
-                );
-                let resources = queue.tx_resources(&frame, ledger_version);
+                let resources = queue.tx_resources(&entry.tx.envelope, ledger_version);
                 let exceeds = any_greater(&resources, &lane_left[GENERIC_LANE]);
                 if exceeds {
                     had_not_fitting[GENERIC_LANE] = true;
-                    queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
+                    queue.remove_entry(lane, &entry, ledger_version);
                     continue;
                 }
                 selected.push(entry.tx.clone());
                 lane_left[GENERIC_LANE] -= resources;
-                queue.remove_entry(lane, &entry, ledger_version, &self.config.network_id);
+                queue.remove_entry(lane, &entry, ledger_version);
                 let account = account_key(&entry.tx.envelope);
                 push_next_account_tx(
                     &mut queue,

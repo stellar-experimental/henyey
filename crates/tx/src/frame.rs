@@ -42,7 +42,7 @@ use stellar_xdr::curr::{
     InvokeHostFunctionOp, LedgerKey, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
     SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
     TransactionExt, TransactionSignaturePayload, TransactionSignaturePayloadTaggedTransaction,
-    Uint256, VecM, WriteXdr,
+    Uint256, WriteXdr,
 };
 
 use crate::{Result, TxError};
@@ -406,12 +406,11 @@ impl TransactionFrame {
     /// For fee-bump transactions, returns `inner_ops + 1`, matching
     /// stellar-core's `FeeBumpTransactionFrame::getNumOperations()`.
     /// For regular transactions, returns `operations().len()`.
+    /// Returns the operation count for resource/fee accounting.
+    ///
+    /// Delegates to [`crate::envelope_utils::envelope_operation_count`].
     pub fn resource_operation_count(&self) -> usize {
-        if self.is_fee_bump() {
-            self.operation_count() + 1
-        } else {
-            self.operation_count()
-        }
+        crate::envelope_utils::envelope_operation_count(&self.envelope)
     }
 
     /// Minimum inclusion fee at the given base fee.
@@ -561,29 +560,17 @@ impl TransactionFrame {
     }
 
     /// Check if this is a Soroban transaction.
+    ///
+    /// Delegates to [`crate::envelope_utils::is_soroban_envelope`].
     pub fn is_soroban(&self) -> bool {
-        self.operations().iter().any(|op| {
-            matches!(
-                op.body,
-                OperationBody::InvokeHostFunction(_)
-                    | OperationBody::ExtendFootprintTtl(_)
-                    | OperationBody::RestoreFootprint(_)
-            )
-        })
+        crate::envelope_utils::is_soroban_envelope(&self.envelope)
     }
 
     /// Check if this transaction includes DEX-related operations.
+    ///
+    /// Delegates to [`crate::envelope_utils::has_dex_operations_envelope`].
     pub fn has_dex_operations(&self) -> bool {
-        self.operations().iter().any(|op| {
-            matches!(
-                op.body,
-                OperationBody::ManageSellOffer(_)
-                    | OperationBody::ManageBuyOffer(_)
-                    | OperationBody::CreatePassiveSellOffer(_)
-                    | OperationBody::PathPaymentStrictSend(_)
-                    | OperationBody::PathPaymentStrictReceive(_)
-            )
-        })
+        crate::envelope_utils::has_dex_operations_envelope(&self.envelope)
     }
 
     /// Get the Soroban transaction data (if present).
@@ -603,57 +590,13 @@ impl TransactionFrame {
 
     /// Return the resource footprint used for surge pricing and limits.
     ///
-    /// Mirrors stellar-core's `TransactionFrame::getResources()` and
-    /// `FeeBumpTransactionFrame::getResources()`. For fee-bump transactions:
-    /// - TX_BYTE_SIZE uses the inner envelope size (delegation pattern)
-    /// - OPERATIONS uses inner_ops + 1 (`getNumOperations()`)
+    /// Delegates to [`crate::envelope_utils::resources_from_envelope`].
     pub fn resources(&self, use_byte_limit_in_classic: bool, ledger_version: u32) -> Resource {
-        let tx_size = self.resource_tx_size_bytes() as i64;
-
-        if self.is_soroban() {
-            let data = self.soroban_data();
-            let fallback_resources = stellar_xdr::curr::SorobanResources {
-                footprint: stellar_xdr::curr::LedgerFootprint {
-                    read_only: VecM::default(),
-                    read_write: VecM::default(),
-                },
-                instructions: 0,
-                disk_read_bytes: 0,
-                write_bytes: 0,
-            };
-            let resources = data.map(|d| &d.resources).unwrap_or(&fallback_resources);
-
-            // stellar-core: TransactionFrame::getResources() hardcodes opCount = 1,
-            // FeeBumpTransactionFrame::getResources() overrides with getNumOperations()
-            let op_count = if self.is_fee_bump() {
-                self.resource_operation_count() as i64
-            } else {
-                1i64
-            };
-            let disk_read_entries = soroban_disk_read_entries(
-                resources,
-                data.map(|d| &d.ext),
-                self.is_restore_footprint_tx(),
-                ledger_version,
-            );
-            let write_entries = resources.footprint.read_write.len() as i64;
-
-            return Resource::new(vec![
-                op_count,
-                resources.instructions as i64,
-                tx_size,
-                resources.disk_read_bytes as i64,
-                resources.write_bytes as i64,
-                disk_read_entries,
-                write_entries,
-            ]);
-        }
-
-        if use_byte_limit_in_classic {
-            Resource::new(vec![self.resource_operation_count() as i64, tx_size])
-        } else {
-            Resource::new(vec![self.resource_operation_count() as i64])
-        }
+        crate::envelope_utils::resources_from_envelope(
+            &self.envelope,
+            use_byte_limit_in_classic,
+            ledger_version,
+        )
     }
 
     /// Return the transaction size in bytes (XDR encoding).
