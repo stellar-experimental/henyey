@@ -4028,7 +4028,7 @@
               "legendFormat": "Ledger Max TX Count",
               "refId": "A",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_ledger_max_cpu_insn{job=\"henyey\", instance=~\"$instance\"}",
@@ -4039,7 +4039,7 @@
               "legendFormat": "Ledger Max CPU Instructions",
               "refId": "B",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_ledger_max_txs_size_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4050,7 +4050,7 @@
               "legendFormat": "Ledger Max TXs Size (bytes)",
               "refId": "C",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_ledger_max_read_entry{job=\"henyey\", instance=~\"$instance\"}",
@@ -4061,7 +4061,7 @@
               "legendFormat": "Ledger Max Read Entries",
               "refId": "D",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_ledger_max_read_ledger_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4072,7 +4072,7 @@
               "legendFormat": "Ledger Max Read Bytes",
               "refId": "E",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_ledger_max_write_entry{job=\"henyey\", instance=~\"$instance\"}",
@@ -4083,7 +4083,7 @@
               "legendFormat": "Ledger Max Write Entries",
               "refId": "F",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_ledger_max_write_ledger_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4094,7 +4094,7 @@
               "legendFormat": "Ledger Max Write Bytes",
               "refId": "G",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_tx_max_cpu_insn{job=\"henyey\", instance=~\"$instance\"}",
@@ -4105,7 +4105,7 @@
               "legendFormat": "TX Max CPU Instructions",
               "refId": "H",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_tx_max_mem_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4116,7 +4116,7 @@
               "legendFormat": "TX Max Memory (bytes)",
               "refId": "I",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_tx_max_size_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4127,7 +4127,7 @@
               "legendFormat": "TX Max Size (bytes)",
               "refId": "J",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_tx_max_read_entry{job=\"henyey\", instance=~\"$instance\"}",
@@ -4138,7 +4138,7 @@
               "legendFormat": "TX Max Read Entries",
               "refId": "K",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_tx_max_read_ledger_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4149,7 +4149,7 @@
               "legendFormat": "TX Max Read Bytes",
               "refId": "L",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_tx_max_write_entry{job=\"henyey\", instance=~\"$instance\"}",
@@ -4160,7 +4160,7 @@
               "legendFormat": "TX Max Write Entries",
               "refId": "M",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_tx_max_write_ledger_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4171,7 +4171,7 @@
               "legendFormat": "TX Max Write Bytes",
               "refId": "N",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_tx_max_emit_event_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4182,7 +4182,7 @@
               "legendFormat": "TX Max Emit Event (bytes)",
               "refId": "O",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_contract_max_rw_code_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4193,7 +4193,7 @@
               "legendFormat": "Contract Max RW Code (bytes)",
               "refId": "P",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_contract_max_rw_data_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4204,7 +4204,7 @@
               "legendFormat": "Contract Max RW Data (bytes)",
               "refId": "Q",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_contract_max_rw_key_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4215,7 +4215,7 @@
               "legendFormat": "Contract Max RW Key (bytes)",
               "refId": "R",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_fee_write_1kb{job=\"henyey\", instance=~\"$instance\"}",
@@ -4226,7 +4226,7 @@
               "legendFormat": "Fee Write 1KB",
               "refId": "S",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             },
             {
               "expr": "stellar_soroban_config_bucket_list_target_size_byte{job=\"henyey\", instance=~\"$instance\"}",
@@ -4237,20 +4237,63 @@
               "legendFormat": "Bucket List Target Size (bytes)",
               "refId": "T",
               "instant": true,
-              "format": "table"
+              "format": "time_series"
             }
           ],
           "transformations": [
             {
-              "id": "merge",
-              "options": {}
+              "id": "reduce",
+              "options": {
+                "reducers": ["lastNotNull"],
+                "mode": "seriesToRows",
+                "includeTimeField": false
+              }
             }
           ],
           "options": {
             "showHeader": true,
             "footer": {
               "show": false
-            }
+            },
+            "sortBy": [
+              {
+                "displayName": "Field",
+                "desc": false
+              }
+            ]
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": [
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Field"
+                },
+                "properties": [
+                  {
+                    "id": "custom.width",
+                    "value": 350
+                  },
+                  {
+                    "id": "displayName",
+                    "value": "Config Parameter"
+                  }
+                ]
+              },
+              {
+                "matcher": {
+                  "id": "byName",
+                  "options": "Last *"
+                },
+                "properties": [
+                  {
+                    "id": "displayName",
+                    "value": "Value"
+                  }
+                ]
+              }
+            ]
           }
         }
       ]

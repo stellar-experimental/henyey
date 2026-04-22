@@ -485,7 +485,8 @@ Since this is currently a single-node deployment, the instance variable exists f
 
 ### Panel 9.1: Soroban Config Table
 - **Type:** table
-- **Queries:** One query per config metric, using `instant` mode:
+- **Transformation:** `reduce` (mode: seriesToRows, reducer: lastNotNull) — collapses each series to a single Name/Value row
+- **Queries:** One query per config metric, using `instant` mode and `time_series` format:
   - `stellar_soroban_config_ledger_max_tx_count{job="henyey", instance=~"$instance"}`
   - `stellar_soroban_config_ledger_max_cpu_insn{job="henyey", instance=~"$instance"}`
   - `stellar_soroban_config_ledger_max_txs_size_byte{job="henyey", instance=~"$instance"}`
