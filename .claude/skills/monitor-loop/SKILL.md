@@ -202,15 +202,19 @@ table is the human reference.
 | `stellar_herder_lost_sync_total` | ≥ 1 | SYNC | Node fell out of Tracking — always a bug on a steady-state node |
 | `henyey_post_catchup_hard_reset_total` | ≥ 1 | ACTION | Recovery fired |
 | `henyey_recovery_stalled_tick_total` | ≥ 5 | WARN | Recovery loop not progressing |
-| `stellar_ledger_apply_failure_total` | ≥ 50 | WARN | Tx apply failures spiking (mainnet baseline ~0/ledger) |
+| `stellar_ledger_apply_failure_total` | ≥ 90000 | WARN | Mainnet baseline measured ~8755/tick (~80 fails/ledger) on 2026-04-22; threshold at ~10× baseline |
 | `stellar_herder_pending_too_old_total` | ≥ 100 | WARN | Pending pool rejecting stale envelopes; overlay lag |
 | `stellar_overlay_timeout_idle_total` + `_straggler_total` (sum) | 5× prior-tick sum | WARN | Overlay churn burst |
 | `stellar_overlay_error_read_total` + `_write_total` (sum) | ≥ 50 | WARN | Overlay I/O errors |
 | `henyey_archive_cache_refresh_error_total` | ≥ 1 | NONC | Archive fetch failing |
 | `henyey_archive_cache_refresh_timeout_total` | ≥ 3 | NONC | Archive fetch slow |
-| `henyey_scp_post_verify_drops_total` | ≥ 100 | WARN | Post-verify dropping; investigate reason labels |
+| `henyey_scp_post_verify_drops_total` | ≥ 2000000 | WARN | Mainnet baseline measured ~171971/tick on 2026-04-22 (broad overlay broadcast → TooOld/Invalid at ~318/s); threshold at ~10× baseline |
 
-Mainnet closes ~120 ledgers per tick; "≥ 50 failures/tick" ≈ 0.4/ledger.
+Mainnet closes ~120 ledgers per tick. Thresholds above for `ledger_apply_failure_total`
+and `scp_post_verify_drops_total` are empirically set at ~10× the 2026-04-22 mainnet
+baseline; they are blunt absolute-delta checks and may false-negative on slow, sustained
+degradation. Follow-up: replace with ratio checks
+(`ledger_apply_failure / (success + failure)` and `scp_post_verify_drops / scp_envelope_receive`).
 
 **B. Gauges — fire on absolute threshold**
 
@@ -518,7 +522,7 @@ HEALTH CHECKS:
 
 (e) Evaluate METRIC ALERT CATALOG against current.prom (and deltas vs prev.prom):
 
-COUNTERS (delta ≥ threshold): stellar_herder_lost_sync_total ≥1 SYNC; henyey_post_catchup_hard_reset_total ≥1 ACTION; henyey_recovery_stalled_tick_total ≥5 WARN; stellar_ledger_apply_failure_total ≥50 WARN; stellar_herder_pending_too_old_total ≥100 WARN; (stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total) 5× prior-tick-sum WARN; (stellar_overlay_error_read_total + stellar_overlay_error_write_total) ≥50 WARN; henyey_archive_cache_refresh_error_total ≥1 NONC; henyey_archive_cache_refresh_timeout_total ≥3 NONC; henyey_scp_post_verify_drops_total ≥100 WARN.
+COUNTERS (delta ≥ threshold): stellar_herder_lost_sync_total ≥1 SYNC; henyey_post_catchup_hard_reset_total ≥1 ACTION; henyey_recovery_stalled_tick_total ≥5 WARN; stellar_ledger_apply_failure_total ≥90000 WARN (baselined ~8755/tick 2026-04-22, threshold ~10× baseline); stellar_herder_pending_too_old_total ≥100 WARN; (stellar_overlay_timeout_idle_total + stellar_overlay_timeout_straggler_total) 5× prior-tick-sum WARN; (stellar_overlay_error_read_total + stellar_overlay_error_write_total) ≥50 WARN; henyey_archive_cache_refresh_error_total ≥1 NONC; henyey_archive_cache_refresh_timeout_total ≥3 NONC; henyey_scp_post_verify_drops_total ≥2000000 WARN (baselined ~172k/tick 2026-04-22, threshold ~10× baseline).
 
 GAUGES (absolute threshold on current): stellar_peer_count <8 WARN; henyey_jemalloc_fragmentation_pct >50 on two consecutive ticks WARN; stellar_ledger_age_current_seconds >30 SYNC; stellar_herder_state !=2 when uptime >15m SYNC; henyey_scp_verify_input_backlog >100 WARN; henyey_scp_verifier_thread_state !=0 WARN (0=Running, 1=Stopping, 2=Dead; only Running is healthy); stellar_herder_pending_envelopes >2000 WARN; henyey_overlay_fetch_channel_depth_max >500 WARN; (henyey_process_open_fds / henyey_process_max_fds) >0.85 WARN; henyey_herder_drift_max_seconds >10 NONC. [quorum_agree / quorum_missing / quorum_fail_at intentionally NOT monitored — they snapshot the tracking slot's QuorumInfo and return false-positive noise between externalizations; see skill body.]
 
