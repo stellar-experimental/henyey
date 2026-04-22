@@ -820,6 +820,9 @@ impl Herder {
             // Purge externalized values and pending tx set requests
             self.scp_driver.purge_slots_below(purge_slot);
 
+            // Purge stale pending envelopes for old slots
+            self.pending_envelopes.purge_slots_below(purge_slot);
+
             return Some(purge_slot);
         }
 
@@ -1336,7 +1339,20 @@ impl Herder {
                     );
                 }
                 PendingResult::BufferFull => {
-                    debug!("Pending envelope buffer full");
+                    // Rate-limit: warn once per slot to avoid log flooding.
+                    let last_warned = self.pending_envelopes.last_buffer_full_warn_slot();
+                    if slot != last_warned {
+                        self.pending_envelopes.set_last_buffer_full_warn_slot(slot);
+                        let stats = self.pending_envelopes.stats();
+                        tracing::warn!(
+                            slot,
+                            current_slot,
+                            pending_slot,
+                            buffered_slots = self.pending_envelopes.slot_count(),
+                            total_buffer_full = stats.buffer_full,
+                            "Pending envelope buffer full (slot-count limit)"
+                        );
+                    }
                     return (
                         EnvelopeState::Invalid,
                         PostVerifyReason::PendingAddBufferFull,
@@ -1867,6 +1883,9 @@ impl Herder {
 
         // Clean up old data
         self.cleanup();
+
+        // Purge stale pending envelopes for slots behind the closed ledger.
+        self.pending_envelopes.purge_slots_below(slot);
     }
 
     /// Handle nomination timeout.
@@ -2275,6 +2294,7 @@ impl Herder {
     /// fresh state to be fetched from peers.
     pub fn purge_slots_below(&self, slot: SlotIndex) {
         self.scp_driver.purge_slots_below(slot);
+        self.pending_envelopes.purge_slots_below(slot);
         self.pending_envelopes.evict_expired();
     }
 

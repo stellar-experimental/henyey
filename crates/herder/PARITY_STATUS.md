@@ -237,6 +237,7 @@ Corresponds to: `PendingEnvelopes.h`
 | `peerDoesntHave()` | `FetchingEnvelopes::peer_doesnt_have()` | Full |
 | `pop()` | `FetchingEnvelopes::pop()` | Full |
 | `eraseBelow()` | `FetchingEnvelopes::erase_below()` + `QuorumSetTracker::evict_pending_below()` | Full |
+| `stopAllOutsideRange()` (lower bound) | `PendingEnvelopes::purge_slots_below()` | Full |
 | `forceRebuildQuorum()` | _(not implemented)_ | None |
 | `readySlots()` | `FetchingEnvelopes::ready_slots()` | Full |
 | `getJsonInfo()` | _(not implemented)_ | None |
@@ -250,6 +251,19 @@ Corresponds to: `PendingEnvelopes.h`
 | `getJsonValidatorCost()` | _(not implemented)_ | None |
 | `recordReceivedCost()` | _(not implemented)_ | None |
 | `getCostPerValidator()` | _(not implemented)_ | None |
+
+**Parity notes (pending.rs):**
+- **No per-slot envelope count cap** (matches stellar-core). Removed the
+  henyey-specific `max_per_slot` field in #1899 — stellar-core's
+  `PendingEnvelopes` uses an unbounded `std::map<uint64, SlotEnvelopes>`
+  with no per-slot limit. Cleanup is slot-based, not per-envelope.
+- **Slot-count gating** correctly skips the `max_slots` check when appending
+  to an existing slot (fixed in #1899).
+- **`purge_slots_below(min_slot)`** mirrors the lower-bound cleanup of
+  stellar-core's `stopAllOutsideRange`. Wired into `out_of_sync_recovery`
+  and `ledger_closed`.
+- **Follow-up:** Full `purge_slots_outside_range(min, max, slot_to_keep)`
+  with upper bound and checkpoint preservation is not yet implemented.
 
 ### QuorumTracker (`quorum_tracker.rs`)
 

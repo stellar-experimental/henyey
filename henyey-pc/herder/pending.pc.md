@@ -6,14 +6,15 @@
 ### Data: PendingConfig
 
 ```
-CONST MAX_PER_SLOT     = 100
 CONST MAX_SLOTS        = 100   // matches LEDGER_VALIDITY_BRACKET
 CONST MAX_AGE          = 300 seconds
 
 PendingConfig:
-  max_per_slot:      int
   max_slots:         int
   max_age:           Duration
+
+// No per-slot cap — stellar-core does not impose one.
+// Removed in #1899 to fix PendingAddBufferFull stall.
 ```
 
 ### Data: PendingEnvelope
@@ -29,23 +30,26 @@ PendingEnvelope:
 
 ```
 PendingEnvelopes:
-  config:       PendingConfig
-  slots:        Map<SlotIndex, List<PendingEnvelope>>
-  seen_hashes:  Set<Hash256>
-  current_slot: SlotIndex
-  stats:        PendingStats
+  config:                     PendingConfig
+  slots:                      Map<SlotIndex, List<PendingEnvelope>>
+  seen_hashes:                Set<Hash256>
+  current_slot:               SlotIndex
+  stats:                      PendingStats
+  last_buffer_full_warn_slot: u64  // rate-limiting for warn! log
 ```
 
 ### Data: PendingStats
 
 ```
 PendingStats:
-  received:   u64
-  added:      u64
-  duplicates: u64
-  too_old:    u64
-  released:   u64
-  evicted:    u64
+  received:              u64
+  added:                 u64
+  duplicates:            u64
+  too_old:               u64
+  released:              u64
+  evicted:               u64
+  buffer_full:           u64   // total BufferFull rejections
+  max_envelopes_per_slot: u64  // high-water mark
 ```
 
 ### Data: PendingResult
@@ -88,18 +92,23 @@ function add(slot, envelope):
   GUARD seen_hashes contains pending.hash
                               → Duplicate
 
+  // Existing slot — just append, no slot-count check.
+  if slots contains slot:
+    seen_hashes.add(pending.hash)
+    slots[slot].append(pending)
+    update max_envelopes_per_slot high-water mark
+    stats.added += 1
+    → Added
+
+  // New slot — enforce max_slots with eviction.
   if slots.count >= config.max_slots:
     evict_old_slots(current)
     GUARD slots.count >= config.max_slots
+      stats.buffer_full += 1
                               → BufferFull
 
   seen_hashes.add(pending.hash)
-
-  entry = slots[slot] (create if absent)
-  GUARD entry.length >= config.max_per_slot
-                              → BufferFull
-
-  entry.append(pending)
+  slots[slot].append(pending)
   stats.added += 1
   → Added
 ```
@@ -150,6 +159,19 @@ function evict_old_slots(current):
       seen_hashes.remove(env.hash)
 ```
 
+### purge_slots_below
+
+```
+function purge_slots_below(min_slot):
+  slots_to_remove = all keys in self.slots where key < min_slot
+
+  for each slot in slots_to_remove:
+    envelopes = slots.remove(slot)
+    stats.evicted += envelopes.length
+    for each env in envelopes:
+      seen_hashes.remove(env.hash)
+```
+
 ### evict_expired
 
 ```
@@ -193,5 +215,5 @@ function clear():
 
 | Metric        | Source | Pseudocode |
 |---------------|--------|------------|
-| Lines (logic) | 346    | 88         |
-| Functions     | 16     | 13         |
+| Lines (logic) | 420    | 100        |
+| Functions     | 18     | 15         |

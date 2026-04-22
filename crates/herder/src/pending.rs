@@ -14,15 +14,24 @@
 //! # Key Features
 //!
 //! - **Deduplication**: Tracks envelope hashes to prevent duplicate processing
-//! - **Slot Distance Limits**: Rejects envelopes too far ahead of the current slot
+//! - **Slot Limits**: Limits the number of distinct slots buffered (matching
+//!   `LEDGER_VALIDITY_BRACKET`)
 //! - **Expiration**: Automatically evicts old envelopes based on configurable age limits
-//! - **Per-Slot Limits**: Prevents memory exhaustion by limiting envelopes per slot
+//!
+//! # Parity with stellar-core
+//!
+//! stellar-core's `PendingEnvelopes` does NOT impose per-slot envelope count
+//! limits. Cleanup is done by `stopAllOutsideRange(min, max, slotToKeep)`,
+//! which removes entire slots outside the active window. Henyey matches this:
+//! no per-slot cap, slot-count gating only for new slots, and
+//! `purge_slots_below` for lifecycle cleanup.
 
 use dashmap::DashMap;
 use henyey_common::Hash256;
 use henyey_scp::SlotIndex;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::ScpEnvelope;
 
@@ -44,10 +53,14 @@ use stellar_xdr::curr::ScpEnvelope;
 /// the captive-core observer post-catchup, and otherwise-valid EXTERNALIZE
 /// envelopes were silently dropped as `SlotTooFar`. The field has been
 /// removed to match stellar-core.
+///
+/// stellar-core also does NOT impose per-slot envelope count limits.
+/// The `max_per_slot` field that previously existed here was
+/// henyey-specific and caused issue #1899: during heavy-TX bursts the
+/// per-slot cap filled up and critical CONFIRM/EXTERNALIZE votes were
+/// dropped, stalling the node. It has been removed to match stellar-core.
 #[derive(Debug, Clone)]
 pub struct PendingConfig {
-    /// Maximum number of pending envelopes per slot.
-    pub max_per_slot: usize,
     /// Maximum number of slots to buffer.
     pub max_slots: usize,
     /// Maximum age of pending envelopes before eviction.
@@ -57,13 +70,11 @@ pub struct PendingConfig {
 impl Default for PendingConfig {
     fn default() -> Self {
         Self {
-            max_per_slot: 100,
             // Sized to cover a full `LEDGER_VALIDITY_BRACKET` window so
-            // that post-catchup buffering can hold one envelope per slot
-            // across the pre-filter horizon. Bound to the constant so the
-            // invariant ("buffer capacity == pre-filter horizon") is
-            // locked in at the type level. Worst-case memory cost:
-            // `max_per_slot × max_slots × ~2 KB = ~20 MB`.
+            // that post-catchup buffering can hold envelopes across the
+            // pre-filter horizon. Bound to the constant so the invariant
+            // ("buffer capacity == pre-filter horizon") is locked in at
+            // the type level.
             max_slots: crate::sync_recovery::LEDGER_VALIDITY_BRACKET as usize,
             max_age: Duration::from_secs(300),
         }
@@ -127,6 +138,8 @@ pub struct PendingEnvelopes {
     current_slot: RwLock<SlotIndex>,
     /// Statistics.
     stats: RwLock<PendingStats>,
+    /// Last slot for which a BufferFull warning was emitted (rate-limiting).
+    last_buffer_full_warn_slot: AtomicU64,
 }
 
 /// Statistics about pending envelope management.
@@ -144,6 +157,10 @@ pub struct PendingStats {
     pub released: u64,
     /// Envelopes evicted due to expiration.
     pub evicted: u64,
+    /// Total BufferFull rejections (slot-count limit).
+    pub buffer_full: u64,
+    /// High-water mark: largest envelope count observed in any single slot.
+    pub max_envelopes_per_slot: u64,
 }
 
 impl PendingEnvelopes {
@@ -155,6 +172,7 @@ impl PendingEnvelopes {
             seen_hashes: DashMap::new(),
             current_slot: RwLock::new(0),
             stats: RwLock::new(PendingStats::default()),
+            last_buffer_full_warn_slot: AtomicU64::new(0),
         }
     }
 
@@ -199,25 +217,40 @@ impl PendingEnvelopes {
             return PendingResult::Duplicate;
         }
 
-        // Check buffer limits
+        // Existing slot — just append, no slot-count check needed.
+        // This avoids false BufferFull when max_slots slots exist but
+        // the target slot is already one of them.
+        if let Some(mut existing) = self.slots.get_mut(&slot) {
+            self.seen_hashes.insert(pending.hash, ());
+            existing.push(pending);
+            let count = existing.len() as u64;
+            let mut stats = self.stats.write();
+            stats.added += 1;
+            if count > stats.max_envelopes_per_slot {
+                stats.max_envelopes_per_slot = count;
+            }
+            return PendingResult::Added;
+        }
+
+        // New slot — enforce max_slots with eviction.
         if self.slots.len() >= self.config.max_slots {
-            // Try to evict old slots first
             self.evict_old_slots(current);
             if self.slots.len() >= self.config.max_slots {
+                let mut stats = self.stats.write();
+                stats.buffer_full += 1;
                 return PendingResult::BufferFull;
             }
         }
 
-        // Add to pending — check per-slot capacity before inserting into seen_hashes
-        // to avoid ghost entries that would permanently poison dedup.
-        let mut entry = self.slots.entry(slot).or_default();
-        if entry.len() >= self.config.max_per_slot {
-            return PendingResult::BufferFull;
-        }
+        // Insert into new slot.
         self.seen_hashes.insert(pending.hash, ());
-        entry.push(pending);
+        self.slots.entry(slot).or_default().push(pending);
 
-        self.stats.write().added += 1;
+        let mut stats = self.stats.write();
+        stats.added += 1;
+        if stats.max_envelopes_per_slot == 0 {
+            stats.max_envelopes_per_slot = 1;
+        }
         PendingResult::Added
     }
 
@@ -358,6 +391,51 @@ impl PendingEnvelopes {
             tracing::info!(slots_count, seen_count, "Cleared pending_envelopes");
         }
     }
+
+    /// Remove all buffered slots below `min_slot`, cleaning up seen_hashes.
+    ///
+    /// Matches stellar-core's `stopAllOutsideRange` lower bound — removes
+    /// stale slots that can no longer be processed. Does NOT impose an upper
+    /// bound, matching stellar-core behavior where future-slot bounds are
+    /// unreliable when not tracking.
+    pub fn purge_slots_below(&self, min_slot: SlotIndex) {
+        let slots_to_remove: Vec<SlotIndex> = self
+            .slots
+            .iter()
+            .filter(|e| *e.key() < min_slot)
+            .map(|e| *e.key())
+            .collect();
+
+        let mut total_evicted = 0u64;
+        for slot in slots_to_remove {
+            if let Some((_, envelopes)) = self.slots.remove(&slot) {
+                total_evicted += envelopes.len() as u64;
+                for env in envelopes {
+                    self.seen_hashes.remove(&env.hash);
+                }
+            }
+        }
+        if total_evicted > 0 {
+            self.stats.write().evicted += total_evicted;
+            tracing::debug!(
+                min_slot,
+                total_evicted,
+                "Purged pending slots below threshold"
+            );
+        }
+    }
+
+    /// Returns the last slot for which a BufferFull warning was logged.
+    /// Used for rate-limiting warnings (once per slot).
+    pub fn last_buffer_full_warn_slot(&self) -> u64 {
+        self.last_buffer_full_warn_slot.load(Ordering::Relaxed)
+    }
+
+    /// Set the last slot for which a BufferFull warning was logged.
+    pub fn set_last_buffer_full_warn_slot(&self, slot: u64) {
+        self.last_buffer_full_warn_slot
+            .store(slot, Ordering::Relaxed);
+    }
 }
 
 impl Default for PendingEnvelopes {
@@ -492,34 +570,37 @@ mod tests {
         }
     }
 
-    /// [AUDIT-XH7] When per-slot buffer is full, the envelope's hash must not
-    /// remain in seen_hashes. Otherwise the envelope is permanently rejected
-    /// as a "duplicate" even though it was never actually buffered.
+    /// [AUDIT-XH7] When the buffer is full (slot-count limit), the envelope's
+    /// hash must not remain in seen_hashes. Otherwise the envelope is
+    /// permanently rejected as a "duplicate" even though it was never actually
+    /// buffered.
+    ///
+    /// Updated for #1899: the per-slot cap no longer exists; BufferFull is
+    /// now triggered only by the slot-count limit.
     #[test]
     fn test_audit_xh7_buffer_full_does_not_poison_seen_hashes() {
         let config = PendingConfig {
-            max_per_slot: 1, // Only allow 1 envelope per slot
+            max_slots: 1, // Only allow 1 slot
             ..Default::default()
         };
         let pending = PendingEnvelopes::new(config);
         pending.set_current_slot(100);
 
-        // Fill the buffer for slot 101
+        // Fill the single slot
         let env1 = make_test_envelope_with_node(101, 1);
         assert_eq!(pending.add(101, env1), PendingResult::Added);
 
-        // Try to add a second envelope — should be BufferFull
-        let env2 = make_test_envelope_with_node(101, 2);
-        assert_eq!(pending.add(101, env2.clone()), PendingResult::BufferFull);
+        // Try to add to a different slot — should be BufferFull (slot-count limit)
+        let env2 = make_test_envelope_with_node(102, 2);
+        assert_eq!(pending.add(102, env2.clone()), PendingResult::BufferFull);
 
-        // Release slot 101 to clear the buffer
+        // Release slot 101 to free space
         pending.release(101);
 
         // Now re-add the envelope that was previously rejected as BufferFull.
         // Before fix: returns Duplicate (ghost entry in seen_hashes)
         // After fix: returns Added
-        pending.set_current_slot(100); // Keep it eligible
-        let result = pending.add(101, env2);
+        let result = pending.add(102, env2);
         assert_eq!(
             result,
             PendingResult::Added,
@@ -556,5 +637,234 @@ mod tests {
 
         // Slot 105 should remain in the buffer
         assert_eq!(pending.slot_count(), 1);
+    }
+
+    /// Regression for #1899, Test A: 200+ envelopes with distinct node IDs
+    /// in one slot should all be accepted (no per-slot cap).
+    #[test]
+    fn test_issue_1899_no_per_slot_cap() {
+        let pending = PendingEnvelopes::with_defaults();
+        pending.set_current_slot(100);
+
+        for i in 0..=200u8 {
+            let env = make_test_envelope_with_node(101, i);
+            assert_eq!(
+                pending.add(101, env),
+                PendingResult::Added,
+                "Envelope from node {i} should be accepted — no per-slot cap"
+            );
+        }
+        assert_eq!(pending.pending_count(101), 201);
+        let stats = pending.stats();
+        assert_eq!(stats.max_envelopes_per_slot, 201);
+    }
+
+    /// Regression for #1899, Test B: Append to existing slot when max_slots
+    /// is full — must be accepted without eviction.
+    #[test]
+    fn test_issue_1899_existing_slot_bypasses_max_slots_check() {
+        let config = PendingConfig {
+            max_slots: 2,
+            ..Default::default()
+        };
+        let pending = PendingEnvelopes::new(config);
+        pending.set_current_slot(100);
+
+        // Fill both slots
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(102, make_test_envelope_with_node(102, 2)),
+            PendingResult::Added
+        );
+        assert_eq!(pending.slot_count(), 2);
+
+        // Adding to an existing slot should succeed even though max_slots is full
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 3)),
+            PendingResult::Added,
+            "Appending to existing slot must succeed regardless of slot-count limit"
+        );
+        assert_eq!(pending.pending_count(101), 2);
+
+        // Adding a new third slot should fail
+        assert_eq!(
+            pending.add(103, make_test_envelope_with_node(103, 4)),
+            PendingResult::BufferFull,
+            "New slot should be rejected when max_slots is full"
+        );
+    }
+
+    /// Regression for #1899, Test C: Slot-count eviction with small max_slots.
+    #[test]
+    fn test_issue_1899_slot_count_eviction() {
+        let config = PendingConfig {
+            max_slots: 2,
+            ..Default::default()
+        };
+        let pending = PendingEnvelopes::new(config);
+        pending.set_current_slot(100);
+
+        // Fill both slots
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(102, make_test_envelope_with_node(102, 2)),
+            PendingResult::Added
+        );
+
+        // Advance current_slot so slot 101 becomes old
+        pending.set_current_slot(102);
+
+        // Now adding slot 103 should evict slot 101 and succeed
+        assert_eq!(
+            pending.add(103, make_test_envelope_with_node(103, 3)),
+            PendingResult::Added,
+            "Should evict old slot 101 and accept new slot 103"
+        );
+        assert_eq!(pending.slot_count(), 2);
+        assert!(
+            !pending.has_pending(101),
+            "Slot 101 should have been evicted"
+        );
+    }
+
+    /// Regression for #1899, Test D: Non-tracking mode (current_slot=0)
+    /// should still enforce slot-count limit.
+    #[test]
+    fn test_issue_1899_non_tracking_buffer_full() {
+        let config = PendingConfig {
+            max_slots: 2,
+            ..Default::default()
+        };
+        let pending = PendingEnvelopes::new(config);
+        // current_slot = 0 (default, non-tracking)
+
+        assert_eq!(
+            pending.add(100, make_test_envelope_with_node(100, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 2)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(102, make_test_envelope_with_node(102, 3)),
+            PendingResult::BufferFull,
+            "Non-tracking mode: no old slots to evict, must return BufferFull"
+        );
+    }
+
+    /// Regression for #1899, Test E: seen_hashes are cleaned up after eviction.
+    #[test]
+    fn test_issue_1899_seen_hashes_cleaned_on_eviction() {
+        let config = PendingConfig {
+            max_slots: 3,
+            ..Default::default()
+        };
+        let pending = PendingEnvelopes::new(config);
+        pending.set_current_slot(100);
+
+        let env = make_test_envelope_with_node(101, 1);
+        assert_eq!(pending.add(101, env.clone()), PendingResult::Added);
+        assert_eq!(
+            pending.add(102, make_test_envelope_with_node(102, 2)),
+            PendingResult::Added
+        );
+
+        // Advance and evict slot 101 via evict_old_slots (triggered by slot-count pressure)
+        pending.set_current_slot(102);
+        // Add slot 103 — this fills to max_slots=3 (102, 103, and maybe evicts 101)
+        assert_eq!(
+            pending.add(103, make_test_envelope_with_node(103, 3)),
+            PendingResult::Added
+        );
+        // Manually purge below 102 to evict slot 101
+        pending.purge_slots_below(102);
+
+        // Slot 101 was evicted. Re-add the same envelope — should not be Duplicate.
+        pending.set_current_slot(100); // make slot eligible again
+        let result = pending.add(101, env);
+        assert_eq!(
+            result,
+            PendingResult::Added,
+            "After eviction, envelope hash must be removed from seen_hashes"
+        );
+    }
+
+    /// Regression for #1899, Test G: Observability counters are correct.
+    #[test]
+    fn test_issue_1899_observability_counters() {
+        let config = PendingConfig {
+            max_slots: 1,
+            ..Default::default()
+        };
+        let pending = PendingEnvelopes::new(config);
+        pending.set_current_slot(100);
+
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 1)),
+            PendingResult::Added
+        );
+        // This triggers BufferFull (slot-count limit)
+        assert_eq!(
+            pending.add(102, make_test_envelope_with_node(102, 2)),
+            PendingResult::BufferFull
+        );
+        assert_eq!(
+            pending.add(103, make_test_envelope_with_node(103, 3)),
+            PendingResult::BufferFull
+        );
+
+        let stats = pending.stats();
+        assert_eq!(stats.buffer_full, 2, "Two BufferFull rejections");
+        assert_eq!(
+            stats.max_envelopes_per_slot, 1,
+            "High-water mark for single envelope"
+        );
+        assert_eq!(stats.added, 1);
+        assert_eq!(stats.received, 3);
+    }
+
+    /// Regression for #1899, Test H: purge_slots_below cleans seen_hashes.
+    #[test]
+    fn test_issue_1899_purge_slots_below_cleans_seen_hashes() {
+        let pending = PendingEnvelopes::with_defaults();
+        pending.set_current_slot(100);
+
+        let env1 = make_test_envelope_with_node(101, 1);
+        let env2 = make_test_envelope_with_node(102, 2);
+        let env3 = make_test_envelope_with_node(103, 3);
+        assert_eq!(pending.add(101, env1.clone()), PendingResult::Added);
+        assert_eq!(pending.add(102, env2.clone()), PendingResult::Added);
+        assert_eq!(pending.add(103, env3), PendingResult::Added);
+        assert_eq!(pending.slot_count(), 3);
+
+        // Purge everything below 103
+        pending.purge_slots_below(103);
+        assert_eq!(pending.slot_count(), 1, "Only slot 103 should remain");
+        assert!(!pending.has_pending(101));
+        assert!(!pending.has_pending(102));
+        assert!(pending.has_pending(103));
+
+        // Re-add the purged envelopes — should not be Duplicate
+        pending.set_current_slot(100);
+        assert_eq!(
+            pending.add(101, env1),
+            PendingResult::Added,
+            "After purge, seen_hashes for slot 101 must be cleared"
+        );
+        assert_eq!(
+            pending.add(102, env2),
+            PendingResult::Added,
+            "After purge, seen_hashes for slot 102 must be cleared"
+        );
+
+        let stats = pending.stats();
+        assert_eq!(stats.evicted, 2, "Two envelopes evicted by purge");
     }
 }
