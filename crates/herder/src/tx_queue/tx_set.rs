@@ -420,20 +420,21 @@ impl TransactionSet {
     /// Prepare a transaction set for ledger application.
     ///
     /// This corresponds to upstream `TxSetXDRFrame::prepareForApply()`.
-    pub fn prepare_for_apply(&self, network_id: NetworkId) -> std::result::Result<Self, String> {
+    /// The `_network_id` parameter is intentionally retained (unused) to
+    /// preserve API shape parity with upstream `prepareForApply(Application&)`.
+    pub fn prepare_for_apply(&self, _network_id: NetworkId) -> std::result::Result<Self, String> {
         match &self.body {
-            TxSetBody::Generalized(gen) => Self::prepare_generalized_for_apply(gen, network_id),
+            TxSetBody::Generalized(gen) => Self::prepare_generalized_for_apply(gen),
             TxSetBody::Legacy {
                 previous_ledger_hash,
                 transactions,
-            } => Self::prepare_legacy_for_apply(*previous_ledger_hash, transactions, network_id),
+            } => Self::prepare_legacy_for_apply(*previous_ledger_hash, transactions),
         }
     }
 
     /// Validate and prepare a generalized transaction set for application.
     fn prepare_generalized_for_apply(
         gen: &GeneralizedTransactionSet,
-        network_id: NetworkId,
     ) -> std::result::Result<Self, String> {
         validate_generalized_tx_set_xdr_structure(gen)?;
 
@@ -446,7 +447,7 @@ impl TransactionSet {
                     for component in components.iter() {
                         match component {
                             TxSetComponent::TxsetCompTxsMaybeDiscountedFee(comp) => {
-                                validate_wire_txs(&comp.txs, network_id, expect_soroban)?;
+                                validate_wire_txs(&comp.txs, expect_soroban)?;
                             }
                         }
                     }
@@ -454,7 +455,7 @@ impl TransactionSet {
                 TransactionPhase::V1(parallel) => {
                     for stage in parallel.execution_stages.iter() {
                         for cluster in stage.iter() {
-                            validate_wire_txs(cluster.as_slice(), network_id, expect_soroban)?;
+                            validate_wire_txs(cluster.as_slice(), expect_soroban)?;
                         }
                     }
                 }
@@ -481,7 +482,6 @@ impl TransactionSet {
     fn prepare_legacy_for_apply(
         previous_ledger_hash: Hash256,
         transactions: &[TransactionEnvelope],
-        _network_id: NetworkId,
     ) -> std::result::Result<Self, String> {
         for env in transactions {
             validate_tx_fee(env)?;
@@ -659,34 +659,7 @@ fn source_account_ed25519(env: &TransactionEnvelope) -> [u8; 32] {
 ///
 /// Mirrors upstream `XDRProvidesValidFee`.
 fn validate_tx_fee(env: &TransactionEnvelope) -> std::result::Result<(), String> {
-    let is_soroban = match env {
-        TransactionEnvelope::TxV0(e) => e.tx.operations.iter().any(|op| {
-            matches!(
-                op.body,
-                stellar_xdr::curr::OperationBody::InvokeHostFunction(_)
-                    | stellar_xdr::curr::OperationBody::ExtendFootprintTtl(_)
-                    | stellar_xdr::curr::OperationBody::RestoreFootprint(_)
-            )
-        }),
-        TransactionEnvelope::Tx(e) => e.tx.operations.iter().any(|op| {
-            matches!(
-                op.body,
-                stellar_xdr::curr::OperationBody::InvokeHostFunction(_)
-                    | stellar_xdr::curr::OperationBody::ExtendFootprintTtl(_)
-                    | stellar_xdr::curr::OperationBody::RestoreFootprint(_)
-            )
-        }),
-        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            FeeBumpTransactionInnerTx::Tx(inner) => inner.tx.operations.iter().any(|op| {
-                matches!(
-                    op.body,
-                    stellar_xdr::curr::OperationBody::InvokeHostFunction(_)
-                        | stellar_xdr::curr::OperationBody::ExtendFootprintTtl(_)
-                        | stellar_xdr::curr::OperationBody::RestoreFootprint(_)
-                )
-            }),
-        },
-    };
+    let is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(env);
 
     if is_soroban {
         match env {
@@ -760,7 +733,6 @@ fn is_sorted_by_hash(txs: &[TransactionEnvelope]) -> bool {
 /// Validate a set of wire-format transaction envelopes.
 fn validate_wire_txs(
     txs: &[TransactionEnvelope],
-    _network_id: NetworkId,
     expect_soroban: bool,
 ) -> std::result::Result<(), String> {
     for env in txs {
@@ -893,13 +865,16 @@ fn summary_generalized_tx_set(gen: &GeneralizedTransactionSet) -> String {
 mod tests {
     use super::*;
     use stellar_xdr::curr::{
-        CreateAccountOp, DecoratedSignature, DependentTxCluster, FeeBumpTransaction,
-        FeeBumpTransactionEnvelope, FeeBumpTransactionExt, FeeBumpTransactionInnerTx,
-        GeneralizedTransactionSet, Memo, MuxedAccount, Operation, OperationBody,
-        ParallelTxExecutionStage, ParallelTxsComponent, Preconditions, SequenceNumber,
-        SignatureHint, Transaction, TransactionEnvelope, TransactionExt, TransactionPhase,
-        TransactionSetV1, TransactionV1Envelope, TxSetComponent,
-        TxSetComponentTxsMaybeDiscountedFee, Uint256,
+        ContractDataDurability, ContractId, CreateAccountOp, DecoratedSignature,
+        DependentTxCluster, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+        FeeBumpTransactionInnerTx, GeneralizedTransactionSet, Hash, HostFunction,
+        InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey,
+        LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody,
+        ParallelTxExecutionStage, ParallelTxsComponent, Preconditions, ScAddress, ScSymbol, ScVal,
+        SequenceNumber, SignatureHint, SorobanResources, SorobanTransactionData,
+        SorobanTransactionDataExt, Transaction, TransactionEnvelope, TransactionExt,
+        TransactionPhase, TransactionSetV1, TransactionV0, TransactionV0Envelope,
+        TransactionV1Envelope, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee, Uint256, VecM,
     };
 
     fn make_tx_envelope(seed: u8, fee: u32) -> TransactionEnvelope {
@@ -1478,5 +1453,300 @@ mod tests {
         let result = validate_generalized_tx_set_xdr_structure(&gen);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("negative base fee"));
+    }
+
+    // =========================================================================
+    // Soroban test helpers
+    // =========================================================================
+
+    fn invoke_host_fn_op() -> Operation {
+        Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: VecM::default(),
+                }),
+                auth: VecM::default(),
+            }),
+        }
+    }
+
+    fn soroban_tx_data() -> SorobanTransactionData {
+        SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: vec![LedgerKey::ContractData(LedgerKeyContractData {
+                        contract: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                        key: ScVal::Bool(true),
+                        durability: ContractDataDurability::Persistent,
+                    })]
+                    .try_into()
+                    .unwrap(),
+                },
+                instructions: 5000,
+                disk_read_bytes: 1024,
+                write_bytes: 512,
+            },
+            resource_fee: 50,
+        }
+    }
+
+    /// Build a valid Soroban V1 envelope (InvokeHostFunction + SorobanTransactionData).
+    fn make_soroban_envelope(seed: u8, fee: u32) -> TransactionEnvelope {
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([seed; 32])),
+                fee,
+                seq_num: SequenceNumber(seed as i64),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![invoke_host_fn_op()].try_into().unwrap(),
+                ext: TransactionExt::V1(soroban_tx_data()),
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    // =========================================================================
+    // validate_tx_fee — Soroban edge cases
+    // =========================================================================
+
+    #[test]
+    fn test_validate_tx_fee_rejects_soroban_in_txv0() {
+        let env = TransactionEnvelope::TxV0(TransactionV0Envelope {
+            tx: TransactionV0 {
+                source_account_ed25519: Uint256([1u8; 32]),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                time_bounds: None,
+                memo: Memo::None,
+                operations: vec![invoke_host_fn_op()].try_into().unwrap(),
+                ext: stellar_xdr::curr::TransactionV0Ext::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        });
+        let result = validate_tx_fee(&env);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("TxV0"),
+            "should reject Soroban ops in a TxV0 envelope"
+        );
+    }
+
+    #[test]
+    fn test_validate_tx_fee_rejects_soroban_v1_missing_soroban_data() {
+        // Soroban operation in V1 envelope but with TransactionExt::V0 (no SorobanTransactionData)
+        let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([1u8; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![invoke_host_fn_op()].try_into().unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        });
+        let result = validate_tx_fee(&env);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("missing SorobanTransactionData"),
+            "should reject Soroban tx without SorobanTransactionData"
+        );
+    }
+
+    #[test]
+    fn test_validate_tx_fee_rejects_soroban_fee_bump_missing_soroban_data() {
+        // Fee-bump wrapping a Soroban V1 tx that lacks TransactionExt::V1
+        let inner = TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([1u8; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![invoke_host_fn_op()].try_into().unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        };
+        let env = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+                fee: 200,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        });
+        let result = validate_tx_fee(&env);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("missing SorobanTransactionData"),
+            "should reject fee-bump Soroban without SorobanTransactionData"
+        );
+    }
+
+    #[test]
+    fn test_validate_tx_fee_accepts_valid_soroban() {
+        let env = make_soroban_envelope(1, 100);
+        assert!(validate_tx_fee(&env).is_ok());
+    }
+
+    #[test]
+    fn test_validate_tx_fee_accepts_classic() {
+        let env = make_tx_envelope(1, 100);
+        assert!(validate_tx_fee(&env).is_ok());
+    }
+
+    #[test]
+    fn test_validate_tx_fee_rejects_negative_resource_fee() {
+        let mut data = soroban_tx_data();
+        data.resource_fee = -1;
+        let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([1u8; 32])),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![invoke_host_fn_op()].try_into().unwrap(),
+                ext: TransactionExt::V1(data),
+            },
+            signatures: vec![].try_into().unwrap(),
+        });
+        let result = validate_tx_fee(&env);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("out of valid range"),
+            "should reject negative resource fee"
+        );
+    }
+
+    // =========================================================================
+    // validate_wire_txs — phase mismatch
+    // =========================================================================
+
+    #[test]
+    fn test_validate_wire_txs_rejects_classic_in_soroban_phase() {
+        let mut txs = vec![make_tx_envelope(1, 100)];
+        sort_txs_by_hash(&mut txs);
+        let result = validate_wire_txs(&txs, true);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Classic transaction found in Soroban phase"),
+            "classic tx in soroban phase should be rejected"
+        );
+    }
+
+    #[test]
+    fn test_validate_wire_txs_rejects_soroban_in_classic_phase() {
+        let mut txs = vec![make_soroban_envelope(1, 100)];
+        sort_txs_by_hash(&mut txs);
+        let result = validate_wire_txs(&txs, false);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .contains("Soroban transaction found in classic phase"),
+            "soroban tx in classic phase should be rejected"
+        );
+    }
+
+    // =========================================================================
+    // prepare_for_apply — public-path phase mismatch
+    // =========================================================================
+
+    #[test]
+    fn test_prepare_for_apply_rejects_classic_tx_in_soroban_phase() {
+        // Build a generalized tx set with a classic tx in phase 1 (soroban)
+        let mut classic_tx = vec![make_tx_envelope(1, 100)];
+        sort_txs_by_hash(&mut classic_tx);
+        let mut soroban_tx = vec![make_soroban_envelope(2, 200)];
+        sort_txs_by_hash(&mut soroban_tx);
+
+        let gen = make_gen_tx_set(vec![
+            // Phase 0 (classic): valid soroban-free tx
+            TransactionPhase::V0(
+                vec![make_classic_component(soroban_tx, None)]
+                    .try_into()
+                    .unwrap(),
+            ),
+            // Phase 1 (soroban): classic tx — WRONG
+            TransactionPhase::V0(
+                vec![make_classic_component(classic_tx, None)]
+                    .try_into()
+                    .unwrap(),
+            ),
+        ]);
+
+        let tx_set = TransactionSet {
+            hash: Hash256::ZERO,
+            body: TxSetBody::Generalized(gen),
+        };
+        let result = tx_set.prepare_for_apply(NetworkId::testnet());
+        assert!(result.is_err());
+        // Either "Classic transaction found in Soroban phase" or
+        // "Soroban transaction found in classic phase" depending on which
+        // phase is checked first — both are phase mismatch rejections.
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("found in") && (err.contains("phase") || err.contains("Phase")),
+            "should reject phase mismatch via prepare_for_apply, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_prepare_for_apply_rejects_soroban_tx_in_classic_phase() {
+        // Build a generalized tx set with a soroban tx in phase 0 (classic)
+        let mut classic_tx = vec![make_tx_envelope(1, 100)];
+        sort_txs_by_hash(&mut classic_tx);
+        let mut soroban_tx = vec![make_soroban_envelope(2, 200)];
+        sort_txs_by_hash(&mut soroban_tx);
+
+        let gen = make_gen_tx_set(vec![
+            // Phase 0 (classic): soroban tx — WRONG
+            TransactionPhase::V0(
+                vec![make_classic_component(soroban_tx, None)]
+                    .try_into()
+                    .unwrap(),
+            ),
+            // Phase 1 (soroban): classic tx
+            TransactionPhase::V0(
+                vec![make_classic_component(classic_tx, None)]
+                    .try_into()
+                    .unwrap(),
+            ),
+        ]);
+
+        let tx_set = TransactionSet {
+            hash: Hash256::ZERO,
+            body: TxSetBody::Generalized(gen),
+        };
+        let result = tx_set.prepare_for_apply(NetworkId::testnet());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Soroban transaction found in classic phase"),
+            "should reject soroban in classic phase, got: {}",
+            err
+        );
     }
 }
