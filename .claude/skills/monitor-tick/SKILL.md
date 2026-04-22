@@ -274,21 +274,24 @@ Locale-independent, catches PID reuse.
 - Snapshot malformed, missing fields, or `version` ≠ `1` → discard
 - Any current counter < previous value → discard (counter reset)
 
-**Metric extraction** — use anchored patterns:
+**Metric extraction** — illustrative pseudocode (not literal shell; each bail
+point must stop ratio-check processing for this tick):
 
 ```bash
 metrics_body=$(curl -s http://localhost:$MONITOR_ADMIN_PORT/metrics)
 
-# Bail on fetch failure
+# Bail on fetch failure — stop ratio checks for this tick
 if [ -z "$metrics_body" ]; then
   > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
   # report: metrics_ratio: skipped (fetch failed)
+  # STOP — do not proceed to extraction or ratio evaluation
 fi
 
-# Bail if recorder not installed
+# Bail if recorder not installed — stop ratio checks
 if echo "$metrics_body" | grep -q 'metrics recorder not installed'; then
   > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
   # report: metrics_ratio: skipped (recorder not installed)
+  # STOP
 fi
 
 ledger_age=$(echo "$metrics_body" | grep -E '^stellar_ledger_age_current_seconds ' | awk '{printf "%d", $2}')
@@ -297,21 +300,23 @@ apply_failure=$(echo "$metrics_body" | grep -E '^stellar_ledger_apply_failure_to
 pv_accepted=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="accepted"\} ' | awk '{printf "%d", $2}')
 pv_processed=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="processed_directly"\} ' | awk '{printf "%d", $2}')
 
-# Validate exact 13-label set
+# Validate exact 13-label set — STOP if mismatch
 pv_labels=$(echo "$metrics_body" | grep -oP '^henyey_scp_post_verify_total\{reason="\K[^"]+' | sort)
 expected_labels=$(printf '%s\n' accepted buffer_full buffered drift_cannot_receive drift_close_time drift_range duplicate invalid_sig non_quorum panic processed_directly self_message too_far | sort)
 if [ "$pv_labels" != "$expected_labels" ]; then
   > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
   # report: metrics_ratio: skipped (label set mismatch)
+  # STOP
 fi
 
 pv_total_sum=$(echo "$metrics_body" | grep -E '^henyey_scp_post_verify_total\{reason="[^"]+"\} ' | awk '{sum+=$2} END {printf "%d", sum}')
 
-# Validate all 6 values present and numeric
+# Validate all 6 values present and numeric — STOP if any invalid
 for v in "$ledger_age" "$apply_success" "$apply_failure" "$pv_accepted" "$pv_processed" "$pv_total_sum"; do
   if [ -z "$v" ] || ! echo "$v" | grep -qE '^[0-9]+$'; then
     > /home/tomer/data/$MONITOR_SESSION_ID/metrics/ratio_snapshot
     # report: metrics_ratio: skipped (missing counters)
+    # STOP
   fi
 done
 ```
@@ -348,17 +353,23 @@ minimum, that check skips (streak resets to 0) and the other proceeds normally.
 
 **Status report:** Each check independently reports one of: `ok (value)`,
 `skipped (reason)`, `WARNING value (N ticks)`, or `collecting baseline`.
-Compose the `metrics_ratio:` line by joining both check statuses:
 
-```
-  metrics_ratio: scp <scp_status>, apply <apply_status>
-```
+**Rendering precedence** (determines the `metrics_ratio:` line format):
+
+1. **Global skip** (both checks skipped for the same reason — e.g., not in sync,
+   fetch failed, recorder not installed, missing counters, label mismatch):
+   Use the collapsed form: `metrics_ratio: skipped (<reason>)`
+2. **Collecting baseline** (no previous snapshot exists — first steady-state tick):
+   `metrics_ratio: collecting baseline`
+3. **Per-check reporting** (at least one check ran — whether ok, warning, or
+   individually skipped for low volume):
+   Compose: `metrics_ratio: scp <scp_status>, apply <apply_status>`
 
 Examples:
 - Both healthy: `metrics_ratio: scp ok (accept=15%), apply ok (fail=8%)`
 - One warning: `metrics_ratio: scp ok (accept=12%), apply WARNING fail=55%>50% (3 ticks) — investigating`
-- One skipped: `metrics_ratio: scp skipped (low volume), apply ok (fail=5%)`
-- Both skipped: `metrics_ratio: skipped (not in sync)`
+- One skipped (low volume): `metrics_ratio: scp skipped (low volume), apply ok (fail=5%)`
+- Global skip: `metrics_ratio: skipped (not in sync)`
 - Collecting: `metrics_ratio: collecting baseline`
 
 ### Firing alerts — cooldown + filing
