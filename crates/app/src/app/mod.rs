@@ -1544,9 +1544,10 @@ impl App {
         let next_ledger = current_ledger + 1;
 
         // Trigger the herder to close the next ledger
-        self.herder
-            .trigger_next_ledger(next_ledger)
+        let herder = std::sync::Arc::clone(&self.herder);
+        tokio::task::spawn_blocking(move || herder.trigger_next_ledger(next_ledger))
             .await
+            .expect("trigger_next_ledger panicked")
             .map_err(|e| anyhow::anyhow!("Failed to trigger next ledger: {}", e))?;
 
         Ok(next_ledger)
@@ -2326,6 +2327,7 @@ impl App {
         let fetch_depth_max = Arc::clone(&self.fetch_channel_depth_max);
         let pid = std::process::id();
         let verifier = self.herder.scp_verifier_handle();
+        let abort_threshold_secs = self.config.diagnostics.watchdog_abort_secs;
 
         std::thread::Builder::new()
             .name("watchdog".into())
@@ -2358,6 +2360,7 @@ impl App {
                         fetch_channel_depth,
                         fetch_channel_depth_max,
                         pid,
+                        abort_threshold_secs,
                     };
 
                     match snap.tier() {
@@ -2433,6 +2436,24 @@ impl App {
                             //            the tool to be installed)
                             let hint = format_watchdog_diagnostic_hint(pid);
                             tracing::error!(pid, "{}", hint);
+
+                            // Auto-abort: when the event loop has been frozen
+                            // longer than the configured threshold, terminate
+                            // the process. abort() generates SIGABRT → core
+                            // dump (if ulimit -c allows), providing the exact
+                            // multi-thread stack trace for post-mortem.
+                            if snap.should_abort() {
+                                tracing::error!(
+                                    stale_secs = snap.stale_secs,
+                                    phase = snap.phase,
+                                    phase_sub = snap.phase_sub,
+                                    abort_threshold_secs = snap.abort_threshold_secs,
+                                    "WATCHDOG: Auto-aborting after {}s freeze at phase={}",
+                                    snap.stale_secs,
+                                    snap.phase,
+                                );
+                                std::process::abort();
+                            }
                         }
                         WatchdogTier::Warn => snap.emit_warn(),
                         WatchdogTier::None => {}
@@ -2546,6 +2567,8 @@ pub(crate) struct WatchdogSnapshot {
     pub fetch_channel_depth: i64,
     pub fetch_channel_depth_max: i64,
     pub pid: u32,
+    /// Auto-abort threshold in seconds. 0 = disabled.
+    pub abort_threshold_secs: u64,
 }
 
 impl WatchdogSnapshot {
@@ -2558,6 +2581,14 @@ impl WatchdogSnapshot {
         } else {
             WatchdogTier::None
         }
+    }
+
+    /// Whether the watchdog should abort the process.
+    ///
+    /// Returns `true` when auto-abort is enabled (`abort_threshold_secs > 0`)
+    /// and the event loop has been frozen for at least that many seconds.
+    pub(crate) fn should_abort(&self) -> bool {
+        self.abort_threshold_secs > 0 && self.stale_secs >= self.abort_threshold_secs
     }
 
     /// Emit the ≥15s warning-tier WATCHDOG event.
@@ -5029,6 +5060,7 @@ mod tests {
             fetch_channel_depth: 42,
             fetch_channel_depth_max: 100,
             pid: 99999,
+            abort_threshold_secs: 0,
         }
     }
 
@@ -5042,6 +5074,37 @@ mod tests {
         assert_eq!(test_snapshot(29).tier(), WatchdogTier::Warn);
         assert_eq!(test_snapshot(30).tier(), WatchdogTier::Error);
         assert_eq!(test_snapshot(999).tier(), WatchdogTier::Error);
+    }
+
+    /// Test A2: `WatchdogSnapshot::should_abort()` boundary routing.
+    #[test]
+    fn watchdog_should_abort_routing() {
+        // Disabled (threshold = 0): never abort regardless of stale_secs.
+        let mut snap = test_snapshot(999);
+        snap.abort_threshold_secs = 0;
+        assert!(!snap.should_abort());
+
+        // Enabled but not yet stale enough.
+        snap.abort_threshold_secs = 120;
+        snap.stale_secs = 119;
+        assert!(!snap.should_abort());
+
+        // Exactly at threshold: abort.
+        snap.stale_secs = 120;
+        assert!(snap.should_abort());
+
+        // Well past threshold: abort.
+        snap.stale_secs = 999;
+        assert!(snap.should_abort());
+
+        // Edge: threshold = 1, stale = 1: abort.
+        snap.abort_threshold_secs = 1;
+        snap.stale_secs = 1;
+        assert!(snap.should_abort());
+
+        // Edge: threshold = 1, stale = 0: no abort.
+        snap.stale_secs = 0;
+        assert!(!snap.should_abort());
     }
 
     /// Test B: `emit_warn()` emits a WARN event with the correct fields

@@ -1706,7 +1706,11 @@ impl Herder {
     /// Trigger consensus for the next ledger (for validators).
     ///
     /// This is called periodically by the consensus timer.
-    pub async fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<()> {
+    /// Trigger SCP nomination for the next ledger.
+    ///
+    /// This is entirely synchronous (parking_lot locks + CPU). It was
+    /// previously declared `async` but had no `.await` points.
+    pub fn trigger_next_ledger(&self, ledger_seq: u32) -> Result<()> {
         if !self.is_validator() {
             return Err(HerderError::NotValidating);
         }
@@ -1737,9 +1741,11 @@ impl Herder {
         // Record when we first started processing this slot (for timing metrics).
         self.scp_driver.record_slot_activity(slot);
 
+        let t0 = std::time::Instant::now();
         let value = self
             .build_nomination_value()
             .ok_or_else(|| HerderError::Internal("Failed to build nomination value".into()))?;
+        let build_value_ms = t0.elapsed().as_millis();
 
         // Cache the nomination value for this slot so timeout retries reuse it,
         // matching stellar-core's by-value lambda capture.
@@ -1749,12 +1755,30 @@ impl Herder {
         let prev_value = self.prev_value.read().clone();
 
         // Start SCP nomination
+        let t1 = std::time::Instant::now();
         if self.scp.nominate(slot, value, &prev_value) {
             info!(slot, "Started SCP nomination for ledger");
         } else {
             debug!(
                 slot,
                 "Nomination already in progress or slot already externalized"
+            );
+        }
+        let nominate_ms = t1.elapsed().as_millis();
+
+        if build_value_ms > 50 || nominate_ms > 50 {
+            tracing::warn!(
+                slot,
+                build_value_ms,
+                nominate_ms,
+                "trigger_next_ledger: slow consensus trigger"
+            );
+        } else {
+            tracing::debug!(
+                slot,
+                build_value_ms,
+                nominate_ms,
+                "trigger_next_ledger timing"
             );
         }
 
@@ -3579,7 +3603,7 @@ mod tests {
 
         // Trigger consensus for ledger 2 (no LedgerManager, so header defaults
         // to version=0, base_reserve=0 — upgrades should fire)
-        let result = herder.trigger_next_ledger(2).await;
+        let result = herder.trigger_next_ledger(2);
         assert!(
             result.is_ok(),
             "trigger_next_ledger should succeed: {:?}",
@@ -3672,7 +3696,7 @@ mod tests {
 
         herder.bootstrap(1);
 
-        let result = herder.trigger_next_ledger(2).await;
+        let result = herder.trigger_next_ledger(2);
         assert!(
             result.is_ok(),
             "trigger_next_ledger failed: {:?}",
@@ -3765,7 +3789,7 @@ mod tests {
         herder.bootstrap(1);
 
         // First trigger: starts nomination, round should be 1.
-        let result1 = herder.trigger_next_ledger(2).await;
+        let result1 = herder.trigger_next_ledger(2);
         assert!(result1.is_ok(), "first trigger should succeed");
 
         let state1 = herder.scp().get_slot_state(2).expect("slot 2 should exist");
@@ -3776,7 +3800,7 @@ mod tests {
         );
 
         // Second trigger: should be skipped by the is_nominating guard.
-        let result2 = herder.trigger_next_ledger(2).await;
+        let result2 = herder.trigger_next_ledger(2);
         assert!(result2.is_ok(), "second trigger should succeed (no-op)");
 
         let state2 = herder
@@ -3789,7 +3813,7 @@ mod tests {
         );
 
         // Third trigger for good measure.
-        let result3 = herder.trigger_next_ledger(2).await;
+        let result3 = herder.trigger_next_ledger(2);
         assert!(result3.is_ok());
         let state3 = herder.scp().get_slot_state(2).expect("slot 2 exists");
         assert_eq!(
@@ -5238,7 +5262,7 @@ mod advance_tracking_slot_tests {
         let before = lm.test_snapshot_count();
 
         // Trigger nomination (builds nomination value internally).
-        let _ = herder.trigger_next_ledger(11).await;
+        let _ = herder.trigger_next_ledger(11);
 
         // Measure snapshot count after.
         let after = lm.test_snapshot_count();

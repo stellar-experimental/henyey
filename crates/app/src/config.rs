@@ -480,6 +480,16 @@ pub struct DiagnosticsConfig {
     /// Maps to stellar-core's `ENABLE_DIAGNOSTICS_FOR_TX_SUBMISSION`.
     #[serde(default)]
     pub tx_submission_diagnostics: bool,
+
+    /// When the event loop has been frozen for at least this many seconds,
+    /// the watchdog thread calls `std::process::abort()` to terminate the
+    /// process and (if `ulimit -c` allows) generate a core dump.
+    ///
+    /// Set to `0` (default) to disable auto-abort. Recommended value: `120`.
+    /// Requires a process supervisor (systemd, monitor-loop) to restart
+    /// the node after the abort.
+    #[serde(default)]
+    pub watchdog_abort_secs: u64,
 }
 
 /// Testing overrides for accelerated or customized behavior.

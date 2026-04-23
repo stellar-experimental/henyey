@@ -155,7 +155,16 @@ impl App {
             // For now, trigger the herder
             self.consensus_trigger_attempts
                 .fetch_add(1, Ordering::Relaxed);
-            if let Err(e) = self.herder.trigger_next_ledger(next_slot).await {
+
+            // trigger_next_ledger is entirely synchronous (parking_lot locks +
+            // CPU-heavy SCP nomination). Run it on the blocking pool so the
+            // tokio worker thread stays free to service other task wake-ups.
+            let herder = std::sync::Arc::clone(&self.herder);
+            let result = tokio::task::spawn_blocking(move || herder.trigger_next_ledger(next_slot))
+                .await
+                .expect("trigger_next_ledger panicked");
+
+            if let Err(e) = result {
                 self.consensus_trigger_failures
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(error = %e, slot = next_slot, "Failed to trigger ledger");
