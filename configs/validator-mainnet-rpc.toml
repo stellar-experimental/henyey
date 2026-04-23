@@ -161,12 +161,13 @@ address = "0.0.0.0"
 port = 11627
 
 [catchup]
-# Recent catchup: replay only the last N ledgers rather than the full gap
-# from lcl to target. Post-wedge recovery can otherwise take 30+ min replaying
-# 7000+ missed ledgers (see #1904). 500 ledgers covers ~40 min of wall-clock
-# mainnet and is sufficient for SCP to re-enter consensus after buffered-catchup
-# bucket-apply.
-recent = 500
+# Minimal catchup: for gaps > MINIMAL_BUCKET_DOWNLOAD_THRESHOLD (10_000 ledgers,
+# ~14h wall-clock) the node downloads a fresh HAS and applies buckets at the
+# last checkpoint before target, then replays only the tail. For small gaps
+# (< 10k) this is equivalent to full replay from lcl+1.
+# Recent(N) was removed because with lcl > genesis it always falls through to
+# full replay regardless of N — see crates/history/src/catchup_range.rs:240.
+recent = 0
 
 [rpc]
 enabled = true
