@@ -15,6 +15,7 @@ set -euo pipefail
 # ── Configuration ────────────────────────────────────────────────────
 MODE_FLAG=""
 INTERVAL_MINUTES=10
+MODEL="gpt-5.4"
 LOG_DIR="$HOME/data/monitor"
 LAUNCHER_LOG="$LOG_DIR/monitor-launcher.log"
 TICK_TIMEOUT=1800  # 30 minutes per tick
@@ -78,7 +79,7 @@ log "Running /monitor-loop (setup + first tick)..."
 log "  Log: $LOOP_LOG"
 
 cd "$REPO_ROOT"
-if ! copilot -p "/monitor-loop $MODE_FLAG" --allow-all 2>&1 | tee "$LOOP_LOG"; then
+if ! copilot -p "/monitor-loop $MODE_FLAG" --model "$MODEL" --allow-all 2>&1 | tee "$LOOP_LOG"; then
     log "ERROR: /monitor-loop failed. See $LOOP_LOG"
     exit 1
 fi
@@ -98,7 +99,7 @@ run_tick() {
     log "Running /monitor-tick..."
 
     cd "$REPO_ROOT"
-    if timeout "$TICK_TIMEOUT" copilot -p "/monitor-tick" --allow-all 2>&1 | tee "$TICK_LOG"; then
+    if timeout "$TICK_TIMEOUT" copilot -p "/monitor-tick" --model "$MODEL" --allow-all 2>&1 | tee "$TICK_LOG"; then
         log "/monitor-tick completed. Log: $TICK_LOG"
     else
         EXIT_CODE=$?
