@@ -228,6 +228,13 @@ Check:
 
 If the API errors out, emit `obsrvr: N/A (api-error)` instead of omitting the field.
 
+If the API returns a response but `latestLedger` or `updatedAt` is missing/null
+(partial response), treat the entire radar result as stale / incomplete and
+emit `obsrvr: N/A (api-incomplete)`. Do NOT evaluate `lag` in this case — a
+`lag` value returned alongside a null `latestLedger`/`updatedAt` is a cached
+aggregate from a prior observation window (observed post-restart: lag=8754
+against a node that is in real-time sync with age=2s).
+
 **(12) Metrics scan** — scrape `/metrics` and evaluate the alert catalog.
 
 1. `mkdir -p /home/tomer/data/$MONITOR_SESSION_ID/metrics`.
