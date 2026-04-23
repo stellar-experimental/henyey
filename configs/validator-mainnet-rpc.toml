@@ -160,6 +160,14 @@ preferred_peers = []
 address = "0.0.0.0"
 port = 11627
 
+[catchup]
+# Recent catchup: replay only the last N ledgers rather than the full gap
+# from lcl to target. Post-wedge recovery can otherwise take 30+ min replaying
+# 7000+ missed ledgers (see #1904). 500 ledgers covers ~40 min of wall-clock
+# mainnet and is sufficient for SCP to re-enter consensus after buffered-catchup
+# bucket-apply.
+recent = 500
+
 [rpc]
 enabled = true
 port = 8000
