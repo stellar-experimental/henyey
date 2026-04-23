@@ -652,6 +652,7 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating>, pending <ok (too_old=Z%) | skipped (reason) | WARNING too_old=Z%>50% (N ticks)> | collecting baseline
   deploy:  <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
   ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
+  self_reflect: <clean | fixed inline (<sha>: <short-desc>) | filed #<N> (ready: <short-desc>) | filed #<N> (not-ready: <short-desc>)>
 ```
 
 Use WARNING for threshold breaches. Use ACTION when a corrective action was
@@ -660,3 +661,132 @@ Use SYNC FAILURE (not WARNING) when the node has exceeded the active sync
 deadline (15m populated / 4h fresh-start) but is not closing ledgers in
 real-time — this is a bug that requires immediate investigation AND
 filing/commenting on a `ready`-labeled issue.
+
+## Self-reflection
+
+After the status report is emitted, look back at THIS tick's output and
+check for problems **in the monitor itself** — not in the node. The node
+is covered by the `## Investigation` policy above. This section is about
+bugs / miscalibrations in the tick logic, thresholds, catalog, or
+detection code that fired false positives, failed silently, or rendered
+contradictory output.
+
+### What to look for
+
+1. **False-positive alert**: a check fired, but investigation showed the
+   underlying state is expected-correct. Root cause is the catalog
+   threshold / rule, not the node. (Examples from this session:
+   `scp_verifier_thread_state !=1` was inverted; `quorum_agree <4` fires
+   between externalizations by design.)
+2. **Silent failure**: a check returned empty / zero due to a tool bug.
+   (Examples: zsh glob `NO_NOMATCH` killed a pipeline; a histogram
+   metric name had a typo and silently resolved to `count_delta=0`
+   which skipped evaluation.)
+3. **Self-contradictory output**: `sync: synced` alongside
+   `metrics: peer_count<8 WARN`, or similar internal inconsistency that
+   suggests a missing warmup exemption or cross-check rule.
+4. **Missing carveout**: a gauge / counter fires during a legitimate
+   transient (startup, restart-warmup, crash-recovery replay) but has
+   no exemption in the catalog.
+
+If none of the above: report `self_reflect: clean` and stop.
+
+### Three tiers of action
+
+When an issue is found, choose a tier and act on it in the same tick.
+
+**Tier 1 — Fix inline (trivial edit).**
+
+Criteria (ALL must hold):
+- Change is contained to `.claude/skills/monitor-tick/SKILL.md`
+  (no other files touched)
+- Diff < 50 lines
+- No new runtime dependency (no new file path, env var, or metric name
+  that the skill depends on)
+- The edit is a clear text change with an obvious correct value:
+  typo fix, threshold adjustment to match an observed live baseline,
+  shell-portability fix, adding a metric to an existing exemption
+  list, rendering-template tweak
+- The need is demonstrated by THIS tick's observation — not speculative
+
+Action sequence (same pattern used for every skill edit in this repo):
+
+```bash
+# 1. Edit .claude/skills/monitor-tick/SKILL.md
+# 2. git add .claude/skills/monitor-tick/SKILL.md
+# 3. git commit -m "Monitor-tick: <what + why>" with Co-authored-by: Claude Code trailer
+# 4. git push origin main (on reject: git pull --rebase && git push)
+```
+
+Report: `self_reflect: fixed inline (<short-sha>: <short-desc>)`.
+
+**Tier 2 — File `ready` GH issue (non-trivial but codeable).**
+
+The issue is real and actionable but any of:
+- Touches multiple files or crates
+- Requires a design choice (which metric? which threshold value?
+  which algorithm?)
+- Needs verification beyond the tick (new test cases, reproducing
+  with a build)
+- Affects runtime contracts (env schema, file format, section
+  ordering that another skill depends on)
+
+Before filing, search for an existing open issue:
+`gh issue list --search "monitor-tick: <keywords>" --state open`.
+Comment with new evidence if a match exists; otherwise file.
+
+Issue body MUST include:
+- **Symptom**: one-line description of the false positive / silent
+  failure / contradiction
+- **Evidence**: exact tick output and command results that demonstrated
+  the issue
+- **Suspected root cause**: which rule / threshold / code path
+- **Concrete fix sketch**: file:line references and proposed diff
+  direction
+- **Related to #<prior>** if it's a recurrence of something already
+  filed
+
+Label: `ready`. Title format:
+- `Non-critical: monitor-tick: <description>` — for observability /
+  calibration issues (noise reduction, threshold tuning)
+- `monitor-tick: <description>` — for correctness bugs (silent
+  failures, contradictory output)
+
+Report: `self_reflect: filed #<N> (ready: <short-desc>)`.
+
+**Tier 3 — File `not-ready` GH issue (human input required).**
+
+Use this tier when any of:
+- The fix has product/ops policy implications (e.g., "should we
+  monitor a new metric class?", "should we change the restart
+  philosophy?", "should we broaden the auto-deploy trigger?")
+- Ambiguous scope — fix A, B, or C would all work and the right
+  choice depends on operator intent
+- Touches the node code, another skill, or config defaults — the
+  downstream fixer should not auto-pick this up without explicit
+  operator direction
+
+Issue body includes everything from Tier 2 plus an explicit
+**"Human input required"** section listing the specific
+decisions / options that need an operator answer.
+
+Label: `not-ready`. Title format:
+`monitor-tick: [needs-decision] <description>`.
+
+Report: `self_reflect: filed #<N> (not-ready: <short-desc>)`.
+
+### Boundaries
+
+- **Scope is single-tick.** Do not retrospectively review prior ticks
+  for drift. Cross-tick pattern detection is a separate concern.
+- **Never suppresses a real node-side filing.** If a check flagged a
+  SYNC FAILURE on the node and self-reflection concludes the detection
+  was over-eager, the SYNC FAILURE filing still goes out this tick
+  (real-or-not is downstream's call). File a separate Tier 2 issue to
+  tune the detection.
+- **Never re-opens or argues with already-filed issues** from this
+  or prior ticks. Those stand as-is.
+- **Trivial-fix bias**: when in doubt between Tier 1 and Tier 2,
+  prefer Tier 2 (filing) over an aggressive inline edit. Inline edits
+  affect every subsequent tick immediately; better to write up the
+  rationale and let the operator review.
