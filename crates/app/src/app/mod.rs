@@ -2682,6 +2682,7 @@ mod tests {
             ),
             close_time: seq as u64,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         }
     }
 
@@ -3343,6 +3344,7 @@ mod tests {
             ),
             close_time: 1,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         };
 
         let mut pending = pending;
@@ -3385,6 +3387,7 @@ mod tests {
             ),
             close_time: 1,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         };
 
         let mut pending = pending;
@@ -3443,6 +3446,7 @@ mod tests {
             ),
             close_time: 1,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         };
 
         let mut pending = pending;
@@ -3489,6 +3493,7 @@ mod tests {
             ),
             close_time: 1,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         };
 
         let mut pipeline = super::close_pipeline::ClosePipeline::new();
@@ -3553,6 +3558,7 @@ mod tests {
             ),
             close_time: 1,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         };
 
         pipeline.closing = Some(pending);
@@ -5391,6 +5397,7 @@ mod tests {
             ),
             close_time: 1,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         };
 
         let mut pending = pending;
@@ -5600,6 +5607,7 @@ mod tests {
             ),
             close_time: 1,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         };
 
         let mut pending = pending;
@@ -5780,6 +5788,7 @@ mod tests {
                 ),
                 close_time: 1,
                 upgrades: Vec::new(),
+                dispatch_time: std::time::Instant::now(),
             };
             let mut pending = pending;
             let join_result = (&mut pending.handle).await;

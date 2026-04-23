@@ -475,6 +475,9 @@ pub(super) struct PendingLedgerClose {
     /// Upgrades included in the externalized StellarValue (used for clearing
     /// runtime upgrade parameters after application).
     pub upgrades: Vec<UpgradeType>,
+    /// Instant when `spawn_blocking` was dispatched, for dispatch-to-join
+    /// latency measurement (#1909).
+    pub dispatch_time: std::time::Instant,
 }
 
 /// State for a deferred ledger persist running on a background task.

@@ -225,6 +225,12 @@ pub const CLOSE_TX_QUEUE_INVALIDATION_SECONDS: &str = "henyey_close_tx_queue_inv
 pub const PERSIST_LEDGER_CLOSE_SECONDS: &str = "henyey_persist_ledger_close_seconds";
 pub const CLOSE_CYCLE_SECONDS: &str = "henyey_close_cycle_seconds";
 
+// Close-cycle decomposition metrics (#1909).
+// close_cycle ≈ handle_complete + post_complete + inter_close_wait + dispatch_to_join
+pub const CLOSE_HANDLE_COMPLETE_SECONDS: &str = "henyey_close_handle_complete_seconds";
+pub const CLOSE_POST_COMPLETE_SECONDS: &str = "henyey_close_post_complete_seconds";
+pub const CLOSE_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_close_dispatch_to_join_seconds";
+
 // Phase 5 — Slot-to-close latency histogram.
 pub const SLOT_TO_CLOSE_LATENCY_SECONDS: &str = "henyey_slot_to_close_latency_seconds";
 
@@ -822,6 +828,20 @@ pub fn describe_metrics() {
     describe_histogram!(
         CLOSE_CYCLE_SECONDS,
         "Wall-clock between consecutive deferred-pipeline close-complete events (seconds)"
+    );
+
+    // Close-cycle decomposition (#1909).
+    describe_histogram!(
+        CLOSE_HANDLE_COMPLETE_SECONDS,
+        "Wall-clock of handle_close_complete including finalizer dispatch (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_POST_COMPLETE_SECONDS,
+        "Wall-clock of post-close lifecycle work after handle_close_complete (seconds)"
+    );
+    describe_histogram!(
+        CLOSE_DISPATCH_TO_JOIN_SECONDS,
+        "Wall-clock from spawn_blocking dispatch to event-loop join observation (seconds)"
     );
 
     // Phase 5: Slot-to-close latency.

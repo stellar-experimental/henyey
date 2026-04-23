@@ -262,6 +262,9 @@ impl App {
                     }
                     tracing::debug!(select_iteration, "BRANCH: pending_close completed");
                     let pending = close_pipeline.take_close();
+                    // Close-cycle decomposition (#1909): dispatch-to-join latency.
+                    metrics::histogram!(crate::metrics::CLOSE_DISPATCH_TO_JOIN_SECONDS)
+                        .record(pending.dispatch_time.elapsed().as_secs_f64());
                     let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
                     let success = self
                         .handle_close_complete(
@@ -272,6 +275,9 @@ impl App {
                         .await;
                     // Chain persist and next close if successful.
                     if success {
+                        // Close-cycle decomposition (#1909): post-close lifecycle work.
+                        let post_complete_start = std::time::Instant::now();
+
                         // Track the deferred persist task. Deferred always
                         // sends on success (see handle_close_complete
                         // dispatch at ledger_close.rs); the `try_recv` is
@@ -340,6 +346,10 @@ impl App {
                                 pending_catchup = Some(pc);
                             }
                         }
+
+                        // Close-cycle decomposition (#1909): record post-complete duration.
+                        metrics::histogram!(crate::metrics::CLOSE_POST_COMPLETE_SECONDS)
+                            .record(post_complete_start.elapsed().as_secs_f64());
 
                         // Don't start the next close here — wait for
                         // persist to complete first. This ensures the DB

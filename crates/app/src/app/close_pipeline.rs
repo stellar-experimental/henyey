@@ -154,6 +154,7 @@ mod tests {
             tx_set: henyey_herder::TransactionSet::new_legacy(Hash256::default(), Vec::new()),
             close_time: 0,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         }
     }
 

@@ -68,6 +68,7 @@ impl HerderCallback for App {
             tx_set,
             close_time,
             upgrades: Vec::new(),
+            dispatch_time: std::time::Instant::now(),
         };
 
         let join_result = (&mut pending.handle).await;

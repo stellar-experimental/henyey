@@ -1669,6 +1669,7 @@ impl App {
         let runtime_handle = tokio::runtime::Handle::current();
         self.set_applying_ledger(true);
 
+        let dispatch_time = std::time::Instant::now();
         let join_handle = tokio::task::spawn_blocking(move || {
             lm.close_ledger(close_data, Some(runtime_handle))
                 .map_err(|e| e.to_string())
@@ -1680,6 +1681,7 @@ impl App {
             tx_set,
             close_time,
             upgrades: close_info.upgrades.clone(),
+            dispatch_time,
         })
     }
 
@@ -1714,11 +1716,11 @@ impl App {
         let result = self
             .handle_close_complete_inner(pending, join_result, finalize)
             .await;
-        super::warn_if_slow(
-            close_complete_start.elapsed(),
-            "handle_close_complete",
-            ledger_seq as u64,
-        );
+        let elapsed = close_complete_start.elapsed();
+        super::warn_if_slow(elapsed, "handle_close_complete", ledger_seq as u64);
+        // Close-cycle decomposition (#1909): envelope metric for handle_close_complete.
+        metrics::histogram!(crate::metrics::CLOSE_HANDLE_COMPLETE_SECONDS)
+            .record(elapsed.as_secs_f64());
         result
     }
 
