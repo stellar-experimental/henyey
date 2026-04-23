@@ -50,16 +50,27 @@ If the node's previous run ended with a crash or wedge (SIGKILL), restart
 begins from a stale lcl that can be hours behind mainnet tip; replay will
 legitimately exceed the 15m clean-restart deadline.
 
-Detect crash-recovery once at the top of the tick. The rule: this process
-is in crash-recovery mode if the most recent log rotation in the session's
-`logs/` dir is a `.crashed-*`, `.stuck-*`, or `.frozen-*` (not a planned
-`.preredeploy-*`), AND the current process uptime is under 2 hours (after
-which recovery is considered complete regardless).
+Detect crash-recovery once at the top of the tick. The rule fires on
+**either** of these signals (both gated by `uptime < 2h`, after which
+recovery is considered complete regardless):
 
-Uses `find` (not shell globs) to avoid zsh `NO_NOMATCH` failing the pipeline,
-and anchors to "most recent rotation type" rather than a narrow timing
-window (the old 60s window missed the rebuild-then-restart workflow where
-minutes elapse between log rotation and process start):
+1. **Rotation signal**: the most recent log rotation in the session's
+   `logs/` dir is a `.crashed-*`, `.stuck-*`, or `.frozen-*` (not a
+   planned `.preredeploy-*`). Uses `find` (not shell globs) to avoid
+   zsh `NO_NOMATCH` failing the pipeline. Anchors to "most recent
+   rotation type" rather than a narrow timing window — the old 60s
+   window missed the rebuild-then-restart workflow where minutes
+   elapse between log rotation and process start.
+
+2. **Active-catchup signal** (fires even when the rotation was
+   `.preredeploy-*`): the node is in `Catching Up` state AND uptime
+   exceeds 5 minutes. Normal clean-restart catchup (a few ledgers
+   missed during a build) finishes within 2-3 minutes. If the node is
+   still catching up past 5 minutes, the persisted lcl is more than a
+   few-minutes stale — which is the condition the extended deadline is
+   meant for. This handles the case where a manual planned restart
+   (which rotates as `preredeploy-*`) happens AFTER a wedge, leaving
+   the lcl hours stale.
 
 ```bash
 CRASH_RECOVERY=no
@@ -68,6 +79,7 @@ if [ -n "$PID" ]; then
   uptime_sec=$(ps -o etimes= -p "$PID" 2>/dev/null | tr -d ' ')
   uptime_sec=${uptime_sec:-0}
   if [ "$uptime_sec" -lt 7200 ]; then
+    # Signal 1: newest rotation type
     logs_dir="/home/tomer/data/$MONITOR_SESSION_ID/logs"
     newest_rotation=$(find "$logs_dir" -maxdepth 1 -type f \
         \( -name 'monitor.log.crashed-*' \
@@ -78,6 +90,15 @@ if [ -n "$PID" ]; then
     case "$newest_rotation" in
       *.crashed-*|*.stuck-*|*.frozen-*) CRASH_RECOVERY=yes ;;
     esac
+
+    # Signal 2: active catchup past the clean-restart window
+    if [ "$CRASH_RECOVERY" = "no" ] && [ "$uptime_sec" -gt 300 ]; then
+      node_state=$(curl -s -m 3 "http://localhost:$MONITOR_ADMIN_PORT/info" 2>/dev/null \
+                   | python3 -c 'import sys,json; print(json.load(sys.stdin).get("state",""))' 2>/dev/null)
+      if [ "$node_state" = "Catching Up" ]; then
+        CRASH_RECOVERY=yes
+      fi
+    fi
   fi
 fi
 ```
