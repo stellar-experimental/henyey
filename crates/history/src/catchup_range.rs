@@ -230,12 +230,14 @@ impl CatchupRange {
         //
         // For Minimal mode with a LARGE gap (> MINIMAL_BUCKET_DOWNLOAD_THRESHOLD), fall
         // through to the checkpoint-based logic. Downloading a fresh checkpoint is faster
-        // than replaying thousands of ledgers (e.g., 22k ledger startup gap).
+        // than replaying thousands of ledgers (e.g., a post-wedge ~4500-ledger recovery).
         //
         // For small gaps, ALWAYS replay from LCL+1. A 4-minute bucket download for a
         // 93-ledger gap would block the event loop and trigger an infinite catchup loop
-        // (the network advances faster than the bucket download completes).
-        const MINIMAL_BUCKET_DOWNLOAD_THRESHOLD: u32 = 10_000;
+        // (the network advances faster than the bucket download completes). The 1_000
+        // threshold (~83m of mainnet wall-clock) is the crossover where bucket-apply
+        // pays for its download overhead.
+        const MINIMAL_BUCKET_DOWNLOAD_THRESHOLD: u32 = 1_000;
         if lcl > GENESIS_LEDGER_SEQ {
             if mode != CatchupMode::Minimal
                 || full_replay_count <= MINIMAL_BUCKET_DOWNLOAD_THRESHOLD
@@ -436,10 +438,10 @@ mod tests {
 
     #[test]
     fn test_minimal_lcl_past_genesis_small_gap_replays() {
-        // Minimal mode with persisted LCL and a SMALL gap (< 10_000) — must replay,
+        // Minimal mode with persisted LCL and a SMALL gap (< threshold) — must replay,
         // not download buckets. A 4-minute bucket download for a 93-ledger gap would
         // block the event loop and cause an infinite catchup loop.
-        // target=127 is a checkpoint ledger, but gap=27 < 10_000 → replay_only.
+        // target=127 is a checkpoint ledger, but gap=27 < threshold → replay_only.
         let range = CatchupRange::calculate(100, 127, CatchupMode::Minimal);
         assert!(!range.apply_buckets());
         assert!(range.replay_ledgers());
@@ -461,7 +463,7 @@ mod tests {
     #[test]
     fn test_minimal_mainnet_scenario() {
         // Startup scenario: persisted at L61529351, target L61551615 (checkpoint).
-        // Gap=22264 > 10_000 → download checkpoint, not replay 22k ledgers.
+        // Gap=22264 > threshold → download checkpoint, not replay 22k ledgers.
         let range = CatchupRange::calculate(61529351, 61551615, CatchupMode::Minimal);
         assert!(range.apply_buckets());
         assert!(!range.replay_ledgers());
