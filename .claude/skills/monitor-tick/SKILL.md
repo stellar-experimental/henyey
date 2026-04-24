@@ -163,6 +163,36 @@ a large gap is expected — report CATCHING UP instead of SYNC FAILURE.
      >> /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log 2>&1 &
    ```
 
+**(3b) Wedge detection** — a process can be alive but have a frozen event
+loop (watchdog fires, HTTP hangs, ledger progression stops). Check 3 alone
+misses this because `pgrep` still finds the PID. Detect and remediate:
+
+1. Is the event loop frozen? `grep 'WATCHDOG: Event loop appears frozen'
+   $LOG | tail -1` — if present AND its timestamp is within the last 120s,
+   the watchdog is currently firing.
+2. Is HTTP hung? `curl -s -m 3 http://localhost:$MONITOR_ADMIN_PORT/info`
+   returns empty body or times out.
+
+If BOTH hold, flag WEDGE and execute the kill+relaunch path, rotating the
+log as `.frozen-<ts>` (NOT `.crashed-<ts>`) so the next tick's crash-
+recovery signal 1 matches:
+
+```bash
+PID=$(pgrep -f 'henyey.*run' | head -1)
+kill "$PID"; for i in $(seq 1 10); do sleep 1; kill -0 "$PID" 2>/dev/null || break; done
+kill -0 "$PID" 2>/dev/null && kill -9 "$PID" && sleep 2
+rm -f /home/tomer/data/mainnet/mainnet.lock
+mv /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log \
+   /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log.frozen-$(date -u +%Y%m%dT%H%M%SZ) 2>/dev/null || true
+RUST_LOG=info nohup /home/tomer/data/$MONITOR_SESSION_ID/cargo-target/release/henyey \
+  --mainnet run $MONITOR_RUN_FLAGS -c $MONITOR_CONFIG \
+  >> /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log 2>&1 &
+```
+
+Wedges are a known recurring symptom (see #1904, #1873, #1921). Always
+file a new `ready` issue referencing the most recent related one —
+recurrence-after-fix → NEW issue, not a comment on a closed one.
+
 **(4) Memory** — `ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1)`, convert to MB.
 
 - If `RSS > 12 GB`, flag HIGH MEMORY (report-only; no restart).
