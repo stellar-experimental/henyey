@@ -920,12 +920,26 @@ impl App {
             return;
         }
 
-        if let Err(err) = self.db.store_scp_quorum_set(
-            &hash,
-            self.ledger_manager.current_ledger_seq(),
-            &quorum_set,
-        ) {
-            tracing::warn!(error = %err, "Failed to store quorum set");
+        // Offload synchronous DB write to the blocking pool so the async
+        // event loop stays responsive (#1924).
+        {
+            let db = self.db.clone();
+            let ledger_seq = self.ledger_manager.current_ledger_seq();
+            let qs = quorum_set.clone();
+            let h = hash;
+            match henyey_common::spawn_blocking_logged("store_scp_quorum_set", move || {
+                db.store_scp_quorum_set(&h, ledger_seq, &qs)
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(db_err)) => {
+                    tracing::warn!(error = %db_err, "Failed to store quorum set");
+                }
+                Err(_) => {
+                    // JoinError already logged by spawn_blocking_logged
+                }
+            }
         }
 
         for node_id in &node_ids {
