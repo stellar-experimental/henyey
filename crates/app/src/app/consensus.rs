@@ -925,6 +925,30 @@ impl App {
             self.herder.store_quorum_set(node_id, quorum_set.clone());
         }
 
+        // Drain envelopes that became ready after quorum-set arrival,
+        // on a blocking-pool thread so the event loop stays responsive.
+        // Mirrors receive_tx_set() pattern (#1904).
+        let herder = Arc::clone(&self.herder);
+        let join_result =
+            tokio::task::spawn_blocking(move || herder.process_ready_fetching_envelopes()).await;
+
+        match join_result {
+            Ok(_processed) => {}
+            Err(e) if e.is_panic() => {
+                tracing::error!(
+                    error = %e,
+                    "process_ready_fetching_envelopes panicked in spawn_blocking \
+                     after quorum-set receipt"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "spawn_blocking join error for quorum-set envelope drain"
+                );
+            }
+        }
+
         self.herder.clear_quorum_set_request(&hash);
     }
 

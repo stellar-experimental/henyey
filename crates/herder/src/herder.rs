@@ -700,6 +700,12 @@ impl Herder {
     }
 
     /// Store a quorum set for a peer node.
+    ///
+    /// This stores the quorum set in the SCP driver and quorum tracker, and
+    /// notifies FetchingEnvelopes so blocked envelopes become ready. It does
+    /// NOT drain the ready queue — callers must call
+    /// `process_ready_fetching_envelopes()` separately (typically via
+    /// `spawn_blocking` to avoid event-loop stalls).
     pub fn store_quorum_set(&self, node_id: &NodeId, quorum_set: ScpQuorumSet) {
         // Compute hash before storing so we can notify fetching_envelopes.
         let qs_hash = henyey_scp::hash_quorum_set(&quorum_set);
@@ -718,11 +724,6 @@ impl Herder {
         // store_quorum_set only updates ScpDriver and the quorum tracker,
         // leaving FetchingEnvelopes unaware (AUDIT-004).
         self.fetching_envelopes.recv_quorum_set(qs_hash, quorum_set);
-
-        // Drain ready queue — envelopes unblocked by this quorum set need
-        // to be fed to SCP. Mirrors receive_tx_set() which also drains
-        // after notifying FetchingEnvelopes (AUDIT-104).
-        self.process_ready_fetching_envelopes();
     }
 
     /// Get a quorum set by hash if available.
@@ -4048,18 +4049,21 @@ mod tests {
 
         // After the fix, store_quorum_set mirrors into FetchingEnvelopes,
         // which should now have the quorum set cached and the envelope
-        // moved to the ready queue AND drained via process_ready_fetching_envelopes.
+        // moved to the ready queue.
         assert!(
             herder.fetching_envelopes.has_quorum_set(&qs_hash_bytes),
             "FetchingEnvelopes must learn about the quorum set via store_quorum_set"
         );
 
-        // The ready queue should be empty because process_ready_fetching_envelopes()
-        // drains it as part of store_quorum_set (AUDIT-104 Bug B fix).
+        // Caller is responsible for draining ready envelopes (#1907).
+        // Simulate what handle_quorum_set does after storing.
+        herder.process_ready_fetching_envelopes();
+
+        // The ready queue should now be empty because we drained it.
         let popped = herder.fetching_envelopes.pop(100);
         assert!(
             popped.is_none(),
-            "Ready queue must be drained by store_quorum_set (envelope already processed through SCP)"
+            "Ready queue must be drained after store_quorum_set + process_ready_fetching_envelopes"
         );
     }
 
@@ -4294,10 +4298,14 @@ mod tests {
         );
     }
 
-    /// Regression test for AUDIT-104 Bug B: store_quorum_set must drain the
-    /// ready queue after notifying FetchingEnvelopes, so envelopes unblocked
-    /// by quorum-set arrival are fed to SCP immediately (not left in the
-    /// ready queue until a tx_set arrival happens to drain it).
+    /// Regression test for AUDIT-104 Bug B: after storing a quorum set and
+    /// draining ready envelopes, envelopes unblocked by quorum-set arrival
+    /// are fed to SCP immediately (not left in the ready queue until a
+    /// tx_set arrival happens to drain it).
+    ///
+    /// Since #1907 the drain is the caller's responsibility, so this test
+    /// calls process_ready_fetching_envelopes() explicitly after
+    /// store_quorum_set().
     #[test]
     fn test_audit_104_store_quorum_set_drains_ready() {
         use stellar_xdr::curr::Hash as XdrHash;
@@ -4333,17 +4341,19 @@ mod tests {
         let result = herder.fetching_envelopes.recv_envelope(envelope);
         assert_eq!(result, RecvResult::Fetching);
 
-        // store_quorum_set should: mirror to FetchingEnvelopes AND drain ready queue
+        // store_quorum_set mirrors to FetchingEnvelopes (AUDIT-004/AUDIT-104)
         herder.store_quorum_set(&node_id, quorum_set);
 
-        // After the fix, the ready queue should be empty because
-        // process_ready_fetching_envelopes() was called and drained it.
+        // Caller drains ready queue (#1907 — moved out of store_quorum_set)
+        herder.process_ready_fetching_envelopes();
+
+        // The ready queue should be empty because we drained it.
         // (The envelope gets sent to SCP, which may return Invalid for a
         // non-tracking herder — that's fine, the point is it was drained.)
         let popped = herder.fetching_envelopes.pop(100);
         assert!(
             popped.is_none(),
-            "AUDIT-104: ready queue must be drained by store_quorum_set (envelope already processed)"
+            "AUDIT-104: ready queue must be drained after store + drain (envelope already processed)"
         );
     }
 
