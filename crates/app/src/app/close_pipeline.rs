@@ -164,6 +164,7 @@ mod tests {
         PendingPersist {
             handle,
             ledger_seq: seq,
+            dispatch_time: std::time::Instant::now(),
         }
     }
 

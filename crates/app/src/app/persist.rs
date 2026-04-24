@@ -310,8 +310,13 @@ impl PersistJob {
 /// This is acceptable because persist work must complete to maintain
 /// on-disk/in-memory consistency, and no caller ever aborts the handle.
 pub(super) fn spawn_persist_task(job: PersistJob, ledger_seq: u32) -> PendingPersist {
+    let dispatch_time = std::time::Instant::now();
     let handle = tokio::task::spawn_blocking(move || job.run_blocking(ledger_seq));
-    PendingPersist { handle, ledger_seq }
+    PendingPersist {
+        handle,
+        ledger_seq,
+        dispatch_time,
+    }
 }
 
 /// Flush the pending bucket persist handle synchronously.

@@ -230,6 +230,7 @@ pub const CLOSE_CYCLE_SECONDS: &str = "henyey_close_cycle_seconds";
 pub const CLOSE_HANDLE_COMPLETE_SECONDS: &str = "henyey_close_handle_complete_seconds";
 pub const CLOSE_POST_COMPLETE_SECONDS: &str = "henyey_close_post_complete_seconds";
 pub const CLOSE_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_close_dispatch_to_join_seconds";
+pub const PERSIST_DISPATCH_TO_JOIN_SECONDS: &str = "henyey_persist_dispatch_to_join_seconds";
 
 // Phase 5 — Slot-to-close latency histogram.
 pub const SLOT_TO_CLOSE_LATENCY_SECONDS: &str = "henyey_slot_to_close_latency_seconds";
@@ -842,6 +843,10 @@ pub fn describe_metrics() {
     describe_histogram!(
         CLOSE_DISPATCH_TO_JOIN_SECONDS,
         "Wall-clock from spawn_blocking dispatch to event-loop join observation (seconds)"
+    );
+    describe_histogram!(
+        PERSIST_DISPATCH_TO_JOIN_SECONDS,
+        "Wall-clock from persist spawn_blocking dispatch to event-loop join observation (seconds)"
     );
 
     // Phase 5: Slot-to-close latency.

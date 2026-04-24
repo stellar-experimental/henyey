@@ -491,6 +491,9 @@ pub(super) struct PendingPersist {
     pub handle: tokio::task::JoinHandle<()>,
     /// Sequence number being persisted (for logging).
     pub ledger_seq: u32,
+    /// Instant when `spawn_blocking` was dispatched, for dispatch-to-join
+    /// latency measurement (#1916).
+    pub dispatch_time: std::time::Instant,
 }
 
 #[derive(Debug)]

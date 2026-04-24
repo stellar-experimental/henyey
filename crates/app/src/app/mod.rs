@@ -3555,6 +3555,7 @@ mod tests {
         pipeline.persisting = Some(super::types::PendingPersist {
             handle: persist_handle,
             ledger_seq: 41,
+            dispatch_time: std::time::Instant::now(),
         });
 
         // Simulate a close that verifies persist already ran.

@@ -462,6 +462,9 @@ impl App {
                     }
                 } => {
                     let persist = close_pipeline.take_persist();
+                    // Persist-cycle decomposition (#1916): dispatch-to-join latency.
+                    metrics::histogram!(crate::metrics::PERSIST_DISPATCH_TO_JOIN_SECONDS)
+                        .record(persist.dispatch_time.elapsed().as_secs_f64());
                     if let Err(e) = persist_result {
                         tracing::error!(
                             error = %e,
