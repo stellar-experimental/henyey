@@ -297,6 +297,28 @@ pub struct Herder {
     >,
 }
 
+/// Spawn a blocking closure and log any JoinError/panic.
+///
+/// Returns `Some(value)` on success, `None` on error. The caller decides
+/// how to handle `None` (e.g. return a default, log extra context fields).
+async fn spawn_blocking_logged<T, F>(context: &str, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(val) => Some(val),
+        Err(e) if e.is_panic() => {
+            error!(error = %e, "{context} panicked in spawn_blocking");
+            None
+        }
+        Err(e) => {
+            error!(error = %e, "spawn_blocking join error for {context}");
+            None
+        }
+    }
+}
+
 impl Herder {
     /// Create a new Herder (observer mode, no secret key).
     pub fn new(config: HerderConfig) -> Self {
@@ -2499,30 +2521,8 @@ impl Herder {
         // We `await` the JoinHandle before returning: callers rely on
         // externalization state populated inside the drain (e.g.
         // `try_close_slot_directly(slot)`).
-        let herder_for_drain = Arc::clone(&self);
-        let join_result = tokio::task::spawn_blocking(move || {
-            herder_for_drain.process_ready_fetching_envelopes()
-        })
-        .await;
-
-        match join_result {
-            Ok(_processed) => {}
-            Err(e) if e.is_panic() => {
-                error!(
-                    ?slot,
-                    error = %e,
-                    "process_ready_fetching_envelopes panicked in spawn_blocking; \
-                     slot tracking completed but envelope drain may be incomplete"
-                );
-            }
-            Err(e) => {
-                error!(
-                    ?slot,
-                    error = %e,
-                    "spawn_blocking join error for envelope drain"
-                );
-            }
-        }
+        self.drain_ready_envelopes_blocking("envelope drain after receive_tx_set")
+            .await;
         timer.mark("process_ready_spawn_blocking_ms");
 
         timer.finish("herder.receive_tx_set");
@@ -2574,32 +2574,40 @@ impl Herder {
     ///
     /// This is the async-safe public entry point. It calls [`cache_tx_set`]
     /// (cache + notify) then spawns [`process_ready_fetching_envelopes`] on
-    /// the blocking pool via `spawn_blocking`, matching the pattern in
-    /// [`receive_tx_set`](Self::receive_tx_set).
+    /// the blocking pool via [`drain_ready_envelopes_blocking`](Self::drain_ready_envelopes_blocking).
     pub async fn cache_tx_set_and_drain(self: Arc<Self>, tx_set: TransactionSet) {
         self.cache_tx_set(tx_set);
+        self.drain_ready_envelopes_blocking("envelope drain after cache_tx_set")
+            .await;
+    }
 
-        let herder_for_drain = Arc::clone(&self);
-        let join_result = tokio::task::spawn_blocking(move || {
-            herder_for_drain.process_ready_fetching_envelopes()
+    /// Drain ready fetching envelopes on `spawn_blocking`.
+    ///
+    /// Returns the number of processed envelopes, or 0 on JoinError/panic.
+    /// Callers in async context should use this instead of calling
+    /// [`process_ready_fetching_envelopes`](Self::process_ready_fetching_envelopes)
+    /// directly.
+    pub async fn drain_ready_envelopes_blocking(self: &Arc<Self>, context: &str) -> usize {
+        let herder = Arc::clone(self);
+        spawn_blocking_logged(context, move || herder.process_ready_fetching_envelopes())
+            .await
+            .unwrap_or(0)
+    }
+
+    /// Run [`handle_nomination_timeout`](Self::handle_nomination_timeout) on
+    /// `spawn_blocking`.
+    ///
+    /// Callers in async context should use this instead of calling the sync
+    /// method directly.
+    pub async fn handle_nomination_timeout_blocking(self: &Arc<Self>, slot: SlotIndex) {
+        let herder = Arc::clone(self);
+        if spawn_blocking_logged("handle_nomination_timeout", move || {
+            herder.handle_nomination_timeout(slot);
         })
-        .await;
-
-        match join_result {
-            Ok(_processed) => {}
-            Err(e) if e.is_panic() => {
-                error!(
-                    error = %e,
-                    "process_ready_fetching_envelopes panicked in spawn_blocking \
-                     after cache_tx_set; envelope drain may be incomplete"
-                );
-            }
-            Err(e) => {
-                error!(
-                    error = %e,
-                    "spawn_blocking join error for envelope drain after cache_tx_set"
-                );
-            }
+        .await
+        .is_none()
+        {
+            error!(slot, "nomination timeout failed on spawn_blocking");
         }
     }
 

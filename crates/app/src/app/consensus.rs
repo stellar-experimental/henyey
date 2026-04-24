@@ -928,26 +928,9 @@ impl App {
         // Drain envelopes that became ready after quorum-set arrival,
         // on a blocking-pool thread so the event loop stays responsive.
         // Mirrors receive_tx_set() pattern (#1904).
-        let herder = Arc::clone(&self.herder);
-        let join_result =
-            tokio::task::spawn_blocking(move || herder.process_ready_fetching_envelopes()).await;
-
-        match join_result {
-            Ok(_processed) => {}
-            Err(e) if e.is_panic() => {
-                tracing::error!(
-                    error = %e,
-                    "process_ready_fetching_envelopes panicked in spawn_blocking \
-                     after quorum-set receipt"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "spawn_blocking join error for quorum-set envelope drain"
-                );
-            }
-        }
+        self.herder
+            .drain_ready_envelopes_blocking("quorum-set envelope drain")
+            .await;
 
         self.herder.clear_quorum_set_request(&hash);
     }
@@ -1049,28 +1032,7 @@ impl App {
         // fallback calls build_nomination_value → cache_tx_set, which can
         // stall the event loop (#1922).
         if fire_nomination {
-            let herder = Arc::clone(&self.herder);
-            match tokio::task::spawn_blocking(move || {
-                herder.handle_nomination_timeout(slot);
-            })
-            .await
-            {
-                Ok(()) => {}
-                Err(e) if e.is_panic() => {
-                    tracing::error!(
-                        slot,
-                        error = %e,
-                        "handle_nomination_timeout panicked in spawn_blocking"
-                    );
-                }
-                Err(e) => {
-                    tracing::error!(
-                        slot,
-                        error = %e,
-                        "spawn_blocking join error for nomination timeout"
-                    );
-                }
-            }
+            self.herder.handle_nomination_timeout_blocking(slot).await;
         }
         if fire_ballot {
             self.herder.handle_ballot_timeout(slot);
