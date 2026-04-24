@@ -1501,9 +1501,11 @@ impl Herder {
             for hash in &tx_set_hashes {
                 self.fetching_envelopes.tx_set_available(*hash, slot);
             }
-            // Drain any OTHER envelopes that tx_set_available() just made
-            // ready (they were waiting only on this tx_set).
-            self.process_ready_fetching_envelopes();
+            // Note: we do NOT drain ready envelopes here. Any envelopes
+            // unblocked by tx_set_available() will be drained by the next
+            // receive_tx_set() or handle_quorum_set() call, both of which
+            // run process_ready_fetching_envelopes() via spawn_blocking.
+            // Draining inline here would stall the event loop (#1907).
 
             let envelope_clone = envelope.clone();
             let result = self.fetching_envelopes.recv_envelope(envelope);
@@ -4485,6 +4487,109 @@ mod tests {
              (observed {} ticks); if 0, the event-loop thread was \
              blocked during the drain — the spawn_blocking off-load \
              was lost",
+            ticks_during_drain,
+        );
+    }
+
+    /// Regression test for #1907: after store_quorum_set() (which no longer
+    /// drains inline), the caller-side spawn_blocking drain frees the event
+    /// loop while processing ready envelopes.
+    ///
+    /// Same approach as test_issue_1773: a heartbeat task on a
+    /// current_thread runtime proves the event loop is not blocked during
+    /// the drain.
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn test_issue_1907_quorum_set_drain_frees_event_loop() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use stellar_xdr::curr::Hash as XdrHash;
+
+        let herder = Arc::new(make_test_herder());
+
+        // Build a sane quorum set
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([42u8; 32]),
+        ));
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        // Synthesise 400 ready envelopes for slot 1.
+        const BACKLOG: usize = 400;
+        let mut envelopes = Vec::with_capacity(BACKLOG);
+        for i in 0..BACKLOG {
+            let ballot = ScpBallot {
+                counter: i as u32 + 1,
+                value: Value(vec![0u8; 1].try_into().unwrap()),
+            };
+            let statement = ScpStatement {
+                node_id: node_id.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: XdrHash([0u8; 32]),
+                    ballot,
+                    prepared: None,
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            };
+            envelopes.push(ScpEnvelope {
+                statement,
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            });
+        }
+        herder.fetching_envelopes.test_insert_ready(1, envelopes);
+
+        // store_quorum_set no longer drains — verify envelopes are still ready
+        herder.store_quorum_set(&node_id, quorum_set);
+        assert_eq!(
+            herder.fetching_envelopes.ready_slots(),
+            vec![1],
+            "pre-condition: slot 1 should still be ready (store_quorum_set no longer drains)"
+        );
+
+        // Heartbeat task
+        let heartbeat_count = Arc::new(AtomicU64::new(0));
+        let heartbeat_count_clone = Arc::clone(&heartbeat_count);
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::task::yield_now().await;
+                heartbeat_count_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let count_before = heartbeat_count.load(Ordering::Relaxed);
+
+        // Drain via spawn_blocking — mirroring handle_quorum_set()
+        let herder_for_drain = Arc::clone(&herder);
+        let join_result = tokio::task::spawn_blocking(move || {
+            herder_for_drain.process_ready_fetching_envelopes()
+        })
+        .await;
+        assert!(join_result.is_ok(), "spawn_blocking drain must not panic");
+
+        let count_after = heartbeat_count.load(Ordering::Relaxed);
+        heartbeat_handle.abort();
+
+        // Ordering: drain completed before return
+        let popped = herder.fetching_envelopes.pop(1);
+        assert!(
+            popped.is_none(),
+            "#1907: envelope drain must complete before spawn_blocking returns"
+        );
+
+        // Free-event-loop: heartbeat made progress during the await
+        let ticks_during_drain = count_after.saturating_sub(count_before);
+        assert!(
+            ticks_during_drain >= 1,
+            "#1907: heartbeat must make progress during drain \
+             (observed {} ticks); if 0, the event-loop thread was \
+             blocked — the spawn_blocking off-load was lost",
             ticks_during_drain,
         );
     }
