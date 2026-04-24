@@ -255,6 +255,9 @@ pub const ARCHIVE_CACHE_POPULATED: &str = "henyey_archive_cache_populated";
 // Phase 5 — Recovery stalled tick counter.
 pub const RECOVERY_STALLED_TICK_TOTAL: &str = "henyey_recovery_stalled_tick_total";
 
+// Phase 6 — TxSet exhaustion stuck gauge.
+pub const RECOVERY_TX_SET_STUCK_SECONDS: &str = "henyey_recovery_tx_set_stuck_seconds";
+
 // ── Registration ───────────────────────────────────────────────────────
 
 /// Register HELP/TYPE annotations for all metrics.
@@ -903,6 +906,12 @@ pub fn describe_metrics() {
         RECOVERY_STALLED_TICK_TOTAL,
         "Recovery stalled ticks by reason"
     );
+
+    // Phase 6: TxSet exhaustion stuck gauge.
+    describe_gauge!(
+        RECOVERY_TX_SET_STUCK_SECONDS,
+        "Seconds since all peers exhausted for pending tx_set hashes (0 = not stuck)"
+    );
 }
 
 /// Pre-register all metrics with initial values so that every metric appears
@@ -1362,6 +1371,15 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     } else {
         0.0
     });
+
+    // Phase 6: TxSet exhaustion stuck gauge.
+    let exhausted_since = state.app.tx_set_exhausted_since_offset();
+    if exhausted_since > 0 {
+        let stuck_secs = uptime.saturating_sub(exhausted_since);
+        gauge!(RECOVERY_TX_SET_STUCK_SECONDS).set(stuck_secs as f64);
+    } else {
+        gauge!(RECOVERY_TX_SET_STUCK_SECONDS).set(0.0);
+    }
 }
 
 // ── Process health helpers ──────────────────────────────────────────────

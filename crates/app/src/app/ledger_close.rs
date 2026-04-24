@@ -2386,8 +2386,7 @@ impl App {
             self.cleanup_stale_bucket_files_background();
         }
 
-        self.tx_set_all_peers_exhausted
-            .store(false, Ordering::SeqCst);
+        self.clear_tx_set_exhausted();
 
         // Spawn the persist task on a blocking thread. All persist work
         // (hot-archive file I/O, bucket flush, SQLite transaction) runs in a

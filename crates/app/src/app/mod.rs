@@ -480,6 +480,14 @@ pub struct App {
     tx_set_all_peers_exhausted: AtomicBool,
     /// Tx set hashes we've already logged "all peers exhausted" warning for (to avoid spam).
     tx_set_exhausted_warned: RwLock<HashSet<Hash256>>,
+    /// Per-hash retry timestamps for exhausted tx_set re-fetches (30s backoff).
+    /// Separate from `tx_set_last_request` because DontHave handling removes
+    /// last_request entries, which would destroy retry backoff state.
+    tx_set_last_retry: RwLock<HashMap<Hash256, Instant>>,
+    /// Monotonic offset (seconds since `start_instant`) when `tx_set_all_peers_exhausted`
+    /// first transitioned false→true. 0 means "not exhausted". Used by the
+    /// `henyey_recovery_tx_set_stuck_seconds` gauge.
+    tx_set_exhausted_since: AtomicU64,
     /// When we detected consensus is stuck (for timeout detection).
     /// Stores (current_ledger, first_buffered, stuck_start_time, last_recovery_attempt).
     pub(crate) consensus_stuck_state: RwLock<Option<ConsensusStuckState>>,
@@ -927,6 +935,8 @@ impl App {
             tx_set_last_request: RwLock::new(HashMap::new()),
             tx_set_all_peers_exhausted: AtomicBool::new(false),
             tx_set_exhausted_warned: RwLock::new(HashSet::new()),
+            tx_set_last_retry: RwLock::new(HashMap::new()),
+            tx_set_exhausted_since: AtomicU64::new(0),
             consensus_stuck_state: RwLock::new(None),
             last_catchup_completed_at: RwLock::new(None),
             archive_checkpoint_cache,
@@ -1242,11 +1252,11 @@ impl App {
     /// exhaustion warnings. Callers that also need to clear `consensus_stuck_state`
     /// should do so separately.
     pub(crate) async fn reset_tx_set_tracking(&self) {
-        self.tx_set_all_peers_exhausted
-            .store(false, Ordering::SeqCst);
+        self.clear_tx_set_exhausted();
         self.tx_set_dont_have.write().await.clear();
         self.tx_set_last_request.write().await.clear();
         self.tx_set_exhausted_warned.write().await.clear();
+        self.tx_set_last_retry.write().await.clear();
     }
 
     /// Persist in-memory hot archive buckets to disk.
@@ -7494,5 +7504,191 @@ mod tests {
             result.is_none(),
             "no catchup should be spawned when scp_since_reset=0"
         );
+    }
+
+    // ============================================================
+    // TxSet exhaustion retry and metric tests (#1929)
+    // ============================================================
+
+    #[tokio::test]
+    async fn test_mark_tx_set_exhausted_records_timestamp_on_first_transition() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Initially both are unset.
+        assert!(!app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+        assert_eq!(app.tx_set_exhausted_since.load(Ordering::SeqCst), 0);
+
+        // First false→true transition should set the timestamp.
+        app.mark_tx_set_exhausted();
+        assert!(app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+        let since1 = app.tx_set_exhausted_since.load(Ordering::SeqCst);
+        assert!(since1 > 0, "should record timestamp on first transition");
+
+        // Second call (already true) should NOT change the timestamp.
+        // Sleep briefly to ensure elapsed would differ.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        app.mark_tx_set_exhausted();
+        let since2 = app.tx_set_exhausted_since.load(Ordering::SeqCst);
+        assert_eq!(
+            since1, since2,
+            "should NOT reset timestamp on repeated store"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_tx_set_exhausted_clears_both_flag_and_timestamp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        app.mark_tx_set_exhausted();
+        assert!(app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+        assert!(app.tx_set_exhausted_since.load(Ordering::SeqCst) > 0);
+
+        app.clear_tx_set_exhausted();
+        assert!(!app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+        assert_eq!(app.tx_set_exhausted_since.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_reset_tx_set_tracking_clears_retry_map_and_exhausted_since() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Seed all tracking state.
+        app.mark_tx_set_exhausted();
+        let hash = Hash256::from_bytes([10u8; 32]);
+        app.tx_set_dont_have.write().await.insert(
+            hash,
+            HashSet::from([henyey_overlay::PeerId::from_bytes([1u8; 32])]),
+        );
+        app.tx_set_last_request.write().await.insert(
+            hash,
+            TxSetRequestState {
+                last_request: Instant::now(),
+                first_requested: Instant::now(),
+                next_peer_offset: 0,
+            },
+        );
+        app.tx_set_exhausted_warned.write().await.insert(hash);
+        app.tx_set_last_retry
+            .write()
+            .await
+            .insert(hash, Instant::now());
+
+        app.reset_tx_set_tracking().await;
+
+        assert!(!app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+        assert_eq!(app.tx_set_exhausted_since.load(Ordering::SeqCst), 0);
+        assert!(app.tx_set_dont_have.read().await.is_empty());
+        assert!(app.tx_set_last_request.read().await.is_empty());
+        assert!(app.tx_set_exhausted_warned.read().await.is_empty());
+        assert!(app.tx_set_last_retry.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_retry_exhausted_tx_sets_skips_when_not_exhausted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Not exhausted — retry should be a no-op.
+        assert!(!app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+        app.retry_exhausted_tx_sets().await;
+        // No panic, no state change.
+        assert!(!app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_retry_exhausted_tx_sets_no_overlay_graceful() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Set exhausted but no overlay available — should not panic.
+        app.mark_tx_set_exhausted();
+        app.retry_exhausted_tx_sets().await;
+        // Flag remains set (no peers to retry with).
+        assert!(app.tx_set_all_peers_exhausted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_tx_set_exhausted_since_offset_reflects_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        assert_eq!(app.tx_set_exhausted_since_offset(), 0);
+
+        app.mark_tx_set_exhausted();
+        let offset = app.tx_set_exhausted_since_offset();
+        assert!(offset > 0, "should be non-zero after exhaustion");
+
+        app.clear_tx_set_exhausted();
+        assert_eq!(
+            app.tx_set_exhausted_since_offset(),
+            0,
+            "should be zero after clearing"
+        );
+    }
+
+    #[test]
+    fn test_tx_set_eligible_peers_prefers_outbound() {
+        use std::net::SocketAddr;
+
+        let make_info = |id: u8, dir: ConnectionDirection| henyey_overlay::PeerInfo {
+            peer_id: henyey_overlay::PeerId::from_bytes([id; 32]),
+            address: SocketAddr::from(([127, 0, 0, id], 11625)),
+            direction: dir,
+            version_string: String::new(),
+            overlay_version: 0,
+            ledger_version: 0,
+            connected_at: Instant::now(),
+            original_address: None,
+        };
+
+        // Mixed outbound + inbound — should only return outbound.
+        let infos = vec![
+            make_info(1, ConnectionDirection::Inbound),
+            make_info(2, ConnectionDirection::Outbound),
+            make_info(3, ConnectionDirection::Outbound),
+        ];
+        let peers = App::tx_set_eligible_peers(&infos);
+        assert_eq!(peers.len(), 2);
+        assert!(peers.contains(&henyey_overlay::PeerId::from_bytes([2u8; 32])));
+        assert!(peers.contains(&henyey_overlay::PeerId::from_bytes([3u8; 32])));
+
+        // All inbound — should fall back to all.
+        let infos = vec![
+            make_info(4, ConnectionDirection::Inbound),
+            make_info(5, ConnectionDirection::Inbound),
+        ];
+        let peers = App::tx_set_eligible_peers(&infos);
+        assert_eq!(peers.len(), 2);
+
+        // Empty — empty result.
+        let peers = App::tx_set_eligible_peers(&[]);
+        assert!(peers.is_empty());
     }
 }

@@ -1262,6 +1262,9 @@ impl App {
                     // ticks even after the refresh completes on tick 2.
                     // Fall through to peer-SCP fallback; the next tick
                     // (10 s later) will see the refreshed cache.
+                    if self.tx_set_all_peers_exhausted.load(Ordering::SeqCst) {
+                        self.archive_checkpoint_cache.set_urgent(true);
+                    }
                     tracing::debug!(
                         next_checkpoint = next_cp,
                         "Archive checkpoint cache cold — \
@@ -1315,6 +1318,11 @@ impl App {
                         }
                     });
                 }
+
+                // Retry exhausted tx_set fetches with 30s per-hash backoff.
+                // Peers may have re-acquired the tx_set since they last said
+                // DontHave (e.g., a slow peer catching up).
+                self.retry_exhausted_tx_sets().await;
 
                 // Do NOT re-arm sync_recovery_pending here. Let the
                 // SyncRecoveryManager's 10-second timer drive the next

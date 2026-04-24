@@ -839,22 +839,10 @@ impl App {
             tracing::warn!("No peers connected, cannot request tx sets");
             return;
         }
-        // Prefer outbound peers for tx_set requests. Previously did a
-        // synchronous db.load_peer() per inbound peer which blocked the
-        // event loop on SQLite I/O (#1713). Connection direction is a
-        // sufficient heuristic.
-        let mut peers = Vec::new();
-        let mut fallback = Vec::new();
-        for info in peer_infos {
-            fallback.push(info.peer_id.clone());
-            if matches!(info.direction, ConnectionDirection::Outbound) {
-                peers.push(info.peer_id);
-            }
-        }
+        let peers = Self::tx_set_eligible_peers(&peer_infos);
         if peers.is_empty() {
-            peers = fallback;
+            return;
         }
-        peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
         let now = self.clock.now();
         let (requests, newly_exhausted) = {
@@ -908,8 +896,7 @@ impl App {
                         if !exhausted_warned.contains(hash) {
                             exhausted.push((*hash, dont_have_set.len(), peers.len()));
                         }
-                        self.tx_set_all_peers_exhausted
-                            .store(true, Ordering::SeqCst);
+                        self.mark_tx_set_exhausted();
                     }
                     continue;
                 }
@@ -930,8 +917,7 @@ impl App {
                             if !exhausted_warned.contains(hash) {
                                 exhausted.push((*hash, set.len(), peers.len()));
                             }
-                            self.tx_set_all_peers_exhausted
-                                .store(true, Ordering::SeqCst);
+                            self.mark_tx_set_exhausted();
                             // Don't clear the set or return a peer - stop requesting this tx set
                             // until catchup or tx_set tracking is reset.
                         }
@@ -972,6 +958,168 @@ impl App {
             let request = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(hash.0));
             if let Err(e) = overlay.try_send_to(&peer_id, request) {
                 tracing::warn!(hash = %hash, peer = %peer_id, error = %e, "Failed to request TxSet");
+            }
+        }
+    }
+
+    /// Record the false→true transition of `tx_set_all_peers_exhausted` and
+    /// stamp `tx_set_exhausted_since` on the first transition only.
+    pub(super) fn mark_tx_set_exhausted(&self) {
+        if self
+            .tx_set_all_peers_exhausted
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let elapsed = self.start_instant.elapsed().as_secs().max(1);
+            self.tx_set_exhausted_since.store(elapsed, Ordering::SeqCst);
+        }
+    }
+
+    /// Clear `tx_set_all_peers_exhausted` and its timestamp together.
+    /// Use this instead of bare `.store(false)` to keep the flag and timestamp
+    /// in sync at every transition point.
+    pub(super) fn clear_tx_set_exhausted(&self) {
+        self.tx_set_all_peers_exhausted
+            .store(false, Ordering::SeqCst);
+        self.tx_set_exhausted_since.store(0, Ordering::SeqCst);
+    }
+
+    /// Return the seconds-since-start at which `tx_set_all_peers_exhausted`
+    /// first became true, or 0 if not exhausted.
+    pub(crate) fn tx_set_exhausted_since_offset(&self) -> u64 {
+        self.tx_set_exhausted_since.load(Ordering::SeqCst)
+    }
+
+    /// Build the eligible peer list for tx-set requests, preferring outbound
+    /// peers. This is shared between `request_pending_tx_sets` and
+    /// `retry_exhausted_tx_sets` so both use the same peer universe.
+    pub(super) fn tx_set_eligible_peers(
+        peer_infos: &[henyey_overlay::PeerInfo],
+    ) -> Vec<henyey_overlay::PeerId> {
+        let mut peers = Vec::new();
+        let mut fallback = Vec::new();
+        for info in peer_infos {
+            fallback.push(info.peer_id.clone());
+            if matches!(info.direction, ConnectionDirection::Outbound) {
+                peers.push(info.peer_id.clone());
+            }
+        }
+        if peers.is_empty() {
+            peers = fallback;
+        }
+        peers.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        peers
+    }
+
+    /// Retry fetching exhausted tx_sets with per-hash 30s backoff.
+    ///
+    /// When all peers have reported DontHave for every pending tx_set hash,
+    /// the normal `request_pending_tx_sets` stops requesting them. If the
+    /// archive hasn't published the next checkpoint yet, the node stalls for
+    /// minutes. This method re-asks peers that may have re-acquired the
+    /// tx_set (e.g., via a slow peer catching up).
+    ///
+    /// Called from the recovery fallback path in `trigger_recovery_catchup`.
+    pub(super) async fn retry_exhausted_tx_sets(&self) {
+        if !self.tx_set_all_peers_exhausted.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let current_ledger = match self.get_current_ledger().await {
+            Ok(seq) => seq,
+            Err(_) => return,
+        };
+        let min_slot = current_ledger.saturating_add(1) as u64;
+        let window_end = current_ledger as u64 + TX_SET_REQUEST_WINDOW;
+
+        let pending = self.herder.get_pending_tx_sets();
+        let pending_hashes: Vec<Hash256> = pending
+            .into_iter()
+            .filter(|(_, slot)| *slot >= min_slot && *slot <= window_end)
+            .map(|(hash, _)| hash)
+            .collect();
+        if pending_hashes.is_empty() {
+            return;
+        }
+
+        let Some(overlay) = self.overlay().await else {
+            return;
+        };
+        let peer_infos = overlay.peer_infos();
+        let peers = Self::tx_set_eligible_peers(&peer_infos);
+        if peers.is_empty() {
+            return;
+        }
+
+        let now = self.clock.now();
+        const RETRY_BACKOFF: Duration = Duration::from_secs(30);
+        const MAX_RETRIES_PER_TICK: usize = 4;
+
+        let retry_hashes = {
+            let mut dont_have = self.tx_set_dont_have.write().await;
+            let mut last_request = self.tx_set_last_request.write().await;
+            let mut exhausted_warned = self.tx_set_exhausted_warned.write().await;
+            let mut last_retry = self.tx_set_last_retry.write().await;
+
+            let mut to_retry = Vec::new();
+
+            for hash in &pending_hashes {
+                if to_retry.len() >= MAX_RETRIES_PER_TICK {
+                    break;
+                }
+
+                // Only retry hashes where ALL eligible peers are in dont_have.
+                let is_exhausted = dont_have
+                    .get(hash)
+                    .map(|set| peers.iter().all(|p| set.contains(p)))
+                    .unwrap_or(false);
+                if !is_exhausted {
+                    continue;
+                }
+
+                // 30s per-hash backoff.
+                if let Some(&prev) = last_retry.get(hash) {
+                    if now.duration_since(prev) < RETRY_BACKOFF {
+                        continue;
+                    }
+                }
+
+                // Clear per-hash state for retry.
+                dont_have.remove(hash);
+                exhausted_warned.remove(hash);
+                // Reset request tracking so request_pending_tx_sets doesn't
+                // immediately re-exhaust via the timeout path.
+                last_request.remove(hash);
+                last_retry.insert(*hash, now);
+
+                to_retry.push(*hash);
+            }
+
+            // Recompute global flag: any remaining hash still exhausted?
+            let any_still_exhausted = pending_hashes.iter().any(|hash| {
+                dont_have
+                    .get(hash)
+                    .map(|set| peers.iter().all(|p| set.contains(p)))
+                    .unwrap_or(false)
+            });
+
+            if !any_still_exhausted {
+                self.clear_tx_set_exhausted();
+            }
+
+            to_retry
+        };
+
+        // Broadcast GetTxSet to all eligible peers for retried hashes.
+        for hash in &retry_hashes {
+            tracing::info!(
+                hash = %hash,
+                peer_count = peers.len(),
+                "Retrying exhausted tx_set fetch — broadcasting to all eligible peers"
+            );
+            let msg = StellarMessage::GetTxSet(stellar_xdr::curr::Uint256(hash.0));
+            for peer in &peers {
+                let _ = overlay.try_send_to(peer, msg.clone());
             }
         }
     }

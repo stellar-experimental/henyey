@@ -455,8 +455,7 @@ impl App {
         }
 
         // Reset the tx set exhausted flag after catchup - fresh start
-        self.tx_set_all_peers_exhausted
-            .store(false, Ordering::SeqCst);
+        self.clear_tx_set_exhausted();
 
         // Update cache with the latest published checkpoint at or below the
         // ledger we caught up to. `output.ledger_seq` is the target-ledger
@@ -1914,8 +1913,7 @@ impl App {
                             }
                             // tx_set cleanup outside all lock scopes.
                             if !recently_caught_up {
-                                self.tx_set_all_peers_exhausted
-                                    .store(false, Ordering::SeqCst);
+                                self.clear_tx_set_exhausted();
                                 self.tx_set_exhausted_warned.write().await.clear();
                             }
                         }
