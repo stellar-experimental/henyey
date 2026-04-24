@@ -295,6 +295,10 @@ pub struct SnapshotHandle {
     prefetch_cache: Arc<parking_lot::RwLock<HashMap<LedgerKey, LedgerEntry>>>,
     /// Lookup statistics shared across clones.
     stats: Arc<SnapshotLookupStats>,
+    /// True after `release_lookups()` has been called. Used to distinguish
+    /// "lookups were never configured" from "lookups were dropped on purpose"
+    /// so post-release fallback paths return errors instead of silent None.
+    lookups_released: bool,
 }
 
 impl SnapshotHandle {
@@ -309,6 +313,7 @@ impl SnapshotHandle {
             pool_share_tls_by_account_fn: None,
             prefetch_cache: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             stats: Arc::new(SnapshotLookupStats::default()),
+            lookups_released: false,
         }
     }
 
@@ -354,6 +359,20 @@ impl SnapshotHandle {
     /// Set the pool-share-trustlines-by-account lookup function.
     pub fn set_pool_share_tls_by_account(&mut self, f: PoolShareTrustlinesByAccountFn) {
         self.pool_share_tls_by_account_fn = Some(f);
+    }
+
+    /// Drop lookup closures to release captured resources (Arc references to
+    /// soroban state snapshots, bucket list snapshots, etc.).
+    ///
+    /// After calling this, `get_entry()` and `load_entries()` will only check
+    /// the snapshot cache and prefetch cache — any fallback to lookup_fn /
+    /// batch_lookup_fn for uncached keys returns an error.
+    ///
+    /// Stats and prefetch cache are preserved for end-of-close reporting.
+    pub fn release_lookups(&mut self) {
+        self.lookup_fn = None;
+        self.batch_lookup_fn = None;
+        self.lookups_released = true;
     }
 
     /// Look up all pool IDs for pool share trustlines owned by `account_id`.
@@ -441,6 +460,10 @@ impl SnapshotHandle {
                 }
             }
             loaded
+        } else if self.lookups_released {
+            return Err(crate::LedgerError::Internal(
+                "snapshot load_entries attempted after release_lookups()".into(),
+            ));
         } else {
             Vec::new()
         };
@@ -517,6 +540,11 @@ impl SnapshotHandle {
         }
 
         // 4. No lookup function — uncached key with no way to resolve
+        if self.lookups_released {
+            return Err(crate::LedgerError::Internal(
+                "snapshot lookup attempted after release_lookups()".into(),
+            ));
+        }
         self.stats.fallback_lookups.fetch_add(1, Ordering::Relaxed);
         Ok(None)
     }
@@ -566,6 +594,10 @@ impl SnapshotHandle {
                 }
             }
             loaded
+        } else if self.lookups_released {
+            return Err(crate::LedgerError::Internal(
+                "snapshot prefetch attempted after release_lookups()".into(),
+            ));
         } else {
             return Ok(PrefetchStats {
                 requested: needed.len(),
@@ -1148,5 +1180,137 @@ mod tests {
 
         handle.prefetch_cache.write().insert(key2, entry2);
         assert_eq!(handle.prefetch_cache_len(), 2);
+    }
+
+    #[test]
+    fn test_release_lookups_drops_arc_references() {
+        let shared = Arc::new(42u64);
+        let shared_clone = shared.clone();
+        assert_eq!(Arc::strong_count(&shared), 2);
+
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+        let s1 = shared.clone();
+        handle.set_lookup(Arc::new(move |_k| {
+            let _ = &s1;
+            Ok(None)
+        }));
+        let s2 = shared.clone();
+        handle.set_batch_lookup(Arc::new(move |_k| {
+            let _ = &s2;
+            Ok(vec![])
+        }));
+        assert_eq!(Arc::strong_count(&shared), 4);
+
+        handle.release_lookups();
+        // Only our original + shared_clone should remain
+        assert_eq!(Arc::strong_count(&shared), 2);
+        assert!(handle.lookups_released);
+        drop(shared_clone);
+    }
+
+    #[test]
+    fn test_post_release_get_entry_returns_error_for_uncached() {
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+        handle.set_lookup(Arc::new(|_k| Ok(None)));
+        handle.release_lookups();
+
+        let (key, _) = create_test_account(1);
+        let result = handle.get_entry(&key);
+        assert!(
+            result.is_err(),
+            "uncached lookup after release should error"
+        );
+    }
+
+    #[test]
+    fn test_post_release_get_entry_succeeds_for_cached() {
+        let (key, entry) = create_test_account(1);
+        let snapshot = SnapshotBuilder::new(1)
+            .add_entry(key.clone(), entry.clone())
+            .build_with_default_header();
+        let handle_with_cache = SnapshotHandle::new(snapshot);
+
+        // Also test prefetch cache
+        let snapshot2 = LedgerSnapshot::empty(1);
+        let mut handle_prefetch = SnapshotHandle::new(snapshot2);
+        handle_prefetch
+            .prefetch_cache
+            .write()
+            .insert(key.clone(), entry);
+        handle_prefetch.set_lookup(Arc::new(|_k| Ok(None)));
+        handle_prefetch.release_lookups();
+
+        // Snapshot cache hit
+        let result = handle_with_cache.get_entry(&key).unwrap();
+        assert!(result.is_some());
+
+        // Prefetch cache hit
+        let result2 = handle_prefetch.get_entry(&key).unwrap();
+        assert!(result2.is_some());
+    }
+
+    #[test]
+    fn test_post_release_prefetch_returns_error() {
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+        handle.set_lookup(Arc::new(|_k| Ok(None)));
+        handle.release_lookups();
+
+        let (key, _) = create_test_account(1);
+        let result = handle.prefetch(&[key]);
+        assert!(result.is_err(), "prefetch after release should error");
+    }
+
+    #[test]
+    fn test_post_release_load_entries_returns_error() {
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+        handle.set_lookup(Arc::new(|_k| Ok(None)));
+        handle.release_lookups();
+
+        let (key, _) = create_test_account(1);
+        let result = handle.load_entries(&[key]);
+        assert!(result.is_err(), "load_entries after release should error");
+    }
+
+    #[test]
+    fn test_lifecycle_snapshot_release_then_mutate() {
+        // Simulates the real commit path: snapshot → executor loaders → release → mutation
+        let shared_data = Arc::new(std::collections::HashMap::<u32, u32>::new());
+        assert_eq!(Arc::strong_count(&shared_data), 1);
+
+        // Simulate create_snapshot capturing the data in closures
+        let snapshot = LedgerSnapshot::empty(1);
+        let mut handle = SnapshotHandle::new(snapshot);
+
+        let data_for_lookup = shared_data.clone();
+        handle.set_lookup(Arc::new(move |_k| {
+            let _ = &data_for_lookup;
+            Ok(None)
+        }));
+        let data_for_batch = shared_data.clone();
+        handle.set_batch_lookup(Arc::new(move |_k| {
+            let _ = &data_for_batch;
+            Ok(vec![])
+        }));
+        assert_eq!(Arc::strong_count(&shared_data), 3);
+
+        // Simulate executor loaders (clone of handle)
+        let executor_handle = handle.clone();
+        // lookup/batch closures are Arc-shared, so strong count stays at 3
+        assert_eq!(Arc::strong_count(&shared_data), 3);
+
+        // Simulate clearing executor loaders (Part 0)
+        drop(executor_handle);
+
+        // Simulate release_lookups on ltx.snapshot (Part 2)
+        handle.release_lookups();
+        assert_eq!(
+            Arc::strong_count(&shared_data),
+            1,
+            "after clearing executor and releasing lookups, refcount should be 1"
+        );
     }
 }

@@ -286,6 +286,17 @@ impl CloseLedgerState {
         self.current.drain_categorization_for_bucket_update()
     }
 
+    /// Release the snapshot's lookup closures to drop captured Arc references.
+    ///
+    /// Called after `drain_for_bucket_update()` during commit, before the
+    /// soroban state update phase. This drops the Arc references to the
+    /// soroban state snapshot held by the lookup closures, allowing
+    /// `Arc::make_mut` on the live soroban state to mutate in-place instead
+    /// of deep-cloning the entire HashMap.
+    pub fn release_snapshot_lookups(&mut self) {
+        self.snapshot.release_lookups();
+    }
+
     // ------------------------------------------------------------------
     // Escape hatches for the execution layer
     // ------------------------------------------------------------------

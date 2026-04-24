@@ -639,6 +639,19 @@ impl LedgerStateManager {
         self.pool_share_tls_by_account_loader = Some(loader);
     }
 
+    /// Clear all snapshot-backed loaders.
+    ///
+    /// Called after TX execution completes, before storing the executor back
+    /// for reuse. This drops Arc references to the SnapshotHandle clones
+    /// (and transitively to the soroban state snapshot), allowing
+    /// `Arc::make_mut` on the live soroban state to mutate in-place during
+    /// `commit()` instead of deep-cloning the entire HashMap.
+    pub fn clear_entry_loaders(&mut self) {
+        self.entry_loader = None;
+        self.batch_entry_loader = None;
+        self.pool_share_tls_by_account_loader = None;
+    }
+
     /// Batch-load all entries needed to cross an offer (seller account + trustlines).
     ///
     /// This is significantly faster than separate `ensure_account_loaded` +
@@ -829,6 +842,7 @@ impl LedgerStateManager {
         self.entry_sponsorship_ext.clear();
         self.entry_last_modified.clear();
         self.entry_loader = None;
+        self.batch_entry_loader = None;
         self.pool_share_tls_by_account_loader = None;
 
         // Clear all transaction-level state
@@ -4049,5 +4063,42 @@ mod tests {
             Some(1_000_000),
             "Claimable balance amount must be restored to original after rollback_to_savepoint"
         );
+    }
+
+    #[test]
+    fn test_clear_cached_entries_preserving_offers_clears_batch_entry_loader() {
+        let mut manager = new_manager_with_offers(100, 1);
+        manager.set_entry_loader(Arc::new(|_| Ok(None)));
+        manager.set_batch_entry_loader(Arc::new(|_| Ok(vec![])));
+        manager.set_pool_share_tls_by_account_loader(Arc::new(|_| Ok(vec![])));
+
+        // All three loaders should be set
+        assert!(manager.entry_loader.is_some());
+        assert!(manager.batch_entry_loader.is_some());
+        assert!(manager.pool_share_tls_by_account_loader.is_some());
+
+        manager.clear_cached_entries_preserving_offers();
+
+        // All three loaders should be cleared
+        assert!(manager.entry_loader.is_none());
+        assert!(
+            manager.batch_entry_loader.is_none(),
+            "batch_entry_loader must be cleared to avoid cross-ledger retention"
+        );
+        assert!(manager.pool_share_tls_by_account_loader.is_none());
+    }
+
+    #[test]
+    fn test_clear_entry_loaders() {
+        let mut manager = new_manager_with_offers(100, 1);
+        manager.set_entry_loader(Arc::new(|_| Ok(None)));
+        manager.set_batch_entry_loader(Arc::new(|_| Ok(vec![])));
+        manager.set_pool_share_tls_by_account_loader(Arc::new(|_| Ok(vec![])));
+
+        manager.clear_entry_loaders();
+
+        assert!(manager.entry_loader.is_none());
+        assert!(manager.batch_entry_loader.is_none());
+        assert!(manager.pool_share_tls_by_account_loader.is_none());
     }
 }

@@ -3926,6 +3926,14 @@ impl LedgerCloseContext<'_> {
             })?
         };
 
+        // Clear snapshot-backed loaders before storing the executor back. This drops
+        // Arc references to SnapshotHandle clones (and transitively to the soroban state
+        // snapshot), allowing Arc::make_mut on the live soroban state to mutate in-place
+        // during commit() instead of deep-cloning the entire HashMap.
+        if let Some(ref mut exec) = executor {
+            exec.state_mut().clear_entry_loaders();
+        }
+
         // Store the executor back for reuse on the next ledger close
         *self.manager.executor.lock() = executor;
 
@@ -4605,6 +4613,11 @@ impl LedgerCloseContext<'_> {
         // Drains entries from the current delta (moving instead of cloning), saving ~50K clone operations.
         // Metadata (fee_pool_delta, total_coins_delta) is preserved for build_and_hash_header.
         let cat = self.ltx.drain_for_bucket_update();
+        // Release snapshot lookup closures. After drain, no code in commit()
+        // reads entries via self.ltx. Dropping these closures releases Arc
+        // references to the soroban state snapshot, allowing Arc::make_mut on
+        // the live soroban state to mutate in-place instead of deep-cloning.
+        self.ltx.release_snapshot_lookups();
         let init_entries = cat.init_entries;
         let mut live_entries = cat.live_entries;
         let mut dead_entries = cat.dead_keys;
