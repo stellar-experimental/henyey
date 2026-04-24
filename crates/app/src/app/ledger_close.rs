@@ -1761,6 +1761,7 @@ impl App {
                     "Background ledger close failed"
                 );
                 if is_hash_mismatch {
+                    self.set_phase_sub(phase::PHASE_6_1_SYNCING_LEDGERS_HASH_MISMATCH);
                     let mut buffer =
                         tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
                     let cleared_count = buffer.len();
@@ -1868,6 +1869,7 @@ impl App {
         // (for debug-only streams that don't need I/O isolation).
         if let Some(ref meta) = result.meta {
             if let Some(ref writer) = self.meta_writer {
+                self.set_phase_sub(phase::PHASE_6_2_WRITE_META);
                 if let Err(e) = writer.write_meta(meta.clone(), pending.ledger_seq).await {
                     tracing::error!(
                         error = %e,
@@ -1985,6 +1987,7 @@ impl App {
         // Clear per-ledger overlay state (flood gate, etc.) for old ledgers.
         // Mirrors upstream HerderImpl::eraseBelow() -> clearLedgersBelow().
         {
+            self.set_phase_sub(phase::PHASE_6_3_OVERLAY_CLEAR_LEDGERS);
             if let Some(overlay) = self.overlay().await {
                 overlay.clear_ledgers_below(pending.ledger_seq, pending.ledger_seq);
             }
@@ -1999,6 +2002,7 @@ impl App {
             let diff = new_max.saturating_sub(old_max);
             self.max_tx_size_bytes.store(new_max, Ordering::Relaxed);
             if diff > 0 {
+                self.set_phase_sub(phase::PHASE_6_4_OVERLAY_MAX_TX_SIZE);
                 if let Some(overlay) = self.overlay().await {
                     overlay.handle_max_tx_size_increase(diff).await;
                 }
@@ -2008,6 +2012,7 @@ impl App {
         // Clean up old survey rate limiter entries.
         // Mirrors upstream SurveyManager::clearOldLedgers() called from clearLedgersBelow().
         {
+            self.set_phase_sub(phase::PHASE_6_5_SURVEY_LIMITER_WRITE);
             let mut limiter = self.survey_limiter.write().await;
             limiter.clear_old_ledgers(pending.ledger_seq);
         }
@@ -2307,6 +2312,7 @@ impl App {
             (shift_result, invalid_banned)
         });
 
+        self.set_phase_sub(phase::PHASE_6_6_TX_QUEUE_JOIN);
         match join.await {
             Ok((shift_result, invalid_banned)) => {
                 if shift_result.unbanned_count > 0 || shift_result.evicted_due_to_age > 0 {
@@ -2343,7 +2349,9 @@ impl App {
         record_phase_histogram(crate::metrics::CLOSE_COMPLETE_TX_QUEUE_SECONDS, &timer);
 
         // Update current ledger tracking.
+        self.set_phase_sub(phase::PHASE_6_7_LAST_PROCESSED_SLOT_WRITE);
         *self.last_processed_slot.write().await = pending.ledger_seq as u64;
+        self.set_phase_sub(phase::PHASE_6_8_CLEAR_TX_ADVERT_HISTORY);
         self.clear_tx_advert_history(pending.ledger_seq).await;
 
         // Re-bootstrap the herder so tracking_slot advances past the

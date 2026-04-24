@@ -678,9 +678,10 @@ pub struct App {
     event_loop_phase: Arc<AtomicU64>,
 
     /// Fine-grained sub-phase code for pinpointing a stall inside a
-    /// coarse phase. See [`phase`](super::phase) for the `PHASE_13_*`
-    /// constants stamped before every notable `.await` on the
-    /// buffered-catchup arm (issue #1788 investigation).
+    /// coarse phase. See [`phase`](super::phase) for the `PHASE_6_*`
+    /// and `PHASE_13_*` constants stamped before every notable `.await`
+    /// on the pending-close and buffered-catchup arms (issues #1921,
+    /// #1788).
     ///
     /// Zero means "coarse phase entered, sub-phase not yet set".
     /// `set_phase` clears this to 0 so stale sub-phase values from a
@@ -2260,8 +2261,8 @@ impl App {
     /// Update the event loop phase code (for watchdog diagnostics).
     ///
     /// Also clears the fine-grained sub-phase counter back to 0 so stale
-    /// `PHASE_13_*` values stamped by a prior coarse phase do not leak
-    /// into subsequent WATCHDOG reports.
+    /// `PHASE_6_*` / `PHASE_13_*` values stamped by a prior coarse phase
+    /// do not leak into subsequent WATCHDOG reports.
     #[inline]
     fn set_phase(&self, phase: u64) {
         self.event_loop_phase.store(phase, Ordering::Relaxed);
@@ -2637,8 +2638,8 @@ impl WatchdogSnapshot {
             fetch_channel_depth_max = self.fetch_channel_depth_max,
             pid = self.pid,
             "WATCHDOG: Event loop appears frozen! {} \
-             Sub-phase 13.N labels (issue #1788): see \
-             crates/app/src/app/phase.rs for PHASE_13_* constants.",
+             Sub-phase N.M labels: see \
+             crates/app/src/app/phase.rs for PHASE_6_* and PHASE_13_* constants.",
             WATCHDOG_PHASE_LEGEND,
         );
     }
@@ -5874,9 +5875,9 @@ mod tests {
     }
 
     /// `set_phase` MUST clear the fine-grained sub-phase so stale
-    /// `PHASE_13_*` values from a prior coarse phase cannot leak into
-    /// a later WATCHDOG capture. Regression guard for issue #1788's
-    /// sub-phase instrumentation.
+    /// `PHASE_6_*` / `PHASE_13_*` values from a prior coarse phase
+    /// cannot leak into a later WATCHDOG capture. Regression guard for
+    /// issues #1788 and #1921 sub-phase instrumentation.
     #[tokio::test]
     async fn test_set_phase_clears_phase_sub() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -6214,13 +6215,58 @@ mod tests {
             "phase-13 sub-phase constants must all be distinct"
         );
         assert_eq!(sorted.first().copied(), Some(1));
-        assert_eq!(sorted.last().copied(), Some(max_defined_sub_phase()));
+        assert_eq!(
+            sorted.last().copied(),
+            Some(max_defined_phase_13_sub_phase())
+        );
         // Dense: no gaps.
         for (i, v) in sorted.iter().enumerate() {
             assert_eq!(
                 *v,
                 (i as u32) + 1,
                 "phase-13 sub-phase constants must be densely numbered 1..=N"
+            );
+        }
+    }
+
+    /// All `PHASE_6_*` sub-phase constants are distinct and densely numbered.
+    /// Mirrors the `PHASE_13_*` test above. Prevents accidental constant
+    /// collision during future edits (issue #1921).
+    #[test]
+    fn test_phase_6_constants_distinct_and_dense() {
+        use super::phase::*;
+        let all = [
+            PHASE_6_1_SYNCING_LEDGERS_HASH_MISMATCH,
+            PHASE_6_2_WRITE_META,
+            PHASE_6_3_OVERLAY_CLEAR_LEDGERS,
+            PHASE_6_4_OVERLAY_MAX_TX_SIZE,
+            PHASE_6_5_SURVEY_LIMITER_WRITE,
+            PHASE_6_6_TX_QUEUE_JOIN,
+            PHASE_6_7_LAST_PROCESSED_SLOT_WRITE,
+            PHASE_6_8_CLEAR_TX_ADVERT_HISTORY,
+            PHASE_6_9_MAYBE_PUBLISH_HISTORY,
+            PHASE_6_10_TRY_TRIGGER_CONSENSUS,
+            PHASE_6_11_FETCH_DRAIN,
+            PHASE_6_12_PROCESS_EXTERNALIZED_SLOTS,
+        ];
+        let mut sorted = all.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            all.len(),
+            "phase-6 sub-phase constants must all be distinct"
+        );
+        assert_eq!(sorted.first().copied(), Some(1));
+        assert_eq!(
+            sorted.last().copied(),
+            Some(max_defined_phase_6_sub_phase())
+        );
+        for (i, v) in sorted.iter().enumerate() {
+            assert_eq!(
+                *v,
+                (i as u32) + 1,
+                "phase-6 sub-phase constants must be densely numbered 1..=N"
             );
         }
     }

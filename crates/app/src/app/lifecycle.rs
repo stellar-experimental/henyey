@@ -305,10 +305,12 @@ impl App {
                         }
 
                         // Publish queued history checkpoints (if any).
+                        self.set_phase_sub(super::phase::PHASE_6_9_MAYBE_PUBLISH_HISTORY);
                         self.maybe_publish_history().await;
 
                         // Trigger consensus immediately after a successful close.
                         if self.is_validator {
+                            self.set_phase_sub(super::phase::PHASE_6_10_TRY_TRIGGER_CONSENSUS);
                             self.try_trigger_consensus().await;
                         }
 
@@ -332,6 +334,7 @@ impl App {
                             "post_close_scp_drain",
                             scp_drained,
                         );
+                        self.set_phase_sub(super::phase::PHASE_6_11_FETCH_DRAIN);
                         let fetch_drain_start = std::time::Instant::now();
                         let mut fetch_drained: u64 = 0;
                         for _ in 0..MAX_DRAIN_PER_TICK {
@@ -350,6 +353,7 @@ impl App {
                             fetch_drained,
                         );
                         if pending_catchup.is_none() {
+                            self.set_phase_sub(super::phase::PHASE_6_12_PROCESS_EXTERNALIZED_SLOTS);
                             if let Some(pc) = self.process_externalized_slots().await {
                                 pending_catchup = Some(pc);
                             }

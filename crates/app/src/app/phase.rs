@@ -7,6 +7,17 @@
 //! `phase` and `phase_sub` in its warn/error lines, so the next freeze
 //! heartbeat names the exact `.await`.
 //!
+//! ## Phase 6 (`pending_close`)
+//!
+//! Issue #1921 context: the coarse `phase=6` covers the entire
+//! post-close window — from `handle_close_complete_inner` (ledger_close.rs)
+//! through `maybe_publish_history`, `try_trigger_consensus`, SCP/fetch
+//! drain loops, and `process_externalized_slots` (lifecycle.rs:261-370).
+//! The `PHASE_6_*` constants below provide coarse attribution within
+//! phase 6, narrowing a stall to one of 12 sub-regions.
+//!
+//! ## Phase 13 (`buffered_catchup`)
+//!
 //! Issue #1788 context: the coarse `phase=13 buffered_catchup` label
 //! covers everything from
 //! `process_externalized_slots` (ledger_close.rs) stamping `set_phase(13)`
@@ -18,6 +29,66 @@
 //!
 //! Convention: constants are one-based dense integers within a coarse
 //! phase. Zero means "coarse phase entered, sub-phase not yet set".
+
+// ── Phase 6: pending_close (issue #1921) ─────────────────────────────
+
+/// `handle_close_complete_inner`: about to acquire
+/// `syncing_ledgers.write().await` on hash-mismatch error path.
+pub(crate) const PHASE_6_1_SYNCING_LEDGERS_HASH_MISMATCH: u32 = 1;
+
+/// `handle_close_complete_inner`: about to call
+/// `writer.write_meta(...).await` for metadata emission.
+pub(crate) const PHASE_6_2_WRITE_META: u32 = 2;
+
+/// `handle_close_complete_inner`: about to call
+/// `overlay().await` + `clear_ledgers_below()`.
+pub(crate) const PHASE_6_3_OVERLAY_CLEAR_LEDGERS: u32 = 3;
+
+/// `handle_close_complete_inner`: about to call
+/// `overlay().await` + `handle_max_tx_size_increase().await` (two awaits).
+pub(crate) const PHASE_6_4_OVERLAY_MAX_TX_SIZE: u32 = 4;
+
+/// `handle_close_complete_inner`: about to acquire
+/// `survey_limiter.write().await` for clearing old ledgers.
+pub(crate) const PHASE_6_5_SURVEY_LIMITER_WRITE: u32 = 5;
+
+/// `handle_close_complete_inner`: about to call
+/// `join.await` on `spawn_blocking` tx-queue work.
+pub(crate) const PHASE_6_6_TX_QUEUE_JOIN: u32 = 6;
+
+/// `handle_close_complete_inner`: about to acquire
+/// `last_processed_slot.write().await`.
+pub(crate) const PHASE_6_7_LAST_PROCESSED_SLOT_WRITE: u32 = 7;
+
+/// `handle_close_complete_inner`: about to call
+/// `clear_tx_advert_history(...)` (internally acquires 4 write locks:
+/// `tx_adverts_by_peer`, `tx_demand_history`, `tx_set_dont_have`,
+/// `tx_set_last_request`).
+pub(crate) const PHASE_6_8_CLEAR_TX_ADVERT_HISTORY: u32 = 8;
+
+/// `lifecycle.rs` post-close: about to call `maybe_publish_history().await`.
+pub(crate) const PHASE_6_9_MAYBE_PUBLISH_HISTORY: u32 = 9;
+
+/// `lifecycle.rs` post-close: about to call `try_trigger_consensus().await`.
+pub(crate) const PHASE_6_10_TRY_TRIGGER_CONSENSUS: u32 = 10;
+
+/// `lifecycle.rs` post-close: about to drain fetch response channel.
+/// Each iteration calls `handle_overlay_message` which may have
+/// internal awaits.
+pub(crate) const PHASE_6_11_FETCH_DRAIN: u32 = 11;
+
+/// `lifecycle.rs` post-close: about to call
+/// `process_externalized_slots().await`. Only covers the pre-transition
+/// prefix; the method overrides coarse phase to 11/13 internally.
+pub(crate) const PHASE_6_12_PROCESS_EXTERNALIZED_SLOTS: u32 = 12;
+
+/// Test helper: return the highest phase-6 sub-phase constant.
+#[cfg(test)]
+pub(crate) const fn max_defined_phase_6_sub_phase() -> u32 {
+    PHASE_6_12_PROCESS_EXTERNALIZED_SLOTS
+}
+
+// ── Phase 13: buffered_catchup (issue #1788) ─────────────────────────
 
 /// `maybe_start_buffered_catchup`: about to acquire
 /// `syncing_ledgers.write().await` for trim/evict (catchup_impl.rs).
@@ -83,9 +154,9 @@ pub(crate) const PHASE_13_14_VALIDATE_TARGET_CHECKPOINT: u32 = 14;
 /// `validate_archive_has_newer_checkpoint`.
 pub(crate) const PHASE_13_15_VALIDATE_ARCHIVE_NEWER: u32 = 15;
 
-/// Test helper: return the highest sub-phase constant in use. New
-/// constants added above must increase this.
+/// Test helper: return the highest phase-13 sub-phase constant in use.
+/// New constants added above must increase this.
 #[cfg(test)]
-pub(crate) const fn max_defined_sub_phase() -> u32 {
+pub(crate) const fn max_defined_phase_13_sub_phase() -> u32 {
     PHASE_13_15_VALIDATE_ARCHIVE_NEWER
 }

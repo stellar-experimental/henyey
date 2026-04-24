@@ -469,7 +469,7 @@ fn default_query_thread_pool_size() -> usize {
 /// soroban_diagnostic_events = true
 /// tx_submission_diagnostics = true
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticsConfig {
     /// When true, include Soroban diagnostic events in `LedgerCloseMeta`.
     /// Maps to stellar-core's `ENABLE_SOROBAN_DIAGNOSTIC_EVENTS`.
@@ -485,11 +485,25 @@ pub struct DiagnosticsConfig {
     /// the watchdog thread calls `std::process::abort()` to terminate the
     /// process and (if `ulimit -c` allows) generate a core dump.
     ///
-    /// Set to `0` (default) to disable auto-abort. Recommended value: `120`.
+    /// Defaults to `120`. Set to `0` to disable auto-abort.
     /// Requires a process supervisor (systemd, monitor-loop) to restart
     /// the node after the abort.
-    #[serde(default)]
+    #[serde(default = "default_watchdog_abort_secs")]
     pub watchdog_abort_secs: u64,
+}
+
+fn default_watchdog_abort_secs() -> u64 {
+    120
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        Self {
+            soroban_diagnostic_events: false,
+            tx_submission_diagnostics: false,
+            watchdog_abort_secs: default_watchdog_abort_secs(),
+        }
+    }
 }
 
 /// Testing overrides for accelerated or customized behavior.
@@ -2401,5 +2415,58 @@ bucket_io_concurrency = 12
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.rpc.rpc_db_concurrency, 4);
         assert_eq!(config.rpc.bucket_io_concurrency, 12);
+    }
+
+    // ── watchdog_abort_secs default tests (issue #1921) ──────────────
+
+    #[test]
+    fn test_diagnostics_config_default_watchdog_abort_secs() {
+        assert_eq!(DiagnosticsConfig::default().watchdog_abort_secs, 120);
+    }
+
+    #[test]
+    fn test_testnet_config_watchdog_abort_secs() {
+        assert_eq!(AppConfig::testnet().diagnostics.watchdog_abort_secs, 120);
+    }
+
+    #[test]
+    fn test_mainnet_config_watchdog_abort_secs() {
+        assert_eq!(AppConfig::mainnet().diagnostics.watchdog_abort_secs, 120);
+    }
+
+    #[test]
+    fn test_toml_no_diagnostics_section_defaults_watchdog_abort_secs() {
+        let toml_str = r#"
+[node]
+name = "test"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.diagnostics.watchdog_abort_secs, 120);
+    }
+
+    #[test]
+    fn test_toml_diagnostics_section_no_watchdog_defaults() {
+        let toml_str = r#"
+[node]
+name = "test"
+
+[diagnostics]
+soroban_diagnostic_events = true
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.diagnostics.watchdog_abort_secs, 120);
+    }
+
+    #[test]
+    fn test_toml_explicit_watchdog_zero_honored() {
+        let toml_str = r#"
+[node]
+name = "test"
+
+[diagnostics]
+watchdog_abort_secs = 0
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.diagnostics.watchdog_abort_secs, 0);
     }
 }
