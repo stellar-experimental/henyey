@@ -1094,6 +1094,19 @@ impl EvictionThresholds {
     }
 }
 
+/// ## Lock Ordering (MUST be followed by all methods)
+///
+/// When acquiring multiple write locks, always acquire in this order:
+///
+///   `store → account_states → banned_transactions → seen`
+///
+/// `validation_context` is excluded: it is only read-locked in
+/// multi-lock contexts. If a future change needs `.write()` while
+/// holding other locks, add it to this order.
+///
+/// Violating this order creates ABBA deadlock risk between concurrent
+/// callers (e.g., RPC `try_add` vs spawn_blocking `remove_applied`).
+/// See issue #1930 for the deadlock that motivated this invariant.
 pub struct TransactionQueue {
     /// Configuration.
     config: TxQueueConfig,
@@ -1883,6 +1896,14 @@ impl TransactionQueue {
         let ledger_version = self.validation_context.read().protocol_version;
         let queued_is_soroban = henyey_tx::envelope_utils::is_soroban_envelope(&queued.envelope);
 
+        // Re-check ban after acquiring store.write() to close the TOCTOU
+        // window with ban(). The early is_banned() check (above) is a
+        // fast-path that avoids the store lock; this re-check ensures we
+        // see any ban() that completed between the two checks.
+        if self.is_banned(&queued.hash) {
+            return TxQueueResult::Banned;
+        }
+
         // Parity: check Soroban resource limits against network config
         if queued_is_soroban {
             if let Err(reason) = self.check_soroban_resources(&queued.envelope) {
@@ -1952,14 +1973,16 @@ impl TransactionQueue {
             store.remove(&evicted.hash, ledger_version);
         }
         if !pending_eviction_list.is_empty() {
-            let mut seen = self.seen.write();
+            // Lock order: account_states → banned → seen (canonical order
+            // within the store scope — see TransactionQueue doc comment).
             let mut account_states = self.account_states.write();
+            let mut banned = self.banned_transactions.write();
+            let mut seen = self.seen.write();
             for evicted in &pending_eviction_list {
                 seen.remove(&evicted.hash);
                 Self::drop_transaction(&mut account_states, evicted);
             }
             // Ban evicted hashes so they cannot be re-submitted immediately.
-            let mut banned = self.banned_transactions.write();
             if let Some(newest) = banned.back_mut() {
                 for evicted in &pending_eviction_list {
                     newest.insert(evicted.hash);
@@ -2281,7 +2304,13 @@ impl TransactionQueue {
             return;
         }
 
+        // Lock order: store → account_states → banned → seen (canonical).
+        let mut store = self.store.write();
+        let mut account_states = self.account_states.write();
         let mut banned = self.banned_transactions.write();
+        let mut seen = self.seen.write();
+        let ledger_version = self.validation_context.read().protocol_version;
+
         // Add to the newest (back) set
         if let Some(newest) = banned.back_mut() {
             for hash in tx_hashes {
@@ -2291,10 +2320,6 @@ impl TransactionQueue {
 
         // Also remove from the queue if present, cleaning up account_states.
         // Mirrors stellar-core's ban() which calls dropTransaction().
-        let mut store = self.store.write();
-        let mut account_states = self.account_states.write();
-        let mut seen = self.seen.write();
-        let ledger_version = self.validation_context.read().protocol_version;
         let mut did_remove = false;
         for hash in tx_hashes {
             if let Some(removed) = store.remove(hash, ledger_version) {
@@ -2376,8 +2401,9 @@ impl TransactionQueue {
             return;
         }
 
-        let mut account_states = self.account_states.write();
+        // Lock order: store → account_states → banned (canonical).
         let mut store = self.store.write();
+        let mut account_states = self.account_states.write();
         let mut banned = self.banned_transactions.write();
         let ledger_version = self.validation_context.read().protocol_version;
 
@@ -2478,9 +2504,10 @@ impl TransactionQueue {
     ///
     /// A `ShiftResult` with details about unbanned and auto-banned transactions.
     pub fn shift(&self) -> ShiftResult {
-        let mut banned = self.banned_transactions.write();
-        let mut account_states = self.account_states.write();
+        // Lock order: store → account_states → banned (canonical).
         let mut store = self.store.write();
+        let mut account_states = self.account_states.write();
+        let mut banned = self.banned_transactions.write();
         let ledger_version = self.validation_context.read().protocol_version;
 
         // Remove the oldest set (front) to unban those transactions
