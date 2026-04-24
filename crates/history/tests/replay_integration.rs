@@ -347,3 +347,237 @@ async fn test_catchup_replay_bucket_hash_verification() {
     let final_header = ledger_manager.current_header();
     assert_eq!(final_header.ledger_seq, target);
 }
+
+/// Test that Recent(N) with a gap larger than N triggers the bucket-apply +
+/// short-replay path (Case 1b → Case 5 in CatchupRange).
+///
+/// Scenario: LCL=100, target=200, Recent(50) → gap=100 > 50
+/// Expected: apply_buckets at checkpoint 127, replay 128..200 (73 ledgers)
+#[tokio::test(flavor = "multi_thread")]
+async fn test_catchup_recent_large_gap_bucket_apply() {
+    use henyey_history::CatchupMode;
+    use stellar_xdr::curr::{
+        GeneralizedTransactionSet, ParallelTxsComponent, TransactionPhase, TransactionSetV1,
+    };
+
+    let bucket_apply_at = 127u32; // checkpoint where buckets are applied
+    let target = 200u32;
+    let lcl = 100u32;
+
+    // Compute the empty bucket list hash for the checkpoint header.
+    let bucket_list = empty_bucket_list();
+    let checkpoint_bucket_hash = combined_bucket_list_hash(bucket_list.hash());
+
+    // Pre-compute the empty tx result hash (same for every ledger).
+    let empty_result_set = TransactionResultSet {
+        results: VecM::default(),
+    };
+    let empty_result_xdr = empty_result_set
+        .to_xdr(stellar_xdr::curr::Limits::none())
+        .expect("tx result xdr");
+    let empty_tx_result_hash = Hash256::hash(&empty_result_xdr);
+
+    // Helper: compute the generalized empty tx set hash for a given prev_hash.
+    // This must match what `empty_tx_history_entry` produces for protocol >= 20.
+    let compute_empty_gen_tx_set_hash = |prev_hash: &Hash256| -> Hash256 {
+        let classic_phase = TransactionPhase::V0(VecM::default());
+        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: None,
+            execution_stages: VecM::default(),
+        });
+        let gen_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash(*prev_hash.as_bytes()),
+            phases: vec![classic_phase, soroban_phase]
+                .try_into()
+                .unwrap_or_default(),
+        });
+        let gen_set_variant = TransactionSetVariant::Generalized(gen_set);
+        henyey_history::verify::compute_tx_set_hash(&gen_set_variant).expect("tx set hash")
+    };
+
+    // Build a header chain from ledger 127 (bucket-apply checkpoint) to 200 (target).
+    // Ledger 127 is the checkpoint header; 128..200 are replayed.
+    let mut headers: Vec<(u32, LedgerHeader, Hash256)> = Vec::new();
+
+    // Ledger 127: checkpoint header
+    // Use Hash256::ZERO for prev_hash (we don't verify chain anchors in this test).
+    // tx_set_hash is not verified for the checkpoint header itself (only for replayed ledgers).
+    let header_127 = make_header(
+        bucket_apply_at,
+        Hash256::ZERO,
+        checkpoint_bucket_hash,
+        Hash256::ZERO, // tx_set_hash not checked for checkpoint header
+        Hash256::ZERO, // tx_result_hash not checked for checkpoint header
+    );
+    let hash_127 = verify::compute_header_hash(&header_127).expect("header hash 127");
+    headers.push((bucket_apply_at, header_127, hash_127));
+
+    // Ledgers 128..200: replayed ledgers with correct hash chain
+    let mut prev_hash = hash_127;
+    for seq in (bucket_apply_at + 1)..=target {
+        let tx_set_hash = compute_empty_gen_tx_set_hash(&prev_hash);
+        let header = make_header(
+            seq,
+            prev_hash,
+            Hash256::ZERO, // bucket_list_hash not verified (verify_bucket_list=false)
+            tx_set_hash,
+            empty_tx_result_hash,
+        );
+        let hash = verify::compute_header_hash(&header).expect("header hash");
+        headers.push((seq, header, hash));
+        prev_hash = hash;
+    }
+
+    // Group headers into checkpoint files.
+    // Checkpoint 127: ledgers 64-127 (we only have 127)
+    // Checkpoint 191: ledgers 128-191
+    // Checkpoint 255: ledgers 192-255 (we only have 192-200)
+    let mut fixtures: HashMap<String, Vec<u8>> = HashMap::new();
+
+    // Build header XDR per checkpoint
+    for &checkpoint in &[127u32, 191, 255] {
+        let entries: Vec<Vec<u8>> = headers
+            .iter()
+            .filter(|(seq, _, _)| {
+                henyey_history::checkpoint::checkpoint_containing(*seq) == checkpoint
+            })
+            .map(|(_, header, hash)| {
+                let entry = LedgerHeaderHistoryEntry {
+                    hash: Hash(*hash.as_bytes()),
+                    header: header.clone(),
+                    ext: LedgerHeaderHistoryEntryExt::default(),
+                };
+                entry
+                    .to_xdr(stellar_xdr::curr::Limits::none())
+                    .expect("header xdr")
+            })
+            .collect();
+        if !entries.is_empty() {
+            fixtures.insert(
+                checkpoint_path("ledger", checkpoint, "xdr.gz"),
+                gzip_bytes(&record_marked(&entries)),
+            );
+        }
+    }
+
+    // Empty transaction and result files for checkpoints 191 and 255
+    // (download_ledger_data only downloads from checkpoint_seq+1 = 128 to target = 200)
+    for &checkpoint in &[191u32, 255] {
+        fixtures.insert(
+            checkpoint_path("transactions", checkpoint, "xdr.gz"),
+            gzip_bytes(&[]),
+        );
+        fixtures.insert(
+            checkpoint_path("results", checkpoint, "xdr.gz"),
+            gzip_bytes(&[]),
+        );
+    }
+
+    // HAS at checkpoint 127
+    let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
+    for _ in 0..BUCKET_LIST_LEVELS {
+        levels.push(HASBucketLevel {
+            curr: "0".repeat(64),
+            snap: "0".repeat(64),
+            next: Default::default(),
+        });
+    }
+    let has = HistoryArchiveState {
+        version: 2,
+        server: Some("henyey test".to_string()),
+        current_ledger: bucket_apply_at,
+        network_passphrase: Some("Test SDF Network ; September 2015".to_string()),
+        current_buckets: levels,
+        hot_archive_buckets: None,
+    };
+    fixtures.insert(
+        checkpoint_path("history", bucket_apply_at, "json"),
+        has.to_json().unwrap().into_bytes(),
+    );
+
+    // Serve fixtures via Axum
+    let fixtures = Arc::new(fixtures);
+    let app =
+        Router::new()
+            .route(
+                "/*path",
+                get(
+                    |Path(path): Path<String>,
+                     State(state): State<Arc<HashMap<String, Vec<u8>>>>| async move {
+                        let key = path.trim_start_matches('/');
+                        if let Some(body) = state.get(key) {
+                            (StatusCode::OK, body.clone())
+                        } else {
+                            (StatusCode::NOT_FOUND, Vec::new())
+                        }
+                    },
+                ),
+            )
+            .with_state(Arc::clone(&fixtures));
+
+    let listener = match TcpListener::bind("127.0.0.1:0").await {
+        Ok(listener) => listener,
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            eprintln!("skipping test: tcp bind not permitted in this environment");
+            return;
+        }
+        Err(err) => panic!("bind: {err}"),
+    };
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+
+    let base_url = format!("http://{}/", addr);
+    let archive = HistoryArchive::new(&base_url).expect("archive");
+
+    let bucket_dir = tempfile::tempdir().expect("bucket dir");
+    let bucket_manager =
+        henyey_bucket::BucketManager::new(bucket_dir.path().to_path_buf()).expect("bucket manager");
+    let db = Database::open_in_memory().expect("db");
+
+    let ledger_manager = henyey_ledger::LedgerManager::new(
+        "Test SDF Network ; September 2015".to_string(),
+        henyey_ledger::LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        },
+    );
+
+    let mut manager = CatchupManagerBuilder::new()
+        .add_archive(archive)
+        .bucket_manager(bucket_manager)
+        .database(db)
+        .options(CatchupOptions {
+            verify_buckets: false,
+            verify_headers: false,
+        })
+        .build()
+        .expect("catchup manager");
+
+    manager.set_replay_config(henyey_history::ReplayConfig {
+        verify_bucket_list: false,
+        verify_results: false,
+        ..Default::default()
+    });
+
+    // Call catchup_to_ledger_with_mode with Recent(50) and lcl=100.
+    // Since apply_buckets=true (gap 100 > 50) and existing_state=None,
+    // this can only succeed via the bucket-apply path.
+    let output = manager
+        .catchup_to_ledger_with_mode(target, CatchupMode::Recent(50), lcl, None, &ledger_manager)
+        .await
+        .expect("catchup with Recent(50) and large gap should succeed");
+
+    // Verify the bucket-apply + replay path was taken with correct values.
+    assert_eq!(output.ledger_seq, target, "should reach target ledger");
+    assert_eq!(
+        output.ledgers_applied, 73,
+        "should replay 73 ledgers (128..200)"
+    );
+    let final_header = ledger_manager.current_header();
+    assert_eq!(
+        final_header.ledger_seq, target,
+        "ledger manager should advance to target"
+    );
+}
