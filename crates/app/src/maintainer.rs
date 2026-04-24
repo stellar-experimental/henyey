@@ -97,7 +97,7 @@ pub struct Maintainer {
     config: MaintenanceConfig,
     shutdown_rx: watch::Receiver<bool>,
     /// Function to get the current LCL and minimum queued checkpoint
-    get_ledger_bounds: Box<dyn Fn() -> (u32, Option<u32>) + Send + Sync>,
+    get_ledger_bounds: Arc<dyn Fn() -> (u32, Option<u32>) + Send + Sync>,
 }
 
 impl Maintainer {
@@ -120,7 +120,7 @@ impl Maintainer {
             database,
             config: MaintenanceConfig::default(),
             shutdown_rx,
-            get_ledger_bounds: Box::new(get_ledger_bounds),
+            get_ledger_bounds: Arc::new(get_ledger_bounds),
         }
     }
 
@@ -138,7 +138,7 @@ impl Maintainer {
             database,
             config,
             shutdown_rx,
-            get_ledger_bounds: Box::new(get_ledger_bounds),
+            get_ledger_bounds: Arc::new(get_ledger_bounds),
         }
     }
 
@@ -183,12 +183,12 @@ impl Maintainer {
                     let db = Arc::clone(&self.database);
                     let config_count = self.config.count;
                     let rpc_retention_window = self.config.rpc_retention_window;
-                    let get_bounds = &self.get_ledger_bounds;
-                    let (lcl, min_queued) = get_bounds();
+                    let get_bounds = Arc::clone(&self.get_ledger_bounds);
 
-                    let _ = henyey_common::spawn_blocking_logged(
+                    match henyey_common::spawn_blocking_logged(
                         "maintainer-cycle",
                         move || {
+                            let (lcl, min_queued) = get_bounds();
                             let start = std::time::Instant::now();
                             info!("Performing database maintenance");
 
@@ -212,7 +212,16 @@ impl Maintainer {
                             }
                         },
                     )
-                    .await;
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(join_err) if join_err.is_panic() => {
+                            std::panic::resume_unwind(join_err.into_panic());
+                        }
+                        Err(join_err) => {
+                            warn!("Maintenance task cancelled: {join_err}");
+                        }
+                    }
                 }
                 _ = self.shutdown_rx.changed() => {
                     if *self.shutdown_rx.borrow() {
