@@ -240,8 +240,11 @@ capped at 3 retained. Report how many files were removed if any.
 and `du -sh /home/tomer/data/mainnet/`. If combined > 200 GB, flag SESSION DISK HIGH.
 
 **(7) Memory report** — `grep 'Memory report summary' /home/tomer/data/$MONITOR_SESSION_ID/logs/monitor.log | tail -1`.
-If grep returns no output, flag WARNING memory-report-missing (log format may have
-changed). Otherwise extract `jemalloc_allocated_mb`, `jemalloc_resident_mb`,
+If grep returns no output AND process uptime > 400s, flag WARNING
+memory-report-missing (log format may have changed). Memory reports emit
+every ~6 minutes, so an uptime below 400s legitimately has no entry yet on
+a post-restart tick — report `memreport: N/A (warmup)` and move on.
+Otherwise extract `jemalloc_allocated_mb`, `jemalloc_resident_mb`,
 `fragmentation_pct`, `heap_components_mb`, `mmap_mb`, `unaccounted_mb`,
 `unaccounted_sign`. If `fragmentation_pct > 50`, flag HIGH FRAGMENTATION.
 If `unaccounted_mb > 1000` with sign `+`, note it (known jemalloc overhead,
