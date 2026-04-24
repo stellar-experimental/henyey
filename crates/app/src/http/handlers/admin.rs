@@ -172,10 +172,14 @@ pub(crate) async fn maintenance_handler(
 
     let count = params.count.unwrap_or(state.app.config().maintenance.count);
     let app = Arc::clone(&state.app);
-    let _ = henyey_common::spawn_blocking_logged("maintenance", move || {
+    match henyey_common::spawn_blocking_logged("maintenance", move || {
         app.perform_maintenance(count);
     })
-    .await;
+    .await
+    {
+        Ok(()) => {}
+        Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
+    }
 
     Json(MaintenanceResponse {
         message: "Done".to_string(),

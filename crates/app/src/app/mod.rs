@@ -7712,4 +7712,36 @@ mod tests {
         let peers = App::tx_set_eligible_peers(&[]);
         assert!(peers.is_empty());
     }
+
+    /// Verify `db_blocking` propagates Ok, Err, and re-panics JoinError.
+    /// Uses a real App constructed via `App::new` with a temp database.
+    #[tokio::test]
+    async fn test_db_blocking_ok_and_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.database.path = dir.path().join("test.db");
+        let app = App::new(config).await.unwrap();
+
+        // Ok path
+        let result = app.db_blocking("test-ok", |_db| Ok(42)).await;
+        assert_eq!(result.unwrap(), 42);
+
+        // Err path
+        let result: anyhow::Result<()> = app
+            .db_blocking("test-err", |_db| anyhow::bail!("simulated"))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("simulated"));
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "boom")]
+    async fn test_db_blocking_repanics_on_join_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.database.path = dir.path().join("test.db");
+        let app = App::new(config).await.unwrap();
+
+        let _: anyhow::Result<()> = app.db_blocking("test-panic", |_db| panic!("boom")).await;
+    }
 }

@@ -38,10 +38,14 @@ pub(crate) async fn compat_maintenance_handler(
 
     let count = params.count.unwrap_or(state.app.config().maintenance.count);
     let app = Arc::clone(&state.app);
-    let _ = henyey_common::spawn_blocking_logged("compat-maintenance", move || {
+    match henyey_common::spawn_blocking_logged("compat-maintenance", move || {
         app.perform_maintenance(count);
     })
-    .await;
+    .await
+    {
+        Ok(()) => {}
+        Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
+    }
     "Done\n".to_string()
 }
 
