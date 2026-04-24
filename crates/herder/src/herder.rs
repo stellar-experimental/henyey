@@ -1750,6 +1750,11 @@ impl Herder {
             .ok_or_else(|| HerderError::Internal("Failed to build nomination value".into()))?;
         let build_value_ms = t0.elapsed().as_millis();
 
+        // build_nomination_value() caches the tx set but no longer drains
+        // ready envelopes inline. Drain now — safe because trigger_next_ledger
+        // runs on spawn_blocking from the app layer.
+        self.process_ready_fetching_envelopes();
+
         // Cache the nomination value for this slot so timeout retries reuse it,
         // matching stellar-core's by-value lambda capture.
         *self.cached_nomination_value.write() = Some((slot, value.clone()));
@@ -1919,6 +1924,11 @@ impl Herder {
     ///
     /// Called when the nomination timer expires. Re-nominates with the same
     /// value to try to make progress.
+    ///
+    /// Callers must ensure this runs on `spawn_blocking` (not the async
+    /// event loop) because the cache-miss fallback calls
+    /// `build_nomination_value()` → `cache_tx_set()` and then drains
+    /// ready envelopes via `process_ready_fetching_envelopes()`.
     pub fn handle_nomination_timeout(&self, slot: SlotIndex) {
         if !self.is_validator() {
             return; // Observers don't nominate
@@ -1927,7 +1937,7 @@ impl Herder {
 
         // Reuse the cached nomination value for this slot, matching stellar-core's
         // by-value lambda capture (NominationProtocol.cpp:654-659).
-        let value = {
+        let cached_value = {
             let cached = self.cached_nomination_value.read();
             cached
                 .as_ref()
@@ -1937,7 +1947,16 @@ impl Herder {
 
         // Fall back to building a fresh value if none cached (e.g., if
         // trigger_next_ledger wasn't called for this slot).
-        let value = value.or_else(|| self.build_nomination_value());
+        let (value, built_fresh) = match cached_value {
+            Some(v) => (Some(v), false),
+            None => (self.build_nomination_value(), true),
+        };
+
+        // build_nomination_value() caches a tx set but no longer drains
+        // ready envelopes inline. Drain only when the fallback fired.
+        if built_fresh {
+            self.process_ready_fetching_envelopes();
+        }
 
         if let Some(value) = value {
             if self.scp.nominate_timeout(slot, value, &prev_value) {
@@ -2081,8 +2100,9 @@ impl Herder {
             tx_count = tx_set.len(),
             "Proposing transaction set"
         );
-        // Use herder-level cache_tx_set which also notifies FetchingEnvelopes
-        // and drains any envelopes that were waiting for this tx_set.
+        // Cache the tx set and notify FetchingEnvelopes. Does NOT drain the
+        // ready queue — callers (trigger_next_ledger, handle_nomination_timeout)
+        // are responsible for draining via process_ready_fetching_envelopes().
         self.cache_tx_set(tx_set.clone());
 
         // 4. Upgrades: config + runtime, filtered against current state.
@@ -2532,18 +2552,55 @@ impl Herder {
         processed
     }
 
-    /// Cache a transaction set directly.
+    /// Cache a transaction set and notify FetchingEnvelopes.
     ///
-    /// This also notifies the fetching envelopes manager, which may
-    /// process any waiting envelopes.
-    pub fn cache_tx_set(&self, tx_set: TransactionSet) {
+    /// Stores the tx set in the SCP driver and notifies FetchingEnvelopes
+    /// so blocked envelopes become ready. Does NOT drain the ready queue —
+    /// callers must call `process_ready_fetching_envelopes()` separately
+    /// (via `spawn_blocking` to avoid event-loop stalls).
+    ///
+    /// Concurrent drains are safe: `process_ready_fetching_envelopes()`
+    /// acquires interior locks, so overlapping calls from multiple
+    /// `spawn_blocking` tasks serialize correctly.
+    fn cache_tx_set(&self, tx_set: TransactionSet) {
         let hash = *tx_set.hash();
         self.scp_driver.cache_tx_set(tx_set);
 
-        // Notify fetching envelopes and process any that become ready
         let slot = self.tracking_slot();
         self.fetching_envelopes.tx_set_available(hash, slot);
-        self.process_ready_fetching_envelopes();
+    }
+
+    /// Cache a transaction set and drain ready envelopes off the event loop.
+    ///
+    /// This is the async-safe public entry point. It calls [`cache_tx_set`]
+    /// (cache + notify) then spawns [`process_ready_fetching_envelopes`] on
+    /// the blocking pool via `spawn_blocking`, matching the pattern in
+    /// [`receive_tx_set`](Self::receive_tx_set).
+    pub async fn cache_tx_set_and_drain(self: Arc<Self>, tx_set: TransactionSet) {
+        self.cache_tx_set(tx_set);
+
+        let herder_for_drain = Arc::clone(&self);
+        let join_result = tokio::task::spawn_blocking(move || {
+            herder_for_drain.process_ready_fetching_envelopes()
+        })
+        .await;
+
+        match join_result {
+            Ok(_processed) => {}
+            Err(e) if e.is_panic() => {
+                error!(
+                    error = %e,
+                    "process_ready_fetching_envelopes panicked in spawn_blocking \
+                     after cache_tx_set; envelope drain may be incomplete"
+                );
+            }
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "spawn_blocking join error for envelope drain after cache_tx_set"
+                );
+            }
+        }
     }
 
     /// Check if a transaction set is cached.
@@ -4710,6 +4767,161 @@ mod tests {
             "#1907: heartbeat must make progress during drain \
              (observed {} ticks); if 0, the event-loop thread was \
              blocked — the spawn_blocking off-load was lost",
+            ticks_during_drain,
+        );
+    }
+
+    /// Regression test for #1922: `cache_tx_set()` (the private method) must
+    /// NOT drain ready envelopes inline. Only an explicit
+    /// `process_ready_fetching_envelopes()` call should drain them.
+    #[test]
+    fn test_issue_1922_cache_tx_set_does_not_drain_inline() {
+        use stellar_xdr::curr::Hash as XdrHash;
+
+        let herder = make_test_herder();
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+
+        // Synthesise 10 ready envelopes for slot 1.
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([42u8; 32]),
+        ));
+        let mut envelopes = Vec::with_capacity(10);
+        for i in 0..10 {
+            let ballot = ScpBallot {
+                counter: i as u32 + 1,
+                value: Value(vec![0u8; 1].try_into().unwrap()),
+            };
+            let statement = ScpStatement {
+                node_id: node_id.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: XdrHash([0u8; 32]),
+                    ballot,
+                    prepared: None,
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            };
+            envelopes.push(ScpEnvelope {
+                statement,
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            });
+        }
+        herder.fetching_envelopes.test_insert_ready(1, envelopes);
+
+        assert_eq!(
+            herder.fetching_envelopes.ready_slots(),
+            vec![1],
+            "pre-condition: slot 1 should be ready"
+        );
+
+        // Cache the tx set — this must NOT drain ready envelopes.
+        herder.cache_tx_set(tx_set);
+
+        assert_eq!(
+            herder.fetching_envelopes.ready_slots(),
+            vec![1],
+            "#1922: cache_tx_set() must NOT drain ready envelopes inline"
+        );
+
+        // Explicit drain clears the queue.
+        herder.process_ready_fetching_envelopes();
+
+        let popped = herder.fetching_envelopes.pop(1);
+        assert!(
+            popped.is_none(),
+            "Ready queue must be drained after explicit process_ready_fetching_envelopes()"
+        );
+    }
+
+    /// Regression test for #1922: `cache_tx_set_and_drain()` must free the
+    /// event loop during the drain by running it on `spawn_blocking`.
+    ///
+    /// Same heartbeat approach as test_issue_1773.
+    #[tokio::test(flavor = "current_thread", start_paused = false)]
+    async fn test_issue_1922_cache_tx_set_and_drain_frees_event_loop() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use stellar_xdr::curr::Hash as XdrHash;
+
+        let herder = Arc::new(make_test_herder());
+
+        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+
+        // Synthesise 400 ready envelopes for slot 1.
+        const BACKLOG: usize = 400;
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([42u8; 32]),
+        ));
+        let mut envelopes = Vec::with_capacity(BACKLOG);
+        for i in 0..BACKLOG {
+            let ballot = ScpBallot {
+                counter: i as u32 + 1,
+                value: Value(vec![0u8; 1].try_into().unwrap()),
+            };
+            let statement = ScpStatement {
+                node_id: node_id.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                    quorum_set_hash: XdrHash([0u8; 32]),
+                    ballot,
+                    prepared: None,
+                    prepared_prime: None,
+                    n_c: 0,
+                    n_h: 0,
+                }),
+            };
+            envelopes.push(ScpEnvelope {
+                statement,
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            });
+        }
+        herder.fetching_envelopes.test_insert_ready(1, envelopes);
+
+        assert_eq!(
+            herder.fetching_envelopes.ready_slots(),
+            vec![1],
+            "pre-condition: slot 1 should be ready"
+        );
+
+        // Heartbeat task
+        let heartbeat_count = Arc::new(AtomicU64::new(0));
+        let heartbeat_count_clone = Arc::clone(&heartbeat_count);
+        let heartbeat_handle = tokio::spawn(async move {
+            loop {
+                tokio::task::yield_now().await;
+                heartbeat_count_clone.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let count_before = heartbeat_count.load(Ordering::Relaxed);
+
+        // cache_tx_set_and_drain should offload the drain to spawn_blocking
+        Arc::clone(&herder).cache_tx_set_and_drain(tx_set).await;
+
+        let count_after = heartbeat_count.load(Ordering::Relaxed);
+        heartbeat_handle.abort();
+
+        // Ordering contract: drain completed before return.
+        let popped = herder.fetching_envelopes.pop(1);
+        assert!(
+            popped.is_none(),
+            "#1922 ordering contract: envelope drain must complete \
+             before cache_tx_set_and_drain returns"
+        );
+
+        // Free-event-loop property: heartbeat made progress during the await.
+        let ticks_during_drain = count_after.saturating_sub(count_before);
+        assert!(
+            ticks_during_drain >= 1,
+            "#1922: heartbeat must make progress during drain \
+             (observed {} ticks); if 0, the event-loop thread was \
+             blocked during the drain — the spawn_blocking off-load \
+             was lost",
             ticks_during_drain,
         );
     }

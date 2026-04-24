@@ -1073,8 +1073,9 @@ impl App {
                         gen_tx_set,
                     );
 
-                    // Cache it in herder (this will be available after catchup)
-                    self.herder.cache_tx_set(tx_set);
+                    // Cache it in herder and drain ready envelopes off the
+                    // event loop (this will be available after catchup).
+                    self.herder.clone().cache_tx_set_and_drain(tx_set).await;
                     cached_tx_sets += 1;
 
                     tracing::debug!(

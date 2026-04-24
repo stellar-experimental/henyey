@@ -1012,32 +1012,76 @@ impl App {
         let current_ledger = self.current_ledger_seq() as u64;
         let slot = self.herder.tracking_slot().max(current_ledger + 1);
         let now = self.clock.now();
-        let mut timeouts = self.scp_timeouts.write().await;
-        if timeouts.slot != slot {
-            timeouts.slot = slot;
-            timeouts.next_nomination = None;
-            timeouts.next_ballot = None;
-        }
 
-        if let Some(next) = timeouts.next_nomination {
-            if now >= next {
-                self.nomination_timeout_fires
-                    .fetch_add(1, Ordering::Relaxed);
-                self.herder.handle_nomination_timeout(slot);
+        // Phase 1: decide which timeouts fired, clear them, drop guard.
+        let (fire_nomination, fire_ballot) = {
+            let mut timeouts = self.scp_timeouts.write().await;
+            if timeouts.slot != slot {
+                timeouts.slot = slot;
                 timeouts.next_nomination = None;
+                timeouts.next_ballot = None;
+            }
+
+            let nom = match timeouts.next_nomination {
+                Some(next) if now >= next => {
+                    self.nomination_timeout_fires
+                        .fetch_add(1, Ordering::Relaxed);
+                    timeouts.next_nomination = None;
+                    true
+                }
+                _ => false,
+            };
+
+            let bal = match timeouts.next_ballot {
+                Some(next) if now >= next => {
+                    self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
+                    timeouts.next_ballot = None;
+                    true
+                }
+                _ => false,
+            };
+
+            (nom, bal)
+        }; // guard dropped
+
+        // Phase 2: execute handlers without holding the guard.
+        // Nomination timeout runs on spawn_blocking because the cache-miss
+        // fallback calls build_nomination_value → cache_tx_set, which can
+        // stall the event loop (#1922).
+        if fire_nomination {
+            let herder = Arc::clone(&self.herder);
+            match tokio::task::spawn_blocking(move || {
+                herder.handle_nomination_timeout(slot);
+            })
+            .await
+            {
+                Ok(()) => {}
+                Err(e) if e.is_panic() => {
+                    tracing::error!(
+                        slot,
+                        error = %e,
+                        "handle_nomination_timeout panicked in spawn_blocking"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        slot,
+                        error = %e,
+                        "spawn_blocking join error for nomination timeout"
+                    );
+                }
             }
         }
+        if fire_ballot {
+            self.herder.handle_ballot_timeout(slot);
+        }
+
+        // Phase 3: reschedule next timeouts (re-acquire guard).
+        // Done after handlers execute so get_*_timeout() sees updated SCP state.
+        let mut timeouts = self.scp_timeouts.write().await;
         if timeouts.next_nomination.is_none() {
             if let Some(timeout) = self.herder.get_nomination_timeout(slot) {
                 timeouts.next_nomination = Some(now + timeout);
-            }
-        }
-
-        if let Some(next) = timeouts.next_ballot {
-            if now >= next {
-                self.ballot_timeout_fires.fetch_add(1, Ordering::Relaxed);
-                self.herder.handle_ballot_timeout(slot);
-                timeouts.next_ballot = None;
             }
         }
         if timeouts.next_ballot.is_none() {
