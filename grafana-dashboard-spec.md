@@ -120,10 +120,10 @@ Since this is currently a single-node deployment, the instance variable exists f
 
 ### Panel 2.4: Apply Time
 - **Type:** timeseries
-- **Query:** `stellar_ledger_apply_us{job="henyey", instance=~"$instance"} / 1000`
-- **Y-axis:** milliseconds
-- **Legend:** "apply time (ms)"
-- **Description:** Total ledger apply time for the most recent close. This is the CPU-bound portion of the close (excludes consensus/network). Compare with close duration to see how much time is consensus vs execution.
+- **Query:** `rate(stellar_ledger_close_duration_seconds_sum{job="henyey", instance=~"$instance"}[1m]) / rate(stellar_ledger_close_duration_seconds_count{job="henyey", instance=~"$instance"}[1m])`
+- **Y-axis:** seconds
+- **Legend:** "avg close duration"
+- **Description:** Average ledger close duration over a 1-minute window. This is the total close time including execution and commit phases.
 
 ### Panel 2.5: Classic vs Soroban Execution (Rolling Average)
 - **Type:** timeseries (stacked area)

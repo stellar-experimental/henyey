@@ -866,18 +866,18 @@
       },
       "targets": [
         {
-          "expr": "stellar_ledger_apply_us{job=\"henyey\", instance=~\"$instance\"} / 1000",
+          "expr": "rate(stellar_ledger_close_duration_seconds_sum{job=\"henyey\", instance=~\"$instance\"}[1m]) / rate(stellar_ledger_close_duration_seconds_count{job=\"henyey\", instance=~\"$instance\"}[1m])",
           "datasource": {
             "type": "prometheus",
             "uid": "000000001"
           },
-          "legendFormat": "apply time (ms)",
+          "legendFormat": "avg close duration",
           "refId": "A"
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "ms",
+          "unit": "s",
           "custom": {
             "lineWidth": 1,
             "fillOpacity": 10,
