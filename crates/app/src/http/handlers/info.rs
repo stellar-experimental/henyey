@@ -183,8 +183,9 @@ pub(crate) async fn upgrades_handler(
 }
 
 pub(crate) async fn self_check_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    match state.app.self_check(32) {
-        Ok(result) => (
+    let app = Arc::clone(&state.app);
+    match henyey_common::spawn_blocking_logged("self-check", move || app.self_check(32)).await {
+        Ok(Ok(result)) => (
             StatusCode::OK,
             Json(SelfCheckResponse {
                 ok: result.ok,
@@ -193,7 +194,7 @@ pub(crate) async fn self_check_handler(State(state): State<Arc<ServerState>>) ->
                 message: None,
             }),
         ),
-        Err(err) => (
+        Ok(Err(err)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(SelfCheckResponse {
                 ok: false,
@@ -202,6 +203,7 @@ pub(crate) async fn self_check_handler(State(state): State<Arc<ServerState>>) ->
                 message: Some(err.to_string()),
             }),
         ),
+        Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
     }
 }
 

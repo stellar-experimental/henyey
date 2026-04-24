@@ -294,16 +294,14 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
                 ..Default::default()
             };
             let manager = PublishManager::new(publish_config);
-            manager
-                .publish_checkpoint(
-                    checkpoint,
-                    &headers,
-                    &tx_entries,
-                    &tx_results,
-                    &bucket_list,
-                    None,
-                )
-                .await?;
+            manager.publish_checkpoint(
+                checkpoint,
+                &headers,
+                &tx_entries,
+                &tx_results,
+                &bucket_list,
+                None,
+            )?;
 
             write_root_has(&publish_dir, &has)?;
             Some(publish_dir)
@@ -320,16 +318,14 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
             if !force && manager.is_published(checkpoint) {
                 continue;
             }
-            manager
-                .publish_checkpoint(
-                    checkpoint,
-                    &headers,
-                    &tx_entries,
-                    &tx_results,
-                    &bucket_list,
-                    None,
-                )
-                .await?;
+            manager.publish_checkpoint(
+                checkpoint,
+                &headers,
+                &tx_entries,
+                &tx_results,
+                &bucket_list,
+                None,
+            )?;
             write_scp_history_file(path, checkpoint, &scp_entries)?;
             write_root_has(path, &has)?;
             println!("OK ({})", url);

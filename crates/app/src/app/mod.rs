@@ -1323,6 +1323,27 @@ impl App {
         &self.db
     }
 
+    /// Run a blocking database operation on the Tokio blocking pool.
+    ///
+    /// Wraps `spawn_blocking_logged` with a cloned `Database` handle.
+    /// Re-panics on `JoinError` to preserve today's failure semantics:
+    /// the calling Tokio task still panics, so best-effort callers see a
+    /// task abort rather than a swallowed error.
+    pub(crate) async fn db_blocking<T, F>(&self, context: &str, f: F) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&henyey_db::Database) -> anyhow::Result<T> + Send + 'static,
+    {
+        let db = self.db.clone();
+        match henyey_common::spawn_blocking_logged(context, move || f(&db)).await {
+            Ok(result) => result,
+            Err(join_err) => {
+                // Panic in blocking task — re-panic to preserve today's semantics.
+                std::panic::resume_unwind(join_err.into_panic())
+            }
+        }
+    }
+
     /// Get the bucket snapshot manager for concurrent query access.
     pub fn bucket_snapshot_manager(&self) -> &Arc<BucketSnapshotManager> {
         &self.bucket_snapshot_manager

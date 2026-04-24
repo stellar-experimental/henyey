@@ -37,7 +37,11 @@ pub(crate) async fn compat_maintenance_handler(
     }
 
     let count = params.count.unwrap_or(state.app.config().maintenance.count);
-    state.app.perform_maintenance(count);
+    let app = Arc::clone(&state.app);
+    let _ = henyey_common::spawn_blocking_logged("compat-maintenance", move || {
+        app.perform_maintenance(count);
+    })
+    .await;
     "Done\n".to_string()
 }
 
@@ -298,16 +302,21 @@ pub(crate) async fn compat_self_check_handler(
     State(state): State<Arc<CompatServerState>>,
     Query(params): Query<SelfCheckParams>,
 ) -> impl IntoResponse {
-    match state.app.self_check(params.depth) {
-        Ok(result) => Json(serde_json::json!({
+    let app = Arc::clone(&state.app);
+    let depth = params.depth;
+    match henyey_common::spawn_blocking_logged("compat-self-check", move || app.self_check(depth))
+        .await
+    {
+        Ok(Ok(result)) => Json(serde_json::json!({
             "ok": result.ok,
             "checked_ledgers": result.checked_ledgers,
         }))
         .into_response(),
-        Err(e) => Json(serde_json::json!({
+        Ok(Err(e)) => Json(serde_json::json!({
             "exception": format!("{}", e),
         }))
         .into_response(),
+        Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
     }
 }
 

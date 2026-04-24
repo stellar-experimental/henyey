@@ -40,7 +40,12 @@ impl App {
         }
 
         // Load one queued checkpoint
-        let queued = match self.db.load_publish_queue(Some(1)) {
+        let queued = match self
+            .db_blocking("load-publish-queue", |db| {
+                db.load_publish_queue(Some(1)).map_err(Into::into)
+            })
+            .await
+        {
             Ok(q) => q,
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to load publish queue");
@@ -85,7 +90,7 @@ impl App {
             }
         };
 
-        tokio::spawn(async move {
+        tokio::task::spawn_blocking(move || {
             let command_archives: Vec<_> = app
                 .config
                 .history
@@ -94,10 +99,7 @@ impl App {
                 .filter(|a| a.put_enabled && a.put.is_some())
                 .collect();
 
-            match app
-                .publish_single_checkpoint(checkpoint, &command_archives)
-                .await
-            {
+            match app.publish_single_checkpoint(checkpoint, &command_archives) {
                 Ok(()) => {
                     if let Err(e) = app.db.remove_publish(checkpoint) {
                         tracing::warn!(checkpoint, error = %e, "Failed to dequeue published checkpoint");
@@ -114,7 +116,7 @@ impl App {
     }
 
     /// Publish a single checkpoint to all command-based archives.
-    async fn publish_single_checkpoint(
+    fn publish_single_checkpoint(
         &self,
         checkpoint: u32,
         archives: &[&crate::config::HistoryArchiveEntry],
@@ -207,16 +209,14 @@ impl App {
             ..Default::default()
         };
         let manager = PublishManager::new(publish_config);
-        manager
-            .publish_checkpoint(
-                checkpoint,
-                &headers,
-                &tx_entries,
-                &tx_results,
-                &bucket_list,
-                Some(&has),
-            )
-            .await?;
+        manager.publish_checkpoint(
+            checkpoint,
+            &headers,
+            &tx_entries,
+            &tx_results,
+            &bucket_list,
+            Some(&has),
+        )?;
 
         // Write hot archive bucket files if the HAS includes them.
         // These are written separately because publish_checkpoint only

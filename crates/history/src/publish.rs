@@ -215,7 +215,7 @@ impl PublishManager {
     /// protocol >= 23 where the HAS must include hot archive bucket hashes
     /// that are only available at checkpoint close time.
     ///
-    pub async fn publish_checkpoint(
+    pub fn publish_checkpoint(
         &self,
         checkpoint_ledger: u32,
         headers: &[LedgerHeaderHistoryEntry],

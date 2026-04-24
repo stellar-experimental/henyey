@@ -180,7 +180,39 @@ impl Maintainer {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    self.perform_maintenance();
+                    let db = Arc::clone(&self.database);
+                    let config_count = self.config.count;
+                    let rpc_retention_window = self.config.rpc_retention_window;
+                    let get_bounds = &self.get_ledger_bounds;
+                    let (lcl, min_queued) = get_bounds();
+
+                    let _ = henyey_common::spawn_blocking_logged(
+                        "maintainer-cycle",
+                        move || {
+                            let start = std::time::Instant::now();
+                            info!("Performing database maintenance");
+
+                            run_maintenance(
+                                &db,
+                                lcl,
+                                min_queued,
+                                rpc_retention_window,
+                                config_count,
+                            );
+
+                            let elapsed = start.elapsed();
+                            if elapsed > Duration::from_secs(10) {
+                                warn!(
+                                    elapsed_ms = elapsed.as_millis(),
+                                    "Maintenance took too long; consider increasing AUTOMATIC_MAINTENANCE_COUNT \
+                                     or performing manual database maintenance"
+                                );
+                            } else {
+                                debug!(elapsed_ms = elapsed.as_millis(), "Maintenance complete");
+                            }
+                        },
+                    )
+                    .await;
                 }
                 _ = self.shutdown_rx.changed() => {
                     if *self.shutdown_rx.borrow() {

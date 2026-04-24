@@ -851,7 +851,7 @@ impl App {
                 _ = peer_refresh_interval.tick() => {
                     self.set_phase(29); // 29 = peer_refresh
                     if let Some(overlay) = self.overlay().await {
-                        let _ = self.refresh_known_peers(&overlay);
+                        let _ = self.refresh_known_peers(&overlay).await;
                     }
                 }
 
@@ -1031,7 +1031,7 @@ impl App {
     pub async fn start_overlay(&self) -> anyhow::Result<()> {
         tracing::info!("Starting overlay network");
 
-        self.store_config_peers();
+        self.store_config_peers().await;
 
         // Create local node info
         let mut local_node =
@@ -1077,7 +1077,7 @@ impl App {
         overlay_config.is_validator = self.is_validator; // Watchers filter non-essential messages
         overlay_config.network_passphrase = self.config.network.passphrase.clone();
 
-        if let Ok(persisted) = self.load_persisted_peers() {
+        if let Ok(persisted) = self.load_persisted_peers().await {
             for addr in persisted {
                 if !overlay_config.known_peers.contains(&addr) {
                     overlay_config.known_peers.push(addr);
@@ -1110,8 +1110,8 @@ impl App {
         overlay_config.peer_event_tx = Some(peer_event_tx);
 
         let db = self.db.clone();
-        tokio::spawn(async move {
-            while let Some(event) = peer_event_rx.recv().await {
+        tokio::task::spawn_blocking(move || {
+            while let Some(event) = peer_event_rx.blocking_recv() {
                 update_peer_record(&db, event);
             }
         });
@@ -1133,7 +1133,10 @@ impl App {
         overlay.set_scp_callback(Arc::new(super::HerderScpCallback {
             herder: Arc::clone(&self.herder),
         }));
-        if let Ok(bans) = self.db.load_bans() {
+        if let Ok(bans) = self
+            .db_blocking("load-bans-overlay", |db| db.load_bans().map_err(Into::into))
+            .await
+        {
             for ban in bans {
                 if let Some(peer_id) = Self::strkey_to_peer_id(&ban) {
                     overlay.ban_peer(peer_id).await;
