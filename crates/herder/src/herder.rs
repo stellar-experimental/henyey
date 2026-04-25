@@ -5733,3 +5733,290 @@ mod advance_tracking_slot_tests {
         );
     }
 }
+
+// ────────────────────────────────────────────────────────────────────
+// quorum_health() regression tests (#1938)
+// ────────────────────────────────────────────────────────────────────
+//
+// These tests exercise Herder::quorum_health() directly, covering:
+// - previous-slot-first preference
+// - fallback to current slot when previous is absent
+// - both slots absent → None
+// - Delayed→agree folding
+// - tracking_slot==0 → None
+// - tracking_slot==1 edge case
+// - non-zero fail_at
+//
+// Envelope injection uses `herder.scp().receive_envelope()` which
+// bypasses herder-level validation (signature verification, quorum
+// tracker, close-time checks). This is intentional — these tests
+// exercise quorum_health() logic, not envelope ingestion.
+
+#[cfg(test)]
+mod quorum_health_tests {
+    use super::*;
+    use crate::tx_queue::TransactionSet;
+    use henyey_common::Hash256;
+    use henyey_crypto::SecretKey;
+    use henyey_scp::hash_quorum_set;
+    use stellar_xdr::curr::{
+        EnvelopeType, LedgerCloseValueSignature, Limits, NodeId as XdrNodeId, ScpBallot,
+        ScpStatement, ScpStatementExternalize, ScpStatementPledges, ScpStatementPrepare,
+        Signature as XdrSignature, StellarValue, StellarValueExt, TimePoint, Value, WriteXdr,
+    };
+
+    /// Build a validator herder whose quorum set contains `n` validators
+    /// (the local node + `n-1` peers) with the given `threshold`.
+    /// Returns the herder, all secret keys, and the shared quorum set.
+    fn make_n_node_validator_herder(
+        n: usize,
+        threshold: u32,
+    ) -> (Herder, Vec<SecretKey>, ScpQuorumSet) {
+        assert!(n >= 1);
+        let mut keys = Vec::with_capacity(n);
+        let mut node_ids = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let seed = [(10 + i as u8); 32];
+            let sk = SecretKey::from_seed(&seed);
+            let pk = sk.public_key();
+            node_ids.push(node_id_from_public_key(&pk));
+            keys.push(sk);
+        }
+
+        let quorum_set = ScpQuorumSet {
+            threshold,
+            validators: node_ids.try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let local_pk = keys[0].public_key();
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_pk,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[10u8; 32]));
+
+        // Register each peer's quorum set so that is_statement_sane can
+        // resolve the quorum_set_hash in PREPARE/CONFIRM envelopes.
+        for key in &keys[1..] {
+            let peer_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                *key.public_key().as_bytes(),
+            )));
+            herder.store_quorum_set(&peer_node_id, quorum_set.clone());
+        }
+
+        (herder, keys, quorum_set)
+    }
+
+    /// Build a signed StellarValue and cache its tx set in the herder.
+    /// This produces a Value that passes validate_value_impl.
+    fn make_valid_value(herder: &Herder, signer: &SecretKey) -> Value {
+        let tx_set = TransactionSet::new(Hash256::ZERO, Vec::new());
+        let tx_set_hash = *tx_set.hash();
+        herder.scp_driver.cache_tx_set(tx_set);
+
+        let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+        let close_time = TimePoint(1);
+
+        let network_id = herder.scp_driver.network_id();
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).unwrap());
+        sign_data.extend_from_slice(&xdr_tx_set_hash.to_xdr(Limits::none()).unwrap());
+        sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).unwrap());
+        let sig = signer.sign(&sign_data);
+
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*signer.public_key().as_bytes()),
+        ));
+
+        let stellar_value = StellarValue {
+            tx_set_hash: xdr_tx_set_hash,
+            close_time,
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id,
+                signature: XdrSignature(sig.0.to_vec().try_into().unwrap_or_default()),
+            }),
+        };
+        let value_bytes = stellar_value.to_xdr(Limits::none()).unwrap();
+        Value(value_bytes.try_into().unwrap())
+    }
+
+    /// Build an SCP envelope for injection via `scp().receive_envelope()`.
+    /// Signature is zeroed — `receive_envelope()` does not verify signatures.
+    fn make_envelope(
+        secret_key: &SecretKey,
+        slot: u64,
+        pledges: ScpStatementPledges,
+    ) -> ScpEnvelope {
+        let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+            *secret_key.public_key().as_bytes(),
+        )));
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges,
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    fn externalize_pledges(value: &Value) -> ScpStatementPledges {
+        ScpStatementPledges::Externalize(ScpStatementExternalize {
+            commit: ScpBallot {
+                counter: u32::MAX,
+                value: value.clone(),
+            },
+            n_h: u32::MAX,
+            commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+        })
+    }
+
+    fn prepare_pledges(value: &Value, quorum_set: &ScpQuorumSet) -> ScpStatementPledges {
+        let qs_hash = hash_quorum_set(quorum_set);
+        ScpStatementPledges::Prepare(ScpStatementPrepare {
+            quorum_set_hash: stellar_xdr::curr::Hash(qs_hash.0),
+            ballot: ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        })
+    }
+
+    /// Helper to set tracking to `slot` using bootstrap.
+    /// `bootstrap(n)` sets tracking_slot to `n + 1`, so we pass `slot - 1`.
+    fn set_tracking(herder: &Herder, slot: u64) {
+        assert!(slot >= 1);
+        herder.bootstrap((slot - 1) as u32);
+    }
+
+    // ── Test 1: tracking_slot == 0 → None ──────────────────────────
+
+    #[test]
+    fn test_quorum_health_returns_none_when_not_tracking() {
+        let herder = Herder::new(HerderConfig::default());
+        assert_eq!(herder.tracking_slot(), 0);
+        assert!(herder.quorum_health().is_none());
+    }
+
+    // ── Test 2: previous slot used when current is absent ──────────
+
+    #[test]
+    fn test_quorum_health_uses_previous_slot() {
+        let (herder, keys, _qs) = make_n_node_validator_herder(1, 1);
+
+        let value = make_valid_value(&herder, &keys[0]);
+        herder.scp().force_externalize(9, value);
+
+        set_tracking(&herder, 10);
+
+        let health = herder.quorum_health();
+        assert_eq!(health, Some((1, 0, 0, 0)));
+    }
+
+    // ── Test 3: fallback to current when previous is absent ────────
+
+    #[test]
+    fn test_quorum_health_falls_back_to_current_slot() {
+        let (herder, keys, _qs) = make_n_node_validator_herder(1, 1);
+
+        let value = make_valid_value(&herder, &keys[0]);
+        herder.scp().force_externalize(10, value);
+
+        set_tracking(&herder, 10);
+
+        let health = herder.quorum_health();
+        assert_eq!(health, Some((1, 0, 0, 0)));
+    }
+
+    // ── Test 4: both slots absent → None ───────────────────────────
+
+    #[test]
+    fn test_quorum_health_returns_none_when_both_slots_absent() {
+        let (herder, _keys, _qs) = make_n_node_validator_herder(1, 1);
+
+        set_tracking(&herder, 10);
+
+        assert!(herder.quorum_health().is_none());
+    }
+
+    // ── Test 5: Delayed peer folded into agree ─────────────────────
+
+    #[test]
+    fn test_quorum_health_delayed_folded_into_agree() {
+        let (herder, keys, qs) = make_n_node_validator_herder(2, 2);
+        let peer_key = &keys[1];
+
+        let value = make_valid_value(&herder, &keys[0]);
+
+        // Slot 9: local node externalized. Inject peer PREPARE (peer is behind).
+        herder.scp().force_externalize(9, value.clone());
+        let peer_prepare = make_envelope(peer_key, 9, prepare_pledges(&value, &qs));
+        let r = herder.scp().receive_envelope(peer_prepare);
+        assert!(r.is_valid(), "peer PREPARE rejected: {:?}", r);
+
+        // Slot 10: exists (needed for get_reporting_summary(10) to return Some).
+        herder.scp().force_externalize(10, value);
+
+        // Tracking = 11 → quorum_health reads summary(10).
+        // For peer: slot 10 has no peer envelope (NoInfo), falls back to slot 9
+        // with self_already_moved_on=true. Slot 9 phase=Externalize, peer has
+        // PREPARE (not externalized) → Delayed. Delayed folds into agree.
+        set_tracking(&herder, 11);
+
+        let health = herder.quorum_health();
+        // agree = 1 (local Agree) + 1 (peer Delayed) = 2, threshold=2, fail_at=0
+        assert_eq!(health, Some((2, 0, 0, 0)));
+    }
+
+    // ── Test 6: tracking_slot == 1 edge case ───────────────────────
+
+    #[test]
+    fn test_quorum_health_tracking_slot_one() {
+        let (herder, keys, _qs) = make_n_node_validator_herder(1, 1);
+
+        let value = make_valid_value(&herder, &keys[0]);
+        herder.scp().force_externalize(1, value);
+
+        set_tracking(&herder, 1);
+
+        let health = herder.quorum_health();
+        assert_eq!(health, Some((1, 0, 0, 0)));
+    }
+
+    // ── Test 7: non-zero fail_at ───────────────────────────────────
+
+    #[test]
+    fn test_quorum_health_fail_at_nonzero() {
+        // 3-node quorum with threshold=2 → fail_at = 3 - 2 = 1.
+        let (herder, keys, _qs) = make_n_node_validator_herder(3, 2);
+        let peer1_key = &keys[1];
+        let peer2_key = &keys[2];
+
+        let value = make_valid_value(&herder, &keys[0]);
+
+        // Slot 9: local externalized. Inject EXTERNALIZE from both peers.
+        herder.scp().force_externalize(9, value.clone());
+        let peer1_ext = make_envelope(peer1_key, 9, externalize_pledges(&value));
+        let peer2_ext = make_envelope(peer2_key, 9, externalize_pledges(&value));
+        let r1 = herder.scp().receive_envelope(peer1_ext);
+        let r2 = herder.scp().receive_envelope(peer2_ext);
+        assert!(r1.is_valid(), "peer1 EXTERNALIZE rejected: {:?}", r1);
+        assert!(r2.is_valid(), "peer2 EXTERNALIZE rejected: {:?}", r2);
+
+        set_tracking(&herder, 10);
+
+        let health = herder.quorum_health();
+        // 3 nodes all Agree, threshold=2, fail_at = 3 - 2 = 1.
+        assert_eq!(health, Some((3, 0, 0, 1)));
+    }
+}
