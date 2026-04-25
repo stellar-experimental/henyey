@@ -1,0 +1,1436 @@
+{
+  "uid": "henyey-vs-core",
+  "title": "Henyey vs Core",
+  "tags": [
+    "henyey",
+    "stellar-core",
+    "comparison",
+    "validator"
+  ],
+  "timezone": "browser",
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "henyey_instance",
+        "label": "Henyey Instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "000000001"
+        },
+        "query": "label_values(up{job=\"henyey\"}, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "core_instance",
+        "label": "Core Instance",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "000000001"
+        },
+        "query": "label_values(stellar_core_started_on{network=~\".*Public Global.*\"}, instance)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "regex": "/core-validator.*/",
+        "current": {
+          "selected": true,
+          "text": "core-validator-004.prd.stellar002",
+          "value": "core-validator-004.prd.stellar002"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Health Summary",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "panels": []
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Henyey Ledger Age",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 30 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Core Ledger Age",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_core_ledger_age{instance=~\"$core_instance\"}",
+          "legendFormat": "Core",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 10 },
+              { "color": "red", "value": 30 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Henyey Quorum Fail At",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_quorum_fail_at{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Core Quorum Fail At",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_core_quorum_fail_at{instance=~\"$core_instance\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Henyey Peers",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_peer_count{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 3 },
+              { "color": "green", "value": 5 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Henyey Uptime",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_uptime_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "textMode": "auto"
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Ledger Performance",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 200,
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Ledger Age",
+      "description": "Seconds since last ledger close for both implementations. Should track closely when both are in sync.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_ledger_age_current_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        },
+        {
+          "expr": "stellar_core_ledger_age{instance=~\"$core_instance\"}",
+          "legendFormat": "Core ({{instance}})",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Henyey" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Ledger Close Duration (avg)",
+      "description": "Average ledger close duration. Henyey uses a histogram, core uses a summary — both compared via rate(sum)/rate(count).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "rate(stellar_ledger_close_duration_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(stellar_ledger_close_duration_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+          "legendFormat": "Henyey avg",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_core_ledger_ledger_close_seconds_sum{instance=~\"$core_instance\"}[$__rate_interval]) / rate(stellar_core_ledger_ledger_close_seconds_count{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core avg",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Ledger Close Duration (p99)",
+      "description": "99th percentile close duration. Henyey: histogram_quantile, Core: summary quantile.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, rate(stellar_ledger_close_duration_seconds_bucket{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]))",
+          "legendFormat": "Henyey p99",
+          "refId": "A"
+        },
+        {
+          "expr": "stellar_core_ledger_ledger_close_seconds{quantile=\"0.99\", instance=~\"$core_instance\"}",
+          "legendFormat": "Core p99",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Transaction Count",
+      "description": "Transactions per ledger. Henyey: gauge per-close. Core: summary average.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_ledger_tx_count{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_core_ledger_transaction_count_sum{instance=~\"$core_instance\"}[$__rate_interval]) / rate(stellar_core_ledger_transaction_count_count{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core avg",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Operation Count",
+      "description": "Operations per ledger.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_ledger_op_count{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_core_ledger_operation_count_sum{instance=~\"$core_instance\"}[$__rate_interval]) / rate(stellar_core_ledger_operation_count_count{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core avg",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Apply Time (per ledger)",
+      "description": "Total transaction apply time per ledger close. Henyey: stellar_ledger_apply_us gauge. Core: sum of per-tx apply seconds divided by ledger count (= total apply per ledger).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_ledger_apply_us{job=\"henyey\", instance=~\"$henyey_instance\"} / 1e6",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_core_ledger_transaction_apply_seconds_sum{instance=~\"$core_instance\"}[$__rate_interval]) / rate(stellar_core_ledger_ledger_close_seconds_count{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Quorum & Consensus",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
+      "id": 300,
+      "panels": []
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Quorum Agree / Disagree",
+      "description": "Number of nodes agreeing/disagreeing with the latest externalized slot.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_quorum_agree{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey agree",
+          "refId": "A"
+        },
+        {
+          "expr": "stellar_core_quorum_agree{instance=~\"$core_instance\"}",
+          "legendFormat": "Core agree",
+          "refId": "B"
+        },
+        {
+          "expr": "stellar_quorum_disagree{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey disagree",
+          "refId": "C"
+        },
+        {
+          "expr": "stellar_core_quorum_disagree{instance=~\"$core_instance\"}",
+          "legendFormat": "Core disagree",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Henyey agree" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Core agree" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Henyey disagree" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#AEC7E8" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Core disagree" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FFBB78" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Quorum Fail At / Missing",
+      "description": "Fail-at: how many nodes can fail before quorum loss. Missing: nodes not participating.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_quorum_fail_at{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey fail_at",
+          "refId": "A"
+        },
+        {
+          "expr": "stellar_core_quorum_fail_at{instance=~\"$core_instance\"}",
+          "legendFormat": "Core fail_at",
+          "refId": "B"
+        },
+        {
+          "expr": "stellar_quorum_missing{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey missing",
+          "refId": "C"
+        },
+        {
+          "expr": "stellar_core_quorum_missing{instance=~\"$core_instance\"}",
+          "legendFormat": "Core missing",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey fail_at/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core fail_at/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey missing/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#AEC7E8" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core missing/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FFBB78" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "SCP Externalize Time",
+      "description": "Time to externalize a slot. Henyey: gauge (last slot). Core: summary rate(sum)/rate(count).",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_scp_timing_externalized_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_core_scp_timing_externalized_seconds_sum{instance=~\"$core_instance\"}[$__rate_interval]) / rate(stellar_core_scp_timing_externalized_seconds_count{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core avg",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "SCP Nominate Time",
+      "description": "Time to nominate a value. Henyey: gauge (last slot). Core: summary rate(sum)/rate(count).",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_scp_timing_nominated_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_core_scp_timing_nominated_seconds_sum{instance=~\"$core_instance\"}[$__rate_interval]) / rate(stellar_core_scp_timing_nominated_seconds_count{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core avg",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "SCP Envelope Rates",
+      "description": "SCP envelope emit/sign and receive rates. Henyey: emit_total/receive_total. Core: envelope_sign/envelope_receive.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 39 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "rate(stellar_scp_envelope_emit_total{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+          "legendFormat": "Henyey emit",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_core_scp_envelope_sign{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core sign",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(stellar_scp_envelope_receive_total{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+          "legendFormat": "Henyey receive",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(stellar_core_scp_envelope_receive{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core receive",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Henyey emit" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Core sign" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Henyey receive" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#AEC7E8" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Core receive" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FFBB78" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Overlay / Network",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 },
+      "id": 400,
+      "panels": []
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Authenticated Peers (Inbound / Outbound)",
+      "description": "Authenticated peer connections. Solid lines = inbound, dashed = outbound.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_overlay_inbound_authenticated{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey inbound",
+          "refId": "A"
+        },
+        {
+          "expr": "stellar_overlay_outbound_authenticated{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey outbound",
+          "refId": "B"
+        },
+        {
+          "expr": "stellar_core_overlay_inbound_live{instance=~\"$core_instance\"}",
+          "legendFormat": "Core inbound",
+          "refId": "C"
+        },
+        {
+          "expr": "stellar_core_overlay_connection_authenticated{instance=~\"$core_instance\"} - stellar_core_overlay_inbound_live{instance=~\"$core_instance\"}",
+          "legendFormat": "Core outbound",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Henyey inbound" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Core inbound" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Henyey outbound" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#AEC7E8" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Core outbound" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FFBB78" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Message Read / Write Rate",
+      "description": "Overlay message rates (henyey only — core uses different metric structure for overlay messages).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "rate(stellar_overlay_message_read_total{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+          "legendFormat": "Henyey read",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_overlay_message_write_total{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+          "legendFormat": "Henyey write",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(stellar_overlay_message_broadcast_total{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+          "legendFormat": "Henyey broadcast",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Bucket Merges",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
+      "id": 500,
+      "panels": []
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Bucket Merge Rate",
+      "description": "Rate of completed bucket merges.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "rate(stellar_bucket_merge_completed_total{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(stellar_core_bucket_snap_merge_seconds_count{instance=~\"$core_instance\"}[$__rate_interval]))",
+          "legendFormat": "Core",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Bucket Merge Time",
+      "description": "Time spent in bucket merges. Henyey: counter in us. Core: summary in seconds.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "rate(stellar_bucket_merge_time_us_total{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / 1e6",
+          "legendFormat": "Henyey (s/s)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(stellar_core_bucket_snap_merge_seconds_sum{instance=~\"$core_instance\"}[$__rate_interval]))",
+          "legendFormat": "Core (s/s)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Henyey-Only: Close Phase Breakdown",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 65 },
+      "id": 600,
+      "panels": [
+        {
+          "id": 50,
+          "type": "timeseries",
+          "title": "Close Phase Breakdown (avg per close)",
+          "description": "Stacked average time per close phase. Henyey-only — no core equivalent.",
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 66 },
+          "datasource": { "type": "prometheus", "uid": "000000001" },
+          "targets": [
+            {
+              "expr": "rate(henyey_ledger_close_begin_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(henyey_ledger_close_begin_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+              "legendFormat": "begin",
+              "refId": "A"
+            },
+            {
+              "expr": "rate(henyey_ledger_close_classic_exec_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(henyey_ledger_close_classic_exec_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+              "legendFormat": "classic_exec",
+              "refId": "B"
+            },
+            {
+              "expr": "rate(henyey_ledger_close_soroban_exec_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(henyey_ledger_close_soroban_exec_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+              "legendFormat": "soroban_exec",
+              "refId": "C"
+            },
+            {
+              "expr": "rate(henyey_ledger_close_commit_setup_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(henyey_ledger_close_commit_setup_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+              "legendFormat": "commit_setup",
+              "refId": "D"
+            },
+            {
+              "expr": "rate(henyey_ledger_close_eviction_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(henyey_ledger_close_eviction_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+              "legendFormat": "eviction",
+              "refId": "E"
+            },
+            {
+              "expr": "rate(henyey_ledger_close_bucket_add_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(henyey_ledger_close_bucket_add_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+              "legendFormat": "bucket_add",
+              "refId": "F"
+            },
+            {
+              "expr": "rate(henyey_ledger_close_header_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(henyey_ledger_close_header_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+              "legendFormat": "header",
+              "refId": "G"
+            },
+            {
+              "expr": "rate(henyey_ledger_close_commit_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(henyey_ledger_close_commit_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+              "legendFormat": "commit",
+              "refId": "H"
+            },
+            {
+              "expr": "rate(henyey_ledger_close_meta_seconds_sum{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval]) / rate(henyey_ledger_close_meta_seconds_count{job=\"henyey\", instance=~\"$henyey_instance\"}[$__rate_interval])",
+              "legendFormat": "meta",
+              "refId": "I"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 80,
+                "drawStyle": "bars",
+                "stacking": { "mode": "normal", "group": "A" },
+                "pointSize": 5,
+                "showPoints": "never",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          }
+        }
+      ]
+    },
+
+    {
+      "type": "row",
+      "title": "Henyey-Only: SCP Verify Pipeline",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
+      "id": 700,
+      "panels": [
+        {
+          "id": 60,
+          "type": "timeseries",
+          "title": "Verify Backlogs",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+          "datasource": { "type": "prometheus", "uid": "000000001" },
+          "targets": [
+            {
+              "expr": "henyey_scp_verify_input_backlog{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "input backlog",
+              "refId": "A"
+            },
+            {
+              "expr": "henyey_scp_verify_output_backlog{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "output backlog",
+              "refId": "B"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "drawStyle": "line",
+                "pointSize": 5,
+                "showPoints": "auto",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "none" }
+          }
+        },
+        {
+          "id": 61,
+          "type": "timeseries",
+          "title": "Verify Latency (avg us)",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
+          "datasource": { "type": "prometheus", "uid": "000000001" },
+          "targets": [
+            {
+              "expr": "henyey_scp_verify_latency_us_sum{job=\"henyey\", instance=~\"$henyey_instance\"} / henyey_scp_verify_latency_us_count{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "avg latency (us)",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "us",
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "drawStyle": "line",
+                "pointSize": 5,
+                "showPoints": "auto",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "none" }
+          }
+        }
+      ]
+    },
+
+    {
+      "type": "row",
+      "title": "Henyey-Only: Memory & Process",
+      "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "id": 800,
+      "panels": [
+        {
+          "id": 70,
+          "type": "timeseries",
+          "title": "Jemalloc Memory",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
+          "datasource": { "type": "prometheus", "uid": "000000001" },
+          "targets": [
+            {
+              "expr": "henyey_jemalloc_resident_bytes{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "resident",
+              "refId": "A"
+            },
+            {
+              "expr": "henyey_jemalloc_allocated_bytes{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "allocated",
+              "refId": "B"
+            },
+            {
+              "expr": "henyey_jemalloc_active_bytes{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "active",
+              "refId": "C"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "drawStyle": "line",
+                "pointSize": 5,
+                "showPoints": "auto",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "none" }
+          }
+        },
+        {
+          "id": 71,
+          "type": "timeseries",
+          "title": "Herder Drift",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
+          "datasource": { "type": "prometheus", "uid": "000000001" },
+          "targets": [
+            {
+              "expr": "henyey_herder_drift_min_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "min",
+              "refId": "A"
+            },
+            {
+              "expr": "henyey_herder_drift_median_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "median",
+              "refId": "B"
+            },
+            {
+              "expr": "henyey_herder_drift_p75_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "p75",
+              "refId": "C"
+            },
+            {
+              "expr": "henyey_herder_drift_max_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+              "legendFormat": "max",
+              "refId": "D"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "lineWidth": 1,
+                "fillOpacity": 10,
+                "drawStyle": "line",
+                "pointSize": 5,
+                "showPoints": "auto",
+                "spanNulls": false
+              }
+            },
+            "overrides": []
+          },
+          "options": {
+            "legend": { "displayMode": "list", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "none" }
+          }
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 37,
+  "version": 0,
+  "links": [
+    {
+      "title": "Henyey Validator",
+      "url": "/d/henyey-validator/henyey-validator",
+      "type": "link",
+      "icon": "dashboard",
+      "tooltip": "Full Henyey-only dashboard"
+    },
+    {
+      "title": "Stellar Core Full",
+      "url": "/d/DCQsHZ7Wk/stellar-core-full",
+      "type": "link",
+      "icon": "dashboard",
+      "tooltip": "Full Stellar Core dashboard"
+    }
+  ]
+}
