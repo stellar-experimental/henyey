@@ -118,6 +118,13 @@ Scan for hash mismatches ("hash mismatch", "HashMismatch", differing expected/ac
 hashes), panics/crashes ("panic", "thread.*panicked", "SIGABRT", "SIGSEGV"),
 ERROR-level log lines, assertion failures ("assertion failed").
 
+**Match ERROR-level lines by log-level prefix only**, e.g. anchor with
+`grep -E '^[^ ]+Z\s+ERROR\s'` (timestamp followed by the ERROR level token).
+A naive case-insensitive `error` match falsely fires on INFO-level lines that
+contain the word "error" as part of a message body — e.g. peer disconnect
+lines like `INFO ... recv error: IO error: Connection reset by peer`. Treat
+those as the normal overlay-churn INFO they are; do not flag.
+
 **(2) Ledger progression & sync deadline** — persist ledger progression across
 ticks so STUCK can be detected by a single invocation:
 
