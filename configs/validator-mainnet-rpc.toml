@@ -118,7 +118,7 @@ get_enabled = true
 put_enabled = false
 
 [overlay]
-peer_port = 11625
+peer_port = 8009
 max_inbound_peers = 64
 max_outbound_peers = 8
 target_outbound_peers = 8
