@@ -717,13 +717,32 @@ Only act on failures from the last 2 hours (compare `createdAt` with
 
 1. `gh run view <ID> --log-failed 2>&1 | tail -80`.
 2. Categorize: build error, test failure, timeout, flaky, infrastructure.
-3. Check for an existing open issue:
+3. **If the failure looks like CI automation rather than a real defect**
+   — runner timeout outside test logic, network error fetching deps,
+   GHA service hiccup, OOM-on-runner, "operation timed out" with no test
+   stack, known-flaky test patterns (`test_core3_restart_rejoin_*` is a
+   recurrer; see #1838 / #1939) — **rerun the failing jobs first**:
+   ```bash
+   attempts=$(gh run view <ID> --json attempt --jq .attempt)
+   if [ "$attempts" -lt 2 ]; then
+     gh run rerun <ID> --failed
+   fi
+   ```
+   Report `CI RERUN ATTEMPTED — <workflow> jobs <names> on <sha>, attempt 1→2`
+   and stop CI processing for this tick. The next tick will see the
+   re-run conclusion. Don't rerun more than once — if the re-run also
+   fails, the failure is real (or an unusually persistent flake) and
+   warrants filing.
+   If the failure is clearly NOT automation (build error from real code,
+   test assertion mismatch, hash mismatch, panic from production code),
+   skip the rerun and proceed to step 4.
+4. Check for an existing open issue:
    `gh issue list --search "<workflow name + signature>" --state open`.
    If one matches, `gh issue comment <N>` with the new evidence (sha, log
    snippet, timestamp) and ensure it has the `ready` label
    (`gh issue edit <N> --add-label ready`).
-4. Otherwise, file a new issue: `gh issue create --label ready --title "<workflow>: <short signature>" --body "..."` with investigation findings.
-5. Do NOT commit a fix. Report: `CI ISSUE FILED — <workflow> failed on <sha>, filed/commented #<N>`.
+5. Otherwise, file a new issue: `gh issue create --label ready --title "<workflow>: <short signature>" --body "..."` with investigation findings.
+6. Do NOT commit a fix. Report: `CI ISSUE FILED — <workflow> failed on <sha>, filed/commented #<N>`.
 
 ## Bug filing workflow
 
