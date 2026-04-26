@@ -605,10 +605,36 @@ impl FetchingEnvelopes {
         }
     }
 
-    /// Add a QuorumSet to the cache directly.
+    /// Check all fetching envelopes referencing a quorum-set hash and move
+    /// any that are now ready.
+    fn move_ready_envelopes_for_quorum_set(&self, qs_hash: &Hash256) {
+        let to_check: Vec<ScpEnvelope> = {
+            let mut result = Vec::new();
+            for slot_entry in self.slots.iter() {
+                for (_, (env, _)) in slot_entry.fetching.iter() {
+                    if Self::extract_quorum_set_hash(env).as_ref() == Some(qs_hash) {
+                        result.push(env.clone());
+                    }
+                }
+            }
+            result
+        };
+
+        for envelope in to_check {
+            self.check_and_move_to_ready(envelope);
+        }
+    }
+
+    /// Add a QuorumSet to the cache directly and process any waiting envelopes.
+    ///
+    /// Parallel to `tx_set_available` — used when a quorum-set is received
+    /// through means other than the quorum-set fetcher.
     pub fn cache_quorum_set(&self, hash: Hash256, quorum_set: ScpQuorumSet) {
         self.evict_quorum_set_cache_if_full();
         self.quorum_set_cache.insert(hash, Arc::new(quorum_set));
+
+        // Check if any fetching envelopes are now ready
+        self.move_ready_envelopes_for_quorum_set(&hash);
     }
 
     // --- Internal helpers ---
@@ -722,6 +748,11 @@ impl FetchingEnvelopes {
     }
 
     /// Check if an envelope is now fully fetched and move to ready if so.
+    ///
+    /// If dependencies are still missing (e.g. a previously-received dependency
+    /// was evicted from the cache under pressure), re-start fetching for those
+    /// dependencies. This mirrors stellar-core's `startFetch()` retry behavior
+    /// in `PendingEnvelopes::recvSCPEnvelope`.
     fn check_and_move_to_ready(&self, envelope: ScpEnvelope) {
         let slot = envelope.statement.slot_index;
         let env_hash = Self::compute_envelope_hash(&envelope);
@@ -736,6 +767,36 @@ impl FetchingEnvelopes {
                 if slot_state.fetching.remove(&env_hash).is_some() {
                     slot_state.ready.push(envelope);
                     debug!(slot, "Envelope ready after receiving dependencies");
+                }
+            }
+        } else {
+            // Re-start fetching for any dependency that was evicted from the
+            // cache after being received. Without this, the envelope would
+            // remain stranded in `fetching` forever.
+            if need_tx_set {
+                for tx_set_hash in Self::extract_tx_set_hashes(&envelope) {
+                    if !self.tx_set_cache.contains_key(&tx_set_hash) {
+                        let hash = Hash(tx_set_hash.0);
+                        self.tx_set_fetcher.fetch(hash, &envelope);
+                        debug!(
+                            slot,
+                            tx_set = %hex::encode(tx_set_hash.0),
+                            "Re-started fetch for evicted tx-set dependency"
+                        );
+                    }
+                }
+            }
+            if need_quorum_set {
+                if let Some(qs_hash) = Self::extract_quorum_set_hash(&envelope) {
+                    if !self.quorum_set_cache.contains_key(&qs_hash) {
+                        let hash = Hash(qs_hash.0);
+                        self.quorum_set_fetcher.fetch(hash, &envelope);
+                        debug!(
+                            slot,
+                            quorum_set = %hex::encode(qs_hash.0),
+                            "Re-started fetch for evicted quorum-set dependency"
+                        );
+                    }
                 }
             }
         }
@@ -1658,9 +1719,9 @@ mod tests {
     /// Regression test for #1954: tx-set eviction must not strand envelopes
     /// that already received the tx-set but are still waiting on a quorum-set.
     ///
-    /// Before fix: arbitrary eviction could remove tx-set A from the cache;
-    /// when quorum-set Q arrives, check_dependencies sees A as missing and
-    /// leaves the envelope in fetching forever.
+    /// Scenario: envelope needs tx-set A + quorum-set Q. Deliver A (envelope
+    /// stays fetching for Q). Dependency-aware eviction protects A. When Q
+    /// arrives via cache_quorum_set + recheck, the envelope becomes ready.
     #[test]
     fn test_tx_set_eviction_does_not_strand_fetching_envelopes() {
         let mut config = FetchingConfig::default();
@@ -1682,7 +1743,6 @@ mod tests {
         assert_eq!(fetching.fetching_count(), 1, "still waiting on quorum-set");
 
         // 3. Fill cache to trigger eviction — insert 2 more tx-sets
-        //    (via cache_tx_set which calls evict_tx_set_cache_if_full)
         let tx_hash_b = Hash256::from_bytes([0xBB; 32]);
         let tx_hash_c = Hash256::from_bytes([0xCC; 32]);
         fetching.cache_tx_set(tx_hash_b, 101, vec![4, 5, 6]);
@@ -1694,26 +1754,8 @@ mod tests {
             "tx-set A should be protected from eviction while an envelope depends on it"
         );
 
-        // 4. Deliver quorum-set Q — envelope should become ready
-        //    We need to register the quorum-set fetch tracking first by inserting
-        //    directly, since recv_quorum_set checks is_tracking.
+        // 4. Deliver quorum-set Q — cache_quorum_set now auto-rechecks
         fetching.cache_quorum_set(qs_hash, make_sane_quorum_set());
-
-        // Manually recheck the fetching envelope
-        let to_check: Vec<ScpEnvelope> = fetching
-            .slots
-            .iter()
-            .flat_map(|slot_entry| {
-                slot_entry
-                    .fetching
-                    .values()
-                    .map(|(env, _)| env.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for env in to_check {
-            fetching.check_and_move_to_ready(env);
-        }
 
         assert_eq!(
             fetching.ready_count(),
@@ -1745,7 +1787,7 @@ mod tests {
         let result = fetching.recv_envelope(envelope);
         assert_eq!(result, RecvResult::Fetching);
 
-        // 2. Deliver quorum-set Q via direct cache (since recv_quorum_set needs tracking)
+        // 2. Deliver quorum-set Q via direct cache
         fetching.cache_quorum_set(qs_hash, make_sane_quorum_set());
         assert!(fetching.has_quorum_set(&qs_hash));
         assert_eq!(fetching.fetching_count(), 1, "still waiting on tx-set");
@@ -1762,23 +1804,9 @@ mod tests {
             "quorum-set Q should be protected from eviction while an envelope depends on it"
         );
 
-        // 4. Deliver tx-set A and recheck
+        // 4. Deliver tx-set A and trigger recheck
         fetching.cache_tx_set(tx_hash_a, 100, vec![1, 2, 3]);
-
-        let to_check: Vec<ScpEnvelope> = fetching
-            .slots
-            .iter()
-            .flat_map(|slot_entry| {
-                slot_entry
-                    .fetching
-                    .values()
-                    .map(|(env, _)| env.clone())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        for env in to_check {
-            fetching.check_and_move_to_ready(env);
-        }
+        fetching.move_ready_envelopes_for_tx_set(&tx_hash_a);
 
         assert_eq!(
             fetching.ready_count(),
@@ -1822,5 +1850,98 @@ mod tests {
             "tx_set_cache must not exceed limit, got {}",
             fetching.tx_set_cache_size()
         );
+    }
+
+    /// Test that check_and_move_to_ready re-starts fetching for evicted
+    /// dependencies instead of silently stranding the envelope.
+    ///
+    /// This tests the recovery path: when all cache entries are referenced
+    /// and one gets evicted, the next recheck re-registers the fetch so the
+    /// dependency can be re-requested from peers.
+    #[test]
+    fn test_recheck_restarts_fetch_for_evicted_dependency() {
+        let mut config = FetchingConfig::default();
+        config.max_tx_set_cache = 2;
+        let fetching = FetchingEnvelopes::new(config);
+
+        let tx_hash_a = Hash256::from_bytes([0xAA; 32]);
+        let tx_hash_b = Hash256::from_bytes([0xBB; 32]);
+        let qs_hash_q = Hash256::from_bytes([0x01; 32]);
+        let qs_hash_r = Hash256::from_bytes([0x02; 32]);
+
+        // Insert two envelopes, each needing a different tx-set and quorum-set.
+        // Both are fetching because their quorum-sets are missing.
+        let env_a = make_envelope_with_deps(100, 1, tx_hash_a, qs_hash_q);
+        let env_b = make_envelope_with_deps(101, 2, tx_hash_b, qs_hash_r);
+        assert_eq!(fetching.recv_envelope(env_a), RecvResult::Fetching);
+        assert_eq!(fetching.recv_envelope(env_b), RecvResult::Fetching);
+
+        // Deliver both tx-sets (cache is now full at 2)
+        fetching.recv_tx_set(tx_hash_a, 100, vec![1]);
+        fetching.recv_tx_set(tx_hash_b, 101, vec![2]);
+        assert_eq!(fetching.tx_set_cache_size(), 2);
+        assert_eq!(fetching.fetching_count(), 2);
+
+        // Force eviction by inserting a third tx-set. Since both entries are
+        // referenced, the fallback evicts the oldest-slot entry.
+        let tx_hash_extra = Hash256::from_bytes([0xCC; 32]);
+        fetching.cache_tx_set(tx_hash_extra, 200, vec![3]);
+
+        // One of the two referenced tx-sets was evicted
+        let a_evicted = !fetching.has_tx_set(&tx_hash_a);
+        let b_evicted = !fetching.has_tx_set(&tx_hash_b);
+        assert!(
+            a_evicted || b_evicted,
+            "at least one referenced tx-set should have been evicted to maintain the bound"
+        );
+
+        // Deliver the quorum-set for the envelope whose tx-set was evicted.
+        // check_and_move_to_ready will see the tx-set is missing and should
+        // re-register the fetch (not silently strand the envelope).
+        if a_evicted {
+            // cache_quorum_set now auto-rechecks fetching envelopes
+            fetching.cache_quorum_set(qs_hash_q, make_sane_quorum_set());
+
+            // Envelope A should NOT be ready yet (tx-set A was evicted)
+            assert_eq!(
+                fetching.fetching_count(),
+                2,
+                "envelope A should still be fetching"
+            );
+
+            // But the fetch should have been re-started: verify by checking
+            // the fetcher is now tracking the evicted hash again.
+            assert!(
+                fetching.tx_set_fetcher.is_tracking(&Hash(tx_hash_a.0)),
+                "tx-set A fetch should have been re-started by check_and_move_to_ready"
+            );
+
+            // Simulate re-delivery of the evicted tx-set
+            fetching.recv_tx_set(tx_hash_a, 100, vec![1]);
+            assert_eq!(
+                fetching.ready_count(),
+                1,
+                "envelope A should become ready after re-delivery"
+            );
+        } else {
+            fetching.cache_quorum_set(qs_hash_r, make_sane_quorum_set());
+
+            assert_eq!(
+                fetching.fetching_count(),
+                2,
+                "envelope B should still be fetching"
+            );
+            assert!(
+                fetching.tx_set_fetcher.is_tracking(&Hash(tx_hash_b.0)),
+                "tx-set B fetch should have been re-started by check_and_move_to_ready"
+            );
+
+            fetching.recv_tx_set(tx_hash_b, 101, vec![2]);
+            assert_eq!(
+                fetching.ready_count(),
+                1,
+                "envelope B should become ready after re-delivery"
+            );
+        }
     }
 }
