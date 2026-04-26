@@ -124,8 +124,8 @@ put_enabled = false
 # could reach us. Keep 8009 until ops opens 11625 in the SG (#1935).
 peer_port = 8009
 max_inbound_peers = 64
-max_outbound_peers = 8
-target_outbound_peers = 8
+max_outbound_peers = 20
+target_outbound_peers = 16
 known_peers = [
     # SDF
     "core-live-a.stellar.org:11625",
@@ -158,7 +158,34 @@ known_peers = [
     "hercules.publicnode.org:11625",
     "lyra.publicnode.org:11625",
 ]
-preferred_peers = []
+# Preferred peers — overlay will keep direct outbound connections to these
+# validators rather than auto-evicting them. SCP envelopes from quorum
+# members route to us with no relay hops, reducing externalize wall-clock
+# latency. 2 per org = 14 total; tolerates one host per org going down
+# without losing direct routing for that org's votes.
+preferred_peers = [
+    # SDF (2 of 3)
+    "core-live-a.stellar.org:11625",
+    "core-live-b.stellar.org:11625",
+    # LOBSTR (2 of 3)
+    "v1.stellar.lobstr.co:11625",
+    "v2.stellar.lobstr.co:11625",
+    # Blockdaemon (2 of 3)
+    "stellar-full-validator1.bdnodes.net:11625",
+    "stellar-full-validator2.bdnodes.net:11625",
+    # Franklin Templeton (2 of 3)
+    "stellar1.franklintempleton.com:11625",
+    "stellar2.franklintempleton.com:11625",
+    # SatoshiPay (2 of 3)
+    "stellar-de-fra.satoshipay.io:11625",
+    "stellar-us-iowa.satoshipay.io:11625",
+    # Creit (2 of 3)
+    "alpha.validator.stellar.creit.tech:11625",
+    "beta.validator.stellar.creit.tech:11625",
+    # PublicNode (2 of 3)
+    "bootes.publicnode.org:11625",
+    "hercules.publicnode.org:11625",
+]
 
 [http]
 address = "0.0.0.0"
