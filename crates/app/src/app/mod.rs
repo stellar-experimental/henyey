@@ -1757,17 +1757,6 @@ impl App {
             slot_is_externalized: slot_state.as_ref().map(|s| s.is_externalized),
             slot_ballot_phase: slot_state.as_ref().map(|s| format!("{:?}", s.ballot_phase)),
             slot_ballot_round: slot_state.as_ref().and_then(|s| s.ballot_round),
-            slot_ballot_value_hash: slot_state
-                .as_ref()
-                .and_then(|s| s.ballot_value_hash.clone()),
-            slot_candidate_count: slot_state.as_ref().map(|s| s.candidate_count),
-            slot_composite_hash: slot_state.as_ref().and_then(|s| s.composite_hash.clone()),
-            slot_peer_summaries: slot_state
-                .as_ref()
-                .map(|s| s.peer_ballot_summaries.clone())
-                .unwrap_or_default(),
-            slot_fully_validated: slot_state.as_ref().and_then(|s| s.fully_validated),
-            diag_counters: slot_state.as_ref().and_then(|s| s.diag_counters),
             nomination_timeout_fires: self.nomination_timeout_fires.load(Ordering::Relaxed),
             ballot_timeout_fires: self.ballot_timeout_fires.load(Ordering::Relaxed),
             scp_messages_sent: self.scp_messages_sent.load(Ordering::Relaxed),

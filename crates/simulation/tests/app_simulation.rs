@@ -58,25 +58,12 @@ async fn collect_node_diagnostics(sim: &Simulation) -> String {
     for id in sim.app_node_ids() {
         match sim.app_debug_stats(&id).await {
             Some(stats) => {
-                let peer_info = &stats.slot_peer_summaries;
-                let diag_str = stats.diag_counters.map_or(
-                    "none".to_string(),
-                    |(a, s, f, sup, c, envs, hi, pskip, hi_att, hi_fail)| {
-                        format!(
-                            "att={}/succ={}/qf={}/sup={}/c={}/envs={}/hi={}/pskip={}/hi_att={}/hi_fail={}",
-                            a, s, f, sup, c, envs, hi, pskip, hi_att, hi_fail
-                        )
-                    },
-                );
                 diag.push_str(&format!(
                     "\n  {id}: ledger={}, peers={}, state={}, herder={}, \
                      pending_envelopes={}, heard_quorum={}, v_blocking={}, \
-                     ballot_phase={}, ballot_round={}, fully_validated={}, \
-                     ballot_value={}, candidates={}, composite={}, \
-                     peer_ballots=[{}], \
+                     ballot_phase={}, ballot_round={}, \
                      nom_timeouts={}, ballot_timeouts={}, \
                      scp_sent={}, scp_recv={}, \
-                     accept_prep=[{}], \
                      trigger_attempts={}, trigger_ok={}, trigger_fail={}",
                     stats.current_ledger,
                     stats.peer_count,
@@ -89,20 +76,10 @@ async fn collect_node_diagnostics(sim: &Simulation) -> String {
                     stats
                         .slot_ballot_round
                         .map_or("none".to_string(), |r| r.to_string()),
-                    stats
-                        .slot_fully_validated
-                        .map_or("none".to_string(), |v| v.to_string()),
-                    stats.slot_ballot_value_hash.as_deref().unwrap_or("none"),
-                    stats
-                        .slot_candidate_count
-                        .map_or("none".to_string(), |c| c.to_string()),
-                    stats.slot_composite_hash.as_deref().unwrap_or("none"),
-                    peer_info,
                     stats.nomination_timeout_fires,
                     stats.ballot_timeout_fires,
                     stats.scp_messages_sent,
                     stats.scp_messages_received,
-                    diag_str,
                     stats.consensus_trigger_attempts,
                     stats.consensus_trigger_successes,
                     stats.consensus_trigger_failures,
