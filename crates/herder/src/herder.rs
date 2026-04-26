@@ -2935,7 +2935,9 @@ impl Herder {
                     );
                     // Don't update result — keep serving previous results.
                     // Clear checking_hash so future checks aren't blocked.
-                    let mut state = intersection_state.write();
+                    // N.B. Reuse the `state` guard from line 2894 — do NOT
+                    // re-acquire the write lock here; parking_lot::RwLock is
+                    // non-reentrant and a second .write() would self-deadlock.
                     state.clear_checking();
                 }
             }
@@ -6465,5 +6467,152 @@ mod quorum_health_tests {
         // Agreeing nodes = {local}, excluded = local → empty set for v-blocking.
         // Both peers already failing → already v-blocked → fail_at = 0.
         assert_eq!(fail_at, 0, "already v-blocked with all peers missing");
+    }
+}
+
+// ── Regression tests for quorum intersection self-deadlock (#1949) ──────
+//
+// Issue #1949: the `TooLarge` arm in `run_analysis` re-acquired the
+// `quorum_intersection_state` write lock while the guard from the
+// top-level acquisition was still live, causing a self-deadlock with
+// `parking_lot::RwLock` (non-reentrant).
+
+#[cfg(test)]
+mod quorum_intersection_deadlock_tests {
+    use super::*;
+    use henyey_crypto::SecretKey;
+
+    /// Build a herder whose transitive quorum tracker contains `n` nodes
+    /// (the local node + `n-1` peers), all with the same quorum set.
+    fn make_herder_with_n_quorum_nodes(n: usize) -> Herder {
+        assert!(n >= 1);
+        let mut keys = Vec::with_capacity(n);
+        let mut node_ids = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let seed = [(50 + i as u8); 32];
+            let sk = SecretKey::from_seed(&seed);
+            let pk = sk.public_key();
+            node_ids.push(node_id_from_public_key(&pk));
+            keys.push(sk);
+        }
+
+        let quorum_set = ScpQuorumSet {
+            threshold: (n as u32 / 2) + 1,
+            validators: node_ids.clone().try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let local_pk = keys[0].public_key();
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_pk,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, SecretKey::from_seed(&[50u8; 32]));
+
+        // Expand the transitive quorum tracker with all peers.
+        for key in keys.iter().skip(1) {
+            let peer_node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256(
+                *key.public_key().as_bytes(),
+            )));
+            herder.store_quorum_set(&peer_node_id, quorum_set.clone());
+            // Expand the tracker so the quorum map includes this peer.
+            let mut qt = herder.quorum_tracker.write();
+            let _ = qt.expand(&peer_node_id, quorum_set.clone());
+            drop(qt);
+        }
+
+        herder
+    }
+
+    /// Regression test for #1949: check_and_maybe_reanalyze_quorum_map with
+    /// >20 nodes (TooLarge path) must complete without self-deadlocking.
+    ///
+    /// Before the fix, this test would hang forever because the `TooLarge`
+    /// arm re-acquired the write lock while the top-level guard was live.
+    /// The synchronous fallback (no tokio runtime) exercises this directly.
+    #[test]
+    fn test_too_large_quorum_map_does_not_deadlock() {
+        let herder = make_herder_with_n_quorum_nodes(22);
+
+        // Verify the quorum map is indeed >20 nodes.
+        let qmap_len = herder.quorum_tracker.read().quorum_map().len();
+        assert!(
+            qmap_len > henyey_scp::quorum_intersection::MAX_INTERSECTION_NODES,
+            "test setup: need >20 nodes, got {}",
+            qmap_len,
+        );
+
+        // This call exercises the synchronous fallback (no tokio runtime).
+        // Before the fix, it would self-deadlock and hang forever.
+        herder.check_and_maybe_reanalyze_quorum_map(100);
+
+        // Verify state: checking_hash should be cleared (TooLarge clears it).
+        let state = herder.quorum_intersection_state.read();
+        assert!(
+            state.checking_hash().is_none(),
+            "TooLarge path should clear checking_hash"
+        );
+
+        // No result should be published (TooLarge preserves previous result).
+        assert!(
+            !state.has_any_results(),
+            "TooLarge should not publish a result"
+        );
+        drop(state);
+
+        // A subsequent call should also succeed (lock is free).
+        herder.check_and_maybe_reanalyze_quorum_map(101);
+
+        // And reading the state should succeed too (no lock contention).
+        let state = herder.quorum_intersection_state.read();
+        assert!(state.checking_hash().is_none());
+    }
+
+    /// Verify that TooLarge preserves a prior intersecting result.
+    #[test]
+    fn test_too_large_preserves_prior_result() {
+        let herder = make_herder_with_n_quorum_nodes(22);
+
+        // Manually inject a prior intersecting result.
+        {
+            let prior_hash = Hash256::from([0xAA; 32]);
+            let mut state = herder.quorum_intersection_state.write();
+            state.start_checking(prior_hash);
+            state.complete_check(
+                &prior_hash,
+                crate::quorum_intersection_state::QuorumIntersectionResult::Intersecting {
+                    check_ledger: 50,
+                    num_nodes: 5,
+                    quorum_map_hash: prior_hash,
+                },
+            );
+        }
+
+        // Verify prior result is published.
+        assert!(herder.quorum_intersection_state.read().has_any_results());
+        assert_eq!(
+            herder.quorum_intersection_state.read().last_good_ledger(),
+            50
+        );
+
+        // Now trigger TooLarge path.
+        herder.check_and_maybe_reanalyze_quorum_map(100);
+
+        // Prior result should be preserved.
+        let state = herder.quorum_intersection_state.read();
+        assert!(state.has_any_results(), "prior result should be preserved");
+        assert_eq!(
+            state.last_good_ledger(),
+            50,
+            "last_good_ledger should be preserved"
+        );
+        assert!(
+            state.checking_hash().is_none(),
+            "checking_hash should be cleared"
+        );
     }
 }
