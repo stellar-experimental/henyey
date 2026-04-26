@@ -197,7 +197,8 @@ RUST_LOG=info nohup /home/tomer/data/$MONITOR_SESSION_ID/cargo-target/release/he
 ```
 
 Wedges are a known recurring symptom (see #1904, #1873, #1921). Always
-file a new `ready` issue referencing the most recent related one —
+file a new `urgent`-labeled issue referencing the most recent related one
+(wedge blocks validator operation — meets urgent criteria) —
 recurrence-after-fix → NEW issue, not a comment on a closed one.
 
 **(4) Memory** — `ps -o rss= -p $(pgrep -f 'henyey.*run' | head -1)`, convert to MB.
@@ -648,9 +649,12 @@ For each firing alert:
 3. Otherwise follow the BUG FILING WORKFLOW:
    - Search `gh issue list --search "metrics: <metric-name>" --state open`.
    - If one matches, `gh issue comment <N>` with the new evidence (current/prev
-     values, delta, threshold, ledger, binary sha, sibling metrics) and ensure
-     `ready` label is set.
-   - If no match, `gh issue create --label ready` with:
+     values, delta, threshold, ledger, binary sha, sibling metrics). Apply the
+     `urgent` label only if the metric breach blocks validator operation (per
+     the Label policy in the Bug filing workflow); otherwise leave unlabeled.
+   - If no match, `gh issue create` (append `--label urgent` only when the
+     metric breach is operation-blocking; most metric alerts are non-urgent
+     and should be filed without a label) with:
      - Title: `Non-critical: metrics: <metric>` (NONC tier) or `metrics: <metric> — <symptom>` (WARN/SYNC tier).
      - Body: current/prev values, delta, threshold, ledger, binary sha, related
        sibling metrics, file:line citation from `grep -n "<metric_name_without_prefix>" crates/ -r`,
@@ -752,51 +756,78 @@ Only act on failures from the last 2 hours (compare `createdAt` with
 4. Check for an existing open issue:
    `gh issue list --search "<workflow name + signature>" --state open`.
    If one matches, `gh issue comment <N>` with the new evidence (sha, log
-   snippet, timestamp) and ensure it has the `ready` label
-   (`gh issue edit <N> --add-label ready`).
-5. Otherwise, file a new issue: `gh issue create --label ready --title "<workflow>: <short signature>" --body "..."` with investigation findings.
+   snippet, timestamp) and ensure it has the `urgent` label
+   (`gh issue edit <N> --add-label urgent`) — failing CI on origin/main
+   blocks deploy and meets the urgent criteria.
+5. Otherwise, file a new issue: `gh issue create --label urgent --title "<workflow>: <short signature>" --body "..."` with investigation findings.
 6. Do NOT commit a fix. Report: `CI ISSUE FILED — <workflow> failed on <sha>, filed/commented #<N>`.
 
 ## Bug filing workflow
 
-Applies to node bugs, metric alerts, and CI failures:
+Applies to node bugs, metric alerts, and CI failures.
+
+### Label policy
+
+When creating or commenting on issues:
+
+- **`urgent`** — file with `--label urgent`, OR `gh issue edit <N> --add-label urgent`
+  on an existing issue, ONLY when the symptom blocks validator operation or
+  consensus participation. Specifically:
+  - hash mismatch (any kind)
+  - wedged node (frozen event loop, watchdog auto-abort)
+  - failing CI on origin/main blocking deploy
+  - panic or crash from production code
+  - SYNC FAILURE past the active deadline
+  - OOM-driven restart
+  - and similar runtime-blocking conditions
+- **(no label)** — non-urgent issues: calibration, threshold tuning, NONC
+  alerts, cosmetic noise, follow-up improvements. Downstream picks these up
+  at lower priority.
+- **`not-ready`** — reserved for tier-3 self-reflection issues that need
+  operator decision before any code change. Do not use for regular bug
+  filings.
+
+### Filing flow
 
 1. Identify the failing signature (ledger + error type for node bugs; metric
    + threshold for alerts; workflow + job + error type for CI).
 2. Investigate to root cause — read source code, trace code paths.
 3. Check for an existing open issue: `gh issue list --search "<keywords>" --state open`.
    If a match exists, verify its state is OPEN
-   (`gh issue view <N> --json state -q .state`) and then `gh issue comment <N>`
-   with the new evidence and ensure the `ready` label is set, and STOP.
-4. If no OPEN match, file a new issue using `gh issue create --label ready`
-   with a self-contained proposal body (symptom, evidence, suspected root cause,
-   fix sketch with file:line references).
+   (`gh issue view <N> --json state -q .state`), `gh issue comment <N>` with
+   new evidence, and apply the `urgent` label only if the recurrence meets
+   the urgent criteria above. STOP.
+4. If no OPEN match, file a new issue with `gh issue create` — append
+   `--label urgent` only if the symptom meets the urgent criteria above;
+   otherwise omit the label. Body is a self-contained proposal (symptom,
+   evidence, suspected root cause, fix sketch with file:line references).
 5. Do NOT spawn agents. Do NOT edit the main checkout. The next redeploy tick
    (check 10) will pick up whatever lands on main.
 
 **Recurrence policy**: If a previously-filed bug recurs with material new
 evidence, prefer commenting on the existing issue when it is the same bug at
 the same site AND the issue is OPEN. If the prior issue is CLOSED, file a new
-`ready`-labeled issue with `Related to #<prior> (closed)` in the body and a
-note on why the prior fix did not cover this case; do NOT comment on the
-closed issue. File a new issue (still referencing `Related to #<prior>` with
-one-line scope-diff) when new evidence points at a different named subsystem,
-phase/mark, root-cause hypothesis, or candidate site set.
+issue (label per the policy above) with `Related to #<prior> (closed)` in the
+body and a note on why the prior fix did not cover this case; do NOT comment
+on the closed issue. File a new issue (still referencing `Related to #<prior>`
+with one-line scope-diff) when new evidence points at a different named
+subsystem, phase/mark, root-cause hypothesis, or candidate site set.
 
 **Commit policy**: the monitor does NOT commit code. All fixes are delegated
-via `gh issue` with the `ready` label.
+via `gh issue`.
 
 **Deploy regression policy**: If the node fails after a deploy, (a) file or
-comment on a `ready`-labeled GitHub issue with the regression details
-(commit range, symptoms, watchdog data); (b) restart the node on the last
-known-good binary (rebuild from the previous commit) while waiting for the
-fix. Do NOT revert commits inline.
+comment on a GitHub issue (label `urgent` since validator operation is
+impacted) with the regression details (commit range, symptoms, watchdog
+data); (b) restart the node on the last known-good binary (rebuild from the
+previous commit) while waiting for the fix. Do NOT revert commits inline.
 
 ## Investigation
 
 For ANY anomaly, investigate to root cause — read source code, check logs,
-trace code paths. Never dismiss as "expected". Produce a `ready`-labeled
-GitHub issue (or comment on an existing one) for every anomaly that isn't
+trace code paths. Never dismiss as "expected". Produce a GitHub issue
+(label per the Bug filing workflow's Label policy — `urgent` if it blocks
+operation, otherwise no label) or comment on an existing one for every anomaly that isn't
 immediately explained. **Only exception**: anomalies whose root cause turns
 out to be literal expected-correct behavior per the code — document the code
 path in the status report and skip the filing.
@@ -818,7 +849,7 @@ MONITOR <OK|WARNING|ACTION> — L<ledger> — <timestamp>
   metrics_ratio: scp <ok (accept=X%) | skipped (reason) | WARNING accept=X%<5% (N ticks)>, apply <ok (fail=Y%) | skipped (reason) | WARNING fail=Y%>50% (N ticks) — investigating>, pending <ok (too_old=Z%) | skipped (reason) | WARNING too_old=Z%>50% (N ticks)> | collecting baseline
   deploy:  <up-to-date | pulled N commits (old..new) | SKIPPED (dirty-tree|ci-red|build-failed, filed/commented #<N>)>
   ci:      <all green (run+job level) | WORKFLOW failed — filed/commented #<N> | WORKFLOW jobs FAILED (continue-on-error) — NAME|conclusion listed, filed/commented #<N>>
-  self_reflect: <clean | fixed inline (<sha>: <short-desc>) | filed #<N> (ready: <short-desc>) | filed #<N> (not-ready: <short-desc>)>
+  self_reflect: <clean | fixed inline (<sha>: <short-desc>) | filed #<N> (urgent: <short-desc>) | filed #<N> (no-label: <short-desc>) | filed #<N> (not-ready: <short-desc>)>
 ```
 
 Use WARNING for threshold breaches. Use ACTION when a corrective action was
@@ -826,7 +857,7 @@ taken (restart, deploy, filed a new issue, commented on an existing issue).
 Use SYNC FAILURE (not WARNING) when the node has exceeded the active sync
 deadline (15m populated / 4h fresh-start) but is not closing ledgers in
 real-time — this is a bug that requires immediate investigation AND
-filing/commenting on a `ready`-labeled issue.
+filing/commenting on a GitHub issue (label `urgent` since SYNC FAILURE blocks consensus).
 
 ## Self-reflection
 
@@ -886,7 +917,12 @@ Action sequence (same pattern used for every skill edit in this repo):
 
 Report: `self_reflect: fixed inline (<short-sha>: <short-desc>)`.
 
-**Tier 2 — File `ready` GH issue (non-trivial but codeable).**
+**Tier 2 — File GH issue (non-trivial but codeable).**
+
+Apply the Bug filing workflow's Label policy: most monitor-tick self-reflection
+issues are non-urgent (calibration / threshold / catalog tuning) and should
+be filed without a label. Only use `urgent` if the skill's miscalibration is
+silently masking a real validator-blocking signal.
 
 The issue is real and actionable but any of:
 - Touches multiple files or crates
@@ -912,13 +948,15 @@ Issue body MUST include:
 - **Related to #<prior>** if it's a recurrence of something already
   filed
 
-Label: `ready`. Title format:
+Title format:
 - `Non-critical: monitor-tick: <description>` — for observability /
-  calibration issues (noise reduction, threshold tuning)
+  calibration issues (noise reduction, threshold tuning) — file with no label
 - `monitor-tick: <description>` — for correctness bugs (silent
-  failures, contradictory output)
+  failures, contradictory output) — file with no label unless the bug
+  is silently masking a real validator-blocking signal (then `urgent`)
 
-Report: `self_reflect: filed #<N> (ready: <short-desc>)`.
+Report: `self_reflect: filed #<N> (urgent: <short-desc>)` or
+`self_reflect: filed #<N> (no-label: <short-desc>)`.
 
 **Tier 3 — File `not-ready` GH issue (human input required).**
 
