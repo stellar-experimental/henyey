@@ -326,7 +326,11 @@ checks below, which are traffic-proportional and self-calibrating.
 - `henyey_jemalloc_fragmentation_pct` >50 on two consecutive ticks → WARN
 - `stellar_ledger_age_current_seconds` >30 when uptime >15m AND `CRASH_RECOVERY=no` AND `FRESH_START=no` → SYNC (during `CRASH_RECOVERY=yes` age is legitimately large while replay catches up; during clean post-restart bucket-apply / short-gap replay age is also legitimately large until catchup completes. The authoritative sync check is (2), with its deadline and progress carveout — this gauge is a secondary signal gated to the same 15m window as `stellar_herder_state`)
 - `stellar_herder_state` !=2 when uptime >15m AND `CRASH_RECOVERY=no` AND `FRESH_START=no` → SYNC (during crash-recovery the node is legitimately in state=1 Catching Up until replay completes)
-- `henyey_scp_verify_input_backlog` >100 → WARN
+- `henyey_scp_verify_input_backlog` >100 on two consecutive ticks → WARN (single snapshots
+  routinely spike to 100+ during slot externalize bursts and drain to 0 within 1-2 seconds — gate
+  on persistence, matching the `fragmentation_pct` pattern. Verify by sampling /metrics 5 times
+  at 2s intervals before filing; a real backpressure event holds steady, a normal burst returns
+  to 0.)
 - `henyey_scp_verifier_thread_state` !=0 → WARN (0=Running, 1=Stopping, 2=Dead)
 - `stellar_herder_pending_envelopes` >2000 → WARN
 - `henyey_overlay_fetch_channel_depth_max` >500 → WARN
