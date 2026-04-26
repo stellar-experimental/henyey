@@ -48,12 +48,12 @@ log "Log dir:   $LOOP_LOG_DIR"
 select_issue() {
   local json
 
-  # Priority 1: newest open, unassigned issue labeled "ready",
-  # excluding "plan-do-review-loop-failed" and "not-ready".
+  # Priority 0: resume — oldest open issue already assigned to me
+  # (interrupted previous run). Excludes failed issues.
   if ! json="$(gh issue list \
     --state open \
-    --assignee '' \
-    --search 'sort:created-desc -label:plan-do-review-loop-failed -label:not-ready label:ready' \
+    --assignee '@me' \
+    --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
     --json number,title \
     --limit 1)"; then
     return 1
@@ -64,15 +64,16 @@ select_issue() {
   if [[ -n "$number" ]]; then
     local title
     title="$(jq -r '.[0].title // ""' <<<"$json")"
-    echo "${number} ${title}"
+    echo "resume ${number} ${title}"
     return 0
   fi
 
-  # Priority 2: any eligible issue (no "ready" requirement).
+  # Priority 1: oldest open, unassigned issue labeled "ready",
+  # excluding "plan-do-review-loop-failed" and "not-ready".
   if ! json="$(gh issue list \
     --state open \
     --assignee '' \
-    --search 'sort:created-desc -label:plan-do-review-loop-failed -label:not-ready' \
+    --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready label:ready' \
     --json number,title \
     --limit 1)"; then
     return 1
@@ -82,7 +83,25 @@ select_issue() {
   if [[ -n "$number" ]]; then
     local title
     title="$(jq -r '.[0].title // ""' <<<"$json")"
-    echo "${number} ${title}"
+    echo "new ${number} ${title}"
+    return 0
+  fi
+
+  # Priority 2: any eligible issue (no "ready" requirement), oldest first.
+  if ! json="$(gh issue list \
+    --state open \
+    --assignee '' \
+    --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
+    --json number,title \
+    --limit 1)"; then
+    return 1
+  fi
+
+  number="$(jq -r '.[0].number // empty' <<<"$json")"
+  if [[ -n "$number" ]]; then
+    local title
+    title="$(jq -r '.[0].title // ""' <<<"$json")"
+    echo "new ${number} ${title}"
     return 0
   fi
 }
@@ -121,26 +140,33 @@ while true; do
     continue
   fi
 
-  # Parse "number title…"
-  issue_number="${selected%% *}"
-  issue_title="${selected#* }"
-  log "Auto-selected issue #${issue_number}: ${issue_title}"
+  # Parse "mode number title…"
+  select_mode="${selected%% *}"
+  rest="${selected#* }"
+  issue_number="${rest%% *}"
+  issue_title="${rest#* }"
 
-  # Assign as concurrency lock
-  if ! gh issue edit "$issue_number" --add-assignee "@me" 2>/dev/null; then
-    log "Could not assign issue #${issue_number} — may have been claimed. Sleeping ${LOOP_EMPTY_SLEEP}s…"
-    sleep "$LOOP_EMPTY_SLEEP"
-    continue
-  fi
+  if [[ "$select_mode" == "resume" ]]; then
+    log "Resuming previously assigned issue #${issue_number}: ${issue_title}"
+  else
+    log "Auto-selected new issue #${issue_number}: ${issue_title}"
 
-  # Verify we are the sole assignee (assignment doesn't fail for multi-assignee)
-  assignee_count="$(gh issue view "$issue_number" --json assignees --jq '.assignees | length' 2>/dev/null)" || assignee_count=""
-  if [[ "$assignee_count" != "1" ]]; then
-    log "Issue #${issue_number} has ${assignee_count:-unknown} assignees — another worker likely claimed it. Skipping."
-    sleep "$LOOP_EMPTY_SLEEP"
-    continue
+    # Assign as concurrency lock
+    if ! gh issue edit "$issue_number" --add-assignee "@me" 2>/dev/null; then
+      log "Could not assign issue #${issue_number} — may have been claimed. Sleeping ${LOOP_EMPTY_SLEEP}s…"
+      sleep "$LOOP_EMPTY_SLEEP"
+      continue
+    fi
+
+    # Verify we are the sole assignee (assignment doesn't fail for multi-assignee)
+    assignee_count="$(gh issue view "$issue_number" --json assignees --jq '.assignees | length' 2>/dev/null)" || assignee_count=""
+    if [[ "$assignee_count" != "1" ]]; then
+      log "Issue #${issue_number} has ${assignee_count:-unknown} assignees — another worker likely claimed it. Skipping."
+      sleep "$LOOP_EMPTY_SLEEP"
+      continue
+    fi
+    log "Assigned issue #${issue_number} to self (sole assignee)"
   fi
-  log "Assigned issue #${issue_number} to self (sole assignee)"
 
   # Run copilot with the pre-selected issue number
   ts="$(date +%Y%m%d-%H%M%S)"
