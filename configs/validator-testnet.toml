@@ -17,9 +17,6 @@ is_validator = true
 # Generate one with: stellar-core gen-seed
 # node_seed = "S..."  # UNCOMMENT AND SET YOUR SEED
 
-# Maximum transactions to include in a proposed set
-max_tx_set_size = 100
-
 # Quorum set for consensus
 [node.quorum_set]
 # Threshold percentage (0-100)

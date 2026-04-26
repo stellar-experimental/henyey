@@ -2552,4 +2552,30 @@ name = "test"
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.node.name, "test");
     }
+
+    #[test]
+    fn test_shipped_config_files_parse() {
+        // Ensure all configs in configs/ are valid against deny_unknown_fields
+        let configs_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("configs");
+        for entry in std::fs::read_dir(&configs_dir).expect("configs/ dir should exist") {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().map_or(true, |e| e != "toml") {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).unwrap();
+            let result = toml::from_str::<AppConfig>(&content);
+            assert!(
+                result.is_ok(),
+                "configs/{} failed to parse: {}",
+                path.file_name().unwrap().to_string_lossy(),
+                result.unwrap_err()
+            );
+        }
+    }
 }

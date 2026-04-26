@@ -10,9 +10,6 @@ name = "henyey-watcher"
 # Run as watcher (non-validator)
 is_validator = false
 
-# Maximum transactions to include in a proposed set
-max_tx_set_size = 100
-
 # Quorum set for observing consensus
 [node.quorum_set]
 # Threshold percentage (0-100)

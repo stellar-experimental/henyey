@@ -11,12 +11,6 @@ name = "henyey-testnet"
 # Run as validator (requires keypair)
 is_validator = false
 
-# Maximum transactions to include in a proposed set
-max_tx_set_size = 100
-
-# Maximum peer connections
-max_peer_connections = 50
-
 # Quorum set for consensus
 [node.quorum_set]
 # Threshold percentage (0-100)
@@ -33,29 +27,27 @@ validators = [
 # Network passphrase - MUST match network
 passphrase = "Test SDF Network ; September 2015"
 
+[overlay]
 # Peer-to-peer port
 peer_port = 11625
 
-# HTTP admin port (0 to disable)
-http_port = 11626
+# Known peers to connect to on startup
+known_peers = [
+    "core-testnet1.stellar.org:11625",
+    "core-testnet2.stellar.org:11625",
+    "core-testnet3.stellar.org:11625"
+]
+
+[http]
+# HTTP admin port
+port = 11626
 
 [database]
 # Path to SQLite database file
 path = "testnet.db"
-
-# Connection pool size
 pool_size = 10
 
 [history]
-# Archive selection strategy: "random", "sequential", "fastest"
-selection_strategy = "random"
-
-# Retry failed downloads up to N times
-max_retries = 3
-
-# Download parallelism (concurrent bucket downloads)
-parallelism = 8
-
 # History archives for catchup - these are the official SDF testnet archives
 [[history.archives]]
 name = "sdf1"
@@ -69,33 +61,6 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_002"
 name = "sdf3"
 url = "https://history.stellar.org/prd/core-testnet/core_testnet_003"
 
-[peers]
-# Known peer addresses for bootstrap
-known = [
-    "core-testnet1.stellar.org:11625",
-    "core-testnet2.stellar.org:11625",
-    "core-testnet3.stellar.org:11625"
-]
-
-# Peer authentication timeout (seconds)
-auth_timeout = 10
-
-# Maximum pending peers (not yet authenticated)
-max_pending = 10
-
-# Prefer IPv4 over IPv6
-prefer_ipv4 = true
-
-[catchup]
-# Catchup mode: "minimal", "recent", "complete"
-default_mode = "minimal"
-
-# For "recent" mode: number of ledgers to keep
-recent_ledger_count = 100000
-
-# Verify buckets and headers during catchup
-verify = true
-
 [logging]
 # Log level: "error", "warn", "info", "debug", "trace"
 level = "info"
@@ -103,25 +68,8 @@ level = "info"
 # Log format: "text", "json"
 format = "text"
 
-# Log file path (empty for stdout only)
-file = ""
-
-# Include source location in logs
-include_location = false
-
-[metrics]
-# Enable Prometheus metrics endpoint
-enabled = false
-
-# Metrics port
-port = 9090
-
 [maintenance]
 # Automatic database maintenance
-auto_vacuum = true
-
-# Database checkpoint interval (ledgers)
-checkpoint_frequency = 64
-
-# Keep at most N ledgers in database (0 for unlimited)
-max_ledgers_to_keep = 0
+enabled = true
+period_secs = 14400
+count = 50000
