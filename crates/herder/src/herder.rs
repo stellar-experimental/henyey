@@ -2776,18 +2776,27 @@ impl Herder {
             QuorumIntersectionResult::Intersecting {
                 check_ledger,
                 num_nodes,
+                critical_groups,
                 ..
-            } => Some(crate::json_api::TransitiveQuorumJsonInfo {
-                intersection: true,
-                node_count: *num_nodes as u64,
-                last_check_ledger: *check_ledger as u64,
-                // TODO(parity): critical nodes computation deferred to follow-up issue.
-                // stellar-core computes critical node groups via
-                // getIntersectionCriticalGroups() in HerderImpl.cpp:1714-1728.
-                critical: Vec::new(),
-                last_good_ledger: None,
-                potential_split: None,
-            }),
+            } => {
+                let critical: Vec<Vec<String>> = critical_groups
+                    .iter()
+                    .map(|group| {
+                        group
+                            .iter()
+                            .map(|n| crate::json_api::format_node_id(n, false))
+                            .collect()
+                    })
+                    .collect();
+                Some(crate::json_api::TransitiveQuorumJsonInfo {
+                    intersection: true,
+                    node_count: *num_nodes as u64,
+                    last_check_ledger: *check_ledger as u64,
+                    critical: Some(critical),
+                    last_good_ledger: None,
+                    potential_split: None,
+                })
+            }
             QuorumIntersectionResult::Split {
                 check_ledger,
                 num_nodes,
@@ -2808,7 +2817,7 @@ impl Herder {
                     intersection: false,
                     node_count: *num_nodes as u64,
                     last_check_ledger: *check_ledger as u64,
-                    critical: Vec::new(),
+                    critical: None,
                     last_good_ledger: Some(state.last_good_ledger() as u64),
                     potential_split: Some((
                         format_nodes(&potential_split.0),
@@ -2884,14 +2893,30 @@ impl Herder {
                 seed,
             );
 
-            let mut state = intersection_state.write();
-
             match result {
                 henyey_scp::quorum_intersection::IntersectionResult::Intersects => {
+                    // Only compute critical groups when intersecting (matching stellar-core).
+                    let critical_groups =
+                        match henyey_scp::quorum_intersection::get_intersection_critical_groups(
+                            &qmap,
+                            &interrupt_flag,
+                            seed,
+                        ) {
+                            Ok(groups) => groups,
+                            Err(_interrupted) => {
+                                debug!("Critical groups computation interrupted");
+                                let mut state = intersection_state.write();
+                                state.clear_checking();
+                                return;
+                            }
+                        };
+
+                    let mut state = intersection_state.write();
                     let qi_result = QuorumIntersectionResult::Intersecting {
                         check_ledger: ledger_seq,
                         num_nodes,
                         quorum_map_hash: hash,
+                        critical_groups,
                     };
                     if state.complete_check(&hash, qi_result) {
                         info!(
@@ -2904,6 +2929,7 @@ impl Herder {
                     }
                 }
                 henyey_scp::quorum_intersection::IntersectionResult::Split { pair } => {
+                    let mut state = intersection_state.write();
                     let qi_result = QuorumIntersectionResult::Split {
                         check_ledger: ledger_seq,
                         num_nodes,

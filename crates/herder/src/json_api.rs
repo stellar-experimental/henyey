@@ -222,9 +222,11 @@ pub struct TransitiveQuorumJsonInfo {
     pub node_count: u64,
     /// Ledger when last checked.
     pub last_check_ledger: u64,
-    /// Critical node groups (if intersection exists).
-    #[serde(skip_serializing_if = "Vec::is_empty", default)]
-    pub critical: Vec<Vec<String>>,
+    /// Critical node groups (present when intersection is true, omitted otherwise).
+    ///
+    /// Matches stellar-core which emits `"critical"` only when `intersection == true`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub critical: Option<Vec<Vec<String>>>,
     /// Last good ledger (if no intersection).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_good_ledger: Option<u64>,
@@ -551,7 +553,7 @@ mod tests {
             intersection: true,
             node_count: 10,
             last_check_ledger: 12345,
-            critical: vec![vec!["GABCD".to_string(), "GDEFG".to_string()]],
+            critical: Some(vec![vec!["GABCD".to_string(), "GDEFG".to_string()]]),
             last_good_ledger: None,
             potential_split: None,
         };
@@ -668,7 +670,7 @@ mod tests {
                 intersection: true,
                 node_count: 5,
                 last_check_ledger: 200,
-                critical: vec![],
+                critical: Some(vec![]),
                 last_good_ledger: None,
                 potential_split: None,
             }),
@@ -679,8 +681,9 @@ mod tests {
         assert_eq!(t["intersection"], true);
         assert_eq!(t["node_count"], 5);
         assert_eq!(t["last_check_ledger"], 200);
-        // critical is empty → omitted
-        assert!(t.get("critical").is_none());
+        // critical is present (even though empty) when intersection is true
+        assert!(t.get("critical").is_some());
+        assert_eq!(t["critical"], serde_json::json!([]));
         // last_good_ledger and potential_split omitted when intersecting
         assert!(t.get("last_good_ledger").is_none());
         assert!(t.get("potential_split").is_none());
@@ -705,7 +708,7 @@ mod tests {
                 intersection: false,
                 node_count: 6,
                 last_check_ledger: 300,
-                critical: vec![],
+                critical: None,
                 last_good_ledger: Some(250),
                 potential_split: Some((
                     vec!["GAAA".to_string(), "GBBB".to_string()],

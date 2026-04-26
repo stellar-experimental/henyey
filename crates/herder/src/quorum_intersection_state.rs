@@ -23,6 +23,11 @@ pub(crate) enum QuorumIntersectionResult {
         num_nodes: usize,
         /// Hash of the quorum map that was analyzed.
         quorum_map_hash: Hash256,
+        /// Intersection-critical node groups.
+        ///
+        /// Each inner Vec is a group of nodes whose removal would break
+        /// quorum intersection. Empty if no critical groups found.
+        critical_groups: Vec<Vec<NodeId>>,
     },
     /// Network does NOT enjoy quorum intersection.
     Split {
@@ -240,6 +245,7 @@ mod tests {
             check_ledger: 100,
             num_nodes: 5,
             quorum_map_hash: hash,
+            critical_groups: vec![],
         };
         assert!(state.complete_check(&hash, result));
 
@@ -284,6 +290,7 @@ mod tests {
                 check_ledger: 100,
                 num_nodes: 5,
                 quorum_map_hash: hash1,
+                critical_groups: vec![],
             },
         );
         assert!(state.has_any_results());
@@ -327,6 +334,7 @@ mod tests {
             check_ledger: 100,
             num_nodes: 5,
             quorum_map_hash: hash1,
+            critical_groups: vec![],
         };
         assert!(!state.complete_check(&hash1, result));
 
@@ -338,6 +346,7 @@ mod tests {
             check_ledger: 101,
             num_nodes: 5,
             quorum_map_hash: hash2,
+            critical_groups: vec![],
         };
         assert!(state.complete_check(&hash2, result2));
         assert!(state.has_any_results());
@@ -356,6 +365,7 @@ mod tests {
                 check_ledger: 100,
                 num_nodes: 5,
                 quorum_map_hash: hash1,
+                critical_groups: vec![],
             },
         );
 
@@ -381,6 +391,7 @@ mod tests {
                 check_ledger: 50,
                 num_nodes: 3,
                 quorum_map_hash: hash1,
+                critical_groups: vec![],
             },
         );
 

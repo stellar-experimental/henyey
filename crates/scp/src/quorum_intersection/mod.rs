@@ -13,8 +13,9 @@ mod checker;
 mod qbitset;
 mod tarjan;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use henyey_common::xdr_to_bytes;
@@ -143,6 +144,195 @@ pub fn find_unsatisfiable_node(
         }
     }
     None
+}
+
+/// Error returned when a critical-groups computation is interrupted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Interrupted;
+
+impl fmt::Display for Interrupted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "quorum intersection analysis interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+/// Compute intersection-critical groups.
+///
+/// Mirrors stellar-core's `QuorumIntersectionChecker::getIntersectionCriticalGroups()`
+/// (QuorumIntersectionCheckerImpl.cpp:833-955).
+///
+/// A group is "intersection-critical" if making it "fickle" (willing to go
+/// along with anyone) causes the network to lose quorum intersection.
+///
+/// Returns groups sorted deterministically (BTreeSet ordering = XDR byte
+/// ordering). Returns `Err(Interrupted)` if the interrupt flag is set during
+/// any sub-check.
+pub fn get_intersection_critical_groups(
+    quorum_map: &HashMap<NodeId, Option<ScpQuorumSet>>,
+    interrupt: &Arc<AtomicBool>,
+    seed: u64,
+) -> Result<Vec<Vec<NodeId>>, Interrupted> {
+    // Step 1: Find criticality candidates.
+    let mut candidates: BTreeSet<BTreeSet<NodeId>> = BTreeSet::new();
+    for (_node, qset_opt) in quorum_map {
+        if let Some(qset) = qset_opt {
+            find_criticality_candidates(qset, &mut candidates, true);
+        }
+    }
+
+    tracing::info!(
+        count = candidates.len(),
+        "Examining node groups for intersection-criticality"
+    );
+
+    // Step 2: Test each candidate by making it fickle.
+    let mut critical: BTreeSet<BTreeSet<NodeId>> = BTreeSet::new();
+    let mut test_qmap = quorum_map.clone();
+
+    for group in &candidates {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err(Interrupted);
+        }
+
+        // Build the fickle qset: threshold=2, two inner sets.
+        // Inner set 1: the group itself (threshold = group size).
+        let group_qset = ScpQuorumSet {
+            threshold: group.len() as u32,
+            validators: group
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_or_default(),
+            inner_sets: Vec::new().try_into().unwrap_or_default(),
+        };
+
+        // Inner set 2: all nodes outside the group that point to any group member.
+        let mut points_to_group: BTreeSet<NodeId> = BTreeSet::new();
+        for candidate in group {
+            for (d_node, d_qset_opt) in quorum_map {
+                if !group.contains(d_node) {
+                    if let Some(d_qset) = d_qset_opt {
+                        if points_to_candidate(d_qset, candidate) {
+                            points_to_group.insert(d_node.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let dependers_qset = ScpQuorumSet {
+            threshold: 1,
+            validators: points_to_group
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap_or_default(),
+            inner_sets: Vec::new().try_into().unwrap_or_default(),
+        };
+
+        let fickle_qset = ScpQuorumSet {
+            threshold: 2,
+            validators: Vec::new().try_into().unwrap_or_default(),
+            inner_sets: vec![group_qset, dependers_qset]
+                .try_into()
+                .unwrap_or_default(),
+        };
+
+        // Install the fickle qset for every member of the group.
+        for candidate in group {
+            test_qmap.insert(candidate.clone(), Some(fickle_qset.clone()));
+        }
+
+        // Check if this modified config loses intersection.
+        let result = check_intersection_interruptible(&test_qmap, interrupt, seed);
+        match result {
+            IntersectionResult::Interrupted => return Err(Interrupted),
+            IntersectionResult::Intersects => {
+                tracing::debug!(
+                    group_size = group.len(),
+                    dependers = points_to_group.len(),
+                    "group is not intersection-critical"
+                );
+            }
+            IntersectionResult::Split { .. } => {
+                tracing::warn!(
+                    group_size = group.len(),
+                    dependers = points_to_group.len(),
+                    "group IS intersection-critical"
+                );
+                critical.insert(group.clone());
+            }
+        }
+
+        // Restore original qsets for all group members.
+        for candidate in group {
+            test_qmap.insert(
+                candidate.clone(),
+                quorum_map.get(candidate).cloned().unwrap_or(None),
+            );
+        }
+    }
+
+    if critical.is_empty() {
+        tracing::info!("No intersection-critical groups found");
+    } else {
+        tracing::warn!(count = critical.len(), "Found intersection-critical groups");
+    }
+
+    // Convert BTreeSet<BTreeSet<NodeId>> → Vec<Vec<NodeId>> preserving ordering.
+    Ok(critical
+        .into_iter()
+        .map(|group| group.into_iter().collect())
+        .collect())
+}
+
+/// Recursively find criticality candidates from a quorum set.
+///
+/// Mirrors stellar-core's `findCriticalityCandidates()`.
+fn find_criticality_candidates(
+    qset: &ScpQuorumSet,
+    candidates: &mut BTreeSet<BTreeSet<NodeId>>,
+    root: bool,
+) {
+    // Always add each validator as a singleton.
+    for v in qset.validators.iter() {
+        let singleton: BTreeSet<NodeId> = [v.clone()].into_iter().collect();
+        candidates.insert(singleton);
+    }
+
+    // Non-root with no inner sets => leaf group; record the whole validator set.
+    if !root && qset.inner_sets.is_empty() {
+        let group: BTreeSet<NodeId> = qset.validators.iter().cloned().collect();
+        if !group.is_empty() {
+            candidates.insert(group);
+        }
+    }
+
+    // Recurse into inner sets.
+    for inner in qset.inner_sets.iter() {
+        find_criticality_candidates(inner, candidates, false);
+    }
+}
+
+/// Check if a quorum set references a specific node (directly or in inner sets).
+///
+/// Mirrors stellar-core's `pointsToCandidate()`.
+fn points_to_candidate(qset: &ScpQuorumSet, candidate: &NodeId) -> bool {
+    for v in qset.validators.iter() {
+        if v == candidate {
+            return true;
+        }
+    }
+    for inner in qset.inner_sets.iter() {
+        if points_to_candidate(inner, candidate) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -611,5 +801,216 @@ mod tests {
             "Expected Intersects, got {:?}",
             result
         );
+    }
+
+    // ---- Critical groups tests ----
+
+    #[test]
+    fn test_points_to_candidate_direct() {
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let qset = make_qset(vec![n1.clone(), n2.clone()], 2);
+        assert!(points_to_candidate(&qset, &n1));
+        assert!(points_to_candidate(&qset, &n2));
+        assert!(!points_to_candidate(&qset, &make_node_id(3)));
+    }
+
+    #[test]
+    fn test_points_to_candidate_nested() {
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let inner = make_qset(vec![n2.clone()], 1);
+        let qset = make_qset_with_inner(vec![n1.clone()], vec![inner], 2);
+        assert!(points_to_candidate(&qset, &n1));
+        assert!(points_to_candidate(&qset, &n2));
+        assert!(!points_to_candidate(&qset, &make_node_id(3)));
+    }
+
+    #[test]
+    fn test_find_criticality_candidates_flat() {
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let qset = make_qset(vec![n1.clone(), n2.clone()], 2);
+
+        let mut candidates = BTreeSet::new();
+        find_criticality_candidates(&qset, &mut candidates, true);
+
+        // Root: should add singletons for each validator but NOT the group itself.
+        assert!(candidates.contains(&[n1.clone()].into_iter().collect::<BTreeSet<_>>()));
+        assert!(candidates.contains(&[n2.clone()].into_iter().collect::<BTreeSet<_>>()));
+        // Root with no inner sets → not a leaf group, so no group entry.
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn test_find_criticality_candidates_leaf_group() {
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let qset = make_qset(vec![n1.clone(), n2.clone()], 2);
+
+        let mut candidates = BTreeSet::new();
+        // Non-root with no inner sets → leaf group.
+        find_criticality_candidates(&qset, &mut candidates, false);
+
+        assert!(candidates.contains(&[n1.clone()].into_iter().collect::<BTreeSet<_>>()));
+        assert!(candidates.contains(&[n2.clone()].into_iter().collect::<BTreeSet<_>>()));
+        // Also contains the full group {n1, n2}.
+        let group: BTreeSet<NodeId> = [n1, n2].into_iter().collect();
+        assert!(candidates.contains(&group));
+        assert_eq!(candidates.len(), 3);
+    }
+
+    #[test]
+    fn test_find_criticality_candidates_with_inner_sets() {
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let n3 = make_node_id(3);
+        // Inner set with n2, n3 (leaf group when non-root).
+        let inner = make_qset(vec![n2.clone(), n3.clone()], 1);
+        let qset = make_qset_with_inner(vec![n1.clone()], vec![inner], 2);
+
+        let mut candidates = BTreeSet::new();
+        find_criticality_candidates(&qset, &mut candidates, true);
+
+        // Singletons: n1, n2, n3
+        assert!(candidates.contains(&[n1].into_iter().collect::<BTreeSet<_>>()));
+        assert!(candidates.contains(&[n2.clone()].into_iter().collect::<BTreeSet<_>>()));
+        assert!(candidates.contains(&[n3.clone()].into_iter().collect::<BTreeSet<_>>()));
+        // Inner set is non-root with no inner sets → leaf group {n2, n3}.
+        let group: BTreeSet<NodeId> = [n2, n3].into_iter().collect();
+        assert!(candidates.contains(&group));
+        assert_eq!(candidates.len(), 4);
+    }
+
+    #[test]
+    fn test_critical_groups_empty_map() {
+        let map = HashMap::new();
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let result = get_intersection_critical_groups(&map, &interrupt, 0).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_critical_groups_no_critical_fully_connected() {
+        // 3 nodes, 2-of-3 quorum. Fully connected — no single node or group
+        // is critical because any 2 nodes still intersect.
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let n3 = make_node_id(3);
+        let all = vec![n1.clone(), n2.clone(), n3.clone()];
+
+        let mut map = HashMap::new();
+        map.insert(n1.clone(), Some(make_qset(all.clone(), 2)));
+        map.insert(n2.clone(), Some(make_qset(all.clone(), 2)));
+        map.insert(n3.clone(), Some(make_qset(all.clone(), 2)));
+
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let result = get_intersection_critical_groups(&map, &interrupt, 0).unwrap();
+        assert!(
+            result.is_empty(),
+            "Expected no critical groups in fully connected 2-of-3, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_critical_groups_bridge_node() {
+        // Replicates stellar-core's "quorum intersection criticality" test.
+        // 7 nodes with org3 (n3) as a bridge between two groups:
+        //   - Group A: {n0, n1, n2} connected in a chain, all depending on n3
+        //   - Group B: {n4, n5, n6} fully connected, n4 and n6 depending on n3
+        //   - n3 depends on n0, n1, n2, n4, n6 (5 of 6 slots = bridge)
+        //
+        // The network enjoys intersection because n3 bridges both groups.
+        // Making n3 fickle splits the network.
+
+        let n0 = make_node_id(0);
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let n3 = make_node_id(3);
+        let n4 = make_node_id(4);
+        let n5 = make_node_id(5);
+        let n6 = make_node_id(6);
+
+        let inner = |node: &NodeId| -> ScpQuorumSet { make_qset(vec![node.clone()], 1) };
+
+        // n0: needs n0 + n1 + n3 (threshold 3 of {n0, inner(n1), inner(n3)})
+        let q0 = make_qset_with_inner(vec![n0.clone()], vec![inner(&n1), inner(&n3)], 3);
+        // n1: needs n1 + 2 of {n0, n2, n3} (threshold 3 of 4 slots)
+        let q1 = make_qset_with_inner(
+            vec![n1.clone()],
+            vec![inner(&n0), inner(&n2), inner(&n3)],
+            3,
+        );
+        // n2: needs n2 + n1 + n3 (threshold 3 of 3)
+        let q2 = make_qset_with_inner(vec![n2.clone()], vec![inner(&n1), inner(&n3)], 3);
+        // n3: needs n3 + 4 of {n0, n1, n2, n4, n6} (threshold 5 of 6 slots)
+        let q3 = make_qset_with_inner(
+            vec![n3.clone()],
+            vec![inner(&n0), inner(&n1), inner(&n2), inner(&n4), inner(&n6)],
+            5,
+        );
+        // n4: needs n4 + 2 of {n3, n5, n6} (threshold 3 of 4)
+        let q4 = make_qset_with_inner(
+            vec![n4.clone()],
+            vec![inner(&n3), inner(&n5), inner(&n6)],
+            3,
+        );
+        // n5: needs n5 + n4 + n6 (threshold 3 of 3)
+        let q5 = make_qset_with_inner(vec![n5.clone()], vec![inner(&n4), inner(&n6)], 3);
+        // n6: needs n6 + 2 of {n3, n4, n5} (threshold 3 of 4)
+        let q6 = make_qset_with_inner(
+            vec![n6.clone()],
+            vec![inner(&n3), inner(&n4), inner(&n5)],
+            3,
+        );
+
+        let mut map = HashMap::new();
+        map.insert(n0.clone(), Some(q0));
+        map.insert(n1.clone(), Some(q1));
+        map.insert(n2.clone(), Some(q2));
+        map.insert(n3.clone(), Some(q3));
+        map.insert(n4.clone(), Some(q4));
+        map.insert(n5.clone(), Some(q5));
+        map.insert(n6.clone(), Some(q6));
+
+        // Verify intersection holds.
+        assert!(matches!(
+            check_intersection(&map),
+            IntersectionResult::Intersects
+        ));
+
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let groups = get_intersection_critical_groups(&map, &interrupt, 0).unwrap();
+
+        // n3 (the bridge) should be the only critical group (as a singleton).
+        assert_eq!(
+            groups.len(),
+            1,
+            "Expected exactly 1 critical group, got: {:?}",
+            groups
+        );
+        assert_eq!(
+            groups[0],
+            vec![n3.clone()],
+            "Expected n3 to be the critical group"
+        );
+    }
+
+    #[test]
+    fn test_critical_groups_interrupted() {
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let all = vec![n1.clone(), n2.clone()];
+
+        let mut map = HashMap::new();
+        map.insert(n1.clone(), Some(make_qset(all.clone(), 2)));
+        map.insert(n2.clone(), Some(make_qset(all.clone(), 2)));
+
+        // Set interrupt flag before calling.
+        let interrupt = Arc::new(AtomicBool::new(true));
+        let result = get_intersection_critical_groups(&map, &interrupt, 0);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), Interrupted);
     }
 }
