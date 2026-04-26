@@ -2853,19 +2853,6 @@ impl Herder {
                 debug!("Quorum intersection analysis already in progress for current map");
                 return;
             }
-
-            // If we're analyzing a different (stale) hash, wait for it to
-            // finish before starting a new one. Matches stellar-core's
-            // single-in-flight approach (HerderImpl.cpp:1948-1964).
-            // Results will be discarded as stale on completion; we'll
-            // re-trigger on the next advance_tracking_slot.
-            if state.checking_hash().is_some() {
-                debug!(
-                    "Quorum map changed during intersection analysis; \
-                     waiting for in-flight analysis to complete"
-                );
-                return;
-            }
         }
 
         info!(
@@ -2874,22 +2861,28 @@ impl Herder {
             "Transitive closure of quorum has changed, re-analyzing"
         );
 
-        // Mark analysis as in-progress.
-        {
+        // Mark analysis as in-progress and get the interrupt flag.
+        // If a stale analysis is in progress, start_checking interrupts it.
+        let interrupt_flag = {
             let mut state = self.quorum_intersection_state.write();
-            state.start_checking(curr_hash);
-        }
+            state.start_checking(curr_hash)
+        };
 
         // Clone what the background task needs.
         let intersection_state = Arc::clone(&self.quorum_intersection_state);
         let hash = curr_hash;
         let num_nodes = qmap.len();
+        let seed = rand::random::<u64>();
 
         // Spawn CPU-bound analysis on a blocking thread.
         // Guard: if no tokio runtime is active (e.g. in unit tests),
         // run synchronously instead of panicking.
         let run_analysis = move || {
-            let result = henyey_scp::quorum_intersection::check_intersection(&qmap);
+            let result = henyey_scp::quorum_intersection::check_intersection_interruptible(
+                &qmap,
+                &interrupt_flag,
+                seed,
+            );
 
             let mut state = intersection_state.write();
 
@@ -2927,17 +2920,8 @@ impl Herder {
                         debug!("Quorum intersection result discarded (stale hash)");
                     }
                 }
-                henyey_scp::quorum_intersection::IntersectionResult::TooLarge { node_count } => {
-                    debug!(
-                        node_count,
-                        max = henyey_scp::quorum_intersection::MAX_INTERSECTION_NODES,
-                        "Quorum map too large for brute-force intersection analysis"
-                    );
-                    // Don't update result — keep serving previous results.
-                    // Clear checking_hash so future checks aren't blocked.
-                    // N.B. Reuse the `state` guard from line 2894 — do NOT
-                    // re-acquire the write lock here; parking_lot::RwLock is
-                    // non-reentrant and a second .write() would self-deadlock.
+                henyey_scp::quorum_intersection::IntersectionResult::Interrupted => {
+                    debug!("Quorum intersection analysis interrupted (quorum map changed)");
                     state.clear_checking();
                 }
             }
@@ -6476,6 +6460,9 @@ mod quorum_health_tests {
 // `quorum_intersection_state` write lock while the guard from the
 // top-level acquisition was still live, causing a self-deadlock with
 // `parking_lot::RwLock` (non-reentrant).
+// That TooLarge variant has been removed (issue #1950) — the efficient
+// checker handles large networks. These tests now verify the new
+// behavior: large networks are analyzed successfully.
 
 #[cfg(test)]
 mod quorum_intersection_deadlock_tests {
@@ -6528,91 +6515,62 @@ mod quorum_intersection_deadlock_tests {
         herder
     }
 
-    /// Regression test for #1949: check_and_maybe_reanalyze_quorum_map with
-    /// >20 nodes (TooLarge path) must complete without self-deadlocking.
-    ///
-    /// Before the fix, this test would hang forever because the `TooLarge`
-    /// arm re-acquired the write lock while the top-level guard was live.
-    /// The synchronous fallback (no tokio runtime) exercises this directly.
+    /// With the efficient checker (issue #1950), networks >20 nodes
+    /// are analyzed successfully instead of returning TooLarge.
     #[test]
-    fn test_too_large_quorum_map_does_not_deadlock() {
+    fn test_large_quorum_map_analyzed_successfully() {
         let herder = make_herder_with_n_quorum_nodes(22);
 
         // Verify the quorum map is indeed >20 nodes.
         let qmap_len = herder.quorum_tracker.read().quorum_map().len();
         assert!(
-            qmap_len > henyey_scp::quorum_intersection::MAX_INTERSECTION_NODES,
+            qmap_len > 20,
             "test setup: need >20 nodes, got {}",
             qmap_len,
         );
 
-        // This call exercises the synchronous fallback (no tokio runtime).
-        // Before the fix, it would self-deadlock and hang forever.
+        // This call now runs the efficient intersection checker.
         herder.check_and_maybe_reanalyze_quorum_map(100);
 
-        // Verify state: checking_hash should be cleared (TooLarge clears it).
+        // The checker should produce a result (intersecting, since all
+        // nodes share the same >50% threshold quorum set).
         let state = herder.quorum_intersection_state.read();
         assert!(
             state.checking_hash().is_none(),
-            "TooLarge path should clear checking_hash"
+            "checking_hash should be cleared after analysis"
         );
-
-        // No result should be published (TooLarge preserves previous result).
         assert!(
-            !state.has_any_results(),
-            "TooLarge should not publish a result"
+            state.has_any_results(),
+            "analysis should produce a result for large network"
         );
+        assert!(
+            state.enjoys_quorum_intersection(),
+            "22-node network with >50% threshold should enjoy intersection"
+        );
+
+        // A subsequent call should also succeed.
         drop(state);
-
-        // A subsequent call should also succeed (lock is free).
         herder.check_and_maybe_reanalyze_quorum_map(101);
-
-        // And reading the state should succeed too (no lock contention).
-        let state = herder.quorum_intersection_state.read();
-        assert!(state.checking_hash().is_none());
     }
 
-    /// Verify that TooLarge preserves a prior intersecting result.
+    /// Verify that the efficient checker produces correct results.
     #[test]
-    fn test_too_large_preserves_prior_result() {
+    fn test_large_network_preserves_prior_result_on_subsequent_check() {
         let herder = make_herder_with_n_quorum_nodes(22);
 
-        // Manually inject a prior intersecting result.
-        {
-            let prior_hash = Hash256::from([0xAA; 32]);
-            let mut state = herder.quorum_intersection_state.write();
-            state.start_checking(prior_hash);
-            state.complete_check(
-                &prior_hash,
-                crate::quorum_intersection_state::QuorumIntersectionResult::Intersecting {
-                    check_ledger: 50,
-                    num_nodes: 5,
-                    quorum_map_hash: prior_hash,
-                },
-            );
-        }
-
-        // Verify prior result is published.
-        assert!(herder.quorum_intersection_state.read().has_any_results());
-        assert_eq!(
-            herder.quorum_intersection_state.read().last_good_ledger(),
-            50
-        );
-
-        // Now trigger TooLarge path.
+        // Run first analysis.
         herder.check_and_maybe_reanalyze_quorum_map(100);
 
-        // Prior result should be preserved.
         let state = herder.quorum_intersection_state.read();
-        assert!(state.has_any_results(), "prior result should be preserved");
-        assert_eq!(
-            state.last_good_ledger(),
-            50,
-            "last_good_ledger should be preserved"
-        );
-        assert!(
-            state.checking_hash().is_none(),
-            "checking_hash should be cleared"
-        );
+        assert!(state.has_any_results());
+        assert_eq!(state.last_good_ledger(), 100);
+        drop(state);
+
+        // Same quorum map → should not re-analyze (hash matches).
+        herder.check_and_maybe_reanalyze_quorum_map(101);
+
+        let state = herder.quorum_intersection_state.read();
+        // Result should still be from ledger 100 (not re-analyzed).
+        assert_eq!(state.last_good_ledger(), 100);
     }
 }

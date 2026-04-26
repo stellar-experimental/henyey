@@ -6,6 +6,9 @@
 //! The state separates completed results from in-flight analysis so that
 //! `/info` continues serving previous results while a new check runs.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use henyey_common::Hash256;
 use stellar_xdr::curr::NodeId;
 
@@ -34,6 +37,20 @@ pub(crate) enum QuorumIntersectionResult {
     },
 }
 
+/// In-flight analysis state as an explicit enum to prevent invalid states.
+///
+/// Matches stellar-core's interrupt-and-return model.
+#[derive(Debug)]
+enum AnalysisState {
+    /// No analysis in progress.
+    Idle,
+    /// Analysis is running for the given quorum map hash.
+    Analyzing {
+        hash: Hash256,
+        interrupt_flag: Arc<AtomicBool>,
+    },
+}
+
 /// Quorum intersection analysis state.
 ///
 /// Tracks both the last completed result and any in-flight analysis,
@@ -45,8 +62,8 @@ pub(crate) struct QuorumIntersectionState {
     /// The ledger of the most recent check that found intersection.
     /// Matches stellar-core's `mLastGoodLedger` — 0 until first intersecting result.
     last_good_ledger: u32,
-    /// Hash of the quorum map currently being analyzed. `None` when idle.
-    checking_hash: Option<Hash256>,
+    /// In-flight analysis state.
+    analysis: AnalysisState,
 }
 
 impl QuorumIntersectionState {
@@ -55,7 +72,7 @@ impl QuorumIntersectionState {
         Self {
             last_result: None,
             last_good_ledger: 0,
-            checking_hash: None,
+            analysis: AnalysisState::Idle,
         }
     }
 
@@ -92,7 +109,15 @@ impl QuorumIntersectionState {
 
     /// Get the hash of the quorum map currently being analyzed.
     pub fn checking_hash(&self) -> Option<&Hash256> {
-        self.checking_hash.as_ref()
+        match &self.analysis {
+            AnalysisState::Idle => None,
+            AnalysisState::Analyzing { hash, .. } => Some(hash),
+        }
+    }
+
+    /// Whether analysis is currently in progress.
+    pub fn is_analyzing(&self) -> bool {
+        matches!(self.analysis, AnalysisState::Analyzing { .. })
     }
 
     /// Get the hash from the last completed result.
@@ -108,16 +133,47 @@ impl QuorumIntersectionState {
         }
     }
 
-    /// Mark that analysis is in progress for the given quorum map hash.
-    pub fn start_checking(&mut self, hash: Hash256) {
-        self.checking_hash = Some(hash);
+    /// Start analysis for the given quorum map hash.
+    ///
+    /// Returns a clone of the interrupt flag for the background task.
+    /// If analysis is already in progress for a different hash, the old
+    /// analysis is interrupted first (matching stellar-core's interrupt-and-return).
+    pub fn start_checking(&mut self, hash: Hash256) -> Arc<AtomicBool> {
+        // If already analyzing a different hash, interrupt it.
+        if let AnalysisState::Analyzing {
+            interrupt_flag,
+            hash: old_hash,
+        } = &self.analysis
+        {
+            if *old_hash != hash {
+                interrupt_flag.store(true, Ordering::Relaxed);
+            }
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = Arc::clone(&flag);
+        self.analysis = AnalysisState::Analyzing {
+            hash,
+            interrupt_flag: flag,
+        };
+        flag_clone
+    }
+
+    /// Set the interrupt flag on any in-flight analysis.
+    ///
+    /// Used when the quorum map changes during analysis to signal
+    /// the running checker to abort.
+    pub fn interrupt_stale(&mut self) {
+        if let AnalysisState::Analyzing { interrupt_flag, .. } = &self.analysis {
+            interrupt_flag.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Clear the in-progress analysis marker without publishing a result.
     ///
-    /// Used when the analysis cannot complete (e.g., network too large).
+    /// Used when the analysis is interrupted or cannot complete.
     pub fn clear_checking(&mut self) {
-        self.checking_hash = None;
+        self.analysis = AnalysisState::Idle;
     }
 
     /// Record a completed analysis result.
@@ -132,11 +188,11 @@ impl QuorumIntersectionState {
         expected_hash: &Hash256,
         result: QuorumIntersectionResult,
     ) -> bool {
-        if self.checking_hash.as_ref() != Some(expected_hash) {
+        if self.checking_hash() != Some(expected_hash) {
             // Quorum map changed during analysis; discard stale result.
             return false;
         }
-        self.checking_hash = None;
+        self.analysis = AnalysisState::Idle;
 
         if let QuorumIntersectionResult::Intersecting { check_ledger, .. } = &result {
             self.last_good_ledger = *check_ledger;
@@ -340,5 +396,49 @@ mod tests {
         assert!(state.has_any_results());
         assert!(state.enjoys_quorum_intersection());
         assert_eq!(state.last_good_ledger(), 50);
+    }
+
+    #[test]
+    fn test_interrupt_stale_analysis() {
+        let mut state = QuorumIntersectionState::new();
+        let hash1 = make_hash(1);
+
+        // Start analysis.
+        let flag = state.start_checking(hash1);
+        assert!(!flag.load(Ordering::Relaxed));
+
+        // Interrupt it.
+        state.interrupt_stale();
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_start_checking_interrupts_old_analysis() {
+        let mut state = QuorumIntersectionState::new();
+        let hash1 = make_hash(1);
+        let hash2 = make_hash(2);
+
+        // Start analysis for hash1.
+        let flag1 = state.start_checking(hash1);
+        assert!(!flag1.load(Ordering::Relaxed));
+
+        // Start analysis for hash2 — should interrupt hash1.
+        let _flag2 = state.start_checking(hash2);
+        assert!(
+            flag1.load(Ordering::Relaxed),
+            "old analysis should be interrupted"
+        );
+    }
+
+    #[test]
+    fn test_is_analyzing() {
+        let mut state = QuorumIntersectionState::new();
+        assert!(!state.is_analyzing());
+
+        state.start_checking(make_hash(1));
+        assert!(state.is_analyzing());
+
+        state.clear_checking();
+        assert!(!state.is_analyzing());
     }
 }

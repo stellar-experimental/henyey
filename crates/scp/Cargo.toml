@@ -22,6 +22,7 @@ tracing.workspace = true
 # Utilities
 parking_lot.workspace = true
 hex.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

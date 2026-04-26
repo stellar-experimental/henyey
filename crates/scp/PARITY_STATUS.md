@@ -429,7 +429,7 @@ Features excluded by design. These are NOT counted against parity %.
 | V-blocking/quorum | 2 TEST_CASE / ~35 SECTION (`SCPTests.cpp`) | 38 #[test] in `quorum.rs` | Quorum operations |
 | Multi-node simulation | Covered within SCPTests.cpp | 50 #[test] in `tests/multi_node_simulation.rs` | End-to-end scenarios |
 | SCP parity tests | N/A | 124 #[test] in `tests/scp_parity_tests/` | Parity-focused scenarios |
-| Quorum intersection | N/A | 6 #[test] in `tests/quorum_intersection_json.rs` | JSON-based quorum tests |
+| Quorum intersection | N/A | 7 #[test] in `tests/quorum_intersection_json.rs` + 15 #[test] in `quorum_intersection/` modules | JSON-based quorum tests + SCC/MinQuorumEnumerator unit tests |
 | Statement ordering | Covered within SCPTests.cpp | 3 #[test] in `compare.rs` | Statement comparison |
 | Display formatting | N/A | 4 #[test] in `format.rs` | String formatting |
 | Info/JSON types | N/A | 4 #[test] in `info.rs` | Serialization tests |

@@ -147,3 +147,27 @@ fn test_quorum_slice_is_consistent() {
         assert!(ok, "node {:?} should have a slice in full set", node);
     }
 }
+
+/// Cross-validate the efficient checker against the brute-force oracle.
+#[test]
+fn test_efficient_checker_agrees_with_brute_force_oracle() {
+    use henyey_scp::quorum_intersection::{check_intersection, IntersectionResult};
+
+    for name in &["enjoys-intersection.json", "no-intersection.json"] {
+        let qmap = load_quorum_map(name).expect("load quorum map");
+        let oracle = network_enjoys_quorum_intersection(&qmap);
+
+        // Build the Option<ScpQuorumSet> map for the checker.
+        let opt_map: HashMap<NodeId, Option<ScpQuorumSet>> = qmap
+            .into_iter()
+            .map(|(id, qset)| (id, Some(qset)))
+            .collect();
+        let checker = matches!(check_intersection(&opt_map), IntersectionResult::Intersects);
+
+        assert_eq!(
+            oracle, checker,
+            "disagreement on {}: oracle={}, checker={}",
+            name, oracle, checker
+        );
+    }
+}

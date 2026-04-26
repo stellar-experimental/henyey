@@ -21,7 +21,7 @@
 | TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
 | SurgePricingUtils | Full | All lane configs and priority queue; `erase()` guard matches `releaseAssert(res <= mLaneCurrentCount[lane])` |
 | Upgrades / ConfigUpgradeSetFrame | Partial | Missing ConfigUpgradeSetFrame entirely |
-| QuorumIntersectionChecker | None | Not implemented |
+| QuorumIntersectionChecker | Full | SCC decomposition + MinQuorumEnumerator with interrupt support |
 | ParallelTxSetBuilder | Full | Implemented in parallel_tx_set_builder.rs |
 | FilteredEntries | None | Not implemented (trivial) |
 
@@ -443,7 +443,7 @@ Features excluded by design. These are NOT counted against parity %.
 
 | stellar-core Component | Reason |
 |------------------------|--------|
-| `QuorumIntersectionChecker` / `QuorumIntersectionCheckerImpl` | Complex graph-theoretic analysis; planned for separate crate or external tool |
+| `QuorumIntersectionChecker` / `QuorumIntersectionCheckerImpl` | Implemented in `henyey-scp` crate (`quorum_intersection/` module) with full SCC + MinQuorumEnumerator algorithm |
 | `RustQuorumCheckerAdaptor` | C++/Rust FFI bridge for quorum checker; not applicable in pure Rust |
 | `FilteredEntries.h` (`KEYS_TO_FILTER_P24`) | Empty array constant in upstream; P24 filtering not needed for P24+ |
 | `Upgrades::applyTo()` (static) | Ledger upgrade application handled by `henyey-ledger` crate |
@@ -581,7 +581,7 @@ Features not yet implemented. These ARE counted against parity %.
 |------|-------------------|------------|-------|
 | HerderTests | 38 TEST_CASE / 277 SECTION | 26 `#[test]` + 54 scp_driver | Broad unit coverage; driver tests significantly expanded |
 | PendingEnvelopesTests | 1 TEST_CASE / 20 SECTION | 24 `#[test]` | Good unit coverage; missing cost-tracking parity |
-| QuorumIntersectionTests | 28 TEST_CASE / 0 SECTION | 0 tests | Not implemented |
+| QuorumIntersectionTests | 28 TEST_CASE / 0 SECTION | 12 `#[test]` (herder) + 7 integration (scp) | Core algorithm + interrupt integration tests |
 | QuorumTrackerTests | 2 TEST_CASE / 10 SECTION | 10 unit tests | Good coverage |
 | TransactionQueueTests | 18 TEST_CASE / 157 SECTION | 118 `#[test]` + 7 integration | Strong coverage; fee release and drop now tested |
 | TxSetTests | 10 TEST_CASE / 66 SECTION | 30 tx_set + 27 tx_set_utils + 22 parallel | Strong coverage across modules |
@@ -593,7 +593,7 @@ Features not yet implemented. These ARE counted against parity %.
 - **TransactionQueue**: Missing tests for arbitrage damping and filtered-account overrides. Fee release, drop, and rebroadcast testing improved. Note: `rebroadcast()` exists in `TxBroadcastManager` but is not wired into post-ledger-close path.
 - **TxSet**: Missing `ApplicableTxSetFrame` validation tests, phase ordering tests, and history-tx-set construction tests
 - **Upgrades**: Missing ledger-integrated upgrade application tests, config upgrade set tests, and nomination-timeout stripping behavior
-- **QuorumIntersection**: Entirely missing (not implemented)
+- **QuorumIntersection**: Core algorithm implemented (SCC + MinQuorumEnumerator). Missing some stellar-core-specific test scenarios (28 TEST_CASE). Herder integration with interrupt support is complete.
 
 ## Parity Calculation
 

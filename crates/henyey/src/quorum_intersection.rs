@@ -112,11 +112,8 @@ pub fn check_quorum_intersection_from_json(path: &Path) -> anyhow::Result<bool> 
     match check_intersection(&qmap) {
         IntersectionResult::Intersects => Ok(true),
         IntersectionResult::Split { .. } => Ok(false),
-        IntersectionResult::TooLarge { node_count } => {
-            anyhow::bail!(
-                "network has {} nodes, exceeding the brute-force analysis limit",
-                node_count
-            );
+        IntersectionResult::Interrupted => {
+            unreachable!("check_intersection with no interrupt flag returned Interrupted")
         }
     }
 }

@@ -1,28 +1,30 @@
 //! Quorum intersection analysis for SCP networks.
 //!
-//! Provides a pure analysis function that checks whether all quorums in a
-//! network intersect — a critical safety property for SCP.
+//! Provides analysis functions that check whether all quorums in a network
+//! intersect — a critical safety property for SCP.
 //!
-//! The algorithm enumerates all 2^n subsets of nodes (brute force), identifies
-//! valid quorums, and checks all pairs for intersection. This is only practical
-//! for small networks (≤ 20 nodes).
-//!
-//! For larger networks, a SAT-based approach (as in stellar-core v2) is needed
-//! but is out of scope here.
+//! Uses SCC decomposition + recursive min-quorum enumeration (Lachowski,
+//! arXiv 1902.06493) matching stellar-core's `QuorumIntersectionCheckerImpl`.
+//! This handles real-world networks (e.g. mainnet with 30+ validators)
+//! efficiently, unlike the brute-force 2^n approach.
+
+mod bit_set;
+mod checker;
+mod qbitset;
+mod tarjan;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use henyey_common::xdr_to_bytes;
 use henyey_crypto::Sha256Hasher;
 use stellar_xdr::curr::{NodeId, ScpQuorumSet};
 
-use crate::quorum::{is_quorum, is_quorum_slice};
+use crate::quorum::is_quorum_slice;
 use crate::Hash256;
 
-/// Maximum number of nodes supported for brute-force intersection analysis.
-///
-/// The algorithm is O(2^n), so we cap at 20 nodes (2^20 ≈ 1M subsets).
-pub const MAX_INTERSECTION_NODES: usize = 20;
+use checker::{CheckerResult, QuorumIntersectionChecker};
 
 /// Result of a quorum intersection check.
 #[derive(Debug, Clone)]
@@ -34,111 +36,45 @@ pub enum IntersectionResult {
         /// A pair of non-intersecting quorums (sorted by NodeId XDR for determinism).
         pair: (Vec<NodeId>, Vec<NodeId>),
     },
-    /// Too many nodes for brute-force analysis.
-    TooLarge {
-        /// Number of nodes in the quorum map.
-        node_count: usize,
-    },
+    /// The analysis was interrupted before completing.
+    Interrupted,
 }
 
-/// Check whether all quorums in the network intersect.
+/// Simple, deterministic quorum intersection check.
 ///
-/// Operates on a quorum map where `None` means the node was observed but its
-/// quorum set is unknown. Such nodes are naturally pruned during quorum
-/// detection (they have no quorum set so they fail the `is_quorum` check).
-///
-/// The function tries all nodes with known quorum sets as quorum roots,
-/// sorted deterministically by NodeId XDR bytes.
-///
-/// Returns [`IntersectionResult::TooLarge`] if the map exceeds
-/// [`MAX_INTERSECTION_NODES`] nodes.
+/// Uses seed=0 for fully deterministic results and a never-set interrupt flag.
+/// Suitable for CLI and library callers. Never returns `Interrupted`.
 pub fn check_intersection(
     quorum_map: &HashMap<NodeId, Option<ScpQuorumSet>>,
+) -> IntersectionResult {
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let result = check_intersection_interruptible(quorum_map, &interrupt, 0);
+    debug_assert!(
+        !matches!(result, IntersectionResult::Interrupted),
+        "check_intersection with never-set interrupt flag returned Interrupted"
+    );
+    result
+}
+
+/// Interrupt-aware quorum intersection check.
+///
+/// Uses caller-provided seed and interrupt flag. Returns `Interrupted` if
+/// the interrupt flag is set during analysis.
+pub fn check_intersection_interruptible(
+    quorum_map: &HashMap<NodeId, Option<ScpQuorumSet>>,
+    interrupt: &Arc<AtomicBool>,
+    seed: u64,
 ) -> IntersectionResult {
     if quorum_map.is_empty() {
         return IntersectionResult::Intersects;
     }
 
-    if quorum_map.len() > MAX_INTERSECTION_NODES {
-        return IntersectionResult::TooLarge {
-            node_count: quorum_map.len(),
-        };
+    let checker = QuorumIntersectionChecker::new(quorum_map, Arc::clone(interrupt), seed);
+    match checker.check() {
+        CheckerResult::Intersects => IntersectionResult::Intersects,
+        CheckerResult::Split { pair } => IntersectionResult::Split { pair },
+        CheckerResult::Interrupted => IntersectionResult::Interrupted,
     }
-
-    // Sort nodes deterministically by XDR bytes for reproducible enumeration.
-    let mut sorted_nodes: Vec<NodeId> = quorum_map.keys().cloned().collect();
-    sorted_nodes.sort_by_key(|a| xdr_to_bytes(a));
-
-    // Enumerate all non-empty subsets and find valid quorums.
-    let mut quorums: Vec<HashSet<NodeId>> = Vec::new();
-    let total = sorted_nodes.len();
-
-    for mask in 1..(1u64 << total) {
-        let subset: HashSet<NodeId> = sorted_nodes
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| (mask >> idx) & 1 == 1)
-            .map(|(_, node)| node.clone())
-            .collect();
-
-        if is_quorum_for_map(&subset, quorum_map) {
-            quorums.push(subset);
-        }
-    }
-
-    // Check all quorum pairs for intersection.
-    for i in 0..quorums.len() {
-        for j in (i + 1)..quorums.len() {
-            if quorums[i].is_disjoint(&quorums[j]) {
-                let mut a: Vec<NodeId> = quorums[i].iter().cloned().collect();
-                let mut b: Vec<NodeId> = quorums[j].iter().cloned().collect();
-                sort_nodes(&mut a);
-                sort_nodes(&mut b);
-                // Deterministic ordering: smaller set first, then by first node.
-                if a.len() > b.len()
-                    || (a.len() == b.len()
-                        && !a.is_empty()
-                        && !b.is_empty()
-                        && xdr_to_bytes(&a[0]) > xdr_to_bytes(&b[0]))
-                {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                return IntersectionResult::Split { pair: (a, b) };
-            }
-        }
-    }
-
-    IntersectionResult::Intersects
-}
-
-/// Check if a subset forms a valid quorum using the quorum map.
-///
-/// Tries all nodes in the subset that have known quorum sets as the root node.
-/// This handles the case where some nodes have `None` quorum sets — we need
-/// to find at least one known-qset root whose `is_quorum` check passes.
-fn is_quorum_for_map(
-    nodes: &HashSet<NodeId>,
-    quorum_map: &HashMap<NodeId, Option<ScpQuorumSet>>,
-) -> bool {
-    // Sort for deterministic root selection order.
-    let mut sorted: Vec<&NodeId> = nodes.iter().collect();
-    sorted.sort_by_key(|a| xdr_to_bytes(*a));
-
-    for root in sorted {
-        if let Some(Some(qset)) = quorum_map.get(root) {
-            if is_quorum(qset, nodes, |id| {
-                quorum_map.get(id).and_then(|opt| opt.clone())
-            }) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Sort a vec of NodeIds by XDR bytes for deterministic output.
-fn sort_nodes(nodes: &mut [NodeId]) {
-    nodes.sort_by_key(|a| xdr_to_bytes(a));
 }
 
 /// Compute a deterministic hash of a quorum map.
@@ -300,17 +236,25 @@ mod tests {
     }
 
     #[test]
-    fn test_too_large() {
+    fn test_large_network_now_works() {
+        // Previously returned TooLarge. Now the efficient algorithm handles it.
         let mut map = HashMap::new();
-        for i in 0..21 {
+        for i in 0..25 {
             let node = make_node_id(i);
             map.insert(node.clone(), Some(make_qset(vec![node], 1)));
         }
+        // Each node only requires itself → each is its own quorum.
+        // Any two single-node quorums are disjoint → Split.
         match check_intersection(&map) {
-            IntersectionResult::TooLarge { node_count } => {
-                assert_eq!(node_count, 21);
+            IntersectionResult::Split { pair: (a, b) } => {
+                let a_set: HashSet<_> = a.into_iter().collect();
+                let b_set: HashSet<_> = b.into_iter().collect();
+                assert!(a_set.is_disjoint(&b_set));
             }
-            other => panic!("Expected TooLarge, got {:?}", other),
+            other => panic!(
+                "Expected Split for 25-node self-quorum network, got {:?}",
+                other
+            ),
         }
     }
 
@@ -445,5 +389,169 @@ mod tests {
         map.insert(n2.clone(), Some(make_qset(vec![n1.clone(), n2.clone()], 1)));
 
         assert_eq!(find_unsatisfiable_node(&map), None);
+    }
+
+    // --- Brute-force oracle for cross-validation ---
+
+    /// Brute-force quorum intersection check (retained as test oracle).
+    fn brute_force_check_intersection(quorum_map: &HashMap<NodeId, Option<ScpQuorumSet>>) -> bool {
+        use crate::quorum::is_quorum;
+
+        let mut sorted_nodes: Vec<NodeId> = quorum_map.keys().cloned().collect();
+        sorted_nodes.sort_by_key(|a| xdr_to_bytes(a));
+
+        let total = sorted_nodes.len();
+        if total == 0 || total > 20 {
+            // Oracle only works for small networks.
+            return true;
+        }
+
+        let mut quorums: Vec<HashSet<NodeId>> = Vec::new();
+
+        for mask in 1..(1u64 << total) {
+            let subset: HashSet<NodeId> = sorted_nodes
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| (mask >> idx) & 1 == 1)
+                .map(|(_, node)| node.clone())
+                .collect();
+
+            // Check if this subset is a quorum.
+            let mut is_q = false;
+            let mut sorted_subset: Vec<&NodeId> = subset.iter().collect();
+            sorted_subset.sort_by_key(|a| xdr_to_bytes(*a));
+            for root in &sorted_subset {
+                if let Some(Some(qset)) = quorum_map.get(*root) {
+                    if is_quorum(qset, &subset, |id| {
+                        quorum_map.get(id).and_then(|opt| opt.clone())
+                    }) {
+                        is_q = true;
+                        break;
+                    }
+                }
+            }
+            if is_q {
+                quorums.push(subset);
+            }
+        }
+
+        for i in 0..quorums.len() {
+            for j in (i + 1)..quorums.len() {
+                if quorums[i].is_disjoint(&quorums[j]) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn test_oracle_cross_validation_intersecting() {
+        // Various small networks: verify new checker agrees with brute-force.
+        let cases: Vec<HashMap<NodeId, Option<ScpQuorumSet>>> = vec![
+            // Case 1: 3-node 2-of-3
+            {
+                let nodes: Vec<NodeId> = (1..=3).map(make_node_id).collect();
+                let mut map = HashMap::new();
+                for n in &nodes {
+                    map.insert(n.clone(), Some(make_qset(nodes.clone(), 2)));
+                }
+                map
+            },
+            // Case 2: 5-node 3-of-5
+            {
+                let nodes: Vec<NodeId> = (1..=5).map(make_node_id).collect();
+                let mut map = HashMap::new();
+                for n in &nodes {
+                    map.insert(n.clone(), Some(make_qset(nodes.clone(), 3)));
+                }
+                map
+            },
+            // Case 3: 4-node with unknown qset
+            {
+                let nodes: Vec<NodeId> = (1..=4).map(make_node_id).collect();
+                let known = vec![nodes[0].clone(), nodes[1].clone(), nodes[2].clone()];
+                let mut map = HashMap::new();
+                for n in &known {
+                    map.insert(n.clone(), Some(make_qset(known.clone(), 2)));
+                }
+                map.insert(nodes[3].clone(), None);
+                map
+            },
+        ];
+
+        for (i, map) in cases.iter().enumerate() {
+            let oracle = brute_force_check_intersection(map);
+            let checker = matches!(check_intersection(map), IntersectionResult::Intersects);
+            assert_eq!(
+                oracle, checker,
+                "Case {}: oracle={}, checker={}",
+                i, oracle, checker
+            );
+        }
+    }
+
+    #[test]
+    fn test_oracle_cross_validation_split() {
+        // Split networks: verify both agree.
+        let cases: Vec<HashMap<NodeId, Option<ScpQuorumSet>>> = vec![
+            // Case 1: 4-node split (2 groups of 2)
+            {
+                let mut map = HashMap::new();
+                let n1 = make_node_id(1);
+                let n2 = make_node_id(2);
+                let n3 = make_node_id(3);
+                let n4 = make_node_id(4);
+                map.insert(n1.clone(), Some(make_qset(vec![n1.clone(), n2.clone()], 1)));
+                map.insert(n2.clone(), Some(make_qset(vec![n1.clone(), n2.clone()], 1)));
+                map.insert(n3.clone(), Some(make_qset(vec![n3.clone(), n4.clone()], 1)));
+                map.insert(n4.clone(), Some(make_qset(vec![n3.clone(), n4.clone()], 1)));
+                map
+            },
+            // Case 2: 6-node split (2 groups of 3, each 1-of-3)
+            {
+                let group_a: Vec<NodeId> = (1..=3).map(make_node_id).collect();
+                let group_b: Vec<NodeId> = (4..=6).map(make_node_id).collect();
+                let mut map = HashMap::new();
+                for n in &group_a {
+                    map.insert(n.clone(), Some(make_qset(group_a.clone(), 1)));
+                }
+                for n in &group_b {
+                    map.insert(n.clone(), Some(make_qset(group_b.clone(), 1)));
+                }
+                map
+            },
+        ];
+
+        for (i, map) in cases.iter().enumerate() {
+            let oracle = brute_force_check_intersection(map);
+            let checker = matches!(check_intersection(map), IntersectionResult::Intersects);
+            assert_eq!(
+                oracle, checker,
+                "Split case {}: oracle={}, checker={}",
+                i, oracle, checker
+            );
+        }
+    }
+
+    #[test]
+    fn test_interruptible_api() {
+        let n1 = make_node_id(1);
+        let mut map = HashMap::new();
+        map.insert(n1.clone(), Some(make_qset(vec![n1.clone()], 1)));
+
+        // Non-interrupted.
+        let interrupt = Arc::new(AtomicBool::new(false));
+        assert!(matches!(
+            check_intersection_interruptible(&map, &interrupt, 0),
+            IntersectionResult::Intersects
+        ));
+
+        // Pre-interrupted.
+        let interrupt = Arc::new(AtomicBool::new(true));
+        assert!(matches!(
+            check_intersection_interruptible(&map, &interrupt, 0),
+            IntersectionResult::Interrupted
+        ));
     }
 }
