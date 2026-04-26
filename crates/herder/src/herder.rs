@@ -2781,7 +2781,10 @@ impl Herder {
                 intersection: true,
                 node_count: *num_nodes as u64,
                 last_check_ledger: *check_ledger as u64,
-                critical: Vec::new(), // Deferred: critical nodes computation
+                // TODO(parity): critical nodes computation deferred to follow-up issue.
+                // stellar-core computes critical node groups via
+                // getIntersectionCriticalGroups() in HerderImpl.cpp:1714-1728.
+                critical: Vec::new(),
                 last_good_ledger: None,
                 potential_split: None,
             }),
@@ -2851,15 +2854,17 @@ impl Herder {
                 return;
             }
 
-            // If we're analyzing a different (stale) hash, let it finish —
-            // results will be discarded as stale on completion.
+            // If we're analyzing a different (stale) hash, wait for it to
+            // finish before starting a new one. Matches stellar-core's
+            // single-in-flight approach (HerderImpl.cpp:1948-1964).
+            // Results will be discarded as stale on completion; we'll
+            // re-trigger on the next advance_tracking_slot.
             if state.checking_hash().is_some() {
                 debug!(
                     "Quorum map changed during intersection analysis; \
-                     current analysis is stale and will be discarded"
+                     waiting for in-flight analysis to complete"
                 );
-                // Don't return — we'll start a new check below. But first
-                // we need to update checking_hash, which requires a write lock.
+                return;
             }
         }
 
@@ -2928,9 +2933,10 @@ impl Herder {
                         max = henyey_scp::quorum_intersection::MAX_INTERSECTION_NODES,
                         "Quorum map too large for brute-force intersection analysis"
                     );
-                    // Don't update state — keep serving previous results.
-                    // Clear checking_hash so we don't block future checks.
-                    // (The hash won't match on completion since we never stored a result.)
+                    // Don't update result — keep serving previous results.
+                    // Clear checking_hash so future checks aren't blocked.
+                    let mut state = intersection_state.write();
+                    state.clear_checking();
                 }
             }
         };

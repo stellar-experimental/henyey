@@ -113,6 +113,13 @@ impl QuorumIntersectionState {
         self.checking_hash = Some(hash);
     }
 
+    /// Clear the in-progress analysis marker without publishing a result.
+    ///
+    /// Used when the analysis cannot complete (e.g., network too large).
+    pub fn clear_checking(&mut self) {
+        self.checking_hash = None;
+    }
+
     /// Record a completed analysis result.
     ///
     /// Only publishes if the `expected_hash` matches the current `checking_hash`
@@ -303,5 +310,35 @@ mod tests {
         assert!(state.has_any_results());
         assert!(state.enjoys_quorum_intersection());
         assert_eq!(state.last_good_ledger(), 100);
+    }
+
+    #[test]
+    fn test_clear_checking_unblocks_future_checks() {
+        let mut state = QuorumIntersectionState::new();
+        let hash1 = make_hash(1);
+
+        // Publish an intersecting result.
+        state.start_checking(hash1);
+        state.complete_check(
+            &hash1,
+            QuorumIntersectionResult::Intersecting {
+                check_ledger: 50,
+                num_nodes: 3,
+                quorum_map_hash: hash1,
+            },
+        );
+
+        // Start a new check, then clear it (simulates TooLarge).
+        let hash2 = make_hash(2);
+        state.start_checking(hash2);
+        assert!(state.checking_hash().is_some());
+
+        state.clear_checking();
+        assert!(state.checking_hash().is_none());
+
+        // Previous result should still be available.
+        assert!(state.has_any_results());
+        assert!(state.enjoys_quorum_intersection());
+        assert_eq!(state.last_good_ledger(), 50);
     }
 }
