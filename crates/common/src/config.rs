@@ -129,6 +129,7 @@ impl<'de> Deserialize<'de> for ThresholdPercent {
 /// needed to run a stellar-core node. It can be loaded from a TOML file
 /// using [`Config::from_file`] or created programmatically.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Network configuration (passphrase, peers, ports).
     pub network: NetworkConfig,
@@ -157,6 +158,7 @@ pub struct Config {
 /// Defines the network identity (via passphrase), peer connections,
 /// and port settings for the node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Network passphrase that uniquely identifies the Stellar network.
     ///
@@ -207,6 +209,7 @@ pub struct NetworkConfig {
 ///
 /// Currently only SQLite is supported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     /// Path to the SQLite database file.
     ///
@@ -216,6 +219,7 @@ pub struct DatabaseConfig {
 
 /// Node identity and consensus configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Whether this node participates in consensus as a validator.
     ///
@@ -252,6 +256,7 @@ pub struct NodeConfig {
 /// validators = ["GA...", "GB...", "GC..."]
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuorumSetConfig {
     /// Threshold percentage (0-100) of validators/inner sets that must agree.
     ///
@@ -279,6 +284,7 @@ pub struct QuorumSetConfig {
 /// - Audit: Verifying the complete history of the network
 /// - Publishing: Validators publish their view of history
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryConfig {
     /// History archive configurations for reading (catchup).
     ///
@@ -300,6 +306,7 @@ pub struct HistoryConfig {
 /// - `{0}` - Remote path (e.g., `history/00/00/00/00/ledger-00000000.xdr.gz`)
 /// - `{1}` - Local path (e.g., `/tmp/stellar/ledger-00000000.xdr.gz`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryArchiveConfig {
     /// Human-readable name for this archive.
     pub name: String,
@@ -327,6 +334,7 @@ pub struct HistoryArchiveConfig {
 /// Controls the indexing and caching behavior of the disk-backed BucketListDB.
 /// These settings match stellar-core's `BUCKETLIST_DB_*` config options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BucketListDbConfig {
     /// Exponent for the index page size in bytes: page_size = 1 << exponent.
     ///
@@ -402,6 +410,7 @@ fn default_persist_index() -> bool {
 
 /// Logging configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level filter.
     ///
@@ -501,5 +510,33 @@ impl Config {
             logging: LoggingConfig::default(),
             bucket_list_db: BucketListDbConfig::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_common_config_unknown_field_rejected() {
+        let toml_str = r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+peer_port = 11625
+
+[database]
+path = "stellar.db"
+
+[node]
+is_validator = false
+
+typo_field = "oops"
+"#;
+        let err = toml::from_str::<Config>(toml_str).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typo_field"),
+            "error should mention the unknown key: {msg}"
+        );
     }
 }

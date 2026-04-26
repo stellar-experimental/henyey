@@ -81,6 +81,7 @@ use crate::maintainer;
 /// - At least one history archive is configured
 /// - Quorum set configuration is valid for validators
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Node identity and behavior.
     #[serde(default)]
@@ -182,6 +183,7 @@ pub struct AppConfig {
 /// - `node_seed`: The secret seed for signing SCP messages
 /// - `quorum_set`: A valid quorum set with sufficient validators
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Node name for identification in logs.
     #[serde(default = "default_node_name")]
@@ -242,6 +244,7 @@ impl Default for NodeConfig {
 /// See the [SCP paper](https://www.stellar.org/papers/stellar-consensus-protocol)
 /// for guidance on quorum set design.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QuorumSetConfig {
     /// Threshold percentage (0-100).
     #[serde(default = "default_threshold")]
@@ -310,6 +313,7 @@ impl QuorumSetConfig {
 
 /// Network configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     /// Network passphrase (determines which network to connect to).
     pub passphrase: String,
@@ -329,6 +333,7 @@ pub struct NetworkConfig {
 
 /// Surge pricing configuration (lane byte allowances and caps).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SurgePricingConfig {
     /// Classic tx byte allowance for tx set selection.
     #[serde(default = "default_classic_byte_allowance")]
@@ -355,6 +360,7 @@ impl Default for SurgePricingConfig {
 
 /// Classic event emission configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventsConfig {
     /// Emit classic asset events in transaction metadata.
     #[serde(default)]
@@ -379,6 +385,7 @@ pub struct EventsConfig {
 /// debug_ledgers = 100
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetadataConfig {
     /// Stream destination: file path, named pipe, or "fd:N" for a pre-opened
     /// file descriptor. When set, every `LedgerCloseMeta` is written as a
@@ -422,6 +429,7 @@ fn default_metadata_debug_ledgers() -> u32 {
 /// thread_pool_size = 4
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryConfig {
     /// Port for the query server HTTP endpoint. `None` means disabled.
     /// Maps to stellar-core's `HTTP_QUERY_PORT`.
@@ -470,6 +478,7 @@ fn default_query_thread_pool_size() -> usize {
 /// tx_submission_diagnostics = true
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticsConfig {
     /// When true, include Soroban diagnostic events in `LedgerCloseMeta`.
     /// Maps to stellar-core's `ENABLE_SOROBAN_DIAGNOSTIC_EVENTS`.
@@ -518,6 +527,7 @@ impl Default for DiagnosticsConfig {
 /// accelerate_time = true  # 1s ledger close, checkpoint frequency 8
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TestingConfig {
     /// When true, accelerate time for testing: 1-second ledger close and
     /// checkpoint frequency of 8 (instead of 64).
@@ -582,6 +592,7 @@ pub struct TestingConfig {
 /// recent = 10000
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CatchupConfig {
     /// If true, download complete history from genesis.
     /// Equivalent to stellar-core CATCHUP_COMPLETE.
@@ -616,6 +627,7 @@ impl CatchupConfig {
 
 /// Proposed protocol upgrades configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpgradeConfig {
     /// Proposed protocol version upgrade.
     pub protocol_version: Option<u32>,
@@ -678,6 +690,7 @@ impl NetworkConfig {
 
 /// Database configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseConfig {
     /// Path to the SQLite database file.
     #[serde(default = "default_db_path")]
@@ -699,6 +712,7 @@ impl Default for DatabaseConfig {
 
 /// Bucket storage configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BucketConfig {
     /// Directory for bucket files.
     #[serde(default = "default_bucket_dir")]
@@ -741,6 +755,7 @@ impl Default for BucketConfig {
 
 /// History archive configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryConfig {
     /// Archives for reading history.
     #[serde(default)]
@@ -749,6 +764,7 @@ pub struct HistoryConfig {
 
 /// A single history archive entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HistoryArchiveEntry {
     /// Name of this archive.
     pub name: String,
@@ -792,6 +808,7 @@ pub struct HistoryArchiveEntry {
 /// The `flood_*` parameters control how transactions are advertised and
 /// requested between peers to optimize bandwidth usage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OverlayConfig {
     /// Port to listen on for peer connections.
     #[serde(default = "default_peer_port")]
@@ -877,6 +894,7 @@ fn default_peer_max_failures() -> u32 {
 
 /// Logging configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
@@ -903,6 +921,7 @@ impl Default for LoggingConfig {
 
 /// HTTP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpConfig {
     /// Whether to enable the HTTP server.
     #[serde(default = "default_true")]
@@ -935,6 +954,7 @@ impl Default for HttpConfig {
 ///
 /// When `enabled = false` (default), only the native henyey HTTP server runs.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompatHttpConfig {
     /// Whether to enable the stellar-core compatibility HTTP server.
     #[serde(default)]
@@ -975,6 +995,7 @@ impl Default for CompatHttpConfig {
 /// count = 50000
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MaintenanceAppConfig {
     /// Whether automatic maintenance is enabled.
     #[serde(default = "default_true")]
@@ -1011,6 +1032,7 @@ fn default_maintenance_count() -> u32 {
 
 /// JSON-RPC server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RpcConfig {
     /// Whether to enable the JSON-RPC server.
     #[serde(default)]
@@ -1131,6 +1153,7 @@ fn default_bucket_io_concurrency() -> usize {
 /// These values are not read from TOML; they are set programmatically
 /// before creating the `App`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BuildMetadata {
     /// Git commit hash (from `git rev-parse HEAD`).
     pub commit_hash: String,
@@ -2468,5 +2491,65 @@ watchdog_abort_secs = 0
 "#;
         let config: AppConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(config.diagnostics.watchdog_abort_secs, 0);
+    }
+
+    #[test]
+    fn test_unknown_top_level_key_rejected() {
+        let toml_str = r#"
+[node]
+name = "test"
+
+listen_port = 11625
+"#;
+        let err = toml::from_str::<AppConfig>(toml_str).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("listen_port"),
+            "error should mention the unknown key: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_nested_key_rejected() {
+        let toml_str = r#"
+[node]
+name = "test"
+
+[overlay]
+foo = "bar"
+"#;
+        let err = toml::from_str::<AppConfig>(toml_str).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("foo"),
+            "error should mention the unknown key: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_deep_nested_key_rejected() {
+        let toml_str = r#"
+[node]
+name = "test"
+
+[buckets.bucket_list_db]
+typo = 42
+"#;
+        let err = toml::from_str::<AppConfig>(toml_str).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typo"),
+            "error should mention the unknown key: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_valid_minimal_config_parses() {
+        let toml_str = r#"
+[node]
+name = "test"
+"#;
+        let config: AppConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.node.name, "test");
     }
 }
