@@ -42,8 +42,10 @@ log "Empty sleep: ${LOOP_EMPTY_SLEEP}s"
 log "Between sleep: ${LOOP_BETWEEN_SLEEP}s"
 log "Log dir:   $LOOP_LOG_DIR"
 
-# --- Issue selection (mirrors SKILL.md auto-selection) ---
-# Prints "<number> <title>" on success, or nothing if no eligible issue exists.
+# --- Issue selection ---
+# Priority: assigned-to-me (resume) → urgent → high → medium → low → rest.
+# Within each tier, oldest first. Excludes not-ready and failed issues.
+# Prints "<mode> <number> <title>" on success, or nothing if no eligible issue.
 # Returns 0 on success/empty, 1 on API error.
 select_issue() {
   local json
@@ -68,26 +70,30 @@ select_issue() {
     return 0
   fi
 
-  # Priority 1: oldest open, unassigned issue labeled "ready",
-  # excluding "plan-do-review-loop-failed" and "not-ready".
-  if ! json="$(gh issue list \
-    --state open \
-    --assignee '' \
-    --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready label:ready' \
-    --json number,title \
-    --limit 1)"; then
-    return 1
-  fi
+  # Priority 1–4: unassigned issues by priority label (urgent → high → medium → low),
+  # oldest first within each tier.
+  local priority
+  for priority in urgent high medium low; do
+    if ! json="$(gh issue list \
+      --state open \
+      --assignee '' \
+      --label "$priority" \
+      --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
+      --json number,title \
+      --limit 1)"; then
+      return 1
+    fi
 
-  number="$(jq -r '.[0].number // empty' <<<"$json")"
-  if [[ -n "$number" ]]; then
-    local title
-    title="$(jq -r '.[0].title // ""' <<<"$json")"
-    echo "new ${number} ${title}"
-    return 0
-  fi
+    number="$(jq -r '.[0].number // empty' <<<"$json")"
+    if [[ -n "$number" ]]; then
+      local title
+      title="$(jq -r '.[0].title // ""' <<<"$json")"
+      echo "new ${number} ${title}"
+      return 0
+    fi
+  done
 
-  # Priority 2: any eligible issue (no "ready" requirement), oldest first.
+  # Priority 5: any remaining eligible issue (no priority label requirement), oldest first.
   if ! json="$(gh issue list \
     --state open \
     --assignee '' \

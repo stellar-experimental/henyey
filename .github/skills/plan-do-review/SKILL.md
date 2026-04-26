@@ -12,26 +12,41 @@ Parse `$ARGUMENTS`:
 
 **If no issue number was provided, auto-select one:**
 
-Run:
+Run, in priority order (assigned-to-me → urgent → high → medium → low → rest):
 ```bash
-# Priority 1: newest open, unassigned issue labeled "ready",
-# excluding "plan-do-review-loop-failed" and "not-ready".
+# Priority 0: resume — oldest open issue already assigned to me.
 gh issue list \
   --state open \
-  --assignee '' \
-  --search 'sort:created-desc -label:plan-do-review-loop-failed -label:not-ready label:ready' \
+  --assignee '@me' \
+  --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
   --json number,title \
   --limit 1 \
   --jq '.[0] // empty'
 ```
 
-If that returns empty, fall back:
+If that returns empty, try each priority label in order:
 ```bash
-# Priority 2: any eligible issue (no "ready" requirement).
+# Priority 1–4: unassigned issues by label (urgent → high → medium → low).
+for priority in urgent high medium low; do
+  gh issue list \
+    --state open \
+    --assignee '' \
+    --label "$priority" \
+    --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
+    --json number,title \
+    --limit 1 \
+    --jq '.[0] // empty'
+  # Stop at the first match.
+done
+```
+
+If still empty, fall back:
+```bash
+# Priority 5: any remaining eligible issue, oldest first.
 gh issue list \
   --state open \
   --assignee '' \
-  --search 'sort:created-desc -label:plan-do-review-loop-failed -label:not-ready' \
+  --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
   --json number,title \
   --limit 1 \
   --jq '.[0] // empty'
@@ -134,6 +149,46 @@ Extract:
 - **Comments**: any existing discussion (prior reviews, context)
 - **State**: must be open (if closed, stop and report)
 
+### Resume from Prior Run
+
+Before blocker resolution or readiness triage, check whether a previous
+invocation already made progress on this issue. Scan the comments for
+`## 📝 Proposal Draft (Round N/M)` and `## 🔍 Critic Response (Round N/M)`
+headers.
+
+**If prior proposal/critic comments exist:**
+
+1. Find the **highest round number** across all `📝 Proposal Draft` comments.
+   Call this `last_proposal_round`.
+2. Check whether a `🔍 Critic Response (Round last_proposal_round/M)` comment
+   exists for that round.
+3. **If a critic response exists for the last round:**
+   - Extract its verdict. If `APPROVED`, check for a `## Converged Proposal`
+     comment — if present, skip straight to Step 3 (implementation). If no
+     converged proposal, post one and proceed to Step 3.
+   - If `REVISE`, extract the numbered feedback items from that critic
+     response. Set `proposal_round = last_proposal_round`. Extract the last
+     proposal text as `current_proposal`. Skip Step 1 exploration and
+     readiness triage — proceed directly to Step 2's REVISE handler
+     (investigate feedback, rewrite, loop to 2a).
+4. **If no critic response exists for the last round:**
+   - The previous run posted a proposal but crashed before the critic ran.
+     Extract the last proposal text as `current_proposal`. Set
+     `proposal_round = last_proposal_round - 1` (so the next increment
+     brings it back to the same round number). Skip exploration — proceed
+     directly to Step 2a (spawn critic for the existing proposal).
+5. **If a `## Converged Proposal` comment exists:**
+   - Skip to Step 3. Check for existing worktree/branch from prior run.
+
+**If no prior comments exist**, proceed normally to Blocker-Ancestor
+Resolution and Readiness Triage below.
+
+> **Why this matters.** Without resume, a context-window crash causes the
+> loop script to restart from scratch — re-exploring, re-proposing from
+> Round 1, and wasting all prior convergence progress. With resume, each
+> restart picks up where the last one left off, making forward progress
+> even across multiple session crashes.
+
 ### Blocker-Ancestor Resolution
 
 Before triaging readiness, check whether the issue is **blocked by** another
@@ -228,6 +283,22 @@ Build context for the issue — but **budget your context aggressively**.
 > review-fix rounds. If you exhaust your context window during
 > exploration, the session will exit before the proposal even converges.
 >
+> **Hard limits for initial exploration (Round 0):**
+> - Read at most **15 files** (via `view` or `view_range`).
+> - Each read should be a targeted `view_range` of 20–50 lines, not a
+>   full file.
+> - Total exploration output should stay under ~3,000 lines. If you hit
+>   this, stop and write your first draft with what you have.
+>
+> **Limits for subsequent rounds (Rounds 2+):**
+> - Do NOT re-explore broadly. Only re-read specific lines that the
+>   critic flagged — typically 1–3 targeted `view_range` calls per
+>   feedback item.
+> - If the critic claims a code path exists that you didn't see, verify
+>   with a single `grep` + one `view_range`. Do not read surrounding
+>   context "just in case."
+>
+> **General rules:**
 > - **Prefer `grep`/`glob` over `view`.** Search for specific symbols,
 >   function names, or config keys mentioned in the issue. Do not read
 >   entire files when a 5-line match suffices.
@@ -254,6 +325,15 @@ current_proposal = <issue body + any relevant context>
 ## Step 2: Proposal Convergence Loop
 
 Repeat until `VERDICT: APPROVED` or `proposal_round >= max_proposal_rounds`:
+
+> **Forced convergence rule.** If `proposal_round == max_proposal_rounds - 1`
+> (the penultimate round) and the critic returns `REVISE`, do NOT loop back
+> for another critic round. Instead, incorporate the feedback into a final
+> rewrite, treat it as converged, and proceed to Step 2c. This prevents the
+> common failure mode where the agent crashes from context exhaustion on the
+> last round, wasting all prior progress. The converged proposal comment
+> should note: "Converged after forced acceptance at round N (critic did not
+> fully approve)."
 
 ### 2a: Spawn Critic Agent
 
@@ -384,6 +464,17 @@ Do not skip this step, even if the verdict is APPROVED.
 > the issue comment for the audit trail. When investigating feedback
 > items, do targeted `grep`/`view_range` lookups rather than re-reading
 > everything the critic referenced.
+>
+> **Prior-round trimming.** After each round, discard all prior proposal
+> drafts and critic responses from your working context. Your working
+> state should contain only:
+> 1. The **current (latest) proposal** text
+> 2. The **numbered feedback items** from the most recent critic response
+> 3. The issue title and body (for reference)
+>
+> Prior rounds are preserved in the issue comment trail — you do not need
+> them in context. This is critical for surviving 5 rounds without
+> context exhaustion.
 
 ```bash
 # Use --body-file (see the CRITICAL note in Step 2a).
@@ -406,12 +497,20 @@ rm -f "$tmpfile"
 
 **If `VERDICT: REVISE`**:
 - Extract the numbered feedback items.
-- Investigate each feedback item — read the relevant code, verify the
-  critic's claims, determine which feedback is valid.
+- **Drop all prior proposal/critic text from your working context** — you
+  only need the current proposal and these feedback items going forward.
+- Investigate each feedback item — but **respect the Round 2+ exploration
+  budget**: only read specific lines the critic referenced (1–3 targeted
+  `view_range` calls per item). Do not re-explore the codebase broadly.
+- Verify the critic's claims, determine which feedback is valid.
 - Rewrite `current_proposal` incorporating valid feedback. Discard feedback
   that is incorrect (explain why in the rewrite).
 - The rewrite should be a complete, self-contained proposal (not a diff).
-- Loop back to 2a with the updated proposal.
+- **Check forced convergence**: if `proposal_round >= max_proposal_rounds - 1`,
+  do not loop back to 2a. Instead, proceed to 2c with this rewrite as the
+  final proposal. Note in the converged proposal that the critic did not
+  fully approve.
+- Otherwise, loop back to 2a with the updated proposal.
 
 **If neither verdict found** (agent error):
 - Treat as `VERDICT: REVISE` with feedback "Agent did not produce a clear
