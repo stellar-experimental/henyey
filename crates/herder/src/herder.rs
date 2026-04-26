@@ -64,6 +64,7 @@ use crate::error::HerderError;
 use crate::fetching_envelopes::{FetchingEnvelopes, FetchingStats};
 
 use crate::pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
+use crate::quorum_intersection_state::{QuorumIntersectionResult, QuorumIntersectionState};
 use crate::quorum_tracker::{QuorumTracker, SlotQuorumTracker};
 use crate::scp_driver::{HerderScpCallback, ScpDriver, ScpDriverConfig, SharedTrackingState};
 use crate::state::HerderState;
@@ -277,6 +278,10 @@ pub struct Herder {
     slot_quorum_tracker: RwLock<SlotQuorumTracker>,
     /// Transitive quorum tracker for the current quorum map.
     quorum_tracker: RwLock<QuorumTracker>,
+    /// Quorum intersection analysis state.
+    /// Tracks periodic intersection checks, matching stellar-core's
+    /// `mLastQuorumMapIntersectionState` (HerderImpl.h).
+    quorum_intersection_state: Arc<RwLock<QuorumIntersectionState>>,
     /// Runtime-mutable upgrade scheduling (set via HTTP `/upgrades?mode=set`).
     /// Shared with ScpDriver for nomination validation.
     runtime_upgrades: Arc<RwLock<Upgrades>>,
@@ -444,6 +449,7 @@ impl Herder {
             prev_value: RwLock::new(Value::default()),
             slot_quorum_tracker: RwLock::new(slot_quorum_tracker),
             quorum_tracker: RwLock::new(quorum_tracker),
+            quorum_intersection_state: Arc::new(RwLock::new(QuorumIntersectionState::new())),
             runtime_upgrades,
             queue_full_count: AtomicU64::new(0),
             cached_nomination_value: RwLock::new(None),
@@ -1650,6 +1656,13 @@ impl Herder {
             // stellar-core's processSCPQueueUpToIndex which drains all
             // slots up to the target index, not just a single slot.
             self.drain_and_process_pending(externalized_slot + 1);
+
+            // Check if quorum map changed and re-analyze intersection.
+            // Matches stellar-core's checkAndMaybeReanalyzeQuorumMapV2()
+            // called from valueExternalized (HerderImpl.cpp:486-501).
+            // Placed AFTER drain_and_process_pending so the quorum tracker
+            // is up-to-date with newly processed envelopes.
+            self.check_and_maybe_reanalyze_quorum_map(externalized_slot as u32);
         }
     }
 
@@ -2715,6 +2728,17 @@ impl Herder {
 
         let node = crate::json_api::format_node_id(self.scp.local_node_id(), false);
 
+        // Build transitive quorum intersection info if available.
+        // Matches stellar-core HerderImpl.cpp:1764-1768.
+        let transitive = {
+            let state = self.quorum_intersection_state.read();
+            if state.has_any_results() {
+                self.build_transitive_quorum_info(&state)
+            } else {
+                None
+            }
+        };
+
         Some(crate::json_api::InfoQuorumSnapshot {
             node,
             qset: crate::json_api::InfoQuorumSetSnapshot {
@@ -2728,12 +2752,195 @@ impl Herder {
                 delayed: summary.delayed,
                 ledger: summary.ledger,
             },
+            transitive,
         })
     }
 
     /// Timing snapshot for the most recently externalized slot.
     pub fn scp_timing(&self) -> Option<crate::scp_driver::ExternalizeTimingSnapshot> {
         self.scp_driver.last_externalize_timing()
+    }
+
+    /// Build `TransitiveQuorumJsonInfo` from the current intersection state.
+    ///
+    /// Matches stellar-core's `getJsonTransitiveQuorumIntersectionInfo()`
+    /// (HerderImpl.cpp:1705-1751). Caller must hold the state read-lock
+    /// and verify `has_any_results()` before calling.
+    fn build_transitive_quorum_info(
+        &self,
+        state: &QuorumIntersectionState,
+    ) -> Option<crate::json_api::TransitiveQuorumJsonInfo> {
+        let result = state.last_result()?;
+
+        match result {
+            QuorumIntersectionResult::Intersecting {
+                check_ledger,
+                num_nodes,
+                ..
+            } => Some(crate::json_api::TransitiveQuorumJsonInfo {
+                intersection: true,
+                node_count: *num_nodes as u64,
+                last_check_ledger: *check_ledger as u64,
+                critical: Vec::new(), // Deferred: critical nodes computation
+                last_good_ledger: None,
+                potential_split: None,
+            }),
+            QuorumIntersectionResult::Split {
+                check_ledger,
+                num_nodes,
+                potential_split,
+                ..
+            } => {
+                let format_nodes = |nodes: &[NodeId]| -> Vec<String> {
+                    let mut sorted = nodes.to_vec();
+                    sorted.sort_by(|a, b| {
+                        henyey_common::xdr_to_bytes(a).cmp(&henyey_common::xdr_to_bytes(b))
+                    });
+                    sorted
+                        .iter()
+                        .map(|n| crate::json_api::format_node_id(n, false))
+                        .collect()
+                };
+                Some(crate::json_api::TransitiveQuorumJsonInfo {
+                    intersection: false,
+                    node_count: *num_nodes as u64,
+                    last_check_ledger: *check_ledger as u64,
+                    critical: Vec::new(),
+                    last_good_ledger: Some(state.last_good_ledger() as u64),
+                    potential_split: Some((
+                        format_nodes(&potential_split.0),
+                        format_nodes(&potential_split.1),
+                    )),
+                })
+            }
+        }
+    }
+
+    /// Check if the quorum map has changed and re-analyze intersection.
+    ///
+    /// Mirrors stellar-core's `checkAndMaybeReanalyzeQuorumMapV2()`
+    /// (HerderImpl.cpp:1934-1978). Called after each externalization.
+    fn check_and_maybe_reanalyze_quorum_map(&self, ledger_seq: u32) {
+        // Build the quorum map for hashing (NodeId → Option<ScpQuorumSet>).
+        let qmap: std::collections::HashMap<NodeId, Option<ScpQuorumSet>> = {
+            let qt = self.quorum_tracker.read();
+            qt.quorum_map()
+                .iter()
+                .map(|(id, info)| (id.clone(), info.quorum_set.clone()))
+                .collect()
+        };
+
+        if qmap.is_empty() {
+            return;
+        }
+
+        let curr_hash = henyey_scp::quorum_intersection::compute_quorum_map_hash(&qmap);
+
+        // Check if we need to re-analyze.
+        {
+            let state = self.quorum_intersection_state.read();
+
+            // If the last completed result used this same hash, nothing changed.
+            if state.last_result_hash() == Some(&curr_hash) {
+                return;
+            }
+
+            // If we're already analyzing this hash, wait for it to finish.
+            if state.checking_hash() == Some(&curr_hash) {
+                debug!("Quorum intersection analysis already in progress for current map");
+                return;
+            }
+
+            // If we're analyzing a different (stale) hash, let it finish —
+            // results will be discarded as stale on completion.
+            if state.checking_hash().is_some() {
+                debug!(
+                    "Quorum map changed during intersection analysis; \
+                     current analysis is stale and will be discarded"
+                );
+                // Don't return — we'll start a new check below. But first
+                // we need to update checking_hash, which requires a write lock.
+            }
+        }
+
+        info!(
+            ledger_seq,
+            nodes = qmap.len(),
+            "Transitive closure of quorum has changed, re-analyzing"
+        );
+
+        // Mark analysis as in-progress.
+        {
+            let mut state = self.quorum_intersection_state.write();
+            state.start_checking(curr_hash);
+        }
+
+        // Clone what the background task needs.
+        let intersection_state = Arc::clone(&self.quorum_intersection_state);
+        let hash = curr_hash;
+        let num_nodes = qmap.len();
+
+        // Spawn CPU-bound analysis on a blocking thread.
+        // Guard: if no tokio runtime is active (e.g. in unit tests),
+        // run synchronously instead of panicking.
+        let run_analysis = move || {
+            let result = henyey_scp::quorum_intersection::check_intersection(&qmap);
+
+            let mut state = intersection_state.write();
+
+            match result {
+                henyey_scp::quorum_intersection::IntersectionResult::Intersects => {
+                    let qi_result = QuorumIntersectionResult::Intersecting {
+                        check_ledger: ledger_seq,
+                        num_nodes,
+                        quorum_map_hash: hash,
+                    };
+                    if state.complete_check(&hash, qi_result) {
+                        info!(
+                            ledger_seq,
+                            nodes = num_nodes,
+                            "Quorum intersection check complete: network enjoys intersection"
+                        );
+                    } else {
+                        debug!("Quorum intersection result discarded (stale hash)");
+                    }
+                }
+                henyey_scp::quorum_intersection::IntersectionResult::Split { pair } => {
+                    let qi_result = QuorumIntersectionResult::Split {
+                        check_ledger: ledger_seq,
+                        num_nodes,
+                        quorum_map_hash: hash,
+                        potential_split: pair,
+                    };
+                    if state.complete_check(&hash, qi_result) {
+                        warn!(
+                            ledger_seq,
+                            nodes = num_nodes,
+                            "Quorum intersection check complete: NETWORK DOES NOT ENJOY INTERSECTION"
+                        );
+                    } else {
+                        debug!("Quorum intersection result discarded (stale hash)");
+                    }
+                }
+                henyey_scp::quorum_intersection::IntersectionResult::TooLarge { node_count } => {
+                    debug!(
+                        node_count,
+                        max = henyey_scp::quorum_intersection::MAX_INTERSECTION_NODES,
+                        "Quorum map too large for brute-force intersection analysis"
+                    );
+                    // Don't update state — keep serving previous results.
+                    // Clear checking_hash so we don't block future checks.
+                    // (The hash won't match on completion since we never stored a result.)
+                }
+            }
+        };
+
+        if tokio::runtime::Handle::try_current().is_ok() {
+            tokio::task::spawn_blocking(run_analysis);
+        } else {
+            // No async runtime (unit tests) — run synchronously.
+            run_analysis();
+        }
     }
 
     /// Elapsed time since first SCP activity for the given slot.

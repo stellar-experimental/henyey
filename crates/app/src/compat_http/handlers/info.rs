@@ -429,6 +429,7 @@ mod tests {
                 delayed: 0,
                 ledger: 42,
             },
+            transitive: None,
         };
 
         let wrapper = CompatInfoWrapper {

@@ -293,6 +293,11 @@ pub struct InfoQuorumSnapshot {
     pub node: String,
     /// Per-slot quorum set snapshot.
     pub qset: InfoQuorumSetSnapshot,
+    /// Transitive quorum intersection information.
+    /// Present only when intersection analysis has completed at least once
+    /// with an intersecting result (matching stellar-core's `hasAnyResults()`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transitive: Option<TransitiveQuorumJsonInfo>,
 }
 
 /// Per-slot quorum set info for the `/info` endpoint.
@@ -572,6 +577,7 @@ mod tests {
                 delayed: 1,
                 ledger: 42,
             },
+            transitive: None,
         };
 
         let value = serde_json::to_value(&snapshot).unwrap();
@@ -602,6 +608,7 @@ mod tests {
                 delayed: 0,
                 ledger: 100,
             },
+            transitive: None,
         };
 
         let value = serde_json::to_value(&snapshot).unwrap();
@@ -627,6 +634,7 @@ mod tests {
                 delayed: 0,
                 ledger: 200,
             },
+            transitive: None,
         };
 
         let value = serde_json::to_value(&snapshot).unwrap();
@@ -638,6 +646,109 @@ mod tests {
         assert!(
             value["qset"].get("validated").is_some(),
             "validated must be inside qset"
+        );
+    }
+
+    #[test]
+    fn test_info_quorum_snapshot_with_transitive_intersecting() {
+        let snapshot = InfoQuorumSnapshot {
+            node: "GABCD".to_string(),
+            qset: InfoQuorumSetSnapshot {
+                phase: "EXTERNALIZE".to_string(),
+                hash: Some("aabbcc".to_string()),
+                fail_at: Some(0),
+                validated: Some(true),
+                agree: 4,
+                disagree: 0,
+                missing: 0,
+                delayed: 0,
+                ledger: 200,
+            },
+            transitive: Some(TransitiveQuorumJsonInfo {
+                intersection: true,
+                node_count: 5,
+                last_check_ledger: 200,
+                critical: vec![],
+                last_good_ledger: None,
+                potential_split: None,
+            }),
+        };
+
+        let value = serde_json::to_value(&snapshot).unwrap();
+        let t = &value["transitive"];
+        assert_eq!(t["intersection"], true);
+        assert_eq!(t["node_count"], 5);
+        assert_eq!(t["last_check_ledger"], 200);
+        // critical is empty → omitted
+        assert!(t.get("critical").is_none());
+        // last_good_ledger and potential_split omitted when intersecting
+        assert!(t.get("last_good_ledger").is_none());
+        assert!(t.get("potential_split").is_none());
+    }
+
+    #[test]
+    fn test_info_quorum_snapshot_with_transitive_split() {
+        let snapshot = InfoQuorumSnapshot {
+            node: "GABCD".to_string(),
+            qset: InfoQuorumSetSnapshot {
+                phase: "EXTERNALIZE".to_string(),
+                hash: Some("aabbcc".to_string()),
+                fail_at: Some(0),
+                validated: Some(true),
+                agree: 4,
+                disagree: 0,
+                missing: 0,
+                delayed: 0,
+                ledger: 300,
+            },
+            transitive: Some(TransitiveQuorumJsonInfo {
+                intersection: false,
+                node_count: 6,
+                last_check_ledger: 300,
+                critical: vec![],
+                last_good_ledger: Some(250),
+                potential_split: Some((
+                    vec!["GAAA".to_string(), "GBBB".to_string()],
+                    vec!["GCCC".to_string()],
+                )),
+            }),
+        };
+
+        let value = serde_json::to_value(&snapshot).unwrap();
+        let t = &value["transitive"];
+        assert_eq!(t["intersection"], false);
+        assert_eq!(t["node_count"], 6);
+        assert_eq!(t["last_check_ledger"], 300);
+        assert_eq!(t["last_good_ledger"], 250);
+        // potential_split is a pair of arrays
+        let split = t.get("potential_split").expect("split should be present");
+        assert!(split.is_array());
+        assert_eq!(split[0][0], "GAAA");
+        assert_eq!(split[1][0], "GCCC");
+    }
+
+    #[test]
+    fn test_info_quorum_snapshot_transitive_absent_when_none() {
+        let snapshot = InfoQuorumSnapshot {
+            node: "GABCD".to_string(),
+            qset: InfoQuorumSetSnapshot {
+                phase: "EXTERNALIZE".to_string(),
+                hash: None,
+                fail_at: None,
+                validated: None,
+                agree: 0,
+                disagree: 0,
+                missing: 0,
+                delayed: 0,
+                ledger: 0,
+            },
+            transitive: None,
+        };
+
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert!(
+            value.get("transitive").is_none(),
+            "transitive should be absent when None"
         );
     }
 }

@@ -52,6 +52,7 @@ mod info;
 mod nomination;
 mod quorum;
 pub mod quorum_config;
+pub mod quorum_intersection;
 mod scp;
 mod slot;
 #[cfg(test)]
