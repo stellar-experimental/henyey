@@ -773,6 +773,7 @@ impl App {
             header.base_fee,
             header.base_reserve,
             ledger_flags,
+            self.herder.ledger_close_time_ms(),
         );
 
         // Seed Soroban per-tx limits and dynamic resource limits from network config.
@@ -2279,6 +2280,7 @@ impl App {
                 base_fee,
                 base_reserve,
                 ledger_flags,
+                herder.ledger_close_time_ms(),
             );
             if let Some(q) = queue_limit {
                 herder.tx_queue().update_soroban_resource_limits(q);

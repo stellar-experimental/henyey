@@ -22,8 +22,7 @@ impl App {
     /// `ceil(flood_op_rate_per_ledger * max_tx_set_ops * flood_period_ms / ledger_close_ms)`
     /// plus carry-over from the previous period.
     fn compute_flood_ops_budget(&self) -> usize {
-        let ledger_close_ms = (self.herder.ledger_close_time() as u64).saturating_mul(1000);
-        let ledger_close_ms = ledger_close_ms.max(1) as f64;
+        let ledger_close_ms = self.herder.ledger_close_time_ms().max(1) as f64;
         let ops_to_flood =
             self.config.overlay.flood_op_rate_per_ledger * self.herder.max_tx_set_size() as f64;
         let base_budget = (ops_to_flood * self.config.overlay.flood_advert_period_ms as f64
@@ -171,8 +170,7 @@ impl App {
 
     fn max_advert_size(&self) -> usize {
         const TX_ADVERT_VECTOR_MAX_SIZE: usize = 1000;
-        let ledger_close_ms = (self.herder.ledger_close_time() as u64).saturating_mul(1000);
-        let ledger_close_ms = ledger_close_ms.max(1) as f64;
+        let ledger_close_ms = self.herder.ledger_close_time_ms().max(1) as f64;
         let ops_to_flood =
             self.config.overlay.flood_op_rate_per_ledger * self.herder.max_tx_set_size() as f64;
         let per_period = (ops_to_flood * self.config.overlay.flood_advert_period_ms as f64
@@ -184,8 +182,7 @@ impl App {
 
     fn max_demand_size(&self) -> usize {
         const TX_DEMAND_VECTOR_MAX_SIZE: usize = 1000;
-        let ledger_close_ms = (self.herder.ledger_close_time() as u64).saturating_mul(1000);
-        let ledger_close_ms = ledger_close_ms.max(1) as f64;
+        let ledger_close_ms = self.herder.ledger_close_time_ms().max(1) as f64;
         let ops_to_flood =
             self.config.overlay.flood_op_rate_per_ledger * self.herder.max_queue_size_ops() as f64;
         let per_period = (ops_to_flood * self.config.overlay.flood_demand_period_ms as f64

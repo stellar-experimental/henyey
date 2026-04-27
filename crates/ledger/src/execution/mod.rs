@@ -238,6 +238,8 @@ pub struct SorobanNetworkInfo {
     pub nomination_timeout_increment_ms: u32,
     pub ballot_timeout_initial_ms: u32,
     pub ballot_timeout_increment_ms: u32,
+    /// Ledger target close time in milliseconds (Protocol 23+).
+    pub ledger_target_close_time_ms: u32,
     /// Maximum number of dependent TX clusters per stage (from ContractParallelComputeV0).
     pub ledger_max_dependent_tx_clusters: u32,
 }

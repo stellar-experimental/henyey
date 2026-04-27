@@ -355,6 +355,7 @@ mod tests {
             nomination_timeout_increment_ms: 500,
             ballot_timeout_initial_ms: 1000,
             ballot_timeout_increment_ms: 500,
+            ledger_target_close_time_ms: 5000,
             ledger_max_dependent_tx_clusters: 4,
         }
     }

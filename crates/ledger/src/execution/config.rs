@@ -445,6 +445,7 @@ pub(crate) fn load_soroban_network_info(
         info.nomination_timeout_increment_ms = timing.nomination_timeout_increment_milliseconds;
         info.ballot_timeout_initial_ms = timing.ballot_timeout_initial_milliseconds;
         info.ballot_timeout_increment_ms = timing.ballot_timeout_increment_milliseconds;
+        info.ledger_target_close_time_ms = timing.ledger_target_close_time_milliseconds;
     }
 
     // Load parallel compute settings (Protocol 23+)

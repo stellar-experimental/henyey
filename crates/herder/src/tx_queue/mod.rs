@@ -292,6 +292,9 @@ pub struct ValidationContext {
     pub base_reserve: u32,
     /// Ledger header flags (e.g. LP disable flags). 0 if pre-v1 extension.
     pub ledger_flags: u32,
+    /// Expected ledger close time in milliseconds.
+    /// Updated each ledger close from the dynamic network config.
+    pub expected_close_time_ms: u64,
     /// Soroban per-transaction resource limits (if available).
     pub soroban_limits: Option<SorobanTxLimits>,
     /// Max contract WASM size (from Soroban config, if available).
@@ -329,6 +332,7 @@ impl Default for ValidationContext {
             base_fee: 100,
             base_reserve: DEFAULT_BASE_RESERVE,
             ledger_flags: 0,
+            expected_close_time_ms: 5000,
             soroban_limits: None,
             max_contract_size_bytes: None,
         }
@@ -1173,6 +1177,7 @@ impl TransactionQueue {
     pub fn with_depths(config: TxQueueConfig, ban_depth: u32, pending_depth: u32) -> Self {
         let ctx = ValidationContext {
             base_fee: config.min_fee_per_op,
+            expected_close_time_ms: config.expected_ledger_close_secs * 1000,
             ..Default::default()
         };
 
@@ -1339,6 +1344,7 @@ impl TransactionQueue {
     }
 
     /// Update the validation context (should be called when ledger closes).
+    #[allow(clippy::too_many_arguments)]
     pub fn update_validation_context(
         &self,
         ledger_seq: u32,
@@ -1347,6 +1353,7 @@ impl TransactionQueue {
         base_fee: u32,
         base_reserve: u32,
         ledger_flags: u32,
+        expected_close_time_ms: u64,
     ) {
         let mut ctx = self.validation_context.write();
         ctx.ledger_seq = ledger_seq;
@@ -1355,6 +1362,7 @@ impl TransactionQueue {
         ctx.base_fee = base_fee;
         ctx.base_reserve = base_reserve;
         ctx.ledger_flags = ledger_flags;
+        ctx.expected_close_time_ms = expected_close_time_ms;
     }
 
     /// Set the Soroban per-transaction resource limits in the validation context.
@@ -1440,7 +1448,7 @@ impl TransactionQueue {
                 .as_secs();
             let drift = now.saturating_sub(ctx.close_time);
             let upper_offset =
-                self.config.expected_ledger_close_secs * EXPECTED_CLOSE_TIME_MULT + drift;
+                (ctx.expected_close_time_ms / 1000) * EXPECTED_CLOSE_TIME_MULT + drift;
             let upper_close_time = ctx.close_time.saturating_add(upper_offset);
             let upper_ctx = LedgerContext::new(
                 ctx.ledger_seq,
@@ -3646,7 +3654,7 @@ mod tests {
     fn test_queue_rejects_below_current_base_fee() {
         let queue = TransactionQueue::with_defaults();
 
-        queue.update_validation_context(1, 0, 25, 500, 5_000_000, 0);
+        queue.update_validation_context(1, 0, 25, 500, 5_000_000, 0, 5000);
 
         let low_fee = make_test_envelope(200, 1);
         let high_fee = make_test_envelope(600, 1);
@@ -5352,7 +5360,7 @@ mod tests {
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
-        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0);
+        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0, 5000);
 
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
         let operations: Vec<Operation> = vec![Operation {
@@ -5411,7 +5419,7 @@ mod tests {
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
-        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0);
+        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0, 5000);
 
         // max_time is before lcl_close_time — already expired.
         let max_time = lcl_close_time - 1;
@@ -5454,6 +5462,79 @@ mod tests {
                 TxQueueResult::Invalid(Some(TxResultCode::TxTooLate))
             ),
             "already-expired tx should be rejected with TxTooLate, not TxTooEarly"
+        );
+    }
+
+    /// Verify that the tx queue uses expected_close_time_ms from
+    /// ValidationContext (not the static config) for upper-bound validation.
+    #[test]
+    fn test_queue_uses_dynamic_expected_close_time() {
+        use henyey_tx::TxResultCode;
+        use stellar_xdr::curr::TimeBounds;
+
+        // Use current wall-clock time so drift ≈ 0.
+        let lcl_close_time: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // With 4s dynamic close time, upper_offset = 4*2 + ~0 = 8.
+        // A tx with max_time = lcl + 9 should pass the upper-bound check.
+        // With old static 5s, upper_offset = 5*2 = 10, and 9 < 10 → TxTooLate.
+        let max_time = lcl_close_time + 9;
+
+        let config = TxQueueConfig {
+            validate_signatures: false,
+            validate_time_bounds: true,
+            expected_ledger_close_secs: 5, // Static config says 5s
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+        // Set dynamic close time to 4000ms (4s) via ValidationContext
+        queue.update_validation_context(100, lcl_close_time, 21, 100, 5_000_000, 0, 4000);
+
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations: Vec<Operation> = vec![Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([255u8; 32]))),
+                starting_balance: 1000000000,
+            }),
+        }];
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::Time(TimeBounds {
+                min_time: stellar_xdr::curr::TimePoint(0),
+                max_time: stellar_xdr::curr::TimePoint(max_time),
+            }),
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        // With 4s dynamic close time, upper_offset = 4*2 + ~0 = 8.
+        // max_time = lcl + 9 > lcl + 8, so NOT TxTooLate.
+        let result = queue.try_add(envelope);
+        assert!(
+            !matches!(
+                result,
+                TxQueueResult::Invalid(Some(TxResultCode::TxTooLate))
+            ),
+            "tx with max_time beyond dynamic upper bound should NOT be TxTooLate; got {:?}",
+            result
         );
     }
 
@@ -7345,7 +7426,7 @@ mod resource_limit_parity_tests {
         };
         let queue = TransactionQueue::new(config);
         queue.update_soroban_selection_limits(soroban_limit);
-        queue.update_validation_context(0, 0, PROTOCOL_VERSION, 100, 5_000_000, 0);
+        queue.update_validation_context(0, 0, PROTOCOL_VERSION, 100, 5_000_000, 0, 5000);
         #[cfg(test)]
         queue.set_skip_fee_balance_check(true);
         queue

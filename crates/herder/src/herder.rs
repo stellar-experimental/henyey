@@ -684,9 +684,30 @@ impl Herder {
         low
     }
 
-    /// Get the configured target ledger close time in seconds.
+    /// Get the expected ledger close time in seconds.
+    ///
+    /// For protocol >= 23, reads the dynamic value from the ledger config
+    /// (via `LedgerManager::expected_ledger_close_time_ms()`). Falls back to
+    /// the static `HerderConfig::ledger_close_time` when the ledger manager
+    /// is not yet installed (startup, unit tests).
     pub fn ledger_close_time(&self) -> u32 {
+        let guard = self.ledger_manager.read();
+        if let Some(manager) = guard.as_ref() {
+            return (manager.expected_ledger_close_time_ms() / 1000) as u32;
+        }
         self.config.ledger_close_time
+    }
+
+    /// Get the expected ledger close time in milliseconds.
+    ///
+    /// Prefer this over `ledger_close_time()` in code that works in
+    /// milliseconds to avoid lossy round-trips through seconds.
+    pub fn ledger_close_time_ms(&self) -> u64 {
+        let guard = self.ledger_manager.read();
+        if let Some(manager) = guard.as_ref() {
+            return manager.expected_ledger_close_time_ms();
+        }
+        (self.config.ledger_close_time as u64) * 1000
     }
 
     /// Get the maximum size of a transaction set (ops).
@@ -6821,5 +6842,149 @@ mod quorum_intersection_deadlock_tests {
         let state = herder.quorum_intersection_state.read();
         // Result should still be from ledger 100 (not re-analyzed).
         assert_eq!(state.last_good_ledger(), 100);
+    }
+}
+
+#[cfg(test)]
+mod dynamic_close_time_tests {
+    use super::*;
+    use henyey_ledger::{LedgerManager, LedgerManagerConfig, SorobanNetworkInfo};
+    use stellar_xdr::curr::{
+        Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+    };
+
+    fn make_ledger_manager_with_protocol(protocol: u32) -> LedgerManager {
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: protocol,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 10,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        lm
+    }
+
+    #[test]
+    fn test_herder_close_time_falls_back_to_config_without_ledger_manager() {
+        let config = HerderConfig {
+            ledger_close_time: 3,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config);
+        assert_eq!(herder.ledger_close_time(), 3);
+        assert_eq!(herder.ledger_close_time_ms(), 3000);
+    }
+
+    #[test]
+    fn test_herder_close_time_returns_5s_for_pre_v23() {
+        let config = HerderConfig {
+            ledger_close_time: 5,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config);
+        let lm = Arc::new(make_ledger_manager_with_protocol(22));
+        herder.set_ledger_manager(lm);
+
+        // Protocol 22: should return pre-v23 default (5000ms / 1000 = 5s)
+        assert_eq!(herder.ledger_close_time(), 5);
+        assert_eq!(herder.ledger_close_time_ms(), 5000);
+    }
+
+    #[test]
+    fn test_herder_close_time_returns_dynamic_for_v23() {
+        let config = HerderConfig {
+            ledger_close_time: 5,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config);
+        let lm = make_ledger_manager_with_protocol(23);
+
+        // Set soroban network info with a custom close time (4000ms)
+        {
+            let mut info = SorobanNetworkInfo::default();
+            info.ledger_target_close_time_ms = 4000;
+            lm.set_soroban_network_info_for_test(info);
+        }
+
+        let lm = Arc::new(lm);
+        herder.set_ledger_manager(lm);
+
+        assert_eq!(herder.ledger_close_time(), 4);
+        assert_eq!(herder.ledger_close_time_ms(), 4000);
+    }
+
+    #[test]
+    fn test_herder_close_time_returns_5000ms_when_v23_but_no_soroban_info() {
+        let config = HerderConfig {
+            ledger_close_time: 5,
+            ..HerderConfig::default()
+        };
+        let herder = Herder::new(config);
+        // Protocol 23 but no soroban_network_info populated
+        let lm = Arc::new(make_ledger_manager_with_protocol(23));
+        herder.set_ledger_manager(lm);
+
+        // Falls back to 5000ms pre-v23 constant
+        assert_eq!(herder.ledger_close_time(), 5);
+        assert_eq!(herder.ledger_close_time_ms(), 5000);
+    }
+
+    #[test]
+    fn test_ledger_manager_expected_close_time_protocol_22() {
+        let lm = make_ledger_manager_with_protocol(22);
+        assert_eq!(lm.expected_ledger_close_time_ms(), 5000);
+    }
+
+    #[test]
+    fn test_ledger_manager_expected_close_time_protocol_23_with_config() {
+        let lm = make_ledger_manager_with_protocol(23);
+        let mut info = SorobanNetworkInfo::default();
+        info.ledger_target_close_time_ms = 4000;
+        lm.set_soroban_network_info_for_test(info);
+        assert_eq!(lm.expected_ledger_close_time_ms(), 4000);
+    }
+
+    #[test]
+    fn test_ledger_manager_expected_close_time_non_5000ms_value() {
+        // Verify non-standard values (e.g. 4500ms) are returned correctly
+        // and not truncated to seconds.
+        let lm = make_ledger_manager_with_protocol(23);
+        let mut info = SorobanNetworkInfo::default();
+        info.ledger_target_close_time_ms = 4500;
+        lm.set_soroban_network_info_for_test(info);
+        assert_eq!(lm.expected_ledger_close_time_ms(), 4500);
     }
 }

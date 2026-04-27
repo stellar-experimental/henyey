@@ -2478,6 +2478,28 @@ impl LedgerManager {
         self.state.read().soroban_network_info.clone()
     }
 
+    /// Expected ledger close time in milliseconds.
+    ///
+    /// Mirrors stellar-core's `LedgerManagerImpl::getExpectedLedgerCloseTime()`:
+    /// - Protocol >= 23: read `ledger_target_close_time_milliseconds` from
+    ///   `SorobanNetworkConfig` (stored in `SorobanNetworkInfo`).
+    /// - Otherwise: return the pre-v23 default (5000 ms).
+    ///
+    /// Both the header and soroban_network_info are read under a single state
+    /// lock to avoid races during ledger close.
+    pub fn expected_ledger_close_time_ms(&self) -> u64 {
+        let state = self.state.read();
+        if protocol_version_starts_from(state.header.ledger_version, ProtocolVersion::V23) {
+            if let Some(ref info) = state.soroban_network_info {
+                if info.ledger_target_close_time_ms > 0 {
+                    return info.ledger_target_close_time_ms as u64;
+                }
+            }
+        }
+        // Pre-v23 fallback: TARGET_LEDGER_CLOSE_TIME_BEFORE_PROTOCOL_VERSION_23_MS
+        5000
+    }
+
     /// Compute `SorobanNetworkInfo` from the current bucket-list state.
     ///
     /// Creates a snapshot and loads all ~15 ConfigSetting entries. This is
@@ -2493,6 +2515,12 @@ impl LedgerManager {
                 None
             }
         }
+    }
+
+    /// Set Soroban network info directly (for testing only).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_soroban_network_info_for_test(&self, info: SorobanNetworkInfo) {
+        self.state.write().soroban_network_info = Some(info);
     }
 
     /// Rebuild the module cache for a new protocol version.
