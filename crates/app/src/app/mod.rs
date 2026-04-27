@@ -779,16 +779,16 @@ impl App {
             );
         }
 
-        // Initialize bucket manager for ledger state persistence
-        let bucket_dir = config
-            .database
-            .path
-            .parent()
-            .unwrap_or(&config.database.path)
-            .join("buckets");
+        // Initialize bucket manager for ledger state persistence.
+        // Use the configured bucket directory — this must match the path used
+        // by history publishing (publish.rs) to avoid split-brain bucket access.
+        let bucket_dir = config.buckets.directory.clone();
         std::fs::create_dir_all(&bucket_dir)?;
 
-        let bucket_manager = Arc::new(BucketManager::new(bucket_dir.clone())?);
+        let bucket_manager = Arc::new(BucketManager::with_cache_size(
+            bucket_dir.clone(),
+            config.buckets.cache_size,
+        )?);
         tracing::info!("Bucket manager initialized");
 
         // Initialize the bucket snapshot manager for concurrent query access.

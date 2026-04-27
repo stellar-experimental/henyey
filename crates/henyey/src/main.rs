@@ -1332,7 +1332,7 @@ async fn cmd_run(
             let db = henyey_db::Database::open(db_path)?;
             initialize_genesis_ledger(
                 &db,
-                Some(&db_path.parent().unwrap_or(db_path).join("buckets")),
+                Some(&config.buckets.directory),
                 &config.network.passphrase,
                 config.testing.genesis_test_account_count,
             )?;
@@ -1444,13 +1444,12 @@ async fn cmd_new_db(
 
     // Initialize genesis ledger (ledger 1) with root account, matching stellar-core
     let passphrase = &config.network.passphrase;
-    // Compute bucket directory (same as App::new uses: <db_parent>/buckets/)
-    let bucket_dir = db_path.parent().unwrap_or(db_path).join("buckets");
-    std::fs::create_dir_all(&bucket_dir)?;
+    let bucket_dir = &config.buckets.directory;
+    std::fs::create_dir_all(bucket_dir)?;
 
     initialize_genesis_ledger(
         &db,
-        Some(&bucket_dir),
+        Some(bucket_dir),
         passphrase,
         config.testing.genesis_test_account_count,
     )?;

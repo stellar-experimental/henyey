@@ -1730,6 +1730,8 @@ impl AppConfig {
 #[derive(Debug, Default)]
 pub struct ConfigBuilder {
     config: AppConfig,
+    /// Whether `bucket_directory()` was explicitly called.
+    bucket_dir_explicit: bool,
 }
 
 impl ConfigBuilder {
@@ -1737,6 +1739,7 @@ impl ConfigBuilder {
     pub fn new() -> Self {
         Self {
             config: AppConfig::testnet(),
+            bucket_dir_explicit: false,
         }
     }
 
@@ -1744,6 +1747,7 @@ impl ConfigBuilder {
     pub fn mainnet() -> Self {
         Self {
             config: AppConfig::mainnet(),
+            bucket_dir_explicit: false,
         }
     }
 
@@ -1766,14 +1770,24 @@ impl ConfigBuilder {
     }
 
     /// Set the database path.
+    ///
+    /// Also sets `buckets.directory` to `<db_parent>/buckets` as a default,
+    /// unless `bucket_directory()` was already called explicitly.
     pub fn database_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.config.database.path = path.into();
+        let path = path.into();
+        if !self.bucket_dir_explicit {
+            self.config.buckets.directory = path.parent().unwrap_or(&path).join("buckets");
+        }
+        self.config.database.path = path;
         self
     }
 
     /// Set the bucket directory.
+    ///
+    /// Overrides any default derived from `database_path()`.
     pub fn bucket_directory(mut self, path: impl Into<PathBuf>) -> Self {
         self.config.buckets.directory = path.into();
+        self.bucket_dir_explicit = true;
         self
     }
 
@@ -2802,5 +2816,37 @@ name = "test"
             inner_sets: vec![],
         };
         assert!(!with_validators.is_empty());
+    }
+
+    #[test]
+    fn test_config_builder_database_path_sets_default_bucket_dir() {
+        let config = ConfigBuilder::new()
+            .database_path("/data/stellar/node.db")
+            .build();
+        assert_eq!(
+            config.buckets.directory,
+            PathBuf::from("/data/stellar/buckets"),
+            "database_path should auto-derive bucket dir to <db_parent>/buckets"
+        );
+    }
+
+    #[test]
+    fn test_config_builder_explicit_bucket_dir_overrides_database_path() {
+        // bucket_directory() called after database_path() — explicit wins
+        let config = ConfigBuilder::new()
+            .database_path("/data/stellar/node.db")
+            .bucket_directory("/custom/buckets")
+            .build();
+        assert_eq!(config.buckets.directory, PathBuf::from("/custom/buckets"));
+    }
+
+    #[test]
+    fn test_config_builder_explicit_bucket_dir_not_clobbered_by_database_path() {
+        // bucket_directory() called before database_path() — explicit still wins
+        let config = ConfigBuilder::new()
+            .bucket_directory("/custom/buckets")
+            .database_path("/data/stellar/node.db")
+            .build();
+        assert_eq!(config.buckets.directory, PathBuf::from("/custom/buckets"));
     }
 }
