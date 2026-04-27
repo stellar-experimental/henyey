@@ -445,6 +445,61 @@ impl BucketManager {
         Ok(bucket)
     }
 
+    /// Load a live bucket from disk for merge restart, verifying its hash.
+    ///
+    /// Unlike [`load_bucket`], this always loads disk-backed (streaming I/O),
+    /// does NOT use or populate the bucket cache, and does NOT build an index.
+    /// This is appropriate for merge-restart inputs which are consumed once
+    /// by the merge and then discarded.
+    pub fn load_bucket_for_merge(&self, hash: &Hash256) -> Result<Bucket> {
+        if hash.is_zero() {
+            return Ok(Bucket::empty());
+        }
+
+        let xdr_path = self.bucket_path(hash);
+        if !xdr_path.exists() {
+            return Err(BucketError::NotFound(hash.to_hex()));
+        }
+
+        let bucket = Bucket::from_xdr_file_disk_backed(&xdr_path)?;
+        if bucket.hash() != *hash {
+            return Err(BucketError::HashMismatch {
+                expected: hash.to_hex(),
+                actual: bucket.hash().to_hex(),
+            });
+        }
+
+        Ok(bucket)
+    }
+
+    /// Load a hot archive bucket from disk for merge restart, verifying its hash.
+    ///
+    /// Same semantics as [`load_bucket_for_merge`] — disk-backed, no cache,
+    /// no index. Appropriate for hot archive merge-restart inputs.
+    pub fn load_hot_archive_bucket_for_merge(
+        &self,
+        hash: &Hash256,
+    ) -> Result<crate::hot_archive::HotArchiveBucket> {
+        if hash.is_zero() {
+            return Ok(crate::hot_archive::HotArchiveBucket::empty());
+        }
+
+        let xdr_path = self.bucket_path(hash);
+        if !xdr_path.exists() {
+            return Err(BucketError::NotFound(hash.to_hex()));
+        }
+
+        let bucket = crate::hot_archive::HotArchiveBucket::from_xdr_file_disk_backed(&xdr_path)?;
+        if bucket.hash() != *hash {
+            return Err(BucketError::HashMismatch {
+                expected: hash.to_hex(),
+                actual: bucket.hash().to_hex(),
+            });
+        }
+
+        Ok(bucket)
+    }
+
     /// Check if a bucket exists (in cache or on disk).
     pub fn bucket_exists(&self, hash: &Hash256) -> bool {
         if hash.is_zero() {
@@ -2193,5 +2248,172 @@ mod tests {
             .get_output(&merge_key)
             .copied();
         assert_eq!(output, None);
+    }
+
+    #[test]
+    fn test_verified_loader_rejects_wrong_content() {
+        let (_temp_dir, manager) = create_manager();
+
+        // Create bucket A with some content
+        let entries_a = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
+        let bucket_a = manager.create_bucket(entries_a).unwrap();
+        let hash_a = bucket_a.hash();
+
+        // Create bucket B with different content
+        let entries_b = vec![BucketEntry::Liveentry(make_account_entry([2u8; 32], 200))];
+        let bucket_b = manager.create_bucket(entries_b).unwrap();
+        let hash_b = bucket_b.hash();
+        assert_ne!(hash_a, hash_b);
+
+        // Copy bucket B's file over bucket A's filename (simulating corruption:
+        // valid XDR content but wrong data for the expected hash)
+        let path_a = manager.bucket_path(&hash_a);
+        let path_b = manager.bucket_path(&hash_b);
+        std::fs::copy(&path_b, &path_a).unwrap();
+
+        // load_bucket_for_merge should detect the mismatch
+        let result = manager.load_bucket_for_merge(&hash_a);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            BucketError::HashMismatch { expected, actual } => {
+                assert_eq!(expected, hash_a.to_hex());
+                assert_eq!(actual, hash_b.to_hex());
+            }
+            other => panic!("Expected HashMismatch, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_verified_hot_archive_loader_rejects_wrong_content() {
+        let (_temp_dir, manager) = create_manager();
+
+        // Create two live buckets with different content
+        let entries_a = vec![BucketEntry::Liveentry(make_account_entry([10u8; 32], 500))];
+        let bucket_a = manager.create_bucket(entries_a).unwrap();
+        let hash_a = bucket_a.hash();
+
+        let entries_b = vec![BucketEntry::Liveentry(make_account_entry([20u8; 32], 999))];
+        let bucket_b = manager.create_bucket(entries_b).unwrap();
+        let hash_b = bucket_b.hash();
+        assert_ne!(hash_a, hash_b);
+
+        // Copy B's file over A's filename — same "valid XDR, wrong content" pattern.
+        // Hot archive buckets use the same file format on disk, so this also
+        // exercises the hot archive loader when the file contains wrong data.
+        let path_a = manager.bucket_path(&hash_a);
+        let path_b = manager.bucket_path(&hash_b);
+        std::fs::copy(&path_b, &path_a).unwrap();
+
+        // The hot archive loader should detect the mismatch because the computed
+        // hash of the file content won't match the expected hash.
+        let result = manager.load_hot_archive_bucket_for_merge(&hash_a);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BucketError::HashMismatch { expected, actual } => {
+                assert_eq!(expected, hash_a.to_hex());
+                // Note: actual hash depends on how hot archive computes hash
+                // from live bucket entries — it may differ from hash_b.
+                // The key assertion is that it's NOT hash_a.
+                assert_ne!(actual, expected);
+            }
+            // Hot archive parse may fail before hash check if live bucket
+            // entries are not valid hot archive entries — that's also fine,
+            // it means corruption is detected.
+            _other => {
+                // Any error is acceptable — the important thing is it doesn't
+                // silently succeed with wrong data.
+            }
+        }
+    }
+
+    #[test]
+    fn test_verified_loader_accepts_correct_content() {
+        let (_temp_dir, manager) = create_manager();
+
+        let entries = vec![BucketEntry::Liveentry(make_account_entry([1u8; 32], 100))];
+        let bucket = manager.create_bucket(entries).unwrap();
+        let hash = bucket.hash();
+
+        // load_bucket_for_merge should work fine for correct files
+        let loaded = manager.load_bucket_for_merge(&hash).unwrap();
+        assert_eq!(loaded.hash(), hash);
+    }
+
+    #[test]
+    fn test_verified_loader_returns_empty_for_zero_hash() {
+        let (_temp_dir, manager) = create_manager();
+
+        let result = manager.load_bucket_for_merge(&Hash256::ZERO).unwrap();
+        assert!(result.hash().is_zero());
+        assert_eq!(result.len(), 0);
+
+        let result = manager
+            .load_hot_archive_bucket_for_merge(&Hash256::ZERO)
+            .unwrap();
+        assert!(result.hash().is_zero());
+        assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn test_verified_loader_not_found() {
+        let (_temp_dir, manager) = create_manager();
+
+        let fake_hash = Hash256::from_bytes([0xAB; 32]);
+        let result = manager.load_bucket_for_merge(&fake_hash);
+        assert!(matches!(result, Err(BucketError::NotFound(_))));
+
+        let result = manager.load_hot_archive_bucket_for_merge(&fake_hash);
+        assert!(matches!(result, Err(BucketError::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_restart_merges_from_has_rejects_mismatched_input() {
+        use crate::bucket_list::{BucketList, HasNextState, HAS_NEXT_STATE_INPUTS};
+
+        // Create a bucket list and a real bucket
+        let mut bl = BucketList::default();
+
+        let real_entries = vec![BucketEntry::Liveentry(make_account_entry([5u8; 32], 500))];
+        let real_bucket = Bucket::from_entries(real_entries).unwrap();
+        let real_hash = real_bucket.hash();
+
+        // Create a different bucket whose hash won't match
+        let wrong_entries = vec![BucketEntry::Liveentry(make_account_entry([6u8; 32], 600))];
+        let wrong_bucket = Bucket::from_entries(wrong_entries).unwrap();
+        let wrong_hash = wrong_bucket.hash();
+        assert_ne!(real_hash, wrong_hash);
+
+        // Build next_states with state-2 inputs using the real hash
+        let mut next_states = vec![HasNextState::default(); 11];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_INPUTS,
+            output: None,
+            input_curr: Some(real_hash),
+            input_snap: Some(Hash256::ZERO),
+        };
+
+        // Pass a loader that returns the WRONG bucket for the real hash
+        // The layer-2 assertion in restart_merges_from_has should catch this
+        let load_bucket = |hash: &Hash256| -> crate::Result<Bucket> {
+            if hash.is_zero() {
+                return Ok(Bucket::empty());
+            }
+            // Return wrong bucket regardless of requested hash
+            Ok(wrong_bucket.clone())
+        };
+
+        let result = bl
+            .restart_merges_from_has(1, 25, &next_states, load_bucket, false)
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BucketError::HashMismatch { expected, actual } => {
+                assert_eq!(expected, real_hash.to_hex());
+                assert_eq!(actual, wrong_hash.to_hex());
+            }
+            other => panic!("Expected HashMismatch, got: {:?}", other),
+        }
     }
 }

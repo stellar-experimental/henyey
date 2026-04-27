@@ -602,22 +602,10 @@ impl App {
         // Step 6d: Restart pending merges from HAS (async, ~60s).
         // Safe to hold &mut bucket_list while scan thread has Arc clones.
         {
-            let bucket_dir_for_merge = bucket_dir.clone();
+            let bm = self.bucket_manager.clone();
             let load_bucket_for_merge =
-                |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
-                    if hash.is_zero() {
-                        return Ok(henyey_bucket::Bucket::empty());
-                    }
-                    let bucket_path =
-                        bucket_dir_for_merge.join(henyey_bucket::canonical_bucket_filename(hash));
-                    if bucket_path.exists() {
-                        henyey_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
-                    } else {
-                        Err(henyey_bucket::BucketError::NotFound(format!(
-                            "bucket {} not found on disk",
-                            hash.to_hex()
-                        )))
-                    }
+                move |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
+                    bm.load_bucket_for_merge(hash)
                 };
             bucket_list
                 .restart_merges_from_has(
@@ -910,7 +898,7 @@ impl App {
     ) -> anyhow::Result<(BucketList, HotArchiveBucketList)> {
         // Reconstruct live BucketList
         let live_hash_pairs = has.bucket_hash_pairs();
-        let live_next_states: Vec<HasNextState> = has
+        let mut live_next_states: Vec<HasNextState> = has
             .live_next_states()
             .into_iter()
             .map(|s| HasNextState {
@@ -920,6 +908,25 @@ impl App {
                 input_snap: s.input_snap,
             })
             .collect();
+
+        // Downgrade state-1 (completed merge output) to state-0 if the output
+        // file is missing on disk. The merge will be re-run via structure-based
+        // restart. This matches the same logic in load_last_known_ledger.
+        for state in &mut live_next_states {
+            if state.state == 1 {
+                if let Some(ref output_hash) = state.output {
+                    if !output_hash.is_zero() && !self.bucket_manager.bucket_exists(output_hash) {
+                        tracing::info!(
+                            output = %output_hash.to_hex(),
+                            "reconstruct_bucket_lists: pending merge output not on disk, \
+                             discarding merge state"
+                        );
+                        state.state = 0;
+                        state.output = None;
+                    }
+                }
+            }
+        }
 
         let bucket_manager = self.bucket_manager.clone();
         let load_bucket = |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
@@ -940,21 +947,10 @@ impl App {
         // AssumeStateWork -> assumeState() -> restartMerges().
         {
             let protocol_version = header.ledger_version;
+            let bm = self.bucket_manager.clone();
             let load_bucket_for_merge =
-                |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
-                    if hash.is_zero() {
-                        return Ok(henyey_bucket::Bucket::empty());
-                    }
-                    let bucket_path =
-                        bucket_dir.join(henyey_bucket::canonical_bucket_filename(hash));
-                    if bucket_path.exists() {
-                        henyey_bucket::Bucket::from_xdr_file_disk_backed(&bucket_path)
-                    } else {
-                        Err(henyey_bucket::BucketError::NotFound(format!(
-                            "bucket {} not found on disk",
-                            hash.to_hex()
-                        )))
-                    }
+                move |hash: &Hash256| -> henyey_bucket::Result<henyey_bucket::Bucket> {
+                    bm.load_bucket_for_merge(hash)
                 };
             bucket_list
                 .restart_merges_from_has(
@@ -1633,6 +1629,7 @@ impl App {
                  the network's previous ledger hash. This means our ledger state \
                  has diverged from the network. Shutting down."
             );
+            self.ledger_manager.log_bucket_list_debug(next_seq);
             std::process::exit(1);
         }
         if *tx_set.hash() != close_info.tx_set_hash {

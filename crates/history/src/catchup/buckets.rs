@@ -33,54 +33,26 @@ pub(super) fn rss_mb() -> Option<u64> {
 ///
 /// This uses `Bucket::from_xdr_file_disk_backed()` which streams through the file
 /// in two passes (hash computation + index building) without loading the entire file
-/// into memory. Memory usage is O(index_size) instead of O(file_size).
+/// Create a closure that loads live buckets from disk with hash verification.
 ///
-/// This is critical for mainnet where higher-level buckets can be tens of GB.
-/// Loading a 30GB bucket file fully into memory would require 30GB+ RAM, while
-/// the streaming approach uses only ~150MB for the index.
-pub(super) fn load_disk_backed_bucket_closure(
-    bucket_dir: std::path::PathBuf,
+/// Uses streaming I/O (disk-backed) for memory efficiency — O(index_size)
+/// instead of O(file_size). Critical for mainnet where buckets can be tens of GB.
+/// Verifies the loaded bucket's hash matches the expected hash to prevent
+/// silent divergence from corrupted files.
+pub(super) fn verified_bucket_loader(
+    bucket_manager: std::sync::Arc<henyey_bucket::BucketManager>,
 ) -> impl FnMut(&Hash256) -> henyey_bucket::Result<Bucket> {
-    move |hash: &Hash256| {
-        if hash.is_zero() {
-            return Ok(Bucket::empty());
-        }
-        let bucket_path = bucket_dir.join(canonical_bucket_filename(hash));
-        if bucket_path.exists() {
-            Bucket::from_xdr_file_disk_backed(&bucket_path)
-        } else {
-            Err(henyey_bucket::BucketError::NotFound(format!(
-                "bucket {} not found on disk at {}",
-                hash,
-                bucket_path.display()
-            )))
-        }
-    }
+    move |hash: &Hash256| bucket_manager.load_bucket_for_merge(hash)
 }
 
-/// Create a closure that loads hot archive buckets from disk using streaming I/O.
+/// Create a closure that loads hot archive buckets from disk with hash verification.
 ///
-/// Same memory optimization as `load_disk_backed_bucket_closure` but for hot archive
-/// buckets which use `HotArchiveBucketEntry` format instead of `BucketEntry`.
-pub(super) fn load_disk_backed_hot_archive_bucket_closure(
-    bucket_dir: std::path::PathBuf,
+/// Same memory optimization and hash verification as [`verified_bucket_loader`]
+/// but for hot archive buckets which use `HotArchiveBucketEntry` format.
+pub(super) fn verified_hot_archive_bucket_loader(
+    bucket_manager: std::sync::Arc<henyey_bucket::BucketManager>,
 ) -> impl FnMut(&Hash256) -> henyey_bucket::Result<henyey_bucket::HotArchiveBucket> {
-    use henyey_bucket::HotArchiveBucket;
-    move |hash: &Hash256| {
-        if hash.is_zero() {
-            return Ok(HotArchiveBucket::empty());
-        }
-        let bucket_path = bucket_dir.join(canonical_bucket_filename(hash));
-        if bucket_path.exists() {
-            HotArchiveBucket::from_xdr_file_disk_backed(&bucket_path)
-        } else {
-            Err(henyey_bucket::BucketError::NotFound(format!(
-                "hot archive bucket {} not found on disk at {}",
-                hash,
-                bucket_path.display()
-            )))
-        }
-    }
+    move |hash: &Hash256| bucket_manager.load_hot_archive_bucket_for_merge(hash)
 }
 
 impl CatchupManager {
@@ -98,8 +70,7 @@ impl CatchupManager {
         let protocol_version = CURRENT_PROTOCOL_VERSION;
 
         // Run live bucket list merge restarts in parallel (all levels concurrently).
-        let bucket_dir = self.bucket_manager.bucket_dir().to_path_buf();
-        let load_bucket_for_merge = load_disk_backed_bucket_closure(bucket_dir.clone());
+        let load_bucket_for_merge = verified_bucket_loader(self.bucket_manager.clone());
 
         bucket_list
             .restart_merges_from_has(
@@ -116,7 +87,8 @@ impl CatchupManager {
 
         // Hot archive merges are small — run synchronously.
         {
-            let load_hot_bucket_for_merge = load_disk_backed_hot_archive_bucket_closure(bucket_dir);
+            let load_hot_bucket_for_merge =
+                verified_hot_archive_bucket_loader(self.bucket_manager.clone());
             hot_archive_bucket_list
                 .restart_merges_from_has(
                     checkpoint_seq,

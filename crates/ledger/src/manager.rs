@@ -1490,7 +1490,75 @@ impl LedgerManager {
         hashes
     }
 
-    /// Initialize the ledger from bucket list state.
+    /// Log detailed per-level bucket list state for debugging hash mismatches.
+    ///
+    /// Dumps curr/snap hashes for every level of both live and hot archive
+    /// bucket lists, plus the combined hash computation. Called from both
+    /// the close-ledger hash mismatch path and the pre-close check.
+    pub fn log_bucket_list_debug(&self, ledger_seq: u32) {
+        let bucket_list = self.bucket_list.read();
+        let live_hash = bucket_list.hash();
+        tracing::error!(
+            ledger_seq,
+            bucket_list_ledger_seq = bucket_list.ledger_seq(),
+            live_bucket_list_hash = %live_hash.to_hex(),
+            "HASH_MISMATCH_DEBUG: Live bucket list state"
+        );
+
+        for (level, level_hash, curr_hash, snap_hash) in bucket_list.level_hashes() {
+            tracing::error!(
+                ledger_seq,
+                level,
+                level_hash = %level_hash.to_hex(),
+                curr_hash = %curr_hash.to_hex(),
+                snap_hash = %snap_hash.to_hex(),
+                "HASH_MISMATCH_DEBUG: Live bucket list level"
+            );
+        }
+
+        let hot_archive = self.hot_archive_bucket_list.read();
+        if let Some(ref ha) = *hot_archive {
+            let hot_hash = ha.hash();
+            tracing::error!(
+                ledger_seq,
+                hot_archive_ledger_seq = ha.ledger_seq(),
+                hot_archive_hash = %hot_hash.to_hex(),
+                "HASH_MISMATCH_DEBUG: Hot archive bucket list state"
+            );
+
+            for (level, level_hash, curr_hash, snap_hash) in ha.level_hashes() {
+                tracing::error!(
+                    ledger_seq,
+                    level,
+                    level_hash = %level_hash.to_hex(),
+                    curr_hash = %curr_hash.to_hex(),
+                    snap_hash = %snap_hash.to_hex(),
+                    "HASH_MISMATCH_DEBUG: Hot archive bucket list level"
+                );
+            }
+
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(live_hash.as_bytes());
+            hasher.update(hot_hash.as_bytes());
+            let result = hasher.finalize();
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&result);
+            let combined_hash = Hash256::from_bytes(bytes);
+            tracing::error!(
+                ledger_seq,
+                live_hash = %live_hash.to_hex(),
+                hot_hash = %hot_hash.to_hex(),
+                combined_hash = %combined_hash.to_hex(),
+                "HASH_MISMATCH_DEBUG: Combined bucket list hash computation"
+            );
+        } else {
+            tracing::error!(
+                ledger_seq,
+                "HASH_MISMATCH_DEBUG: No hot archive bucket list present!"
+            );
+        }
+    }
     ///
     /// This is used during catchup from history archives.
     ///
@@ -1891,75 +1959,7 @@ impl LedgerManager {
             );
 
             // Log detailed bucket list state for debugging hash mismatch
-            // This helps identify which specific level has diverged
-            {
-                let bucket_list = self.bucket_list.read();
-                let live_hash = bucket_list.hash();
-                tracing::error!(
-                    ledger_seq = state.header.ledger_seq,
-                    bucket_list_ledger_seq = bucket_list.ledger_seq(),
-                    live_bucket_list_hash = %live_hash.to_hex(),
-                    "HASH_MISMATCH_DEBUG: Live bucket list state"
-                );
-
-                // Log each level's curr and snap hashes
-                for (level, level_hash, curr_hash, snap_hash) in bucket_list.level_hashes() {
-                    tracing::error!(
-                        ledger_seq = state.header.ledger_seq,
-                        level = level,
-                        level_hash = %level_hash.to_hex(),
-                        curr_hash = %curr_hash.to_hex(),
-                        snap_hash = %snap_hash.to_hex(),
-                        "HASH_MISMATCH_DEBUG: Live bucket list level"
-                    );
-                }
-
-                // Log hot archive state if present
-                let hot_archive = self.hot_archive_bucket_list.read();
-                if let Some(ref ha) = *hot_archive {
-                    let hot_hash = ha.hash();
-                    tracing::error!(
-                        ledger_seq = state.header.ledger_seq,
-                        hot_archive_ledger_seq = ha.ledger_seq(),
-                        hot_archive_hash = %hot_hash.to_hex(),
-                        "HASH_MISMATCH_DEBUG: Hot archive bucket list state"
-                    );
-
-                    for (level, level_hash, curr_hash, snap_hash) in ha.level_hashes() {
-                        tracing::error!(
-                            ledger_seq = state.header.ledger_seq,
-                            level = level,
-                            level_hash = %level_hash.to_hex(),
-                            curr_hash = %curr_hash.to_hex(),
-                            snap_hash = %snap_hash.to_hex(),
-                            "HASH_MISMATCH_DEBUG: Hot archive bucket list level"
-                        );
-                    }
-
-                    // Log the combined hash computation
-                    use sha2::{Digest, Sha256};
-                    let mut hasher = Sha256::new();
-                    hasher.update(live_hash.as_bytes());
-                    hasher.update(hot_hash.as_bytes());
-                    let result = hasher.finalize();
-                    let mut bytes = [0u8; 32];
-                    bytes.copy_from_slice(&result);
-                    let combined_hash = Hash256::from_bytes(bytes);
-                    tracing::error!(
-                        ledger_seq = state.header.ledger_seq,
-                        live_hash = %live_hash.to_hex(),
-                        hot_hash = %hot_hash.to_hex(),
-                        combined_hash = %combined_hash.to_hex(),
-                        header_bucket_list_hash = %Hash256::from(state.header.bucket_list_hash.0).to_hex(),
-                        "HASH_MISMATCH_DEBUG: Combined bucket list hash computation"
-                    );
-                } else {
-                    tracing::error!(
-                        ledger_seq = state.header.ledger_seq,
-                        "HASH_MISMATCH_DEBUG: No hot archive bucket list present!"
-                    );
-                }
-            }
+            self.log_bucket_list_debug(state.header.ledger_seq);
 
             return Err(LedgerError::HashMismatch {
                 expected: state.header_hash.to_hex(),

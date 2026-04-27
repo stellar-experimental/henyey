@@ -1494,13 +1494,27 @@ impl HotArchiveBucketList {
                         let input_curr = if curr_hash.is_zero() {
                             HotArchiveBucket::empty()
                         } else {
-                            load_bucket(curr_hash)?
+                            let b = load_bucket(curr_hash)?;
+                            if b.hash() != *curr_hash {
+                                return Err(BucketError::HashMismatch {
+                                    expected: curr_hash.to_hex(),
+                                    actual: b.hash().to_hex(),
+                                });
+                            }
+                            b
                         };
 
                         let input_snap = if snap_hash.is_zero() {
                             HotArchiveBucket::empty()
                         } else {
-                            load_bucket(snap_hash)?
+                            let b = load_bucket(snap_hash)?;
+                            if b.hash() != *snap_hash {
+                                return Err(BucketError::HashMismatch {
+                                    expected: snap_hash.to_hex(),
+                                    actual: b.hash().to_hex(),
+                                });
+                            }
+                            b
                         };
 
                         tracing::info!(
