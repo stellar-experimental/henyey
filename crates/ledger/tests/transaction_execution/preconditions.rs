@@ -1248,3 +1248,80 @@ fn test_inner_source_frozen_bypass_allowed() {
         "Transaction with frozen source should be allowed when bypass hash matches"
     );
 }
+
+/// Regression test for AUDIT-180: when current ledger == max_ledger, the result
+/// code must be TxTooLate (not TxFailed). stellar-core treats maxLedger as an
+/// exclusive upper bound: maxLedger <= ledgerSeq means "too late".
+#[test]
+fn test_execute_transaction_ledger_bounds_equality_is_too_late() {
+    let secret = SecretKey::from_seed(&[42u8; 32]);
+    let account_id: AccountId = (&secret.public_key()).into();
+
+    let (key, entry) = create_account_entry(account_id.clone(), 1, 10_000_000);
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(key, entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let destination = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32])));
+    let operation = Operation {
+        source_account: None,
+        body: OperationBody::CreateAccount(CreateAccountOp {
+            destination,
+            starting_balance: 1_000_000,
+        }),
+    };
+
+    // Ledger bounds: max_ledger = 100 (exclusive upper bound)
+    // Context ledger: 100 (equality case — must be TxTooLate)
+    let preconditions = Preconditions::V2(PreconditionsV2 {
+        time_bounds: None,
+        ledger_bounds: Some(LedgerBounds {
+            min_ledger: 0,
+            max_ledger: 100,
+        }),
+        min_seq_num: None,
+        min_seq_age: Duration(0),
+        min_seq_ledger_gap: 0,
+        extra_signers: VecM::default(),
+    });
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: 100,
+        seq_num: SequenceNumber(2),
+        cond: preconditions,
+        memo: Memo::None,
+        operations: vec![operation].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+
+    let network_id = NetworkId::testnet();
+    let decorated = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![decorated].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(100, 1_000, 100, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+
+    let result = executor
+        .execute_transaction(&snapshot, &envelope, 100, None)
+        .expect("execute");
+
+    assert_eq!(
+        result.failure,
+        Some(ExecutionFailure::TxTooLate),
+        "current == max_ledger must yield TxTooLate, not TxFailed"
+    );
+}

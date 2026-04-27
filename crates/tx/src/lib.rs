@@ -248,7 +248,7 @@ pub enum ValidationResult {
     BadMinSeqAgeOrGap,
     /// Extra signer requirements specified in preconditions not met.
     BadAuthExtra,
-    /// Other validation failure (structure, ledger bounds, etc.).
+    /// Other validation failure (structure, fee bump inner tx, etc.).
     Invalid,
 }
 
