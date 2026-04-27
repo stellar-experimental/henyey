@@ -1659,6 +1659,13 @@ impl Herder {
     /// Mirrors stellar-core's `processSCPQueueUpToIndex` which pops all
     /// envelopes for slots ≤ target in a loop.
     fn drain_and_process_pending(&self, slot: u64) {
+        self.drain_and_process_pending_impl(slot, |_| {});
+    }
+
+    fn drain_and_process_pending_impl<F>(&self, slot: u64, mut before_process: F)
+    where
+        F: FnMut(&ScpEnvelope),
+    {
         let pending = self.pending_envelopes.release_up_to(slot);
         for (pending_slot, envelopes) in pending {
             debug!(
@@ -1667,9 +1674,18 @@ impl Herder {
                 pending_slot
             );
             for env in envelopes {
+                before_process(&env);
                 let _ = self.process_scp_envelope(env);
             }
         }
+    }
+
+    #[cfg(test)]
+    fn drain_and_process_pending_with_hook<F>(&self, slot: u64, mut before_process: F)
+    where
+        F: FnMut(&ScpEnvelope),
+    {
+        self.drain_and_process_pending_impl(slot, |env| before_process(env));
     }
 
     /// Advance tracking slot after externalization.
@@ -6059,6 +6075,15 @@ mod advance_tracking_slot_tests {
 
     fn make_test_envelope(slot: u64) -> ScpEnvelope {
         let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])));
+        make_test_envelope_with_node(slot, node_id)
+    }
+
+    fn make_test_envelope_with_seed(slot: u64, seed: u8) -> ScpEnvelope {
+        let node_id = XdrNodeId(PublicKey::PublicKeyTypeEd25519(Uint256([seed; 32])));
+        make_test_envelope_with_node(slot, node_id)
+    }
+
+    fn make_test_envelope_with_node(slot: u64, node_id: XdrNodeId) -> ScpEnvelope {
         ScpEnvelope {
             statement: ScpStatement {
                 node_id,
@@ -6070,6 +6095,12 @@ mod advance_tracking_slot_tests {
                 }),
             },
             signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    fn node_seed(env: &ScpEnvelope) -> u8 {
+        match &env.statement.node_id.0 {
+            PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => bytes[0],
         }
     }
 
@@ -6116,6 +6147,53 @@ mod advance_tracking_slot_tests {
         let ts = herder.tracking_state.read();
         assert_eq!(ts.consensus_index, 104);
         assert!(ts.is_tracking);
+    }
+
+    /// AUDIT-1972 regression: for one released slot, herder drain must consume
+    /// envelopes in intra-slot LIFO order (last-added first), matching
+    /// stellar-core `PendingEnvelopes::pop()` (`pop_back`) behavior used by
+    /// `processSCPQueueUpToIndex`. This test checks slot-local ordering only.
+    #[test]
+    fn test_drain_and_process_pending_uses_lifo_within_slot() {
+        let herder = Herder::new(HerderConfig::default());
+        herder.pending_envelopes.set_current_slot(100);
+
+        assert_eq!(
+            herder
+                .pending_envelopes
+                .add(101, make_test_envelope_with_seed(101, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            herder
+                .pending_envelopes
+                .add(101, make_test_envelope_with_seed(101, 2)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            herder
+                .pending_envelopes
+                .add(101, make_test_envelope_with_seed(101, 3)),
+            PendingResult::Added
+        );
+
+        let mut observed = Vec::new();
+        let mut hook_calls = 0usize;
+        herder.drain_and_process_pending_with_hook(101, |env| {
+            hook_calls += 1;
+            observed.push(node_seed(env));
+        });
+
+        assert_eq!(
+            hook_calls, 3,
+            "hook must observe each envelope before process_scp_envelope"
+        );
+        assert_eq!(
+            observed,
+            vec![3, 2, 1],
+            "herder must process slot 101 in LIFO order"
+        );
+        assert_eq!(herder.pending_envelopes.slot_count(), 0);
     }
 
     /// Regression test for #1783: build_nomination_value must create exactly
