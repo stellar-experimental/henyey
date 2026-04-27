@@ -736,7 +736,7 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
             init_checkpoint,
             init_protocol_version,
             &live_next_states,
-            |hash| bucket_manager.load_bucket(hash).map(|b| (*b).clone()),
+            |hash| bucket_manager.load_bucket_for_merge(hash),
             true, // restart_structure_based = true to match stellar-core online mode
         )
         .await?;
@@ -746,7 +746,7 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
             init_checkpoint,
             init_protocol_version,
             ha_next_states,
-            |hash| bucket_manager.load_hot_archive_bucket(hash),
+            |hash| bucket_manager.load_hot_archive_bucket_for_merge(hash),
             true, // restart_structure_based = true to match stellar-core online mode
         )?;
     }
