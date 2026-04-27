@@ -233,8 +233,7 @@ impl PublishManager {
             "Publishing checkpoint to history"
         );
 
-        let header_chain: Vec<_> = headers.iter().map(|entry| entry.header.clone()).collect();
-        verify::verify_header_chain(&header_chain)?;
+        verify::verify_header_chain_from_entries(headers)?;
 
         let tx_entry_map: std::collections::HashMap<_, _> = tx_entries
             .iter()
@@ -245,7 +244,8 @@ impl PublishManager {
             .map(|entry| (entry.ledger_seq, entry))
             .collect();
 
-        for header in &header_chain {
+        for header_entry in headers {
+            let header = &header_entry.header;
             let entry = tx_entry_map.get(&header.ledger_seq).ok_or_else(|| {
                 HistoryError::VerificationFailed(format!(
                     "missing tx history entry for ledger {}",
@@ -581,6 +581,53 @@ mod tests {
         // Check that bucket directories were created
         let bucket_dir = temp.path().join("bucket/00");
         assert!(bucket_dir.exists());
+    }
+
+    #[test]
+    fn test_publish_checkpoint_rejects_bad_header_entry_hash() {
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntryExt, StellarValue,
+            StellarValueExt, TimePoint, VecM,
+        };
+
+        let temp = TempDir::new().unwrap();
+        let manager = PublishManager::new(PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            ..Default::default()
+        });
+
+        let header = LedgerHeader {
+            ledger_version: 25,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(0),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 63,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5000000,
+            max_tx_set_size: 100,
+            skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+            ext: LedgerHeaderExt::V0,
+        };
+        let entry = LedgerHeaderHistoryEntry {
+            hash: Hash([1u8; 32]),
+            header,
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        };
+
+        let err = manager
+            .publish_checkpoint(63, &[entry], &[], &[], &BucketList::new(), None)
+            .unwrap_err();
+        assert!(matches!(err, HistoryError::VerificationFailed(_)));
     }
 
     /// Verify that `build_history_archive_state` produces a HAS whose bucket
