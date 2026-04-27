@@ -2380,19 +2380,16 @@ async fn verify_single_checkpoint(
     println!("  Checkpoint {}: OK", checkpoint);
     verified += 1;
 
-    // Verify ledger headers
+    // Verify ledger header entries, including their advertised hashes.
     let headers = match archive.fetch_ledger_headers(checkpoint).await {
-        Ok(history_entries) => history_entries
-            .iter()
-            .map(|entry| entry.header.clone())
-            .collect::<Vec<_>>(),
+        Ok(history_entries) => history_entries,
         Err(e) => {
             println!("    Warning: Could not verify headers: {}", e);
             return (verified, errors);
         }
     };
 
-    if let Err(e) = verify::verify_header_chain(&headers) {
+    if let Err(e) = verify::verify_header_chain_from_entries(&headers) {
         println!("    Header chain verification FAILED: {}", e);
         errors += 1;
     }
@@ -2426,7 +2423,8 @@ async fn verify_single_checkpoint(
         .map(|entry| (entry.ledger_seq, entry))
         .collect::<std::collections::HashMap<_, _>>();
 
-    for header in &headers {
+    for header_entry in &headers {
+        let header = &header_entry.header;
         let Some(tx_entry) = tx_map.get(&header.ledger_seq) else {
             println!(
                 "    Missing transaction history entry for ledger {}",
@@ -3218,19 +3216,18 @@ async fn cmd_verify_checkpoints(
                     continue;
                 }
 
-                // Extract headers
-                let headers: Vec<stellar_xdr::curr::LedgerHeader> = history_entries
-                    .iter()
-                    .map(|entry| entry.header.clone())
-                    .collect();
-
-                // Verify header chain within this checkpoint
-                if let Err(e) = verify::verify_header_chain(&headers) {
+                // Verify header entries and chain within this checkpoint.
+                if let Err(e) = verify::verify_header_chain_from_entries(&history_entries) {
                     println!("FAIL (chain broken: {})", e);
                     error_count += 1;
                     current_checkpoint = checkpoint::next_checkpoint(current_checkpoint);
                     continue;
                 }
+
+                let headers: Vec<stellar_xdr::curr::LedgerHeader> = history_entries
+                    .iter()
+                    .map(|entry| entry.header.clone())
+                    .collect();
 
                 // Verify linkage to previous checkpoint
                 if let Some(ref prev) = prev_header {
