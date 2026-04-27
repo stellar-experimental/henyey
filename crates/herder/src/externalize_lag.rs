@@ -146,6 +146,11 @@ impl ExternalizeLagTracker {
         }
     }
 
+    /// Get the first-externalize timestamp for a slot, if recorded.
+    pub fn first_externalize_for_slot(&self, slot: SlotIndex) -> Option<Instant> {
+        self.first_externalize.get(&slot).copied()
+    }
+
     /// Remove first_externalize entries for a specific slot.
     pub fn cleanup_slot(&mut self, slot: SlotIndex) {
         self.first_externalize.remove(&slot);

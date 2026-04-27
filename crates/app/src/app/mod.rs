@@ -2191,6 +2191,9 @@ impl App {
         Some(crate::app::types::ScpTimingMetrics {
             externalize_duration_secs: Some(snapshot.externalize_duration.as_secs_f64()),
             nomination_duration_secs: snapshot.nomination_duration.map(|d| d.as_secs_f64()),
+            first_to_self_externalize_secs: snapshot
+                .first_to_self_externalize_lag
+                .map(|d| d.as_secs_f64()),
         })
     }
 }
@@ -6021,7 +6024,7 @@ mod tests {
         for (slot, hash_byte) in &[(n + 1, 0x11u8), (n + 5, 0x55u8), (n + 10, 0x0Au8)] {
             let hash = [*hash_byte; 32];
             let xdr = mk_stellar_value_xdr(hash);
-            driver.record_externalized(*slot, mk_value(xdr));
+            driver.record_externalized(*slot, mk_value(xdr), None);
         }
 
         // Seed the syncing_ledgers buffer with pre-existing entries (no
@@ -6126,7 +6129,7 @@ mod tests {
         for slot in (n + 1)..=(n + 10) {
             let hash = [(slot & 0xff) as u8; 32];
             let xdr = mk_stellar_value_xdr(hash);
-            driver.record_externalized(slot, mk_value(xdr));
+            driver.record_externalized(slot, mk_value(xdr), None);
         }
         *app.last_processed_slot.write().await = n;
 
@@ -6178,7 +6181,7 @@ mod tests {
         // advances to >= missing_slot.
         let driver = app.herder.scp_driver();
         let xdr = mk_stellar_value_xdr([0xaa; 32]);
-        driver.record_externalized(n + 5, mk_value(xdr));
+        driver.record_externalized(n + 5, mk_value(xdr), None);
 
         // Pre-seed buffer with an entry at `missing_slot` that has a hash
         // but no tx_set.

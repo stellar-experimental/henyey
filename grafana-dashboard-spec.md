@@ -254,6 +254,12 @@ Since this is currently a single-node deployment, the instance variable exists f
 - **Y-axis:** seconds
 - **Description:** Both timings overlaid to visualize the nomination-to-externalization gap. The area between the lines represents ballot protocol duration.
 
+### Panel 3.6a: First-to-Self Externalize Lag
+- **Type:** timeseries
+- **Query:** `stellar_scp_timing_first_to_self_externalize_seconds{job="henyey", instance=~"$instance"}`
+- **Y-axis:** seconds
+- **Description:** Propagation lag from the first EXTERNALIZE message seen (from any node) to this node's own externalization. Comparable to stellar-core's `mFirstToSelfExternalizeLag`. Healthy values are ~0.3-0.5s on mainnet. High values indicate this node is slow to finalize consensus relative to the network. This is a last-slot gauge, not a histogram.
+
 ### Panel 3.7: SCP Envelope Rates
 - **Type:** timeseries
 - **Queries:**

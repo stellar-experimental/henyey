@@ -326,6 +326,8 @@ metric_catalog! {
             => "Time from slot creation to externalize (seconds, last slot)";
         SCP_TIMING_NOMINATED_SECONDS = "stellar_scp_timing_nominated_seconds"
             => "Time from first local nomination to externalize (seconds, last slot)";
+        SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS = "stellar_scp_timing_first_to_self_externalize_seconds"
+            => "Time from first observed EXTERNALIZE to self-externalize (seconds, last slot)";
 
         // Phase 5: Archive cache gauges.
         ARCHIVE_CACHE_AGE_SECONDS = "henyey_archive_cache_age_seconds"
@@ -786,10 +788,16 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
         } else {
             gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
         }
+        if let Some(lag_secs) = timing.first_to_self_externalize_secs {
+            gauge!(SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS).set(lag_secs);
+        } else {
+            gauge!(SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS).set(0.0);
+        }
     } else {
         // No timing available (e.g., after catchup cleared it). Reset gauges.
         gauge!(SCP_TIMING_EXTERNALIZED_SECONDS).set(0.0);
         gauge!(SCP_TIMING_NOMINATED_SECONDS).set(0.0);
+        gauge!(SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS).set(0.0);
     }
 
     // Phase 5: Archive cache absolute counters.

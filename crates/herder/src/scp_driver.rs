@@ -293,6 +293,10 @@ pub struct ExternalizeTimingSnapshot {
     /// Duration from first local nomination vote to externalization.
     /// `None` if this node did not nominate for the slot (watcher/catchup path).
     pub nomination_duration: Option<std::time::Duration>,
+    /// Duration from first EXTERNALIZE seen (any node) to self-externalize.
+    /// Near-zero when this node was the first to externalize.
+    /// `None` on catchup/fast-forward paths where no externalize events were recorded.
+    pub first_to_self_externalize_lag: Option<std::time::Duration>,
 }
 
 impl ScpDriver {
@@ -586,16 +590,16 @@ impl ScpDriver {
     ///
     /// Sets the first-externalize baseline for this slot.
     /// Mirrors stellar-core's `recordSCPExternalizeEvent(slotIndex, localNodeID, false)`.
-    pub fn record_self_externalize_event(&self, slot: SlotIndex) {
+    /// Returns the captured `now` instant so callers can reuse it for timing consistency.
+    pub fn record_self_externalize_event(&self, slot: SlotIndex) -> std::time::Instant {
+        let now = std::time::Instant::now();
         let self_node = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
             stellar_xdr::curr::Uint256(*self.config.node_id.as_bytes()),
         ));
-        self.externalize_lag.write().record_event(
-            slot,
-            &self_node,
-            true,
-            std::time::Instant::now(),
-        );
+        self.externalize_lag
+            .write()
+            .record_event(slot, &self_node, true, now);
+        now
     }
 
     /// Record an SCP externalize event for a peer node.
@@ -1786,7 +1790,17 @@ impl ScpDriver {
     /// The fast-forward path records the externalized value but doesn't create
     /// or emit an SCP envelope — this method fills that gap.
     /// Record an externalized value.
-    pub fn record_externalized(&self, slot: SlotIndex, value: Value) {
+    ///
+    /// `ext_now` is an optional pre-captured instant from the externalize event
+    /// (e.g., from `record_self_externalize_event`). When provided, it is used
+    /// for timing consistency with the lag tracker baseline. When `None`,
+    /// `Instant::now()` is captured internally (catchup/fast-forward path).
+    pub fn record_externalized(
+        &self,
+        slot: SlotIndex,
+        value: Value,
+        ext_now: Option<std::time::Instant>,
+    ) {
         // Clear the tx set validity cache on ledger externalization
         self.clear_tx_set_valid_cache();
 
@@ -1826,7 +1840,7 @@ impl ScpDriver {
             }
         }
 
-        let now = std::time::Instant::now();
+        let now = ext_now.unwrap_or_else(std::time::Instant::now);
         let externalized = ExternalizedSlot {
             slot,
             value,
@@ -1838,6 +1852,12 @@ impl ScpDriver {
         // Compute timing snapshot only on first externalization for this slot.
         let is_first = !tracked_read(LOCK_SCP_EXTERNALIZED, &self.externalized).contains_key(&slot);
         if is_first {
+            let first_to_self = self
+                .externalize_lag
+                .read()
+                .first_externalize_for_slot(slot)
+                .map(|first_ext| now.duration_since(first_ext));
+
             if let Some(first_seen) = self.slot_first_seen.read().get(&slot).copied() {
                 let externalize_duration = now - first_seen;
                 let nomination_duration = self
@@ -1849,6 +1869,7 @@ impl ScpDriver {
                     slot,
                     externalize_duration,
                     nomination_duration,
+                    first_to_self_externalize_lag: first_to_self,
                 });
             } else {
                 // Catchup/fast-forward path: no slot_first_seen recorded.
@@ -2661,8 +2682,9 @@ impl SCPDriver for HerderScpCallback {
     fn value_externalized(&self, slot_index: u64, value: &Value) {
         // Record first-externalize baseline BEFORE processing.
         // Mirrors stellar-core line 915: recordSCPExternalizeEvent(self, false)
-        self.driver.record_self_externalize_event(slot_index);
-        self.driver.record_externalized(slot_index, value.clone());
+        let now = self.driver.record_self_externalize_event(slot_index);
+        self.driver
+            .record_externalized(slot_index, value.clone(), Some(now));
     }
 
     fn ballot_did_prepare(&self, _slot_index: u64, _ballot: &stellar_xdr::curr::ScpBallot) {
@@ -2863,13 +2885,13 @@ mod tests {
 
         assert!(driver.latest_externalized_slot().is_none());
 
-        driver.record_externalized(100, Value::default());
+        driver.record_externalized(100, Value::default(), None);
         assert_eq!(driver.latest_externalized_slot(), Some(100));
 
-        driver.record_externalized(99, Value::default()); // older slot
+        driver.record_externalized(99, Value::default(), None); // older slot
         assert_eq!(driver.latest_externalized_slot(), Some(100)); // still 100
 
-        driver.record_externalized(101, Value::default());
+        driver.record_externalized(101, Value::default(), None);
         assert_eq!(driver.latest_externalized_slot(), Some(101));
     }
 
@@ -2878,7 +2900,7 @@ mod tests {
         let driver = make_test_driver();
 
         for slot in 1..=10 {
-            driver.record_externalized(slot, Value::default());
+            driver.record_externalized(slot, Value::default(), None);
         }
 
         assert_eq!(driver.externalized.read().len(), 10);
@@ -2900,7 +2922,7 @@ mod tests {
 
         driver.record_slot_activity(100);
         driver.record_nomination_start(100);
-        driver.record_externalized(100, Value::default());
+        driver.record_externalized(100, Value::default(), None);
 
         let snapshot = driver.last_externalize_timing().unwrap();
         assert_eq!(snapshot.slot, 100);
@@ -2914,7 +2936,7 @@ mod tests {
         let driver = make_test_driver();
 
         driver.record_slot_activity(100);
-        driver.record_externalized(100, Value::default());
+        driver.record_externalized(100, Value::default(), None);
 
         let snapshot = driver.last_externalize_timing().unwrap();
         assert_eq!(snapshot.slot, 100);
@@ -2928,11 +2950,11 @@ mod tests {
 
         driver.record_slot_activity(100);
         driver.record_nomination_start(100);
-        driver.record_externalized(100, Value::default());
+        driver.record_externalized(100, Value::default(), None);
 
         let snapshot1 = driver.last_externalize_timing().unwrap();
 
-        driver.record_externalized(100, Value::default());
+        driver.record_externalized(100, Value::default(), None);
 
         let snapshot2 = driver.last_externalize_timing().unwrap();
         assert_eq!(snapshot1.slot, snapshot2.slot);
@@ -2968,7 +2990,7 @@ mod tests {
         }
 
         driver.record_slot_activity(200);
-        driver.record_externalized(200, Value::default());
+        driver.record_externalized(200, Value::default(), None);
 
         let map = driver.nomination_started_at.read();
         assert!(map.is_empty() || map.keys().all(|&s| 200u64.saturating_sub(s) <= 100));
@@ -2979,7 +3001,7 @@ mod tests {
         let driver = make_test_driver();
 
         driver.record_slot_activity(100);
-        driver.record_externalized(100, Value::default());
+        driver.record_externalized(100, Value::default(), None);
 
         let duration = driver.last_externalize_duration();
         assert!(duration.is_some());
@@ -3022,14 +3044,122 @@ mod tests {
         // First: a normal externalization with timing
         driver.record_slot_activity(100);
         driver.record_nomination_start(100);
-        driver.record_externalized(100, Value::default());
+        driver.record_externalized(100, Value::default(), None);
         assert!(driver.last_externalize_timing().is_some());
 
         // Now simulate catchup: record_externalized without record_slot_activity
-        driver.record_externalized(200, Value::default());
+        driver.record_externalized(200, Value::default(), None);
 
         // Timing should be cleared (not stale from slot 100)
         assert!(driver.last_externalize_timing().is_none());
+    }
+
+    #[test]
+    fn test_first_to_self_externalize_lag_peer_first() {
+        let driver = make_test_driver();
+        let peer_node = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([1u8; 32]),
+        ));
+
+        driver.record_slot_activity(100);
+
+        // Peer externalizes first — sets first_externalize baseline.
+        driver.record_peer_externalize_event(100, &peer_node);
+
+        // Self externalizes after — lag should be positive.
+        let now = driver.record_self_externalize_event(100);
+        driver.record_externalized(100, Value::default(), Some(now));
+
+        let snapshot = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot.slot, 100);
+        assert!(
+            snapshot.first_to_self_externalize_lag.is_some(),
+            "Should have first-to-self lag when peer externalizes first"
+        );
+        assert!(
+            snapshot.first_to_self_externalize_lag.unwrap().as_nanos() > 0,
+            "Lag should be positive when peer externalizes first"
+        );
+    }
+
+    #[test]
+    fn test_first_to_self_externalize_lag_self_first() {
+        let driver = make_test_driver();
+
+        driver.record_slot_activity(100);
+
+        // Self externalizes first (no prior peer EXTERNALIZE).
+        let now = driver.record_self_externalize_event(100);
+        driver.record_externalized(100, Value::default(), Some(now));
+
+        let snapshot = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot.slot, 100);
+        // When self is first, first_externalize was set by self event,
+        // and record_externalized uses the same `now`, so lag is ~0.
+        assert!(
+            snapshot.first_to_self_externalize_lag.is_some(),
+            "Should have first-to-self lag even when self is first"
+        );
+    }
+
+    #[test]
+    fn test_first_to_self_externalize_lag_catchup_path() {
+        let driver = make_test_driver();
+
+        // Catchup path: record_externalized without any prior externalize events.
+        driver.record_externalized(100, Value::default(), None);
+
+        // No timing at all (no slot_first_seen either).
+        assert!(driver.last_externalize_timing().is_none());
+    }
+
+    #[test]
+    fn test_first_to_self_externalize_lag_duplicate_externalization() {
+        let driver = make_test_driver();
+        let peer_node = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([1u8; 32]),
+        ));
+
+        driver.record_slot_activity(100);
+        driver.record_peer_externalize_event(100, &peer_node);
+        let now = driver.record_self_externalize_event(100);
+        driver.record_externalized(100, Value::default(), Some(now));
+
+        let snapshot1 = driver.last_externalize_timing().unwrap();
+
+        // Duplicate externalization should not change snapshot.
+        driver.record_externalized(100, Value::default(), None);
+
+        let snapshot2 = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot1.slot, snapshot2.slot);
+        assert_eq!(
+            snapshot1.first_to_self_externalize_lag,
+            snapshot2.first_to_self_externalize_lag
+        );
+    }
+
+    #[test]
+    fn test_first_to_self_externalize_lag_cleanup() {
+        let driver = make_test_driver();
+        let peer_node = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256([1u8; 32]),
+        ));
+
+        // Record externalize event for slot 100.
+        driver.record_peer_externalize_event(100, &peer_node);
+        assert!(driver
+            .externalize_lag
+            .read()
+            .first_externalize_for_slot(100)
+            .is_some());
+
+        // Cleanup slots below 101 should remove slot 100.
+        driver.externalize_lag.write().cleanup_slots_below(101);
+        assert!(driver
+            .externalize_lag
+            .read()
+            .first_externalize_for_slot(100)
+            .is_none());
     }
 
     #[test]
@@ -3129,7 +3259,7 @@ mod tests {
                 .try_into()
                 .unwrap(),
         );
-        driver.record_externalized(1, ext);
+        driver.record_externalized(1, ext, None);
 
         // Now try to validate a value with same close time (should fail)
         let sv = make_signed_stellar_value(

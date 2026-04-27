@@ -1141,7 +1141,7 @@ impl App {
                         }
 
                         // All validations passed - record this externalized slot
-                        scp_driver.record_externalized(slot, value);
+                        scp_driver.record_externalized(slot, value, None);
                         recorded_externalized += 1;
                         tracing::debug!(slot, "Recorded externalized slot during catchup");
 
@@ -4223,7 +4223,7 @@ mod tests {
         let xdr = mk_stellar_value_xdr_for_slot([0x50; 32]);
         app.herder
             .scp_driver()
-            .record_externalized(50, mk_value_for_slot(xdr));
+            .record_externalized(50, mk_value_for_slot(xdr), None);
 
         // 2. syncing_ledgers: one entry at slot 50 (no tx_set).
         //    50 % 64 ≠ 0 → not checkpoint boundary → can_trigger_immediate=false.

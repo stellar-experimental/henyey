@@ -345,6 +345,9 @@ pub struct ScpTimingMetrics {
     /// Duration from first local nomination vote to externalize (seconds).
     /// None if this node did not nominate for the slot (watcher/catchup).
     pub nomination_duration_secs: Option<f64>,
+    /// Duration from first EXTERNALIZE seen (any node) to self-externalize (seconds).
+    /// None on catchup/fast-forward paths where no externalize events were recorded.
+    pub first_to_self_externalize_secs: Option<f64>,
 }
 
 impl std::fmt::Display for AppInfo {

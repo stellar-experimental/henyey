@@ -1600,7 +1600,8 @@ impl Herder {
                             self.scp_driver.request_tx_set(tx_set_hash.into(), slot);
                         }
 
-                        self.scp_driver.record_externalized(slot, value.clone());
+                        self.scp_driver
+                            .record_externalized(slot, value.clone(), None);
                         self.scp_driver
                             .cleanup_externalized(self.config.max_externalized_slots);
 
