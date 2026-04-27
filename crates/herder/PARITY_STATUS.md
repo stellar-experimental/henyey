@@ -14,7 +14,7 @@
 | HerderPersistence (SCP state DB) | Partial | Missing `copySCPHistoryToStream`, `getNodeQuorumSet` |
 | HerderUtils (value extraction) | Partial | Missing validated hash/quorum-map helpers |
 | LedgerCloseData | Full | All accessors and XDR round-trip |
-| PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache; release-up-to drain now matches `processSCPQueueUpToIndex` |
+| PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache; release-up-to drain now matches `processSCPQueueUpToIndex`; intra-slot LIFO ordering now matches `pop()` |
 | QuorumTracker | Full | expand, rebuild, closest validators |
 | TransactionQueue | Partial | Missing arb damping; fee release and drop now implemented |
 | TxQueueLimiter | Partial | Missing visitTopTxs with custom limits |
@@ -264,6 +264,10 @@ Corresponds to: `PendingEnvelopes.h`
   and `ledger_closed`.
 - **Follow-up:** Full `purge_slots_outside_range(min, max, slot_to_keep)`
   with upper bound and checkpoint preservation is not yet implemented.
+- **Intra-slot release order** now matches stellar-core's LIFO semantics
+  (fixed in #1969). `release()` reverses the insertion-order vec so
+  last-added envelopes are processed first, matching `pop()`'s
+  `v.back()` / `pop_back()` behavior.
 
 ### QuorumTracker (`quorum_tracker.rs`)
 

@@ -255,6 +255,10 @@ impl PendingEnvelopes {
     }
 
     /// Release all envelopes for a slot that has become active.
+    ///
+    /// Returns envelopes in LIFO order (last-added first), matching
+    /// stellar-core's `PendingEnvelopes::pop()` which uses `v.back()` /
+    /// `pop_back()`.
     fn release(&self, slot: SlotIndex) -> Vec<ScpEnvelope> {
         if let Some((_, envelopes)) = self.slots.remove(&slot) {
             let count = envelopes.len() as u64;
@@ -267,6 +271,7 @@ impl PendingEnvelopes {
 
             envelopes
                 .into_iter()
+                .rev()
                 .filter(|e| !e.is_expired(self.config.max_age))
                 .map(|e| e.envelope)
                 .collect()
@@ -276,6 +281,10 @@ impl PendingEnvelopes {
     }
 
     /// Release all envelopes up to and including the given slot.
+    ///
+    /// Slots are returned in ascending order (via `BTreeMap`). Within each
+    /// slot, envelopes are in LIFO order (last-added first), matching
+    /// stellar-core's `PendingEnvelopes::pop()` semantics.
     pub fn release_up_to(&self, slot: SlotIndex) -> BTreeMap<SlotIndex, Vec<ScpEnvelope>> {
         let mut result = BTreeMap::new();
         let slots_to_release: Vec<SlotIndex> = self
@@ -866,5 +875,72 @@ mod tests {
 
         let stats = pending.stats();
         assert_eq!(stats.evicted, 2, "Two envelopes evicted by purge");
+    }
+
+    /// Helper: extract the node_seed byte from an envelope created by
+    /// `make_test_envelope_with_node`.
+    fn node_seed(env: &ScpEnvelope) -> u8 {
+        match &env.statement.node_id.0 {
+            PublicKey::PublicKeyTypeEd25519(Uint256(bytes)) => bytes[0],
+        }
+    }
+
+    /// Regression for #1969: release_up_to must return envelopes in
+    /// ascending slot order, with intra-slot LIFO (last-added first) to
+    /// match stellar-core's PendingEnvelopes::pop() semantics.
+    #[test]
+    fn test_issue_1969_release_lifo_within_slot() {
+        let pending = PendingEnvelopes::with_defaults();
+        pending.set_current_slot(99);
+
+        // Slot 100: add 3 envelopes with node seeds 1, 2, 3
+        assert_eq!(
+            pending.add(100, make_test_envelope_with_node(100, 1)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(100, make_test_envelope_with_node(100, 2)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(100, make_test_envelope_with_node(100, 3)),
+            PendingResult::Added
+        );
+
+        // Slot 101: add 3 envelopes with node seeds 4, 5, 6
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 4)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 5)),
+            PendingResult::Added
+        );
+        assert_eq!(
+            pending.add(101, make_test_envelope_with_node(101, 6)),
+            PendingResult::Added
+        );
+
+        let released = pending.release_up_to(101);
+
+        // Cross-slot: ascending order
+        let slots: Vec<u64> = released.keys().copied().collect();
+        assert_eq!(slots, vec![100, 101], "Slots must be in ascending order");
+
+        // Intra-slot LIFO for slot 100: last-added (seed=3) first
+        let slot_100: Vec<u8> = released[&100].iter().map(node_seed).collect();
+        assert_eq!(
+            slot_100,
+            vec![3, 2, 1],
+            "Slot 100 must be LIFO: last-added envelope first"
+        );
+
+        // Intra-slot LIFO for slot 101: last-added (seed=6) first
+        let slot_101: Vec<u8> = released[&101].iter().map(node_seed).collect();
+        assert_eq!(
+            slot_101,
+            vec![6, 5, 4],
+            "Slot 101 must be LIFO: last-added envelope first"
+        );
     }
 }
