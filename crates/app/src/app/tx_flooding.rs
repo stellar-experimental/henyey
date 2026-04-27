@@ -33,6 +33,26 @@ impl App {
         base_budget + carryover
     }
 
+    /// Compute the per-period DEX ops budget for transaction flooding.
+    ///
+    /// Returns `None` when `MAX_DEX_TX_OPERATIONS_IN_TX_SET` is not configured,
+    /// meaning DEX transactions are uncapped. When configured, computes
+    /// `ceil(flood_op_rate_per_ledger * min(max_dex_ops, max_tx_set_ops) * flood_period_ms / ledger_close_ms)`
+    /// plus DEX carry-over.
+    fn compute_dex_flood_ops_budget(&self) -> Option<usize> {
+        let max_dex_ops = self.config.surge_pricing.max_dex_tx_operations?;
+        let max_ops = self.herder.max_tx_set_size() as u32;
+        let effective_dex_ops = max_dex_ops.min(max_ops);
+        let ledger_close_ms = self.herder.ledger_close_time_ms().max(1) as f64;
+        let dex_ops_to_flood =
+            self.config.overlay.flood_op_rate_per_ledger * effective_dex_ops as f64;
+        let base = (dex_ops_to_flood * self.config.overlay.flood_advert_period_ms as f64
+            / ledger_close_ms)
+            .ceil() as usize;
+        let carryover = self.broadcast_dex_op_carryover.load(Ordering::Relaxed);
+        Some(base + carryover)
+    }
+
     /// Maximum carry-over ops between flood periods.
     /// Matches stellar-core's cap at MAX_OPS_PER_TX + 1 to allow one worst-case
     /// fee-bump transaction in carry-over.
@@ -40,13 +60,21 @@ impl App {
 
     pub(super) async fn flush_tx_adverts(&self) {
         let ops_budget = self.compute_flood_ops_budget();
-        let candidates = self.herder.tx_queue().broadcast_some(ops_budget);
+        let dex_ops_budget = self.compute_dex_flood_ops_budget();
+        let candidates = self
+            .herder
+            .tx_queue()
+            .broadcast_some(ops_budget, dex_ops_budget);
 
         if candidates.is_empty() {
             // No txs to flood — preserve carry-over (capped).
             let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
             self.broadcast_op_carryover
                 .store(new_carryover, Ordering::Relaxed);
+            if let Some(dex_budget) = dex_ops_budget {
+                self.broadcast_dex_op_carryover
+                    .store(dex_budget.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
+            }
             return;
         }
 
@@ -55,6 +83,10 @@ impl App {
             let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
             self.broadcast_op_carryover
                 .store(new_carryover, Ordering::Relaxed);
+            if let Some(dex_budget) = dex_ops_budget {
+                self.broadcast_dex_op_carryover
+                    .store(dex_budget.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
+            }
             return;
         };
 
@@ -64,6 +96,10 @@ impl App {
             let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
             self.broadcast_op_carryover
                 .store(new_carryover, Ordering::Relaxed);
+            if let Some(dex_budget) = dex_ops_budget {
+                self.broadcast_dex_op_carryover
+                    .store(dex_budget.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
+            }
             return;
         }
 
@@ -82,24 +118,32 @@ impl App {
         // Parity: stellar-core returns SKIPPED for already-broadcast txs,
         // which does NOT count against the ops budget.
         let mut ops_used: usize = 0;
+        let mut dex_ops_used: usize = 0;
         let mut per_peer: HashMap<henyey_overlay::PeerId, Vec<Hash256>> = HashMap::new();
         {
             let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
             adverts_by_peer.retain(|peer, _| peer_set.contains(peer));
 
-            for (hash, op_count) in &candidates {
+            for candidate in &candidates {
                 let mut new_to_any_peer = false;
                 for peer_id in &peer_ids {
                     let adverts = adverts_by_peer
                         .entry(peer_id.clone())
                         .or_insert_with(PeerTxAdverts::new);
-                    if !adverts.seen_advert(hash) {
+                    if !adverts.seen_advert(&candidate.hash) {
                         new_to_any_peer = true;
-                        per_peer.entry(peer_id.clone()).or_default().push(*hash);
+                        per_peer
+                            .entry(peer_id.clone())
+                            .or_default()
+                            .push(candidate.hash);
                     }
                 }
                 if new_to_any_peer {
-                    ops_used += (*op_count as usize).max(1);
+                    let ops = (candidate.op_count as usize).max(1);
+                    ops_used += ops;
+                    if candidate.is_dex {
+                        dex_ops_used += ops;
+                    }
                 }
             }
         } // drop write lock before sending
@@ -109,6 +153,8 @@ impl App {
             new_adverts = per_peer.values().map(|v| v.len()).sum::<usize>(),
             ops_used,
             ops_budget,
+            dex_ops_used,
+            ?dex_ops_budget,
             "Flushing tx adverts (priority-ordered)"
         );
 
@@ -116,6 +162,13 @@ impl App {
         let remaining = ops_budget.saturating_sub(ops_used);
         self.broadcast_op_carryover
             .store(remaining.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
+        if let Some(dex_budget) = dex_ops_budget {
+            let dex_remaining = dex_budget.saturating_sub(dex_ops_used);
+            self.broadcast_dex_op_carryover.store(
+                dex_remaining.min(Self::MAX_CARRYOVER_OPS),
+                Ordering::Relaxed,
+            );
+        }
 
         // Phase 2: Send adverts and mark successfully sent hashes.
         for (peer_id, hashes) in &per_peer {

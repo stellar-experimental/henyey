@@ -503,6 +503,7 @@ mod tests {
             op_count: ops,
             fee_per_op: if ops > 0 { fee / ops as u64 } else { 0 },
             received_at: std::time::Instant::now(),
+            is_dex: false,
         }
     }
 

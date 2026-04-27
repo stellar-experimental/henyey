@@ -466,6 +466,10 @@ pub struct App {
     /// MAX_OPS_PER_TX + 1 to prevent unbounded accumulation from missed ticks.
     broadcast_op_carryover: AtomicUsize,
 
+    /// DEX-lane carry-over ops budget from the previous flood period.
+    /// Only meaningful when `MAX_DEX_TX_OPERATIONS_IN_TX_SET` is configured.
+    broadcast_dex_op_carryover: AtomicUsize,
+
     /// Per-peer advert tracking and queues for demand scheduling.
     tx_adverts_by_peer: RwLock<HashMap<henyey_overlay::PeerId, PeerTxAdverts>>,
     /// Demand history for transaction pulls.
@@ -992,6 +996,7 @@ impl App {
                 max_outbound_peers,
             )),
             broadcast_op_carryover: AtomicUsize::new(0),
+            broadcast_dex_op_carryover: AtomicUsize::new(0),
             tx_adverts_by_peer: RwLock::new(HashMap::new()),
             tx_demand_history: RwLock::new(HashMap::new()),
             tx_pending_demands: RwLock::new(VecDeque::new()),

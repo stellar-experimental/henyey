@@ -356,6 +356,8 @@ pub struct QueuedTransaction {
     pub total_fee: u64,
     /// Inclusion fee used for surge pricing and replacement decisions.
     pub inclusion_fee: i64,
+    /// Whether this transaction contains DEX operations (cached at admission).
+    pub is_dex: bool,
 }
 
 impl QueuedTransaction {
@@ -371,6 +373,7 @@ impl QueuedTransaction {
         };
 
         Ok(Self {
+            is_dex: henyey_tx::envelope_utils::has_dex_operations_envelope(&envelope),
             envelope: Arc::new(envelope),
             hash,
             received_at: Instant::now(),
@@ -592,6 +595,7 @@ struct FeeEntry {
     inclusion_fee: i64,
     op_count: u32,
     hash: Hash256,
+    is_dex: bool,
 }
 
 impl FeeEntry {
@@ -600,6 +604,7 @@ impl FeeEntry {
             inclusion_fee: tx.inclusion_fee,
             op_count: tx.op_count,
             hash: tx.hash,
+            is_dex: tx.is_dex,
         }
     }
 }
@@ -2686,30 +2691,61 @@ impl TransactionQueue {
     }
 
     /// Return transaction hashes in surge-pricing priority order (highest
-    /// inclusion-fee rate first), limited by an operations budget.
+    /// inclusion-fee rate first), limited by generic and optional DEX ops budgets.
     ///
-    /// Iterates the maintained `fee_index` BTreeSet in reverse (O(k) where k
-    /// is the number of returned txs). Stops when the next transaction's ops
-    /// would exceed `ops_budget`. Returns `(hashes, ops_used)`.
-    /// Return the top transaction hashes by fee priority within an ops budget.
-    ///
-    /// Returns `(hash, op_count)` pairs in descending fee-rate order, stopping
-    /// when the cumulative ops would exceed `ops_budget`. The caller is
-    /// responsible for tracking which hashes were actually broadcast and
-    /// updating carry-over accordingly.
-    pub fn broadcast_some(&self, ops_budget: usize) -> Vec<(Hash256, u32)> {
+    /// Implements lane-drop semantics matching stellar-core's
+    /// `popTopTxs(allowGaps=false)`:
+    /// - When a DEX tx exceeds the DEX budget: drop the entire DEX lane, continue
+    ///   with non-DEX txs
+    /// - When any tx exceeds the generic budget: stop entirely
+    /// - When no DEX budget is configured (`None`): DEX txs use generic budget only
+    pub fn broadcast_some(
+        &self,
+        ops_budget: usize,
+        dex_ops_budget: Option<usize>,
+    ) -> Vec<BroadcastCandidate> {
         let store = self.store.read();
         let mut result = Vec::new();
         let mut ops_remaining = ops_budget;
+        let mut dex_ops_remaining = dex_ops_budget;
+        let mut dex_lane_active = true;
+
         // fee_index is sorted ascending by FeeEntry::Ord (inclusion_fee/op_count
         // cross-multiply comparison); iterate in reverse for highest-fee-first.
         for entry in store.fee_index.iter().rev() {
             let ops = (entry.op_count as usize).max(1);
-            if ops > ops_remaining {
-                break;
+
+            if entry.is_dex && dex_ops_budget.is_some() {
+                if !dex_lane_active {
+                    continue;
+                }
+                if let Some(dex_rem) = dex_ops_remaining {
+                    if ops > dex_rem {
+                        // Drop entire DEX lane — matches popTopTxs lane_active[lane] = false
+                        dex_lane_active = false;
+                        continue;
+                    }
+                }
+                if ops > ops_remaining {
+                    break;
+                }
+                ops_remaining -= ops;
+                if let Some(ref mut dex_rem) = dex_ops_remaining {
+                    *dex_rem -= ops;
+                }
+            } else {
+                // Non-DEX tx, or DEX with no configured limit: generic budget only
+                if ops > ops_remaining {
+                    break;
+                }
+                ops_remaining -= ops;
             }
-            result.push((entry.hash, entry.op_count));
-            ops_remaining -= ops;
+
+            result.push(BroadcastCandidate {
+                hash: entry.hash,
+                op_count: entry.op_count,
+                is_dex: entry.is_dex,
+            });
         }
         result
     }
@@ -2752,6 +2788,17 @@ impl TransactionQueue {
             seen_count: seen.len(),
         }
     }
+}
+
+/// A transaction selected for broadcast by [`TransactionQueue::broadcast_some`].
+#[derive(Debug, Clone)]
+pub struct BroadcastCandidate {
+    /// Hash of the transaction.
+    pub hash: Hash256,
+    /// Number of operations in the transaction.
+    pub op_count: u32,
+    /// Whether this transaction contains DEX operations.
+    pub is_dex: bool,
 }
 
 /// Statistics about the transaction queue.
@@ -8514,6 +8561,7 @@ mod inclusion_fee_i64_tests {
             op_count: 1,
             fee_per_op: 200,
             received_at: std::time::Instant::now(),
+            is_dex: false,
         };
         assert_eq!(min_inclusion_fee_to_beat((100, 1), &tx), 0);
     }
@@ -8528,6 +8576,7 @@ mod inclusion_fee_i64_tests {
             op_count: 1,
             fee_per_op: 50,
             received_at: std::time::Instant::now(),
+            is_dex: false,
         };
         let result = min_inclusion_fee_to_beat((100, 1), &tx);
         assert_eq!(result, 101);
@@ -8645,9 +8694,9 @@ mod broadcast_some_tests {
         assert_eq!(queue.try_add(tx_high.clone()), TxQueueResult::Added);
 
         // broadcast_some with unlimited budget should return all in fee-descending order
-        let entries = queue.broadcast_some(100);
-        let hashes: Vec<_> = entries.iter().map(|(h, _)| *h).collect();
-        let ops_used: usize = entries.iter().map(|(_, ops)| (*ops as usize).max(1)).sum();
+        let entries = queue.broadcast_some(100, None);
+        let hashes: Vec<_> = entries.iter().map(|c| c.hash).collect();
+        let ops_used: usize = entries.iter().map(|c| (c.op_count as usize).max(1)).sum();
         assert_eq!(hashes.len(), 3);
         assert_eq!(ops_used, 3);
 
@@ -8681,34 +8730,34 @@ mod broadcast_some_tests {
         queue.try_add(tx3);
 
         // Budget of 3 ops: only 1 tx fits (each has 2 ops), then 1 remaining < 2
-        let entries = queue.broadcast_some(3);
+        let entries = queue.broadcast_some(3, None);
         assert_eq!(entries.len(), 1);
         assert_eq!(
             entries
                 .iter()
-                .map(|(_, ops)| (*ops as usize).max(1))
+                .map(|c| (c.op_count as usize).max(1))
                 .sum::<usize>(),
             2
         );
 
         // Budget of 4 ops: 2 txs fit
-        let entries = queue.broadcast_some(4);
+        let entries = queue.broadcast_some(4, None);
         assert_eq!(entries.len(), 2);
         assert_eq!(
             entries
                 .iter()
-                .map(|(_, ops)| (*ops as usize).max(1))
+                .map(|c| (c.op_count as usize).max(1))
                 .sum::<usize>(),
             4
         );
 
         // Budget of 6 ops: all 3 txs fit
-        let entries = queue.broadcast_some(6);
+        let entries = queue.broadcast_some(6, None);
         assert_eq!(entries.len(), 3);
         assert_eq!(
             entries
                 .iter()
-                .map(|(_, ops)| (*ops as usize).max(1))
+                .map(|c| (c.op_count as usize).max(1))
                 .sum::<usize>(),
             6
         );
@@ -8719,7 +8768,7 @@ mod broadcast_some_tests {
         let config = TxQueueConfig::default();
         let queue = TransactionQueue::new(config);
 
-        let entries = queue.broadcast_some(100);
+        let entries = queue.broadcast_some(100, None);
         assert!(entries.is_empty());
     }
 
@@ -8735,7 +8784,7 @@ mod broadcast_some_tests {
         set_source(&mut tx, 1);
         queue.try_add(tx);
 
-        let entries = queue.broadcast_some(0);
+        let entries = queue.broadcast_some(0, None);
         assert!(entries.is_empty());
     }
 
@@ -8759,8 +8808,217 @@ mod broadcast_some_tests {
         queue.remove_applied(&[(tx1, 300)]);
 
         // Only tx2 should remain
-        let entries = queue.broadcast_some(100);
+        let entries = queue.broadcast_some(100, None);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, Hash256::hash_xdr(&tx2));
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&tx2));
+    }
+
+    /// Create a DEX tx envelope containing a ManageSellOffer operation.
+    fn make_dex_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let operations: Vec<Operation> = (0..ops)
+            .map(|_| Operation {
+                source_account: None,
+                body: OperationBody::ManageSellOffer(ManageSellOfferOp {
+                    selling: Asset::Native,
+                    buying: Asset::CreditAlphanum4(AlphaNum4 {
+                        asset_code: AssetCode4(*b"USD\0"),
+                        issuer: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32]))),
+                    }),
+                    amount: 100,
+                    price: Price { n: 1, d: 1 },
+                    offer_id: 0,
+                }),
+            })
+            .collect();
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    #[test]
+    fn test_broadcast_some_dex_budget_limits() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // 2 DEX txs (1 op each), 1 non-DEX tx
+        let mut dex1 = make_dex_envelope(300, 1);
+        set_source(&mut dex1, 1);
+        let mut dex2 = make_dex_envelope(200, 1);
+        set_source(&mut dex2, 2);
+        let mut non_dex = make_test_envelope(100, 1);
+        set_source(&mut non_dex, 3);
+
+        queue.try_add(dex1.clone());
+        queue.try_add(dex2.clone());
+        queue.try_add(non_dex.clone());
+
+        // DEX budget of 1: only 1 DEX tx fits, plus the non-DEX
+        let entries = queue.broadcast_some(100, Some(1));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&dex1)); // highest fee DEX
+        assert!(entries[0].is_dex);
+        assert_eq!(entries[1].hash, Hash256::hash_xdr(&non_dex)); // non-DEX
+        assert!(!entries[1].is_dex);
+    }
+
+    #[test]
+    fn test_broadcast_some_dex_lane_drop() {
+        // When top DEX tx exceeds DEX budget, ALL DEX txs are dropped
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // DEX tx with 3 ops, fee 900 → fee_per_op 300 (highest)
+        let mut dex_big = make_dex_envelope(900, 3);
+        set_source(&mut dex_big, 1);
+        // DEX tx with 1 op, fee 100 → fee_per_op 100 (lowest)
+        let mut dex_small = make_dex_envelope(100, 1);
+        set_source(&mut dex_small, 2);
+        // Non-DEX tx with 1 op, fee 200 → fee_per_op 200
+        let mut non_dex = make_test_envelope(200, 1);
+        set_source(&mut non_dex, 3);
+
+        queue.try_add(dex_big);
+        queue.try_add(dex_small);
+        queue.try_add(non_dex.clone());
+
+        // DEX budget of 2: dex_big (3 ops) exceeds, drops DEX lane entirely
+        // dex_small (1 op) also skipped because lane is dropped
+        // only non_dex survives
+        let entries = queue.broadcast_some(100, Some(2));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&non_dex));
+        assert!(!entries[0].is_dex);
+    }
+
+    #[test]
+    fn test_broadcast_some_dex_lane_drop_continues_non_dex() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Fee rates: DEX_high(500/1=500) > non_dex_high(400) > DEX_low(300) > non_dex_low(200)
+        let mut dex_high = make_dex_envelope(500, 1);
+        set_source(&mut dex_high, 1);
+        let mut non_dex_high = make_test_envelope(400, 1);
+        set_source(&mut non_dex_high, 2);
+        let mut dex_low = make_dex_envelope(300, 1);
+        set_source(&mut dex_low, 3);
+        let mut non_dex_low = make_test_envelope(200, 1);
+        set_source(&mut non_dex_low, 4);
+
+        queue.try_add(dex_high.clone());
+        queue.try_add(non_dex_high.clone());
+        queue.try_add(dex_low);
+        queue.try_add(non_dex_low.clone());
+
+        // DEX budget of 1: dex_high (1 op) fits, dex_low (1 op) would exceed
+        // → drops DEX lane after dex_high. Both non-DEX txs still flood.
+        let entries = queue.broadcast_some(100, Some(1));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&dex_high));
+        assert!(entries[0].is_dex);
+        assert_eq!(entries[1].hash, Hash256::hash_xdr(&non_dex_high));
+        assert!(!entries[1].is_dex);
+        assert_eq!(entries[2].hash, Hash256::hash_xdr(&non_dex_low));
+        assert!(!entries[2].is_dex);
+    }
+
+    #[test]
+    fn test_broadcast_some_dex_exceeds_generic_breaks() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // DEX tx with 3 ops, generic budget of 2
+        let mut dex = make_dex_envelope(300, 3);
+        set_source(&mut dex, 1);
+        let mut non_dex = make_test_envelope(100, 1);
+        set_source(&mut non_dex, 2);
+
+        queue.try_add(dex);
+        queue.try_add(non_dex);
+
+        // Generic budget 2, DEX budget 10: DEX tx (3 ops) exceeds generic → break
+        let entries = queue.broadcast_some(2, Some(10));
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_broadcast_some_no_dex_budget_uncapped() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex1 = make_dex_envelope(300, 1);
+        set_source(&mut dex1, 1);
+        let mut dex2 = make_dex_envelope(200, 1);
+        set_source(&mut dex2, 2);
+
+        queue.try_add(dex1.clone());
+        queue.try_add(dex2.clone());
+
+        // No DEX budget (None): all DEX txs use generic budget only
+        let entries = queue.broadcast_some(100, None);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_dex);
+        assert!(entries[1].is_dex);
+    }
+
+    #[test]
+    fn test_broadcast_some_returns_broadcast_candidate() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex = make_dex_envelope(200, 2);
+        set_source(&mut dex, 1);
+        let mut non_dex = make_test_envelope(100, 1);
+        set_source(&mut non_dex, 2);
+
+        queue.try_add(dex.clone());
+        queue.try_add(non_dex.clone());
+
+        let entries = queue.broadcast_some(100, None);
+        assert_eq!(entries.len(), 2);
+
+        // First entry is DEX (higher fee)
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&dex));
+        assert_eq!(entries[0].op_count, 2);
+        assert!(entries[0].is_dex);
+
+        // Second entry is non-DEX
+        assert_eq!(entries[1].hash, Hash256::hash_xdr(&non_dex));
+        assert_eq!(entries[1].op_count, 1);
+        assert!(!entries[1].is_dex);
     }
 }

@@ -108,7 +108,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `setupTriggerNextLedger()` | _(not implemented)_ | None |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
-| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_some()`; missing DEX-lane flood budget and arb damping |
+| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_some()` with DEX-lane flood budget; missing arb damping |
 | `processSCPQueue()` | pending envelope release | Full |
 | `updateTransactionQueue()` | handled in `ledger_closed()` | Full |
 | `maybeSetupSorobanQueue()` | Integrated via lane-based `TransactionQueue` | Full |
@@ -306,7 +306,7 @@ Corresponds to: `TransactionQueue.h`
 | `dropTransaction()` | `drop_transaction()` | Full |
 | `isFiltered()` | `is_filtered()` | Full |
 | `broadcastTx()` | _(removed — replaced by `broadcast_some()`)_ | N/A |
-| `broadcastSome()` | `TransactionQueue::broadcast_some()` | Partial — priority-ordered with ops budget; missing DEX-lane limits |
+| `broadcastSome()` | `TransactionQueue::broadcast_some()` | Full — priority-ordered with ops budget and DEX-lane limits |
 | `SorobanTransactionQueue::resetAndRebuild()` | `reset_and_rebuild()` in `tx_queue.rs` | Full |
 | `SorobanTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
 | `ClassicTransactionQueue::getMaxQueueSizeOps()` | via config | Full |

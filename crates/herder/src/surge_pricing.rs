@@ -836,6 +836,7 @@ mod tests {
             op_count: 1,
             fee_per_op: 100,
             received_at: std::time::Instant::now(),
+            is_dex: false,
         };
 
         // Add the transaction (lane_current_count[0] becomes Resource([1])).
