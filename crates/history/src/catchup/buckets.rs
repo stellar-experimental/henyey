@@ -164,8 +164,10 @@ impl CatchupManager {
             if hash.is_zero() {
                 return Ok(Bucket::empty());
             }
-            if hash == empty_bucket_hash {
-                return Ok(Bucket::empty());
+            // SHA-256 of empty bytes — a bucket file with no entries.
+            // Bucket::from_entries(vec![]) produces a bucket with this exact hash.
+            if *hash == *empty_bucket_hash {
+                return Bucket::from_entries(vec![]);
             }
 
             // Check cache first
@@ -298,13 +300,21 @@ impl CatchupManager {
             );
         }
 
-        // Build hot archive next states (even if no hot archive buckets, for return value)
-        let hot_next_states: Vec<HasNextState> = has
-            .hot_archive_next_states()
-            .unwrap_or_default()
-            .into_iter()
-            .map(HasNextState::from)
-            .collect();
+        // Build hot archive next states (even if no hot archive buckets, for return value).
+        // Default to the correct number of levels so restart_merges_from_has gets valid input.
+        let hot_next_states: Vec<HasNextState> = {
+            let states: Vec<HasNextState> = has
+                .hot_archive_next_states()
+                .unwrap_or_default()
+                .into_iter()
+                .map(HasNextState::from)
+                .collect();
+            if states.is_empty() {
+                vec![HasNextState::default(); henyey_bucket::HotArchiveBucketList::NUM_LEVELS]
+            } else {
+                states
+            }
+        };
 
         // Build hot archive bucket list if present (protocol 23+)
         // Hot archive uses HotArchiveBucketEntry (Metaentry/Archived/Live), not BucketEntry

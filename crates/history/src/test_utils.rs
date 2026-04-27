@@ -93,7 +93,9 @@ pub fn make_test_header(ledger_seq: u32, combined_hash: Hash256) -> LedgerHeader
 
 /// Build an 11-level [`BucketList`] whose level-0 `curr` is `bucket_hash`
 /// and whose remaining levels are all zero hashes (empty buckets).
-pub fn make_bucket_list_with_hash(bucket_hash: Hash256) -> BucketList {
+///
+/// `bucket` must be the actual bucket whose hash equals `bucket_hash`.
+pub fn make_bucket_list_with_hash(bucket_hash: Hash256, bucket: Bucket) -> BucketList {
     let mut hashes = Vec::with_capacity(22);
     for level in 0..11 {
         if level == 0 {
@@ -105,13 +107,17 @@ pub fn make_bucket_list_with_hash(bucket_hash: Hash256) -> BucketList {
         }
     }
 
-    let empty_bucket_hash = Hash256::hash(&[]);
-    let bucket_data: Vec<u8> = Vec::new();
     let load_bucket = move |hash: &Hash256| -> henyey_bucket::Result<Bucket> {
-        if hash.is_zero() || *hash == empty_bucket_hash {
+        if hash.is_zero() {
             return Ok(Bucket::empty());
         }
-        Bucket::from_xdr_bytes(&bucket_data)
+        if *hash == bucket_hash {
+            return Ok(bucket.clone());
+        }
+        Err(henyey_bucket::BucketError::Serialization(format!(
+            "bucket not found: {}",
+            hash.to_hex(),
+        )))
     };
 
     BucketList::restore_from_hashes(&hashes, load_bucket).expect("restore bucket list")
@@ -193,7 +199,12 @@ pub async fn build_single_checkpoint_archive(
 ) -> Result<HistoryArchiveFixture, FixtureBindDenied> {
     let bucket_data: Vec<u8> = Vec::new();
     let bucket_hash = Hash256::hash(&bucket_data);
-    let bucket_list = make_bucket_list_with_hash(bucket_hash);
+    // Create a real empty bucket whose hash = SHA256("") = bucket_hash.
+    // Bucket::from_entries(vec![]) produces exactly this hash since it
+    // hashes zero entries with the same SHA-256 streaming approach.
+    let bucket = Bucket::from_entries(vec![]).expect("empty bucket");
+    assert_eq!(bucket.hash(), bucket_hash, "empty bucket hash mismatch");
+    let bucket_list = make_bucket_list_with_hash(bucket_hash, bucket);
     let bucket_list_hash = bucket_list.hash();
 
     let hot_archive = HotArchiveBucketList::new();

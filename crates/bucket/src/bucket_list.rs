@@ -1127,6 +1127,36 @@ fn perform_merge(
     }
 }
 
+/// Load a bucket by hash via `FnMut` closure and verify the returned hash matches.
+fn load_and_verify<F>(hash: &Hash256, load_bucket: &mut F) -> Result<Bucket>
+where
+    F: FnMut(&Hash256) -> Result<Bucket>,
+{
+    let bucket = load_bucket(hash)?;
+    if bucket.hash() != *hash {
+        return Err(BucketError::HashMismatch {
+            expected: hash.to_hex(),
+            actual: bucket.hash().to_hex(),
+        });
+    }
+    Ok(bucket)
+}
+
+/// Load a bucket by hash via shared `Fn` closure and verify the returned hash matches.
+fn load_and_verify_shared<F>(hash: &Hash256, load_bucket: &F) -> Result<Bucket>
+where
+    F: Fn(&Hash256) -> Result<Bucket>,
+{
+    let bucket = load_bucket(hash)?;
+    if bucket.hash() != *hash {
+        return Err(BucketError::HashMismatch {
+            expected: hash.to_hex(),
+            actual: bucket.hash().to_hex(),
+        });
+    }
+    Ok(bucket)
+}
+
 impl BucketList {
     /// Number of levels in the BucketList.
     pub const NUM_LEVELS: usize = BUCKET_LIST_LEVELS;
@@ -2229,6 +2259,13 @@ impl BucketList {
                 hashes.len()
             )));
         }
+        if next_states.len() != BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} next states, got {}",
+                BUCKET_LIST_LEVELS,
+                next_states.len()
+            )));
+        }
 
         let load_bucket = &load_bucket;
 
@@ -2262,13 +2299,13 @@ impl BucketList {
                         let curr = if curr_hash.is_zero() {
                             Bucket::empty()
                         } else {
-                            load_bucket(curr_hash)?
+                            load_and_verify_shared(curr_hash, load_bucket)?
                         };
 
                         let snap = if snap_hash.is_zero() {
                             Bucket::empty()
                         } else {
-                            load_bucket(snap_hash)?
+                            load_and_verify_shared(snap_hash, load_bucket)?
                         };
 
                         tracing::info!(
@@ -2297,7 +2334,7 @@ impl BucketList {
                         i,
                         s.spawn(move || -> Result<Bucket> {
                             let t = std::time::Instant::now();
-                            let bucket = load_bucket(&hash)?;
+                            let bucket = load_and_verify_shared(&hash, load_bucket)?;
                             tracing::info!(
                                 level = i,
                                 entries = bucket.len(),
@@ -2381,6 +2418,13 @@ impl BucketList {
                 hashes.len()
             )));
         }
+        if next_states.len() != BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} next states, got {}",
+                BUCKET_LIST_LEVELS,
+                next_states.len()
+            )));
+        }
 
         let mut levels = Vec::with_capacity(BUCKET_LIST_LEVELS);
 
@@ -2389,13 +2433,13 @@ impl BucketList {
             let curr = if curr_hash.is_zero() {
                 Bucket::empty()
             } else {
-                load_bucket(curr_hash)?
+                load_and_verify(curr_hash, &mut load_bucket)?
             };
 
             let snap = if snap_hash.is_zero() {
                 Bucket::empty()
             } else {
-                load_bucket(snap_hash)?
+                load_and_verify(snap_hash, &mut load_bucket)?
             };
 
             tracing::info!(
@@ -2407,28 +2451,28 @@ impl BucketList {
             );
 
             // Check if there's a completed merge (state == HAS_NEXT_STATE_OUTPUT) for this level
-            let next: Option<PendingMerge> = if let Some(state) = next_states.get(i) {
-                if state.state == HAS_NEXT_STATE_OUTPUT {
-                    if let Some(ref output_hash) = state.output {
-                        if !output_hash.is_zero() {
-                            tracing::debug!(
-                                level = i,
-                                output_hash = %output_hash.to_hex(),
-                                "restore_from_has: loading completed merge output"
-                            );
-                            Some(PendingMerge::InMemory(load_bucket(output_hash)?))
-                        } else {
-                            None
-                        }
+            let state = &next_states[i];
+            let next: Option<PendingMerge> = if state.state == HAS_NEXT_STATE_OUTPUT {
+                if let Some(ref output_hash) = state.output {
+                    if !output_hash.is_zero() {
+                        tracing::debug!(
+                            level = i,
+                            output_hash = %output_hash.to_hex(),
+                            "restore_from_has: loading completed merge output"
+                        );
+                        Some(PendingMerge::InMemory(load_and_verify(
+                            output_hash,
+                            &mut load_bucket,
+                        )?))
                     } else {
                         None
                     }
                 } else {
-                    // For state 2 (HAS_NEXT_STATE_INPUTS), we don't set next here.
-                    // The merge will be restarted in restart_merges_from_has.
                     None
                 }
             } else {
+                // For state 2 (HAS_NEXT_STATE_INPUTS), we don't set next here.
+                // The merge will be restarted in restart_merges_from_has.
                 None
             };
 
@@ -2489,6 +2533,14 @@ impl BucketList {
             "restart_merges_from_has: restarting merges using HAS input hashes (parallel)"
         );
 
+        if next_states.len() != BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} next states, got {}",
+                BUCKET_LIST_LEVELS,
+                next_states.len()
+            )));
+        }
+
         // Phase 1: Collect work items (sequential, fast — just loads input buckets)
         struct MergeWorkItem {
             level: usize,
@@ -2509,52 +2561,37 @@ impl BucketList {
                 continue;
             }
 
-            if let Some(state) = next_states.get(i) {
-                if state.state == HAS_NEXT_STATE_INPUTS {
-                    if let (Some(ref curr_hash), Some(ref snap_hash)) =
-                        (&state.input_curr, &state.input_snap)
-                    {
-                        let input_curr = if curr_hash.is_zero() {
-                            Bucket::empty()
-                        } else {
-                            let b = load_bucket(curr_hash)?;
-                            if b.hash() != *curr_hash {
-                                return Err(BucketError::HashMismatch {
-                                    expected: curr_hash.to_hex(),
-                                    actual: b.hash().to_hex(),
-                                });
-                            }
-                            b
-                        };
+            let state = &next_states[i];
+            if state.state == HAS_NEXT_STATE_INPUTS {
+                if let (Some(ref curr_hash), Some(ref snap_hash)) =
+                    (&state.input_curr, &state.input_snap)
+                {
+                    let input_curr = if curr_hash.is_zero() {
+                        Bucket::empty()
+                    } else {
+                        load_and_verify(curr_hash, &mut load_bucket)?
+                    };
 
-                        let input_snap = if snap_hash.is_zero() {
-                            Bucket::empty()
-                        } else {
-                            let b = load_bucket(snap_hash)?;
-                            if b.hash() != *snap_hash {
-                                return Err(BucketError::HashMismatch {
-                                    expected: snap_hash.to_hex(),
-                                    actual: b.hash().to_hex(),
-                                });
-                            }
-                            b
-                        };
+                    let input_snap = if snap_hash.is_zero() {
+                        Bucket::empty()
+                    } else {
+                        load_and_verify(snap_hash, &mut load_bucket)?
+                    };
 
-                        tracing::info!(
-                            level = i,
-                            ledger = ledger,
-                            input_curr_hash = %curr_hash.to_hex(),
-                            input_snap_hash = %snap_hash.to_hex(),
-                            "restart_merges_from_has: queueing merge"
-                        );
+                    tracing::info!(
+                        level = i,
+                        ledger = ledger,
+                        input_curr_hash = %curr_hash.to_hex(),
+                        input_snap_hash = %snap_hash.to_hex(),
+                        "restart_merges_from_has: queueing merge"
+                    );
 
-                        work_items.push(MergeWorkItem {
-                            level: i,
-                            input_curr,
-                            input_snap,
-                            keep_dead: Self::keep_tombstone_entries(i),
-                        });
-                    }
+                    work_items.push(MergeWorkItem {
+                        level: i,
+                        input_curr,
+                        input_snap,
+                        keep_dead: Self::keep_tombstone_entries(i),
+                    });
                 }
             }
         }
@@ -4610,5 +4647,185 @@ mod tests {
 
         // Should panic: persistent entry lookup returns None (DEAD tombstone)
         let _ = bl.scan_for_eviction_incremental(iter, current_ledger, &settings);
+    }
+
+    // ============ hash assertion tests ============
+
+    /// Build a loader that returns a bucket with a different hash than requested,
+    /// simulating a corrupted or misidentified bucket.
+    fn make_wrong_hash_loader(
+        correct_bucket: Bucket,
+        wrong_bucket: Bucket,
+    ) -> impl Fn(&Hash256) -> crate::Result<Bucket> + Send + Sync {
+        let correct_hash = correct_bucket.hash();
+        let map: std::collections::HashMap<Hash256, Bucket> = vec![
+            (correct_bucket.hash(), correct_bucket),
+            (wrong_bucket.hash(), wrong_bucket.clone()),
+        ]
+        .into_iter()
+        .collect();
+        let map = std::sync::Arc::new(map);
+        // When asked for correct_hash, return wrong_bucket instead
+        let wrong = std::sync::Arc::new(wrong_bucket);
+        move |hash: &Hash256| {
+            if *hash == correct_hash {
+                Ok((*wrong).clone())
+            } else {
+                map.get(hash)
+                    .cloned()
+                    .ok_or_else(|| BucketError::Serialization("not found".to_string()))
+            }
+        }
+    }
+
+    #[test]
+    fn test_restore_from_has_hash_mismatch_curr() {
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+
+        let correct_bucket =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entry1)]).unwrap();
+        let wrong_bucket = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry2)]).unwrap();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (correct_bucket.hash(), Hash256::ZERO);
+
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+
+        let loader = make_wrong_hash_loader(correct_bucket, wrong_bucket);
+        let result = BucketList::restore_from_has(&hashes, &next_states, loader);
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_hash_mismatch_curr() {
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+
+        let correct_bucket =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entry1)]).unwrap();
+        let wrong_bucket = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry2)]).unwrap();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (correct_bucket.hash(), Hash256::ZERO);
+
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+
+        let loader = make_wrong_hash_loader(correct_bucket, wrong_bucket);
+        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn test_restore_from_has_hash_mismatch_output() {
+        let entry_curr = make_account_entry([1u8; 32], 100);
+        let entry_out = make_account_entry([9u8; 32], 999);
+        let entry_wrong = make_account_entry([7u8; 32], 777);
+
+        let bucket_curr =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_curr)]).unwrap();
+        let bucket_out = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_out)]).unwrap();
+        let bucket_wrong =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_wrong)]).unwrap();
+
+        let hc = bucket_curr.hash();
+        let ho = bucket_out.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (hc, Hash256::ZERO);
+
+        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        next_states[0] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(ho),
+            ..Default::default()
+        };
+
+        // Loader returns wrong bucket when output hash is requested
+        let wrong_clone = bucket_wrong.clone();
+        let loader = make_loader(vec![bucket_curr]);
+        let output_hash = ho;
+        let combined_loader = move |hash: &Hash256| {
+            if *hash == output_hash {
+                Ok(wrong_clone.clone())
+            } else {
+                loader(hash)
+            }
+        };
+
+        let result = BucketList::restore_from_has(&hashes, &next_states, combined_loader);
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn test_restore_from_has_parallel_hash_mismatch_output() {
+        let entry_curr = make_account_entry([1u8; 32], 100);
+        let entry_out = make_account_entry([9u8; 32], 999);
+        let entry_wrong = make_account_entry([7u8; 32], 777);
+
+        let bucket_curr =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_curr)]).unwrap();
+        let bucket_out = Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_out)]).unwrap();
+        let bucket_wrong =
+            Bucket::from_entries(vec![BucketListEntry::Liveentry(entry_wrong)]).unwrap();
+
+        let hc = bucket_curr.hash();
+        let ho = bucket_out.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        hashes[0] = (hc, Hash256::ZERO);
+
+        let mut next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS];
+        next_states[0] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(ho),
+            ..Default::default()
+        };
+
+        let wrong_clone = bucket_wrong.clone();
+        let loader = make_loader(vec![bucket_curr]);
+        let output_hash = ho;
+        let combined_loader = move |hash: &Hash256| {
+            if *hash == output_hash {
+                Ok(wrong_clone.clone())
+            } else {
+                loader(hash)
+            }
+        };
+
+        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, combined_loader);
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn test_restore_from_has_next_states_under_length() {
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS - 1]; // too short
+
+        let result = BucketList::restore_from_has(&hashes, &next_states, |_| {
+            unreachable!("should not call loader")
+        });
+        assert!(result.is_err());
+
+        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, |_| {
+            unreachable!("should not call loader")
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_restore_from_has_next_states_over_length() {
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); BUCKET_LIST_LEVELS];
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS + 1]; // too long
+
+        let result = BucketList::restore_from_has(&hashes, &next_states, |_| {
+            unreachable!("should not call loader")
+        });
+        assert!(result.is_err());
+
+        let result = BucketList::restore_from_has_parallel(&hashes, &next_states, |_| {
+            unreachable!("should not call loader")
+        });
+        assert!(result.is_err());
     }
 }

@@ -897,6 +897,36 @@ pub struct HotArchiveBucketList {
     ledger_seq: u32,
 }
 
+/// Load a hot archive bucket by hash via `FnMut` closure and verify the returned hash matches.
+fn load_hot_and_verify<F>(hash: &Hash256, load_bucket: &mut F) -> Result<HotArchiveBucket>
+where
+    F: FnMut(&Hash256) -> Result<HotArchiveBucket>,
+{
+    let bucket = load_bucket(hash)?;
+    if bucket.hash() != *hash {
+        return Err(BucketError::HashMismatch {
+            expected: hash.to_hex(),
+            actual: bucket.hash().to_hex(),
+        });
+    }
+    Ok(bucket)
+}
+
+/// Load a hot archive bucket by hash via shared `Fn` closure and verify the returned hash matches.
+fn load_hot_and_verify_shared<F>(hash: &Hash256, load_bucket: &F) -> Result<HotArchiveBucket>
+where
+    F: Fn(&Hash256) -> Result<HotArchiveBucket>,
+{
+    let bucket = load_bucket(hash)?;
+    if bucket.hash() != *hash {
+        return Err(BucketError::HashMismatch {
+            expected: hash.to_hex(),
+            actual: bucket.hash().to_hex(),
+        });
+    }
+    Ok(bucket)
+}
+
 impl HotArchiveBucketList {
     /// Number of levels in the hot archive bucket list.
     pub const NUM_LEVELS: usize = HOT_ARCHIVE_BUCKET_LIST_LEVELS;
@@ -1300,6 +1330,13 @@ impl HotArchiveBucketList {
                 hashes.len()
             )));
         }
+        if next_states.len() != HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} next states, got {}",
+                HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+                next_states.len()
+            )));
+        }
 
         let load_bucket = &load_bucket;
         let levels = std::thread::scope(|s| -> Result<Vec<HotArchiveBucketLevel>> {
@@ -1312,13 +1349,13 @@ impl HotArchiveBucketList {
                         let curr = if curr_hash.is_zero() {
                             HotArchiveBucket::empty()
                         } else {
-                            load_bucket(curr_hash)?
+                            load_hot_and_verify_shared(curr_hash, load_bucket)?
                         };
 
                         let snap = if snap_hash.is_zero() {
                             HotArchiveBucket::empty()
                         } else {
-                            load_bucket(snap_hash)?
+                            load_hot_and_verify_shared(snap_hash, load_bucket)?
                         };
 
                         let next = if state.state == HAS_NEXT_STATE_OUTPUT {
@@ -1329,7 +1366,7 @@ impl HotArchiveBucketList {
                                         output_hash = %output_hash.to_hex(),
                                         "hot_archive restore_from_has_parallel: loading completed merge output"
                                     );
-                                    Some(load_bucket(output_hash)?)
+                                    Some(load_hot_and_verify_shared(output_hash, load_bucket)?)
                                 } else {
                                     None
                                 }
@@ -1390,6 +1427,13 @@ impl HotArchiveBucketList {
                 hashes.len()
             )));
         }
+        if next_states.len() != HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} next states, got {}",
+                HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+                next_states.len()
+            )));
+        }
 
         let mut levels = Vec::with_capacity(HOT_ARCHIVE_BUCKET_LIST_LEVELS);
 
@@ -1397,29 +1441,26 @@ impl HotArchiveBucketList {
             let curr = if curr_hash.is_zero() {
                 HotArchiveBucket::empty()
             } else {
-                load_bucket(curr_hash)?
+                load_hot_and_verify(curr_hash, &mut load_bucket)?
             };
 
             let snap = if snap_hash.is_zero() {
                 HotArchiveBucket::empty()
             } else {
-                load_bucket(snap_hash)?
+                load_hot_and_verify(snap_hash, &mut load_bucket)?
             };
 
             // Check if there's a completed merge (state == HAS_NEXT_STATE_OUTPUT) for this level
-            let next = if let Some(state) = next_states.get(i) {
-                if state.state == HAS_NEXT_STATE_OUTPUT {
-                    if let Some(ref output_hash) = state.output {
-                        if !output_hash.is_zero() {
-                            tracing::debug!(
-                                level = i,
-                                output_hash = %output_hash.to_hex(),
-                                "hot_archive restore_from_has: loading completed merge output"
-                            );
-                            Some(load_bucket(output_hash)?)
-                        } else {
-                            None
-                        }
+            let state = &next_states[i];
+            let next = if state.state == HAS_NEXT_STATE_OUTPUT {
+                if let Some(ref output_hash) = state.output {
+                    if !output_hash.is_zero() {
+                        tracing::debug!(
+                            level = i,
+                            output_hash = %output_hash.to_hex(),
+                            "hot_archive restore_from_has: loading completed merge output"
+                        );
+                        Some(load_hot_and_verify(output_hash, &mut load_bucket)?)
                     } else {
                         None
                     }
@@ -1474,6 +1515,14 @@ impl HotArchiveBucketList {
             "hot_archive restart_merges_from_has: restarting merges using HAS input hashes"
         );
 
+        if next_states.len() != HOT_ARCHIVE_BUCKET_LIST_LEVELS {
+            return Err(BucketError::Serialization(format!(
+                "Expected {} next states, got {}",
+                HOT_ARCHIVE_BUCKET_LIST_LEVELS,
+                next_states.len()
+            )));
+        }
+
         for i in 1..HOT_ARCHIVE_BUCKET_LIST_LEVELS {
             // Skip if there's already a pending merge (from state 1 output)
             if self.levels[i].next.is_some() {
@@ -1485,68 +1534,53 @@ impl HotArchiveBucketList {
             }
 
             // Check if HAS has stored input hashes for this level (state 2)
-            if let Some(state) = next_states.get(i) {
-                if state.state == HAS_NEXT_STATE_INPUTS {
-                    if let (Some(ref curr_hash), Some(ref snap_hash)) =
-                        (&state.input_curr, &state.input_snap)
-                    {
-                        // Load the input buckets from the stored hashes
-                        let input_curr = if curr_hash.is_zero() {
-                            HotArchiveBucket::empty()
-                        } else {
-                            let b = load_bucket(curr_hash)?;
-                            if b.hash() != *curr_hash {
-                                return Err(BucketError::HashMismatch {
-                                    expected: curr_hash.to_hex(),
-                                    actual: b.hash().to_hex(),
-                                });
-                            }
-                            b
-                        };
+            let state = &next_states[i];
+            if state.state == HAS_NEXT_STATE_INPUTS {
+                if let (Some(ref curr_hash), Some(ref snap_hash)) =
+                    (&state.input_curr, &state.input_snap)
+                {
+                    // Load the input buckets from the stored hashes
+                    let input_curr = if curr_hash.is_zero() {
+                        HotArchiveBucket::empty()
+                    } else {
+                        load_hot_and_verify(curr_hash, &mut load_bucket)?
+                    };
 
-                        let input_snap = if snap_hash.is_zero() {
-                            HotArchiveBucket::empty()
-                        } else {
-                            let b = load_bucket(snap_hash)?;
-                            if b.hash() != *snap_hash {
-                                return Err(BucketError::HashMismatch {
-                                    expected: snap_hash.to_hex(),
-                                    actual: b.hash().to_hex(),
-                                });
-                            }
-                            b
-                        };
+                    let input_snap = if snap_hash.is_zero() {
+                        HotArchiveBucket::empty()
+                    } else {
+                        load_hot_and_verify(snap_hash, &mut load_bucket)?
+                    };
 
-                        tracing::info!(
-                            level = i,
-                            ledger = ledger,
-                            input_curr_hash = %curr_hash.to_hex(),
-                            input_snap_hash = %snap_hash.to_hex(),
-                            "hot_archive restart_merges_from_has: restarting merge with HAS input hashes"
-                        );
+                    tracing::info!(
+                        level = i,
+                        ledger = ledger,
+                        input_curr_hash = %curr_hash.to_hex(),
+                        input_snap_hash = %snap_hash.to_hex(),
+                        "hot_archive restart_merges_from_has: restarting merge with HAS input hashes"
+                    );
 
-                        // Perform the merge with the exact input hashes from HAS
-                        // Use the caller's protocol_version (from ledger header) as the
-                        // max protocol version, matching stellar-core behavior in restartMerges
-                        // where makeLive() is called with maxProtocolVersion.
-                        let keep_tombstones = Self::keep_tombstone_entries(i);
+                    // Perform the merge with the exact input hashes from HAS
+                    // Use the caller's protocol_version (from ledger header) as the
+                    // max protocol version, matching stellar-core behavior in restartMerges
+                    // where makeLive() is called with maxProtocolVersion.
+                    let keep_tombstones = Self::keep_tombstone_entries(i);
 
-                        let merged = merge_hot_archive_buckets(
-                            &input_curr,
-                            &input_snap,
-                            protocol_version, // Use caller's protocol version, not bucket's
-                            keep_tombstones,
-                        )?;
+                    let merged = merge_hot_archive_buckets(
+                        &input_curr,
+                        &input_snap,
+                        protocol_version, // Use caller's protocol version, not bucket's
+                        keep_tombstones,
+                    )?;
 
-                        tracing::info!(
-                            level = i,
-                            merged_hash = %merged.hash().to_hex(),
-                            "hot_archive restart_merges_from_has: merge completed"
-                        );
+                    tracing::info!(
+                        level = i,
+                        merged_hash = %merged.hash().to_hex(),
+                        "hot_archive restart_merges_from_has: merge completed"
+                    );
 
-                        self.levels[i].next = Some(merged);
-                        continue;
-                    }
+                    self.levels[i].next = Some(merged);
+                    continue;
                 }
             }
         }
@@ -2219,5 +2253,219 @@ mod tests {
             24,
             "Output should be max(24, 24)=24, not constraint=25"
         );
+    }
+
+    // ============ hash assertion tests ============
+
+    fn make_hot_loader(
+        buckets: Vec<HotArchiveBucket>,
+    ) -> impl Fn(&Hash256) -> crate::Result<HotArchiveBucket> + Send + Sync {
+        let map: std::collections::HashMap<Hash256, HotArchiveBucket> =
+            buckets.into_iter().map(|b| (b.hash(), b)).collect();
+        let map = std::sync::Arc::new(map);
+        move |hash: &Hash256| {
+            map.get(hash).cloned().ok_or_else(|| {
+                BucketError::Serialization(format!("bucket not found: {}", hash.to_hex()))
+            })
+        }
+    }
+
+    #[test]
+    fn test_hot_restore_from_has_hash_mismatch_curr() {
+        let correct = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([1u8; 32], b"k1", 1)],
+            vec![],
+        )
+        .unwrap();
+        let wrong = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([2u8; 32], b"k2", 2)],
+            vec![],
+        )
+        .unwrap();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        hashes[0] = (correct.hash(), Hash256::ZERO);
+
+        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+
+        let correct_hash = correct.hash();
+        let wrong_clone = wrong.clone();
+        let loader = move |hash: &Hash256| {
+            if *hash == correct_hash {
+                Ok(wrong_clone.clone())
+            } else {
+                Err(BucketError::Serialization("not found".to_string()))
+            }
+        };
+
+        let result = HotArchiveBucketList::restore_from_has(&hashes, &next_states, loader);
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn test_hot_restore_from_has_parallel_hash_mismatch_curr() {
+        let correct = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([1u8; 32], b"k1", 1)],
+            vec![],
+        )
+        .unwrap();
+        let wrong = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([2u8; 32], b"k2", 2)],
+            vec![],
+        )
+        .unwrap();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        hashes[0] = (correct.hash(), Hash256::ZERO);
+
+        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+
+        let correct_hash = correct.hash();
+        let wrong_clone = wrong.clone();
+        let loader = move |hash: &Hash256| {
+            if *hash == correct_hash {
+                Ok(wrong_clone.clone())
+            } else {
+                Err(BucketError::Serialization("not found".to_string()))
+            }
+        };
+
+        let result = HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, loader);
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn test_hot_restore_from_has_hash_mismatch_output() {
+        let bucket_curr = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([1u8; 32], b"k1", 1)],
+            vec![],
+        )
+        .unwrap();
+        let bucket_out = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([9u8; 32], b"k9", 9)],
+            vec![],
+        )
+        .unwrap();
+        let bucket_wrong = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([7u8; 32], b"k7", 7)],
+            vec![],
+        )
+        .unwrap();
+
+        let hc = bucket_curr.hash();
+        let ho = bucket_out.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        hashes[0] = (hc, Hash256::ZERO);
+
+        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[0] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(ho),
+            ..Default::default()
+        };
+
+        let wrong_clone = bucket_wrong.clone();
+        let loader = make_hot_loader(vec![bucket_curr]);
+        let output_hash = ho;
+        let combined_loader = move |hash: &Hash256| {
+            if *hash == output_hash {
+                Ok(wrong_clone.clone())
+            } else {
+                loader(hash)
+            }
+        };
+
+        let result = HotArchiveBucketList::restore_from_has(&hashes, &next_states, combined_loader);
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn test_hot_restore_from_has_parallel_hash_mismatch_output() {
+        let bucket_curr = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([1u8; 32], b"k1", 1)],
+            vec![],
+        )
+        .unwrap();
+        let bucket_out = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([9u8; 32], b"k9", 9)],
+            vec![],
+        )
+        .unwrap();
+        let bucket_wrong = HotArchiveBucket::fresh(
+            25,
+            vec![make_contract_data_entry([7u8; 32], b"k7", 7)],
+            vec![],
+        )
+        .unwrap();
+
+        let hc = bucket_curr.hash();
+        let ho = bucket_out.hash();
+
+        let mut hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        hashes[0] = (hc, Hash256::ZERO);
+
+        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[0] = HasNextState {
+            state: HAS_NEXT_STATE_OUTPUT,
+            output: Some(ho),
+            ..Default::default()
+        };
+
+        let wrong_clone = bucket_wrong.clone();
+        let loader = make_hot_loader(vec![bucket_curr]);
+        let output_hash = ho;
+        let combined_loader = move |hash: &Hash256| {
+            if *hash == output_hash {
+                Ok(wrong_clone.clone())
+            } else {
+                loader(hash)
+            }
+        };
+
+        let result =
+            HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, combined_loader);
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+    }
+
+    #[test]
+    fn test_hot_restore_from_has_next_states_under_length() {
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1];
+
+        let result = HotArchiveBucketList::restore_from_has(&hashes, &next_states, |_| {
+            unreachable!("should not call loader")
+        });
+        assert!(result.is_err());
+
+        let result = HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, |_| {
+            unreachable!("should not call loader")
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hot_restore_from_has_next_states_over_length() {
+        let hashes = vec![(Hash256::ZERO, Hash256::ZERO); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS + 1];
+
+        let result = HotArchiveBucketList::restore_from_has(&hashes, &next_states, |_| {
+            unreachable!("should not call loader")
+        });
+        assert!(result.is_err());
+
+        let result = HotArchiveBucketList::restore_from_has_parallel(&hashes, &next_states, |_| {
+            unreachable!("should not call loader")
+        });
+        assert!(result.is_err());
     }
 }
