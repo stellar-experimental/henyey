@@ -950,6 +950,22 @@ mod tests {
     }
 
     #[test]
+    fn test_streaming_loader_rejects_undecodable_full_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("invalid.bucket");
+        let body = [0xff, 0xff, 0xff, 0xff];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((body.len() as u32) | crate::XDR_RECORD_MARK).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(
+            DiskBucket::from_file_streaming(&path).is_err(),
+            "complete but invalid XDR records must not be skipped"
+        );
+    }
+
+    #[test]
     fn test_disk_iterators_emit_one_terminal_error() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("iter.bucket");
@@ -975,6 +991,26 @@ mod tests {
         assert!(sized_iter.next().unwrap().is_ok());
         assert!(sized_iter.next().unwrap().is_err());
         assert!(sized_iter.next().is_none());
+    }
+
+    #[test]
+    fn test_disk_iterator_rejects_undecodable_full_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("invalid-iter.bucket");
+        let body = [0xff, 0xff, 0xff, 0xff];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((body.len() as u32) | crate::XDR_RECORD_MARK).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let file = File::open(&path).unwrap();
+        let file_len = file.metadata().unwrap().len();
+        let mut iter = DiskBucketIter {
+            records: crate::record::RecordMarkedReader::new(BufReader::new(file), file_len),
+            failed: false,
+        };
+        assert!(iter.next().unwrap().is_err());
+        assert!(iter.next().is_none());
     }
 
     #[test]

@@ -1862,6 +1862,22 @@ mod tests {
     }
 
     #[test]
+    fn test_hot_archive_disk_backed_rejects_undecodable_full_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hot-invalid.bucket");
+        let body = [0xff, 0xff, 0xff, 0xff];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&((body.len() as u32) | crate::XDR_RECORD_MARK).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(
+            HotArchiveBucket::from_xdr_file_disk_backed(&path).is_err(),
+            "complete but invalid hot archive XDR records must be rejected"
+        );
+    }
+
+    #[test]
     fn test_hot_archive_disk_iterator_reports_terminal_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hot.bucket");
