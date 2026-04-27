@@ -4,12 +4,10 @@
 //! - AllowTrust (deprecated, but still supported)
 //! - SetTrustLineFlags
 
-use std::collections::HashMap;
-
 use stellar_xdr::curr::{
     AccountFlags, AccountId, AllowTrustOp, AllowTrustResult, AllowTrustResultCode, Asset,
     ClaimPredicate, ClaimableBalanceEntry, ClaimableBalanceId, Claimant, ClaimantV0, Hash,
-    HashIdPreimage, HashIdPreimageRevokeId, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyOffer,
+    HashIdPreimage, HashIdPreimageRevokeId, LedgerKey, LedgerKeyClaimableBalance,
     LedgerKeyTrustLine, LiquidityPoolEntryBody, OfferEntry, OperationResult, OperationResultTr,
     PoolId, SequenceNumber, SetTrustLineFlagsOp, SetTrustLineFlagsResult,
     SetTrustLineFlagsResultCode, TrustLineAsset,
@@ -343,7 +341,7 @@ fn handle_deauthorization(
     let will_be_authorized_to_maintain = is_authorized_to_maintain_liabilities(new_flags);
 
     if was_authorized_to_maintain && !will_be_authorized_to_maintain {
-        remove_offers_with_cleanup(state, trustor, asset);
+        remove_offers_with_cleanup(state, trustor, asset)?;
         let result = redeem_pool_share_trustlines(state, context, trustor, asset, tx_id)?;
         if result != RemoveResult::Success {
             return Ok(Some(result));
@@ -389,48 +387,26 @@ fn is_trust_line_flag_auth_valid(flags: u32) -> bool {
 }
 
 /// Remove offers by account and asset with full cleanup.
-/// This handles:
-/// - Releasing liabilities on trustlines/accounts
-/// - Decrementing num_sub_entries on the seller account
-/// - Updating sponsorship counts if the offer was sponsored
+///
+/// Processes each offer individually matching stellar-core's
+/// `removeOffersByAccountAndAsset` (TransactionUtils.cpp:1390-1417):
+/// release liabilities → delete with sponsorship cleanup.
+///
+/// Offers are sorted by offer_id for deterministic processing since the
+/// underlying index uses `HashSet<i64>`.
 fn remove_offers_with_cleanup(
     state: &mut LedgerStateManager,
     account_id: &AccountId,
     asset: &Asset,
-) {
-    // Collect sponsorship info BEFORE removing offers, since deletion
-    // destroys the sponsor metadata stored in the offer store.
-    let offers = state.get_offers_by_account_and_asset(account_id, asset);
-    let mut sponsor_map: HashMap<i64, AccountId> = HashMap::new();
-    for offer in &offers {
-        let ledger_key = LedgerKey::Offer(LedgerKeyOffer {
-            seller_id: offer.seller_id.clone(),
-            offer_id: offer.offer_id,
-        });
-        if let Some(sponsor) = state.entry_sponsor(&ledger_key) {
-            sponsor_map.insert(offer.offer_id, sponsor);
-        }
+) -> Result<()> {
+    let mut offers = state.get_offers_by_account_and_asset(account_id, asset);
+    offers.sort_by_key(|o| o.offer_id);
+
+    for offer in offers {
+        release_offer_liabilities(state, &offer);
+        super::offer_utils::delete_offer_with_sponsorship(&offer.seller_id, offer.offer_id, state)?;
     }
-
-    // Now remove the offers (also records deletion in delta)
-    let removed_offers = state.remove_offers_by_account_and_asset(account_id, asset);
-
-    // For each removed offer:
-    // 1. Release liabilities
-    // 2. Decrement sponsorship counters
-    // 3. Decrement num_sub_entries
-    for offer in &removed_offers {
-        release_offer_liabilities(state, offer);
-
-        if let Some(sponsor) = sponsor_map.get(&offer.offer_id) {
-            let _ = state.update_num_sponsoring(sponsor, -1);
-            let _ = state.update_num_sponsored(&offer.seller_id, -1);
-        }
-
-        if let Some(account) = state.get_account_mut(&offer.seller_id) {
-            dec_sub_entries(account, 1);
-        }
-    }
+    Ok(())
 }
 
 /// Calculate and release liabilities for a deleted offer.
@@ -3445,6 +3421,253 @@ mod tests {
         assert_eq!(
             trustor_ext.num_sponsored, 0,
             "Trustor's num_sponsored should be decremented after sponsored offer deletion"
+        );
+    }
+
+    // ========================================================================
+    // Regression tests for remove_offers_with_cleanup sponsorship errors (#1995)
+    // ========================================================================
+
+    /// Helper to set up a basic deauthorization scenario with a sponsored offer.
+    /// Returns (state, context, issuer_id, trustor_id, sponsor_id, asset).
+    fn setup_sponsored_offer_scenario(
+        trustor_sub_entries: u32,
+        trustor_num_sponsored: u32,
+        sponsor_num_sponsoring: u32,
+    ) -> (
+        LedgerStateManager,
+        LedgerContext,
+        AccountId,
+        AccountId,
+        AccountId,
+        Asset,
+    ) {
+        use crate::test_utils::{create_test_account_id, create_test_account_with_sponsorship};
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let issuer_id = create_test_account_id(200);
+        let trustor_id = create_test_account_id(201);
+        let sponsor_id = create_test_account_id(202);
+
+        // Issuer: AUTH_REQUIRED | AUTH_REVOCABLE
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
+        ));
+
+        // Trustor
+        state.create_account(create_test_account_with_sponsorship(
+            trustor_id.clone(),
+            100_000_000,
+            trustor_sub_entries,
+            trustor_num_sponsored,
+            0,
+        ));
+
+        // Sponsor
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            sponsor_num_sponsoring,
+        ));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        // Create authorized trustline
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            balance: 1000,
+            limit: 10000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        // Create offer
+        state.create_offer(OfferEntry {
+            seller_id: trustor_id.clone(),
+            offer_id: 1,
+            selling: asset.clone(),
+            buying: Asset::Native,
+            amount: 100,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        // Register sponsorship
+        let offer_key = LedgerKey::Offer(LedgerKeyOffer {
+            seller_id: trustor_id.clone(),
+            offer_id: 1,
+        });
+        state.set_entry_sponsor(offer_key, sponsor_id.clone());
+
+        (state, context, issuer_id, trustor_id, sponsor_id, asset)
+    }
+
+    /// #1995 — Deauthorization with missing sponsor account returns an error
+    /// instead of silently leaving inconsistent sponsorship counts.
+    #[test]
+    fn test_remove_offers_with_cleanup_missing_sponsor_errors() {
+        let (mut state, _context, _issuer_id, trustor_id, _sponsor_id, asset) =
+            setup_sponsored_offer_scenario(
+                2, // num_sub_entries: trustline + offer
+                1, // num_sponsored
+                1, // num_sponsoring (will be irrelevant — sponsor account missing)
+            );
+
+        // Remove the sponsor account to simulate corrupt state
+        state.delete_account(&_sponsor_id);
+
+        let result = remove_offers_with_cleanup(&mut state, &trustor_id, &asset);
+        assert!(
+            result.is_err(),
+            "Should error when sponsor account is missing"
+        );
+
+        // Verify no partial mutation: offer should still exist
+        assert!(
+            state.get_offer(&trustor_id, 1).is_some(),
+            "Offer should not be deleted when sponsorship validation fails"
+        );
+    }
+
+    /// #1995 — Deauthorization with sponsor num_sponsoring == 0 returns an error.
+    #[test]
+    fn test_remove_offers_with_cleanup_zero_num_sponsoring_errors() {
+        let (mut state, _context, _issuer_id, trustor_id, _sponsor_id, asset) =
+            setup_sponsored_offer_scenario(
+                2, // num_sub_entries
+                1, // num_sponsored
+                0, // num_sponsoring: zero — would underflow
+            );
+
+        let result = remove_offers_with_cleanup(&mut state, &trustor_id, &asset);
+        assert!(
+            result.is_err(),
+            "Should error when num_sponsoring would underflow"
+        );
+
+        // Verify no partial mutation
+        assert!(
+            state.get_offer(&trustor_id, 1).is_some(),
+            "Offer should not be deleted when sponsorship validation fails"
+        );
+
+        // Verify sponsorship counts unchanged
+        let (_, num_sponsored) = state.sponsorship_counts_for_account(&trustor_id).unwrap();
+        assert_eq!(
+            num_sponsored, 1,
+            "num_sponsored should be unchanged after error"
+        );
+    }
+
+    /// #1995 — Deauthorization with seller num_sponsored == 0 returns an error.
+    #[test]
+    fn test_remove_offers_with_cleanup_zero_num_sponsored_errors() {
+        let (mut state, _context, _issuer_id, trustor_id, _sponsor_id, asset) =
+            setup_sponsored_offer_scenario(
+                2, // num_sub_entries
+                0, // num_sponsored: zero — would underflow
+                1, // num_sponsoring
+            );
+
+        let result = remove_offers_with_cleanup(&mut state, &trustor_id, &asset);
+        assert!(
+            result.is_err(),
+            "Should error when num_sponsored would underflow"
+        );
+
+        // Verify no partial mutation
+        assert!(
+            state.get_offer(&trustor_id, 1).is_some(),
+            "Offer should not be deleted when sponsorship validation fails"
+        );
+
+        // Verify sponsor counts unchanged
+        let (num_sponsoring, _) = state.sponsorship_counts_for_account(&_sponsor_id).unwrap();
+        assert_eq!(
+            num_sponsoring, 1,
+            "num_sponsoring should be unchanged after error"
+        );
+    }
+
+    /// #1995 — Non-sponsored offer is deleted successfully without sponsorship path.
+    #[test]
+    fn test_remove_offers_with_cleanup_non_sponsored_succeeds() {
+        use crate::test_utils::create_test_account_id;
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let issuer_id = create_test_account_id(210);
+        let trustor_id = create_test_account_id(211);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
+        ));
+        state.create_account(create_test_account(trustor_id.clone(), 100_000_000, 0));
+
+        // Manually set num_sub_entries (create_test_account sets 0, we need 2)
+        if let Some(account) = state.get_account_mut(&trustor_id) {
+            account.num_sub_entries = 2; // trustline + offer
+        }
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            balance: 1000,
+            limit: 10000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        state.create_offer(OfferEntry {
+            seller_id: trustor_id.clone(),
+            offer_id: 1,
+            selling: asset.clone(),
+            buying: Asset::Native,
+            amount: 100,
+            price: Price { n: 1, d: 1 },
+            flags: 0,
+            ext: OfferEntryExt::V0,
+        });
+
+        // No sponsorship registered — this is a non-sponsored offer
+        let result = remove_offers_with_cleanup(&mut state, &trustor_id, &asset);
+        assert!(result.is_ok(), "Non-sponsored offer removal should succeed");
+
+        // Offer should be deleted
+        assert!(
+            state.get_offer(&trustor_id, 1).is_none(),
+            "Offer should be deleted after cleanup"
+        );
+
+        // Sub-entries should be decremented
+        let account = state.get_account(&trustor_id).unwrap();
+        assert_eq!(
+            account.num_sub_entries, 1,
+            "num_sub_entries should be decremented by 1"
         );
     }
 }
