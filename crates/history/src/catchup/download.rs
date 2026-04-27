@@ -1,7 +1,8 @@
 //! Download helpers for catchup: HAS, buckets, ledger data, and checkpoint headers.
 
 use crate::{
-    archive::HistoryArchive, archive_state::HistoryArchiveState, checkpoint, HistoryError, Result,
+    archive::HistoryArchive, archive_state::HistoryArchiveState, checkpoint, verify, HistoryError,
+    Result,
 };
 use henyey_bucket::canonical_bucket_filename;
 use henyey_common::Hash256;
@@ -371,6 +372,9 @@ impl CatchupManager {
         checkpoint: u32,
     ) -> Result<CheckpointLedgerData> {
         let headers = archive.fetch_ledger_headers(checkpoint).await?;
+        if self.replay_config.verify_results {
+            verify::verify_header_chain_from_entries(&headers)?;
+        }
         let tx_entries = archive.fetch_transactions(checkpoint).await?;
         let result_entries = archive.fetch_results(checkpoint).await?;
         Ok(CheckpointLedgerData {
@@ -427,10 +431,10 @@ impl CatchupManager {
         }
     }
 
-    /// Download the header for a specific ledger with its pre-computed hash.
+    /// Download the header for a specific ledger with its verified hash.
     ///
-    /// Returns the header and its hash as recorded in the history archive.
-    /// The hash from the archive is authoritative - it's what the network used.
+    /// The archive-advertised hash is accepted only after recomputing the
+    /// header hash locally and checking that both values match.
     pub(super) async fn download_checkpoint_header(
         &self,
         ledger_seq: u32,

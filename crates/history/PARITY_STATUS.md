@@ -18,7 +18,7 @@
 | Publish queue persistence | Full | SQLite-backed queue replaces filesystem queue |
 | Publish orchestration | Partial | Missing some callbacks, metrics, cleanup helpers |
 | State snapshot publishing | Partial | No SCP snapshot file or differential HAS upload |
-| Verification | Full | Header, bucket, tx-set, tx-result checks implemented |
+| Verification | Full | Header entry hash, header chain, bucket, tx-set, tx-result checks implemented |
 | Catchup and replay | Full | Rust-native orchestration covers core flow |
 | Metrics and status plumbing | None | No Medida/StatusManager equivalent yet |
 
