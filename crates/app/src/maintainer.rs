@@ -281,9 +281,11 @@ impl Maintainer {
 /// Deletes old SCP history, ledger headers, and (if `rpc_retention_window` is set)
 /// RPC-specific tables (events, ledger close meta, tx history).
 ///
-/// Ledger headers and SCP history are always pruned at the publish-safe threshold
-/// (`qmin - checkpoint_frequency`), matching stellar-core's `Maintainer::performMaintenance`.
-/// RPC-specific tables are pruned at the RPC retention window independently.
+/// Tables are pruned based on their data class:
+/// - **Publish-only** (SCP history): pruned at `publish_safe_lmin` (stellar-core parity).
+/// - **Publish + RPC** (headers, tx history/sets/results): pruned at the more
+///   conservative of `publish_safe_lmin` and `rpc_lmin` to satisfy both consumers.
+/// - **RPC-only** (events, close meta): pruned at `rpc_lmin`.
 pub fn run_maintenance(
     db: &henyey_db::Database,
     lcl: u32,
@@ -293,43 +295,43 @@ pub fn run_maintenance(
 ) {
     let qmin = min_queued.unwrap_or(lcl).min(lcl);
 
-    // Publish-safe threshold: keeps headers needed for queued checkpoint publishing.
+    // Publish-safe threshold: keeps data needed for queued checkpoint publishing.
     // Matches stellar-core: lmin = qmin - checkpoint_frequency.
     let publish_safe_lmin = qmin.saturating_sub(checkpoint_frequency());
 
-    // RPC retention threshold: only for RPC-specific tables (events, close meta, tx history).
+    // RPC retention threshold: for tables that RPC serves.
     let rpc_lmin = rpc_retention_window.map(|w| lcl.saturating_sub(w));
+
+    // For tables needed by both publish and RPC, use the more conservative
+    // (lower) threshold so neither consumer loses required data.
+    let publish_and_rpc_lmin = match rpc_lmin {
+        Some(rpc_lmin) => publish_safe_lmin.min(rpc_lmin),
+        None => publish_safe_lmin,
+    };
 
     debug!(
         lcl = lcl,
         min_queued = ?min_queued,
         publish_safe_lmin = publish_safe_lmin,
         rpc_lmin = ?rpc_lmin,
+        publish_and_rpc_lmin = publish_and_rpc_lmin,
         count = count,
         "Running maintenance"
     );
 
-    if let Some(rpc_lmin) = rpc_lmin {
-        if publish_safe_lmin < rpc_lmin {
-            debug!(
-                publish_safe_lmin,
-                rpc_lmin, "Publish queue extends header retention beyond RPC window"
-            );
-        }
-    }
-
-    // Delete old SCP history (publish-safe threshold).
+    // Delete old SCP history (publish-safe threshold, publish-only).
     if let Err(e) = db.delete_old_scp_entries(publish_safe_lmin, count) {
         warn!(error = %e, "Failed to delete old SCP entries");
     }
 
-    // Delete old ledger headers (publish-safe threshold, matching stellar-core).
-    if let Err(e) = db.delete_old_ledger_headers(publish_safe_lmin, count) {
+    // Delete old ledger headers (publish + RPC threshold).
+    if let Err(e) = db.delete_old_ledger_headers(publish_and_rpc_lmin, count) {
         warn!(error = %e, "Failed to delete old ledger headers");
     }
 
-    // Clean up RPC-specific tables at the RPC retention boundary.
+    // Clean up RPC tables when RPC retention is configured.
     if let Some(rpc_lmin) = rpc_lmin {
+        // RPC-only tables: events and close meta.
         if let Err(e) = db.delete_old_events(rpc_lmin, count) {
             warn!(error = %e, "Failed to delete old events");
         }
@@ -338,7 +340,8 @@ pub fn run_maintenance(
             warn!(error = %e, "Failed to delete old ledger close meta");
         }
 
-        if let Err(e) = db.delete_old_tx_history(rpc_lmin, count) {
+        // Tx history/sets/results are needed by both publish and RPC.
+        if let Err(e) = db.delete_old_tx_history(publish_and_rpc_lmin, count) {
             warn!(error = %e, "Failed to delete old tx history");
         }
     }
@@ -587,14 +590,14 @@ mod tests {
     }
 
     #[test]
-    fn test_headers_use_publish_safe_threshold_when_rpc_enabled() {
-        // Headers are always pruned at publish_safe_lmin, not rpc_lmin,
-        // matching stellar-core's Maintainer::performMaintenance.
+    fn test_headers_use_min_of_publish_and_rpc_thresholds() {
+        // Headers are needed by both publish and RPC, so they use the more
+        // conservative (lower) threshold: min(publish_safe_lmin, rpc_lmin).
         //
         // Scenario: lcl=1000, min_queued=1000, checkpoint_freq=64, retention=200
         //   publish_safe_lmin = 1000 - 64 = 936
         //   rpc_lmin = 800
-        //   header_lmin = publish_safe_lmin = 936
+        //   header_lmin = min(936, 800) = 800
         let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -615,12 +618,12 @@ mod tests {
 
         maintainer.perform_maintenance();
 
-        // Headers at ledgerseq <= 936 should be deleted (790..=936 = 147 rows)
-        // Headers at ledgerseq > 936 should remain (937..=940 = 4 rows)
-        assert_eq!(count_rows(&db_clone, "ledgerheaders"), 4);
+        // Headers at ledgerseq <= 800 should be deleted (790..=800 = 11 rows)
+        // Headers at ledgerseq > 800 should remain (801..=940 = 140 rows)
+        assert_eq!(count_rows(&db_clone, "ledgerheaders"), 140);
         assert_eq!(
             min_ledger(&db_clone, "ledgerheaders", "ledgerseq"),
-            Some(937)
+            Some(801)
         );
     }
 
@@ -707,8 +710,8 @@ mod tests {
 
     #[test]
     fn test_perform_maintenance_with_count_uses_correct_thresholds() {
-        // Verify that perform_maintenance_with_count uses publish_safe_lmin
-        // for headers/SCP and rpc_lmin for RPC-only tables.
+        // Verify that perform_maintenance_with_count uses the correct thresholds:
+        // rpc_lmin for RPC-only tables (events, close meta).
         let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
