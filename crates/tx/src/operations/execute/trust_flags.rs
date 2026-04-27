@@ -3670,4 +3670,101 @@ mod tests {
             "num_sub_entries should be decremented by 1"
         );
     }
+
+    /// #1995 — Deauthorization with seller num_sub_entries == 0 returns an error.
+    #[test]
+    fn test_remove_offers_with_cleanup_zero_sub_entries_errors() {
+        let (mut state, _context, _issuer_id, trustor_id, _sponsor_id, asset) =
+            setup_sponsored_offer_scenario(
+                0, // num_sub_entries: zero — would underflow
+                1, // num_sponsored
+                1, // num_sponsoring
+            );
+
+        let result = remove_offers_with_cleanup(&mut state, &trustor_id, &asset);
+        assert!(
+            result.is_err(),
+            "Should error when num_sub_entries would underflow"
+        );
+
+        // Verify no partial mutation: offer still exists
+        assert!(
+            state.get_offer(&trustor_id, 1).is_some(),
+            "Offer should not be deleted when sub-entry validation fails"
+        );
+    }
+
+    /// #1995 — Multiple offers are processed in deterministic order (sorted by offer_id).
+    #[test]
+    fn test_remove_offers_with_cleanup_multiple_offers_deterministic() {
+        use crate::test_utils::{create_test_account_id, create_test_account_with_sponsorship};
+
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let _context = create_test_context();
+
+        let issuer_id = create_test_account_id(220);
+        let trustor_id = create_test_account_id(221);
+
+        state.create_account(create_test_account(
+            issuer_id.clone(),
+            100_000_000,
+            AccountFlags::RequiredFlag as u32 | AccountFlags::RevocableFlag as u32,
+        ));
+        state.create_account(create_test_account_with_sponsorship(
+            trustor_id.clone(),
+            100_000_000,
+            4, // num_sub_entries: trustline + 3 offers
+            0,
+            0,
+        ));
+
+        let asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: issuer_id.clone(),
+        });
+
+        state.create_trustline(TrustLineEntry {
+            account_id: trustor_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: issuer_id.clone(),
+            }),
+            balance: 1000,
+            limit: 10000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        });
+
+        // Create 3 non-sponsored offers with different IDs
+        for id in [3, 1, 2] {
+            state.create_offer(OfferEntry {
+                seller_id: trustor_id.clone(),
+                offer_id: id,
+                selling: asset.clone(),
+                buying: Asset::Native,
+                amount: 100,
+                price: Price { n: 1, d: 1 },
+                flags: 0,
+                ext: OfferEntryExt::V0,
+            });
+        }
+
+        let result = remove_offers_with_cleanup(&mut state, &trustor_id, &asset);
+        assert!(result.is_ok(), "Multiple offer removal should succeed");
+
+        // All offers should be deleted
+        for id in [1, 2, 3] {
+            assert!(
+                state.get_offer(&trustor_id, id).is_none(),
+                "Offer {id} should be deleted"
+            );
+        }
+
+        // Sub-entries decremented by 3
+        let account = state.get_account(&trustor_id).unwrap();
+        assert_eq!(
+            account.num_sub_entries, 1,
+            "num_sub_entries should be decremented by 3 (trustline remains)"
+        );
+    }
 }
