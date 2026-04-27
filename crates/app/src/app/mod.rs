@@ -67,8 +67,8 @@ use henyey_herder::{
     drift_tracker::CloseTimeDriftTracker,
     flow_control::compute_max_tx_size,
     sync_recovery::{SyncRecoveryCallback, SyncRecoveryHandle, SyncRecoveryManager},
-    CloseTimeBounds, EnvelopeState, Herder, HerderConfig, HerderStats, TxQueueConfig,
-    TxSetValidationContext,
+    BroadcastBudget, BroadcastVisitResult, CloseTimeBounds, EnvelopeState, Herder, HerderConfig,
+    HerderStats, TxQueueConfig, TxSetValidationContext,
 };
 use henyey_history::{
     build_history_archive_state, checkpoint_containing, checkpoint_frequency, is_checkpoint_ledger,

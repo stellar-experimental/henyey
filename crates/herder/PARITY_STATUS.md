@@ -37,7 +37,7 @@
 | `LedgerCloseData.h` / `LedgerCloseData.cpp` | `ledger_close_data.rs` | Ledger close wrapper |
 | `PendingEnvelopes.h` / `PendingEnvelopes.cpp` | `pending.rs`, `fetching_envelopes.rs` | Split into two modules |
 | `QuorumTracker.h` / `QuorumTracker.cpp` | `quorum_tracker.rs` | Transitive quorum tracking |
-| `TransactionQueue.h` / `TransactionQueue.cpp` | `tx_queue/mod.rs`, `tx_queue/selection.rs` | Queue and selection; `broadcast_some()` on `TransactionQueue` |
+| `TransactionQueue.h` / `TransactionQueue.cpp` | `tx_queue/mod.rs`, `tx_queue/selection.rs` | Queue and selection; `broadcast_with_visitor()` on `TransactionQueue` |
 | `TxQueueLimiter.h` / `TxQueueLimiter.cpp` | `tx_queue_limiter.rs` | Resource-aware limiting |
 | `TxSetFrame.h` / `TxSetFrame.cpp` | `tx_queue/tx_set.rs` | Simplified; no ApplicableTxSetFrame |
 | `TxSetUtils.h` / `TxSetUtils.cpp` | `tx_set_utils.rs` | Filtering and validation utilities |
@@ -108,7 +108,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `setupTriggerNextLedger()` | _(not implemented)_ | None |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
-| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_some()` with DEX-lane flood budget; missing arb damping |
+| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget and budget-neutral skipped txs; missing arb damping, ban-on-damping, dedicated flood queue, mark-on-attempt |
 | `processSCPQueue()` | pending envelope release | Full |
 | `updateTransactionQueue()` | handled in `ledger_closed()` | Full |
 | `maybeSetupSorobanQueue()` | Integrated via lane-based `TransactionQueue` | Full |
@@ -292,7 +292,7 @@ Corresponds to: `TransactionQueue.h`
 | `removeApplied()` | `remove_applied()` | Full |
 | `ban()` | `ban()` | Full |
 | `shift()` | `shift()` | Full |
-| `rebroadcast()` | _(removed — replaced by periodic `broadcast_some()`)_ | N/A |
+| `rebroadcast()` | _(removed — replaced by periodic `broadcast_with_visitor()`)_ | N/A |
 | `shutdown()` | _(not implemented)_ | None |
 | `isBanned()` | `is_banned()` | Full |
 | `getTx()` | `get_tx()` | Full |
@@ -305,8 +305,8 @@ Corresponds to: `TransactionQueue.h`
 | `prepareDropTransaction()` | _(not needed — Rust ownership)_ | _(omitted)_ |
 | `dropTransaction()` | `drop_transaction()` | Full |
 | `isFiltered()` | `is_filtered()` | Full |
-| `broadcastTx()` | _(removed — replaced by `broadcast_some()`)_ | N/A |
-| `broadcastSome()` | `TransactionQueue::broadcast_some()` | Full — priority-ordered with ops budget and DEX-lane limits |
+| `broadcastTx()` | _(removed — replaced by `broadcast_with_visitor()`)_ | N/A |
+| `broadcastSome()` | `TransactionQueue::broadcast_with_visitor()` | Partial — priority-ordered with ops budget, DEX-lane limits, budget-neutral skipped txs; missing arb damping, ban-on-damping |
 | `SorobanTransactionQueue::resetAndRebuild()` | `reset_and_rebuild()` in `tx_queue.rs` | Full |
 | `SorobanTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
 | `ClassicTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
@@ -594,7 +594,7 @@ Features not yet implemented. These ARE counted against parity %.
 ### Test Gaps
 
 - **HerderTests**: Missing integration tests for full envelope processing flow, ledger close lifecycle, out-of-sync recovery, quorum map reanalysis, and upgrade scheduling. SCP driver tests (54) cover significant validation and signing paths.
-- **TransactionQueue**: Missing tests for arbitrage damping and filtered-account overrides. Fee release, drop, and rebroadcast testing improved. `broadcast_some()` now lives directly on `TransactionQueue` with priority ordering and ops budget.
+- **TransactionQueue**: Missing tests for arbitrage damping and filtered-account overrides. Fee release, drop, and rebroadcast testing improved. `broadcast_with_visitor()` now lives directly on `TransactionQueue` with priority ordering, ops budget, and budget-neutral skipped-tx semantics matching stellar-core.
 - **TxSet**: Missing `ApplicableTxSetFrame` validation tests, phase ordering tests, and history-tx-set construction tests
 - **Upgrades**: Missing ledger-integrated upgrade application tests, config upgrade set tests, and nomination-timeout stripping behavior
 - **QuorumIntersection**: Core algorithm implemented (SCC + MinQuorumEnumerator). Missing some stellar-core-specific test scenarios (28 TEST_CASE). Herder integration with interrupt support is complete.

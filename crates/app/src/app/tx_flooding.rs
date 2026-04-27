@@ -61,95 +61,81 @@ impl App {
     pub(super) async fn flush_tx_adverts(&self) {
         let ops_budget = self.compute_flood_ops_budget();
         let dex_ops_budget = self.compute_dex_flood_ops_budget();
-        let candidates = self
-            .herder
-            .tx_queue()
-            .broadcast_some(ops_budget, dex_ops_budget);
-
-        if candidates.is_empty() {
-            // No txs to flood — preserve carry-over (capped).
-            let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
-            self.broadcast_op_carryover
-                .store(new_carryover, Ordering::Relaxed);
-            if let Some(dex_budget) = dex_ops_budget {
-                self.broadcast_dex_op_carryover
-                    .store(dex_budget.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
-            }
-            return;
-        }
 
         let Some(overlay) = self.overlay().await else {
-            // No overlay — preserve carry-over.
-            let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
-            self.broadcast_op_carryover
-                .store(new_carryover, Ordering::Relaxed);
-            if let Some(dex_budget) = dex_ops_budget {
-                self.broadcast_dex_op_carryover
-                    .store(dex_budget.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
-            }
+            // No overlay — preserve carry-over (capped).
+            self.store_carryover(ops_budget, dex_ops_budget);
             return;
         };
 
         let snapshots = overlay.peer_snapshots();
         if snapshots.is_empty() {
-            // No peers — preserve carry-over.
-            let new_carryover = ops_budget.min(Self::MAX_CARRYOVER_OPS);
-            self.broadcast_op_carryover
-                .store(new_carryover, Ordering::Relaxed);
-            if let Some(dex_budget) = dex_ops_budget {
-                self.broadcast_dex_op_carryover
-                    .store(dex_budget.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
-            }
+            // No peers — preserve carry-over (capped).
+            self.store_carryover(ops_budget, dex_ops_budget);
             return;
         }
 
-        let peer_ids = snapshots
+        let peer_ids: Vec<_> = snapshots
             .iter()
             .map(|snapshot| snapshot.info.peer_id.clone())
-            .collect::<Vec<_>>();
+            .collect();
         let peer_set: HashSet<_> = peer_ids.iter().cloned().collect();
         let ledger_seq = self.herder.tracking_slot().saturating_sub(1) as u32;
 
         // XDR vector chunk size — cap at 1000 per the protocol limit.
         let max_chunk_size = self.max_advert_size().min(1000);
 
-        // Phase 1: Determine which hashes are new to at least one peer.
-        // Only count ops for hashes that will actually be advertised.
-        // Parity: stellar-core returns SKIPPED for already-broadcast txs,
-        // which does NOT count against the ops budget.
-        let mut ops_used: usize = 0;
-        let mut dex_ops_used: usize = 0;
-        let mut per_peer: HashMap<henyey_overlay::PeerId, Vec<Hash256>> = HashMap::new();
+        // Phase 0: Prune stale peers and ensure entries exist for all active peers.
         {
             let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
             adverts_by_peer.retain(|peer, _| peer_set.contains(peer));
-
-            for candidate in &candidates {
-                let mut new_to_any_peer = false;
-                for peer_id in &peer_ids {
-                    let adverts = adverts_by_peer
-                        .entry(peer_id.clone())
-                        .or_insert_with(PeerTxAdverts::new);
-                    if !adverts.seen_advert(&candidate.hash) {
-                        new_to_any_peer = true;
-                        per_peer
-                            .entry(peer_id.clone())
-                            .or_default()
-                            .push(candidate.hash);
-                    }
-                }
-                if new_to_any_peer {
-                    let ops = (candidate.op_count as usize).max(1);
-                    ops_used += ops;
-                    if candidate.is_dex {
-                        dex_ops_used += ops;
-                    }
-                }
+            for peer_id in &peer_ids {
+                adverts_by_peer
+                    .entry(peer_id.clone())
+                    .or_insert_with(PeerTxAdverts::new);
             }
-        } // drop write lock before sending
+        }
+
+        // Phase 1: Traverse candidates with the visitor API.
+        // Budget-fit checks in broadcast_with_visitor ensure only fitting
+        // candidates reach our closure. Skipped candidates are budget-neutral.
+        let mut budget = BroadcastBudget {
+            ops_remaining: ops_budget,
+            dex_ops_remaining: dex_ops_budget,
+        };
+        let mut per_peer: HashMap<henyey_overlay::PeerId, Vec<Hash256>> = HashMap::new();
+        {
+            let adverts_by_peer = self.tx_adverts_by_peer.read().await;
+            self.herder
+                .tx_queue()
+                .broadcast_with_visitor(&mut budget, |candidate| {
+                    let mut new_to_any_peer = false;
+                    for peer_id in &peer_ids {
+                        if let Some(adverts) = adverts_by_peer.get(peer_id) {
+                            if !adverts.seen_advert(&candidate.hash) {
+                                new_to_any_peer = true;
+                                per_peer
+                                    .entry(peer_id.clone())
+                                    .or_default()
+                                    .push(candidate.hash);
+                            }
+                        }
+                    }
+                    if new_to_any_peer {
+                        BroadcastVisitResult::Processed
+                    } else {
+                        BroadcastVisitResult::Skipped
+                    }
+                });
+        }
+
+        let ops_used = ops_budget.saturating_sub(budget.ops_remaining);
+        let dex_ops_used = dex_ops_budget
+            .zip(budget.dex_ops_remaining)
+            .map(|(orig, rem)| orig.saturating_sub(rem))
+            .unwrap_or(0);
 
         tracing::debug!(
-            candidate_count = candidates.len(),
             new_adverts = per_peer.values().map(|v| v.len()).sum::<usize>(),
             ops_used,
             ops_budget,
@@ -158,16 +144,20 @@ impl App {
             "Flushing tx adverts (priority-ordered)"
         );
 
-        // Update carry-over: remaining budget, capped.
-        let remaining = ops_budget.saturating_sub(ops_used);
-        self.broadcast_op_carryover
-            .store(remaining.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
-        if let Some(dex_budget) = dex_ops_budget {
-            let dex_remaining = dex_budget.saturating_sub(dex_ops_used);
+        // Update carry-over from remaining budget (capped).
+        self.broadcast_op_carryover.store(
+            budget.ops_remaining.min(Self::MAX_CARRYOVER_OPS),
+            Ordering::Relaxed,
+        );
+        if let Some(dex_remaining) = budget.dex_ops_remaining {
             self.broadcast_dex_op_carryover.store(
                 dex_remaining.min(Self::MAX_CARRYOVER_OPS),
                 Ordering::Relaxed,
             );
+        }
+
+        if per_peer.is_empty() {
+            return;
         }
 
         // Phase 2: Send adverts and mark successfully sent hashes.
@@ -202,6 +192,16 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Store carry-over budgets (capped) for the next flood period.
+    fn store_carryover(&self, ops_budget: usize, dex_ops_budget: Option<usize>) {
+        self.broadcast_op_carryover
+            .store(ops_budget.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
+        if let Some(dex_budget) = dex_ops_budget {
+            self.broadcast_dex_op_carryover
+                .store(dex_budget.min(Self::MAX_CARRYOVER_OPS), Ordering::Relaxed);
         }
     }
 

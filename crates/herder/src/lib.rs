@@ -131,7 +131,7 @@ pub mod sync_recovery;
 pub(crate) mod timer_manager;
 mod tracked_lock;
 // tx_broadcast module removed — flood scheduling is now handled by
-// TransactionQueue::broadcast_some() + the app-layer flood timer.
+// TransactionQueue::broadcast_with_visitor() + the app-layer flood timer.
 mod tx_queue;
 mod tx_queue_limiter;
 mod tx_set_tracker;
@@ -151,8 +151,8 @@ pub use scp_driver::{
 };
 pub use state::HerderState;
 pub use tx_queue::{
-    BroadcastCandidate, QueuedTransaction, SorobanTxLimits, TransactionQueue, TransactionSet,
-    TxQueueConfig, TxQueueResult, TxQueueStats, TxSetBody,
+    BroadcastBudget, BroadcastCandidate, BroadcastVisitResult, QueuedTransaction, SorobanTxLimits,
+    TransactionQueue, TransactionSet, TxQueueConfig, TxQueueResult, TxQueueStats, TxSetBody,
 };
 
 // Persistence
@@ -201,7 +201,7 @@ pub use sync_recovery::{
     OUT_OF_SYNC_RECOVERY_INTERVAL,
 };
 
-// (TxBroadcastManager removed — see TransactionQueue::broadcast_some)
+// (TxBroadcastManager removed — see TransactionQueue::broadcast_with_visitor)
 
 // Dead node detection
 pub use dead_node_tracker::{DeadNodeTracker, CHECK_FOR_DEAD_NODES_MINUTES};

@@ -660,7 +660,7 @@ pub(super) enum ConsensusStuckAction {
 }
 
 // (TxAdvertQueue removed — flooding now reads from herder's TransactionQueue
-// in priority order via broadcast_some(). See tx_flooding.rs.)
+// in priority order via broadcast_with_visitor(). See tx_flooding.rs.)
 
 #[derive(Debug)]
 pub(super) struct PeerTxAdverts {

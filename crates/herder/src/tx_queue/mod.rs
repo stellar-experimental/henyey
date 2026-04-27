@@ -2690,64 +2690,75 @@ impl TransactionQueue {
         out
     }
 
-    /// Return transaction hashes in surge-pricing priority order (highest
-    /// inclusion-fee rate first), limited by generic and optional DEX ops budgets.
+    /// Visit queued transactions in fee-descending order with lane-aware budgeting.
     ///
-    /// Implements lane-drop semantics matching stellar-core's
-    /// `popTopTxs(allowGaps=false)`:
-    /// - When a DEX tx exceeds the DEX budget: drop the entire DEX lane, continue
-    ///   with non-DEX txs
-    /// - When any tx exceeds the generic budget: stop entirely
-    /// - When no DEX budget is configured (`None`): DEX txs use generic budget only
-    pub fn broadcast_some(
-        &self,
-        ops_budget: usize,
-        dex_ops_budget: Option<usize>,
-    ) -> Vec<BroadcastCandidate> {
-        let store = self.store.read();
-        let mut result = Vec::new();
-        let mut ops_remaining = ops_budget;
-        let mut dex_ops_remaining = dex_ops_budget;
+    /// Mirrors stellar-core's `popTopTxs(allowGaps=false)` budget semantics but
+    /// operates as a **read-only scan** — the queue is not mutated. Candidates are
+    /// snapshotted from `fee_index` while holding a read lock, then the lock is
+    /// released before invoking the visitor.
+    ///
+    /// Budget-fit checks happen **before** invoking the visitor:
+    /// - A DEX tx that exceeds `dex_ops_remaining` deactivates the DEX lane
+    ///   (non-DEX candidates continue).
+    /// - Any tx that exceeds `ops_remaining` stops traversal entirely.
+    /// - `budget.ops_remaining` and `budget.dex_ops_remaining` are decremented
+    ///   only for [`BroadcastVisitResult::Processed`] candidates.
+    pub fn broadcast_with_visitor<F>(&self, budget: &mut BroadcastBudget, mut visitor: F)
+    where
+        F: FnMut(&BroadcastCandidate) -> BroadcastVisitResult,
+    {
+        // Snapshot candidates from fee_index while holding the read lock.
+        let candidates: Vec<BroadcastCandidate> = {
+            let store = self.store.read();
+            store
+                .fee_index
+                .iter()
+                .rev()
+                .map(|entry| BroadcastCandidate {
+                    hash: entry.hash,
+                    op_count: entry.op_count,
+                    is_dex: entry.is_dex,
+                })
+                .collect()
+        };
+        // Lock released — visitor may acquire other locks without ordering issues.
+
         let mut dex_lane_active = true;
 
-        // fee_index is sorted ascending by FeeEntry::Ord (inclusion_fee/op_count
-        // cross-multiply comparison); iterate in reverse for highest-fee-first.
-        for entry in store.fee_index.iter().rev() {
-            let ops = (entry.op_count as usize).max(1);
+        for candidate in &candidates {
+            let ops = (candidate.op_count as usize).max(1);
 
-            if entry.is_dex && dex_ops_budget.is_some() {
+            if candidate.is_dex && budget.dex_ops_remaining.is_some() {
                 if !dex_lane_active {
                     continue;
                 }
-                if let Some(dex_rem) = dex_ops_remaining {
+                if let Some(dex_rem) = budget.dex_ops_remaining {
                     if ops > dex_rem {
                         // Drop entire DEX lane — matches popTopTxs lane_active[lane] = false
                         dex_lane_active = false;
                         continue;
                     }
                 }
-                if ops > ops_remaining {
+                if ops > budget.ops_remaining {
                     break;
                 }
-                ops_remaining -= ops;
-                if let Some(ref mut dex_rem) = dex_ops_remaining {
-                    *dex_rem -= ops;
+                // Candidate fits both budgets — invoke visitor.
+                if visitor(&candidate) == BroadcastVisitResult::Processed {
+                    budget.ops_remaining -= ops;
+                    if let Some(ref mut dex_rem) = budget.dex_ops_remaining {
+                        *dex_rem -= ops;
+                    }
                 }
             } else {
                 // Non-DEX tx, or DEX with no configured limit: generic budget only
-                if ops > ops_remaining {
+                if ops > budget.ops_remaining {
                     break;
                 }
-                ops_remaining -= ops;
+                if visitor(&candidate) == BroadcastVisitResult::Processed {
+                    budget.ops_remaining -= ops;
+                }
             }
-
-            result.push(BroadcastCandidate {
-                hash: entry.hash,
-                op_count: entry.op_count,
-                is_dex: entry.is_dex,
-            });
         }
-        result
     }
 
     /// Return transaction hashes ordered by fee per op (desc) then received time (asc).
@@ -2790,7 +2801,7 @@ impl TransactionQueue {
     }
 }
 
-/// A transaction selected for broadcast by [`TransactionQueue::broadcast_some`].
+/// A transaction selected for broadcast by [`TransactionQueue::broadcast_with_visitor`].
 #[derive(Debug, Clone)]
 pub struct BroadcastCandidate {
     /// Hash of the transaction.
@@ -2799,6 +2810,34 @@ pub struct BroadcastCandidate {
     pub op_count: u32,
     /// Whether this transaction contains DEX operations.
     pub is_dex: bool,
+}
+
+/// Result returned by a broadcast visitor closure.
+///
+/// Unlike [`VisitTxResult`], this enum has no `Rejected` variant — budget-fit
+/// checks happen before the visitor is invoked, so the visitor only decides
+/// whether the candidate is useful (Processed) or redundant (Skipped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BroadcastVisitResult {
+    /// The candidate was accepted (e.g., at least one peer needs it).
+    /// Budget is consumed for this candidate.
+    Processed,
+    /// The candidate was skipped (e.g., all peers already have it).
+    /// Budget is NOT consumed.
+    Skipped,
+}
+
+/// Mutable budget state for [`TransactionQueue::broadcast_with_visitor`].
+///
+/// After traversal, `ops_remaining` and `dex_ops_remaining` reflect the
+/// unconsumed budget, suitable for carry-over to the next flood period.
+#[derive(Debug, Clone)]
+pub struct BroadcastBudget {
+    /// Remaining generic ops budget. Decremented only for `Processed` candidates.
+    pub ops_remaining: usize,
+    /// Remaining DEX ops budget. `None` means DEX flooding is uncapped.
+    /// Decremented only for `Processed` DEX candidates.
+    pub dex_ops_remaining: Option<usize>,
 }
 
 /// Statistics about the transaction queue.
@@ -8629,7 +8668,7 @@ mod inclusion_fee_i64_tests {
 }
 
 #[cfg(test)]
-mod broadcast_some_tests {
+mod broadcast_visitor_tests {
     use super::*;
     use stellar_xdr::curr::*;
 
@@ -8673,146 +8712,6 @@ mod broadcast_some_tests {
         }
     }
 
-    #[test]
-    fn test_broadcast_some_priority_order() {
-        let config = TxQueueConfig {
-            max_size: 10,
-            ..Default::default()
-        };
-        let queue = TransactionQueue::new(config);
-
-        // Add 3 txs with different fees from different accounts
-        let mut tx_low = make_test_envelope(100, 1);
-        set_source(&mut tx_low, 1);
-        let mut tx_mid = make_test_envelope(200, 1);
-        set_source(&mut tx_mid, 2);
-        let mut tx_high = make_test_envelope(300, 1);
-        set_source(&mut tx_high, 3);
-
-        assert_eq!(queue.try_add(tx_low.clone()), TxQueueResult::Added);
-        assert_eq!(queue.try_add(tx_mid.clone()), TxQueueResult::Added);
-        assert_eq!(queue.try_add(tx_high.clone()), TxQueueResult::Added);
-
-        // broadcast_some with unlimited budget should return all in fee-descending order
-        let entries = queue.broadcast_some(100, None);
-        let hashes: Vec<_> = entries.iter().map(|c| c.hash).collect();
-        let ops_used: usize = entries.iter().map(|c| (c.op_count as usize).max(1)).sum();
-        assert_eq!(hashes.len(), 3);
-        assert_eq!(ops_used, 3);
-
-        // Verify highest-fee tx is first
-        let hash_high = Hash256::hash_xdr(&tx_high);
-        let hash_mid = Hash256::hash_xdr(&tx_mid);
-        let hash_low = Hash256::hash_xdr(&tx_low);
-        assert_eq!(hashes[0], hash_high);
-        assert_eq!(hashes[1], hash_mid);
-        assert_eq!(hashes[2], hash_low);
-    }
-
-    #[test]
-    fn test_broadcast_some_ops_budget_cap() {
-        let config = TxQueueConfig {
-            max_size: 10,
-            ..Default::default()
-        };
-        let queue = TransactionQueue::new(config);
-
-        // Add 3 txs each with 2 ops (fees must be >= 100/op to pass min_fee_per_op)
-        let mut tx1 = make_test_envelope(600, 2);
-        set_source(&mut tx1, 1);
-        let mut tx2 = make_test_envelope(400, 2);
-        set_source(&mut tx2, 2);
-        let mut tx3 = make_test_envelope(200, 2);
-        set_source(&mut tx3, 3);
-
-        queue.try_add(tx1);
-        queue.try_add(tx2);
-        queue.try_add(tx3);
-
-        // Budget of 3 ops: only 1 tx fits (each has 2 ops), then 1 remaining < 2
-        let entries = queue.broadcast_some(3, None);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries
-                .iter()
-                .map(|c| (c.op_count as usize).max(1))
-                .sum::<usize>(),
-            2
-        );
-
-        // Budget of 4 ops: 2 txs fit
-        let entries = queue.broadcast_some(4, None);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            entries
-                .iter()
-                .map(|c| (c.op_count as usize).max(1))
-                .sum::<usize>(),
-            4
-        );
-
-        // Budget of 6 ops: all 3 txs fit
-        let entries = queue.broadcast_some(6, None);
-        assert_eq!(entries.len(), 3);
-        assert_eq!(
-            entries
-                .iter()
-                .map(|c| (c.op_count as usize).max(1))
-                .sum::<usize>(),
-            6
-        );
-    }
-
-    #[test]
-    fn test_broadcast_some_empty_queue() {
-        let config = TxQueueConfig::default();
-        let queue = TransactionQueue::new(config);
-
-        let entries = queue.broadcast_some(100, None);
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn test_broadcast_some_zero_budget() {
-        let config = TxQueueConfig {
-            max_size: 10,
-            ..Default::default()
-        };
-        let queue = TransactionQueue::new(config);
-
-        let mut tx = make_test_envelope(100, 1);
-        set_source(&mut tx, 1);
-        queue.try_add(tx);
-
-        let entries = queue.broadcast_some(0, None);
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn test_broadcast_some_after_remove_applied() {
-        let config = TxQueueConfig {
-            max_size: 10,
-            ..Default::default()
-        };
-        let queue = TransactionQueue::new(config);
-
-        let mut tx1 = make_test_envelope(300, 1);
-        set_source(&mut tx1, 1);
-        let mut tx2 = make_test_envelope(200, 1);
-        set_source(&mut tx2, 2);
-
-        queue.try_add(tx1.clone());
-        queue.try_add(tx2.clone());
-
-        // Remove tx1 as applied
-        queue.remove_applied(&[(tx1, 300)]);
-
-        // Only tx2 should remain
-        let entries = queue.broadcast_some(100, None);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].hash, Hash256::hash_xdr(&tx2));
-    }
-
     /// Create a DEX tx envelope containing a ManageSellOffer operation.
     fn make_dex_envelope(fee: u32, ops: usize) -> TransactionEnvelope {
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
@@ -8851,15 +8750,147 @@ mod broadcast_some_tests {
         })
     }
 
+    /// Helper: visit all candidates as Processed, collecting them.
+    fn visit_all_processed(
+        queue: &TransactionQueue,
+        ops_budget: usize,
+        dex_ops_budget: Option<usize>,
+    ) -> (Vec<BroadcastCandidate>, BroadcastBudget) {
+        let mut budget = BroadcastBudget {
+            ops_remaining: ops_budget,
+            dex_ops_remaining: dex_ops_budget,
+        };
+        let mut results = Vec::new();
+        queue.broadcast_with_visitor(&mut budget, |candidate| {
+            results.push(candidate.clone());
+            BroadcastVisitResult::Processed
+        });
+        (results, budget)
+    }
+
     #[test]
-    fn test_broadcast_some_dex_budget_limits() {
+    fn test_broadcast_visitor_priority_order() {
         let config = TxQueueConfig {
             max_size: 10,
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
 
-        // 2 DEX txs (1 op each), 1 non-DEX tx
+        let mut tx_low = make_test_envelope(100, 1);
+        set_source(&mut tx_low, 1);
+        let mut tx_mid = make_test_envelope(200, 1);
+        set_source(&mut tx_mid, 2);
+        let mut tx_high = make_test_envelope(300, 1);
+        set_source(&mut tx_high, 3);
+
+        assert_eq!(queue.try_add(tx_low.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_mid.clone()), TxQueueResult::Added);
+        assert_eq!(queue.try_add(tx_high.clone()), TxQueueResult::Added);
+
+        let (entries, budget) = visit_all_processed(&queue, 100, None);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(budget.ops_remaining, 97);
+
+        let hash_high = Hash256::hash_xdr(&tx_high);
+        let hash_mid = Hash256::hash_xdr(&tx_mid);
+        let hash_low = Hash256::hash_xdr(&tx_low);
+        assert_eq!(entries[0].hash, hash_high);
+        assert_eq!(entries[1].hash, hash_mid);
+        assert_eq!(entries[2].hash, hash_low);
+    }
+
+    #[test]
+    fn test_broadcast_visitor_ops_budget_cap() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx1 = make_test_envelope(600, 2);
+        set_source(&mut tx1, 1);
+        let mut tx2 = make_test_envelope(400, 2);
+        set_source(&mut tx2, 2);
+        let mut tx3 = make_test_envelope(200, 2);
+        set_source(&mut tx3, 3);
+
+        queue.try_add(tx1);
+        queue.try_add(tx2);
+        queue.try_add(tx3);
+
+        // Budget of 3: only 1 tx fits (each has 2 ops)
+        let (entries, budget) = visit_all_processed(&queue, 3, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(budget.ops_remaining, 1);
+
+        // Budget of 4: 2 txs fit
+        let (entries, budget) = visit_all_processed(&queue, 4, None);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(budget.ops_remaining, 0);
+
+        // Budget of 6: all 3 fit
+        let (entries, budget) = visit_all_processed(&queue, 6, None);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(budget.ops_remaining, 0);
+    }
+
+    #[test]
+    fn test_broadcast_visitor_empty_queue() {
+        let config = TxQueueConfig::default();
+        let queue = TransactionQueue::new(config);
+
+        let (entries, budget) = visit_all_processed(&queue, 100, None);
+        assert!(entries.is_empty());
+        assert_eq!(budget.ops_remaining, 100);
+    }
+
+    #[test]
+    fn test_broadcast_visitor_zero_budget() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx = make_test_envelope(100, 1);
+        set_source(&mut tx, 1);
+        queue.try_add(tx);
+
+        let (entries, budget) = visit_all_processed(&queue, 0, None);
+        assert!(entries.is_empty());
+        assert_eq!(budget.ops_remaining, 0);
+    }
+
+    #[test]
+    fn test_broadcast_visitor_after_remove_applied() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx1 = make_test_envelope(300, 1);
+        set_source(&mut tx1, 1);
+        let mut tx2 = make_test_envelope(200, 1);
+        set_source(&mut tx2, 2);
+
+        queue.try_add(tx1.clone());
+        queue.try_add(tx2.clone());
+        queue.remove_applied(&[(tx1, 300)]);
+
+        let (entries, _) = visit_all_processed(&queue, 100, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&tx2));
+    }
+
+    #[test]
+    fn test_broadcast_visitor_dex_budget_limits() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
         let mut dex1 = make_dex_envelope(300, 1);
         set_source(&mut dex1, 1);
         let mut dex2 = make_dex_envelope(200, 1);
@@ -8871,31 +8902,30 @@ mod broadcast_some_tests {
         queue.try_add(dex2.clone());
         queue.try_add(non_dex.clone());
 
-        // DEX budget of 1: only 1 DEX tx fits, plus the non-DEX
-        let entries = queue.broadcast_some(100, Some(1));
+        // DEX budget of 1: only 1 DEX tx fits, then DEX lane drops, non-DEX still traversed
+        let (entries, budget) = visit_all_processed(&queue, 100, Some(1));
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].hash, Hash256::hash_xdr(&dex1)); // highest fee DEX
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&dex1));
         assert!(entries[0].is_dex);
-        assert_eq!(entries[1].hash, Hash256::hash_xdr(&non_dex)); // non-DEX
+        assert_eq!(entries[1].hash, Hash256::hash_xdr(&non_dex));
         assert!(!entries[1].is_dex);
+        assert_eq!(budget.ops_remaining, 98);
+        assert_eq!(budget.dex_ops_remaining, Some(0));
     }
 
     #[test]
-    fn test_broadcast_some_dex_lane_drop() {
-        // When top DEX tx exceeds DEX budget, ALL DEX txs are dropped
+    fn test_broadcast_visitor_dex_lane_drop() {
         let config = TxQueueConfig {
             max_size: 10,
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
 
-        // DEX tx with 3 ops, fee 900 → fee_per_op 300 (highest)
+        // DEX tx with 3 ops exceeds DEX budget of 2 → drops lane
         let mut dex_big = make_dex_envelope(900, 3);
         set_source(&mut dex_big, 1);
-        // DEX tx with 1 op, fee 100 → fee_per_op 100 (lowest)
         let mut dex_small = make_dex_envelope(100, 1);
         set_source(&mut dex_small, 2);
-        // Non-DEX tx with 1 op, fee 200 → fee_per_op 200
         let mut non_dex = make_test_envelope(200, 1);
         set_source(&mut non_dex, 3);
 
@@ -8903,24 +8933,20 @@ mod broadcast_some_tests {
         queue.try_add(dex_small);
         queue.try_add(non_dex.clone());
 
-        // DEX budget of 2: dex_big (3 ops) exceeds, drops DEX lane entirely
-        // dex_small (1 op) also skipped because lane is dropped
-        // only non_dex survives
-        let entries = queue.broadcast_some(100, Some(2));
+        let (entries, _) = visit_all_processed(&queue, 100, Some(2));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].hash, Hash256::hash_xdr(&non_dex));
         assert!(!entries[0].is_dex);
     }
 
     #[test]
-    fn test_broadcast_some_dex_lane_drop_continues_non_dex() {
+    fn test_broadcast_visitor_dex_lane_drop_continues_non_dex() {
         let config = TxQueueConfig {
             max_size: 10,
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
 
-        // Fee rates: DEX_high(500/1=500) > non_dex_high(400) > DEX_low(300) > non_dex_low(200)
         let mut dex_high = make_dex_envelope(500, 1);
         set_source(&mut dex_high, 1);
         let mut non_dex_high = make_test_envelope(400, 1);
@@ -8935,9 +8961,8 @@ mod broadcast_some_tests {
         queue.try_add(dex_low);
         queue.try_add(non_dex_low.clone());
 
-        // DEX budget of 1: dex_high (1 op) fits, dex_low (1 op) would exceed
-        // → drops DEX lane after dex_high. Both non-DEX txs still flood.
-        let entries = queue.broadcast_some(100, Some(1));
+        // DEX budget 1: dex_high fits, dex_low exceeds → drops DEX lane
+        let (entries, _) = visit_all_processed(&queue, 100, Some(1));
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].hash, Hash256::hash_xdr(&dex_high));
         assert!(entries[0].is_dex);
@@ -8948,14 +8973,13 @@ mod broadcast_some_tests {
     }
 
     #[test]
-    fn test_broadcast_some_dex_exceeds_generic_breaks() {
+    fn test_broadcast_visitor_dex_exceeds_generic_breaks() {
         let config = TxQueueConfig {
             max_size: 10,
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
 
-        // DEX tx with 3 ops, generic budget of 2
         let mut dex = make_dex_envelope(300, 3);
         set_source(&mut dex, 1);
         let mut non_dex = make_test_envelope(100, 1);
@@ -8965,12 +8989,12 @@ mod broadcast_some_tests {
         queue.try_add(non_dex);
 
         // Generic budget 2, DEX budget 10: DEX tx (3 ops) exceeds generic → break
-        let entries = queue.broadcast_some(2, Some(10));
+        let (entries, _) = visit_all_processed(&queue, 2, Some(10));
         assert!(entries.is_empty());
     }
 
     #[test]
-    fn test_broadcast_some_no_dex_budget_uncapped() {
+    fn test_broadcast_visitor_no_dex_budget_uncapped() {
         let config = TxQueueConfig {
             max_size: 10,
             ..Default::default()
@@ -8986,14 +9010,16 @@ mod broadcast_some_tests {
         queue.try_add(dex2.clone());
 
         // No DEX budget (None): all DEX txs use generic budget only
-        let entries = queue.broadcast_some(100, None);
+        let (entries, budget) = visit_all_processed(&queue, 100, None);
         assert_eq!(entries.len(), 2);
         assert!(entries[0].is_dex);
         assert!(entries[1].is_dex);
+        assert_eq!(budget.ops_remaining, 98);
+        assert_eq!(budget.dex_ops_remaining, None);
     }
 
     #[test]
-    fn test_broadcast_some_returns_broadcast_candidate() {
+    fn test_broadcast_visitor_returns_broadcast_candidate() {
         let config = TxQueueConfig {
             max_size: 10,
             ..Default::default()
@@ -9008,17 +9034,216 @@ mod broadcast_some_tests {
         queue.try_add(dex.clone());
         queue.try_add(non_dex.clone());
 
-        let entries = queue.broadcast_some(100, None);
+        let (entries, _) = visit_all_processed(&queue, 100, None);
         assert_eq!(entries.len(), 2);
-
-        // First entry is DEX (higher fee)
         assert_eq!(entries[0].hash, Hash256::hash_xdr(&dex));
         assert_eq!(entries[0].op_count, 2);
         assert!(entries[0].is_dex);
-
-        // Second entry is non-DEX
         assert_eq!(entries[1].hash, Hash256::hash_xdr(&non_dex));
         assert_eq!(entries[1].op_count, 1);
         assert!(!entries[1].is_dex);
+    }
+
+    // --- New tests for skipped-budget-neutral semantics ---
+
+    #[test]
+    fn test_broadcast_visitor_skipped_does_not_consume_generic_budget() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx_high = make_test_envelope(300, 2);
+        set_source(&mut tx_high, 1);
+        let mut tx_low = make_test_envelope(100, 1);
+        set_source(&mut tx_low, 2);
+
+        queue.try_add(tx_high.clone());
+        queue.try_add(tx_low.clone());
+
+        let hash_high = Hash256::hash_xdr(&tx_high);
+        let mut budget = BroadcastBudget {
+            ops_remaining: 3,
+            dex_ops_remaining: None,
+        };
+        let mut visited = Vec::new();
+        queue.broadcast_with_visitor(&mut budget, |candidate| {
+            visited.push(candidate.hash);
+            if candidate.hash == hash_high {
+                BroadcastVisitResult::Skipped
+            } else {
+                BroadcastVisitResult::Processed
+            }
+        });
+        // Both candidates visited; high was skipped, low was processed
+        assert_eq!(visited.len(), 2);
+        // Budget: started at 3, only low (1 op) consumed
+        assert_eq!(budget.ops_remaining, 2);
+    }
+
+    #[test]
+    fn test_broadcast_visitor_skipped_does_not_consume_dex_budget() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex = make_dex_envelope(300, 1);
+        set_source(&mut dex, 1);
+        let mut non_dex = make_test_envelope(100, 1);
+        set_source(&mut non_dex, 2);
+
+        queue.try_add(dex.clone());
+        queue.try_add(non_dex.clone());
+
+        let dex_hash = Hash256::hash_xdr(&dex);
+        let mut budget = BroadcastBudget {
+            ops_remaining: 10,
+            dex_ops_remaining: Some(5),
+        };
+        queue.broadcast_with_visitor(&mut budget, |candidate| {
+            if candidate.hash == dex_hash {
+                BroadcastVisitResult::Skipped
+            } else {
+                BroadcastVisitResult::Processed
+            }
+        });
+        // DEX tx skipped → DEX budget unchanged, generic budget consumed only for non-DEX
+        assert_eq!(budget.ops_remaining, 9);
+        assert_eq!(budget.dex_ops_remaining, Some(5));
+    }
+
+    #[test]
+    fn test_broadcast_visitor_all_skipped_scans_full_queue() {
+        let config = TxQueueConfig {
+            max_size: 100,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add 20 txs
+        for i in 1..=20u8 {
+            let mut tx = make_test_envelope(100 * i as u32, 1);
+            set_source(&mut tx, i);
+            queue.try_add(tx);
+        }
+
+        let mut visit_count = 0;
+        let mut budget = BroadcastBudget {
+            ops_remaining: 100,
+            dex_ops_remaining: None,
+        };
+        queue.broadcast_with_visitor(&mut budget, |_| {
+            visit_count += 1;
+            BroadcastVisitResult::Skipped
+        });
+        // All 20 candidates visited, none consumed budget
+        assert_eq!(visit_count, 20);
+        assert_eq!(budget.ops_remaining, 100);
+    }
+
+    #[test]
+    fn test_broadcast_visitor_budget_carry_over_mixed() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // 3 DEX txs: 2 ops each
+        let mut dex1 = make_dex_envelope(900, 2);
+        set_source(&mut dex1, 1);
+        let mut dex2 = make_dex_envelope(600, 2);
+        set_source(&mut dex2, 2);
+        let mut non_dex = make_test_envelope(300, 1);
+        set_source(&mut non_dex, 3);
+
+        queue.try_add(dex1.clone());
+        queue.try_add(dex2.clone());
+        queue.try_add(non_dex.clone());
+
+        let dex1_hash = Hash256::hash_xdr(&dex1);
+        let mut budget = BroadcastBudget {
+            ops_remaining: 10,
+            dex_ops_remaining: Some(5),
+        };
+        queue.broadcast_with_visitor(&mut budget, |candidate| {
+            if candidate.hash == dex1_hash {
+                // Skip the first DEX tx
+                BroadcastVisitResult::Skipped
+            } else {
+                BroadcastVisitResult::Processed
+            }
+        });
+        // dex1 (2 ops) skipped → no consumption
+        // dex2 (2 ops) processed → ops: 10-2=8, dex: 5-2=3
+        // non_dex (1 op) processed → ops: 8-1=7
+        assert_eq!(budget.ops_remaining, 7);
+        assert_eq!(budget.dex_ops_remaining, Some(3));
+    }
+
+    #[test]
+    fn test_broadcast_visitor_dex_budget_zero_deactivates_lane() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex = make_dex_envelope(300, 1);
+        set_source(&mut dex, 1);
+        let mut non_dex = make_test_envelope(100, 1);
+        set_source(&mut non_dex, 2);
+
+        queue.try_add(dex);
+        queue.try_add(non_dex.clone());
+
+        // dex_ops_budget = Some(0): first DEX tx (1 op > 0) deactivates lane
+        let (entries, budget) = visit_all_processed(&queue, 100, Some(0));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&non_dex));
+        assert!(!entries[0].is_dex);
+        assert_eq!(budget.dex_ops_remaining, Some(0));
+    }
+
+    #[test]
+    fn test_broadcast_visitor_exact_fit_boundary() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut tx = make_test_envelope(200, 2);
+        set_source(&mut tx, 1);
+        queue.try_add(tx.clone());
+
+        // Budget exactly matches: ops == remaining → should fit (not exceed)
+        let (entries, budget) = visit_all_processed(&queue, 2, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&tx));
+        assert_eq!(budget.ops_remaining, 0);
+    }
+
+    #[test]
+    fn test_broadcast_visitor_dex_exact_fit_boundary() {
+        let config = TxQueueConfig {
+            max_size: 10,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        let mut dex = make_dex_envelope(200, 2);
+        set_source(&mut dex, 1);
+        queue.try_add(dex.clone());
+
+        // Both generic and DEX budget exactly match
+        let (entries, budget) = visit_all_processed(&queue, 2, Some(2));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, Hash256::hash_xdr(&dex));
+        assert_eq!(budget.ops_remaining, 0);
+        assert_eq!(budget.dex_ops_remaining, Some(0));
     }
 }
