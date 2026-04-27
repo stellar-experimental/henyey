@@ -168,13 +168,14 @@ async fn test_catchup_replay_bucket_hash_verification() {
     );
 
     let headers_xdr = {
+        let header64_hash = verify::compute_header_hash(&header64).expect("header64 hash");
         let entry63 = LedgerHeaderHistoryEntry {
-            hash: Hash([0u8; 32]),
+            hash: header63_hash.into(),
             header: header63,
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
         let entry64 = LedgerHeaderHistoryEntry {
-            hash: Hash([0u8; 32]),
+            hash: header64_hash.into(),
             header: header64.clone(),
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
@@ -187,8 +188,9 @@ async fn test_catchup_replay_bucket_hash_verification() {
         record_marked(&[entry63_xdr, entry64_xdr])
     };
     let headers_xdr_for_data_checkpoint = {
+        let header64_hash = verify::compute_header_hash(&header64).expect("header64 hash");
         let entry64 = LedgerHeaderHistoryEntry {
-            hash: Hash([0u8; 32]),
+            hash: header64_hash.into(),
             header: header64,
             ext: LedgerHeaderHistoryEntryExt::default(),
         };
