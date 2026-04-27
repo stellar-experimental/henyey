@@ -4828,4 +4828,36 @@ mod tests {
         });
         assert!(result.is_err());
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_restart_merges_from_has_next_states_under_length() {
+        let mut bl = BucketList::new();
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS - 1];
+
+        let result = bl
+            .restart_merges_from_has(1, 25, &next_states, |_| unreachable!(), false)
+            .await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Expected 11 next states, got 10"),
+            "{err_msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_restart_merges_from_has_next_states_over_length() {
+        let mut bl = BucketList::new();
+        let next_states = vec![HasNextState::default(); BUCKET_LIST_LEVELS + 1];
+
+        let result = bl
+            .restart_merges_from_has(1, 25, &next_states, |_| unreachable!(), false)
+            .await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Expected 11 next states, got 12"),
+            "{err_msg}"
+        );
+    }
 }

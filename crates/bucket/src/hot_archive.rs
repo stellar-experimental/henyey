@@ -2468,4 +2468,85 @@ mod tests {
         });
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_hot_restart_merges_from_has_next_states_under_length() {
+        let mut ha = HotArchiveBucketList::new();
+        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS - 1];
+
+        let result = ha.restart_merges_from_has(1, 25, &next_states, |_| unreachable!(), false);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Expected 11 next states, got 10"),
+            "{err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_hot_restart_merges_from_has_next_states_over_length() {
+        let mut ha = HotArchiveBucketList::new();
+        let next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS + 1];
+
+        let result = ha.restart_merges_from_has(1, 25, &next_states, |_| unreachable!(), false);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("Expected 11 next states, got 12"),
+            "{err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_hot_restart_merges_from_has_hash_mismatch_input() {
+        use crate::bucket_list::{HasNextState, HAS_NEXT_STATE_INPUTS};
+
+        let mut ha = HotArchiveBucketList::new();
+
+        // Create a real hot archive bucket with an entry
+        let entry = make_contract_data_entry([7u8; 32], b"key", 700);
+        let real_bucket =
+            HotArchiveBucket::from_entries(vec![HotArchiveBucketEntry::Archived(entry)]).unwrap();
+        let real_hash = real_bucket.hash();
+        assert!(!real_hash.is_zero());
+
+        // Create a different bucket whose hash won't match
+        let entry2 = make_contract_data_entry([8u8; 32], b"key2", 800);
+        let wrong_bucket =
+            HotArchiveBucket::from_entries(vec![HotArchiveBucketEntry::Archived(entry2)]).unwrap();
+        let wrong_hash = wrong_bucket.hash();
+        assert_ne!(real_hash, wrong_hash);
+
+        // Build next_states with state-2 inputs using the real hash at level 1
+        let mut next_states = vec![HasNextState::default(); HOT_ARCHIVE_BUCKET_LIST_LEVELS];
+        next_states[1] = HasNextState {
+            state: HAS_NEXT_STATE_INPUTS,
+            output: None,
+            input_curr: Some(real_hash),
+            input_snap: Some(Hash256::ZERO),
+        };
+
+        // Loader returns the WRONG bucket for the real hash
+        let result = ha.restart_merges_from_has(
+            1,
+            25,
+            &next_states,
+            |hash| {
+                if hash.is_zero() {
+                    return Ok(HotArchiveBucket::empty());
+                }
+                Ok(wrong_bucket.clone())
+            },
+            false,
+        );
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            BucketError::HashMismatch { expected, actual } => {
+                assert_eq!(expected, real_hash.to_hex());
+                assert_eq!(actual, wrong_hash.to_hex());
+            }
+            other => panic!("Expected HashMismatch, got: {:?}", other),
+        }
+    }
 }
