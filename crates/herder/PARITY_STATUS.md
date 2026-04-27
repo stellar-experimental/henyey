@@ -595,6 +595,11 @@ Features not yet implemented. These ARE counted against parity %.
 - **Upgrades**: Missing ledger-integrated upgrade application tests, config upgrade set tests, and nomination-timeout stripping behavior
 - **QuorumIntersection**: Core algorithm implemented (SCC + MinQuorumEnumerator). Missing some stellar-core-specific test scenarios (28 TEST_CASE). Herder integration with interrupt support is complete.
 
+## Parity Notes
+
+- **Local quorum set normalization in `Herder::build`** (issue #1953): `Herder::build` now normalizes `config.local_quorum_set` before distributing it to `SCP::new`, `ScpDriverConfig`, `FetchingEnvelopes`, `QuorumSetTracker`, and `SlotQuorumTracker`. This matches stellar-core's `LocalNode::LocalNode` which calls `normalizeQSet` on the local quorum set before computing `mQSetHash`. The app config path (`config_to_quorum_set`) already normalized, so this is defense-in-depth for direct API callers.
+- **Remaining parity debt**: `set_local_quorum_set` does not normalize (matching upstream `LocalNode::updateQuorumSet`), but henyey only applies it to new slots while stellar-core's shared `LocalNode` reference affects all slots retroactively.
+
 ## Parity Calculation
 
 | Category | Count |

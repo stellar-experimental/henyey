@@ -110,9 +110,12 @@ impl<D: SCPDriver> SCP<D> {
     pub fn new(
         node_id: NodeId,
         is_validator: bool,
-        quorum_set: ScpQuorumSet,
+        mut quorum_set: ScpQuorumSet,
         driver: Arc<D>,
     ) -> Self {
+        // Normalize before storing, matching stellar-core's
+        // LocalNode::LocalNode which calls normalizeQSet(mQSet).
+        crate::quorum::normalize_quorum_set(&mut quorum_set);
         Self {
             local_node_id: node_id,
             is_validator,
@@ -1867,5 +1870,88 @@ mod tests {
         );
         assert_eq!(summary.disagree, 0);
         assert_eq!(summary.delayed, 0);
+    }
+
+    /// SCP::new normalizes unsorted validators (parity with stellar-core
+    /// LocalNode::LocalNode which calls normalizeQSet).
+    #[test]
+    fn test_scp_new_normalizes_unsorted_validators() {
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+
+        // Supply validators in reverse order [C, B, A].
+        let unsorted_qs = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node_c.clone(), node_b.clone(), node_a.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let driver = MockDriverBuilder::new()
+            .quorum_set(unsorted_qs.clone())
+            .build();
+
+        let scp = SCP::new(node_a.clone(), true, unsorted_qs, Arc::new(driver));
+        let stored = scp.local_quorum_set();
+
+        // Validators must be sorted (canonical order).
+        let validators: Vec<_> = stored.validators.iter().collect();
+        for i in 1..validators.len() {
+            assert!(
+                validators[i - 1].as_ref() <= validators[i].as_ref(),
+                "validators must be sorted after normalization"
+            );
+        }
+
+        // Hash must match the hash of the normalized form.
+        let mut expected_qs = stored.clone();
+        crate::quorum::normalize_quorum_set(&mut expected_qs);
+        assert_eq!(
+            hash_quorum_set(stored),
+            hash_quorum_set(&expected_qs),
+            "stored quorum set hash must be canonical"
+        );
+    }
+
+    /// SCP::new flattens singleton inner sets (threshold=1, one validator,
+    /// no nested inner sets) into the parent, matching stellar-core normalization.
+    #[test]
+    fn test_scp_new_flattens_singleton_inner_set() {
+        let node_a = make_node_id(1);
+        let node_b = make_node_id(2);
+        let node_c = make_node_id(3);
+
+        // Inner set with threshold=1 and a single validator → should be merged.
+        let singleton_inner = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_c.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let qs_with_singleton = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![node_a.clone(), node_b.clone()].try_into().unwrap(),
+            inner_sets: vec![singleton_inner].try_into().unwrap(),
+        };
+
+        let driver = MockDriverBuilder::new()
+            .quorum_set(qs_with_singleton.clone())
+            .build();
+
+        let scp = SCP::new(node_a.clone(), true, qs_with_singleton, Arc::new(driver));
+        let stored = scp.local_quorum_set();
+
+        // The singleton inner set should have been merged into the parent.
+        assert!(
+            stored.inner_sets.is_empty(),
+            "singleton inner set should be flattened into parent"
+        );
+        assert_eq!(
+            stored.validators.len(),
+            3,
+            "parent should have 3 validators after flattening"
+        );
     }
 }

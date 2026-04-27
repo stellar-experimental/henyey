@@ -314,7 +314,18 @@ impl Herder {
     }
 
     /// Shared constructor logic for both observer and validator modes.
-    fn build(config: HerderConfig, secret_key: Option<SecretKey>) -> Self {
+    fn build(mut config: HerderConfig, secret_key: Option<SecretKey>) -> Self {
+        // Normalize the local quorum set up front, before it fans out to
+        // SCP::new, ScpDriverConfig, FetchingEnvelopes, QuorumSetTracker,
+        // and SlotQuorumTracker. Matches stellar-core's LocalNode constructor
+        // which calls normalizeQSet(mQSet) before computing mQSetHash.
+        // SCP::new also normalizes (defense-in-depth), but doing it here
+        // ensures all consumers — including the by-hash index — use the
+        // canonical form.
+        if let Some(ref mut qs) = config.local_quorum_set {
+            henyey_scp::normalize_quorum_set(qs);
+        }
+
         // Decouple the pending-envelope buffer sizing from
         // `max_externalized_slots`. These control different things:
         // `max_externalized_slots` caps the already-externalized-slot
@@ -3763,8 +3774,12 @@ mod tests {
             "should not have ballot timeout without quorum"
         );
 
-        // Send a PREPARE from the second node to form quorum
-        let qs_hash = hash_quorum_set(&quorum_set);
+        // Send a PREPARE from the second node to form quorum.
+        // Use the normalized hash — Herder::build normalizes the local quorum
+        // set, so SCP statements use the canonical hash.
+        let mut normalized_qs = quorum_set.clone();
+        henyey_scp::normalize_quorum_set(&mut normalized_qs);
+        let qs_hash = hash_quorum_set(&normalized_qs);
         let ballot = ScpBallot {
             counter: 1,
             value: value.clone(),

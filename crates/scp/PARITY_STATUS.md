@@ -229,8 +229,9 @@ Corresponds to: `LocalNode.h`, `QuorumSetUtils.h`
 | stellar-core | Rust | Status |
 |--------------|------|--------|
 | `LocalNode()` | Distributed across `SCP`, `Slot` | Full |
+| `LocalNode()` normalization | `SCP::new` calls `normalize_quorum_set` | Full |
 | `getNodeID()` | `SCP::local_node_id()` | Full |
-| `updateQuorumSet()` | `SCP::set_local_quorum_set()` | Full |
+| `updateQuorumSet()` | `SCP::set_local_quorum_set()` | Partial — does not normalize (matches upstream), but only affects new slots (upstream's shared `LocalNode` affects all slots) |
 | `getQuorumSet()` | `SCP::local_quorum_set()` | Full |
 | `getQuorumSetHash()` | `hash_quorum_set()` | Full |
 | `isValidator()` | `SCP::is_validator()` | Full |
