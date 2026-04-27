@@ -922,6 +922,24 @@ impl OverlayManager {
             .count()
     }
 
+    /// Count outbound peers that are not in the preferred set.
+    ///
+    /// Matches stellar-core `nonPreferredAuthenticatedCount()`
+    /// (OverlayManagerImpl.cpp:835-849). Used to compute how many outbound
+    /// slots are replaceable by preferred peers.
+    pub(super) fn count_non_preferred_outbound_peers(
+        peer_info_cache: &DashMap<PeerId, PeerInfo>,
+        preferred_set: &PreferredPeerSet,
+    ) -> usize {
+        peer_info_cache
+            .iter()
+            .filter(|entry| {
+                let info = entry.value();
+                info.direction.we_called_remote() && !preferred_set.is_preferred(info)
+            })
+            .count()
+    }
+
     /// Returns true if a peer's connection info matches the given address,
     /// checking the original hostname-based address first, then falling back
     /// to resolved IP comparison.

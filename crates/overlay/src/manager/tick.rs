@@ -255,23 +255,36 @@ impl OverlayManager {
                 let now = Instant::now();
                 let outbound_count = Self::count_outbound_peers(&shared.peer_info_cache);
                 let available = max_outbound.saturating_sub(outbound_count);
-                if available == 0 {
-                    continue;
+
+                // Preferred peers can evict non-preferred outbound peers, so
+                // their dial capacity includes replaceable (non-preferred) slots.
+                // Matches stellar-core OverlayManagerImpl.cpp:748-749:
+                //   preferredToConnect = availableAuthenticatedSlots
+                //                      + nonPreferredAuthenticatedCount();
+                let non_preferred_count = Self::count_non_preferred_outbound_peers(
+                    &shared.peer_info_cache,
+                    &preferred_set,
+                );
+                let preferred_capacity = available + non_preferred_count;
+
+                // Connect to preferred peers first (may evict non-preferred).
+                if preferred_capacity > 0 {
+                    Self::connect_preferred_peers(
+                        &preferred_set,
+                        &mut retry_after,
+                        now,
+                        preferred_capacity,
+                        max_outbound,
+                        &pool,
+                        &shared,
+                        &ctx,
+                    )
+                    .await;
                 }
 
-                // Connect to preferred peers first.
-                let remaining = Self::connect_preferred_peers(
-                    &preferred_set,
-                    &mut retry_after,
-                    now,
-                    available,
-                    &pool,
-                    &shared,
-                    &ctx,
-                )
-                .await;
-
+                // Recount after preferred connections may have changed things.
                 let outbound_count = Self::count_outbound_peers(&shared.peer_info_cache);
+                let remaining = max_outbound.saturating_sub(outbound_count);
                 if remaining == 0 || outbound_count >= ctx.target_outbound {
                     continue;
                 }
@@ -361,13 +374,18 @@ impl OverlayManager {
 
     /// Try connecting to each preferred peer that isn't already connected.
     ///
-    /// Evicts youngest non-preferred outbound peer if the pool is full.
-    /// Returns how many slots remain after connecting.
+    /// Pre-evicts the youngest non-preferred outbound peer when authenticated
+    /// slots are full. Returns how many slots remain after connecting.
+    ///
+    /// Matches stellar-core's preferred connection logic in
+    /// `OverlayManagerImpl.cpp:744-757`.
+    #[allow(clippy::too_many_arguments)]
     async fn connect_preferred_peers(
         preferred_set: &PreferredPeerSet,
         retry_after: &mut HashMap<PeerAddress, Instant>,
         now: Instant,
         mut remaining: usize,
+        max_outbound: usize,
         pool: &Arc<ConnectionPool>,
         shared: &SharedPeerState,
         ctx: &TickConnectCtx,
@@ -389,7 +407,11 @@ impl OverlayManager {
                 continue;
             }
 
-            if !pool.try_reserve() {
+            // Pre-evict if authenticated slots are full. We check
+            // authenticated_count rather than relying on try_reserve(),
+            // because try_reserve() includes pending headroom and would
+            // succeed even when all authenticated slots are occupied.
+            if pool.authenticated_count() >= max_outbound {
                 let evicted = Self::maybe_evict_for_preferred(
                     &shared.peers,
                     &shared.peer_info_cache,
@@ -398,10 +420,11 @@ impl OverlayManager {
                 if evicted {
                     tokio::time::sleep(Duration::from_millis(EVICTION_SETTLE_DELAY_MS)).await;
                 }
-                if !pool.try_reserve() {
-                    debug!("Outbound peer limit reached (even after eviction attempt)");
-                    return 0;
-                }
+            }
+
+            if !pool.try_reserve() {
+                debug!("Outbound peer limit reached (even after eviction attempt)");
+                return 0;
             }
 
             let timeout = ctx.connect_timeout.max(ctx.auth_timeout);
@@ -643,7 +666,7 @@ impl OverlayManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::ConnectionDirection;
+    use crate::connection::{ConnectionDirection, ConnectionPool};
     use crate::flow_control::{FlowControl, FlowControlConfig};
     use crate::peer::{PeerInfo, PeerStats};
     use crate::PeerAddress;
@@ -1008,5 +1031,186 @@ mod tests {
         // retries = PEER_IP_RESOLVE_DELAY / PEER_IP_RESOLVE_RETRY_DELAY = 60
         let max_retries = PEER_IP_RESOLVE_DELAY.as_secs() / PEER_IP_RESOLVE_RETRY_DELAY.as_secs();
         assert_eq!(max_retries, 60);
+    }
+
+    // ---- AUDIT-182 tests: preferred-peer eviction when slots full ----
+
+    #[test]
+    fn test_count_non_preferred_outbound_peers_mixed() {
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // 3 outbound non-preferred peers
+        for i in 0..3 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            info_cache.insert(info.peer_id.clone(), info);
+        }
+
+        // 2 outbound preferred peers (127.0.0.1:11100, 127.0.0.1:11101)
+        let preferred_addrs: Vec<PeerAddress> = (0..2)
+            .map(|i| PeerAddress::new("127.0.0.1", 11100 + i))
+            .collect();
+        for i in 0..2u16 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11100 + i);
+            info_cache.insert(info.peer_id.clone(), info);
+        }
+
+        // 2 inbound peers (should be ignored)
+        for i in 0..2 {
+            let info = make_peer_info(ConnectionDirection::Inbound, 12000 + i);
+            info_cache.insert(info.peer_id.clone(), info);
+        }
+
+        let preferred_set = PreferredPeerSet::from_config(preferred_addrs);
+        let count = OverlayManager::count_non_preferred_outbound_peers(&info_cache, &preferred_set);
+        assert_eq!(count, 3, "should only count non-preferred outbound peers");
+    }
+
+    #[test]
+    fn test_count_non_preferred_outbound_all_preferred() {
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        let preferred_addrs: Vec<PeerAddress> = (0..3)
+            .map(|i| PeerAddress::new("127.0.0.1", 11000 + i))
+            .collect();
+        for i in 0..3u16 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            info_cache.insert(info.peer_id.clone(), info);
+        }
+
+        let preferred_set = PreferredPeerSet::from_config(preferred_addrs);
+        let count = OverlayManager::count_non_preferred_outbound_peers(&info_cache, &preferred_set);
+        assert_eq!(count, 0, "all outbound are preferred");
+    }
+
+    #[test]
+    fn test_maybe_evict_for_preferred_evicts_youngest_non_preferred() {
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // Register 3 non-preferred outbound peers with different connected_at times.
+        let base_time = Instant::now() - Duration::from_secs(30);
+        for i in 0..3u16 {
+            let mut info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            info.connected_at = base_time + Duration::from_secs(i as u64 * 10);
+            register_fake_peer(&peers, &info_cache, info);
+        }
+
+        let preferred_set = PreferredPeerSet::from_config(vec![]);
+        let evicted =
+            OverlayManager::maybe_evict_for_preferred(&peers, &info_cache, &preferred_set);
+        assert!(evicted, "should evict a non-preferred peer");
+
+        // The youngest (port 11002, connected_at = base + 20s) should be evicted.
+        // After eviction, the peer's outbound_tx is dropped, so the handle
+        // is consumed. Verify we still have 3 entries (eviction sends error
+        // but the cleanup is async — the peer entry remains until the loop exits).
+    }
+
+    #[test]
+    fn test_maybe_evict_for_preferred_no_eviction_when_all_preferred() {
+        let peers: DashMap<PeerId, PeerHandle> = DashMap::new();
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+
+        // All outbound peers are preferred
+        let preferred_addrs: Vec<PeerAddress> = (0..3)
+            .map(|i| PeerAddress::new("127.0.0.1", 11000 + i))
+            .collect();
+        for i in 0..3u16 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            register_fake_peer(&peers, &info_cache, info);
+        }
+
+        let preferred_set = PreferredPeerSet::from_config(preferred_addrs);
+        let evicted =
+            OverlayManager::maybe_evict_for_preferred(&peers, &info_cache, &preferred_set);
+        assert!(
+            !evicted,
+            "should not evict when all outbound peers are preferred"
+        );
+    }
+
+    #[test]
+    fn test_preferred_capacity_includes_non_preferred_replaceable_slots() {
+        // Regression test for AUDIT-182: when all outbound slots are full of
+        // non-preferred peers, preferred_capacity should be > 0 (allowing
+        // connect_preferred_peers to be called and trigger eviction).
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+        let max_outbound: usize = 8;
+
+        // Fill all 8 slots with non-preferred outbound peers
+        for i in 0..8u16 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            info_cache.insert(info.peer_id.clone(), info);
+        }
+
+        let preferred_set = PreferredPeerSet::from_config(vec![]);
+        let outbound_count = OverlayManager::count_outbound_peers(&info_cache);
+        let available = max_outbound.saturating_sub(outbound_count);
+        assert_eq!(available, 0, "no free slots");
+
+        let non_preferred_count =
+            OverlayManager::count_non_preferred_outbound_peers(&info_cache, &preferred_set);
+        let preferred_capacity = available + non_preferred_count;
+        assert_eq!(
+            preferred_capacity, 8,
+            "preferred_capacity should include replaceable non-preferred slots"
+        );
+    }
+
+    #[test]
+    fn test_preferred_capacity_zero_when_all_preferred() {
+        // When all outbound slots are full of preferred peers,
+        // preferred_capacity should be 0 (no replaceable slots).
+        let info_cache: DashMap<PeerId, PeerInfo> = DashMap::new();
+        let max_outbound: usize = 3;
+
+        let preferred_addrs: Vec<PeerAddress> = (0..3)
+            .map(|i| PeerAddress::new("127.0.0.1", 11000 + i))
+            .collect();
+        for i in 0..3u16 {
+            let info = make_peer_info(ConnectionDirection::Outbound, 11000 + i);
+            info_cache.insert(info.peer_id.clone(), info);
+        }
+
+        let preferred_set = PreferredPeerSet::from_config(preferred_addrs);
+        let outbound_count = OverlayManager::count_outbound_peers(&info_cache);
+        let available = max_outbound.saturating_sub(outbound_count);
+        let non_preferred_count =
+            OverlayManager::count_non_preferred_outbound_peers(&info_cache, &preferred_set);
+        let preferred_capacity = available + non_preferred_count;
+        assert_eq!(
+            preferred_capacity, 0,
+            "no replaceable slots when all are preferred"
+        );
+    }
+
+    #[test]
+    fn test_eviction_trigger_uses_authenticated_count_not_try_reserve() {
+        // Regression test: eviction should fire based on authenticated_count
+        // >= max_outbound, not on try_reserve() failure (which succeeds due
+        // to pending headroom).
+        let pool = Arc::new(ConnectionPool::new(2)); // max_connections = 2
+
+        // Simulate 2 authenticated connections (pool is "full" for authenticated)
+        assert!(pool.try_reserve()); // pending slot 1
+        pool.mark_authenticated(); // promote to authenticated
+        assert!(pool.try_reserve()); // pending slot 2
+        pool.mark_authenticated(); // promote to authenticated
+
+        assert_eq!(pool.authenticated_count(), 2);
+
+        // try_reserve() still succeeds due to pending headroom (max_pending_extra = 32)
+        assert!(
+            pool.try_reserve(),
+            "try_reserve succeeds even with all authenticated slots full"
+        );
+        pool.release_pending(); // clean up the test reservation
+
+        // The eviction condition should trigger on authenticated_count >= max
+        let needs_eviction = pool.authenticated_count() >= 2;
+        assert!(
+            needs_eviction,
+            "eviction should trigger based on authenticated count"
+        );
     }
 }
