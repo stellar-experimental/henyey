@@ -211,8 +211,10 @@ pub async fn build_single_checkpoint_archive(
     let combined = combined_bucket_list_hash(bucket_list_hash, hot_archive.hash());
 
     let header = make_test_header(checkpoint, combined);
+    let header_hash =
+        crate::verify::compute_header_hash(&header).expect("test checkpoint header hash");
     let header_entry = LedgerHeaderHistoryEntry {
-        hash: Hash([0u8; 32]),
+        hash: header_hash.into(),
         header,
         ext: LedgerHeaderHistoryEntryExt::default(),
     };

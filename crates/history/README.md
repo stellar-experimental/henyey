@@ -141,11 +141,12 @@ println!("ledger {} closed at {}", header.ledger_seq, header.scp_value.close_tim
 | `replay/execution.rs` | Execution-based ledger replay using transaction re-execution. |
 | `replay/metadata.rs` | Metadata-based ledger replay from archived `TransactionMeta`. |
 | `test_utils.rs` | Feature-gated in-process archive fixtures for integration tests. |
-| `verify.rs` | Header-chain, bucket, tx-set, SCP-history, and HAS verification routines. |
+| `verify.rs` | Ledger-header entry, header-chain, bucket, tx-set, SCP-history, and HAS verification routines. |
 
 ## Design Notes
 
 - Replay defaults to re-execution instead of applying `TransactionMeta`, so traditional archives remain usable; checkpoint bucket-list hashes are the main correctness boundary.
+- Ledger-header history entries are verified by recomputing `SHA256(XDR(header))` before their advertised hashes are trusted, matching stellar-core's catchup chain verification.
 - Protocol 23+ replay maintains both the live bucket list and the hot-archive bucket list, and verification uses `SHA256(live_hash || hot_archive_hash)`.
 - `HistoryArchiveState::differing_bucket_hashes()` mirrors stellar-core's inhibited bottom-up bucket diff algorithm so catchup can avoid re-downloading buckets already implied by local state.
 - `CheckpointBuilder` uses `.dirty` files plus durable rename so partially written checkpoints never become visible as final archive outputs.

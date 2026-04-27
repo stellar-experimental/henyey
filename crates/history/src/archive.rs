@@ -20,6 +20,7 @@ use crate::download::{
 };
 use crate::error::HistoryError;
 use crate::paths::{bucket_path, checkpoint_path, root_has_path};
+use crate::verify;
 
 /// Client for accessing a Stellar history archive.
 ///
@@ -318,10 +319,8 @@ impl HistoryArchive {
 
     /// Download a single ledger header with its pre-computed hash by sequence.
     ///
-    /// This downloads the checkpoint containing the ledger and extracts
-    /// the specific header along with its hash from the archive.
-    /// The hash is the one recorded in the history archive, which is the
-    /// authoritative hash used by the network.
+    /// This downloads the checkpoint containing the ledger and extracts the
+    /// specific header along with its verified hash.
     ///
     /// # Arguments
     ///
@@ -336,10 +335,10 @@ impl HistoryArchive {
     ) -> Result<(stellar_xdr::curr::LedgerHeader, Hash256), HistoryError> {
         let headers = self.fetch_ledger_headers(seq).await?;
 
-        // Find the header with the matching sequence
         for entry in headers {
             if entry.header.ledger_seq == seq {
-                return Ok((entry.header, Hash256::from(entry.hash.0)));
+                let hash = verify::verify_ledger_header_history_entry(&entry)?;
+                return Ok((entry.header, hash));
             }
         }
 

@@ -874,7 +874,8 @@ fn checkpoint_header_from_headers(
 ) -> Result<(LedgerHeader, Hash256)> {
     for entry in headers {
         if entry.header.ledger_seq == checkpoint_seq {
-            return Ok((entry.header.clone(), Hash256::from(entry.hash.0)));
+            let hash = verify::verify_ledger_header_history_entry(entry)?;
+            return Ok((entry.header.clone(), hash));
         }
     }
 
@@ -1212,5 +1213,38 @@ mod tests {
         assert_eq!(select(0), 0);
         assert_eq!(select(1), 0);
         assert_eq!(select(100), 0);
+    }
+
+    #[test]
+    fn test_checkpoint_header_from_headers_verifies_entry_hash() {
+        let header = LedgerHeader {
+            ledger_version: 20,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: stellar_xdr::curr::StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: stellar_xdr::curr::TimePoint(0),
+                upgrades: stellar_xdr::curr::VecM::default(),
+                ext: stellar_xdr::curr::StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 63,
+            total_coins: 0,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5000000,
+            max_tx_set_size: 100,
+            skip_list: std::array::from_fn(|_| Hash([0u8; 32])),
+            ext: stellar_xdr::curr::LedgerHeaderExt::V0,
+        };
+        let entry = LedgerHeaderHistoryEntry {
+            hash: Hash([1u8; 32]),
+            header,
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        };
+
+        assert!(checkpoint_header_from_headers(63, &[entry]).is_err());
     }
 }

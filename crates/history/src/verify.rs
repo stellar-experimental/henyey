@@ -87,9 +87,14 @@ pub fn verify_header_chain(headers: &[LedgerHeader]) -> Result<()> {
 }
 
 /// Like [`verify_header_chain`] but accepts `LedgerHeaderHistoryEntry` slices
-/// directly, avoiding the need to clone every `LedgerHeader` into a
-/// contiguous `Vec` just for verification.
+/// directly, verifying each entry's advertised hash before checking chain
+/// links and avoiding the need to clone every `LedgerHeader` into a contiguous
+/// `Vec` just for verification.
 pub fn verify_header_chain_from_entries(entries: &[LedgerHeaderHistoryEntry]) -> Result<()> {
+    for entry in entries {
+        verify_ledger_header_history_entry(entry)?;
+    }
+
     verify_header_chain_inner(entries.iter().map(|e| &e.header))
 }
 
@@ -242,6 +247,25 @@ pub fn compute_header_hash(header: &LedgerHeader) -> Result<Hash256> {
         })?;
 
     Ok(Hash256::hash(&xdr_bytes))
+}
+
+/// Verify a ledger-header history entry's advertised hash.
+///
+/// Stellar-core rejects `LedgerHeaderHistoryEntry` records whose `hash` field
+/// does not match `SHA256(XDR(header))` before trusting that hash or using the
+/// entry in ledger-chain verification.
+pub fn verify_ledger_header_history_entry(entry: &LedgerHeaderHistoryEntry) -> Result<Hash256> {
+    let computed_hash = compute_header_hash(&entry.header)?;
+    let advertised_hash = Hash256::from(entry.hash.clone());
+
+    if computed_hash != advertised_hash {
+        return Err(HistoryError::VerificationFailed(format!(
+            "ledger-header entry hash mismatch at ledger {}: archive claims {}, computed {}",
+            entry.header.ledger_seq, advertised_hash, computed_hash
+        )));
+    }
+
+    Ok(computed_hash)
 }
 
 /// Verify a transaction result set against the ledger header.
@@ -504,7 +528,7 @@ pub fn verify_tx_result_ordering(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stellar_xdr::curr::{Hash, StellarValue, TimePoint, VecM};
+    use stellar_xdr::curr::{Hash, LedgerHeaderHistoryEntryExt, StellarValue, TimePoint, VecM};
 
     fn make_test_header(seq: u32, prev_hash: Hash256) -> LedgerHeader {
         LedgerHeader {
@@ -560,6 +584,53 @@ mod tests {
 
         let headers = vec![header1, header3];
         assert!(verify_header_chain(&headers).is_err());
+    }
+
+    fn make_header_history_entry(header: LedgerHeader, hash: Hash256) -> LedgerHeaderHistoryEntry {
+        LedgerHeaderHistoryEntry {
+            hash: hash.into(),
+            header,
+            ext: LedgerHeaderHistoryEntryExt::default(),
+        }
+    }
+
+    #[test]
+    fn test_verify_ledger_header_history_entry_validates_advertised_hash() {
+        let header = make_test_header(1, Hash256::ZERO);
+        let expected_hash = compute_header_hash(&header).unwrap();
+        let entry = make_header_history_entry(header, expected_hash);
+
+        assert_eq!(
+            verify_ledger_header_history_entry(&entry).unwrap(),
+            expected_hash
+        );
+    }
+
+    #[test]
+    fn test_verify_ledger_header_history_entry_rejects_mismatched_hash() {
+        let header = make_test_header(1, Hash256::ZERO);
+        let entry = make_header_history_entry(header, Hash256::hash(b"wrong"));
+
+        assert!(verify_ledger_header_history_entry(&entry).is_err());
+    }
+
+    #[test]
+    fn test_verify_header_chain_from_entries_rejects_first_entry_hash_mismatch() {
+        let header = make_test_header(1, Hash256::ZERO);
+        let entry = make_header_history_entry(header, Hash256::hash(b"wrong"));
+
+        assert!(verify_header_chain_from_entries(&[entry]).is_err());
+    }
+
+    #[test]
+    fn test_verify_header_chain_from_entries_rejects_later_entry_hash_mismatch() {
+        let header1 = make_test_header(1, Hash256::ZERO);
+        let hash1 = compute_header_hash(&header1).unwrap();
+        let header2 = make_test_header(2, hash1);
+        let entry1 = make_header_history_entry(header1, hash1);
+        let entry2 = make_header_history_entry(header2, Hash256::hash(b"wrong"));
+
+        assert!(verify_header_chain_from_entries(&[entry1, entry2]).is_err());
     }
 
     #[test]
