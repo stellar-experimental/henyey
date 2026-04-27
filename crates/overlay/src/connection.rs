@@ -534,9 +534,9 @@ impl ConnectionPool {
     /// when all authenticated slots are full. Preferred IPs get additional
     /// slots via `possibly_preferred_extra`.
     ///
-    /// The reserved slot starts as "pending" (unauthenticated). After
-    /// handshake and PEERS exchange, call [`try_promote_to_authenticated`]
-    /// to check the authenticated limit.
+    /// The reserved slot starts as "pending" (unauthenticated). Production
+    /// callers must promote through `OverlayManager` admission so preferred-peer
+    /// eviction and capacity checks stay centralized.
     pub fn try_reserve_with_ip(&self, ip: Option<IpAddr>) -> bool {
         let mut current = self.current_count.load(Ordering::Relaxed);
         loop {
@@ -602,10 +602,17 @@ impl ConnectionPool {
         self.current_count.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Marks a connection as authenticated (promotes from pending).
+    /// Force-promotes a pending connection to authenticated.
     ///
-    /// Call this after the Hello/Auth handshake completes successfully.
-    pub fn mark_authenticated(&self) {
+    /// This intentionally bypasses the authenticated limit and is only used by
+    /// the overlay-manager admission path after it has selected a peer to evict.
+    /// The pending reservation must already exist.
+    pub(crate) fn force_promote_authenticated(&self) {
+        let pending = self.pending_count.load(Ordering::Relaxed);
+        assert!(
+            pending > 0,
+            "force_promote_authenticated requires a pending reservation"
+        );
         self.pending_count.fetch_sub(1, Ordering::Relaxed);
         self.authenticated_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -619,7 +626,11 @@ impl ConnectionPool {
     /// Matches stellar-core `acceptAuthenticatedPeer`
     /// (OverlayManagerImpl.cpp:206): PEERS are already sent by this point,
     /// so crawlers get topology data even when rejected.
-    pub fn try_promote_to_authenticated(&self) -> bool {
+    pub(crate) fn try_promote_to_authenticated(&self) -> bool {
+        assert!(
+            self.pending_count.load(Ordering::Relaxed) > 0,
+            "try_promote_to_authenticated requires a pending reservation"
+        );
         let mut current = self.authenticated_count.load(Ordering::Relaxed);
         loop {
             if current >= self.max_connections {
@@ -695,7 +706,7 @@ mod tests {
         assert_eq!(pool.count(), 3);
 
         // Promote one to authenticated
-        pool.mark_authenticated();
+        pool.force_promote_authenticated();
         assert_eq!(pool.pending_count(), 2);
         assert_eq!(pool.authenticated_count(), 1);
         assert_eq!(pool.count(), 3); // total unchanged
@@ -776,9 +787,9 @@ mod tests {
 
         // Fill authenticated slots
         assert!(pool.try_reserve());
-        pool.mark_authenticated();
+        pool.force_promote_authenticated();
         assert!(pool.try_reserve());
-        pool.mark_authenticated();
+        pool.force_promote_authenticated();
         assert_eq!(pool.authenticated_count(), 2);
 
         // We can still accept pending connections (for handshake + PEERS)

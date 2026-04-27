@@ -3,15 +3,15 @@
 **Crate**: `henyey-overlay`
 **Upstream**: `stellar-core/src/overlay/`
 **Overall Parity**: 92%
-**Last Updated**: 2026-04-26
+**Last Updated**: 2026-04-27
 
 ## Summary
 
 | Area | Status | Notes |
 |------|--------|-------|
 | Authentication (PeerAuth, Hmac) | Full | HKDF key derivation, HMAC-SHA256 MAC |
-| Peer Connection (Peer, TCPPeer) | Partial | Core handshake and I/O complete; admin JSON and query throttle absent |
-| OverlayManager | Partial | Core peer lifecycle present; some peer-list and stats accessors absent |
+| Peer Connection (Peer, TCPPeer) | Partial | Core handshake and I/O complete; rejected outbound peers may still receive SEND_MORE_EXTENDED/GET_SCP_STATE before ERR_LOAD; admin JSON and query throttle absent |
+| OverlayManager | Partial | Core peer lifecycle present; preferred-peer eviction happens at authenticated admission; some peer-list and stats accessors absent |
 | Floodgate | Full | Message deduplication, ledger-based cleanup |
 | FlowControl | Full | Capacity tracking, throttling, SCP-aware trimming, CapacityGuard RAII |
 | ItemFetcher / Tracker | Full | Fetch lifecycle, retry, envelope tracking |
@@ -321,7 +321,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `maybeAddInboundConnection()` | (in listener accept flow) | Full |
 | `addOutboundConnection()` | (in connector flow) | Full |
 | `removePeer()` | (via peer drop) | Full |
-| `acceptAuthenticatedPeer()` | (in handshake completion) | Full |
+| `acceptAuthenticatedPeer()` | `try_accept_authenticated_peer()` after handshake completion | Partial (preferred eviction and load rejection match admission semantics; outbound rejection still occurs after SEND_MORE_EXTENDED/GET_SCP_STATE) |
 | `isPreferred()` | `PreferredPeerSet::is_preferred()` | Full (config hostname + resolved IP matching) |
 | `isPossiblyPreferred()` | `ConnectionPool::try_reserve_with_ip()` | Full (runtime update via `update_preferred_ips()`) |
 | `haveSpaceForConnection()` | `ConnectionPool::can_accept()` | Full |
@@ -352,8 +352,8 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `resolvePeers()` | DNS resolution with exponential backoff; results update both known peers and `PreferredPeerSet` (resolved IPs → inbound pool) | Full |
 | `storePeerList()` | In `start()` and tick loop | Full |
 | `connectToImpl()` | (in connector flow) | Full |
-| `moveToAuthenticated()` | (in handshake completion) | Full |
-| `nonPreferredAuthenticatedCount()` | N/A | None |
+| `moveToAuthenticated()` | `ConnectionPool` promotion via centralized admission | Full |
+| `nonPreferredAuthenticatedCount()` | `count_non_preferred_outbound_peers()` | Full |
 | `updateSizeCounters()` | N/A | None |
 | `shufflePeerList()` | (via rand::shuffle) | Full |
 | `canAcceptOutboundPeer()` | (via ConnectionPool) | Full |

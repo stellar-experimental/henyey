@@ -216,6 +216,29 @@ pub(super) struct TickConnectCtx {
     pub(super) connection_factory: Arc<dyn ConnectionFactory>,
 }
 
+/// Shared admission state for authenticated-peer promotion.
+///
+/// The lock around this state serializes admission decisions so concurrent
+/// preferred peers cannot evict the same victim or over-promote the pool.
+#[derive(Debug, Default)]
+pub(super) struct AdmissionState {
+    evicting: HashSet<PeerId>,
+}
+
+impl AdmissionState {
+    fn is_evicting(&self, peer_id: &PeerId) -> bool {
+        self.evicting.contains(peer_id)
+    }
+
+    fn mark_evicting(&mut self, peer_id: PeerId) {
+        self.evicting.insert(peer_id);
+    }
+
+    fn clear_evicting(&mut self, peer_id: &PeerId) {
+        self.evicting.remove(peer_id);
+    }
+}
+
 /// Tracks in-flight connections to prevent duplicate dials/handshakes.
 ///
 /// During the window between initiating a connection and completing
@@ -331,10 +354,11 @@ pub(super) struct SharedPeerState {
     pub(super) is_tracking: Arc<AtomicBool>,
     /// Tracks in-flight connections for dedup.
     pub(super) pending_connections: PendingConnections,
-    /// Preferred peer set — immutable snapshot updated after each DNS resolution.
-    /// Replaces the old `Arc<Vec<PeerAddress>>` with a type that holds both
-    /// config hostnames and resolved IPs.
-    pub(super) preferred_peers: Arc<PreferredPeerSet>,
+    /// Preferred peer set shared by all connection tasks and updated after DNS
+    /// resolution so admission decisions use current config and resolved IPs.
+    pub(super) preferred_peers: Arc<RwLock<PreferredPeerSet>>,
+    /// Serialized authenticated admission state.
+    pub(super) admission_state: Arc<Mutex<AdmissionState>>,
     /// Current depth of the dedicated fetch channel. Incremented on every
     /// successful send from `route_to_subscribers` and decremented by the
     /// consumer on every successful `recv()`. Exposed via `/metrics` as
@@ -362,6 +386,7 @@ impl SharedPeerState {
     pub(super) fn cleanup_peer(&self, peer_id: &PeerId) {
         self.peers.remove(peer_id);
         self.peer_info_cache.remove(peer_id);
+        self.admission_state.lock().clear_evicting(peer_id);
         self.dropped_authenticated_peers
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -546,6 +571,10 @@ pub struct OverlayManager {
     pub(super) connection_factory: Arc<dyn ConnectionFactory>,
     /// Tracks in-flight connections for dedup.
     pub(super) pending_connections: PendingConnections,
+    /// Current preferred peer set shared with connection tasks.
+    pub(super) preferred_peers: Arc<RwLock<PreferredPeerSet>>,
+    /// Serialized authenticated admission state shared with connection tasks.
+    pub(super) admission_state: Arc<Mutex<AdmissionState>>,
     /// Shared with `SharedPeerState`; see field docs there. Plumbed in from
     /// the app so the same atomics back both the `/metrics` gauge and the
     /// watchdog read path.
@@ -609,6 +638,9 @@ impl OverlayManager {
         let (shutdown_tx, _) = broadcast::channel(1);
         let (scp_message_tx, scp_message_rx) = mpsc::unbounded_channel();
         let (fetch_response_tx, fetch_response_rx) = mpsc::unbounded_channel();
+        let preferred_peers = Arc::new(RwLock::new(PreferredPeerSet::from_config(
+            config.preferred_peers.clone(),
+        )));
 
         Ok(Self {
             config: config.clone(),
@@ -651,6 +683,8 @@ impl OverlayManager {
             is_tracking: Arc::new(AtomicBool::new(false)),
             connection_factory,
             pending_connections: PendingConnections::new(),
+            preferred_peers,
+            admission_state: Arc::new(Mutex::new(AdmissionState::default())),
             fetch_channel_depth,
             fetch_channel_depth_max,
             metrics: Arc::new(OverlayMetrics::new()),
@@ -680,9 +714,8 @@ impl OverlayManager {
             extra_subscribers: Arc::clone(&self.extra_subscribers),
             is_tracking: Arc::clone(&self.is_tracking),
             pending_connections: self.pending_connections.clone(),
-            preferred_peers: Arc::new(PreferredPeerSet::from_config(
-                self.config.preferred_peers.clone(),
-            )),
+            preferred_peers: Arc::clone(&self.preferred_peers),
+            admission_state: Arc::clone(&self.admission_state),
             fetch_channel_depth: Arc::clone(&self.fetch_channel_depth),
             fetch_channel_depth_max: Arc::clone(&self.fetch_channel_depth_max),
             metrics: Arc::clone(&self.metrics),
@@ -1702,7 +1735,8 @@ mod tests {
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
-            preferred_peers: Arc::new(PreferredPeerSet::from_config(preferred)),
+            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(preferred))),
+            admission_state: Arc::new(Mutex::new(AdmissionState::default())),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             metrics: Arc::new(OverlayMetrics::new()),
@@ -1742,6 +1776,23 @@ mod tests {
         outbound_rx
     }
 
+    fn candidate_info(
+        peer_id: PeerId,
+        addr: std::net::SocketAddr,
+        direction: crate::connection::ConnectionDirection,
+    ) -> crate::peer::PeerInfo {
+        crate::peer::PeerInfo {
+            peer_id,
+            address: addr,
+            direction,
+            version_string: String::new(),
+            overlay_version: 0,
+            ledger_version: 0,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        }
+    }
+
     /// Regression test for AUDIT-055: preferred inbound peer evicts non-preferred
     /// when all slots are full.
     #[tokio::test]
@@ -1754,9 +1805,9 @@ mod tests {
         // Fill inbound pool to capacity (max_connections = 2).
         let pool = Arc::new(ConnectionPool::new(2));
         pool.try_reserve();
-        pool.mark_authenticated(); // peer A: non-preferred
+        pool.force_promote_authenticated(); // peer A: non-preferred
         pool.try_reserve();
-        pool.mark_authenticated(); // peer B: non-preferred
+        pool.force_promote_authenticated(); // peer B: non-preferred
         assert_eq!(pool.authenticated_count(), 2);
 
         // Insert a non-preferred inbound peer.
@@ -1772,11 +1823,13 @@ mod tests {
         // Simulate the incoming preferred peer's pending reservation.
         pool.try_reserve();
 
-        // Pool is full — normal promotion should fail.
-        assert!(!pool.try_promote_to_authenticated());
-
         // Preferred peer eviction should succeed.
-        let evicted = OverlayManager::try_evict_non_preferred_for_inbound(&shared, &pool);
+        let candidate = candidate_info(
+            PeerId::from_bytes([9u8; 32]),
+            "10.0.0.1:11625".parse().unwrap(),
+            crate::connection::ConnectionDirection::Inbound,
+        );
+        let evicted = OverlayManager::try_accept_authenticated_peer(&candidate, &shared, &pool);
         assert!(evicted, "should evict a non-preferred peer for preferred");
 
         // The evicted peer should have received a shutdown message.
@@ -1801,7 +1854,7 @@ mod tests {
 
         let pool = Arc::new(ConnectionPool::new(1));
         pool.try_reserve();
-        pool.mark_authenticated();
+        pool.force_promote_authenticated();
         assert_eq!(pool.authenticated_count(), 1);
 
         // Insert an inbound peer that IS preferred.
@@ -1817,8 +1870,13 @@ mod tests {
         // Simulate the incoming preferred peer's pending reservation.
         pool.try_reserve();
 
+        let candidate = candidate_info(
+            PeerId::from_bytes([9u8; 32]),
+            "10.0.0.1:11625".parse().unwrap(),
+            crate::connection::ConnectionDirection::Inbound,
+        );
         // Eviction should fail — the only authenticated peer is preferred.
-        let evicted = OverlayManager::try_evict_non_preferred_for_inbound(&shared, &pool);
+        let evicted = OverlayManager::try_accept_authenticated_peer(&candidate, &shared, &pool);
         assert!(!evicted, "should not evict when all peers are preferred");
         assert_eq!(pool.authenticated_count(), 1);
     }
@@ -1833,7 +1891,7 @@ mod tests {
 
         let pool = Arc::new(ConnectionPool::new(1));
         pool.try_reserve();
-        pool.mark_authenticated();
+        pool.force_promote_authenticated();
 
         // Insert a non-preferred inbound peer.
         let np_id = PeerId::from_bytes([3u8; 32]);
@@ -1845,10 +1903,16 @@ mod tests {
             crate::connection::ConnectionDirection::Inbound,
         );
 
-        // try_promote fails (pool full) and non-preferred peer should NOT evict.
-        assert!(!pool.try_promote_to_authenticated());
-        // (The caller in handle_accepted_inbound_peer only calls eviction for
-        // preferred peers — this test verifies the pool correctly rejects.)
+        pool.try_reserve();
+        let candidate = candidate_info(
+            PeerId::from_bytes([9u8; 32]),
+            "10.0.0.99:11625".parse().unwrap(),
+            crate::connection::ConnectionDirection::Inbound,
+        );
+        assert!(
+            !OverlayManager::try_accept_authenticated_peer(&candidate, &shared, &pool),
+            "non-preferred peer should not evict"
+        );
     }
 
     /// Outbound non-preferred peers must not be evicted when making room for
@@ -1862,7 +1926,7 @@ mod tests {
 
         let pool = Arc::new(ConnectionPool::new(1));
         pool.try_reserve();
-        pool.mark_authenticated();
+        pool.force_promote_authenticated();
 
         // Insert a non-preferred OUTBOUND peer — should not be evictable.
         let outbound_id = PeerId::from_bytes([4u8; 32]);
@@ -1877,12 +1941,216 @@ mod tests {
         // Simulate the incoming preferred peer's pending reservation.
         pool.try_reserve();
 
+        let candidate = candidate_info(
+            PeerId::from_bytes([9u8; 32]),
+            "10.0.0.1:11625".parse().unwrap(),
+            crate::connection::ConnectionDirection::Inbound,
+        );
         // Eviction should fail — the only peer in the cache is outbound.
-        let evicted = OverlayManager::try_evict_non_preferred_for_inbound(&shared, &pool);
+        let evicted = OverlayManager::try_accept_authenticated_peer(&candidate, &shared, &pool);
         assert!(
             !evicted,
             "should not evict outbound peers for inbound admission"
         );
+    }
+
+    #[tokio::test]
+    async fn test_preferred_outbound_admission_evicts_non_preferred_outbound() {
+        use crate::connection::{ConnectionDirection, ConnectionPool};
+
+        let shared = test_shared_state(vec![PeerAddress::new("10.0.0.1", 11625)]);
+        let pool = Arc::new(ConnectionPool::new(1));
+        pool.try_reserve();
+        pool.force_promote_authenticated();
+
+        let victim_id = PeerId::from_bytes([4u8; 32]);
+        let mut victim_rx = insert_fake_peer(
+            &shared,
+            victim_id,
+            "10.0.0.99:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+
+        pool.try_reserve();
+        let candidate = candidate_info(
+            PeerId::from_bytes([9u8; 32]),
+            "10.0.0.1:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+
+        assert!(OverlayManager::try_accept_authenticated_peer(
+            &candidate, &shared, &pool
+        ));
+        assert!(
+            victim_rx.try_recv().is_ok(),
+            "outbound victim should receive error-and-drop"
+        );
+        assert_eq!(pool.authenticated_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_preferred_outbound_admission_reserves_victim_once() {
+        use crate::connection::{ConnectionDirection, ConnectionPool};
+
+        let shared = test_shared_state(vec![
+            PeerAddress::new("10.0.0.1", 11625),
+            PeerAddress::new("10.0.0.2", 11625),
+        ]);
+        let pool = Arc::new(ConnectionPool::new(1));
+        pool.try_reserve();
+        pool.force_promote_authenticated();
+        let victim_id = PeerId::from_bytes([4u8; 32]);
+        let _victim_rx = insert_fake_peer(
+            &shared,
+            victim_id,
+            "10.0.0.99:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+
+        pool.try_reserve();
+        let first = candidate_info(
+            PeerId::from_bytes([9u8; 32]),
+            "10.0.0.1:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+        assert!(OverlayManager::try_accept_authenticated_peer(
+            &first, &shared, &pool
+        ));
+
+        pool.try_reserve();
+        let second = candidate_info(
+            PeerId::from_bytes([8u8; 32]),
+            "10.0.0.2:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+        assert!(
+            !OverlayManager::try_accept_authenticated_peer(&second, &shared, &pool),
+            "already-evicting victim must not be selected twice"
+        );
+        assert_eq!(pool.authenticated_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_admission_cleanup_clears_evicting_marker() {
+        use crate::connection::{ConnectionDirection, ConnectionPool};
+
+        let shared = test_shared_state(vec![PeerAddress::new("10.0.0.1", 11625)]);
+        let pool = Arc::new(ConnectionPool::new(1));
+        pool.try_reserve();
+        pool.force_promote_authenticated();
+        let victim_id = PeerId::from_bytes([4u8; 32]);
+        let _victim_rx = insert_fake_peer(
+            &shared,
+            victim_id.clone(),
+            "10.0.0.99:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+
+        pool.try_reserve();
+        let candidate = candidate_info(
+            PeerId::from_bytes([9u8; 32]),
+            "10.0.0.1:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+        assert!(OverlayManager::try_accept_authenticated_peer(
+            &candidate, &shared, &pool
+        ));
+        assert!(shared.admission_state.lock().is_evicting(&victim_id));
+        shared.cleanup_peer(&victim_id);
+        assert!(!shared.admission_state.lock().is_evicting(&victim_id));
+    }
+
+    #[tokio::test]
+    async fn test_preferred_outbound_admission_uses_peer_id_order() {
+        use crate::connection::{ConnectionDirection, ConnectionPool};
+
+        let shared = test_shared_state(vec![PeerAddress::new("10.0.0.1", 11625)]);
+        let pool = Arc::new(ConnectionPool::new(3));
+        let mut receivers = Vec::new();
+        for byte in [9u8, 1, 5] {
+            pool.try_reserve();
+            pool.force_promote_authenticated();
+            let id = PeerId::from_bytes([byte; 32]);
+            let rx = insert_fake_peer(
+                &shared,
+                id,
+                format!("10.0.1.{byte}:11625").parse().unwrap(),
+                ConnectionDirection::Outbound,
+            );
+            receivers.push((byte, rx));
+        }
+
+        pool.try_reserve();
+        let candidate = candidate_info(
+            PeerId::from_bytes([99u8; 32]),
+            "10.0.0.1:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+        assert!(OverlayManager::try_accept_authenticated_peer(
+            &candidate, &shared, &pool
+        ));
+
+        for (byte, mut rx) in receivers {
+            if byte == 1 {
+                assert!(rx.try_recv().is_ok(), "lowest PeerId should be evicted");
+            } else {
+                assert!(
+                    rx.try_recv().is_err(),
+                    "higher PeerId should not be evicted"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_all_preferred_outbound_peers_block_eviction() {
+        use crate::connection::{ConnectionDirection, ConnectionPool};
+
+        let shared = test_shared_state(vec![
+            PeerAddress::new("10.0.0.1", 11625),
+            PeerAddress::new("10.0.0.2", 11625),
+        ]);
+        let pool = Arc::new(ConnectionPool::new(1));
+        pool.try_reserve();
+        pool.force_promote_authenticated();
+        let _rx = insert_fake_peer(
+            &shared,
+            PeerId::from_bytes([4u8; 32]),
+            "10.0.0.2:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+
+        pool.try_reserve();
+        let candidate = candidate_info(
+            PeerId::from_bytes([9u8; 32]),
+            "10.0.0.1:11625".parse().unwrap(),
+            ConnectionDirection::Outbound,
+        );
+
+        assert!(
+            !OverlayManager::try_accept_authenticated_peer(&candidate, &shared, &pool),
+            "preferred peer should not evict another preferred outbound peer"
+        );
+        assert_eq!(pool.authenticated_count(), 1);
+    }
+
+    #[test]
+    fn test_shared_preferred_state_updates_for_admission() {
+        let shared = test_shared_state(vec![PeerAddress::new("validator.example", 11625)]);
+        let candidate = candidate_info(
+            PeerId::from_bytes([9u8; 32]),
+            "10.0.0.42:11625".parse().unwrap(),
+            crate::connection::ConnectionDirection::Inbound,
+        );
+        assert!(!shared.preferred_peers.read().is_preferred(&candidate));
+
+        let updated = shared
+            .preferred_peers
+            .read()
+            .with_resolved(vec![PeerAddress::new("10.0.0.42", 11625)]);
+        *shared.preferred_peers.write() = updated;
+
+        assert!(shared.preferred_peers.read().is_preferred(&candidate));
     }
 
     /// Regression test for AUDIT-086: targeted sends of flow-controlled messages
@@ -1976,7 +2244,8 @@ mod tests {
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
-            preferred_peers: Arc::new(PreferredPeerSet::from_config(Vec::new())),
+            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(Vec::new()))),
+            admission_state: Arc::new(Mutex::new(AdmissionState::default())),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             metrics: Arc::new(OverlayMetrics::new()),
@@ -2056,7 +2325,8 @@ mod tests {
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
-            preferred_peers: Arc::new(PreferredPeerSet::from_config(Vec::new())),
+            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(Vec::new()))),
+            admission_state: Arc::new(Mutex::new(AdmissionState::default())),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             metrics: Arc::new(OverlayMetrics::new()),
@@ -2575,7 +2845,7 @@ mod tests {
             .get(&PeerId::from_bytes([1u8; 32]))
             .unwrap();
         assert!(
-            shared.preferred_peers.is_preferred(info.value()),
+            shared.preferred_peers.read().is_preferred(info.value()),
             "shared preferred_peers set should recognize the peer"
         );
     }

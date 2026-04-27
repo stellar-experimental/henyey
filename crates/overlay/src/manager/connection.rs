@@ -43,6 +43,83 @@ fn push_peer_handle(handles: &RwLock<Vec<JoinHandle<()>>>, handle: JoinHandle<()
 }
 
 impl OverlayManager {
+    /// Promote a handshaken peer to authenticated, evicting one non-preferred
+    /// peer in the same direction for preferred peers when authenticated slots
+    /// are full.
+    ///
+    /// This is deliberately synchronous: admission state and pool counters are
+    /// updated under one short critical section, and no async I/O happens while
+    /// holding the admission lock.
+    pub(super) fn try_accept_authenticated_peer(
+        peer_info: &PeerInfo,
+        shared: &SharedPeerState,
+        pool: &ConnectionPool,
+    ) -> bool {
+        let mut admission = shared.admission_state.lock();
+
+        if pool.try_promote_to_authenticated() {
+            return true;
+        }
+
+        let preferred = shared.preferred_peers.read();
+        if !preferred.is_preferred(peer_info) {
+            return false;
+        }
+
+        let direction = peer_info.direction;
+        let mut candidates: Vec<PeerId> = shared
+            .peer_info_cache
+            .iter()
+            .filter_map(|entry| {
+                let candidate_id = entry.key();
+                let candidate_info = entry.value();
+                if candidate_info.direction != direction {
+                    return None;
+                }
+                if preferred.is_preferred(candidate_info) {
+                    return None;
+                }
+                if admission.is_evicting(candidate_id) {
+                    return None;
+                }
+                if !shared.peers.contains_key(candidate_id) {
+                    return None;
+                }
+                Some(candidate_id.clone())
+            })
+            .collect();
+        candidates.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+        for victim_id in candidates {
+            if let Some(entry) = shared.peers.get(&victim_id) {
+                info!(
+                    "Evicting non-preferred {:?} peer {} for preferred peer {}",
+                    direction, victim_id, peer_info.peer_id
+                );
+                admission.mark_evicting(victim_id.clone());
+                super::peer_loop::send_error_and_drop(
+                    &victim_id,
+                    &entry.value().outbound_tx,
+                    ErrorCode::Load,
+                    "preferred peer selected instead",
+                );
+                pool.force_promote_authenticated();
+                return true;
+            }
+        }
+
+        false
+    }
+
+    async fn reject_authenticated_load(peer: &mut Peer, shared: &SharedPeerState) {
+        let err_msg = make_error_msg(ErrorCode::Load, "peer rejected");
+        match peer.send(err_msg).await {
+            Ok(()) => shared.metrics.messages_written.inc(),
+            Err(_) => shared.metrics.errors_write.inc(),
+        }
+        peer.close().await;
+    }
+
     /// Create a PeerHandle (outbound channel + FlowControl) and atomically
     /// register the peer in the shared maps. Returns the receiver and
     /// FlowControl needed by `run_peer_loop`, or `Err` if a peer with the
@@ -147,24 +224,8 @@ impl OverlayManager {
         // This ensures crawlers and other peers get topology data even when rejected.
         Self::send_peers_to_inbound_peer(&mut peer, &peer_id, &peer_info, &shared).await;
 
-        // Determine if this peer is preferred (by address).
-        // Uses PreferredPeerSet for both hostname config entries and resolved IPs,
-        // fixing the bug where hostname-based preferred peers were never matched
-        // for inbound connections (which lack original_address).
-        let is_preferred = shared.preferred_peers.is_preferred(&peer_info);
-
-        // Try to promote to authenticated.
-        // Matches stellar-core acceptAuthenticatedPeer (OverlayManagerImpl.cpp:208).
-        let promoted = if pool.try_promote_to_authenticated() {
-            // Room available — promoted directly.
-            true
-        } else if is_preferred {
-            // Preferred peer but no room — try to evict a non-preferred peer.
-            // Matches stellar-core (OverlayManagerImpl.cpp:222-235).
-            Self::try_evict_non_preferred_for_inbound(&shared, &pool)
-        } else {
-            false
-        };
+        let is_preferred = shared.preferred_peers.read().is_preferred(&peer_info);
+        let promoted = Self::try_accept_authenticated_peer(&peer_info, &shared, &pool);
 
         if !promoted {
             let reason = if is_preferred {
@@ -176,12 +237,7 @@ impl OverlayManager {
                 "Inbound authenticated peer {} rejected because {}",
                 peer_id, reason
             );
-            let err_msg = make_error_msg(ErrorCode::Load, "peer rejected");
-            match peer.send(err_msg).await {
-                Ok(()) => shared.metrics.messages_written.inc(),
-                Err(_) => shared.metrics.errors_write.inc(),
-            }
-            peer.close().await;
+            Self::reject_authenticated_load(&mut peer, &shared).await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
             return;
@@ -222,53 +278,6 @@ impl OverlayManager {
 
         shared.cleanup_peer(&peer_id);
         pool.release_authenticated();
-    }
-
-    /// Try to evict a non-preferred authenticated inbound peer to make room for
-    /// a preferred peer. Returns true if eviction succeeded and the pool slot
-    /// was claimed.
-    ///
-    /// Matches stellar-core acceptAuthenticatedPeer (OverlayManagerImpl.cpp:222-235):
-    /// iterates authenticated peers, finds first non-preferred, sends ERR_LOAD.
-    pub(super) fn try_evict_non_preferred_for_inbound(
-        shared: &SharedPeerState,
-        pool: &Arc<ConnectionPool>,
-    ) -> bool {
-        // Find a non-preferred authenticated peer to evict.
-        let victim = shared.peer_info_cache.iter().find_map(|entry| {
-            let info = entry.value();
-            // Only consider inbound peers for inbound eviction.
-            if info.direction.we_called_remote() {
-                return None;
-            }
-            let is_preferred = shared.preferred_peers.is_preferred(info);
-            if is_preferred {
-                return None;
-            }
-            Some(entry.key().clone())
-        });
-
-        if let Some(victim_id) = victim {
-            info!(
-                "Evicting non-preferred inbound peer {} for preferred peer",
-                victim_id
-            );
-            if let Some(entry) = shared.peers.get(&victim_id) {
-                super::peer_loop::send_error_and_drop(
-                    &victim_id,
-                    &entry.value().outbound_tx,
-                    ErrorCode::Load,
-                    "preferred peer selected instead",
-                );
-            }
-            // Force-promote the new peer. The evicted peer's slot will be
-            // released asynchronously when its task exits, temporarily
-            // exceeding max_connections by 1 — this is acceptable.
-            pool.mark_authenticated();
-            true
-        } else {
-            false
-        }
     }
 
     /// Start the connection listener.
@@ -388,7 +397,7 @@ impl OverlayManager {
         };
 
         let pending_peer_ids = Some(Arc::clone(&shared.pending_connections.by_peer_id));
-        let peer = match Peer::connect_with_connection(
+        let mut peer = match Peer::connect_with_connection(
             &addr,
             connection,
             local_node,
@@ -416,6 +425,7 @@ impl OverlayManager {
         // Reject banned peers (mirrors connect_outbound_inner).
         if shared.banned_peers.read().contains(&peer_id) {
             debug!("Rejected banned discovered peer {} at {}", peer_id, addr);
+            peer.close().await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
             return;
@@ -424,23 +434,31 @@ impl OverlayManager {
         // Reject peers we're already connected to (mirrors connect_outbound_inner).
         if shared.peers.contains_key(&peer_id) {
             debug!("Rejected duplicate discovered peer {} at {}", peer_id, addr);
+            peer.close().await;
+            shared.pending_connections.release_peer_id(&peer_id);
+            pool.release_pending();
+            return;
+        }
+
+        let peer_info = peer.info().clone();
+        if !Self::try_accept_authenticated_peer(&peer_info, &shared, &pool) {
+            info!(
+                "Outbound discovered peer {} rejected because all available slots are taken",
+                peer_id
+            );
+            Self::reject_authenticated_load(&mut peer, &shared).await;
             shared.pending_connections.release_peer_id(&peer_id);
             pool.release_pending();
             return;
         }
 
         info!("Connected to discovered peer: {} at {}", peer_id, addr);
-        pool.mark_authenticated();
-        shared
-            .send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
-            .await;
-
-        let peer_info = peer.info().clone();
         let (outbound_rx, flow_control) =
             match Self::register_peer(&peer, &peer_id, peer_info, &shared) {
                 Ok(result) => result,
                 Err(_) => {
                     debug!("Rejected duplicate discovered peer {} (race)", peer_id);
+                    peer.close().await;
                     shared.pending_connections.release_peer_id(&peer_id);
                     pool.release_authenticated();
                     return;
@@ -448,6 +466,9 @@ impl OverlayManager {
             };
 
         shared.pending_connections.release_peer_id(&peer_id);
+        shared
+            .send_peer_event(PeerEvent::Connected(addr.clone(), PeerType::Outbound))
+            .await;
 
         // NOTE: Do NOT send PEERS to outbound peers — see Peer.cpp:1225-1230.
 
@@ -599,7 +620,7 @@ pub(super) async fn connect_to_explicit_peer(
     };
 
     let pending_peer_ids = Some(Arc::clone(&shared.pending_connections.by_peer_id));
-    let peer = match Peer::connect_with_connection(
+    let mut peer = match Peer::connect_with_connection(
         addr,
         connection,
         local_node,
@@ -624,26 +645,39 @@ pub(super) async fn connect_to_explicit_peer(
     shared.pending_connections.release_address(&addr_key);
 
     if shared.banned_peers.read().contains(&peer_id) {
+        peer.close().await;
         pool.release_pending();
         return Err(OverlayError::PeerBanned(peer_id.to_string()));
     }
 
     if shared.peers.contains_key(&peer_id) {
+        peer.close().await;
         shared.pending_connections.release_peer_id(&peer_id);
         pool.release_pending();
         return Err(OverlayError::AlreadyConnected);
     }
 
-    // Handshake succeeded: promote from pending to authenticated
-    pool.mark_authenticated();
-    info!("Connected to peer: {} at {}", peer_id, addr);
-
     let peer_info = peer.info().clone();
+    if !OverlayManager::try_accept_authenticated_peer(&peer_info, &shared, &pool) {
+        info!(
+            "Outbound peer {} rejected because all available slots are taken",
+            peer_id
+        );
+        OverlayManager::reject_authenticated_load(&mut peer, &shared).await;
+        shared.pending_connections.release_peer_id(&peer_id);
+        pool.release_pending();
+        return Err(OverlayError::Internal(
+            "peer rejected due to load".to_string(),
+        ));
+    }
+
+    info!("Connected to peer: {} at {}", peer_id, addr);
     let (outbound_rx, flow_control) =
         match OverlayManager::register_peer(&peer, &peer_id, peer_info, &shared) {
             Ok(result) => result,
             Err(e) => {
                 debug!("Rejected duplicate peer {} (race)", peer_id);
+                peer.close().await;
                 shared.pending_connections.release_peer_id(&peer_id);
                 pool.release_authenticated();
                 return Err(e);
