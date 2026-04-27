@@ -786,58 +786,6 @@
       }
     },
     {
-      "id": 800,
-      "type": "timeseries",
-      "title": "SCP First-to-Self Externalize Lag",
-      "description": "Time from first observed EXTERNALIZE (any node) to self-externalize. Apples-to-apples between henyey and stellar-core (both measure propagation-lag, ~0.3-0.5s healthy). See #1975 — the 'SCP Externalize Time' panel above compares different metrics (henyey slot-cycle vs core propagation-lag) and overstates the henyey-vs-core gap.",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 39 },
-      "datasource": { "type": "prometheus", "uid": "000000001" },
-      "targets": [
-        {
-          "expr": "stellar_scp_timing_first_to_self_externalize_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
-          "legendFormat": "Henyey",
-          "refId": "A"
-        },
-        {
-          "expr": "rate(stellar_core_scp_timing_first_to_self_externalize_lag_sum{instance=~\"$core_instance\"}[$__rate_interval]) / rate(stellar_core_scp_timing_first_to_self_externalize_lag_count{instance=~\"$core_instance\"}[$__rate_interval])",
-          "legendFormat": "Core avg",
-          "refId": "B"
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "color": { "mode": "palette-classic" },
-          "custom": {
-            "lineWidth": 1,
-            "fillOpacity": 10,
-            "drawStyle": "line",
-            "pointSize": 5,
-            "showPoints": "auto",
-            "spanNulls": false
-          }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
-            "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
-            ]
-          },
-          {
-            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
-            "properties": [
-              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": { "displayMode": "list", "placement": "bottom" },
-        "tooltip": { "mode": "multi", "sort": "none" }
-      }
-    },
-    {
       "id": 23,
       "type": "timeseries",
       "title": "SCP Nominate Time",
@@ -967,10 +915,64 @@
     },
 
     {
+      "id": 25,
+      "type": "timeseries",
+      "title": "SCP First-to-Self Externalize Lag",
+      "description": "Time from first observed EXTERNALIZE (any node) to self-externalize. Apples-to-apples propagation-lag comparison. Core is typically ~1ms (well-connected SDF validator); henyey is higher. Note: scale differs significantly between the two.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 47 },
+      "datasource": { "type": "prometheus", "uid": "000000001" },
+      "targets": [
+        {
+          "expr": "stellar_scp_timing_first_to_self_externalize_seconds{job=\"henyey\", instance=~\"$henyey_instance\"}",
+          "legendFormat": "Henyey",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(stellar_core_scp_timing_first_to_self_externalize_lag_seconds_sum{instance=~\"$core_instance\"}[$__rate_interval]) / rate(stellar_core_scp_timing_first_to_self_externalize_lag_seconds_count{instance=~\"$core_instance\"}[$__rate_interval])",
+          "legendFormat": "Core avg",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "pointSize": 5,
+            "showPoints": "auto",
+            "spanNulls": false,
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "/Henyey.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1F77B4" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "/Core.*/" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#FF7F0E" } },
+              { "id": "custom.axisPlacement", "value": "right" }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      }
+    },
+    {
       "type": "row",
       "title": "Overlay / Network",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 47 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 55 },
       "id": 400,
       "panels": []
     },
@@ -979,7 +981,7 @@
       "type": "timeseries",
       "title": "Authenticated Peers (Inbound / Outbound)",
       "description": "Authenticated peer connections. Solid lines = inbound, dashed = outbound.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
       "datasource": { "type": "prometheus", "uid": "000000001" },
       "targets": [
         {
@@ -1054,7 +1056,7 @@
       "type": "timeseries",
       "title": "Message Read / Write Rate",
       "description": "Overlay message rates (henyey only — core uses different metric structure for overlay messages).",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
       "datasource": { "type": "prometheus", "uid": "000000001" },
       "targets": [
         {
@@ -1098,7 +1100,7 @@
       "type": "row",
       "title": "Bucket Merges",
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 64 },
       "id": 500,
       "panels": []
     },
@@ -1107,7 +1109,7 @@
       "type": "timeseries",
       "title": "Bucket Merge Rate",
       "description": "Rate of completed bucket merges.",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 65 },
       "datasource": { "type": "prometheus", "uid": "000000001" },
       "targets": [
         {
@@ -1159,7 +1161,7 @@
       "type": "timeseries",
       "title": "Bucket Merge Time",
       "description": "Time spent in bucket merges. Henyey: counter in us. Core: summary in seconds.",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 65 },
       "datasource": { "type": "prometheus", "uid": "000000001" },
       "targets": [
         {
@@ -1211,7 +1213,7 @@
       "type": "row",
       "title": "Henyey-Only: Close Phase Breakdown",
       "collapsed": true,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 65 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 73 },
       "id": 600,
       "panels": [
         {
@@ -1219,7 +1221,7 @@
           "type": "timeseries",
           "title": "Close Phase Breakdown (avg per close)",
           "description": "Stacked average time per close phase. Henyey-only — no core equivalent.",
-          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 66 },
+          "gridPos": { "h": 10, "w": 24, "x": 0, "y": 74 },
           "datasource": { "type": "prometheus", "uid": "000000001" },
           "targets": [
             {
@@ -1295,14 +1297,14 @@
       "type": "row",
       "title": "Henyey-Only: SCP Verify Pipeline",
       "collapsed": true,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 66 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 74 },
       "id": 700,
       "panels": [
         {
           "id": 60,
           "type": "timeseries",
           "title": "Verify Backlogs",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 67 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 75 },
           "datasource": { "type": "prometheus", "uid": "000000001" },
           "targets": [
             {
@@ -1338,7 +1340,7 @@
           "id": 61,
           "type": "timeseries",
           "title": "Verify Latency (avg us)",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 67 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 75 },
           "datasource": { "type": "prometheus", "uid": "000000001" },
           "targets": [
             {
@@ -1373,14 +1375,14 @@
       "type": "row",
       "title": "Henyey-Only: Memory & Process",
       "collapsed": true,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 67 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 75 },
       "id": 800,
       "panels": [
         {
           "id": 70,
           "type": "timeseries",
           "title": "Jemalloc Memory",
-          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 76 },
           "datasource": { "type": "prometheus", "uid": "000000001" },
           "targets": [
             {
@@ -1422,7 +1424,7 @@
           "id": 71,
           "type": "timeseries",
           "title": "Herder Drift",
-          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 76 },
           "datasource": { "type": "prometheus", "uid": "000000001" },
           "targets": [
             {
