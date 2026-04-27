@@ -849,6 +849,36 @@ deadline (15m populated / 4h fresh-start) but is not closing ledgers in
 real-time — this is a bug that requires immediate investigation AND
 filing/commenting on a GitHub issue (label `urgent` since SYNC FAILURE blocks consensus).
 
+### Tick history capture
+
+After emitting the status report (and before self-reflection), append a
+single JSON line to `/home/tomer/data/$MONITOR_SESSION_ID/tick-history.jsonl`
+so `/daily-summary` can aggregate the last 24h of ticks:
+
+```bash
+HIST=/home/tomer/data/$MONITOR_SESSION_ID/tick-history.jsonl
+python3 - <<PY >> "$HIST"
+import json
+print(json.dumps({
+  "ts":           "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "status":       "<OK|WARNING|ACTION|OFFLINE>",
+  "ledger":       <current-ledger-int>,
+  "build":        "<short-sha>",
+  "deploys":      <0 or 1>,
+  "warnings":     [<list of metric names that breached>],
+  "actions":      [<list of action keywords: restart, deploy, filed-#N>],
+  "self_reflect": "<clean | fixed-inline | filed-#N>",
+  "watch":        ["<key>=<value>", ...]
+}))
+PY
+```
+
+`watch` carries multi-tick non-incident concerns the daily summary should
+surface — examples: `pruning_gap=2451`, `frag_pct=18`, `disk_pct=72`. Add
+a key whenever the tick body called out a value worth tracking but did
+not file an issue. Each entry MUST be one line — the daily-summary
+aggregator parses with `for ln in f: json.loads(ln)`.
+
 ## Self-reflection
 
 After the status report is emitted, look back at THIS tick's output and
