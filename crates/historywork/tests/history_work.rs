@@ -101,8 +101,9 @@ async fn test_history_work_chain() {
     let tx_result_hash = Hash256::hash(&tx_result_xdr);
 
     let header = make_header(checkpoint, Hash256::ZERO, tx_set_hash, tx_result_hash);
+    let header_hash = verify::compute_header_hash(&header).expect("header hash");
     let header_entry = LedgerHeaderHistoryEntry {
-        hash: Hash([0u8; 32]),
+        hash: header_hash.into(),
         header,
         ext: LedgerHeaderHistoryEntryExt::default(),
     };
