@@ -1,7 +1,13 @@
-//! Ledger sequence arithmetic for Soroban TTL targets.
+//! Ledger sequence arithmetic for Soroban TTL targets on **consensus paths** (operation apply
+//! and invoke-host archived restore).
 //!
 //! stellar-core uses unchecked `uint32_t` math for these expressions. Rust must use
-//! [`u32::wrapping_add`] / [`u32::wrapping_sub`] for parity (see issue #1951).
+//! [`u32::wrapping_add`] / [`u32::wrapping_sub`] for parity (issue #1951).
+//!
+//! Note: plain `u32 + u32` in Rust also wraps on overflow in release builds; the consensus bug
+//! class was saturating arithmetic (wrong result) and/or **debug-overflow panics** from non-wrapping
+//! ops in test builds. RPC restore *simulation* intentionally does not use these helpers — it uses
+//! soroban-host checked TTL helpers to match soroban-simulation (RPC `simulate_restore_op`).
 
 /// Target live-until ledger for ExtendFootprintTtl (`ledgerSeq + extendTo`).
 ///

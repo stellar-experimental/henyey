@@ -853,6 +853,8 @@ fn prepare_footprint_entries(
                 };
 
                 if is_actually_archived {
+                    // Use explicit wrapping (not `sequence + ttl - 1`): matches stellar-core
+                    // `uint32_t` and avoids debug-overflow panics from naive `u32` math.
                     let restored_live_until = Some(super::ttl::restore_ttl_target(
                         context.sequence,
                         soroban_config.min_persistent_entry_ttl,
