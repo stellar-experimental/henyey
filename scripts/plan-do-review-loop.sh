@@ -8,10 +8,12 @@
 #   LOOP_MODEL=claude-opus-4.6 ./scripts/plan-do-review-loop.sh
 #
 # Env vars:
-#   LOOP_MODEL         AI model passed to copilot (default: claude-opus-4.6)
-#   LOOP_EMPTY_SLEEP   Seconds to sleep when no issues found (default: 60)
-#   LOOP_BETWEEN_SLEEP Seconds to sleep between successful runs (default: 60)
-#   LOOP_LOG_DIR       Directory for per-run logs (default: ~/data/plan-do-review-loop)
+#   LOOP_MODEL              AI model passed to copilot (default: claude-opus-4.6)
+#   LOOP_EMPTY_SLEEP        Seconds to sleep when no issues found (default: 60)
+#   LOOP_BETWEEN_SLEEP      Seconds to sleep between successful runs (default: 60)
+#   LOOP_LOG_DIR            Directory for per-run logs (default: ~/data/plan-do-review-loop)
+#   LOOP_MAX_STALE_RETRIES  Max consecutive no-progress attempts before marking
+#                           an issue as failed (default: 5)
 
 set -euo pipefail
 
@@ -19,6 +21,7 @@ LOOP_MODEL="${LOOP_MODEL:-claude-opus-4.6}"
 LOOP_EMPTY_SLEEP="${LOOP_EMPTY_SLEEP:-60}"
 LOOP_BETWEEN_SLEEP="${LOOP_BETWEEN_SLEEP:-60}"
 LOOP_LOG_DIR="${LOOP_LOG_DIR:-$HOME/data/plan-do-review-loop}"
+LOOP_MAX_STALE_RETRIES="${LOOP_MAX_STALE_RETRIES:-5}"
 
 log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
 
@@ -40,6 +43,7 @@ log "=== plan-do-review-loop ==="
 log "Model:     $LOOP_MODEL"
 log "Empty sleep: ${LOOP_EMPTY_SLEEP}s"
 log "Between sleep: ${LOOP_BETWEEN_SLEEP}s"
+log "Max stale retries: ${LOOP_MAX_STALE_RETRIES}"
 log "Log dir:   $LOOP_LOG_DIR"
 
 # --- Issue selection ---
@@ -124,6 +128,78 @@ mark_failed() {
     gh issue edit "$issue" --remove-assignee "$me" 2>/dev/null \
       || log "WARNING: could not unassign ${me} from issue #${issue}"
   fi
+  rm -f "$LOOP_LOG_DIR/.progress-${issue}"
+}
+
+# Count issue comments matching plan-do-review progress markers.
+# Returns a fingerprint (comment count) that changes when the skill makes
+# forward progress (new proposal draft, critic response, converged proposal,
+# review-fix report, implementation complete, not-ready triage, redirect).
+count_progress_markers() {
+  local issue="$1"
+  gh issue view "$issue" --json comments \
+    --jq '[.comments[].body | select(
+      test("Proposal Draft|Critic Response|Converged Proposal|Review-Fix Report|Implementation Complete|Marking as not-ready|⏩ This issue is blocked")
+    )] | length' 2>/dev/null || echo "0"
+}
+
+# Check whether the issue reached a terminal state (no further retries needed).
+# Terminal states: closed, labeled not-ready, unassigned (redirect/triage).
+is_terminal() {
+  local issue="$1"
+  local json
+  json="$(gh issue view "$issue" --json state,labels,assignees 2>/dev/null)" || return 1
+
+  local state
+  state="$(jq -r '.state' <<<"$json")"
+  [[ "$state" == "CLOSED" ]] && return 0
+
+  # not-ready label means triage decided it's not actionable
+  local has_not_ready
+  has_not_ready="$(jq -r '[.labels[].name] | any(. == "not-ready")' <<<"$json")"
+  [[ "$has_not_ready" == "true" ]] && return 0
+
+  # Unassigned means the skill handed it off (redirect or triage)
+  local assignee_count
+  assignee_count="$(jq -r '.assignees | length' <<<"$json")"
+  [[ "$assignee_count" == "0" ]] && return 0
+
+  return 1
+}
+
+# Check stale-retry tracking. Returns 0 if the issue should be retried,
+# 1 if it has exceeded LOOP_MAX_STALE_RETRIES without progress.
+check_stale_retries() {
+  local issue="$1"
+  local progress_file="$LOOP_LOG_DIR/.progress-${issue}"
+
+  local current_markers
+  current_markers="$(count_progress_markers "$issue")"
+
+  if [[ -f "$progress_file" ]]; then
+    local prev_markers prev_stale_count
+    prev_markers="$(sed -n '1p' "$progress_file")"
+    prev_stale_count="$(sed -n '2p' "$progress_file")"
+
+    if [[ "$current_markers" -gt "$prev_markers" ]]; then
+      # Progress was made — reset stale counter
+      log "Issue #${issue}: progress detected (markers: ${prev_markers} → ${current_markers}), resetting stale counter"
+      printf '%s\n%s\n' "$current_markers" "0" > "$progress_file"
+    else
+      # No progress — increment stale counter
+      local new_stale=$((prev_stale_count + 1))
+      log "Issue #${issue}: no progress (markers still ${current_markers}), stale attempt ${new_stale}/${LOOP_MAX_STALE_RETRIES}"
+      printf '%s\n%s\n' "$current_markers" "$new_stale" > "$progress_file"
+
+      if [[ "$new_stale" -ge "$LOOP_MAX_STALE_RETRIES" ]]; then
+        return 1  # exceeded max stale retries
+      fi
+    fi
+  else
+    # First attempt — initialize tracking
+    printf '%s\n%s\n' "$current_markers" "0" > "$progress_file"
+  fi
+  return 0
 }
 
 # --- Main loop ---
@@ -174,7 +250,8 @@ while true; do
     log "Assigned issue #${issue_number} to self (sole assignee)"
   fi
 
-  # Run copilot with the pre-selected issue number
+  # Run copilot with the pre-selected issue number.
+  # --autopilot enables autonomous continuation and context management.
   ts="$(date +%Y%m%d-%H%M%S)"
   logfile="$LOOP_LOG_DIR/${ts}-issue-${issue_number}.log"
   log "Starting copilot /plan-do-review ${issue_number} → $logfile"
@@ -182,6 +259,7 @@ while true; do
   set +e
   copilot \
     --model "$LOOP_MODEL" \
+    --autopilot \
     --allow-all-tools \
     --allow-all-paths \
     --log-dir "$LOOP_LOG_DIR/copilot-logs" \
@@ -192,9 +270,24 @@ while true; do
 
   if [[ "$rc" -ne 0 ]]; then
     log "copilot exited $rc for issue #${issue_number}"
-    mark_failed "$issue_number"
   else
     log "copilot exited 0 for issue #${issue_number}"
+  fi
+
+  # Brief pause for GitHub API consistency (auto-close may take a moment)
+  sleep 3
+
+  # Check if the issue reached a terminal state
+  if is_terminal "$issue_number"; then
+    log "Issue #${issue_number} reached terminal state (closed/triaged/redirected)"
+    rm -f "$LOOP_LOG_DIR/.progress-${issue_number}"
+  else
+    log "Issue #${issue_number} still open after copilot exit"
+    # Check stale-retry tracking
+    if ! check_stale_retries "$issue_number"; then
+      log "Issue #${issue_number} exceeded ${LOOP_MAX_STALE_RETRIES} consecutive stale retries — marking as failed"
+      mark_failed "$issue_number"
+    fi
   fi
 
   log "Sleeping ${LOOP_BETWEEN_SLEEP}s before next run…"
