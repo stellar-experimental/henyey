@@ -969,7 +969,7 @@ impl NominationProtocol {
         node_id: &NodeId,
     ) -> u64 {
         let is_local = node_id == ctx.local_node_id;
-        let weight = crate::driver::base_get_node_weight(node_id, quorum_set, is_local);
+        let weight = ctx.driver.get_node_weight(node_id, quorum_set, is_local);
         if weight == 0 {
             return 0;
         }
@@ -1071,7 +1071,9 @@ impl Default for NominationProtocol {
 mod tests {
     use super::*;
     use crate::driver::ValidationLevel;
-    use crate::test_utils::{make_node_id, make_quorum_set, make_value, MockDriver};
+    use crate::test_utils::{
+        make_node_id, make_quorum_set, make_value, MockDriver, MockDriverBuilder,
+    };
     use crate::SlotContext;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -2621,6 +2623,42 @@ mod tests {
         assert_eq!(
             nom.get_reporting_state(&peer, &local, false),
             crate::ReportingNodeState::Agree
+        );
+    }
+
+    /// Verifies that `get_node_priority` dispatches through the driver's
+    /// `get_node_weight` override rather than calling `base_get_node_weight`
+    /// directly. This is the core fix for issue #1957.
+    #[test]
+    fn test_get_node_priority_dispatches_through_driver() {
+        let node0 = make_node_id(0);
+        let node1 = make_node_id(1);
+        let qset = make_quorum_set(vec![node0.clone(), node1.clone()], 1);
+        let prev = make_value(&[0]);
+
+        // Custom driver: override weight to 0 → priority must be 0
+        let mut zero_weight_driver = MockDriverBuilder::new().quorum_set(qset.clone()).build();
+        zero_weight_driver.custom_node_weight = Some(0);
+        let zero_weight_driver = Arc::new(zero_weight_driver);
+        let ctx_zero = ctx!(&node0, &qset, &zero_weight_driver, 1);
+        let nom_zero = NominationProtocol::new();
+        let priority_zero = nom_zero.get_node_priority(&ctx_zero, &qset, &prev, &node1);
+
+        assert_eq!(priority_zero, 0, "zero weight must produce zero priority");
+
+        // Custom driver: override weight to u64::MAX → priority must differ from zero
+        let mut max_weight_driver = MockDriverBuilder::new().quorum_set(qset.clone()).build();
+        max_weight_driver.custom_node_weight = Some(u64::MAX);
+        let max_weight_driver = Arc::new(max_weight_driver);
+        let ctx_max = ctx!(&node0, &qset, &max_weight_driver, 1);
+        let nom_max = NominationProtocol::new();
+        let priority_max = nom_max.get_node_priority(&ctx_max, &qset, &prev, &node1);
+
+        // With u64::MAX weight, any hash value <= weight passes, so priority should be nonzero
+        // (MockDriver::compute_hash_node returns 1, which is <= u64::MAX).
+        assert_ne!(
+            priority_zero, priority_max,
+            "different custom weights must produce different priorities"
         );
     }
 }

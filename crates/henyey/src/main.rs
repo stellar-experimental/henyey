@@ -1158,6 +1158,7 @@ fn local_config() -> AppConfig {
                 inner_sets: vec![],
             },
             manual_close: false,
+            force_old_style_leader_election: false,
         },
         network: NetworkConfig {
             passphrase: "Standalone Network ; February 2017".to_string(),

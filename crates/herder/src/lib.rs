@@ -145,7 +145,8 @@ pub use pending::{PendingConfig, PendingEnvelopes, PendingResult, PendingStats};
 pub use quorum_tracker::{ExpandError, QuorumTracker, SlotQuorumTracker};
 pub use scp_driver::{
     CachedTxSet, ExternalizeTimingSnapshot, ExternalizedSlot, HerderScpCallback, PendingTxSet,
-    ScpDriver, ScpDriverCacheSizes, ScpDriverConfig, ValueValidation,
+    ScpDriver, ScpDriverCacheSizes, ScpDriverConfig, ValidatorEntryInfo, ValidatorQuality,
+    ValidatorWeightConfig, ValueValidation,
 };
 pub use state::HerderState;
 pub use tx_queue::{

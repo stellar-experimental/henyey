@@ -189,6 +189,16 @@ pub struct HerderConfig {
 
     /// Checkpoint frequency in ledgers (default 64, 8 for accelerated testing).
     pub checkpoint_frequency: u64,
+
+    /// Validator weight configuration for application-specific leader election
+    /// (protocol V22+). `None` when using manual quorum set or when quality
+    /// data is not available.
+    pub validator_weight_config: Option<crate::scp_driver::ValidatorWeightConfig>,
+
+    /// When true, always use the old quorum-position weight algorithm
+    /// regardless of protocol version. Matches stellar-core's
+    /// `FORCE_OLD_STYLE_LEADER_ELECTION`.
+    pub force_old_style_leader_election: bool,
 }
 
 const DEFAULT_MAX_EXTERNALIZED_SLOTS: usize = 12;
@@ -209,6 +219,8 @@ impl Default for HerderConfig {
             proposed_upgrades: Vec::new(),
             max_protocol_version: 25,
             checkpoint_frequency: DEFAULT_CHECKPOINT_FREQUENCY,
+            validator_weight_config: None,
+            force_old_style_leader_election: false,
         }
     }
 }
@@ -346,6 +358,8 @@ impl Herder {
             max_tx_set_cache: 10_000,
             max_time_drift: MAX_TIME_SLIP_SECONDS,
             local_quorum_set: config.local_quorum_set.clone(),
+            validator_weight_config: config.validator_weight_config.clone(),
+            force_old_style_leader_election: config.force_old_style_leader_election,
         };
 
         let tracking_state = Arc::new(RwLock::new(SharedTrackingState::default()));

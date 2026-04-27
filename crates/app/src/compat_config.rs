@@ -27,7 +27,8 @@
 use crate::config::{
     AppConfig, CompatHttpConfig, DatabaseConfig, HistoryArchiveEntry, HistoryConfig, HttpConfig,
 };
-use std::collections::HashSet;
+use henyey_herder::{ValidatorEntryInfo, ValidatorQuality, ValidatorWeightConfig};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Top-level keys that `translate_stellar_core_config` actively translates.
@@ -66,6 +67,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "HISTORY",
     "VALIDATORS",
     "QUORUM_SET",
+    "HOME_DOMAINS",
+    "FORCE_OLD_STYLE_LEADER_ELECTION",
 ];
 
 /// Valid stellar-core keys that henyey intentionally does not support.
@@ -79,7 +82,6 @@ const UNSUPPORTED_KNOWN_KEYS: &[&str] = &[
     "EXPERIMENTAL_BUCKETLIST_DB",
     "EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT",
     "EXPERIMENTAL_BUCKETLIST_DB_INDEX_CUTOFF",
-    "HOME_DOMAINS",
     "TARGET_PEER_CONNECTIONS",
     "MAX_ADDITIONAL_PEER_CONNECTIONS",
     "MAX_PENDING_CONNECTIONS",
@@ -96,8 +98,15 @@ const UNSUPPORTED_KNOWN_KEYS: &[&str] = &[
 ];
 
 /// Recognized keys within `[[VALIDATORS]]` entries.
-const VALIDATOR_SUPPORTED_KEYS: &[&str] = &["NAME", "PUBLIC_KEY", "ADDRESS", "HISTORY"];
-const VALIDATOR_UNSUPPORTED_KEYS: &[&str] = &["HOME_DOMAIN", "QUALITY"];
+const VALIDATOR_SUPPORTED_KEYS: &[&str] = &[
+    "NAME",
+    "PUBLIC_KEY",
+    "ADDRESS",
+    "HISTORY",
+    "HOME_DOMAIN",
+    "QUALITY",
+];
+const VALIDATOR_UNSUPPORTED_KEYS: &[&str] = &[];
 
 /// Recognized keys within `[QUORUM_SET]`.
 const QUORUM_SET_KEYS: &[&str] = &["THRESHOLD_PERCENT", "VALIDATORS"];
@@ -153,6 +162,9 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
     if let Some(v) = get_bool(table, "MANUAL_CLOSE") {
         config.node.manual_close = v;
+    }
+    if let Some(v) = get_bool(table, "FORCE_OLD_STYLE_LEADER_ELECTION") {
+        config.node.force_old_style_leader_election = v;
     }
     // NODE_HOME_DOMAIN
     if let Some(v) = get_str(table, "NODE_HOME_DOMAIN") {
@@ -334,6 +346,14 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     // --- Validators / quorum set ---
     // stellar-core uses [[VALIDATORS]] array-of-tables with NAME, PUBLIC_KEY, etc.
     // stellar-rpc typically generates these for captive-core configs.
+
+    // Parse [[HOME_DOMAINS]] first — validators may reference these for quality.
+    let domain_quality_map = parse_home_domains(table)?;
+
+    // Track validator metadata for building ValidatorWeightConfig later.
+    let mut validator_entries: Vec<(String, String, Option<String>, Option<String>)> = Vec::new(); // (pubkey, name, home_domain, quality)
+    let has_manual_quorum_set = table.contains_key("QUORUM_SET");
+
     if let Some(validators) = table.get("VALIDATORS").and_then(|v| v.as_array()) {
         let mut validator_keys = Vec::new();
         let mut validator_addresses = Vec::new();
@@ -345,7 +365,23 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
                     .ok_or_else(|| {
                         anyhow::anyhow!("[[VALIDATORS]] entry {} missing or invalid PUBLIC_KEY", i)
                     })?;
+                let name = val_table
+                    .get("NAME")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("validator")
+                    .to_string();
+                let home_domain = val_table
+                    .get("HOME_DOMAIN")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let quality_str = val_table
+                    .get("QUALITY")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
                 validator_keys.push(key.to_string());
+                validator_entries.push((key.to_string(), name.clone(), home_domain, quality_str));
+
                 // Extract ADDRESS for peer discovery (e.g., "core-testnet1.stellar.org")
                 if let Some(addr) = val_table.get("ADDRESS").and_then(|v| v.as_str()) {
                     let peer_addr = if addr.contains(':') {
@@ -358,11 +394,6 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
                 }
                 // Also extract inline HISTORY from validators
                 if let Some(hist_cmd) = val_table.get("HISTORY").and_then(|v| v.as_str()) {
-                    let name = val_table
-                        .get("NAME")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("validator")
-                        .to_string();
                     if let Some(url) = extract_url_from_curl_cmd(hist_cmd) {
                         config.history.archives.push(HistoryArchiveEntry {
                             name,
@@ -383,6 +414,15 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         if config.overlay.known_peers.is_empty() && !validator_addresses.is_empty() {
             config.overlay.known_peers = validator_addresses;
         }
+    }
+
+    // Build ValidatorWeightConfig when on the auto-generated quorum set path
+    // (not manual [QUORUM_SET]) and validators have quality/home_domain data.
+    // Matches stellar-core: setValidatorWeightConfig is only called on the
+    // auto-generated qset path (Config.cpp:2110).
+    if config.node.is_validator && !validator_entries.is_empty() && !has_manual_quorum_set {
+        config.validator_weight_config =
+            build_validator_weight_config(&config, &validator_entries, &domain_quality_map)?;
     }
 
     // --- Old-style [QUORUM_SET] (used by quickstart local mode) ---
@@ -545,6 +585,155 @@ fn classify_keys(table: &toml::map::Map<String, toml::Value>) -> UnrecognizedKey
     }
 
     result
+}
+
+/// Parse `[[HOME_DOMAINS]]` entries into a domain→quality map.
+///
+/// Matches stellar-core's HOME_DOMAINS parsing (Config.cpp:783-829).
+fn parse_home_domains(
+    table: &toml::map::Map<String, toml::Value>,
+) -> anyhow::Result<HashMap<String, ValidatorQuality>> {
+    let mut map = HashMap::new();
+    let Some(domains) = table.get("HOME_DOMAINS") else {
+        return Ok(map);
+    };
+    let arr = domains
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("HOME_DOMAINS must be an array of tables"))?;
+    for (i, entry) in arr.iter().enumerate() {
+        let entry_table = entry
+            .as_table()
+            .ok_or_else(|| anyhow::anyhow!("[[HOME_DOMAINS]] entry {} must be a table", i))?;
+        let domain = entry_table
+            .get("HOME_DOMAIN")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[HOME_DOMAINS]] entry {} missing HOME_DOMAIN", i))?
+            .to_string();
+        let quality_str = entry_table
+            .get("QUALITY")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("[[HOME_DOMAINS]] entry {} missing QUALITY", i))?;
+        let quality = ValidatorQuality::from_str(quality_str).ok_or_else(|| {
+            anyhow::anyhow!(
+                "[[HOME_DOMAINS]] entry {}: unknown QUALITY '{}'",
+                i,
+                quality_str
+            )
+        })?;
+        // Check for unknown fields
+        for key in entry_table.keys() {
+            if key != "HOME_DOMAIN" && key != "QUALITY" {
+                anyhow::bail!("Unknown field '{}' in [[HOME_DOMAINS]] entry {}", key, i);
+            }
+        }
+        if map.insert(domain.clone(), quality).is_some() {
+            anyhow::bail!("Duplicate HOME_DOMAINS entry for '{}'", domain);
+        }
+    }
+    Ok(map)
+}
+
+/// Build a `ValidatorWeightConfig` from parsed validator entries and domain→quality map.
+///
+/// Resolves each validator's quality from either inline QUALITY or the
+/// [[HOME_DOMAINS]] map. Adds a self-entry when the node is a validator.
+///
+/// Returns `Ok(None)` if validators don't have quality/home_domain data
+/// (e.g., captive-core configs without [[HOME_DOMAINS]]).
+fn build_validator_weight_config(
+    config: &AppConfig,
+    validator_entries: &[(String, String, Option<String>, Option<String>)], // (pubkey, name, home_domain, quality)
+    domain_quality_map: &HashMap<String, ValidatorQuality>,
+) -> anyhow::Result<Option<ValidatorWeightConfig>> {
+    use stellar_xdr::curr::NodeId;
+
+    let mut entries: Vec<(NodeId, ValidatorEntryInfo)> = Vec::new();
+
+    for (pubkey, name, home_domain, quality_str) in validator_entries {
+        // Resolve home domain
+        let Some(domain) = home_domain.as_deref() else {
+            // No home domain data — can't build weight config
+            return Ok(None);
+        };
+
+        // Resolve quality: inline QUALITY takes precedence over HOME_DOMAINS map
+        let quality = if let Some(qs) = quality_str {
+            ValidatorQuality::from_str(qs)
+                .ok_or_else(|| anyhow::anyhow!("Validator '{}': unknown QUALITY '{}'", name, qs))?
+        } else if let Some(q) = domain_quality_map.get(domain) {
+            *q
+        } else {
+            // No quality data available — can't build weight config
+            return Ok(None);
+        };
+
+        let node_id = parse_node_id(pubkey)?;
+        entries.push((
+            node_id,
+            ValidatorEntryInfo {
+                name: name.clone(),
+                home_domain: domain.to_string(),
+                quality,
+            },
+        ));
+    }
+
+    // Add self-entry (matches stellar-core's addSelfToValidators, Config.cpp:880-908).
+    // Self is added when NODE_IS_VALIDATOR and not the "empty validators + manual QUORUM_SET" case.
+    // The caller already checks those conditions.
+    if let Some(ref seed_str) = config.node.node_seed {
+        let node_home_domain = config.node.home_domain.as_deref().unwrap_or("");
+        if node_home_domain.is_empty() {
+            // NODE_HOME_DOMAIN is required when building validator weight config
+            tracing::debug!("NODE_HOME_DOMAIN not set, skipping ValidatorWeightConfig");
+            return Ok(None);
+        }
+
+        let quality = if let Some(q) = domain_quality_map.get(node_home_domain) {
+            *q
+        } else {
+            tracing::debug!(
+                domain = node_home_domain,
+                "NODE_HOME_DOMAIN not found in HOME_DOMAINS, skipping ValidatorWeightConfig"
+            );
+            return Ok(None);
+        };
+
+        let secret = henyey_crypto::SecretKey::from_strkey(seed_str)
+            .map_err(|e| anyhow::anyhow!("Invalid NODE_SEED for self-entry: {}", e))?;
+        let self_node_id = parse_node_id(&secret.public_key().to_strkey())?;
+        entries.push((
+            self_node_id,
+            ValidatorEntryInfo {
+                name: "self".to_string(),
+                home_domain: node_home_domain.to_string(),
+                quality,
+            },
+        ));
+    }
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    match ValidatorWeightConfig::new(&entries) {
+        Ok(vwc) => Ok(Some(vwc)),
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not build ValidatorWeightConfig, using base weights");
+            Ok(None)
+        }
+    }
+}
+
+/// Parse a public key string into a NodeId.
+fn parse_node_id(pubkey: &str) -> anyhow::Result<stellar_xdr::curr::NodeId> {
+    let pk = henyey_crypto::PublicKey::from_strkey(pubkey)
+        .map_err(|e| anyhow::anyhow!("Invalid public key '{}': {}", pubkey, e))?;
+    Ok(stellar_xdr::curr::NodeId(
+        stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+            *pk.as_bytes(),
+        )),
+    ))
 }
 
 /// Warn about unrecognized keys in a stellar-core format config.

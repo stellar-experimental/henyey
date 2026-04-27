@@ -171,6 +171,13 @@ pub struct AppConfig {
     /// if no KNOWN_PEERS were specified in the original config.
     #[serde(skip)]
     pub is_compat_config: bool,
+
+    /// Pre-computed validator weight configuration for application-specific
+    /// leader election (protocol V22+). Built during config translation when
+    /// `[[VALIDATORS]]` with quality/home-domain data are present.
+    /// `None` for manual quorum set configs or non-validator nodes.
+    #[serde(skip)]
+    pub validator_weight_config: Option<henyey_herder::ValidatorWeightConfig>,
 }
 
 /// Node identity and behavior configuration.
@@ -212,6 +219,12 @@ pub struct NodeConfig {
     /// HTTP endpoint. This is primarily used for testing.
     #[serde(default)]
     pub manual_close: bool,
+
+    /// When true, always use the old quorum-position weight algorithm for
+    /// nomination leader election, regardless of protocol version.
+    /// Matches stellar-core's `FORCE_OLD_STYLE_LEADER_ELECTION`.
+    #[serde(default)]
+    pub force_old_style_leader_election: bool,
 }
 
 impl Default for NodeConfig {
@@ -223,6 +236,7 @@ impl Default for NodeConfig {
             home_domain: None,
             quorum_set: QuorumSetConfig::default(),
             manual_close: false,
+            force_old_style_leader_election: false,
         }
     }
 }
@@ -1359,6 +1373,7 @@ impl AppConfig {
             rpc: RpcConfig::default(),
             build: BuildMetadata::default(),
             is_compat_config: false,
+            validator_weight_config: None,
         }
     }
 
@@ -1432,6 +1447,7 @@ impl AppConfig {
             rpc: RpcConfig::default(),
             build: BuildMetadata::default(),
             is_compat_config: false,
+            validator_weight_config: None,
         }
     }
 

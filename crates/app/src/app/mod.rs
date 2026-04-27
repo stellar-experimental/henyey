@@ -1143,6 +1143,8 @@ impl App {
             proposed_upgrades: config.upgrades.to_ledger_upgrades(),
             max_protocol_version: config.network.max_protocol_version,
             checkpoint_frequency: freq as u64,
+            validator_weight_config: config.validator_weight_config.clone(),
+            force_old_style_leader_election: config.node.force_old_style_leader_election,
         }
     }
 

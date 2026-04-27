@@ -483,7 +483,7 @@ pub(crate) fn compute_weight(m: u64, total: u64, threshold: u64) -> u64 {
 ///   weight is further scaled by the outer level's `compute_weight`.
 /// - Returns 0 if the node is not found.
 // SECURITY: quorum set validated at herder layer before reaching SCP weight computation
-pub(crate) fn base_get_node_weight(
+pub fn base_get_node_weight(
     node_id: &NodeId,
     quorum_set: &ScpQuorumSet,
     is_local_node: bool,

@@ -121,6 +121,183 @@ struct ValueValidationContext {
     tracking: Option<SharedTrackingState>,
 }
 
+// ── Application-specific nomination leader election (protocol V22+) ──
+
+/// Validator quality level for nomination leader election weights.
+///
+/// Maps to stellar-core's `ValidatorQuality` enum (Config.h:41-47).
+/// Used to weight nomination leaders by validator quality split across
+/// home domains, replacing the old quorum-position algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ValidatorQuality {
+    Low = 0,
+    Medium = 1,
+    High = 2,
+    Critical = 3,
+}
+
+impl ValidatorQuality {
+    /// Parse a quality string (case-insensitive) matching stellar-core's
+    /// `Config::parseQuality`.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "LOW" => Some(Self::Low),
+            "MEDIUM" | "MED" => Some(Self::Medium),
+            "HIGH" => Some(Self::High),
+            "CRITICAL" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ValidatorQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Low => write!(f, "LOW"),
+            Self::Medium => write!(f, "MEDIUM"),
+            Self::High => write!(f, "HIGH"),
+            Self::Critical => write!(f, "CRITICAL"),
+        }
+    }
+}
+
+/// Information about a single validator for leader election weight computation.
+///
+/// Maps to stellar-core's `ValidatorEntry` (Config.h:49-56).
+#[derive(Debug, Clone)]
+pub struct ValidatorEntryInfo {
+    pub name: String,
+    pub home_domain: String,
+    pub quality: ValidatorQuality,
+}
+
+/// Pre-computed validator weight configuration for application-specific
+/// nomination leader election (protocol V22+).
+///
+/// Maps to stellar-core's `ValidatorWeightConfig` (Config.h:60-70).
+/// Built from `[[VALIDATORS]]` + `[[HOME_DOMAINS]]` config at startup.
+/// When present, `HerderScpCallback::get_node_weight` uses quality/home-domain
+/// weights instead of quorum-position weights.
+#[derive(Debug, Clone)]
+pub struct ValidatorWeightConfig {
+    /// Map from node ID to validator metadata.
+    pub validator_entries: HashMap<NodeId, ValidatorEntryInfo>,
+    /// Map from home domain to count of validators in that domain.
+    pub home_domain_sizes: HashMap<String, u64>,
+    /// Map from quality level to weight.
+    pub quality_weights: HashMap<ValidatorQuality, u64>,
+}
+
+impl ValidatorWeightConfig {
+    /// Build a `ValidatorWeightConfig` from a list of validators.
+    ///
+    /// Ports stellar-core's `Config::setValidatorWeightConfig` (Config.cpp:2727-2791).
+    ///
+    /// # Errors
+    /// Returns an error if all validators have `Low` quality (stellar-core
+    /// requires at least one above Low).
+    pub fn new(validators: &[(NodeId, ValidatorEntryInfo)]) -> std::result::Result<Self, String> {
+        let mut validator_entries = HashMap::new();
+        let mut home_domain_sizes: HashMap<String, u64> = HashMap::new();
+        let mut highest_quality = ValidatorQuality::Low;
+        let mut lowest_quality = ValidatorQuality::Critical;
+        let mut home_domains_by_quality: HashMap<ValidatorQuality, HashSet<String>> =
+            HashMap::new();
+
+        for (node_id, entry) in validators {
+            validator_entries.insert(node_id.clone(), entry.clone());
+            *home_domain_sizes
+                .entry(entry.home_domain.clone())
+                .or_insert(0) += 1;
+            if entry.quality > highest_quality {
+                highest_quality = entry.quality;
+            }
+            if entry.quality < lowest_quality {
+                lowest_quality = entry.quality;
+            }
+            home_domains_by_quality
+                .entry(entry.quality)
+                .or_default()
+                .insert(entry.home_domain.clone());
+        }
+
+        if highest_quality == ValidatorQuality::Low {
+            return Err(
+                "At least one validator must have a quality level higher than LOW".to_string(),
+            );
+        }
+
+        let mut quality_weights = HashMap::new();
+
+        // Highest quality level gets weight u64::MAX
+        quality_weights.insert(highest_quality, u64::MAX);
+
+        // Assign weights to remaining quality levels (descending)
+        let mut q = highest_quality as i32 - 1;
+        while q >= lowest_quality as i32 {
+            let current_quality = match q {
+                0 => ValidatorQuality::Low,
+                1 => ValidatorQuality::Medium,
+                2 => ValidatorQuality::High,
+                3 => ValidatorQuality::Critical,
+                _ => unreachable!(),
+            };
+            let higher_quality = match q + 1 {
+                1 => ValidatorQuality::Medium,
+                2 => ValidatorQuality::High,
+                3 => ValidatorQuality::Critical,
+                _ => unreachable!(),
+            };
+
+            let higher_weight = quality_weights[&higher_quality];
+            // Number of orgs at the higher quality level + 1 for the virtual org
+            let higher_orgs = home_domains_by_quality
+                .get(&higher_quality)
+                .map_or(0, |s| s.len() as u64)
+                + 1;
+            quality_weights.insert(current_quality, higher_weight / (higher_orgs * 10));
+
+            q -= 1;
+        }
+
+        // Low quality always gets weight 0 (stellar-core Config.cpp:2790)
+        quality_weights.insert(ValidatorQuality::Low, 0);
+
+        Ok(Self {
+            validator_entries,
+            home_domain_sizes,
+            quality_weights,
+        })
+    }
+
+    /// Get the weight for a specific node.
+    ///
+    /// Panics if the node is not in the config (matches stellar-core's
+    /// `throw std::runtime_error`).
+    pub fn get_node_weight(&self, node_id: &NodeId) -> u64 {
+        let entry = self
+            .validator_entries
+            .get(node_id)
+            .unwrap_or_else(|| panic!("Validator entry not found for node {:?}", node_id));
+        let home_domain_size = self
+            .home_domain_sizes
+            .get(&entry.home_domain)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Home domain size not found for domain {}",
+                    entry.home_domain
+                )
+            });
+        let quality_weight = self
+            .quality_weights
+            .get(&entry.quality)
+            .unwrap_or_else(|| panic!("Quality weight not found for quality {}", entry.quality));
+
+        assert!(*home_domain_size > 0);
+        quality_weight / home_domain_size
+    }
+}
+
 /// Configuration for the SCP driver.
 #[derive(Debug, Clone)]
 pub struct ScpDriverConfig {
@@ -132,6 +309,13 @@ pub struct ScpDriverConfig {
     pub max_time_drift: u64,
     /// Local quorum set.
     pub local_quorum_set: Option<ScpQuorumSet>,
+    /// Validator weight configuration for application-specific leader election
+    /// (protocol V22+). `None` when using manual quorum set or when quality
+    /// data is not available.
+    pub validator_weight_config: Option<ValidatorWeightConfig>,
+    /// When true, always use the old quorum-position weight algorithm
+    /// regardless of protocol version.
+    pub force_old_style_leader_election: bool,
 }
 
 impl Default for ScpDriverConfig {
@@ -141,6 +325,8 @@ impl Default for ScpDriverConfig {
             max_tx_set_cache: 10_000,
             max_time_drift: 60,
             local_quorum_set: None,
+            validator_weight_config: None,
+            force_old_style_leader_election: false,
         }
     }
 }
@@ -2663,6 +2849,42 @@ impl SCPDriver for HerderScpCallback {
         self.driver.extract_valid_value_impl(slot_index, value)
     }
 
+    fn get_node_weight(
+        &self,
+        node_id: &NodeId,
+        quorum_set: &ScpQuorumSet,
+        is_local_node: bool,
+    ) -> u64 {
+        // Startup/test safety: if ledger manager isn't installed yet,
+        // fall back to base weights. Matches the compute_timeout pattern.
+        let Some(manager) = self.driver.ledger_manager.get() else {
+            return henyey_scp::base_get_node_weight(node_id, quorum_set, is_local_node);
+        };
+
+        let header = manager.current_header();
+        let unsupported_protocol =
+            !protocol_version_starts_from(header.ledger_version, ProtocolVersion::V22);
+
+        // Fall back to base weight algorithm if:
+        // 1. Protocol version < V22
+        // 2. No validator weight config (manual quorum set or non-validator)
+        // 3. FORCE_OLD_STYLE_LEADER_ELECTION is set
+        if unsupported_protocol
+            || self.driver.config.validator_weight_config.is_none()
+            || self.driver.config.force_old_style_leader_election
+        {
+            return henyey_scp::base_get_node_weight(node_id, quorum_set, is_local_node);
+        }
+
+        // Use quality/home-domain weights (stellar-core HerderSCPDriver.cpp:1479-1522)
+        self.driver
+            .config
+            .validator_weight_config
+            .as_ref()
+            .unwrap()
+            .get_node_weight(node_id)
+    }
+
     fn emit_envelope(&self, envelope: &ScpEnvelope) {
         self.driver.emit(envelope.clone());
     }
@@ -5018,5 +5240,203 @@ mod compare_tx_sets_tests {
             result_ab, result_ba,
             "combine_candidates must be order-independent"
         );
+    }
+}
+
+#[cfg(test)]
+mod validator_weight_config_tests {
+    use super::*;
+
+    fn make_node_id(seed: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(bytes),
+        ))
+    }
+
+    fn entry(name: &str, home_domain: &str, quality: ValidatorQuality) -> ValidatorEntryInfo {
+        ValidatorEntryInfo {
+            name: name.to_string(),
+            home_domain: home_domain.to_string(),
+            quality,
+        }
+    }
+
+    #[test]
+    fn test_single_high_quality_validator() {
+        let node = make_node_id(1);
+        let validators = vec![(
+            node.clone(),
+            entry("v1", "example.com", ValidatorQuality::High),
+        )];
+        let config = ValidatorWeightConfig::new(&validators).unwrap();
+
+        // Highest quality gets u64::MAX, divided by home domain size of 1
+        assert_eq!(config.get_node_weight(&node), u64::MAX);
+    }
+
+    #[test]
+    fn test_two_validators_same_domain_same_quality() {
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let validators = vec![
+            (
+                n1.clone(),
+                entry("v1", "example.com", ValidatorQuality::High),
+            ),
+            (
+                n2.clone(),
+                entry("v2", "example.com", ValidatorQuality::High),
+            ),
+        ];
+        let config = ValidatorWeightConfig::new(&validators).unwrap();
+
+        // Both in same domain of size 2 → u64::MAX / 2
+        assert_eq!(config.get_node_weight(&n1), u64::MAX / 2);
+        assert_eq!(config.get_node_weight(&n2), u64::MAX / 2);
+    }
+
+    #[test]
+    fn test_mixed_quality_levels() {
+        let n_high = make_node_id(1);
+        let n_med = make_node_id(2);
+        let validators = vec![
+            (
+                n_high.clone(),
+                entry("v1", "high.com", ValidatorQuality::High),
+            ),
+            (
+                n_med.clone(),
+                entry("v2", "med.com", ValidatorQuality::Medium),
+            ),
+        ];
+        let config = ValidatorWeightConfig::new(&validators).unwrap();
+
+        // High gets u64::MAX (1 org in high)
+        assert_eq!(config.get_node_weight(&n_high), u64::MAX);
+
+        // Medium = high_weight / ((high_orgs + 1) * 10) = u64::MAX / (2 * 10)
+        let expected_med = u64::MAX / 20;
+        assert_eq!(config.get_node_weight(&n_med), expected_med);
+    }
+
+    #[test]
+    fn test_low_quality_always_zero() {
+        let n_high = make_node_id(1);
+        let n_low = make_node_id(2);
+        let validators = vec![
+            (
+                n_high.clone(),
+                entry("v1", "high.com", ValidatorQuality::High),
+            ),
+            (n_low.clone(), entry("v2", "low.com", ValidatorQuality::Low)),
+        ];
+        let config = ValidatorWeightConfig::new(&validators).unwrap();
+
+        assert_eq!(config.get_node_weight(&n_low), 0);
+    }
+
+    #[test]
+    fn test_all_low_quality_rejected() {
+        let n1 = make_node_id(1);
+        let validators = vec![(n1, entry("v1", "example.com", ValidatorQuality::Low))];
+        assert!(ValidatorWeightConfig::new(&validators).is_err());
+    }
+
+    #[test]
+    fn test_critical_high_medium_chain() {
+        // 3 quality levels: Critical > High > Medium
+        let n_crit = make_node_id(1);
+        let n_high = make_node_id(2);
+        let n_med = make_node_id(3);
+        let validators = vec![
+            (
+                n_crit.clone(),
+                entry("v1", "crit.com", ValidatorQuality::Critical),
+            ),
+            (
+                n_high.clone(),
+                entry("v2", "high.com", ValidatorQuality::High),
+            ),
+            (
+                n_med.clone(),
+                entry("v3", "med.com", ValidatorQuality::Medium),
+            ),
+        ];
+        let config = ValidatorWeightConfig::new(&validators).unwrap();
+
+        // Critical = u64::MAX
+        assert_eq!(config.get_node_weight(&n_crit), u64::MAX);
+
+        // High = critical_weight / ((critical_orgs + 1) * 10) = u64::MAX / 20
+        let high_w = u64::MAX / 20;
+        assert_eq!(config.get_node_weight(&n_high), high_w);
+
+        // Medium = high_weight / ((high_orgs + 1) * 10) = high_w / 20
+        let med_w = high_w / 20;
+        assert_eq!(config.get_node_weight(&n_med), med_w);
+    }
+
+    #[test]
+    fn test_multiple_orgs_at_same_quality() {
+        // 2 orgs at High, 1 at Medium
+        let n1 = make_node_id(1);
+        let n2 = make_node_id(2);
+        let n3 = make_node_id(3);
+        let validators = vec![
+            (n1.clone(), entry("v1", "org_a.com", ValidatorQuality::High)),
+            (n2.clone(), entry("v2", "org_b.com", ValidatorQuality::High)),
+            (n3.clone(), entry("v3", "med.com", ValidatorQuality::Medium)),
+        ];
+        let config = ValidatorWeightConfig::new(&validators).unwrap();
+
+        // High = u64::MAX (1 per domain)
+        assert_eq!(config.get_node_weight(&n1), u64::MAX);
+        assert_eq!(config.get_node_weight(&n2), u64::MAX);
+
+        // Medium = high_weight / ((high_orgs_count + 1) * 10) = u64::MAX / (3 * 10) = u64::MAX / 30
+        let med_w = u64::MAX / 30;
+        assert_eq!(config.get_node_weight(&n3), med_w);
+    }
+
+    #[test]
+    #[should_panic(expected = "Validator entry not found")]
+    fn test_unknown_node_panics() {
+        let n1 = make_node_id(1);
+        let validators = vec![(n1, entry("v1", "example.com", ValidatorQuality::High))];
+        let config = ValidatorWeightConfig::new(&validators).unwrap();
+
+        let unknown = make_node_id(99);
+        config.get_node_weight(&unknown);
+    }
+
+    #[test]
+    fn test_quality_parsing() {
+        assert_eq!(
+            ValidatorQuality::from_str("HIGH"),
+            Some(ValidatorQuality::High)
+        );
+        assert_eq!(
+            ValidatorQuality::from_str("high"),
+            Some(ValidatorQuality::High)
+        );
+        assert_eq!(
+            ValidatorQuality::from_str("MEDIUM"),
+            Some(ValidatorQuality::Medium)
+        );
+        assert_eq!(
+            ValidatorQuality::from_str("MED"),
+            Some(ValidatorQuality::Medium)
+        );
+        assert_eq!(
+            ValidatorQuality::from_str("LOW"),
+            Some(ValidatorQuality::Low)
+        );
+        assert_eq!(
+            ValidatorQuality::from_str("CRITICAL"),
+            Some(ValidatorQuality::Critical)
+        );
+        assert_eq!(ValidatorQuality::from_str("unknown"), None);
     }
 }

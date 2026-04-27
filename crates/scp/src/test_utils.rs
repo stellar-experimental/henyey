@@ -35,6 +35,9 @@ pub struct MockDriver {
     /// If true, `get_quorum_set_by_hash` returns the configured quorum set
     /// regardless of the hash. Useful for testing quorum info methods.
     pub return_qset_by_hash: bool,
+    /// If `Some`, `get_node_weight` returns this fixed value for all nodes
+    /// instead of the default quorum-position algorithm.
+    pub custom_node_weight: Option<u64>,
 }
 
 /// How `compute_value_hash` should behave.
@@ -110,6 +113,7 @@ impl MockDriverBuilder {
             emit_count: AtomicU32::new(0),
             heard_from_quorum: AtomicU32::new(0),
             return_qset_by_hash: self.return_qset_by_hash,
+            custom_node_weight: None,
         }
     }
 }
@@ -213,6 +217,19 @@ impl SCPDriver for MockDriver {
     }
 
     fn sign_envelope(&self, _envelope: &mut ScpEnvelope) {}
+
+    fn get_node_weight(
+        &self,
+        node_id: &NodeId,
+        quorum_set: &ScpQuorumSet,
+        is_local_node: bool,
+    ) -> u64 {
+        if let Some(w) = self.custom_node_weight {
+            w
+        } else {
+            crate::driver::base_get_node_weight(node_id, quorum_set, is_local_node)
+        }
+    }
 
     fn verify_envelope(&self, _envelope: &ScpEnvelope) -> bool {
         true
