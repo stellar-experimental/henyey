@@ -4737,7 +4737,9 @@ fn test_post_seq_failure_removes_preauth_signer() {
                     ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
                         num_sponsored: 0,
                         num_sponsoring: 0,
-                        signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                        signer_sponsoring_i_ds: vec![SponsorshipDescriptor(None)]
+                            .try_into()
+                            .unwrap(),
                         ext: AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
                             ext: ExtensionPoint::V0,
                             seq_ledger: 5,
@@ -4965,7 +4967,9 @@ fn test_post_seq_failure_removes_fee_bump_outer_signer() {
                     ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
                         num_sponsored: 0,
                         num_sponsoring: 0,
-                        signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                        signer_sponsoring_i_ds: vec![SponsorshipDescriptor(None)]
+                            .try_into()
+                            .unwrap(),
                         ext: AccountEntryExtensionV2Ext::V3(AccountEntryExtensionV3 {
                             ext: ExtensionPoint::V0,
                             seq_ledger: 5,

@@ -3,11 +3,12 @@
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountFlags, AccountId,
     AccountMergeResult, AccountMergeResultCode, LedgerKey, LedgerKeyAccount, MuxedAccount,
-    OperationResult, OperationResultTr, SponsorshipDescriptor,
+    OperationResult, OperationResultTr,
 };
 
 use super::{add_account_balance, require_source_account_cloned};
 use crate::frame::muxed_to_account_id;
+use crate::state::signers::strict_sponsored_signers;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -64,6 +65,7 @@ pub(crate) fn execute_account_merge(
         return Ok(make_result(AccountMergeResultCode::IsSponsor));
     }
 
+    let sponsored_signers = strict_sponsored_signers(&source_account)?;
     let source_balance = source_account.balance;
 
     // Transfer balance to destination
@@ -74,10 +76,8 @@ pub(crate) fn execute_account_merge(
         return Ok(make_result(AccountMergeResultCode::DestFull));
     }
 
-    if let Some(sponsored_signers) = signer_sponsoring_ids(&source_account) {
-        for sponsor in sponsored_signers {
-            state.update_num_sponsoring(&sponsor, -1)?;
-        }
+    for sponsor in sponsored_signers {
+        state.update_num_sponsoring(&sponsor, -1)?;
     }
 
     let ledger_key = LedgerKey::Account(LedgerKeyAccount {
@@ -122,24 +122,6 @@ fn num_sponsoring(account: &AccountEntry) -> i64 {
         AccountEntryExt::V1(v1) => match &v1.ext {
             AccountEntryExtensionV1Ext::V0 => 0,
             AccountEntryExtensionV1Ext::V2(v2) => v2.num_sponsoring as i64,
-        },
-    }
-}
-
-fn signer_sponsoring_ids(account: &AccountEntry) -> Option<Vec<AccountId>> {
-    match &account.ext {
-        AccountEntryExt::V0 => None,
-        AccountEntryExt::V1(v1) => match &v1.ext {
-            AccountEntryExtensionV1Ext::V0 => None,
-            AccountEntryExtensionV1Ext::V2(v2) => {
-                let mut sponsors = Vec::new();
-                for descriptor in v2.signer_sponsoring_i_ds.iter() {
-                    if let SponsorshipDescriptor(Some(id)) = descriptor {
-                        sponsors.push(id.clone());
-                    }
-                }
-                Some(sponsors)
-            }
         },
     }
 }
@@ -240,6 +222,64 @@ mod tests {
 
         // Dest should have combined balance
         assert_eq!(state.get_account(&dest_id).unwrap().balance, 150_000_000);
+    }
+
+    #[test]
+    fn test_account_merge_rejects_extra_signer_descriptor_before_mutation() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let source_id = create_test_account_id(20);
+        let dest_id = create_test_account_id(21);
+        let sponsor_id = create_test_account_id(22);
+        let mut source = create_test_account(source_id.clone(), 100_000_000);
+        source.num_sub_entries = 1;
+        source.signers = vec![Signer {
+            key: SignerKey::Ed25519(Uint256([8; 32])),
+            weight: 1,
+        }]
+        .try_into()
+        .unwrap();
+        source.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 0,
+            },
+            ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                num_sponsored: 0,
+                num_sponsoring: 0,
+                signer_sponsoring_i_ds: vec![
+                    SponsorshipDescriptor(None),
+                    SponsorshipDescriptor(Some(sponsor_id.clone())),
+                ]
+                .try_into()
+                .unwrap(),
+                ext: AccountEntryExtensionV2Ext::V0,
+            }),
+        });
+
+        state.create_account(source);
+        state.create_account(create_test_account(dest_id.clone(), 50_000_000));
+        state.create_account(create_test_account_with_sponsoring(
+            sponsor_id.clone(),
+            10_000_000,
+            1,
+        ));
+
+        let result = execute_account_merge(
+            &create_test_muxed_account(21),
+            &source_id,
+            &mut state,
+            &context,
+        );
+        assert!(result.is_err());
+        assert!(state.get_account(&source_id).is_some());
+        assert_eq!(state.get_account(&dest_id).unwrap().balance, 50_000_000);
+        assert_eq!(
+            num_sponsoring(state.get_account(&sponsor_id).unwrap()),
+            1,
+            "stale descriptor must not decrement sponsor counts"
+        );
     }
 
     #[test]

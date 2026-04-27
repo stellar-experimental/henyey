@@ -47,6 +47,7 @@ pub(crate) mod entry_store;
 pub mod offer_index;
 pub mod offer_store;
 mod savepoint;
+pub mod signers;
 mod sponsorship;
 mod ttl;
 
@@ -1630,7 +1631,6 @@ pub(crate) fn ensure_account_ext_v2(account: &mut AccountEntry) -> &mut AccountE
 
     if let AccountEntryExt::V1(v1) = &mut account.ext {
         if let AccountEntryExtensionV1Ext::V2(v2) = &mut v1.ext {
-            ensure_signer_sponsoring_ids(v2, account.signers.len());
             return v2;
         }
     }
@@ -1689,17 +1689,8 @@ pub fn get_account_seq_ledger(account: &AccountEntry) -> u32 {
 
 fn build_signer_sponsoring_ids(count: usize) -> VecM<SponsorshipDescriptor, 20> {
     let ids = vec![SponsorshipDescriptor(None); count];
-    ids.try_into().unwrap_or_default()
-}
-
-fn ensure_signer_sponsoring_ids(v2: &mut AccountEntryExtensionV2, signer_count: usize) {
-    let mut ids: Vec<SponsorshipDescriptor> = v2.signer_sponsoring_i_ds.to_vec();
-    if ids.len() < signer_count {
-        ids.extend(std::iter::repeat(SponsorshipDescriptor(None)).take(signer_count - ids.len()));
-    } else if ids.len() > signer_count {
-        ids.truncate(signer_count);
-    }
-    v2.signer_sponsoring_i_ds = ids.try_into().unwrap_or_default();
+    ids.try_into()
+        .expect("account signers are bounded to 20 descriptors")
 }
 
 #[cfg(test)]

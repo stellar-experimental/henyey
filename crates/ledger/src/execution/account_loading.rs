@@ -386,25 +386,15 @@ impl TransactionExecutor {
                 // If SetOptions modifies signers and the source account has sponsored signers,
                 // we need to load those sponsor accounts so we can update their num_sponsoring.
                 if op_data.signer.is_some() {
-                    // Collect sponsor IDs from the source account's signer_sponsoring_i_ds
+                    // Collect sponsor IDs from paired signer slots. Strict
+                    // validation prevents loading sponsors for stale
+                    // descriptors that do not correspond to real signers.
                     let sponsor_ids: Vec<AccountId> = self
                         .state
                         .get_account(&op_source)
-                        .and_then(|account| {
-                            if let stellar_xdr::curr::AccountEntryExt::V1(v1) = &account.ext {
-                                if let stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) =
-                                    &v1.ext
-                                {
-                                    return Some(
-                                        v2.signer_sponsoring_i_ds
-                                            .iter()
-                                            .filter_map(|s| s.0.clone())
-                                            .collect(),
-                                    );
-                                }
-                            }
-                            None
-                        })
+                        .map(henyey_tx::state::signers::strict_sponsored_signers)
+                        .transpose()
+                        .map_err(|e| LedgerError::Internal(e.to_string()))?
                         .unwrap_or_default();
 
                     // Load each sponsor account

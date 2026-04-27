@@ -11,10 +11,11 @@ use stellar_xdr::curr::{
     EndSponsoringFutureReservesResultCode, LedgerEntryData, LedgerKey, LedgerKeyAccount,
     LedgerKeyClaimableBalance, LedgerKeyData, LedgerKeyOffer, LedgerKeyTrustLine, OperationResult,
     OperationResultTr, RevokeSponsorshipOp, RevokeSponsorshipResult, RevokeSponsorshipResultCode,
-    SponsorshipDescriptor, TrustLineAsset,
+    TrustLineAsset,
 };
 
 use super::account_balance_after_liabilities;
+use crate::state::signers::SignerSet;
 use crate::state::LedgerStateManager;
 use crate::validation::LedgerContext;
 use crate::{Result, TxError};
@@ -287,7 +288,8 @@ pub(crate) fn execute_revoke_sponsorship(
             };
 
             let owner_id = signer_key.account_id.clone();
-            let current_sponsor = current_signer_sponsor(account, pos);
+            let mut signer_set = SignerSet::strict_from_account(account)?;
+            let current_sponsor = signer_set.sponsor_at(pos)?;
             let was_sponsored = current_sponsor.is_some();
 
             if was_sponsored {
@@ -329,9 +331,14 @@ pub(crate) fn execute_revoke_sponsorship(
                 if num_sponsoring > u32::MAX as i64 - 1 {
                     return Ok(OperationResult::OpTooManySponsoring);
                 }
+                signer_set.set_sponsor(pos, Some(new_sponsor.clone()))?;
+                let prepared = signer_set.prepare_write()?;
                 state.update_num_sponsoring(&old_sponsor, -1)?;
                 state.update_num_sponsoring(&new_sponsor, 1)?;
-                set_signer_sponsor(state, &owner_id, pos, Some(new_sponsor))?;
+                let account = state
+                    .get_account_mut(&owner_id)
+                    .ok_or(TxError::SourceAccountNotFound)?;
+                prepared.apply(account);
             } else if was_sponsored && !will_be_sponsored {
                 if let Some(owner_account) = state.get_account(&owner_id) {
                     let new_min_balance = state.minimum_balance_for_account_with_deltas(
@@ -348,9 +355,14 @@ pub(crate) fn execute_revoke_sponsorship(
                 }
 
                 let old_sponsor = current_sponsor.expect("old sponsor exists");
+                signer_set.set_sponsor(pos, None)?;
+                let prepared = signer_set.prepare_write()?;
                 state.update_num_sponsoring(&old_sponsor, -1)?;
                 state.update_num_sponsored(&owner_id, -1)?;
-                set_signer_sponsor(state, &owner_id, pos, None)?;
+                let account = state
+                    .get_account_mut(&owner_id)
+                    .ok_or(TxError::SourceAccountNotFound)?;
+                prepared.apply(account);
             } else if !was_sponsored && will_be_sponsored {
                 let new_sponsor = new_sponsor.expect("sponsor must exist");
                 let new_sponsor_account = state
@@ -375,9 +387,14 @@ pub(crate) fn execute_revoke_sponsorship(
                 if num_sponsoring > u32::MAX as i64 - 1 {
                     return Ok(OperationResult::OpTooManySponsoring);
                 }
+                signer_set.set_sponsor(pos, Some(new_sponsor.clone()))?;
+                let prepared = signer_set.prepare_write()?;
                 state.update_num_sponsoring(&new_sponsor, 1)?;
                 state.update_num_sponsored(&owner_id, 1)?;
-                set_signer_sponsor(state, &owner_id, pos, Some(new_sponsor))?;
+                let account = state
+                    .get_account_mut(&owner_id)
+                    .ok_or(TxError::SourceAccountNotFound)?;
+                prepared.apply(account);
             }
 
             Ok(make_revoke_result(RevokeSponsorshipResultCode::Success))
@@ -461,45 +478,6 @@ fn update_entry_after_sponsorship(
         }
         _ => {}
     }
-    Ok(())
-}
-
-fn current_signer_sponsor(
-    account: &stellar_xdr::curr::AccountEntry,
-    pos: usize,
-) -> Option<AccountId> {
-    match &account.ext {
-        stellar_xdr::curr::AccountEntryExt::V0 => None,
-        stellar_xdr::curr::AccountEntryExt::V1(v1) => match &v1.ext {
-            stellar_xdr::curr::AccountEntryExtensionV1Ext::V0 => None,
-            stellar_xdr::curr::AccountEntryExtensionV1Ext::V2(v2) => {
-                v2.signer_sponsoring_i_ds.get(pos).and_then(|id| match id {
-                    SponsorshipDescriptor(Some(s)) => Some(s.clone()),
-                    _ => None,
-                })
-            }
-        },
-    }
-}
-
-fn set_signer_sponsor(
-    state: &mut LedgerStateManager,
-    account_id: &AccountId,
-    pos: usize,
-    sponsor: Option<AccountId>,
-) -> Result<()> {
-    let account = state
-        .get_account_mut(account_id)
-        .ok_or(TxError::SourceAccountNotFound)?;
-    let ext = crate::state::ensure_account_ext_v2(account);
-    let mut sponsoring_ids: Vec<SponsorshipDescriptor> = ext.signer_sponsoring_i_ds.to_vec();
-    if sponsoring_ids.len() <= pos {
-        return Err(TxError::Internal(
-            "signer sponsoring ids out of range".to_string(),
-        ));
-    }
-    sponsoring_ids[pos] = SponsorshipDescriptor(sponsor);
-    ext.signer_sponsoring_i_ds = sponsoring_ids.try_into().unwrap_or_default();
     Ok(())
 }
 

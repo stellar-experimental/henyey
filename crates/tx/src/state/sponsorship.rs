@@ -1,5 +1,6 @@
 //! Sponsorship tracking and management for ledger entry reserves.
 
+use super::signers::SignerSet;
 use super::*;
 
 impl LedgerStateManager {
@@ -318,28 +319,10 @@ impl LedgerStateManager {
             return Ok(false); // Signer not found
         };
 
-        // Read ext v2 sponsorship metadata (immutable read — no mutations).
-        // The signer is still present, so descriptors.len() should equal
-        // signers.len() (one descriptor per signer, including the master key).
-        let (has_ext_v2, sponsor_id) = match &account.ext {
-            AccountEntryExt::V1(v1) => match &v1.ext {
-                AccountEntryExtensionV1Ext::V2(v2) => {
-                    // Validate descriptor slot is in bounds — matches stellar-core's
-                    // `.at(n)` which throws out_of_range when n >= size().
-                    if idx >= v2.signer_sponsoring_i_ds.len() {
-                        return Err(TxError::Internal(format!(
-                            "signer descriptor out of bounds: index {} >= descriptors len {}",
-                            idx,
-                            v2.signer_sponsoring_i_ds.len()
-                        )));
-                    }
-                    let sponsor = v2.signer_sponsoring_i_ds[idx].0.clone();
-                    (true, sponsor)
-                }
-                AccountEntryExtensionV1Ext::V0 => (false, None),
-            },
-            AccountEntryExt::V0 => (false, None),
-        };
+        // Strictly validate the paired signer/descriptor invariant before any
+        // state changes. This mirrors stellar-core's account-entry invariant.
+        let mut signer_set = SignerSet::strict_from_account(account)?;
+        let sponsor_id = signer_set.sponsor_at(idx)?;
 
         // Validate sponsorship preconditions if the signer is sponsored.
         // Matches stellar-core's `canRemoveSignerWithSponsorship`
@@ -422,27 +405,12 @@ impl LedgerStateManager {
             }
         }
 
-        // Remove the descriptor slot when ext v2 exists, regardless of
-        // whether the signer was sponsored. Matches stellar-core's
-        // removeSignerWithoutSponsorship which unconditionally erases the
-        // signerSponsoringIDs entry.
-        if has_ext_v2 {
-            if let Some(account) = self.get_account_mut(account_id) {
-                if let AccountEntryExt::V1(v1) = &mut account.ext {
-                    if let AccountEntryExtensionV1Ext::V2(v2) = &mut v1.ext {
-                        let mut ids: Vec<_> = v2.signer_sponsoring_i_ds.to_vec();
-                        ids.remove(idx);
-                        v2.signer_sponsoring_i_ds = ids.try_into().unwrap_or_default();
-                    }
-                }
-            }
-        }
+        signer_set.remove(idx)?;
+        let prepared = signer_set.prepare_write()?;
 
-        // Remove the signer from the signers vec
+        // Remove the signer and paired descriptor from the account.
         if let Some(account) = self.get_account_mut(account_id) {
-            let mut new_signers: Vec<stellar_xdr::curr::Signer> = account.signers.to_vec();
-            new_signers.remove(idx);
-            account.signers = new_signers.try_into().unwrap_or_default();
+            prepared.apply(account);
 
             henyey_common::checked_types::dec_sub_entries(account, 1);
         }
@@ -707,7 +675,7 @@ mod tests {
         );
     }
 
-    /// Already-corrupted state (desynchronized vectors) must not panic.
+    /// Already-corrupted state (desynchronized vectors) must error atomically.
     #[test]
     fn test_remove_signer_with_corrupted_descriptor_length() {
         let mut state = LedgerStateManager::new(5_000_000, 100);
@@ -728,18 +696,17 @@ mod tests {
         );
         state.create_account(account);
 
-        // Must not error — extra trailing descriptors are tolerated
-        // (only out-of-bounds access is a hard error)
-        let removed = state
-            .remove_account_signer(&account_id, &signer.key)
-            .unwrap();
-        assert!(removed);
+        let result = state.remove_account_signer(&account_id, &signer.key);
+        assert!(
+            result.is_err(),
+            "strict signer descriptors must reject extra stale slots"
+        );
 
         let account = state.get_account(&account_id).unwrap();
-        assert_eq!(account.signers.len(), 0);
+        assert_eq!(account.signers.len(), 1);
+        assert_eq!(account.num_sub_entries, 1);
         let v2 = get_ext_v2(account);
-        // Best-effort: removed the descriptor at index 0, one stale slot remains
-        assert_eq!(v2.signer_sponsoring_i_ds.len(), 1);
+        assert_eq!(v2.signer_sponsoring_i_ds.len(), 2);
     }
 
     // ========================================================================
