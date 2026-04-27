@@ -765,7 +765,11 @@ impl App {
         let max_outbound_peers = config.overlay.max_outbound_peers as u32;
 
         // Convert quorum set config to XDR
-        let local_quorum_set = config.node.quorum_set.to_xdr();
+        let local_quorum_set = if config.node.quorum_set.is_empty() {
+            None
+        } else {
+            Some(config.node.quorum_set.to_xdr()?)
+        };
         if let Some(ref qs) = local_quorum_set {
             tracing::info!(
                 threshold = qs.threshold,

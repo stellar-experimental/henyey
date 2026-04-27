@@ -55,6 +55,7 @@
 //! - `RS_STELLAR_CORE_DATABASE_PATH` - Database file path
 //! - `RS_STELLAR_CORE_LOG_LEVEL` - Log level (trace, debug, info, warn, error)
 
+use anyhow::Context;
 use henyey_common::BucketListDbConfig;
 use henyey_history::CatchupMode;
 use serde::{Deserialize, Serialize};
@@ -260,40 +261,47 @@ pub struct QuorumSetConfig {
 }
 
 impl QuorumSetConfig {
+    /// Returns true if no validators or inner sets are configured.
+    pub fn is_empty(&self) -> bool {
+        self.validators.is_empty() && self.inner_sets.is_empty()
+    }
+
     /// Convert to XDR ScpQuorumSet.
     ///
-    /// Returns None if the quorum set is empty or has invalid validators.
-    pub fn to_xdr(&self) -> Option<stellar_xdr::curr::ScpQuorumSet> {
+    /// Returns an error if the quorum set is empty, has invalid validators,
+    /// invalid inner sets, or an invalid threshold_percent. Errors from
+    /// nested inner sets are propagated with path context rather than
+    /// silently dropped.
+    pub fn to_xdr(&self) -> anyhow::Result<stellar_xdr::curr::ScpQuorumSet> {
         use stellar_xdr::curr::{NodeId, PublicKey, ScpQuorumSet, Uint256};
+
+        if self.is_empty() {
+            anyhow::bail!("Quorum set has no validators or inner sets");
+        }
+
+        if self.threshold_percent == 0 || self.threshold_percent > 100 {
+            anyhow::bail!(
+                "Quorum set threshold_percent must be in 1..=100, got {}",
+                self.threshold_percent
+            );
+        }
 
         // Parse validator public keys
         let mut validators = Vec::new();
         for v in &self.validators {
-            // Parse G... public key to bytes
-            match henyey_crypto::PublicKey::from_strkey(v) {
-                Ok(pubkey) => {
-                    let node_id =
-                        NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(*pubkey.as_bytes())));
-                    validators.push(node_id);
-                }
-                Err(e) => {
-                    tracing::error!(validator = %v, error = %e, "Failed to parse validator public key - check strkey format");
-                    return None;
-                }
-            }
+            let pubkey = henyey_crypto::PublicKey::from_strkey(v)
+                .map_err(|e| anyhow::anyhow!("Invalid validator public key '{}': {}", v, e))?;
+            let node_id = NodeId(PublicKey::PublicKeyTypeEd25519(Uint256(*pubkey.as_bytes())));
+            validators.push(node_id);
         }
 
-        // Recursively convert inner sets
+        // Recursively convert inner sets — propagate errors instead of dropping
         let mut inner_sets = Vec::new();
-        for inner in &self.inner_sets {
-            if let Some(inner_xdr) = inner.to_xdr() {
-                inner_sets.push(inner_xdr);
-            }
-        }
-
-        // If empty, return None
-        if validators.is_empty() && inner_sets.is_empty() {
-            return None;
+        for (i, inner) in self.inner_sets.iter().enumerate() {
+            let inner_xdr = inner
+                .to_xdr()
+                .with_context(|| format!("in inner_sets[{}]", i))?;
+            inner_sets.push(inner_xdr);
         }
 
         // Calculate threshold from percentage using ceiling division.
@@ -303,11 +311,15 @@ impl QuorumSetConfig {
 
         let mut quorum_set = ScpQuorumSet {
             threshold,
-            validators: validators.try_into().ok()?,
-            inner_sets: inner_sets.try_into().ok()?,
+            validators: validators
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Too many validators for XDR encoding"))?,
+            inner_sets: inner_sets
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("Too many inner sets for XDR encoding"))?,
         };
         henyey_scp::normalize_quorum_set(&mut quorum_set);
-        Some(quorum_set)
+        Ok(quorum_set)
     }
 }
 
@@ -1652,19 +1664,11 @@ impl AppConfig {
 
         // Validate quorum set if validator
         if self.node.is_validator {
-            if self.node.quorum_set.validators.is_empty()
-                && self.node.quorum_set.inner_sets.is_empty()
-            {
-                anyhow::bail!("Validators must have a quorum set configured");
-            }
-            if self.node.quorum_set.threshold_percent == 0 {
-                anyhow::bail!("Quorum set threshold_percent must be > 0 for validators");
-            }
             let quorum_set = self
                 .node
                 .quorum_set
                 .to_xdr()
-                .ok_or_else(|| anyhow::anyhow!("Invalid quorum set configuration"))?;
+                .context("Invalid quorum set configuration")?;
             if let Err(err) = henyey_scp::is_quorum_set_sane(&quorum_set, true) {
                 anyhow::bail!("Invalid quorum set: {}", err);
             }
@@ -2037,9 +2041,15 @@ complete = true
         config.node.node_seed =
             Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
         config.node.quorum_set.threshold_percent = 0;
+        config.node.quorum_set.validators = vec![valid_key()];
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("threshold"));
+        let msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            msg.contains("threshold"),
+            "Expected threshold error, got: {}",
+            msg
+        );
     }
 
     #[test]
@@ -2599,5 +2609,182 @@ name = "test"
                 result.unwrap_err()
             );
         }
+    }
+
+    // --- Regression tests for AUDIT-183: invalid inner quorum set silently dropped ---
+
+    fn valid_key() -> String {
+        henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey()
+    }
+
+    fn valid_key2() -> String {
+        henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey()
+    }
+
+    #[test]
+    fn test_quorum_set_invalid_validator_key() {
+        let qs = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec!["GINVALID_KEY_HERE".to_string()],
+            inner_sets: vec![],
+        };
+        let err = qs.to_xdr().unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid validator public key"),
+            "Expected invalid key error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_invalid_inner_set_not_silently_dropped() {
+        let inner = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec!["GINVALID_INNER_KEY".to_string()],
+            inner_sets: vec![],
+        };
+        let qs = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec![valid_key()],
+            inner_sets: vec![inner],
+        };
+        let err = qs.to_xdr().unwrap_err();
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("inner_sets[0]"),
+            "Error should include inner set index, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Invalid validator public key"),
+            "Error should include root cause, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_deeply_nested_invalid_key() {
+        let deep_inner = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec!["GINVALID_DEEP".to_string()],
+            inner_sets: vec![],
+        };
+        let mid_inner = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec![valid_key()],
+            inner_sets: vec![deep_inner],
+        };
+        let qs = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec![valid_key2()],
+            inner_sets: vec![mid_inner],
+        };
+        let err = qs.to_xdr().unwrap_err();
+        let msg = format!("{:#}", err);
+        // Should have nested context: "in inner_sets[0]" at both levels
+        assert!(
+            msg.contains("inner_sets[0]"),
+            "Error should include nested path context, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_empty_is_error() {
+        let qs = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec![],
+            inner_sets: vec![],
+        };
+        let err = qs.to_xdr().unwrap_err();
+        assert!(
+            err.to_string().contains("no validators or inner sets"),
+            "Expected empty set error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_threshold_zero_is_error() {
+        let qs = QuorumSetConfig {
+            threshold_percent: 0,
+            validators: vec![valid_key()],
+            inner_sets: vec![],
+        };
+        let err = qs.to_xdr().unwrap_err();
+        assert!(
+            err.to_string().contains("threshold_percent"),
+            "Expected threshold error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_threshold_over_100_is_error() {
+        let qs = QuorumSetConfig {
+            threshold_percent: 101,
+            validators: vec![valid_key()],
+            inner_sets: vec![],
+        };
+        let err = qs.to_xdr().unwrap_err();
+        assert!(
+            err.to_string().contains("threshold_percent"),
+            "Expected threshold error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_valid_config_succeeds() {
+        let qs = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec![valid_key(), valid_key2()],
+            inner_sets: vec![],
+        };
+        assert!(qs.to_xdr().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_inner_quorum_set() {
+        let mut config = AppConfig::testnet();
+        config.node.is_validator = true;
+        config.node.node_seed = Some(henyey_crypto::SecretKey::from_seed(&[99u8; 32]).to_strkey());
+        config.node.quorum_set = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec![valid_key()],
+            inner_sets: vec![QuorumSetConfig {
+                threshold_percent: 67,
+                validators: vec!["GINVALID_KEY".to_string()],
+                inner_sets: vec![],
+            }],
+        };
+        let result = config.validate();
+        assert!(
+            result.is_err(),
+            "validate() should reject invalid inner quorum set"
+        );
+        let err_msg = format!("{:#}", result.unwrap_err());
+        assert!(
+            err_msg.contains("inner_sets[0]"),
+            "Error should identify which inner set failed, got: {}",
+            err_msg
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_is_empty_helper() {
+        let empty = QuorumSetConfig::default();
+        assert!(empty.is_empty());
+
+        let with_validators = QuorumSetConfig {
+            threshold_percent: 67,
+            validators: vec![valid_key()],
+            inner_sets: vec![],
+        };
+        assert!(!with_validators.is_empty());
     }
 }
