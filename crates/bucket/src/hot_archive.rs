@@ -27,7 +27,7 @@
 
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::io::{BufReader, Read as _, Seek, SeekFrom};
+use std::io::{BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use stellar_xdr::curr::{
@@ -86,60 +86,19 @@ pub struct HotArchiveBucket {
 impl HotArchiveBucket {
     /// Build the BTreeMap index for a disk-backed bucket by streaming through the file.
     ///
-    /// This is extracted as a static method so it can be called from `OnceLock::get_or_init()`.
-    fn build_index(path: &Path) -> BTreeMap<Vec<u8>, u64> {
-        let file = match std::fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!(path = %path.display(), error = %e, "failed to open hot archive bucket for index building");
-                return BTreeMap::new();
-            }
-        };
-        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let mut reader = BufReader::new(file);
-        let mut index = BTreeMap::new();
-        let mut position: u64 = 0;
-
-        while position + 4 <= file_len {
-            let record_offset = position;
-
-            let mut mark_bytes = [0u8; 4];
-            if reader.read_exact(&mut mark_bytes).is_err() {
-                break;
-            }
-            let record_mark = u32::from_be_bytes(mark_bytes);
-            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
-
-            if position + 4 + record_len as u64 > file_len {
-                break;
-            }
-
-            let mut data = vec![0u8; record_len];
-            if reader.read_exact(&mut data).is_err() {
-                break;
-            }
-
-            if let Ok(entry) = HotArchiveBucketEntry::from_xdr(&data, Limits::none()) {
-                if let Ok(key) = hot_archive_entry_to_key(&entry) {
-                    index.insert(key, record_offset);
-                }
-            }
-
-            position += 4 + record_len as u64;
-        }
-
-        index
-    }
-
     /// Ensure the disk-backed index is built, building it if needed.
     ///
     /// Returns a reference to the index. For non-DiskBacked storage, panics.
-    fn ensure_index(&self) -> &BTreeMap<Vec<u8>, u64> {
+    fn ensure_index(&self) -> Result<&BTreeMap<Vec<u8>, u64>> {
         match &self.storage {
-            HotArchiveStorage::DiskBacked { path, index, .. } => {
-                index.get_or_init(|| Self::build_index(path))
-            }
-            _ => panic!("ensure_index called on non-DiskBacked storage"),
+            HotArchiveStorage::DiskBacked { index, .. } => index.get().ok_or_else(|| {
+                BucketError::Serialization(
+                    "disk-backed hot archive index was not initialized".into(),
+                )
+            }),
+            _ => Err(BucketError::Serialization(
+                "ensure_index called on non-DiskBacked storage".into(),
+            )),
         }
     }
 
@@ -258,26 +217,30 @@ impl HotArchiveBucket {
     ///
     /// This matches stellar-core's `getBucketVersion()` method.
     /// Returns the ledger_version from the bucket's metadata entry, or 0 if no metadata.
-    pub fn get_protocol_version(&self) -> u32 {
+    pub fn get_protocol_version(&self) -> Result<u32> {
         match &self.storage {
             HotArchiveStorage::InMemory { entries, .. } => {
                 // Metadata entry is stored with empty key
                 if let Some(HotArchiveBucketEntry::Metaentry(meta)) = entries.get(&Vec::new()) {
-                    return meta.ledger_version;
+                    return Ok(meta.ledger_version);
                 }
-                0
+                Ok(0)
             }
             HotArchiveStorage::DiskBacked { path, .. } => {
                 // Try to read metadata entry (stored at offset for empty key)
-                let index = self.ensure_index();
+                let index = self.ensure_index()?;
                 if let Some(&offset) = index.get(&Vec::new()) {
-                    if let Ok(HotArchiveBucketEntry::Metaentry(meta)) =
-                        Self::read_entry_at_offset(path, offset)
-                    {
-                        return meta.ledger_version;
+                    match Self::read_entry_at_offset(path, offset)? {
+                        HotArchiveBucketEntry::Metaentry(meta) => return Ok(meta.ledger_version),
+                        _ => {
+                            return Err(BucketError::Serialization(format!(
+                                "hot archive metadata offset {} did not contain metadata",
+                                offset
+                            )))
+                        }
                     }
                 }
-                0
+                Ok(0)
             }
         }
     }
@@ -298,7 +261,7 @@ impl HotArchiveBucket {
         match &self.storage {
             HotArchiveStorage::InMemory { entries, .. } => Ok(entries.get(key_bytes).cloned()),
             HotArchiveStorage::DiskBacked { path, .. } => {
-                let index = self.ensure_index();
+                let index = self.ensure_index()?;
                 if let Some(&offset) = index.get(key_bytes) {
                     let entry = Self::read_entry_at_offset(path, offset)?;
                     Ok(Some(entry))
@@ -313,31 +276,8 @@ impl HotArchiveBucket {
     ///
     /// For InMemory buckets, iterates over the BTreeMap values.
     /// For DiskBacked buckets, streams entries from the file sequentially.
-    pub fn iter(&self) -> HotArchiveIter<'_> {
-        match &self.storage {
-            HotArchiveStorage::InMemory {
-                ordered_entries, ..
-            } => HotArchiveIter::InMemory {
-                inner: ordered_entries.iter(),
-            },
-            HotArchiveStorage::DiskBacked { path, .. } => {
-                // Open the file for streaming iteration
-                match std::fs::File::open(path) {
-                    Ok(file) => {
-                        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                        HotArchiveIter::DiskBacked {
-                            reader: BufReader::new(file),
-                            file_len,
-                            position: 0,
-                        }
-                    }
-                    Err(_) => {
-                        // If file can't be opened, return an empty iterator
-                        HotArchiveIter::Empty
-                    }
-                }
-            }
-        }
+    pub fn iter(&self) -> crate::Result<HotArchiveIter<'_>> {
+        self.try_iter()
     }
 
     /// Like [`iter`](Self::iter) but returns an error if the backing file
@@ -360,11 +300,10 @@ impl HotArchiveBucket {
                         ),
                     ))
                 })?;
-                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                let file_len = file.metadata()?.len();
                 Ok(HotArchiveIter::DiskBacked {
-                    reader: BufReader::new(file),
-                    file_len,
-                    position: 0,
+                    records: crate::record::RecordMarkedReader::new(BufReader::new(file), file_len),
+                    failed: false,
                 })
             }
         }
@@ -417,21 +356,23 @@ impl HotArchiveBucket {
 
     /// Read a single entry from the XDR file at a given offset.
     fn read_entry_at_offset(path: &Path, offset: u64) -> Result<HotArchiveBucketEntry> {
-        let mut file = std::fs::File::open(path)?;
-        file.seek(SeekFrom::Start(offset))?;
+        let file = std::fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(offset))?;
+        let mut records = crate::record::RecordMarkedReader::new_at(reader, file_len, offset);
+        let record = records.next_record()?.ok_or_else(|| {
+            BucketError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("no hot archive record at offset {}", offset),
+            ))
+        })?;
 
-        // Read record mark
-        let mut mark_bytes = [0u8; 4];
-        file.read_exact(&mut mark_bytes)?;
-        let record_mark = u32::from_be_bytes(mark_bytes);
-        let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
-
-        // Read entry data
-        let mut data = vec![0u8; record_len];
-        file.read_exact(&mut data)?;
-
-        HotArchiveBucketEntry::from_xdr(&data, Limits::none()).map_err(|e| {
-            BucketError::Serialization(format!("failed to parse hot archive entry: {}", e))
+        HotArchiveBucketEntry::from_xdr(record.body, Limits::none()).map_err(|e| {
+            BucketError::Serialization(format!(
+                "failed to parse hot archive entry at offset {}: {}",
+                record.offset, e
+            ))
         })
     }
 
@@ -465,37 +406,10 @@ impl HotArchiveBucket {
 
         let mut entries = BTreeMap::new();
         let mut ordered_entries = Vec::new();
-        let mut offset = 0;
+        let mut records = crate::record::RecordMarkedSliceIter::new(bytes);
 
-        // Bucket files always use XDR Record Marking Standard (RFC 5531).
-        // Each entry is prefixed with a 4-byte record mark: high bit set
-        // (last fragment) + 31-bit length. This matches stellar-core's
-        // XDRInputFileStream::readOne() which always reads record marks.
-        while offset + 4 <= bytes.len() {
-            // Read 4-byte record mark (big-endian)
-            let record_mark = u32::from_be_bytes([
-                bytes[offset],
-                bytes[offset + 1],
-                bytes[offset + 2],
-                bytes[offset + 3],
-            ]);
-            offset += 4;
-
-            // High bit is "last fragment" flag, remaining 31 bits are length
-            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
-
-            if offset + record_len > bytes.len() {
-                return Err(BucketError::Serialization(format!(
-                    "Record length {} exceeds remaining data {} at offset {}",
-                    record_len,
-                    bytes.len() - offset,
-                    offset - 4
-                )));
-            }
-
-            // Parse the XDR record as HotArchiveBucketEntry
-            let record_data = &bytes[offset..offset + record_len];
-            match HotArchiveBucketEntry::from_xdr(record_data, Limits::none()) {
+        while let Some(record) = records.next_record()? {
+            match HotArchiveBucketEntry::from_xdr(record.body, Limits::none()) {
                 Ok(entry) => {
                     let key = hot_archive_entry_to_key(&entry)?;
                     entries.insert(key, entry.clone());
@@ -503,13 +417,11 @@ impl HotArchiveBucket {
                 }
                 Err(e) => {
                     return Err(BucketError::Serialization(format!(
-                        "Failed to parse hot archive bucket entry: {}",
-                        e
+                        "Failed to parse hot archive bucket entry at offset {}: {}",
+                        record.offset, e
                     )));
                 }
             }
-
-            offset += record_len;
         }
 
         // Compute hash from raw bytes (including record marks)
@@ -594,50 +506,29 @@ impl HotArchiveBucket {
         let path = path.as_ref().to_path_buf();
         let file = std::fs::File::open(&path)?;
         let file_len = file.metadata()?.len();
-        let mut reader = BufReader::new(file);
+        let mut records = crate::record::RecordMarkedReader::new(BufReader::new(file), file_len);
 
         let mut built_index = BTreeMap::new();
         let mut hasher = Sha256::new();
         let mut entry_count = 0;
-        let mut position: u64 = 0;
 
-        while position + 4 <= file_len {
-            let record_offset = position;
-
-            // Read record mark
-            let mut mark_bytes = [0u8; 4];
-            reader.read_exact(&mut mark_bytes)?;
-            let record_mark = u32::from_be_bytes(mark_bytes);
-            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
-
-            if position + 4 + record_len as u64 > file_len {
-                return Err(BucketError::Serialization(format!(
-                    "Record length {} exceeds remaining data at offset {}",
-                    record_len, position
-                )));
-            }
-
-            // Read entry data
-            let mut data = vec![0u8; record_len];
-            reader.read_exact(&mut data)?;
-
+        while let Some(record) = records.next_record()? {
             // Hash: include record mark + data
-            hasher.update(mark_bytes);
-            hasher.update(&data);
+            hasher.update(record.mark_bytes);
+            hasher.update(record.body);
 
             // Parse entry to extract key for index
-            let entry = HotArchiveBucketEntry::from_xdr(&data, Limits::none()).map_err(|e| {
-                BucketError::Serialization(format!(
-                    "failed to parse hot archive entry at offset {}: {}",
-                    position, e
-                ))
-            })?;
+            let entry =
+                HotArchiveBucketEntry::from_xdr(record.body, Limits::none()).map_err(|e| {
+                    BucketError::Serialization(format!(
+                        "failed to parse hot archive entry at offset {}: {}",
+                        record.offset, e
+                    ))
+                })?;
 
             let key = hot_archive_entry_to_key(&entry)?;
-            built_index.insert(key, record_offset);
+            built_index.insert(key, record.offset);
             entry_count += 1;
-
-            position += 4 + record_len as u64;
         }
 
         let hash = if entry_count == 0 {
@@ -709,53 +600,40 @@ pub enum HotArchiveIter<'a> {
     },
     /// Disk-backed streaming iteration.
     DiskBacked {
-        reader: BufReader<std::fs::File>,
-        file_len: u64,
-        position: u64,
+        records: crate::record::RecordMarkedReader<BufReader<std::fs::File>>,
+        failed: bool,
     },
-    /// Empty iterator (used when file can't be opened).
-    Empty,
 }
 
 impl Iterator for HotArchiveIter<'_> {
-    type Item = HotArchiveBucketEntry;
+    type Item = Result<HotArchiveBucketEntry>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            HotArchiveIter::InMemory { inner } => inner.next().cloned(),
-            HotArchiveIter::DiskBacked {
-                reader,
-                file_len,
-                position,
-            } => {
-                if *position + 4 > *file_len {
+            HotArchiveIter::InMemory { inner } => inner.next().cloned().map(Ok),
+            HotArchiveIter::DiskBacked { records, failed } => {
+                if *failed {
                     return None;
                 }
-
-                // Read record mark
-                let mut mark_bytes = [0u8; 4];
-                if reader.read_exact(&mut mark_bytes).is_err() {
-                    return None;
+                let record = match records.next_record() {
+                    Ok(Some(record)) => record,
+                    Ok(None) => return None,
+                    Err(e) => {
+                        *failed = true;
+                        return Some(Err(e));
+                    }
+                };
+                match HotArchiveBucketEntry::from_xdr(record.body, Limits::none()) {
+                    Ok(entry) => Some(Ok(entry)),
+                    Err(e) => {
+                        *failed = true;
+                        Some(Err(BucketError::Serialization(format!(
+                            "failed to parse hot archive entry at offset {}: {}",
+                            record.offset, e
+                        ))))
+                    }
                 }
-                let record_mark = u32::from_be_bytes(mark_bytes);
-                let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
-
-                if *position + 4 + record_len as u64 > *file_len {
-                    return None;
-                }
-
-                // Read entry data
-                let mut data = vec![0u8; record_len];
-                if reader.read_exact(&mut data).is_err() {
-                    return None;
-                }
-
-                *position += 4 + record_len as u64;
-
-                // Parse entry
-                HotArchiveBucketEntry::from_xdr(&data, Limits::none()).ok()
             }
-            HotArchiveIter::Empty => None,
         }
     }
 }
@@ -1650,7 +1528,7 @@ impl HotArchiveBucketList {
             );
 
             // Determine merge parameters
-            let merge_protocol_version = match prev_snap.get_protocol_version() {
+            let merge_protocol_version = match prev_snap.get_protocol_version()? {
                 0 => protocol_version,
                 version => version,
             };
@@ -1811,7 +1689,9 @@ pub fn merge_hot_archive_buckets(
     // Calculate output protocol version using max(curr, snap), matching stellar-core behavior
     // in calculateMergeProtocolVersion(). The passed protocol_version is only used as
     // a constraint (maxProtocolVersion), not as the output version.
-    let output_version = curr.get_protocol_version().max(snap.get_protocol_version());
+    let output_version = curr
+        .get_protocol_version()?
+        .max(snap.get_protocol_version()?);
 
     // Validate that calculated version doesn't exceed the max
     if protocol_version > 0 && output_version > protocol_version {
@@ -1842,14 +1722,22 @@ pub fn merge_hot_archive_buckets(
 
     // Sorted merge-join: iterate both iterators in lock-step.
     // Snap (newer) wins on equal keys.
-    let mut curr_iter = curr
-        .iter()
-        .filter(|e| !matches!(e, HotArchiveBucketEntry::Metaentry(_)))
-        .peekable();
-    let mut snap_iter = snap
-        .iter()
-        .filter(|e| !matches!(e, HotArchiveBucketEntry::Metaentry(_)))
-        .peekable();
+    let curr_entries: Vec<_> = curr
+        .try_iter()?
+        .filter_map(|entry| match entry {
+            Ok(HotArchiveBucketEntry::Metaentry(_)) => None,
+            other => Some(other),
+        })
+        .collect::<Result<_>>()?;
+    let snap_entries: Vec<_> = snap
+        .try_iter()?
+        .filter_map(|entry| match entry {
+            Ok(HotArchiveBucketEntry::Metaentry(_)) => None,
+            other => Some(other),
+        })
+        .collect::<Result<_>>()?;
+    let mut curr_iter = curr_entries.into_iter().peekable();
+    let mut snap_iter = snap_entries.into_iter().peekable();
 
     loop {
         match (curr_iter.peek(), snap_iter.peek()) {
@@ -1953,6 +1841,45 @@ mod tests {
     }
 
     #[test]
+    fn test_hot_archive_rejects_trailing_partial_mark() {
+        let bucket = HotArchiveBucket::fresh(25, vec![], vec![]).unwrap();
+        let mut bytes = bucket.to_xdr_bytes().unwrap();
+        bytes.extend_from_slice(&[0xaa, 0xbb]);
+
+        assert!(HotArchiveBucket::from_xdr_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn test_hot_archive_disk_backed_rejects_truncated_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hot.bucket");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(100u32 | crate::XDR_RECORD_MARK).to_be_bytes());
+        bytes.extend_from_slice(&[1, 2, 3]);
+        std::fs::write(&path, bytes).unwrap();
+
+        assert!(HotArchiveBucket::from_xdr_file_disk_backed(&path).is_err());
+    }
+
+    #[test]
+    fn test_hot_archive_disk_iterator_reports_terminal_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hot.bucket");
+        let bucket = HotArchiveBucket::fresh(25, vec![], vec![]).unwrap();
+        bucket.save_to_xdr_file(&path).unwrap();
+        let disk_bucket = HotArchiveBucket::from_xdr_file_disk_backed(&path).unwrap();
+        let mut corrupt = std::fs::read(&path).unwrap();
+        corrupt.push(0xff);
+        std::fs::write(&path, corrupt).unwrap();
+
+        assert!(disk_bucket.get_protocol_version().is_ok());
+        let mut iter = disk_bucket.try_iter().unwrap();
+        assert!(iter.next().unwrap().is_ok());
+        assert!(iter.next().unwrap().is_err());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
     fn test_hot_archive_bucket_fresh_metaentry_only() {
         // Fresh bucket with no data entries should still have metaentry
         // This matches stellar-core behavior where BucketOutputIterator always writes metaentry first
@@ -1965,7 +1892,7 @@ mod tests {
         // Should have non-zero hash
         assert!(!bucket.hash().is_zero());
         // Should have correct protocol version
-        assert_eq!(bucket.get_protocol_version(), 25);
+        assert_eq!(bucket.get_protocol_version().unwrap(), 25);
     }
 
     #[test]
@@ -1984,7 +1911,7 @@ mod tests {
         // Should have non-zero hash
         assert!(!merged.hash().is_zero());
         // Should have correct protocol version
-        assert_eq!(merged.get_protocol_version(), 25);
+        assert_eq!(merged.get_protocol_version().unwrap(), 25);
     }
 
     #[test]
@@ -2191,7 +2118,7 @@ mod tests {
 
         // Output should use max(23, 24) = 24, NOT 25
         assert_eq!(
-            merged.get_protocol_version(),
+            merged.get_protocol_version().unwrap(),
             24,
             "Hot archive merge should use max(curr=23, snap=24)=24, NOT max_protocol_version=25"
         );
@@ -2249,7 +2176,7 @@ mod tests {
 
         // Output should be 24 (max of inputs), not 25
         assert_eq!(
-            merged.get_protocol_version(),
+            merged.get_protocol_version().unwrap(),
             24,
             "Output should be max(24, 24)=24, not constraint=25"
         );

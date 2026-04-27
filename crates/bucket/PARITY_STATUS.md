@@ -17,7 +17,7 @@
 | Snapshot and query APIs | Partial | Hot-archive refresh and scan helpers still missing |
 | Live bucket indexing | Full | In-memory and page indexes, bloom filter, persistence |
 | Hot archive indexing | Partial | Lookup exists, but no dedicated `HotArchiveBucketIndex` API |
-| Bucket input/output iterators | Partial | Legacy gzip wrappers differ from upstream uncompressed iterators |
+| Bucket input/output iterators | Partial | Legacy gzip wrappers differ from upstream uncompressed iterators; malformed record marks now match `readOne` EOF/error semantics |
 | Bucket applicator and live iteration | Full | Catchup application and live-entry scans implemented |
 | Merge deduplication | Partial | Completed-merge cache wired; in-flight dedup tracker unused |
 
@@ -113,7 +113,7 @@ Corresponds to: `HotArchiveBucket.h`, `HotArchiveBucketList.h`, `HotArchiveBucke
 | `bucketEntryToLoadResult()` / `convertToBucketEntry()` | `get()` / `HotArchiveBucket::fresh()` conversion | Full |
 | `countOldEntryType()` / `countNewEntryType()` / `checkProtocolLegality()` | No-ops consistent with upstream | Full |
 | `HotArchiveBucketList::addBatch()` | `HotArchiveBucketList::add_batch()` | Full |
-| `HotArchiveBucketIndex(...)` | Lazy `ensure_index()` BTreeMap | Partial |
+| `HotArchiveBucketIndex(...)` | Eager disk-backed BTreeMap lookup index | Partial |
 | `HotArchiveBucketIndex::lookup()` | `HotArchiveBucket::get()` | Full |
 | `HotArchiveBucketIndex::scan()` | *(none)* | None |
 | `HotArchiveBucketIndex::getBucketEntryCounters()` | *(none)* | None |
@@ -176,6 +176,16 @@ Corresponds to: `BucketInputIterator.h`, `BucketOutputIterator.h`, `BucketMergeA
 | `put()` | `put()` | Full |
 | `getBucket()` | `finish()` returns path/hash/entries, not adopted bucket | Partial |
 | `MergeInput` / `FileMergeInput` / `MemoryMergeInput` | Same-named Rust trait and structs | Full |
+
+Record-marked XDR readers now distinguish clean EOF from malformed input in
+line with `XDRInputFileStream::readOne`: live buckets, disk-backed live bucket
+iterators/lookups, hot archive bucket readers, and legacy gzip input iteration
+reject partial trailing record marks, truncated bodies, and XDR decode failures.
+Record lengths preserve stellar-core's high-bit behavior by masking the top bit
+rather than requiring it. `DiskBucket::scan_page_for_key` also returns errors
+for truncated or undecodable records reached through mmap-backed page scans;
+this is a defensive corruption check for henyey's index path rather than a
+claim of byte-for-byte `readPage` equivalence.
 
 ### snapshots (`snapshot.rs`)
 
@@ -269,7 +279,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 3. **Hot archive indexing**
    - **stellar-core**: Hot archive buckets expose a dedicated `HotArchiveBucketIndex` built on the same disk-index machinery as live buckets.
-   - **Rust**: `HotArchiveBucket` lazily builds a BTreeMap for point lookups and does not expose a standalone index type.
+   - **Rust**: `HotArchiveBucket` eagerly builds a BTreeMap for point lookups and does not expose a standalone index type.
    - **Rationale**: Current users only need point lookup, but this leaves parity gaps for scan, counters, and metrics.
 
 4. **Iterator path split**

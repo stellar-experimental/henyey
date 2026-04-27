@@ -1005,8 +1005,8 @@ impl BucketManager {
 
             let bucket = self.load_hot_archive_bucket(hash)?;
 
-            for entry in bucket.iter() {
-                match entry {
+            for entry in bucket.try_iter()? {
+                match entry? {
                     stellar_xdr::curr::HotArchiveBucketEntry::Archived(ref ledger_entry) => {
                         let key = henyey_common::entry_to_key(ledger_entry);
                         let key_bytes = key.to_xdr(Limits::none()).map_err(|e| {

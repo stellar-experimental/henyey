@@ -31,6 +31,7 @@ use henyey_common::{BucketListDbConfig, Hash256};
 
 use crate::bloom_filter::{BucketBloomFilter, HashSeed};
 use crate::entry::{compare_keys, BucketEntry, BucketEntryExt};
+use crate::Result;
 
 /// Default page size for disk index in bytes.
 ///
@@ -885,6 +886,74 @@ impl LiveBucketIndex {
             let index = DiskIndex::from_entries(&mut entries, bloom_seed, config.page_size_bytes());
             (LiveBucketIndex::Disk(index), entries)
         }
+    }
+
+    /// Creates a new index from a fallible streaming entry iterator, returning
+    /// the consumed iterator so callers can inspect accumulated state.
+    pub fn try_from_entries_default_with_iter<I>(
+        entries: I,
+        bloom_seed: HashSeed,
+        file_size: u64,
+    ) -> Result<(Self, I)>
+    where
+        I: Iterator<Item = Result<(BucketEntry, u64)>>,
+    {
+        let config = BucketListDbConfig::default();
+        Self::try_from_entries_with_iter(entries, bloom_seed, file_size, &config)
+    }
+
+    /// Fallible variant of [`Self::from_entries_with_iter`] that preserves the
+    /// streaming memory profile while propagating malformed bucket records.
+    pub fn try_from_entries_with_iter<I>(
+        mut entries: I,
+        bloom_seed: HashSeed,
+        file_size: u64,
+        config: &BucketListDbConfig,
+    ) -> Result<(Self, I)>
+    where
+        I: Iterator<Item = Result<(BucketEntry, u64)>>,
+    {
+        struct FallibleEntries<'a, I> {
+            inner: &'a mut I,
+            error: Option<crate::BucketError>,
+        }
+
+        impl<I> Iterator for FallibleEntries<'_, I>
+        where
+            I: Iterator<Item = Result<(BucketEntry, u64)>>,
+        {
+            type Item = (BucketEntry, u64);
+
+            fn next(&mut self) -> Option<Self::Item> {
+                match self.inner.next()? {
+                    Ok(entry) => Some(entry),
+                    Err(e) => {
+                        self.error = Some(e);
+                        None
+                    }
+                }
+            }
+        }
+
+        let mut fallible = FallibleEntries {
+            inner: &mut entries,
+            error: None,
+        };
+        let index = if file_size < config.index_cutoff_bytes() {
+            LiveBucketIndex::InMemory(InMemoryIndex::from_entries(&mut fallible, bloom_seed))
+        } else {
+            LiveBucketIndex::Disk(DiskIndex::from_entries(
+                &mut fallible,
+                bloom_seed,
+                config.page_size_bytes(),
+            ))
+        };
+
+        if let Some(error) = fallible.error {
+            return Err(error);
+        }
+
+        Ok((index, entries))
     }
 
     /// Returns true if the given entry type is not supported by BucketListDB lookups.

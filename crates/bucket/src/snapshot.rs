@@ -216,25 +216,8 @@ impl HotArchiveBucketSnapshot {
     /// - `Archived(LedgerEntry)` — entry is in the archive
     /// - `Live(LedgerKey)` — entry was restored (not in archive)
     pub fn load_keys(&self, keys: &mut Vec<LedgerKey>, result: &mut Vec<HotArchiveBucketEntry>) {
-        keys.retain(|key| {
-            if let Ok(Some(entry)) = self.bucket.get(key) {
-                match &entry {
-                    HotArchiveBucketEntry::Archived(_) => {
-                        result.push(entry);
-                        false // Remove from keys
-                    }
-                    HotArchiveBucketEntry::Live(_) => {
-                        // Entry was restored — treat as "not in archive"
-                        false // Remove from keys, don't add to result
-                    }
-                    HotArchiveBucketEntry::Metaentry(_) => {
-                        true // Keep searching
-                    }
-                }
-            } else {
-                true // Keep in keys, continue searching
-            }
-        });
+        self.load_keys_result(keys, result)
+            .expect("hot archive bucket lookup failed while loading keys");
     }
 
     /// Like [`load_keys`](Self::load_keys) but propagates I/O errors
@@ -685,22 +668,8 @@ impl HotArchiveBucketListSnapshot {
     /// `HotArchiveBucketEntry::Archived` entries found. Keys that resolve to
     /// `Live` (restored) are removed without producing output.
     pub fn load_keys(&self, keys: &[LedgerKey]) -> Vec<HotArchiveBucketEntry> {
-        let mut remaining = keys.to_vec();
-        let mut result = Vec::new();
-
-        for level in &self.levels {
-            if remaining.is_empty() {
-                break;
-            }
-            for bucket in [&level.curr, &level.snap] {
-                if remaining.is_empty() {
-                    break;
-                }
-                bucket.load_keys(&mut remaining, &mut result);
-            }
-        }
-
-        result
+        self.load_keys_result(keys)
+            .expect("hot archive bucket list lookup failed while loading keys")
     }
 
     /// Like [`load_keys`](Self::load_keys) but propagates I/O errors.

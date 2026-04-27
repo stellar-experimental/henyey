@@ -53,15 +53,22 @@ use crate::{BucketError, Result};
 /// XDR records are prefixed with a 4-byte big-endian length field.
 /// Returns None if EOF is reached.
 fn read_xdr_record<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
-    // Read 4-byte length prefix
     let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(BucketError::Io(e)),
+    let first = reader.read(&mut len_buf[..1])?;
+    if first == 0 {
+        return Ok(None);
+    }
+    if let Err(e) = reader.read_exact(&mut len_buf[1..]) {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            return Err(BucketError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "short XDR record length prefix in bucket stream",
+            )));
+        }
+        return Err(BucketError::Io(e));
     }
 
-    let len = u32::from_be_bytes(len_buf) as usize;
+    let len = (u32::from_be_bytes(len_buf) & crate::XDR_RECORD_LEN_MASK) as usize;
     if len == 0 {
         return Ok(Some(Vec::new()));
     }
@@ -712,6 +719,26 @@ mod tests {
         AccountEntry, AccountEntryExt, AccountId, LedgerEntry, LedgerEntryData, LedgerEntryExt,
         LedgerKey, LedgerKeyAccount, PublicKey, SequenceNumber, String32, Thresholds, Uint256,
     };
+
+    #[test]
+    fn test_read_xdr_record_rejects_partial_prefix() {
+        let mut cursor = std::io::Cursor::new(vec![0x80, 0x00]);
+        assert!(read_xdr_record(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn test_read_xdr_record_masks_record_mark_high_bit() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(crate::XDR_RECORD_MARK | 3).to_be_bytes());
+        bytes.extend_from_slice(&[1, 2, 3]);
+        let mut cursor = std::io::Cursor::new(bytes);
+
+        assert_eq!(
+            read_xdr_record(&mut cursor).unwrap().unwrap(),
+            vec![1, 2, 3]
+        );
+        assert!(read_xdr_record(&mut cursor).unwrap().is_none());
+    }
 
     fn make_account_id(bytes: [u8; 32]) -> AccountId {
         AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))

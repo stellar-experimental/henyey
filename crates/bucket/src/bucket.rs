@@ -469,7 +469,7 @@ impl Bucket {
         }
 
         let mut entries = Vec::new();
-        let mut offset = 0;
+        let mut records = crate::record::RecordMarkedSliceIter::new(bytes);
 
         debug!(
             "Parsing bucket entries from {} bytes, first 16 bytes: {:02x?}",
@@ -477,55 +477,25 @@ impl Bucket {
             &bytes[..std::cmp::min(16, bytes.len())]
         );
 
-        // Bucket files always use XDR Record Marking Standard (RFC 5531).
-        // Each entry is prefixed with a 4-byte record mark: high bit set
-        // (last fragment) + 31-bit length. This matches stellar-core's
-        // XDRInputFileStream::readOne() which always reads record marks.
-        while offset + 4 <= bytes.len() {
-            // Read 4-byte record mark (big-endian)
-            let record_mark = u32::from_be_bytes([
-                bytes[offset],
-                bytes[offset + 1],
-                bytes[offset + 2],
-                bytes[offset + 3],
-            ]);
-            offset += 4;
-
-            // High bit is "last fragment" flag, remaining 31 bits are length
-            let _last_fragment = (record_mark & crate::XDR_RECORD_MARK) != 0;
-            let record_len = (record_mark & crate::XDR_RECORD_LEN_MASK) as usize;
-
-            if offset + record_len > bytes.len() {
-                return Err(BucketError::Serialization(format!(
-                    "Record length {} exceeds remaining data {} at offset {}",
-                    record_len,
-                    bytes.len() - offset,
-                    offset - 4
-                )));
-            }
-
-            // Parse the XDR record
-            let record_data = &bytes[offset..offset + record_len];
-            match stellar_xdr::curr::BucketEntry::from_xdr(record_data, Limits::none()) {
+        while let Some(record) = records.next_record()? {
+            match stellar_xdr::curr::BucketEntry::from_xdr(record.body, Limits::none()) {
                 Ok(xdr_entry) => {
                     entries.push(xdr_entry);
                 }
                 Err(e) => {
                     debug!(
                         "Parse error at offset {}, record_len {}, data: {:02x?}, error: {}",
-                        offset,
-                        record_len,
-                        &record_data[..std::cmp::min(16, record_data.len())],
+                        record.offset,
+                        record.declared_len,
+                        &record.body[..std::cmp::min(16, record.body.len())],
                         e
                     );
                     return Err(BucketError::Serialization(format!(
-                        "Failed to parse bucket entry: {}",
-                        e
+                        "Failed to parse bucket entry at offset {}: {}",
+                        record.offset, e
                     )));
                 }
             }
-
-            offset += record_len;
         }
 
         debug!("Parsed {} bucket entries", entries.len());
@@ -1763,6 +1733,30 @@ mod tests {
             result.is_err(),
             "parse_entries should error on corrupt data, not silently return partial results"
         );
+    }
+
+    #[test]
+    fn test_record_marked_parser_rejects_trailing_partial_mark() {
+        let entry = BucketEntry::Liveentry(make_account_entry([7u8; 32], 100));
+        let bucket = Bucket::from_entries(vec![entry]).unwrap();
+        let mut bytes = bucket.to_xdr_bytes().unwrap();
+        bytes.extend_from_slice(&[0xaa, 0xbb]);
+
+        assert!(
+            Bucket::from_xdr_bytes(&bytes).is_err(),
+            "partial trailing record marks must be malformed, not clean EOF"
+        );
+    }
+
+    #[test]
+    fn test_record_marked_parser_accepts_unset_high_bit() {
+        let entry = BucketEntry::Liveentry(make_account_entry([8u8; 32], 100));
+        let bucket = Bucket::from_entries(vec![entry]).unwrap();
+        let mut bytes = bucket.to_xdr_bytes().unwrap();
+        bytes[0] &= 0x7f;
+
+        let parsed = Bucket::from_xdr_bytes(&bytes).unwrap();
+        assert_eq!(parsed.len(), 1);
     }
 
     /// [AUDIT-BH1] All bucket data must be parsed as record-marked XDR.
