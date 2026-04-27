@@ -1102,6 +1102,13 @@ pub struct RpcConfig {
     /// don't starve each other on the shared `spawn_blocking` pool.
     #[serde(default = "default_bucket_io_concurrency")]
     pub bucket_io_concurrency: usize,
+
+    /// Maximum cumulative raw XDR bytes to load from the database per
+    /// `getLedgers` request.  Acts as a DB load budget — the first ledger
+    /// is always returned regardless of its size so pagination can make
+    /// forward progress.  Defaults to 10 MiB.
+    #[serde(default = "default_max_ledger_meta_load_bytes")]
+    pub max_ledger_meta_load_bytes: usize,
 }
 
 impl Default for RpcConfig {
@@ -1116,6 +1123,7 @@ impl Default for RpcConfig {
             request_timeout_secs: default_request_timeout_secs(),
             rpc_db_concurrency: default_rpc_db_concurrency(),
             bucket_io_concurrency: default_bucket_io_concurrency(),
+            max_ledger_meta_load_bytes: default_max_ledger_meta_load_bytes(),
         }
     }
 }
@@ -1172,6 +1180,10 @@ fn default_rpc_db_concurrency() -> usize {
 
 fn default_bucket_io_concurrency() -> usize {
     8
+}
+
+fn default_max_ledger_meta_load_bytes() -> usize {
+    10 * 1024 * 1024 // 10 MiB
 }
 
 /// Build-time metadata populated by the binary crate's `build.rs`.

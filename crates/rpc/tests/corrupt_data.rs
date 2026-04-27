@@ -813,6 +813,23 @@ async fn get_latest_ledger_fields_consistent_with_header_xdr() {
 // getLedgers budget truncation and pagination tests
 // ---------------------------------------------------------------------------
 
+/// Boot a [`FakeRpcTestHarness`] with a custom `max_ledger_meta_load_bytes`
+/// budget and a header snapshot at the given sequence.
+async fn setup_fake_rpc_with_budget(
+    seq: u32,
+    close_time: u64,
+    budget: usize,
+) -> FakeRpcTestHarness {
+    let header = test_header(seq, close_time);
+    let app = FakeRpcApp::builder()
+        .header_snapshot(header)
+        .max_ledger_meta_load_bytes(budget)
+        .build();
+    let h = FakeRpcTestHarness::start(app).await;
+    seed_ledger_header(h.app.database(), seq, close_time);
+    h
+}
+
 /// Verify getLedgers returns valid results and correct cursor for pagination.
 #[tokio::test]
 async fn get_ledgers_pagination_with_cursor() {
@@ -933,4 +950,133 @@ async fn get_ledgers_both_formats() {
         ledgers2[0].get("headerJson").is_some(),
         "json format should have headerJson"
     );
+}
+
+/// Verify getLedgers truncates results when the DB load budget is exceeded,
+/// and that the cursor correctly points to the last included ledger for
+/// pagination to resume.
+#[tokio::test]
+async fn get_ledgers_budget_truncation() {
+    // Each valid_lcm_bytes blob is ~200 bytes. Set budget to 500 so that
+    // 2 ledgers fit but the 3rd is excluded.
+    let budget = 500;
+    let h = setup_fake_rpc_with_budget(10, 1_700_000_010, budget).await;
+
+    // Store 5 valid LCMs at sequences 2..=6
+    for seq in 2..=6 {
+        let lcm = valid_lcm_bytes(seq);
+        h.app
+            .database()
+            .with_connection(|conn| conn.store_ledger_close_meta(seq, &lcm))
+            .unwrap();
+        seed_ledger_header(h.app.database(), seq, 1_700_000_000 + seq as u64);
+    }
+
+    // Request limit=5 but budget should truncate before all 5 are returned.
+    let id = json!("budget-trunc");
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLedgers",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 5 }
+            }
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let ledgers = result["ledgers"].as_array().expect("ledgers array");
+
+    // Should get fewer than 5 due to budget truncation.
+    assert!(
+        ledgers.len() < 5,
+        "expected budget truncation to return fewer than 5 ledgers, got {}",
+        ledgers.len()
+    );
+    // Must return at least 1 (first-row guarantee).
+    assert!(
+        !ledgers.is_empty(),
+        "budget truncation must return at least 1 ledger"
+    );
+    assert_eq!(ledgers[0]["sequence"], json!(2));
+
+    // Cursor should point to the last included ledger.
+    let cursor = result["cursor"].as_str().expect("cursor");
+    let last_seq = ledgers.last().unwrap()["sequence"].as_u64().unwrap();
+    assert_eq!(
+        cursor,
+        last_seq.to_string(),
+        "cursor must equal last included ledger sequence"
+    );
+
+    // Resume from cursor: next page should start after the last returned ledger.
+    let id2 = json!("budget-trunc-resume");
+    let (status2, resp2) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id2,
+            "method": "getLedgers",
+            "params": {
+                "pagination": { "cursor": cursor, "limit": 5 }
+            }
+        }))
+        .await;
+
+    assert_eq!(status2, 200);
+    let result2 = &resp2["result"];
+    let ledgers2 = result2["ledgers"].as_array().expect("ledgers array");
+    // Should resume from next ledger after cursor.
+    if !ledgers2.is_empty() {
+        assert_eq!(
+            ledgers2[0]["sequence"].as_u64().unwrap(),
+            last_seq + 1,
+            "resumed page must start at cursor + 1"
+        );
+    }
+}
+
+/// Verify that a single oversized first ledger is still returned (pagination
+/// forward-progress guarantee) even when the budget is very small.
+#[tokio::test]
+async fn get_ledgers_oversized_first_row_still_returned() {
+    // Budget of 1 byte — far smaller than any valid LCM (~200 bytes).
+    let h = setup_fake_rpc_with_budget(3, 1_700_000_003, 1).await;
+
+    let lcm = valid_lcm_bytes(2);
+    h.app
+        .database()
+        .with_connection(|conn| conn.store_ledger_close_meta(2, &lcm))
+        .unwrap();
+    seed_ledger_header(h.app.database(), 2, 1_700_000_002);
+
+    let lcm3 = valid_lcm_bytes(3);
+    h.app
+        .database()
+        .with_connection(|conn| conn.store_ledger_close_meta(3, &lcm3))
+        .unwrap();
+    seed_ledger_header(h.app.database(), 3, 1_700_000_003);
+
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "oversized-first",
+            "method": "getLedgers",
+            "params": { "startLedger": 2, "pagination": { "limit": 10 } }
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let ledgers = result["ledgers"].as_array().expect("ledgers");
+    // Must return exactly 1 ledger: the first one is always included,
+    // but the second exceeds the budget.
+    assert_eq!(
+        ledgers.len(),
+        1,
+        "with 1-byte budget, only the first ledger should be returned"
+    );
+    assert_eq!(ledgers[0]["sequence"], json!(2));
 }

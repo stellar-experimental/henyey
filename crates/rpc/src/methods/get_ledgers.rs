@@ -16,15 +16,6 @@ const DEFAULT_LEDGER_LIMIT: u32 = 5;
 /// Maximum number of ledgers that can be requested in a single query.
 const MAX_LEDGER_LIMIT: u32 = 200;
 
-/// Maximum cumulative raw XDR bytes to load from the database per request.
-///
-/// This is a **DB load budget**, not a response-size budget. The actual
-/// serialized response will be larger (base64 ~1.33×, JSON more). The first
-/// ledger is always returned regardless of its size so pagination can make
-/// forward progress; subsequent ledgers are included only while the cumulative
-/// raw XDR byte count stays within this limit.
-const MAX_LEDGER_META_LOAD_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
-
 pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
@@ -62,6 +53,7 @@ pub async fn handle(
     let end_ledger = lctx.latest_ledger + 1;
 
     // Query ledger close metas from database with byte budget
+    let meta_load_budget = ctx.app.config().rpc.max_ledger_meta_load_bytes;
     let metas = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
             use henyey_db::LedgerCloseMetaQueries;
@@ -69,7 +61,7 @@ pub async fn handle(
                 effective_start,
                 end_ledger,
                 effective_limit,
-                MAX_LEDGER_META_LOAD_BYTES,
+                meta_load_budget,
             )
         })
     })
