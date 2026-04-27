@@ -808,3 +808,129 @@ async fn get_latest_ledger_fields_consistent_with_header_xdr() {
         "response id must equal SHA-256 of headerXdr bytes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// getLedgers budget truncation and pagination tests
+// ---------------------------------------------------------------------------
+
+/// Verify getLedgers returns valid results and correct cursor for pagination.
+#[tokio::test]
+async fn get_ledgers_pagination_with_cursor() {
+    // Set up with latest ledger = 10, oldest = 2
+    let h = setup_fake_rpc_with_header(10, 1_700_000_010).await;
+
+    // Store valid (small) LCMs for sequences 2..=10
+    for seq in 2..=10 {
+        let lcm = valid_lcm_bytes(seq);
+        h.app
+            .database()
+            .with_connection(|conn| conn.store_ledger_close_meta(seq, &lcm))
+            .unwrap();
+        seed_ledger_header(h.app.database(), seq, 1_700_000_000 + seq as u64);
+    }
+
+    // First page: startLedger=2, limit=3
+    let id = json!("page1");
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "getLedgers",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 3 }
+            }
+        }))
+        .await;
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let ledgers = result["ledgers"].as_array().expect("ledgers array");
+    assert_eq!(ledgers.len(), 3, "first page should have 3 ledgers");
+    assert_eq!(ledgers[0]["sequence"], json!(2));
+    assert_eq!(ledgers[2]["sequence"], json!(4));
+    let cursor = result["cursor"].as_str().expect("cursor");
+    assert_eq!(cursor, "4");
+
+    // Second page: cursor=4, limit=3
+    let id2 = json!("page2");
+    let (status2, resp2) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": id2,
+            "method": "getLedgers",
+            "params": {
+                "pagination": { "cursor": "4", "limit": 3 }
+            }
+        }))
+        .await;
+    assert_eq!(status2, 200);
+    let result2 = &resp2["result"];
+    let ledgers2 = result2["ledgers"].as_array().expect("ledgers array");
+    assert_eq!(ledgers2.len(), 3, "second page should have 3 ledgers");
+    assert_eq!(ledgers2[0]["sequence"], json!(5));
+    assert_eq!(ledgers2[2]["sequence"], json!(7));
+}
+
+/// Verify getLedgers works with both xdr (base64) and json output formats.
+#[tokio::test]
+async fn get_ledgers_both_formats() {
+    let h = setup_fake_rpc_with_header(3, 1_700_000_003).await;
+
+    for seq in 2..=3 {
+        let lcm = valid_lcm_bytes(seq);
+        h.app
+            .database()
+            .with_connection(|conn| conn.store_ledger_close_meta(seq, &lcm))
+            .unwrap();
+        seed_ledger_header(h.app.database(), seq, 1_700_000_000 + seq as u64);
+    }
+
+    // Test base64 format (default)
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "fmt-xdr",
+            "method": "getLedgers",
+            "params": { "startLedger": 2 }
+        }))
+        .await;
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let ledgers = result["ledgers"].as_array().expect("ledgers");
+    assert!(!ledgers.is_empty());
+    // Base64 format: should have metadataXdr and headerXdr
+    assert!(
+        ledgers[0].get("metadataXdr").is_some(),
+        "base64 format should have metadataXdr"
+    );
+    assert!(
+        ledgers[0].get("headerXdr").is_some(),
+        "base64 format should have headerXdr"
+    );
+
+    // Test JSON format
+    let (status2, resp2) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "fmt-json",
+            "method": "getLedgers",
+            "params": {
+                "startLedger": 2,
+                "xdrFormat": "json"
+            }
+        }))
+        .await;
+    assert_eq!(status2, 200);
+    let result2 = &resp2["result"];
+    let ledgers2 = result2["ledgers"].as_array().expect("ledgers");
+    assert!(!ledgers2.is_empty());
+    // JSON format: should have metadataJson and headerJson
+    assert!(
+        ledgers2[0].get("metadataJson").is_some(),
+        "json format should have metadataJson"
+    );
+    assert!(
+        ledgers2[0].get("headerJson").is_some(),
+        "json format should have headerJson"
+    );
+}
