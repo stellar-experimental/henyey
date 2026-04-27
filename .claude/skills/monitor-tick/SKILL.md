@@ -311,8 +311,14 @@ below (traffic-proportional and self-calibrating); do NOT check absolute deltas.
 - `henyey_overlay_fetch_channel_depth_max` >500 → WARN
 - `(henyey_process_open_fds / henyey_process_max_fds)` >0.85 → WARN
 - `henyey_herder_drift_max_seconds` >10 → NONC
-- `stellar_scp_timing_externalized_seconds` >3 → WARN (per #1934: healthy stellar-core ~0.35s; >3s leaves <2s headroom on the 5s slot)
-- `stellar_scp_timing_nominated_seconds` >2 → WARN (per #1934: healthy ~0.78s; >2s indicates message-propagation lag)
+- `stellar_scp_timing_externalized_seconds` >10 → WARN (this is a SLOT-CYCLE metric:
+  first-envelope-received → self-externalize, naturally ~4-6s on mainnet's 5s slots.
+  The earlier `>3` threshold was a misread of #1934 — it compared against stellar-core's
+  `mFirstToSelfExternalizeLag` which measures a different, much narrower window (any-node
+  externalize → self-externalize, ~0.3-0.5s healthy). Until we expose a matching metric,
+  alert only on >2x normal slot-cycle = real degradation)
+- `stellar_scp_timing_nominated_seconds` >7 → WARN (also a SLOT-CYCLE metric measured from
+  first local nomination vote to self-externalize; healthy floor ~3-5s on mainnet)
 
 `quorum_agree` / `quorum_missing` / `quorum_fail_at` are intentionally NOT
 monitored — they snapshot the tracking slot's QuorumInfo and return
