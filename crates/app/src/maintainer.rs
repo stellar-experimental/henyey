@@ -11,7 +11,7 @@
 //! - **scphistory**: Old SCP consensus envelopes are pruned
 //! - **scpquorums**: Old quorum sets are pruned based on their last-seen ledger
 //! - **ledger_close_meta**: Old full ledger close metadata (RPC retention window)
-//! - **txhistory / txsets / txresults**: Old transaction data (RPC retention window)
+//! - **txhistory / txsets / txresults**: Old transaction data (publish + RPC retention)
 //!
 //! # Configuration
 //!
@@ -56,8 +56,10 @@ pub struct MaintenanceConfig {
     /// Whether maintenance is enabled.
     pub enabled: bool,
     /// RPC retention window in ledgers. When set, the maintainer will also clean
-    /// up `ledger_close_meta`, `txhistory`, `txsets`, and `txresults` tables,
-    /// keeping only ledgers within this window of the LCL.
+    /// up `events`, `ledger_close_meta`, `txhistory`, `txsets`, and `txresults`
+    /// tables. RPC-only tables (events, close meta) are pruned at the RPC window;
+    /// publish+RPC tables (tx history) use the more conservative of the publish-safe
+    /// and RPC thresholds.
     pub rpc_retention_window: Option<u32>,
 }
 
@@ -478,6 +480,30 @@ mod tests {
         .unwrap();
     }
 
+    /// Insert synthetic tx history rows (raw SQL, minimal fields).
+    fn insert_tx_history(db: &henyey_db::Database, ledger_seqs: &[u32]) {
+        db.with_connection(|conn| {
+            for &seq in ledger_seqs {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO txhistory (txid, ledgerseq, txindex, txbody, txresult, txmeta) \
+                         VALUES ('tx{seq}', {seq}, 0, X'00', X'00', X'00')"
+                    ),
+                    [],
+                )?;
+                conn.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO txresults (ledgerseq, data) \
+                         VALUES ({seq}, X'00')"
+                    ),
+                    [],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
     /// Count rows in a table.
     fn count_rows(db: &henyey_db::Database, table: &str) -> u32 {
         db.with_connection(|conn| {
@@ -704,6 +730,50 @@ mod tests {
         );
 
         // RPC tables pruned at rpc_lmin = 800: events 801..=810 remain
+        assert_eq!(count_rows(&db_clone, "events"), 10);
+        assert_eq!(min_ledger(&db_clone, "events", "ledgerseq"), Some(801));
+    }
+
+    #[test]
+    fn test_tx_history_preserved_for_publish_queue_with_rpc() {
+        // Regression test: tx history/results must survive when the publish
+        // queue needs them, even when RPC retention would prune them.
+        //
+        // Scenario: lcl=1000, min_queued=127 (pending checkpoint), retention=200
+        //   publish_safe_lmin = 127 - 64 = 63
+        //   rpc_lmin = 800
+        //   publish_and_rpc_lmin = min(63, 800) = 63
+        //   → tx history at 790..810 all preserved (all > 63)
+        //   → events pruned at rpc_lmin = 800
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        insert_tx_history(&db, &(790..=810).collect::<Vec<_>>());
+        insert_events(&db, &(790..=810).collect::<Vec<_>>());
+        assert_eq!(count_rows(&db, "txhistory"), 21);
+        assert_eq!(count_rows(&db, "events"), 21);
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: Some(200),
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (1000, Some(127)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // All tx history preserved: publish_and_rpc_lmin = 63, all rows > 63
+        assert_eq!(count_rows(&db_clone, "txhistory"), 21);
+        assert_eq!(min_ledger(&db_clone, "txhistory", "ledgerseq"), Some(790));
+        assert_eq!(count_rows(&db_clone, "txresults"), 21);
+        assert_eq!(min_ledger(&db_clone, "txresults", "ledgerseq"), Some(790));
+
+        // RPC-only events pruned at rpc_lmin = 800
         assert_eq!(count_rows(&db_clone, "events"), 10);
         assert_eq!(min_ledger(&db_clone, "events", "ledgerseq"), Some(801));
     }
