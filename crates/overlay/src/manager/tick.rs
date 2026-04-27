@@ -214,20 +214,6 @@ impl OverlayManager {
                     break;
                 }
 
-                // G8: Maybe drop a random non-preferred outbound peer when out of sync.
-                let tracking = shared.is_tracking.load(Ordering::Relaxed);
-                Self::maybe_drop_random_peer(
-                    &shared.peers,
-                    &shared.peer_info_cache,
-                    &preferred_set,
-                    max_outbound,
-                    tracking,
-                    &mut last_out_of_sync_reconnect,
-                );
-
-                // Sweep stale pending connection reservations.
-                shared.pending_connections.sweep_stale();
-
                 // G7: Collect completed DNS resolution and schedule next.
                 // Also updates the preferred peer set and inbound pool IPs.
                 Self::maybe_collect_dns_result(
@@ -241,6 +227,22 @@ impl OverlayManager {
                     &mut dns_next_resolve_at,
                 )
                 .await;
+
+                // G8: Maybe drop a random non-preferred outbound peer when out of sync.
+                // Run this after DNS collection so preferred classification uses
+                // the freshest resolved IPs available for this tick.
+                let tracking = shared.is_tracking.load(Ordering::Relaxed);
+                Self::maybe_drop_random_peer(
+                    &shared.peers,
+                    &shared.peer_info_cache,
+                    &preferred_set,
+                    max_outbound,
+                    tracking,
+                    &mut last_out_of_sync_reconnect,
+                );
+
+                // Sweep stale pending connection reservations.
+                shared.pending_connections.sweep_stale();
 
                 if dns_resolve_handle.is_none() && Instant::now() >= dns_next_resolve_at {
                     dns_resolve_handle = Some(spawn_dns_resolution(
@@ -581,12 +583,14 @@ impl OverlayManager {
                         peer_id, outbound_count
                     );
                     if let Some(entry) = peers.get(&peer_id) {
-                        super::peer_loop::send_error_and_drop(
+                        if !super::peer_loop::send_error_and_drop(
                             &peer_id,
                             &entry.value().outbound_tx,
                             ErrorCode::Load,
                             "random disconnect due to out of sync",
-                        );
+                        ) {
+                            return false;
+                        }
                     }
                     // Reset timer to throttle drops.
                     *last_time = now;
@@ -602,10 +606,13 @@ impl OverlayManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::{ConnectionDirection, ConnectionPool};
+    use crate::connection::{Connection, ConnectionDirection, ConnectionPool, Listener};
+    use crate::connection_factory::ConnectionFactory;
     use crate::flow_control::{FlowControl, FlowControlConfig};
     use crate::peer::{PeerInfo, PeerStats};
-    use crate::PeerAddress;
+    use crate::{LocalNode, OverlayConfig, OverlayError, PeerAddress, Result};
+    use async_trait::async_trait;
+    use henyey_crypto::SecretKey;
     use tokio::sync::mpsc;
 
     // ---- G8 tests: maybe_drop_random_peer ----
@@ -644,6 +651,101 @@ mod tests {
         };
         peers.insert(peer_id.clone(), handle);
         info_cache.insert(peer_id, info);
+    }
+
+    fn register_fake_peer_with_rx(
+        peers: &DashMap<PeerId, PeerHandle>,
+        info_cache: &DashMap<PeerId, PeerInfo>,
+        info: PeerInfo,
+    ) -> mpsc::Receiver<super::super::OutboundMessage> {
+        let (tx, rx) = mpsc::channel(8);
+        let peer_id = info.peer_id.clone();
+        let handle = PeerHandle {
+            outbound_tx: tx,
+            stats: Arc::new(PeerStats::default()),
+            flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+        };
+        peers.insert(peer_id.clone(), handle);
+        info_cache.insert(peer_id, info);
+        rx
+    }
+
+    #[derive(Debug)]
+    struct FailingConnectionFactory;
+
+    #[async_trait]
+    impl ConnectionFactory for FailingConnectionFactory {
+        async fn connect(&self, addr: &PeerAddress, _timeout_secs: u64) -> Result<Connection> {
+            Err(OverlayError::ConnectionFailed(format!(
+                "intentional failure for {addr}"
+            )))
+        }
+
+        async fn bind(&self, _port: u16) -> Result<Listener> {
+            Err(OverlayError::ConnectionFailed(
+                "bind not used in test".to_string(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_preferred_connect_failure_does_not_pre_evict() {
+        let preferred_addr = PeerAddress::new("10.0.0.1", 11625);
+        let mut config = OverlayConfig::default();
+        config.max_outbound_peers = 1;
+        config.target_outbound_peers = 1;
+        config.preferred_peers = vec![preferred_addr.clone()];
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let manager = OverlayManager::new_with_connection_factory(
+            config,
+            local_node.clone(),
+            Arc::new(FailingConnectionFactory),
+        )
+        .unwrap();
+        let shared = manager.shared_state();
+
+        assert!(manager.outbound_pool.try_reserve());
+        manager.outbound_pool.force_promote_authenticated();
+        let mut victim_info = make_peer_info(ConnectionDirection::Outbound, 11626);
+        victim_info.address = "10.0.0.99:11625".parse().unwrap();
+        let mut victim_rx =
+            register_fake_peer_with_rx(&shared.peers, &shared.peer_info_cache, victim_info);
+
+        let preferred_set = PreferredPeerSet::from_config(vec![preferred_addr.clone()]);
+        let mut retry_after = HashMap::new();
+        let ctx = TickConnectCtx {
+            local_node,
+            connect_timeout: 1,
+            auth_timeout: 1,
+            target_outbound: 1,
+            connection_factory: Arc::new(FailingConnectionFactory),
+        };
+
+        let remaining = OverlayManager::connect_preferred_peers(
+            &preferred_set,
+            &mut retry_after,
+            Instant::now(),
+            1,
+            1,
+            &manager.outbound_pool,
+            &shared,
+            &ctx,
+        )
+        .await;
+
+        assert_eq!(
+            remaining, 1,
+            "failed preferred dial should not consume capacity"
+        );
+        assert_eq!(manager.outbound_pool.authenticated_count(), 1);
+        assert!(
+            victim_rx.try_recv().is_err(),
+            "failed preferred dial must not evict before authentication"
+        );
+        assert!(
+            retry_after.contains_key(&preferred_addr),
+            "failed preferred dial should still enter retry backoff"
+        );
     }
 
     #[test]

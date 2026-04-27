@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use stellar_xdr::curr::{ErrorCode, SError, StellarMessage, StringM, Uint256};
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tracing::{debug, info, trace, warn};
 
 /// Maximum length for error messages sent to peers, matching the XDR
@@ -277,23 +278,28 @@ pub(super) fn make_error_msg(code: ErrorCode, message: &str) -> StellarMessage {
 /// Send an error to a peer then request its task to shut down.
 ///
 /// Matches stellar-core `Peer::sendErrorAndDrop` (Peer.cpp:722-729).
-/// Uses `try_send` so this never blocks; if the channel is full the error
-/// is silently dropped but the shutdown still proceeds.
+/// Uses `try_send` so this never blocks. Returns true only when the shutdown
+/// request was queued; callers that replace this peer must not assume eviction
+/// is in progress when the channel is full.
 pub(super) fn send_error_and_drop(
     peer_id: &PeerId,
     outbound_tx: &mpsc::Sender<OutboundMessage>,
     code: ErrorCode,
     message: &str,
-) {
+) -> bool {
     let err_msg = make_error_msg(code, message);
     let _ = outbound_tx.try_send(OutboundMessage::Send(err_msg));
-    let _ = outbound_tx.try_send(OutboundMessage::Shutdown);
+    let shutdown_queued = match outbound_tx.try_send(OutboundMessage::Shutdown) {
+        Ok(()) | Err(TrySendError::Closed(_)) => true,
+        Err(TrySendError::Full(_)) => false,
+    };
     debug!(
         "Sent error to {} and requested drop: code={:?} msg={}",
         peer_id,
         code,
         truncate_error_msg(message),
     );
+    shutdown_queued
 }
 
 /// Compute the ping hash for a given nanosecond timestamp.
@@ -1286,7 +1292,12 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<OutboundMessage>(16);
         let peer_id = PeerId::from_bytes([1u8; 32]);
 
-        send_error_and_drop(&peer_id, &tx, ErrorCode::Load, "test message");
+        assert!(send_error_and_drop(
+            &peer_id,
+            &tx,
+            ErrorCode::Load,
+            "test message"
+        ));
 
         // First message should be the error
         match rx.recv().await.unwrap() {
@@ -1308,6 +1319,18 @@ mod tests {
                 std::mem::discriminant(&other)
             ),
         }
+    }
+
+    #[test]
+    fn test_send_error_and_drop_reports_full_channel() {
+        let (tx, _rx) = mpsc::channel::<OutboundMessage>(1);
+        let peer_id = PeerId::from_bytes([1u8; 32]);
+        assert!(tx.try_send(OutboundMessage::Shutdown).is_ok());
+
+        assert!(
+            !send_error_and_drop(&peer_id, &tx, ErrorCode::Load, "test message"),
+            "full channel cannot be treated as an in-progress eviction"
+        );
     }
 
     /// Verify the ping hash computation is deterministic and the

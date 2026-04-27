@@ -96,13 +96,19 @@ impl OverlayManager {
                     "Evicting non-preferred {:?} peer {} for preferred peer {}",
                     direction, victim_id, peer_info.peer_id
                 );
-                admission.mark_evicting(victim_id.clone());
-                super::peer_loop::send_error_and_drop(
+                if !super::peer_loop::send_error_and_drop(
                     &victim_id,
                     &entry.value().outbound_tx,
                     ErrorCode::Load,
                     "preferred peer selected instead",
-                );
+                ) {
+                    debug!(
+                        "Could not queue shutdown for non-preferred peer {}; trying next victim",
+                        victim_id
+                    );
+                    continue;
+                }
+                admission.mark_evicting(victim_id.clone());
                 pool.force_promote_authenticated();
                 return true;
             }
