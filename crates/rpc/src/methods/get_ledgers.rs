@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use serde_json::json;
-use stellar_xdr::curr::LedgerCloseMeta;
 
 use crate::context::RpcContext;
 use crate::error::JsonRpcError;
@@ -16,6 +15,15 @@ use crate::util;
 const DEFAULT_LEDGER_LIMIT: u32 = 5;
 /// Maximum number of ledgers that can be requested in a single query.
 const MAX_LEDGER_LIMIT: u32 = 200;
+
+/// Maximum cumulative raw XDR bytes to load from the database per request.
+///
+/// This is a **DB load budget**, not a response-size budget. The actual
+/// serialized response will be larger (base64 ~1.33×, JSON more). The first
+/// ledger is always returned regardless of its size so pagination can make
+/// forward progress; subsequent ledgers are included only while the cumulative
+/// raw XDR byte count stays within this limit.
+const MAX_LEDGER_META_LOAD_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
 pub async fn handle(
     ctx: &Arc<RpcContext>,
@@ -53,11 +61,16 @@ pub async fn handle(
     // End ledger for query: latest + 1 (exclusive upper bound)
     let end_ledger = lctx.latest_ledger + 1;
 
-    // Query ledger close metas from database
+    // Query ledger close metas from database with byte budget
     let metas = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
             use henyey_db::LedgerCloseMetaQueries;
-            conn.load_ledger_close_metas_in_range(effective_start, end_ledger, effective_limit)
+            conn.load_ledger_close_metas_in_range_bounded(
+                effective_start,
+                end_ledger,
+                effective_limit,
+                MAX_LEDGER_META_LOAD_BYTES,
+            )
         })
     })
     .await
@@ -66,7 +79,8 @@ pub async fn handle(
         JsonRpcError::internal("database error")
     })?;
 
-    // Build response
+    // Build response — parse each LedgerCloseMeta once and reuse for both
+    // header extraction and metadata serialization (avoids double XDR parse).
     let mut ledgers = Vec::with_capacity(metas.len());
     let mut last_cursor = String::new();
 
@@ -87,8 +101,9 @@ pub async fn handle(
         // Header XDR — encode the LedgerHeaderHistoryEntry
         util::insert_xdr_field(&mut obj, "header", header_entry, format)?;
 
-        // Metadata XDR — encode the full LedgerCloseMeta
-        util::insert_raw_xdr_field::<LedgerCloseMeta>(&mut obj, "metadata", meta_bytes, format)?;
+        // Metadata XDR — use the already-parsed LedgerCloseMeta to avoid
+        // re-parsing the raw bytes a second time.
+        util::insert_pre_parsed_xdr_field(&mut obj, "metadata", meta_bytes, &lcm, format)?;
 
         ledgers.push(serde_json::Value::Object(obj));
     }

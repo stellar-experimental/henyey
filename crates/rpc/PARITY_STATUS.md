@@ -99,7 +99,7 @@ Corresponds to: scoped data query RPC methods.
 | `getLedgerEntries` | `get_ledger_entries::handle()` | Full |
 | `getTransaction` | `get_transaction::handle()` | Full |
 | `getTransactions` | `get_transactions::handle()` | Full |
-| `getLedgers` | `get_ledgers::handle()` | Full |
+| `getLedgers` | `get_ledgers::handle()` | Full | Henyey adds a 10 MiB DB load budget (`MAX_LEDGER_META_LOAD_BYTES`) that may return fewer ledgers than the requested limit. Not present in stellar-core RPC. |
 | `getEvents` filtering and pagination | `get_events::handle()` | Full |
 | Shared XDR/pagination/TOID helpers | `util.rs` | Full |
 

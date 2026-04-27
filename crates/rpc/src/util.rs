@@ -330,6 +330,34 @@ pub(crate) fn insert_raw_xdr_field<T: ReadXdr + Serialize>(
     Ok(())
 }
 
+/// Insert an XDR field using a pre-parsed value and its raw bytes.
+///
+/// Like [`insert_raw_xdr_field`] but avoids re-parsing: the caller has already
+/// deserialized the XDR bytes into `parsed`. In Base64 mode the raw `bytes` are
+/// encoded directly; in JSON mode the pre-parsed value is serialized.
+pub(crate) fn insert_pre_parsed_xdr_field<T: Serialize>(
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+    base_name: &str,
+    bytes: &[u8],
+    parsed: &T,
+    format: XdrFormat,
+) -> Result<(), JsonRpcError> {
+    match format {
+        XdrFormat::Base64 => {
+            obj.insert(
+                format!("{base_name}Xdr"),
+                serde_json::Value::String(BASE64.encode(bytes)),
+            );
+        }
+        XdrFormat::Json => {
+            let json_val = serde_json::to_value(parsed)
+                .map_err(|e| JsonRpcError::internal_logged("serialization error", &e))?;
+            obj.insert(format!("{base_name}Json"), json_val);
+        }
+    }
+    Ok(())
+}
+
 /// Insert an array of XDR items into a JSON object with the correct key name.
 ///
 /// `Base64`: inserts `"{base_name}Xdr": ["<b64>", ...]`.
