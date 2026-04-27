@@ -13,6 +13,7 @@ use henyey_history::cdp::{
     CachedCdpDataLake,
 };
 use henyey_history::checkpoint;
+use henyey_history::verify;
 use henyey_ledger::{LedgerManager, LedgerManagerConfig};
 
 pub(crate) struct VerifyExecutionOptions {
@@ -772,7 +773,7 @@ async fn setup(config: AppConfig, opts: VerifyExecutionOptions) -> anyhow::Resul
 
     let init_header_entry = init_header_entry
         .ok_or_else(|| anyhow::anyhow!("No header found for checkpoint {}", init_checkpoint))?;
-    let init_header_hash = Hash256::from(init_header_entry.hash.0);
+    let init_header_hash = verify::verify_ledger_header_history_entry(&init_header_entry)?;
     ledger_manager.initialize(
         bucket_list,
         hot_archive_bucket_list,
@@ -836,11 +837,12 @@ async fn verify_single_ledger(
 ) -> anyhow::Result<()> {
     let header = &header_entry.header;
     let seq = header.ledger_seq;
+    let verified_header_hash = verify::verify_ledger_header_history_entry(header_entry)?;
 
     // Skip ledgers outside our range
     if seq <= ctx.init_checkpoint || seq > ctx.end_ledger {
         if seq > ctx.init_checkpoint {
-            *prev_ledger_hash = Hash256::from(header_entry.hash.0);
+            *prev_ledger_hash = verified_header_hash;
         }
         return Ok(());
     }
@@ -854,7 +856,7 @@ async fn verify_single_ledger(
             if in_test_range {
                 println!("  Ledger {}: CDP fetch failed: {}", seq, e);
             }
-            *prev_ledger_hash = Hash256::from(header_entry.hash.0);
+            *prev_ledger_hash = verified_header_hash;
             return Ok(());
         }
     };
@@ -869,7 +871,7 @@ async fn verify_single_ledger(
         if ctx.stop_on_error {
             anyhow::bail!("CDP epoch mismatch at ledger {}", seq);
         }
-        *prev_ledger_hash = Hash256::from(header_entry.hash.0);
+        *prev_ledger_hash = verified_header_hash;
         return Ok(());
     }
 
@@ -884,7 +886,7 @@ async fn verify_single_ledger(
             if ctx.stop_on_error {
                 anyhow::bail!("close_ledger failed at ledger {}: {}", seq, e);
             }
-            *prev_ledger_hash = Hash256::from(header_entry.hash.0);
+            *prev_ledger_hash = verified_header_hash;
             return Ok(());
         }
     };
@@ -893,7 +895,7 @@ async fn verify_single_ledger(
         stats.ledgers_verified += 1;
 
         // Compare header hash
-        let expected_header_hash = Hash256::from(header_entry.hash.0);
+        let expected_header_hash = verified_header_hash;
         let header_matches = result.header_hash == expected_header_hash;
 
         // Compare tx result hash

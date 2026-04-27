@@ -372,9 +372,7 @@ impl CatchupManager {
         checkpoint: u32,
     ) -> Result<CheckpointLedgerData> {
         let headers = archive.fetch_ledger_headers(checkpoint).await?;
-        if self.replay_config.verify_results {
-            verify::verify_header_chain_from_entries(&headers)?;
-        }
+        verify::verify_header_chain_from_entries(&headers)?;
         let tx_entries = archive.fetch_transactions(checkpoint).await?;
         let result_entries = archive.fetch_results(checkpoint).await?;
         Ok(CheckpointLedgerData {
