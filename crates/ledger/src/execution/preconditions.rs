@@ -223,14 +223,11 @@ impl TransactionExecutor {
         if let Err(e) = validation::validate_ledger_bounds(&frame, &validation_ctx) {
             return Ok(Err(pre_seq_fail(
                 match e {
-                    validation::ValidationError::BadLedgerBounds { min, max, current } => {
-                        if max > 0 && current > max {
-                            TransactionResultCode::TxTooLate
-                        } else if min > 0 && current < min {
-                            TransactionResultCode::TxTooEarly
-                        } else {
-                            TransactionResultCode::TxFailed
-                        }
+                    validation::ValidationError::LedgerBoundsTooEarly { .. } => {
+                        TransactionResultCode::TxTooEarly
+                    }
+                    validation::ValidationError::LedgerBoundsTooLate { .. } => {
+                        TransactionResultCode::TxTooLate
                     }
                     _ => TransactionResultCode::TxFailed,
                 },

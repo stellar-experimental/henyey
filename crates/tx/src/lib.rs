@@ -264,15 +264,8 @@ impl From<ValidationError> for ValidationResult {
             ValidationError::InsufficientBalance => ValidationResult::InsufficientBalance,
             ValidationError::TooLate { .. } => ValidationResult::TooLate,
             ValidationError::TooEarly { .. } => ValidationResult::TooEarly,
-            ValidationError::BadLedgerBounds { min, max, current } => {
-                if max > 0 && current > max {
-                    ValidationResult::TooLate
-                } else if min > 0 && current < min {
-                    ValidationResult::TooEarly
-                } else {
-                    ValidationResult::Invalid
-                }
-            }
+            ValidationError::LedgerBoundsTooEarly { .. } => ValidationResult::TooEarly,
+            ValidationError::LedgerBoundsTooLate { .. } => ValidationResult::TooLate,
             ValidationError::BadMinAccountSequence => ValidationResult::BadSequence,
             ValidationError::BadMinAccountSequenceAge => ValidationResult::BadMinSeqAgeOrGap,
             ValidationError::BadMinAccountSequenceLedgerGap => ValidationResult::BadMinSeqAgeOrGap,
@@ -652,5 +645,28 @@ mod tests {
             mainnet_validator.validate(&envelope),
             ValidationResult::Valid
         );
+    }
+
+    /// Regression test: LedgerBoundsTooLate maps to ValidationResult::TooLate
+    /// (not Invalid). Covers the equality case current == max_ledger.
+    #[test]
+    fn test_ledger_bounds_too_late_maps_to_too_late() {
+        let result: ValidationResult = ValidationError::LedgerBoundsTooLate {
+            max_ledger: 100,
+            current: 100,
+        }
+        .into();
+        assert_eq!(result, ValidationResult::TooLate);
+    }
+
+    /// Regression test: LedgerBoundsTooEarly maps to ValidationResult::TooEarly.
+    #[test]
+    fn test_ledger_bounds_too_early_maps_to_too_early() {
+        let result: ValidationResult = ValidationError::LedgerBoundsTooEarly {
+            min_ledger: 200,
+            current: 50,
+        }
+        .into();
+        assert_eq!(result, ValidationResult::TooEarly);
     }
 }

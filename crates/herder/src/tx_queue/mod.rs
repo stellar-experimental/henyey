@@ -1454,8 +1454,12 @@ impl TransactionQueue {
                 return Err(TxResultCode::TxTooLate);
             }
 
-            if validate_ledger_bounds(&frame, &ledger_ctx).is_err() {
-                return Err(TxResultCode::TxTooEarly);
+            if let Err(e) = validate_ledger_bounds(&frame, &ledger_ctx) {
+                return Err(match e {
+                    ValidationError::LedgerBoundsTooEarly { .. } => TxResultCode::TxTooEarly,
+                    ValidationError::LedgerBoundsTooLate { .. } => TxResultCode::TxTooLate,
+                    _ => TxResultCode::TxTooEarly,
+                });
             }
         }
 

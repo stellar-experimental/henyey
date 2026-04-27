@@ -242,12 +242,17 @@ pub enum ValidationError {
         /// Ledger close time.
         ledger_time: u64,
     },
-    /// Ledger sequence is outside the allowed range.
-    BadLedgerBounds {
+    /// Ledger sequence is below the minimum allowed.
+    LedgerBoundsTooEarly {
         /// Minimum ledger allowed.
-        min: u32,
-        /// Maximum ledger allowed.
-        max: u32,
+        min_ledger: u32,
+        /// Current ledger sequence.
+        current: u32,
+    },
+    /// Ledger sequence is at or above the maximum allowed.
+    LedgerBoundsTooLate {
+        /// Maximum ledger allowed (exclusive upper bound).
+        max_ledger: u32,
         /// Current ledger sequence.
         current: u32,
     },
@@ -303,11 +308,24 @@ impl std::fmt::Display for ValidationError {
                     min_time, ledger_time
                 )
             }
-            Self::BadLedgerBounds { min, max, current } => {
+            Self::LedgerBoundsTooEarly {
+                min_ledger,
+                current,
+            } => {
                 write!(
                     f,
-                    "bad ledger bounds: [{}, {}], current {}",
-                    min, max, current
+                    "ledger bounds too early: min_ledger {}, current {}",
+                    min_ledger, current
+                )
+            }
+            Self::LedgerBoundsTooLate {
+                max_ledger,
+                current,
+            } => {
+                write!(
+                    f,
+                    "ledger bounds too late: max_ledger {}, current {}",
+                    max_ledger, current
                 )
             }
             Self::BadMinAccountSequence => write!(f, "min account sequence not met"),
@@ -483,9 +501,8 @@ pub fn validate_ledger_bounds(
 
         // Check min ledger
         if lb.min_ledger > 0 && current < lb.min_ledger {
-            return Err(ValidationError::BadLedgerBounds {
-                min: lb.min_ledger,
-                max: lb.max_ledger,
+            return Err(ValidationError::LedgerBoundsTooEarly {
+                min_ledger: lb.min_ledger,
                 current,
             });
         }
@@ -493,9 +510,8 @@ pub fn validate_ledger_bounds(
         // Check max ledger (0 means no limit)
         // Spec: TX_SPEC §4.2.3 — ledger sequence MUST be strictly less than maxLedger.
         if lb.max_ledger > 0 && current >= lb.max_ledger {
-            return Err(ValidationError::BadLedgerBounds {
-                min: lb.min_ledger,
-                max: lb.max_ledger,
+            return Err(ValidationError::LedgerBoundsTooLate {
+                max_ledger: lb.max_ledger,
                 current,
             });
         }
@@ -1822,7 +1838,7 @@ mod tests {
 
         assert!(matches!(
             validate_ledger_bounds(&frame, &context),
-            Err(ValidationError::BadLedgerBounds { .. })
+            Err(ValidationError::LedgerBoundsTooEarly { .. })
         ));
     }
 
@@ -1877,7 +1893,7 @@ mod tests {
 
         assert!(matches!(
             validate_ledger_bounds(&frame, &context),
-            Err(ValidationError::BadLedgerBounds { .. })
+            Err(ValidationError::LedgerBoundsTooLate { .. })
         ));
     }
 
@@ -2298,7 +2314,7 @@ mod tests {
         assert!(
             matches!(
                 validate_ledger_bounds(&frame, &context),
-                Err(ValidationError::BadLedgerBounds { .. })
+                Err(ValidationError::LedgerBoundsTooLate { .. })
             ),
             "current == max_ledger must be rejected (strictly less than)"
         );
