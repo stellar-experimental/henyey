@@ -144,6 +144,17 @@ The server uses per-resource-class semaphores to prevent any single category of 
 
 The `request_semaphore` gates async admission (try-acquire, immediate reject). The three blocking semaphores (`simulation`, `db`, `bucket_io`) bound concurrent `spawn_blocking` work. They provide admission control on the shared pool — not isolated thread pools.
 
+### Response Size Budgets
+
+Paginated endpoints that load variable-size blobs (`getLedgers`, `getTransactions`) enforce a cumulative byte budget at the DB query layer. This prevents response amplification attacks where a single request with `limit=200` could force the server to materialize hundreds of MB of XDR.
+
+| Endpoint | Config Field | Default | Measures |
+|----------|-------------|---------|----------|
+| `getLedgers` | `max_ledger_meta_load_bytes` | 10 MiB | Raw `LedgerCloseMeta` XDR |
+| `getTransactions` | `max_tx_load_bytes` | 10 MiB | `txbody + txresult + txmeta` |
+
+The first row is always returned regardless of its size so that cursor-based pagination can always make forward progress.
+
 ## stellar-core Mapping
 
 This crate has no direct `stellar-core` counterpart. The implemented API surface is a native Stellar JSON-RPC surface for henyey nodes, while henyey-specific integrations replace captive-core and standalone ingestion components with direct access to `henyey-app`, `henyey-db`, and bucket snapshots.

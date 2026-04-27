@@ -79,6 +79,7 @@ pub async fn handle(
     // Query transactions and batch-load close times in a single blocking DB call.
     // On pruning race (require_close_times fails), fall back to batch_close_times
     // and skip records with missing headers rather than returning a 500.
+    let tx_load_budget = ctx.app.config().rpc.max_tx_load_bytes;
     let (records, close_time_cache) = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
             use henyey_db::{HistoryQueries, LedgerQueries};
@@ -88,6 +89,7 @@ pub async fn handle(
                 end_ledger,
                 effective_limit,
                 status_filter,
+                tx_load_budget,
             )?;
             let seqs: Vec<u32> = records
                 .iter()

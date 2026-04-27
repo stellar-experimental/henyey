@@ -1080,3 +1080,241 @@ async fn get_ledgers_oversized_first_row_still_returned() {
     );
     assert_eq!(ledgers[0]["sequence"], json!(2));
 }
+
+// ---------------------------------------------------------------------------
+// getTransactions budget truncation and pagination tests
+// ---------------------------------------------------------------------------
+
+/// Boot a [`FakeRpcTestHarness`] with a custom `max_tx_load_bytes` budget
+/// and a header snapshot at the given sequence.
+async fn setup_fake_rpc_with_tx_budget(
+    seq: u32,
+    close_time: u64,
+    budget: usize,
+) -> FakeRpcTestHarness {
+    let header = test_header(seq, close_time);
+    let app = FakeRpcApp::builder()
+        .header_snapshot(header)
+        .max_tx_load_bytes(budget)
+        .build();
+    let h = FakeRpcTestHarness::start(app).await;
+    seed_ledger_header(h.app.database(), seq, close_time);
+    h
+}
+
+/// Seed several valid transactions at a given ledger sequence, each with
+/// the same payload sizes. Returns the per-row byte count.
+fn seed_transactions(h: &FakeRpcTestHarness, ledger_seq: u32, count: u32) -> usize {
+    let body = valid_envelope_bytes();
+    let result = valid_result_pair_bytes();
+    let meta = valid_meta_bytes();
+    let row_bytes = body.len() + result.len() + meta.len();
+    for i in 0..count {
+        let tx_id = format!("budget_tx_{ledger_seq}_{i:04}");
+        h.app
+            .database()
+            .with_connection(|conn| {
+                conn.store_transaction(&StoreTxParams {
+                    ledger_seq,
+                    tx_index: i,
+                    tx_id: &tx_id,
+                    body: &body,
+                    result: &result,
+                    meta: Some(&meta),
+                    status: TxStatus::Success,
+                })
+            })
+            .unwrap();
+    }
+    row_bytes
+}
+
+/// Verify getTransactions respects byte budget and truncates results.
+#[tokio::test]
+async fn get_transactions_budget_truncation() {
+    // Each valid tx blob is relatively small. Set budget so only ~2 fit.
+    let h = setup_fake_rpc_with_tx_budget(10, 1_700_000_010, 1).await;
+
+    // We need to know the actual per-row size to set a proper budget.
+    let row_bytes = seed_transactions(&h, 2, 5);
+    // Seed the header for ledger 2 (where txs live)
+    seed_ledger_header(h.app.database(), 2, 1_700_000_002);
+
+    // Recreate with a budget that fits 2 rows but not 3
+    let budget = row_bytes * 2 + row_bytes / 2; // 2.5x one row
+    let h = setup_fake_rpc_with_tx_budget(10, 1_700_000_010, budget).await;
+    let row_bytes2 = seed_transactions(&h, 2, 5);
+    assert_eq!(row_bytes, row_bytes2);
+    seed_ledger_header(h.app.database(), 2, 1_700_000_002);
+
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "budget-tx-trunc",
+            "method": "getTransactions",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 5 }
+            }
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let txs = result["transactions"]
+        .as_array()
+        .expect("transactions array");
+
+    // Should get fewer than 5 due to budget truncation.
+    assert!(
+        txs.len() < 5,
+        "expected budget truncation to return fewer than 5 txs, got {}",
+        txs.len()
+    );
+    // Must return at least 1 (first-row guarantee).
+    assert!(
+        !txs.is_empty(),
+        "budget truncation must return at least 1 tx"
+    );
+    // Cursor must be present and non-empty for pagination.
+    let cursor = result["cursor"].as_str().expect("cursor");
+    assert!(!cursor.is_empty());
+}
+
+/// Verify getTransactions pagination resumes correctly after budget truncation.
+#[tokio::test]
+async fn get_transactions_budget_truncation_resume() {
+    let body = valid_envelope_bytes();
+    let result_bytes = valid_result_pair_bytes();
+    let meta = valid_meta_bytes();
+    let row_bytes = body.len() + result_bytes.len() + meta.len();
+
+    // Budget fits exactly 1 row (but first-row guarantee means at least 1)
+    let budget = row_bytes;
+    let h = setup_fake_rpc_with_tx_budget(10, 1_700_000_010, budget).await;
+    seed_ledger_header(h.app.database(), 2, 1_700_000_002);
+
+    // Seed 3 transactions at ledger 2
+    for i in 0..3u32 {
+        let tx_id = format!("resume_tx_{i:04}");
+        h.app
+            .database()
+            .with_connection(|conn| {
+                conn.store_transaction(&StoreTxParams {
+                    ledger_seq: 2,
+                    tx_index: i,
+                    tx_id: &tx_id,
+                    body: &body,
+                    result: &result_bytes,
+                    meta: Some(&meta),
+                    status: TxStatus::Success,
+                })
+            })
+            .unwrap();
+    }
+
+    // First page
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "resume-p1",
+            "method": "getTransactions",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 10 }
+            }
+        }))
+        .await;
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let txs = result["transactions"].as_array().expect("transactions");
+    assert_eq!(txs.len(), 1, "budget should limit to 1 tx per page");
+    let cursor = result["cursor"].as_str().expect("cursor");
+
+    // Second page using cursor
+    let (status2, resp2) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "resume-p2",
+            "method": "getTransactions",
+            "params": {
+                "pagination": { "cursor": cursor, "limit": 10 }
+            }
+        }))
+        .await;
+    assert_eq!(status2, 200);
+    let result2 = &resp2["result"];
+    let txs2 = result2["transactions"].as_array().expect("transactions");
+    assert_eq!(txs2.len(), 1, "second page should also have 1 tx");
+
+    // Third page
+    let cursor2 = result2["cursor"].as_str().expect("cursor");
+    let (status3, resp3) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "resume-p3",
+            "method": "getTransactions",
+            "params": {
+                "pagination": { "cursor": cursor2, "limit": 10 }
+            }
+        }))
+        .await;
+    assert_eq!(status3, 200);
+    let txs3 = resp3["result"]["transactions"]
+        .as_array()
+        .expect("transactions");
+    assert_eq!(txs3.len(), 1, "third page should have the last tx");
+}
+
+/// Verify the first-row guarantee: even with a tiny budget, at least one
+/// transaction is returned and the cursor advances.
+#[tokio::test]
+async fn get_transactions_budget_oversized_first_row() {
+    // Budget of 1 byte — far smaller than any real tx
+    let h = setup_fake_rpc_with_tx_budget(10, 1_700_000_010, 1).await;
+    seed_ledger_header(h.app.database(), 2, 1_700_000_002);
+
+    let body = valid_envelope_bytes();
+    let result_bytes = valid_result_pair_bytes();
+    let meta = valid_meta_bytes();
+    h.app
+        .database()
+        .with_connection(|conn| {
+            conn.store_transaction(&StoreTxParams {
+                ledger_seq: 2,
+                tx_index: 0,
+                tx_id: "oversized_first_row",
+                body: &body,
+                result: &result_bytes,
+                meta: Some(&meta),
+                status: TxStatus::Success,
+            })
+        })
+        .unwrap();
+
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "oversized-first",
+            "method": "getTransactions",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 10 }
+            }
+        }))
+        .await;
+
+    assert_eq!(status, 200);
+    let result = &resp["result"];
+    let txs = result["transactions"].as_array().expect("transactions");
+    assert_eq!(
+        txs.len(),
+        1,
+        "with 1-byte budget, first tx must still be returned"
+    );
+    let cursor = result["cursor"].as_str().expect("cursor");
+    assert!(
+        !cursor.is_empty(),
+        "cursor must be present for forward progress"
+    );
+}

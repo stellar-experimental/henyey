@@ -145,11 +145,17 @@ pub trait HistoryQueries {
         result_stream: &mut XdrOutputStream,
     ) -> Result<(u32, u32), DbError>;
 
-    /// Loads transactions in a ledger range, for cursor-based pagination.
+    /// Loads transactions in a ledger range with a cumulative byte budget.
     ///
     /// Returns transactions where `(ledgerseq, txindex) > (start_ledger, start_tx_index)`
     /// and `ledgerseq < end_ledger`, ordered by `(ledgerseq, txindex)` ascending,
-    /// limited to `limit` rows.
+    /// limited to `limit` rows and `max_total_bytes` cumulative payload bytes
+    /// (`txbody + txresult + txmeta`).
+    ///
+    /// The **first row is always included** regardless of its size so that
+    /// pagination can always make forward progress. The byte check uses
+    /// `length(...)` from SQLite before reading blobs, so oversized rows
+    /// beyond the budget are never materialized into memory.
     ///
     /// If `start_tx_index` is `None`, starts from the beginning of `start_ledger`.
     /// If `status_filter` is `Some`, only returns transactions with that status.
@@ -160,6 +166,7 @@ pub trait HistoryQueries {
         end_ledger: u32,
         limit: u32,
         status_filter: Option<TxStatus>,
+        max_total_bytes: usize,
     ) -> Result<Vec<TxRecord>, DbError>;
 
     /// Deletes old transaction history entries with `ledgerseq <= max_ledger`.
@@ -169,6 +176,51 @@ pub trait HistoryQueries {
     /// tables (`txsets`, `txresults`) use the same count independently.
     /// Returns the total number of rows deleted across all tables.
     fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
+}
+
+/// Builds the WHERE clause and bind values for transaction range queries.
+///
+/// Returns `(where_clause, bind_values, limit_param_index)` so that both
+/// the bounded and any future unbounded variants share the same filter logic.
+fn build_tx_range_filter(
+    start_ledger: u32,
+    start_tx_index: Option<u32>,
+    end_ledger: u32,
+    limit: u32,
+    status_filter: Option<TxStatus>,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>, usize) {
+    let mut conditions = Vec::new();
+    let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+    if let Some(tx_index) = start_tx_index {
+        // Cursor-based: resume after (start_ledger, tx_index)
+        conditions.push(format!(
+            "(ledgerseq > ?{idx1} OR (ledgerseq = ?{idx2} AND txindex > ?{idx3}))",
+            idx1 = bind_values.len() + 1,
+            idx2 = bind_values.len() + 2,
+            idx3 = bind_values.len() + 3,
+        ));
+        bind_values.push(Box::new(start_ledger));
+        bind_values.push(Box::new(start_ledger));
+        bind_values.push(Box::new(tx_index));
+    } else {
+        // No cursor: start from the beginning of start_ledger
+        conditions.push(format!("ledgerseq >= ?{}", bind_values.len() + 1));
+        bind_values.push(Box::new(start_ledger));
+    }
+
+    conditions.push(format!("ledgerseq < ?{}", bind_values.len() + 1));
+    bind_values.push(Box::new(end_ledger));
+
+    if let Some(status) = status_filter {
+        conditions.push(format!("status = ?{}", bind_values.len() + 1));
+        bind_values.push(Box::new(status as i32));
+    }
+
+    let limit_idx = bind_values.len() + 1;
+    bind_values.push(Box::new(limit));
+
+    (conditions.join(" AND "), bind_values, limit_idx)
 }
 
 impl HistoryQueries for Connection {
@@ -340,9 +392,39 @@ impl HistoryQueries for Connection {
         end_ledger: u32,
         limit: u32,
         status_filter: Option<TxStatus>,
+        max_total_bytes: usize,
     ) -> Result<Vec<TxRecord>, DbError> {
-        let map_row = |row: &rusqlite::Row<'_>| {
-            Ok(TxRecord {
+        let (where_clause, bind_values, limit_idx) = build_tx_range_filter(
+            start_ledger,
+            start_tx_index,
+            end_ledger,
+            limit,
+            status_filter,
+        );
+
+        let sql = format!(
+            "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status, \
+             length(txbody) + length(txresult) + COALESCE(length(txmeta), 0) \
+             FROM txhistory \
+             WHERE {} ORDER BY ledgerseq ASC, txindex ASC LIMIT ?{}",
+            where_clause, limit_idx,
+        );
+
+        let mut stmt = self.prepare(&sql)?;
+        let params = rusqlite::params_from_iter(bind_values.iter().map(|v| v.as_ref()));
+        let mut rows = stmt.query(params)?;
+        let mut results = Vec::new();
+        let mut cumulative_bytes: usize = 0;
+
+        while let Some(row) = rows.next()? {
+            let row_bytes: i64 = row.get(7)?;
+            let row_bytes = row_bytes.max(0) as usize;
+
+            if !results.is_empty() && cumulative_bytes + row_bytes > max_total_bytes {
+                break;
+            }
+
+            let record = TxRecord {
                 tx_id: row.get(0)?,
                 ledger_seq: row.get(1)?,
                 tx_index: row.get(2)?,
@@ -356,54 +438,12 @@ impl HistoryQueries for Connection {
                         Box::new(e),
                     )
                 })?,
-            })
-        };
-
-        // Build WHERE clause and parameter list dynamically to avoid
-        // duplicating the full query across 4 match arms.
-        let mut conditions = Vec::new();
-        let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(tx_index) = start_tx_index {
-            // Cursor-based: resume after (start_ledger, tx_index)
-            conditions.push(format!(
-                "(ledgerseq > ?{idx1} OR (ledgerseq = ?{idx2} AND txindex > ?{idx3}))",
-                idx1 = bind_values.len() + 1,
-                idx2 = bind_values.len() + 2,
-                idx3 = bind_values.len() + 3,
-            ));
-            bind_values.push(Box::new(start_ledger));
-            bind_values.push(Box::new(start_ledger));
-            bind_values.push(Box::new(tx_index));
-        } else {
-            // No cursor: start from the beginning of start_ledger
-            conditions.push(format!("ledgerseq >= ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(start_ledger));
+            };
+            cumulative_bytes += row_bytes;
+            results.push(record);
         }
 
-        conditions.push(format!("ledgerseq < ?{}", bind_values.len() + 1));
-        bind_values.push(Box::new(end_ledger));
-
-        if let Some(status) = status_filter {
-            conditions.push(format!("status = ?{}", bind_values.len() + 1));
-            bind_values.push(Box::new(status as i32));
-        }
-
-        let limit_idx = bind_values.len() + 1;
-        bind_values.push(Box::new(limit));
-
-        let sql = format!(
-            "SELECT txid, ledgerseq, txindex, txbody, txresult, txmeta, status FROM txhistory \
-             WHERE {} ORDER BY ledgerseq ASC, txindex ASC LIMIT ?{}",
-            conditions.join(" AND "),
-            limit_idx,
-        );
-
-        let mut stmt = self.prepare(&sql)?;
-        let params = rusqlite::params_from_iter(bind_values.iter().map(|v| v.as_ref()));
-        let rows = stmt.query_map(params, map_row)?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(DbError::from)
+        Ok(results)
     }
 
     fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError> {
@@ -915,5 +955,158 @@ mod tests {
         assert_eq!(deleted, 2); // all 2 txns from ledger 11
         assert_eq!(count_txhistory(&conn, 11), 0);
         assert_eq!(count_txhistory(&conn, 12), 1); // untouched
+    }
+
+    // -----------------------------------------------------------------------
+    // load_transactions_in_range bounded byte-budget tests
+    // -----------------------------------------------------------------------
+
+    /// Insert a transaction with controllable payload sizes.
+    fn insert_tx(
+        conn: &Connection,
+        ledger: u32,
+        idx: u32,
+        body_size: usize,
+        result_size: usize,
+        meta: Option<usize>,
+        status: TxStatus,
+    ) {
+        let tx_id = format!("tx-{ledger}-{idx}");
+        let body = vec![0xBBu8; body_size];
+        let result = vec![0xCCu8; result_size];
+        let meta_bytes: Option<Vec<u8>> = meta.map(|n| vec![0xDDu8; n]);
+        conn.store_transaction(&StoreTxParams {
+            ledger_seq: ledger,
+            tx_index: idx,
+            tx_id: &tx_id,
+            body: &body,
+            result: &result,
+            meta: meta_bytes.as_deref(),
+            status,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn test_bounded_basic_truncation() {
+        let conn = setup_db();
+        // Each tx: 100 body + 50 result + 200 meta = 350 bytes
+        for i in 0..5 {
+            insert_tx(&conn, 10, i, 100, 50, Some(200), TxStatus::Success);
+        }
+        // Budget 750 fits 2 rows (700) but not 3 (1050)
+        let results = conn
+            .load_transactions_in_range(10, None, 11, 10, None, 750)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_bounded_first_row_over_budget() {
+        let conn = setup_db();
+        // Single huge tx: 1000 bytes total, budget only 100
+        insert_tx(&conn, 10, 0, 500, 200, Some(300), TxStatus::Success);
+        let results = conn
+            .load_transactions_in_range(10, None, 11, 10, None, 100)
+            .unwrap();
+        assert_eq!(results.len(), 1, "first row must always be included");
+    }
+
+    #[test]
+    fn test_bounded_null_meta() {
+        let conn = setup_db();
+        // Each tx: 100 body + 50 result + NULL meta = 150 bytes
+        for i in 0..5 {
+            insert_tx(&conn, 10, i, 100, 50, None, TxStatus::Success);
+        }
+        // Budget 400 fits 2 rows (300) but not 3 (450)
+        let results = conn
+            .load_transactions_in_range(10, None, 11, 10, None, 400)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].meta.is_none());
+    }
+
+    #[test]
+    fn test_bounded_status_filter() {
+        let conn = setup_db();
+        // 3 success, 2 failed — each 350 bytes
+        for i in 0..3 {
+            insert_tx(&conn, 10, i, 100, 50, Some(200), TxStatus::Success);
+        }
+        for i in 3..5 {
+            insert_tx(&conn, 10, i, 100, 50, Some(200), TxStatus::Failed);
+        }
+        // Budget fits 2 rows; filter to Failed only
+        let results = conn
+            .load_transactions_in_range(10, None, 11, 10, Some(TxStatus::Failed), 750)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.status == TxStatus::Failed));
+    }
+
+    #[test]
+    fn test_bounded_cursor_resume() {
+        let conn = setup_db();
+        // 3 txs across 2 ledgers, each 350 bytes
+        insert_tx(&conn, 10, 0, 100, 50, Some(200), TxStatus::Success);
+        insert_tx(&conn, 10, 1, 100, 50, Some(200), TxStatus::Success);
+        insert_tx(&conn, 11, 0, 100, 50, Some(200), TxStatus::Success);
+
+        // Budget fits 1 row
+        let page1 = conn
+            .load_transactions_in_range(10, None, 12, 10, None, 350)
+            .unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].ledger_seq, 10);
+        assert_eq!(page1[0].tx_index, 0);
+
+        // Resume from cursor (ledger 10, tx_index 0)
+        let page2 = conn
+            .load_transactions_in_range(10, Some(0), 12, 10, None, 350)
+            .unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].ledger_seq, 10);
+        assert_eq!(page2[0].tx_index, 1);
+
+        // Resume from cursor (ledger 10, tx_index 1) — crosses ledger boundary
+        let page3 = conn
+            .load_transactions_in_range(10, Some(1), 12, 10, None, 350)
+            .unwrap();
+        assert_eq!(page3.len(), 1);
+        assert_eq!(page3[0].ledger_seq, 11);
+        assert_eq!(page3[0].tx_index, 0);
+    }
+
+    #[test]
+    fn test_bounded_exact_budget() {
+        let conn = setup_db();
+        // Each tx: 100 + 50 + 200 = 350 bytes
+        for i in 0..3 {
+            insert_tx(&conn, 10, i, 100, 50, Some(200), TxStatus::Success);
+        }
+        // Budget exactly 700 = 2 * 350 — second row should be included
+        let results = conn
+            .load_transactions_in_range(10, None, 11, 10, None, 700)
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "exact budget boundary should include the row"
+        );
+    }
+
+    #[test]
+    fn test_bounded_row_limit_precedence() {
+        let conn = setup_db();
+        // Each tx: 100 + 50 + 200 = 350 bytes
+        for i in 0..5 {
+            insert_tx(&conn, 10, i, 100, 50, Some(200), TxStatus::Success);
+        }
+        // Budget large enough for all 5, but row limit is 2
+        let results = conn
+            .load_transactions_in_range(10, None, 11, 2, None, 100_000)
+            .unwrap();
+        assert_eq!(results.len(), 2, "row limit should take precedence");
     }
 }

@@ -150,6 +150,7 @@ pub struct FakeRpcAppBuilder {
     header_snapshot: Option<LedgerHeader>,
     snapshot_ready: bool,
     max_ledger_meta_load_bytes: Option<usize>,
+    max_tx_load_bytes: Option<usize>,
 }
 
 impl Default for FakeRpcAppBuilder {
@@ -165,6 +166,7 @@ impl Default for FakeRpcAppBuilder {
             header_snapshot: None,
             snapshot_ready: true,
             max_ledger_meta_load_bytes: None,
+            max_tx_load_bytes: None,
         }
     }
 }
@@ -231,12 +233,22 @@ impl FakeRpcAppBuilder {
         self
     }
 
+    /// Override the `getTransactions` DB load budget (bytes).
+    #[allow(dead_code)]
+    pub fn max_tx_load_bytes(mut self, bytes: usize) -> Self {
+        self.max_tx_load_bytes = Some(bytes);
+        self
+    }
+
     pub fn build(self) -> FakeRpcApp {
         let mut config = AppConfig::testnet();
         config.rpc.enabled = true;
         config.network.passphrase = self.network_passphrase.clone();
         if let Some(budget) = self.max_ledger_meta_load_bytes {
             config.rpc.max_ledger_meta_load_bytes = budget;
+        }
+        if let Some(budget) = self.max_tx_load_bytes {
+            config.rpc.max_tx_load_bytes = budget;
         }
 
         let ledger_manager = Arc::new(LedgerManager::new(
