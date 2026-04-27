@@ -1870,8 +1870,9 @@ impl App {
         let lcl = self.ledger_info().ledger_seq;
 
         // Only consult the publish queue for retention when publishing is
-        // possible (#1989).
-        let min_queued = if self.config.history.publish_enabled() {
+        // possible (validator with writable archives) (#1989).
+        let can_publish = self.is_validator && self.config.history.publish_enabled();
+        let min_queued = if can_publish {
             self.db
                 .load_publish_queue(Some(1))
                 .ok()
@@ -2297,13 +2298,14 @@ impl App {
 
         // Provide ledger bounds via Arc<App>.
         let app = Arc::clone(self);
-        let publish_enabled = self.config.history.publish_enabled();
+        let can_publish = self.is_validator && self.config.history.publish_enabled();
         let get_ledger_bounds = move || -> (u32, Option<u32>) {
             let lcl = app.ledger_info().ledger_seq;
             // Only consult the publish queue for retention when publishing is
-            // possible.  Without writable archives the queue cannot drain and
-            // stale entries would pin the prune threshold indefinitely (#1989).
-            let min_queued = if publish_enabled {
+            // possible (validator with writable archives).  Without either the
+            // queue cannot drain and stale entries would pin the prune threshold
+            // indefinitely (#1989).
+            let min_queued = if can_publish {
                 app.database()
                     .load_publish_queue(Some(1))
                     .ok()

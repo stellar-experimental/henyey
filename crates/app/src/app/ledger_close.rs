@@ -453,18 +453,21 @@ impl App {
             );
         }
 
-        // Drain stale publish queue entries when publishing is disabled.
-        // This must happen before restore_checkpoint and bucket verification,
-        // which read the publish queue. Without writable archives, queue entries
-        // can never be published and would pin retention thresholds (#1989).
-        if !self.config.history.publish_enabled() {
+        // Drain stale publish queue entries when publishing cannot happen.
+        // Publishing requires BOTH validator status AND writable archives.
+        // Without either, queue entries can never be published and would pin
+        // retention thresholds (#1989). This also handles config changes
+        // (e.g., validator→non-validator with writable archives still present).
+        let can_publish = self.is_validator && self.config.history.publish_enabled();
+        if !can_publish {
             match self
                 .db_blocking("drain-stale-publish-queue", |db| {
                     let stale = db.load_publish_queue(None)?;
                     if !stale.is_empty() {
                         tracing::info!(
                             count = stale.len(),
-                            "Clearing publish queue: no writable archives configured"
+                            "Clearing publish queue: publishing not possible \
+                             (requires validator with writable archives)"
                         );
                         for seq in &stale {
                             db.remove_publish(*seq)?;
