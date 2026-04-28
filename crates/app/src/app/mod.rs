@@ -1883,9 +1883,9 @@ impl App {
                     tracing::warn!(
                         error = %e,
                         "Failed to read publish queue for maintenance; \
-                         pruning will use LCL as fallback"
+                         skipping this cycle to avoid over-pruning"
                     );
-                    None
+                    return;
                 }
             }
         } else {
@@ -2317,9 +2317,11 @@ impl App {
                         tracing::warn!(
                             error = %e,
                             "Failed to read publish queue for maintenance; \
-                             pruning will use LCL as fallback"
+                             skipping pruning this cycle to avoid over-pruning"
                         );
-                        None
+                        // Use Some(0) to force publish_safe_lmin to 0,
+                        // effectively skipping all publish-sensitive pruning.
+                        Some(0)
                     }
                 }
             } else {
