@@ -375,6 +375,7 @@ pub(crate) fn load_soroban_network_info(
         load_config_setting(snapshot, ConfigSettingId::ContractLedgerCostExtV0)?
     {
         info.fee_write_1kb = ext.fee_write1_kb;
+        info.tx_max_footprint_entries = ext.tx_max_footprint_entries;
     }
 
     // Load historical data settings

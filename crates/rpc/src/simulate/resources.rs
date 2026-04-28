@@ -357,6 +357,7 @@ mod tests {
             ballot_timeout_increment_ms: 500,
             ledger_target_close_time_ms: 5000,
             ledger_max_dependent_tx_clusters: 4,
+            tx_max_footprint_entries: 40,
         }
     }
 

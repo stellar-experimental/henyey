@@ -47,6 +47,11 @@ pub(crate) async fn sorobaninfo_handler(
                     max_write_bytes: info.tx_max_write_bytes,
                     max_contract_events_size_bytes: info.tx_max_contract_events_size_bytes,
                     max_size_bytes: info.tx_max_size_bytes,
+                    max_footprint_size: if protocol_version >= 23 {
+                        Some(info.tx_max_footprint_entries)
+                    } else {
+                        None
+                    },
                 },
                 ledger: SorobanLedgerLimits {
                     max_instructions: info.ledger_max_instructions,
@@ -75,6 +80,8 @@ pub(crate) async fn sorobaninfo_handler(
                     bucketlist_size_window_sample_size: info.bucketlist_size_window_sample_size,
                     eviction_scan_size: info.eviction_scan_size,
                     starting_eviction_scan_level: info.starting_eviction_scan_level,
+                    bucket_list_size_snapshot_period: info.bucketlist_size_window_sample_size,
+                    average_bucket_list_size: info.average_bucket_list_size,
                 },
                 max_dependent_tx_clusters: if protocol_version >= 23 {
                     Some(info.ledger_max_dependent_tx_clusters)

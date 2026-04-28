@@ -353,6 +353,8 @@ pub(crate) async fn compat_sorobaninfo_handler(
                     "ledger_max_write_bytes": info.ledger_max_write_bytes,
                     "ledger_max_tx_count": info.ledger_max_tx_count,
                     "tx_max_size_bytes": info.tx_max_size_bytes,
+                    "average_bucket_list_size": info.average_bucket_list_size,
+                    "bucket_list_size_snapshot_period": info.bucketlist_size_window_sample_size,
                 }
             });
             if protocol_version >= 23 {
@@ -360,6 +362,10 @@ pub(crate) async fn compat_sorobaninfo_handler(
                 obj.insert(
                     "max_dependent_tx_clusters".into(),
                     info.ledger_max_dependent_tx_clusters.into(),
+                );
+                obj.insert(
+                    "max_footprint_size".into(),
+                    info.tx_max_footprint_entries.into(),
                 );
                 obj.insert(
                     "scp".into(),
@@ -593,6 +599,8 @@ mod tests {
                 "ledger_max_write_bytes": 1024_u32,
                 "ledger_max_tx_count": 100_u32,
                 "tx_max_size_bytes": 512_u32,
+                "average_bucket_list_size": 100_000_000_u64,
+                "bucket_list_size_snapshot_period": 30_u32,
             }
         });
         let info = value["info"].as_object().unwrap();
@@ -603,6 +611,19 @@ mod tests {
         assert!(
             !info.contains_key("max_dependent_tx_clusters"),
             "max_dependent_tx_clusters should be absent for pre-protocol 23"
+        );
+        assert!(
+            !info.contains_key("max_footprint_size"),
+            "max_footprint_size should be absent for pre-protocol 23"
+        );
+        // Verify bucket list fields are always present
+        assert!(
+            info.contains_key("average_bucket_list_size"),
+            "average_bucket_list_size should always be present"
+        );
+        assert!(
+            info.contains_key("bucket_list_size_snapshot_period"),
+            "bucket_list_size_snapshot_period should always be present"
         );
     }
 
@@ -622,12 +643,15 @@ mod tests {
                 "ledger_max_write_bytes": 1024_u32,
                 "ledger_max_tx_count": 100_u32,
                 "tx_max_size_bytes": 512_u32,
+                "average_bucket_list_size": 100_000_000_u64,
+                "bucket_list_size_snapshot_period": 30_u32,
             }
         });
         let protocol_version: u32 = 23;
         if protocol_version >= 23 {
             let obj = value["info"].as_object_mut().unwrap();
             obj.insert("max_dependent_tx_clusters".into(), 8_u32.into());
+            obj.insert("max_footprint_size".into(), 40_u32.into());
             obj.insert(
                 "scp".into(),
                 serde_json::json!({
@@ -654,6 +678,9 @@ mod tests {
             assert!(scp.contains_key(key), "compat scp missing key: {key}");
         }
         assert_eq!(scp.len(), 5, "unexpected extra SCP fields in compat");
+
+        // Protocol 23+ includes max_footprint_size
+        assert_eq!(info["max_footprint_size"], 40);
     }
 
     // ── ISO 8601 parser tests ───────────────────────────────────────────

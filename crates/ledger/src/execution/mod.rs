@@ -242,6 +242,8 @@ pub struct SorobanNetworkInfo {
     pub ledger_target_close_time_ms: u32,
     /// Maximum number of dependent TX clusters per stage (from ContractParallelComputeV0).
     pub ledger_max_dependent_tx_clusters: u32,
+    /// Maximum footprint entries per transaction (Protocol 23+, from ContractLedgerCostExtV0).
+    pub tx_max_footprint_entries: u32,
 }
 
 pub(super) struct RefundableFeeTracker {

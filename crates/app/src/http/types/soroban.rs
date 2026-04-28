@@ -54,6 +54,9 @@ pub struct SorobanTxLimits {
     pub max_write_bytes: u32,
     pub max_contract_events_size_bytes: u32,
     pub max_size_bytes: u32,
+    /// Protocol 23+: maximum footprint entries per transaction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_footprint_size: Option<u32>,
 }
 
 /// Soroban per-ledger resource limits.
@@ -80,6 +83,12 @@ pub struct SorobanStateArchival {
     pub bucketlist_size_window_sample_size: u32,
     pub eviction_scan_size: i64,
     pub starting_eviction_scan_level: u32,
+    /// Alias for `bucketlist_size_window_sample_size`.
+    /// stellar-core emits both keys with the same value
+    /// (from `stateArchivalSettings.liveSorobanStateSizeWindowSampleSize`).
+    pub bucket_list_size_snapshot_period: u32,
+    /// Computed average bucket list size (non-configurable).
+    pub average_bucket_list_size: u64,
 }
 
 #[cfg(test)]
@@ -89,6 +98,7 @@ mod tests {
     fn default_response(
         scp: Option<SorobanScpSettings>,
         clusters: Option<u32>,
+        max_footprint_size: Option<u32>,
     ) -> SorobanInfoResponse {
         SorobanInfoResponse {
             max_contract_size: 0,
@@ -103,6 +113,7 @@ mod tests {
                 max_write_bytes: 0,
                 max_contract_events_size_bytes: 0,
                 max_size_bytes: 0,
+                max_footprint_size,
             },
             ledger: SorobanLedgerLimits {
                 max_instructions: 0,
@@ -128,9 +139,11 @@ mod tests {
                 persistent_rent_rate_denominator: 0,
                 temp_rent_rate_denominator: 0,
                 max_entries_to_archive: 0,
-                bucketlist_size_window_sample_size: 0,
+                bucketlist_size_window_sample_size: 30,
                 eviction_scan_size: 0,
                 starting_eviction_scan_level: 0,
+                bucket_list_size_snapshot_period: 30,
+                average_bucket_list_size: 100_000_000,
             },
             max_dependent_tx_clusters: clusters,
             scp,
@@ -139,7 +152,7 @@ mod tests {
 
     #[test]
     fn test_sorobaninfo_pre_protocol_23_omits_scp_fields() {
-        let response = default_response(None, None);
+        let response = default_response(None, None, None);
         let json = serde_json::to_value(&response).unwrap();
 
         assert!(
@@ -149,6 +162,10 @@ mod tests {
         assert!(
             json.get("max_dependent_tx_clusters").is_none(),
             "max_dependent_tx_clusters should be absent for pre-protocol 23"
+        );
+        assert!(
+            json["tx"].get("max_footprint_size").is_none(),
+            "max_footprint_size should be absent for pre-protocol 23"
         );
     }
 
@@ -163,6 +180,7 @@ mod tests {
                 ballot_timeout_inc_ms: 1000,
             }),
             Some(8),
+            Some(40),
         );
         let json = serde_json::to_value(&response).unwrap();
 
@@ -174,6 +192,9 @@ mod tests {
         assert_eq!(scp["nomination_timeout_inc_ms"], 500);
         assert_eq!(scp["ballot_timeout_ms"], 1000);
         assert_eq!(scp["ballot_timeout_inc_ms"], 1000);
+
+        // Protocol 23+ includes max_footprint_size in tx
+        assert_eq!(json["tx"]["max_footprint_size"], 40);
     }
 
     #[test]
@@ -187,6 +208,7 @@ mod tests {
                 ballot_timeout_inc_ms: 5,
             }),
             Some(6),
+            Some(16),
         );
         let json = serde_json::to_value(&response).unwrap();
         let scp = json["scp"].as_object().unwrap();
@@ -206,6 +228,47 @@ mod tests {
             scp.len(),
             expected_keys.len(),
             "unexpected extra SCP fields"
+        );
+    }
+
+    #[test]
+    fn test_sorobaninfo_state_archival_includes_bucket_list_fields() {
+        let response = default_response(None, None, None);
+        let json = serde_json::to_value(&response).unwrap();
+        let archival = &json["state_archival"];
+
+        assert_eq!(
+            archival["average_bucket_list_size"], 100_000_000_u64,
+            "average_bucket_list_size should always be present"
+        );
+        assert_eq!(
+            archival["bucket_list_size_snapshot_period"], 30,
+            "bucket_list_size_snapshot_period should always be present"
+        );
+        // Verify alias invariant: bucket_list_size_snapshot_period == bucketlist_size_window_sample_size
+        assert_eq!(
+            archival["bucket_list_size_snapshot_period"],
+            archival["bucketlist_size_window_sample_size"],
+            "bucket_list_size_snapshot_period must equal bucketlist_size_window_sample_size (alias)"
+        );
+    }
+
+    #[test]
+    fn test_sorobaninfo_max_footprint_size_protocol_gating() {
+        // Pre-protocol 23: max_footprint_size absent
+        let pre_p23 = default_response(None, None, None);
+        let json = serde_json::to_value(&pre_p23).unwrap();
+        assert!(
+            json["tx"].get("max_footprint_size").is_none(),
+            "max_footprint_size should be absent pre-P23"
+        );
+
+        // Protocol 23+: max_footprint_size present
+        let p23 = default_response(None, None, Some(40));
+        let json = serde_json::to_value(&p23).unwrap();
+        assert_eq!(
+            json["tx"]["max_footprint_size"], 40,
+            "max_footprint_size should be 40 for P23+"
         );
     }
 }
