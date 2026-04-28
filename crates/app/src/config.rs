@@ -2747,6 +2747,188 @@ name = "test"
         }
     }
 
+    /// Returns true if `text` contains any `__UPPER_SNAKE__` placeholder markers.
+    fn has_placeholder_markers(text: &str) -> bool {
+        // Manual scan for __[A-Z_]{2,}__ without pulling in the regex crate.
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i + 4 < bytes.len() {
+            if bytes[i] == b'_' && bytes[i + 1] == b'_' {
+                // Found "__", scan for uppercase/underscore body then closing "__"
+                let start = i + 2;
+                let mut j = start;
+                while j < bytes.len() && (bytes[j].is_ascii_uppercase() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                if j >= start + 2 && j + 1 < bytes.len() && bytes[j] == b'_' && bytes[j + 1] == b'_'
+                {
+                    return true;
+                }
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
+        false
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[test]
+    fn test_history_publish_fixture_renders_and_parses() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let template_path = repo_root.join("configs/test-history-publish.toml");
+        let raw = std::fs::read_to_string(&template_path)
+            .expect("configs/test-history-publish.toml should exist");
+
+        // Phase 1: Assert expected markers exist in the raw template.
+        assert!(
+            raw.contains("__NODE_SEED__"),
+            "template missing __NODE_SEED__ marker"
+        );
+        assert!(
+            raw.contains("__DB_PATH__"),
+            "template missing __DB_PATH__ marker"
+        );
+        assert!(
+            raw.contains("__BUCKET_DIR__"),
+            "template missing __BUCKET_DIR__ marker"
+        );
+        assert!(
+            raw.contains("__HISTORY_DIR__"),
+            "template missing __HISTORY_DIR__ marker"
+        );
+        assert!(
+            raw.contains("# __PEER_PORT__"),
+            "template missing # __PEER_PORT__ comment marker"
+        );
+
+        // Assert occurrence counts match the template contract.
+        assert_eq!(
+            count_occurrences(&raw, "__HISTORY_DIR__"),
+            3,
+            "__HISTORY_DIR__ should appear exactly 3 times (url, put, mkdir)"
+        );
+        assert_eq!(
+            count_occurrences(&raw, "__PEER_PORT__"),
+            1,
+            "__PEER_PORT__ should appear exactly once"
+        );
+        assert_eq!(
+            count_occurrences(&raw, "__NODE_SEED__"),
+            1,
+            "__NODE_SEED__ should appear exactly once"
+        );
+        assert_eq!(
+            count_occurrences(&raw, "__DB_PATH__"),
+            1,
+            "__DB_PATH__ should appear exactly once"
+        );
+        assert_eq!(
+            count_occurrences(&raw, "__BUCKET_DIR__"),
+            1,
+            "__BUCKET_DIR__ should appear exactly once"
+        );
+
+        // Phase 2: Render with adversarial values.
+        // Use & and | (sed metacharacters) but not \ (TOML escape char).
+        let test_seed = henyey_crypto::SecretKey::from_seed(&[42u8; 32]).to_strkey();
+        let test_db_path = "/tmp/adv&dir|path/validator.db";
+        let test_bucket_dir = "/tmp/adv&dir|path/buckets";
+        let test_history_dir = "/tmp/adv&dir|path/history";
+        let test_peer_port: u16 = 31415;
+
+        let mut rendered = raw
+            .replace("__NODE_SEED__", &test_seed)
+            .replace("__DB_PATH__", test_db_path)
+            .replace("__BUCKET_DIR__", test_bucket_dir)
+            .replace("__HISTORY_DIR__", test_history_dir);
+
+        // Replace the peer_port line (mirrors the shell script's anchored sed).
+        rendered = rendered
+            .lines()
+            .map(|line| {
+                if line.starts_with("peer_port") && line.contains("# __PEER_PORT__") {
+                    format!("peer_port = {test_peer_port}")
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Phase 3: Assert no placeholder markers remain.
+        assert!(
+            !has_placeholder_markers(&rendered),
+            "rendered config still contains __PLACEHOLDER__ markers:\n{rendered}"
+        );
+
+        // Phase 4: Parse and validate.
+        let config: AppConfig = toml::from_str(&rendered).unwrap_or_else(|e| {
+            panic!("rendered test-history-publish.toml failed to parse as AppConfig: {e}")
+        });
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("rendered config failed semantic validation: {e}"));
+
+        // Phase 5: Assert substituted values via exact equality.
+        assert_eq!(
+            config.node.node_seed.as_deref(),
+            Some(test_seed.as_str()),
+            "node_seed mismatch"
+        );
+        assert_eq!(
+            config.database.path,
+            std::path::PathBuf::from(test_db_path),
+            "database.path mismatch"
+        );
+        assert_eq!(
+            config.buckets.directory,
+            std::path::PathBuf::from(test_bucket_dir),
+            "buckets.directory mismatch"
+        );
+        assert_eq!(
+            config.overlay.peer_port, test_peer_port,
+            "peer_port mismatch"
+        );
+
+        // Verify the "local" archive entry has the adversarial history path
+        // in all three use-sites: url, put, mkdir.
+        let local_archive = config
+            .history
+            .archives
+            .iter()
+            .find(|a| a.name == "local")
+            .expect("template should have a 'local' archive entry");
+        assert_eq!(
+            local_archive.url,
+            format!("file://{test_history_dir}"),
+            "local archive url mismatch"
+        );
+        let put_cmd = local_archive
+            .put
+            .as_deref()
+            .expect("local archive should have a put command");
+        assert!(
+            put_cmd.contains(test_history_dir),
+            "local archive put command should contain history dir, got: {put_cmd}"
+        );
+        let mkdir_cmd = local_archive
+            .mkdir
+            .as_deref()
+            .expect("local archive should have a mkdir command");
+        assert!(
+            mkdir_cmd.contains(test_history_dir),
+            "local archive mkdir command should contain history dir, got: {mkdir_cmd}"
+        );
+    }
+
     // --- Regression tests for AUDIT-183: invalid inner quorum set silently dropped ---
 
     fn valid_key() -> String {
