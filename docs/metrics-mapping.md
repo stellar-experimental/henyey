@@ -74,7 +74,7 @@ Metrics inspired by stellar-core but with different type, unit, or granularity.
 |---|---|---|---|
 | `LEDGER_CLOSE_DURATION_SECONDS` | `stellar_ledger_close_duration_seconds` | histogram | Derived from `stats.close_time_ms`. Histogram (seconds) vs stellar-core's gauge (ms). |
 | `SCP_TIMING_EXTERNALIZED_SECONDS` | `stellar_scp_timing_externalized_seconds` | histogram | SCP externalization latency — histogram in henyey vs timer in stellar-core. |
-| `SCP_TIMING_NOMINATED_SECONDS` | `stellar_scp_timing_nominated_seconds` | histogram | SCP nomination latency — histogram in henyey vs timer in stellar-core. |
+| `SCP_TIMING_NOMINATED_SECONDS` | `stellar_scp_timing_nominated_seconds` | gauge | SCP nomination phase duration (nomination start → ballot protocol start). Matches stellar-core's `mNominateToPrepare`. |
 | `LEDGER_APPLY_SUCCESS_TOTAL` | `stellar_ledger_apply_success_total` | counter | Cumulative successful tx applies — monotonic counter vs per-close gauge in stellar-core. |
 | `LEDGER_APPLY_FAILURE_TOTAL` | `stellar_ledger_apply_failure_total` | counter | Cumulative failed tx applies. |
 | `LEDGER_APPLY_SOROBAN_SUCCESS_TOTAL` | `stellar_ledger_apply_soroban_success_total` | counter | Cumulative successful Soroban tx applies. |

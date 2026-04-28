@@ -464,6 +464,11 @@ pub struct ScpDriver {
     /// First time we nominated a value for each slot (for nomination timing metric).
     /// Recorded from the `nominating_value` SCP callback on the first invocation per slot.
     nomination_started_at: RwLock<HashMap<SlotIndex, std::time::Instant>>,
+    /// First time the ballot protocol started for each slot (prepare phase entry).
+    /// Recorded from the `started_ballot_protocol` SCP callback on the first invocation per slot.
+    /// Used with `nomination_started_at` to compute nomination phase duration
+    /// (matching stellar-core's `mNominateToPrepare`).
+    ballot_started_at: RwLock<HashMap<SlotIndex, std::time::Instant>>,
     /// Timing snapshot for the most recently externalized slot.
     last_externalize_timing: RwLock<Option<ExternalizeTimingSnapshot>>,
     /// Externalize lag tracker for per-node lag statistics.
@@ -479,8 +484,10 @@ pub struct ExternalizeTimingSnapshot {
     pub slot: SlotIndex,
     /// Duration from slot-first-seen to externalization.
     pub externalize_duration: std::time::Duration,
-    /// Duration from first local nomination vote to externalization.
-    /// `None` if this node did not nominate for the slot (watcher/catchup path).
+    /// Duration from first local nomination vote to ballot protocol start (prepare phase).
+    /// Matches stellar-core's `mNominateToPrepare` metric.
+    /// `None` if either nomination start or ballot start was not recorded for this slot
+    /// (e.g., watcher nodes, catchup, fast-forward, or externalize before ballot start).
     pub nomination_duration: Option<std::time::Duration>,
     /// Duration from first EXTERNALIZE seen (any node) to self-externalize.
     /// Near-zero when this node was the first to externalize.
@@ -515,6 +522,7 @@ impl ScpDriver {
             test_clock: Arc::new(AtomicU64::new(0)),
             slot_first_seen: RwLock::new(HashMap::new()),
             nomination_started_at: RwLock::new(HashMap::new()),
+            ballot_started_at: RwLock::new(HashMap::new()),
             last_externalize_timing: RwLock::new(None),
             externalize_lag: RwLock::new(ExternalizeLagTracker::new()),
         }
@@ -760,6 +768,15 @@ impl ScpDriver {
     /// protocol first adds a local vote for the slot.
     pub fn record_nomination_start(&self, slot: SlotIndex) {
         let mut map = self.nomination_started_at.write();
+        map.entry(slot).or_insert_with(std::time::Instant::now);
+    }
+
+    /// Record that the ballot protocol started for a slot (prepare phase entry).
+    /// Only the first call per slot is recorded; subsequent calls are no-ops.
+    /// Called from the `started_ballot_protocol` SCP callback when the slot
+    /// transitions from nomination to the ballot protocol.
+    pub fn record_ballot_start(&self, slot: SlotIndex) {
+        let mut map = self.ballot_started_at.write();
         map.entry(slot).or_insert_with(std::time::Instant::now);
     }
 
@@ -2049,11 +2066,15 @@ impl ScpDriver {
 
             if let Some(first_seen) = self.slot_first_seen.read().get(&slot).copied() {
                 let externalize_duration = now - first_seen;
-                let nomination_duration = self
-                    .nomination_started_at
-                    .read()
-                    .get(&slot)
-                    .map(|&started| now - started);
+                let nomination_duration = match (
+                    self.nomination_started_at.read().get(&slot).copied(),
+                    self.ballot_started_at.read().get(&slot).copied(),
+                ) {
+                    (Some(nom_start), Some(bal_start)) => {
+                        Some(bal_start.saturating_duration_since(nom_start))
+                    }
+                    _ => None,
+                };
                 *self.last_externalize_timing.write() = Some(ExternalizeTimingSnapshot {
                     slot,
                     externalize_duration,
@@ -2075,15 +2096,20 @@ impl ScpDriver {
             *latest = Some(slot);
         }
 
-        // Clean up old slot_first_seen and nomination_started_at entries (keep only recent slots).
-        // Keep 100 slots to ensure close-complete can still find timestamps during backlog
-        // (EXTERNALIZEs race ahead of close-complete when the node is behind).
+        // Clean up old slot_first_seen, nomination_started_at, and ballot_started_at
+        // entries (keep only recent slots). Keep 100 slots to ensure close-complete can
+        // still find timestamps during backlog (EXTERNALIZEs race ahead of close-complete
+        // when the node is behind).
         {
             let mut map = self.slot_first_seen.write();
             map.retain(|&s, _| slot.saturating_sub(s) <= 100);
         }
         {
             let mut map = self.nomination_started_at.write();
+            map.retain(|&s, _| slot.saturating_sub(s) <= 100);
+        }
+        {
+            let mut map = self.ballot_started_at.write();
             map.retain(|&s, _| slot.saturating_sub(s) <= 100);
         }
 
@@ -2197,6 +2223,7 @@ impl ScpDriver {
         // heard_from_quorum(). See #1874.
         self.slot_first_seen.write().clear();
         self.nomination_started_at.write().clear();
+        self.ballot_started_at.write().clear();
         self.externalize_lag.write().clear_slots();
 
         if tx_sizes.cache > 0 || tx_sizes.pending > 0 || externalized_count > 0 {
@@ -2228,6 +2255,9 @@ impl ScpDriver {
             .write()
             .retain(|&s, _| s > keep_after_slot);
         self.nomination_started_at
+            .write()
+            .retain(|&s, _| s > keep_after_slot);
+        self.ballot_started_at
             .write()
             .retain(|&s, _| s > keep_after_slot);
         // cleanup_slots_below uses >= (keep slots >= slot), but here we want
@@ -2270,6 +2300,7 @@ impl ScpDriver {
         // Clean up timing maps for old slots
         self.slot_first_seen.write().retain(|&s, _| s >= slot);
         self.nomination_started_at.write().retain(|&s, _| s >= slot);
+        self.ballot_started_at.write().retain(|&s, _| s >= slot);
         self.externalize_lag.write().cleanup_slots_below(slot);
 
         // Clean up pending tx set requests for old slots
@@ -2904,6 +2935,10 @@ impl SCPDriver for HerderScpCallback {
         self.driver.record_nomination_start(slot_index);
     }
 
+    fn started_ballot_protocol(&self, slot_index: u64, _value: &Value) {
+        self.driver.record_ballot_start(slot_index);
+    }
+
     fn value_externalized(&self, slot_index: u64, value: &Value) {
         // Record first-externalize baseline BEFORE processing.
         // Mirrors stellar-core line 915: recordSCPExternalizeEvent(self, false)
@@ -3147,6 +3182,8 @@ mod tests {
 
         driver.record_slot_activity(100);
         driver.record_nomination_start(100);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        driver.record_ballot_start(100);
         driver.record_externalized(100, Value::default(), None);
 
         let snapshot = driver.last_externalize_timing().unwrap();
@@ -3154,6 +3191,8 @@ mod tests {
         assert!(snapshot.externalize_duration.as_nanos() > 0);
         assert!(snapshot.nomination_duration.is_some());
         assert!(snapshot.nomination_duration.unwrap() <= snapshot.externalize_duration);
+        // nomination_duration should measure nomination→ballot_start, not nomination→externalize
+        assert!(snapshot.nomination_duration.unwrap().as_nanos() > 0);
     }
 
     #[test]
@@ -3175,6 +3214,7 @@ mod tests {
 
         driver.record_slot_activity(100);
         driver.record_nomination_start(100);
+        driver.record_ballot_start(100);
         driver.record_externalized(100, Value::default(), None);
 
         let snapshot1 = driver.last_externalize_timing().unwrap();
@@ -3255,10 +3295,12 @@ mod tests {
 
         driver.record_slot_activity(100);
         driver.record_nomination_start(100);
+        driver.record_ballot_start(100);
 
         driver.clear_slot_scoped_caches();
 
         assert!(driver.nomination_started_at.read().is_empty());
+        assert!(driver.ballot_started_at.read().is_empty());
         assert!(driver.slot_first_seen.read().is_empty());
     }
 
@@ -3277,6 +3319,82 @@ mod tests {
 
         // Timing should be cleared (not stale from slot 100)
         assert!(driver.last_externalize_timing().is_none());
+    }
+
+    #[test]
+    fn test_nomination_timing_no_ballot_start() {
+        // nomination_start recorded but ballot_start not → nomination_duration should be None
+        let driver = make_test_driver();
+
+        driver.record_slot_activity(100);
+        driver.record_nomination_start(100);
+        // No record_ballot_start call
+        driver.record_externalized(100, Value::default(), None);
+
+        let snapshot = driver.last_externalize_timing().unwrap();
+        assert_eq!(snapshot.slot, 100);
+        assert!(snapshot.externalize_duration.as_nanos() > 0);
+        assert!(snapshot.nomination_duration.is_none());
+    }
+
+    #[test]
+    fn test_ballot_start_first_call_guard() {
+        let driver = make_test_driver();
+
+        driver.record_ballot_start(100);
+        let first_time = *driver.ballot_started_at.read().get(&100).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        driver.record_ballot_start(100);
+        let second_time = *driver.ballot_started_at.read().get(&100).unwrap();
+
+        assert_eq!(first_time, second_time);
+    }
+
+    #[test]
+    fn test_ballot_started_at_cleanup() {
+        let driver = make_test_driver();
+
+        for slot in 90..=100 {
+            driver.record_slot_activity(slot);
+            driver.record_nomination_start(slot);
+            driver.record_ballot_start(slot);
+        }
+
+        driver.record_slot_activity(200);
+        driver.record_externalized(200, Value::default(), None);
+
+        let map = driver.ballot_started_at.read();
+        assert!(map.is_empty() || map.keys().all(|&s| 200u64.saturating_sub(s) <= 100));
+    }
+
+    #[test]
+    fn test_ballot_started_at_purge() {
+        let driver = make_test_driver();
+
+        driver.record_ballot_start(50);
+        driver.record_ballot_start(100);
+
+        driver.purge_slots_below(80);
+
+        let map = driver.ballot_started_at.read();
+        assert!(!map.contains_key(&50));
+        assert!(map.contains_key(&100));
+    }
+
+    #[test]
+    fn test_ballot_started_at_trim_stale_caches() {
+        let driver = make_test_driver();
+
+        driver.record_ballot_start(50);
+        driver.record_ballot_start(100);
+
+        driver.trim_stale_caches(80);
+
+        let map = driver.ballot_started_at.read();
+        assert!(!map.contains_key(&50));
+        assert!(map.contains_key(&100));
     }
 
     #[test]

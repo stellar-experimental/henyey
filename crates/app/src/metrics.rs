@@ -325,7 +325,7 @@ metric_catalog! {
         SCP_TIMING_EXTERNALIZED_SECONDS = "stellar_scp_timing_externalized_seconds"
             => "Time from slot creation to externalize (seconds, last slot)";
         SCP_TIMING_NOMINATED_SECONDS = "stellar_scp_timing_nominated_seconds"
-            => "Time from first local nomination to externalize (seconds, last slot)";
+            => "Time from first local nomination to ballot protocol start (seconds, last slot, matches stellar-core mNominateToPrepare)";
         SCP_TIMING_FIRST_TO_SELF_EXTERNALIZE_SECONDS = "stellar_scp_timing_first_to_self_externalize_seconds"
             => "Time from first observed EXTERNALIZE to self-externalize (seconds, last slot)";
 

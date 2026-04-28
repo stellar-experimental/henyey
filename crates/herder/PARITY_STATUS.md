@@ -479,7 +479,7 @@ Features not yet implemented. These ARE counted against parity %.
 | `cacheValidTxSet()` / `checkAndCacheTxSetValid()` | Low | TxSet validity caching |
 | `wrapEnvelope()` / `wrapStellarValue()` / `wrapValue()` | Low | Value wrapper pattern |
 | Ballot phase callbacks (7 methods) | Low | Logging/metrics callbacks |
-| `getPrepareStart()` / SCPTiming | Low | Consensus timing tracking |
+| `getPrepareStart()` / SCPTiming | Partial | `ballot_started_at` tracks prepare start; `nomination_duration` matches `mNominateToPrepare`. Missing: `mPrepareToExternalize` metric. |
 | `getUpgradeNominationTimeoutLimit()` | Medium | Uses a hard-coded default instead of runtime upgrade parameters |
 | `syncMetrics()` | Low | Metrics synchronization |
 | `isNewerNominationOrBallotSt()` | Medium | Envelope dedup optimization |
