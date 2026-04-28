@@ -57,7 +57,14 @@ If still empty, **stop** with a message: "No eligible issues found for auto-sele
 Otherwise, set `$ISSUE` to the selected issue number and announce:
 "Auto-selected issue #$ISSUE: <title>".
 
-Then assign the issue to yourself as a concurrency lock:
+**Set `$ORIGINAL_ISSUE` = `$ISSUE`** (preserved for redirect comments if
+blocker-ancestor resolution changes the target).
+
+**Set `$AUTO_SELECTED` = `true`** when the issue was auto-selected (no argument
+provided), or `false` when an explicit issue number was given.
+
+**Assign the issue to yourself as a concurrency lock** (applies to both
+auto-selected and explicit issue numbers):
 ```bash
 gh issue edit $ISSUE --add-assignee "@me"
 ```
@@ -65,19 +72,18 @@ gh issue edit $ISSUE --add-assignee "@me"
 If assignment fails (e.g., another worker raced), **stop** with a message:
 "Could not assign issue #$ISSUE — it may have been claimed by another worker."
 
-**Set `$ORIGINAL_ISSUE` = `$ISSUE`** (preserved for redirect comments if
-blocker-ancestor resolution changes the target).
-
-**Set `$AUTO_SELECTED` = `true`** when the issue was auto-selected (no argument
-provided), or `false` when an explicit issue number was given.
-
-**Failure handling for auto-selected issues:** If the skill fails at any point
-and `$AUTO_SELECTED` is `true`, before stopping:
-```bash
-gh issue edit $ISSUE --add-label "plan-do-review-loop-failed" --remove-assignee "$(gh api user -q .login)"
-```
-This labels the issue so it won't be auto-selected again and unassigns it so
-other workers can see it is no longer in progress.
+**Failure handling:** If the skill fails at any point, before stopping:
+1. Unassign yourself to release the concurrency lock:
+   ```bash
+   gh issue edit $ISSUE --remove-assignee "$(gh api user -q .login)"
+   ```
+2. If `$AUTO_SELECTED` is `true`, also label the issue so it won't be
+   auto-selected again:
+   ```bash
+   gh issue edit $ISSUE --add-label "plan-do-review-loop-failed"
+   ```
+This releases the lock so other workers can see the issue is no longer in
+progress, and (for auto-selected issues) prevents infinite retry loops.
 
 # Plan-Do-Review
 
