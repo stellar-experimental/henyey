@@ -26,14 +26,27 @@ fn dex_ops_to_flood_per_ledger(rate: f64, ops_limit: u32) -> u32 {
     product as u32
 }
 
-fn rounded_up_flood_budget(per_ledger: u128, period_ms: u64, ledger_close_ms: u64) -> usize {
-    assert!(period_ms > 0, "flood period must be positive");
-    assert!(ledger_close_ms > 0, "ledger close time must be positive");
+/// Extract the millisecond count from a `Duration`, asserting it is a
+/// positive whole-millisecond value. Panics with `name` in the message
+/// if the duration is zero, sub-millisecond, or has sub-ms remainder.
+fn exact_millis(d: Duration, name: &str) -> u128 {
+    assert!(
+        d.subsec_nanos() % 1_000_000 == 0,
+        "{name} must be a whole-millisecond duration"
+    );
+    let ms = d.as_millis();
+    assert!(ms > 0, "{name} must be positive");
+    ms
+}
+
+fn rounded_up_flood_budget(per_ledger: u128, period: Duration, ledger_close: Duration) -> usize {
+    let period_ms = exact_millis(period, "flood period");
+    let close_ms = exact_millis(ledger_close, "ledger close time");
 
     let numerator = per_ledger
-        .checked_mul(period_ms as u128)
+        .checked_mul(period_ms)
         .expect("flood budget numerator overflowed");
-    let quotient = numerator.div_ceil(ledger_close_ms as u128);
+    let quotient = numerator.div_ceil(close_ms);
     assert!(
         quotient <= i64::MAX as u128,
         "flood budget must fit stellar-core int64 result"
@@ -45,11 +58,11 @@ fn rounded_up_flood_budget(per_ledger: u128, period_ms: u64, ledger_close_ms: u6
 fn classic_flood_budget(
     rate: f64,
     ops_limit: usize,
-    period_ms: u64,
-    ledger_close_ms: u64,
+    period: Duration,
+    ledger_close: Duration,
 ) -> usize {
     let per_ledger = ops_to_flood_per_ledger(rate, ops_limit);
-    rounded_up_flood_budget(per_ledger as u128, period_ms, ledger_close_ms)
+    rounded_up_flood_budget(per_ledger as u128, period, ledger_close)
 }
 
 /// Compute the combined classic+Soroban flood budget.
@@ -62,20 +75,20 @@ fn combined_flood_budget(
     classic_limit: usize,
     soroban_rate: f64,
     soroban_limit: usize,
-    period_ms: u64,
-    ledger_close_ms: u64,
+    period: Duration,
+    ledger_close: Duration,
 ) -> usize {
     let classic = ops_to_flood_per_ledger(classic_rate, classic_limit);
     let soroban = ops_to_flood_per_ledger(soroban_rate, soroban_limit);
     let total = classic
         .checked_add(soroban)
         .expect("combined flood per-ledger limit must fit stellar-core int64");
-    rounded_up_flood_budget(total as u128, period_ms, ledger_close_ms)
+    rounded_up_flood_budget(total as u128, period, ledger_close)
 }
 
-fn dex_flood_budget(rate: f64, ops_limit: u32, period_ms: u64, ledger_close_ms: u64) -> usize {
+fn dex_flood_budget(rate: f64, ops_limit: u32, period: Duration, ledger_close: Duration) -> usize {
     let per_ledger = dex_ops_to_flood_per_ledger(rate, ops_limit);
-    rounded_up_flood_budget(per_ledger as u128, period_ms, ledger_close_ms)
+    rounded_up_flood_budget(per_ledger as u128, period, ledger_close)
 }
 
 fn add_flood_carryover(base: usize, carryover: usize) -> usize {
@@ -130,15 +143,15 @@ impl App {
         &self,
         classic_limit: usize,
         soroban_limit: usize,
-        period_ms: u64,
+        period: Duration,
     ) -> usize {
         combined_flood_budget(
             self.config.overlay.flood_op_rate_per_ledger,
             classic_limit,
             self.config.overlay.flood_soroban_rate_per_ledger,
             soroban_limit,
-            period_ms,
-            self.herder.ledger_close_duration().as_millis() as u64,
+            period,
+            self.herder.ledger_close_duration(),
         )
     }
 
@@ -152,7 +165,7 @@ impl App {
         let base_budget = self.combined_ops_flood_budget(
             self.herder.max_tx_set_size(),
             self.soroban_flood_tx_limit(),
-            self.config.overlay.flood_tx_period_ms,
+            self.flood_tx_period(),
         );
         let carryover = self.broadcast_op_carryover.load(Ordering::Relaxed);
         add_flood_carryover(base_budget, carryover)
@@ -170,8 +183,8 @@ impl App {
         let base = dex_flood_budget(
             self.config.overlay.flood_op_rate_per_ledger,
             effective_dex_ops,
-            self.config.overlay.flood_tx_period_ms,
-            self.herder.ledger_close_duration().as_millis() as u64,
+            self.flood_tx_period(),
+            self.herder.ledger_close_duration(),
         );
         let carryover = self.broadcast_dex_op_carryover.load(Ordering::Relaxed);
         Some(add_flood_carryover(base, carryover))
@@ -324,6 +337,10 @@ impl App {
         Duration::from_millis(self.config.overlay.flood_demand_period_ms.max(1))
     }
 
+    fn flood_advert_period(&self) -> Duration {
+        Duration::from_millis(self.config.overlay.flood_advert_period_ms.max(1))
+    }
+
     fn flood_demand_backoff_delay(&self) -> Duration {
         Duration::from_millis(self.config.overlay.flood_demand_backoff_delay_ms.max(1))
     }
@@ -337,7 +354,7 @@ impl App {
         let per_period = self.combined_ops_flood_budget(
             self.herder.max_tx_set_size(),
             self.soroban_flood_tx_limit(),
-            self.config.overlay.flood_advert_period_ms,
+            self.flood_advert_period(),
         );
         per_period.clamp(1, TX_ADVERT_VECTOR_MAX_SIZE)
     }
@@ -348,7 +365,7 @@ impl App {
         let per_period = self.combined_ops_flood_budget(
             self.herder.max_queue_size_ops(),
             self.herder.max_queue_size_soroban_ops(),
-            self.config.overlay.flood_demand_period_ms,
+            self.flood_demand_period(),
         );
         per_period.clamp(1, TX_DEMAND_VECTOR_MAX_SIZE)
     }
@@ -1392,14 +1409,20 @@ fn collect_adverts_for_peers(
 mod tests {
     use super::*;
 
+    use std::time::Duration;
+
+    fn ms(v: u64) -> Duration {
+        Duration::from_millis(v)
+    }
+
     #[test]
     fn test_classic_flood_budget_truncates_before_division() {
-        assert_eq!(classic_flood_budget(0.51, 10, 3, 10), 2);
+        assert_eq!(classic_flood_budget(0.51, 10, ms(3), ms(10)), 2);
     }
 
     #[test]
     fn test_classic_flood_budget_can_truncate_to_zero() {
-        let base = classic_flood_budget(0.009, 100, 200, 5000);
+        let base = classic_flood_budget(0.009, 100, ms(200), ms(5000));
 
         assert_eq!(base, 0);
         assert_eq!(add_flood_carryover(base, 7), 7);
@@ -1407,13 +1430,13 @@ mod tests {
 
     #[test]
     fn test_rounded_up_flood_budget_uses_integer_ceiling() {
-        assert_eq!(rounded_up_flood_budget(7, 200, 5000), 1);
-        assert_eq!(rounded_up_flood_budget(125, 200, 5000), 5);
+        assert_eq!(rounded_up_flood_budget(7, ms(200), ms(5000)), 1);
+        assert_eq!(rounded_up_flood_budget(125, ms(200), ms(5000)), 5);
     }
 
     #[test]
     fn test_vector_size_clamps_zero_to_one() {
-        let per_period = classic_flood_budget(0.001, 10, 100, 5000);
+        let per_period = classic_flood_budget(0.001, 10, ms(100), ms(5000));
 
         assert_eq!(per_period, 0);
         assert_eq!(per_period.clamp(1, TX_ADVERT_VECTOR_MAX_SIZE), 1);
@@ -1423,27 +1446,27 @@ mod tests {
     #[test]
     #[should_panic(expected = "flood rate product must be representable as int64")]
     fn test_classic_flood_budget_rejects_non_finite_rate() {
-        let _ = classic_flood_budget(f64::NAN, 100, 200, 5000);
+        let _ = classic_flood_budget(f64::NAN, 100, ms(200), ms(5000));
     }
 
     #[test]
     #[should_panic(expected = "flood rate product must be representable as int64")]
     fn test_classic_flood_budget_rejects_too_large_product() {
-        let _ = classic_flood_budget(i64::MAX as f64, 1, 200, 5000);
+        let _ = classic_flood_budget(i64::MAX as f64, 1, ms(200), ms(5000));
     }
 
     #[test]
     fn test_combined_flood_budget_adds_soroban_before_division() {
         // classic: 0.1 * 10 = 1, soroban: 0.1 * 10 = 1, total = 2
         // 2 * 1 / 2 = 1 (exact)
-        assert_eq!(combined_flood_budget(0.1, 10, 0.1, 10, 1, 2), 1);
+        assert_eq!(combined_flood_budget(0.1, 10, 0.1, 10, ms(1), ms(2)), 1);
     }
 
     #[test]
     fn test_combined_flood_budget_matches_classic_when_soroban_zero() {
         assert_eq!(
-            combined_flood_budget(0.51, 10, 0.9, 0, 3, 10),
-            classic_flood_budget(0.51, 10, 3, 10)
+            combined_flood_budget(0.51, 10, 0.9, 0, ms(3), ms(10)),
+            classic_flood_budget(0.51, 10, ms(3), ms(10))
         );
     }
 
@@ -1452,8 +1475,8 @@ mod tests {
         // With Soroban limit > 0, the combined budget must be strictly larger
         // than classic-only. This is the regression test for the bug where
         // compute_flood_ops_budget used classic_flood_budget only.
-        let classic_only = classic_flood_budget(0.5, 100, 200, 5000);
-        let combined = combined_flood_budget(0.5, 100, 0.9, 50, 200, 5000);
+        let classic_only = classic_flood_budget(0.5, 100, ms(200), ms(5000));
+        let combined = combined_flood_budget(0.5, 100, 0.9, 50, ms(200), ms(5000));
         assert!(
             combined > classic_only,
             "combined budget ({combined}) must exceed classic-only ({classic_only})"
@@ -1465,19 +1488,31 @@ mod tests {
     fn test_combined_flood_budget_rejects_overflow() {
         // Each term fits i64, but their sum overflows.
         let half = (i64::MAX / 2 + 1) as f64;
-        let _ = combined_flood_budget(half, 1, half, 1, 200, 5000);
+        let _ = combined_flood_budget(half, 1, half, 1, ms(200), ms(5000));
     }
 
     #[test]
     #[should_panic(expected = "flood period must be positive")]
     fn test_rounded_up_flood_budget_rejects_zero_period() {
-        let _ = rounded_up_flood_budget(1, 0, 5000);
+        let _ = rounded_up_flood_budget(1, Duration::ZERO, ms(5000));
     }
 
     #[test]
     #[should_panic(expected = "ledger close time must be positive")]
     fn test_rounded_up_flood_budget_rejects_zero_ledger_close() {
-        let _ = rounded_up_flood_budget(1, 200, 0);
+        let _ = rounded_up_flood_budget(1, ms(200), Duration::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "flood period must be a whole-millisecond duration")]
+    fn test_rounded_up_flood_budget_rejects_sub_ms_period() {
+        let _ = rounded_up_flood_budget(1, Duration::from_micros(1500), ms(5000));
+    }
+
+    #[test]
+    #[should_panic(expected = "ledger close time must be a whole-millisecond duration")]
+    fn test_rounded_up_flood_budget_rejects_sub_ms_ledger_close() {
+        let _ = rounded_up_flood_budget(1, ms(200), Duration::from_micros(1500));
     }
 
     #[test]
@@ -1486,7 +1521,10 @@ mod tests {
         let max_dex_ops = 1000u32;
         let effective_dex_ops = max_dex_ops.min(max_ops);
 
-        assert_eq!(dex_flood_budget(0.51, effective_dex_ops, 200, 5000), 3);
+        assert_eq!(
+            dex_flood_budget(0.51, effective_dex_ops, ms(200), ms(5000)),
+            3
+        );
     }
 
     #[test]
@@ -1515,14 +1553,13 @@ mod tests {
     fn test_budget_uses_tx_period_not_advert_period() {
         let rate = 0.5;
         let ops_limit = 100;
-        let ledger_close_ms = 5000;
+        let ledger_close = ms(5000);
 
-        let advert_period_ms = 100; // flood_advert_period_ms default
-        let tx_period_ms = 200; // flood_tx_period_ms default
+        let advert_period = ms(100); // flood_advert_period_ms default
+        let tx_period = ms(200); // flood_tx_period_ms default
 
-        let budget_advert =
-            classic_flood_budget(rate, ops_limit, advert_period_ms, ledger_close_ms);
-        let budget_tx = classic_flood_budget(rate, ops_limit, tx_period_ms, ledger_close_ms);
+        let budget_advert = classic_flood_budget(rate, ops_limit, advert_period, ledger_close);
+        let budget_tx = classic_flood_budget(rate, ops_limit, tx_period, ledger_close);
 
         // tx period (200ms) should yield double the per-period budget vs advert period (100ms)
         assert_eq!(budget_tx, budget_advert * 2);
@@ -1538,11 +1575,10 @@ mod tests {
     fn test_advert_size_uses_advert_period() {
         let rate = 0.5;
         let ops_limit = 100;
-        let advert_period_ms = 100;
-        let ledger_close_ms = 5000;
+        let advert_period = ms(100);
+        let ledger_close = ms(5000);
 
-        let advert_budget =
-            classic_flood_budget(rate, ops_limit, advert_period_ms, ledger_close_ms);
+        let advert_budget = classic_flood_budget(rate, ops_limit, advert_period, ledger_close);
         // With advert period 100ms: 50 * 100 / 5000 = 1
         assert_eq!(advert_budget, 1);
     }
