@@ -25,46 +25,7 @@ use tracing::{debug, info, trace, warn};
 /// `string msg<100>` constraint in the `Error` struct.
 const MAX_ERROR_MESSAGE_LEN: usize = 100;
 
-/// Multiplier for computing queries-per-window from window duration in seconds.
-/// Matches stellar-core's `QUERY_RESPONSE_MULTIPLIER` (Peer.cpp:136).
-const QUERY_RESPONSE_MULTIPLIER: u32 = 5;
-
-/// Fixed max rate for GetScpState queries per window, matching stellar-core's
-/// `GET_SCP_STATE_MAX_RATE` (Peer.cpp:61).
-const GET_SCP_STATE_MAX_RATE: u32 = 10;
-
-/// Rate-limited query message types.
-///
-/// Parity: stellar-core Peer.cpp uses separate `QueryInfo` instances for
-/// GetTxSet, GetScpQuorumset, and GetScpState, each checked via
-/// `Peer::process()` (Peer.cpp:1423-1438).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryKind {
-    TxSet,
-    ScpQuorumSet,
-    ScpState,
-}
-
-impl QueryKind {
-    /// Classify a message as a rate-limited query, if applicable.
-    fn classify(message: &StellarMessage) -> Option<Self> {
-        match message {
-            StellarMessage::GetTxSet(_) => Some(Self::TxSet),
-            StellarMessage::GetScpQuorumset(_) => Some(Self::ScpQuorumSet),
-            StellarMessage::GetScpState(_) => Some(Self::ScpState),
-            _ => None,
-        }
-    }
-
-    /// Per-kind max queries per window. `None` uses the default
-    /// (`window_secs * QUERY_RESPONSE_MULTIPLIER`).
-    fn max_queries_per_window(self) -> Option<u32> {
-        match self {
-            Self::ScpState => Some(GET_SCP_STATE_MAX_RATE),
-            _ => None,
-        }
-    }
-}
+use crate::query_policy::QueryKind;
 
 /// Per-query-type sliding-window rate limiter.
 ///
@@ -87,17 +48,13 @@ impl QueryInfo {
 
     /// Returns true if the query is allowed under the rate limit.
     ///
-    /// When `max_queries` is `None`, defaults to
-    /// `window_secs * QUERY_RESPONSE_MULTIPLIER`. Mirrors stellar-core's
-    /// `Peer::process(QueryInfo&, optional<uint32_t>)`.
-    fn check_and_increment(&mut self, window: Duration, max_queries: Option<u32>) -> bool {
-        let max =
-            max_queries.unwrap_or_else(|| window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER);
+    /// Mirrors stellar-core's `Peer::process(QueryInfo&, optional<uint32_t>)`.
+    fn check_and_increment(&mut self, window: Duration, max_queries: u32) -> bool {
         if self.last_reset.elapsed() >= window {
             self.last_reset = Instant::now();
             self.count = 0;
         }
-        if self.count >= max {
+        if self.count >= max_queries {
             return false;
         }
         self.count += 1;
@@ -130,7 +87,7 @@ impl QueryRateLimiter {
             Some(k) => k,
             None => return true,
         };
-        let max = kind.max_queries_per_window();
+        let max = kind.max_queries(window);
         let info = match kind {
             QueryKind::TxSet => &mut self.tx_set,
             QueryKind::ScpQuorumSet => &mut self.quorum_set,
@@ -1613,21 +1570,21 @@ mod tests {
     #[test]
     fn test_query_rate_limiter_default_max() {
         let window = Duration::from_secs(10);
-        let max_queries = window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER; // 50
+        let max_queries = QueryKind::TxSet.max_queries(window); // 50
 
         let mut info = QueryInfo::new();
 
         // All queries within limit should be allowed
         for _ in 0..max_queries {
             assert!(
-                info.check_and_increment(window, None),
+                info.check_and_increment(window, max_queries),
                 "query within limit should be allowed"
             );
         }
 
         // Next query should be rejected
         assert!(
-            !info.check_and_increment(window, None),
+            !info.check_and_increment(window, max_queries),
             "query exceeding limit should be rejected"
         );
     }
@@ -1637,11 +1594,11 @@ mod tests {
     #[test]
     fn test_query_rate_limiter_custom_max() {
         let window = Duration::from_secs(10);
-        let custom_max = Some(GET_SCP_STATE_MAX_RATE); // 10
+        let custom_max = QueryKind::ScpState.max_queries(window); // 10
 
         let mut info = QueryInfo::new();
 
-        for _ in 0..GET_SCP_STATE_MAX_RATE {
+        for _ in 0..custom_max {
             assert!(
                 info.check_and_increment(window, custom_max),
                 "query within custom limit should be allowed"
@@ -1661,8 +1618,9 @@ mod tests {
         let window = Duration::from_secs(10);
         let mut limiter = QueryRateLimiter::new();
         let msg = StellarMessage::GetScpState(0);
+        let max = QueryKind::ScpState.max_queries(window);
 
-        for i in 0..GET_SCP_STATE_MAX_RATE {
+        for i in 0..max {
             assert!(
                 limiter.check(&msg, window),
                 "GetScpState #{} should be allowed",
@@ -1673,7 +1631,7 @@ mod tests {
         assert!(
             !limiter.check(&msg, window),
             "GetScpState #{} should be rejected (exceeds max=10)",
-            GET_SCP_STATE_MAX_RATE + 1
+            max + 1
         );
     }
 
@@ -1683,9 +1641,7 @@ mod tests {
         let window = Duration::from_millis(1);
         let mut info = QueryInfo::new();
 
-        // Exhaust the limit. With 1ms window, default max = 0 (0 * 5),
-        // so use custom max.
-        let custom_max = Some(2u32);
+        let custom_max = 2u32;
         assert!(info.check_and_increment(window, custom_max));
         assert!(info.check_and_increment(window, custom_max));
         assert!(!info.check_and_increment(window, custom_max));
@@ -1697,46 +1653,6 @@ mod tests {
         assert!(
             info.check_and_increment(window, custom_max),
             "query should be allowed after window reset"
-        );
-    }
-
-    /// Test QueryKind::classify returns correct variants.
-    #[test]
-    fn test_query_kind_classify() {
-        use stellar_xdr::curr::*;
-
-        // Rate-limited query types
-        assert_eq!(
-            QueryKind::classify(&StellarMessage::GetTxSet(Uint256([0; 32]))),
-            Some(QueryKind::TxSet)
-        );
-        assert_eq!(
-            QueryKind::classify(&StellarMessage::GetScpQuorumset(Uint256([0; 32]))),
-            Some(QueryKind::ScpQuorumSet)
-        );
-        assert_eq!(
-            QueryKind::classify(&StellarMessage::GetScpState(0)),
-            Some(QueryKind::ScpState)
-        );
-
-        // Non-query messages should return None
-        assert_eq!(
-            QueryKind::classify(&StellarMessage::Hello(Hello {
-                ledger_version: 0,
-                overlay_version: 0,
-                overlay_min_version: 0,
-                network_id: Hash([0; 32]),
-                version_str: "".try_into().unwrap(),
-                listening_port: 0,
-                peer_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([0; 32]))),
-                cert: AuthCert {
-                    pubkey: Curve25519Public { key: [0; 32] },
-                    expiration: 0,
-                    sig: Signature::default(),
-                },
-                nonce: Uint256([0; 32]),
-            })),
-            None
         );
     }
 

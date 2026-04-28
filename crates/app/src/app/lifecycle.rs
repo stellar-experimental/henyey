@@ -2,19 +2,11 @@
 
 use super::*;
 
-/// Maximum number of ledger slots used for per-peer rate-limit windows.
-/// Matches stellar-core's `Config::MAX_SLOTS_TO_REMEMBER` (default 12).
-const MAX_SLOTS_TO_REMEMBER: u64 = 12;
-
 /// Compute the query rate-limit window (parity: Peer.cpp:1426-1429).
 ///
-/// stellar-core multiplies the millisecond close time by `MAX_SLOTS_TO_REMEMBER`,
-/// then truncates to whole seconds with `duration_cast<std::chrono::seconds>`.
-/// We replicate that exact sequence: multiply in ms first, then integer-divide
-/// by 1000 to truncate.
+/// Re-exported from the overlay's shared query policy module.
 pub(crate) fn query_rate_limit_window(close_duration: Duration) -> Duration {
-    let total_ms = close_duration.as_millis() as u64 * MAX_SLOTS_TO_REMEMBER;
-    Duration::from_secs(total_ms / 1000)
+    henyey_overlay::query_policy::query_rate_limit_window(close_duration)
 }
 
 impl App {
@@ -1341,33 +1333,17 @@ impl App {
             }
 
             StellarMessage::GetScpState(ledger_seq) => {
-                if self
-                    .check_peer_rate_limit(
-                        &self.scp_state_query_info,
-                        &msg.from_peer,
-                        GET_SCP_STATE_MAX_RATE,
-                    )
-                    .await
-                {
-                    tracing::debug!(ledger_seq, peer = %msg.from_peer, "Peer requested SCP state");
-                    self.send_scp_state(&msg.from_peer, ledger_seq).await;
-                } else {
-                    tracing::debug!(peer = %msg.from_peer, "Dropping GET_SCP_STATE request (rate limited)");
-                }
+                // Rate limiting enforced by the overlay pre-filter
+                // (QueryRateLimiter in peer_loop.rs).
+                tracing::debug!(ledger_seq, peer = %msg.from_peer, "Peer requested SCP state");
+                self.send_scp_state(&msg.from_peer, ledger_seq).await;
             }
 
             StellarMessage::GetScpQuorumset(hash) => {
-                let max_rate =
-                    self.rate_limit_window().as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER;
-                if self
-                    .check_peer_rate_limit(&self.qset_query_info, &msg.from_peer, max_rate)
-                    .await
-                {
-                    tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested quorum set");
-                    self.send_quorum_set(&msg.from_peer, hash).await;
-                } else {
-                    tracing::debug!(peer = %msg.from_peer, "Dropping GET_SCP_QUORUMSET request (rate limited)");
-                }
+                // Rate limiting enforced by the overlay pre-filter
+                // (QueryRateLimiter in peer_loop.rs).
+                tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested quorum set");
+                self.send_quorum_set(&msg.from_peer, hash).await;
             }
 
             StellarMessage::ScpQuorumset(quorum_set) => {
@@ -1437,18 +1413,11 @@ impl App {
             }
 
             StellarMessage::GetTxSet(hash) => {
-                let max_rate =
-                    self.rate_limit_window().as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER;
-                if self
-                    .check_peer_rate_limit(&self.tx_set_query_info, &msg.from_peer, max_rate)
-                    .await
-                {
-                    tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested TxSet");
-                    self.send_tx_set(&msg.from_peer, &henyey_common::Hash256(hash.0))
-                        .await;
-                } else {
-                    tracing::debug!(peer = %msg.from_peer, "Dropping GET_TX_SET request (rate limited)");
-                }
+                // Rate limiting enforced by the overlay pre-filter
+                // (QueryRateLimiter in peer_loop.rs).
+                tracing::debug!(hash = hex::encode(hash.0), peer = %msg.from_peer, "Peer requested TxSet");
+                self.send_tx_set(&msg.from_peer, &henyey_common::Hash256(hash.0))
+                    .await;
             }
 
             _ => {
@@ -1696,24 +1665,6 @@ impl App {
             if let Some(overlay) = self.overlay().await {
                 overlay.handle_max_tx_size_increase(increase).await;
             }
-        }
-    }
-
-    /// Check per-peer rate limit. Returns true if the request is allowed.
-    async fn check_peer_rate_limit(
-        &self,
-        map: &tokio::sync::RwLock<std::collections::HashMap<henyey_overlay::PeerId, QueryInfo>>,
-        peer: &henyey_overlay::PeerId,
-        max_rate: u32,
-    ) -> bool {
-        let window = self.rate_limit_window();
-        let mut guard = map.write().await;
-        let info = guard.entry(peer.clone()).or_insert_with(QueryInfo::new);
-        if info.allow(window, max_rate) {
-            info.num_queries += 1;
-            true
-        } else {
-            false
         }
     }
 
@@ -2240,7 +2191,6 @@ mod pump_tests {
 #[cfg(test)]
 mod rate_limit_tests {
     use super::query_rate_limit_window;
-    use crate::app::types::QUERY_RESPONSE_MULTIPLIER;
     use std::time::Duration;
 
     #[test]
@@ -2249,7 +2199,6 @@ mod rate_limit_tests {
         // Correct: 4500 * 12 = 54000ms / 1000 = 54s.
         let window = query_rate_limit_window(Duration::from_millis(4500));
         assert_eq!(window, Duration::from_secs(54));
-        assert_eq!(window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER, 270);
     }
 
     #[test]
@@ -2257,7 +2206,6 @@ mod rate_limit_tests {
         // Non-round: 4300 * 12 = 51600ms / 1000 = 51s (truncation after multiply).
         let window = query_rate_limit_window(Duration::from_millis(4300));
         assert_eq!(window, Duration::from_secs(51));
-        assert_eq!(window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER, 255);
     }
 
     #[test]
@@ -2266,7 +2214,6 @@ mod rate_limit_tests {
         // Proves truncation happens after multiplication, not before.
         let window = query_rate_limit_window(Duration::from_millis(4999));
         assert_eq!(window, Duration::from_secs(59));
-        assert_eq!(window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER, 295);
     }
 
     #[test]
@@ -2274,7 +2221,6 @@ mod rate_limit_tests {
         // Standard/fallback: 5000 * 12 = 60000ms / 1000 = 60s.
         let window = query_rate_limit_window(Duration::from_secs(5));
         assert_eq!(window, Duration::from_secs(60));
-        assert_eq!(window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER, 300);
     }
 }
 

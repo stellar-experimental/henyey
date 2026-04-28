@@ -87,6 +87,7 @@ mod message_handlers;
 mod metrics;
 mod peer;
 mod peer_manager;
+pub mod query_policy;
 mod survey;
 mod tx_adverts;
 mod tx_demands;
