@@ -3,7 +3,7 @@
 **Crate**: `henyey-app`
 **Upstream**: `stellar-core/src/main/`
 **Overall Parity**: 70%
-**Last Updated**: 2026-04-26
+**Last Updated**: 2026-04-27
 
 ## Summary
 
@@ -14,6 +14,7 @@
 | HTTP admin and query surfaces | Partial | Core endpoints exist including generateLoad; several compat admin routes are stubbed or absent |
 | Catchup and restart recovery | Full | Archive catchup, replay, restart restore, publish flow wired |
 | Persistent state integration | Partial | Critical state persisted through `henyey-db`; some SCP helper APIs absent |
+| Transaction flooding | Partial | Pull-mode advert/demand scheduling; classic flood budgets use stellar-core truncate-then-round integer arithmetic; Soroban advert/demand capacity and distinct `FLOOD_TX_PERIOD_MS` remain gaps |
 | Background maintenance | Full | Periodic pruning and RPC-retention cleanup implemented |
 | Survey and network diagnostics | Partial | Time-sliced surveys implemented; `Diagnostics::bucketStats()` absent |
 | Metadata streaming | Full | Main stream, debug rotation, gzip segments supported |
@@ -32,7 +33,7 @@
 | `ApplicationImpl.cpp` | `src/app/peers.rs` | Peer inspection, connect/drop/unban helpers |
 | `ApplicationImpl.cpp` | `src/app/publish.rs` | History checkpoint publishing |
 | `ApplicationImpl.cpp` | `src/app/survey_impl.rs` | Survey command execution and aggregation |
-| `ApplicationImpl.cpp` | `src/app/tx_flooding.rs` | Tx advert/demand scheduling |
+| `ApplicationImpl.cpp`, `TransactionQueue.cpp`, `TxAdverts.cpp`, `TxDemandsManager.cpp` | `src/app/tx_flooding.rs` | Tx advert/demand scheduling; classic flood budget rounding matches stellar-core integer arithmetic |
 | `Config.h` / `Config.cpp` | `src/config.rs`, `src/compat_config.rs` | Native TOML config plus stellar-core-format translation |
 | `CommandHandler.h` / `CommandHandler.cpp` | `src/http/mod.rs`, `src/http/handlers/`, `src/compat_http/` | Native Axum server plus compat wire-format server |
 | `QueryServer.h` / `QueryServer.cpp` | `src/http/mod.rs`, `src/http/handlers/query.rs` | Separate query server with snapshot lookups |

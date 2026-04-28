@@ -2,6 +2,69 @@
 
 use super::*;
 
+const TX_ADVERT_VECTOR_MAX_SIZE: usize = 1000;
+const TX_DEMAND_VECTOR_MAX_SIZE: usize = 1000;
+const MAX_FLOOD_RESOURCE: usize = u32::MAX as usize;
+
+fn classic_ops_to_flood_per_ledger(rate: f64, ops_limit: usize) -> i64 {
+    let product = rate * ops_limit as f64;
+    assert!(
+        product.is_finite() && product >= 0.0 && product < i64::MAX as f64,
+        "classic flood rate product must be representable as int64"
+    );
+    product as i64
+}
+
+fn dex_ops_to_flood_per_ledger(rate: f64, ops_limit: u32) -> u32 {
+    let product = rate * ops_limit as f64;
+    assert!(
+        product.is_finite() && product >= 0.0 && product < (u32::MAX as f64 + 1.0),
+        "DEX flood rate product must truncate to uint32"
+    );
+    product as u32
+}
+
+fn rounded_up_flood_budget(per_ledger: u128, period_ms: u64, ledger_close_ms: u64) -> usize {
+    assert!(period_ms > 0, "flood period must be positive");
+    assert!(ledger_close_ms > 0, "ledger close time must be positive");
+
+    let numerator = per_ledger
+        .checked_mul(period_ms as u128)
+        .expect("flood budget numerator overflowed");
+    let quotient = numerator.div_ceil(ledger_close_ms as u128);
+    assert!(
+        quotient <= i64::MAX as u128,
+        "flood budget must fit stellar-core int64 result"
+    );
+    usize::try_from(quotient).expect("flood budget does not fit usize")
+}
+
+fn classic_flood_budget(
+    rate: f64,
+    ops_limit: usize,
+    period_ms: u64,
+    ledger_close_ms: u64,
+) -> usize {
+    let per_ledger = classic_ops_to_flood_per_ledger(rate, ops_limit);
+    rounded_up_flood_budget(per_ledger as u128, period_ms, ledger_close_ms)
+}
+
+fn dex_flood_budget(rate: f64, ops_limit: u32, period_ms: u64, ledger_close_ms: u64) -> usize {
+    let per_ledger = dex_ops_to_flood_per_ledger(rate, ops_limit);
+    rounded_up_flood_budget(per_ledger as u128, period_ms, ledger_close_ms)
+}
+
+fn add_flood_carryover(base: usize, carryover: usize) -> usize {
+    let total = base
+        .checked_add(carryover)
+        .expect("flood budget plus carry-over overflowed");
+    assert!(
+        total <= MAX_FLOOD_RESOURCE,
+        "flood budget must fit stellar-core uint32 resource"
+    );
+    total
+}
+
 impl App {
     pub(super) fn tx_set_start_index(
         hash: &Hash256,
@@ -18,39 +81,36 @@ impl App {
 
     /// Compute the per-period ops budget for transaction flooding.
     ///
-    /// Matches stellar-core's `getMaxResourcesToFloodThisPeriod` for classic txs:
-    /// `ceil(flood_op_rate_per_ledger * max_tx_set_ops * flood_period_ms / ledger_close_ms)`
-    /// plus carry-over from the previous period.
+    /// Matches stellar-core's truncate-then-round-up integer arithmetic for
+    /// classic tx flooding, using henyey's combined advert flush period.
     fn compute_flood_ops_budget(&self) -> usize {
-        let ledger_close_ms = self.herder.ledger_close_time_ms().max(1) as f64;
-        let ops_to_flood =
-            self.config.overlay.flood_op_rate_per_ledger * self.herder.max_tx_set_size() as f64;
-        let base_budget = (ops_to_flood * self.config.overlay.flood_advert_period_ms as f64
-            / ledger_close_ms)
-            .ceil()
-            .max(1.0) as usize;
+        let base_budget = classic_flood_budget(
+            self.config.overlay.flood_op_rate_per_ledger,
+            self.herder.max_tx_set_size(),
+            self.config.overlay.flood_advert_period_ms,
+            self.herder.ledger_close_time_ms(),
+        );
         let carryover = self.broadcast_op_carryover.load(Ordering::Relaxed);
-        base_budget + carryover
+        add_flood_carryover(base_budget, carryover)
     }
 
     /// Compute the per-period DEX ops budget for transaction flooding.
     ///
     /// Returns `None` when `MAX_DEX_TX_OPERATIONS_IN_TX_SET` is not configured,
-    /// meaning DEX transactions are uncapped. When configured, computes
-    /// `ceil(flood_op_rate_per_ledger * min(max_dex_ops, max_tx_set_ops) * flood_period_ms / ledger_close_ms)`
-    /// plus DEX carry-over.
+    /// meaning DEX transactions are uncapped. When configured, mirrors
+    /// stellar-core's DEX clamp, truncate, round-up, then carry-over sequence.
     fn compute_dex_flood_ops_budget(&self) -> Option<usize> {
         let max_dex_ops = self.config.surge_pricing.max_dex_tx_operations?;
         let max_ops = self.herder.max_tx_set_size() as u32;
         let effective_dex_ops = max_dex_ops.min(max_ops);
-        let ledger_close_ms = self.herder.ledger_close_time_ms().max(1) as f64;
-        let dex_ops_to_flood =
-            self.config.overlay.flood_op_rate_per_ledger * effective_dex_ops as f64;
-        let base = (dex_ops_to_flood * self.config.overlay.flood_advert_period_ms as f64
-            / ledger_close_ms)
-            .ceil() as usize;
+        let base = dex_flood_budget(
+            self.config.overlay.flood_op_rate_per_ledger,
+            effective_dex_ops,
+            self.config.overlay.flood_advert_period_ms,
+            self.herder.ledger_close_time_ms(),
+        );
         let carryover = self.broadcast_dex_op_carryover.load(Ordering::Relaxed);
-        Some(base + carryover)
+        Some(add_flood_carryover(base, carryover))
     }
 
     /// Maximum carry-over ops between flood periods.
@@ -222,27 +282,23 @@ impl App {
     }
 
     fn max_advert_size(&self) -> usize {
-        const TX_ADVERT_VECTOR_MAX_SIZE: usize = 1000;
-        let ledger_close_ms = self.herder.ledger_close_time_ms().max(1) as f64;
-        let ops_to_flood =
-            self.config.overlay.flood_op_rate_per_ledger * self.herder.max_tx_set_size() as f64;
-        let per_period = (ops_to_flood * self.config.overlay.flood_advert_period_ms as f64
-            / ledger_close_ms)
-            .ceil()
-            .max(1.0);
-        per_period.min(TX_ADVERT_VECTOR_MAX_SIZE as f64) as usize
+        let per_period = classic_flood_budget(
+            self.config.overlay.flood_op_rate_per_ledger,
+            self.herder.max_tx_set_size(),
+            self.config.overlay.flood_advert_period_ms,
+            self.herder.ledger_close_time_ms(),
+        );
+        per_period.clamp(1, TX_ADVERT_VECTOR_MAX_SIZE)
     }
 
     fn max_demand_size(&self) -> usize {
-        const TX_DEMAND_VECTOR_MAX_SIZE: usize = 1000;
-        let ledger_close_ms = self.herder.ledger_close_time_ms().max(1) as f64;
-        let ops_to_flood =
-            self.config.overlay.flood_op_rate_per_ledger * self.herder.max_queue_size_ops() as f64;
-        let per_period = (ops_to_flood * self.config.overlay.flood_demand_period_ms as f64
-            / ledger_close_ms)
-            .ceil()
-            .max(1.0);
-        per_period.min(TX_DEMAND_VECTOR_MAX_SIZE as f64) as usize
+        let per_period = classic_flood_budget(
+            self.config.overlay.flood_op_rate_per_ledger,
+            self.herder.max_queue_size_ops(),
+            self.config.overlay.flood_demand_period_ms,
+            self.herder.ledger_close_time_ms(),
+        );
+        per_period.clamp(1, TX_DEMAND_VECTOR_MAX_SIZE)
     }
 
     fn retry_delay_demand(&self, attempts: usize) -> Duration {
@@ -1231,5 +1287,91 @@ impl App {
                 let _ = overlay.try_send_to(peer, msg.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classic_flood_budget_truncates_before_division() {
+        assert_eq!(classic_flood_budget(0.51, 10, 3, 10), 2);
+    }
+
+    #[test]
+    fn test_classic_flood_budget_can_truncate_to_zero() {
+        let base = classic_flood_budget(0.009, 100, 200, 5000);
+
+        assert_eq!(base, 0);
+        assert_eq!(add_flood_carryover(base, 7), 7);
+    }
+
+    #[test]
+    fn test_rounded_up_flood_budget_uses_integer_ceiling() {
+        assert_eq!(rounded_up_flood_budget(7, 200, 5000), 1);
+        assert_eq!(rounded_up_flood_budget(125, 200, 5000), 5);
+    }
+
+    #[test]
+    fn test_vector_size_clamps_zero_to_one() {
+        let per_period = classic_flood_budget(0.001, 10, 100, 5000);
+
+        assert_eq!(per_period, 0);
+        assert_eq!(per_period.clamp(1, TX_ADVERT_VECTOR_MAX_SIZE), 1);
+        assert_eq!(per_period.clamp(1, TX_DEMAND_VECTOR_MAX_SIZE), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "classic flood rate product must be representable as int64")]
+    fn test_classic_flood_budget_rejects_non_finite_rate() {
+        let _ = classic_flood_budget(f64::NAN, 100, 200, 5000);
+    }
+
+    #[test]
+    #[should_panic(expected = "classic flood rate product must be representable as int64")]
+    fn test_classic_flood_budget_rejects_too_large_product() {
+        let _ = classic_flood_budget(i64::MAX as f64, 1, 200, 5000);
+    }
+
+    #[test]
+    #[should_panic(expected = "flood period must be positive")]
+    fn test_rounded_up_flood_budget_rejects_zero_period() {
+        let _ = rounded_up_flood_budget(1, 0, 5000);
+    }
+
+    #[test]
+    #[should_panic(expected = "ledger close time must be positive")]
+    fn test_rounded_up_flood_budget_rejects_zero_ledger_close() {
+        let _ = rounded_up_flood_budget(1, 200, 0);
+    }
+
+    #[test]
+    fn test_dex_flood_budget_clamps_before_truncation() {
+        let max_ops = 100u32;
+        let max_dex_ops = 1000u32;
+        let effective_dex_ops = max_dex_ops.min(max_ops);
+
+        assert_eq!(dex_flood_budget(0.51, effective_dex_ops, 200, 5000), 3);
+    }
+
+    #[test]
+    fn test_dex_product_allows_fractional_u32_upper_bound() {
+        assert_eq!(
+            dex_ops_to_flood_per_ledger(u32::MAX as f64 + 0.5, 1),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "DEX flood rate product must truncate to uint32")]
+    fn test_dex_product_rejects_values_that_do_not_truncate_to_u32() {
+        let _ = dex_ops_to_flood_per_ledger(u32::MAX as f64 + 1.0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "flood budget must fit stellar-core uint32 resource")]
+    fn test_flood_carryover_rejects_final_resource_overflow() {
+        let _ = add_flood_carryover(u32::MAX as usize, 1);
     }
 }

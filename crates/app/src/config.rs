@@ -1597,11 +1597,15 @@ impl AppConfig {
             anyhow::bail!("At least one history archive must be configured");
         }
 
-        if self.overlay.flood_op_rate_per_ledger <= 0.0 {
-            anyhow::bail!("flood_op_rate_per_ledger must be > 0");
+        if !self.overlay.flood_op_rate_per_ledger.is_finite()
+            || self.overlay.flood_op_rate_per_ledger <= 0.0
+        {
+            anyhow::bail!("flood_op_rate_per_ledger must be finite and > 0");
         }
-        if self.overlay.flood_soroban_rate_per_ledger <= 0.0 {
-            anyhow::bail!("flood_soroban_rate_per_ledger must be > 0");
+        if !self.overlay.flood_soroban_rate_per_ledger.is_finite()
+            || self.overlay.flood_soroban_rate_per_ledger <= 0.0
+        {
+            anyhow::bail!("flood_soroban_rate_per_ledger must be finite and > 0");
         }
         if self.overlay.flood_demand_period_ms == 0 {
             anyhow::bail!("flood_demand_period_ms must be > 0");

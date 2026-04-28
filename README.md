@@ -54,7 +54,7 @@ Supporting crates: `crypto`, `common`, `work`, `historywork`
 
 ### Consensus & Networking
 - SCP consensus participation (validator, full-node, and watcher modes)
-- P2P overlay with pull-mode transaction flooding and flow control
+- P2P overlay with pull-mode transaction flooding, stellar-core-style classic flood budget rounding, and flow control
 - Quorum intersection checking
 
 ### Transaction Execution
