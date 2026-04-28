@@ -49,7 +49,7 @@ log "Log dir:   $LOOP_LOG_DIR"
 # --- Issue selection ---
 # Priority: urgent → high → medium → low → rest (all unassigned).
 # Within each tier, oldest first. Excludes not-ready and failed issues.
-# Skips issues already assigned to anyone (assignee is used as a mutex).
+# Skips issues already assigned to anyone (uses `no:assignee` search qualifier).
 # Prints "<mode> <number> <title>" on success, or nothing if no eligible issue.
 # Returns 0 on success/empty, 1 on API error.
 select_issue() {
@@ -61,9 +61,8 @@ select_issue() {
   for priority in urgent high medium low; do
     if ! json="$(gh issue list \
       --state open \
-      --assignee '' \
       --label "$priority" \
-      --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
+      --search 'sort:created-asc no:assignee -label:plan-do-review-loop-failed -label:not-ready' \
       --json number,title \
       --limit 1)"; then
       return 1
@@ -81,8 +80,7 @@ select_issue() {
   # Priority 5: any remaining eligible issue (no priority label requirement), oldest first.
   if ! json="$(gh issue list \
     --state open \
-    --assignee '' \
-    --search 'sort:created-asc -label:plan-do-review-loop-failed -label:not-ready' \
+    --search 'sort:created-asc no:assignee -label:plan-do-review-loop-failed -label:not-ready' \
     --json number,title \
     --limit 1)"; then
     return 1
