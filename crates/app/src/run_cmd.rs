@@ -455,6 +455,13 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
                 handle.abort();
                 tracing::info!("Stopped catchup message caching task");
             }
+
+            // Refresh overlay dynamic state after catchup — the protocol may
+            // have advanced, changing the close duration and max tx size.
+            // The overlay was started before catchup (line 417), so existing
+            // peers need to be notified of any changes.
+            app.refresh_overlay_query_window().await;
+            app.refresh_max_tx_size_bytes().await;
         }
     }
 

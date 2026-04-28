@@ -66,6 +66,11 @@ impl App {
                     anyhow::bail!("startup catchup persist task failed: {e}");
                 }
             }
+
+            // Refresh overlay dynamic state after fallback catchup — the
+            // protocol may have advanced during catchup.
+            self.refresh_overlay_query_window().await;
+            self.refresh_max_tx_size_bytes().await;
         }
 
         // Bootstrap herder with current ledger
@@ -1649,7 +1654,7 @@ impl App {
     /// Called after startup, catchup, and each ledger close so the overlay's
     /// per-peer pre-filter stays in sync with the dynamic close duration.
     /// Parity: stellar-core recomputes per-call in Peer::process() (Peer.cpp:1426-1429).
-    pub(super) async fn refresh_overlay_query_window(&self) {
+    pub(crate) async fn refresh_overlay_query_window(&self) {
         if let Some(overlay) = self.overlay().await {
             overlay.set_query_rate_limit_window(self.rate_limit_window());
         }
@@ -1681,7 +1686,7 @@ impl App {
     ///
     /// Mirrors upstream `HerderImpl::maybeHandleUpgrade()` max-tx-size
     /// tracking plus the startup initialization in `HerderImpl::start()`.
-    pub(super) async fn refresh_max_tx_size_bytes(&self) {
+    pub(crate) async fn refresh_max_tx_size_bytes(&self) {
         let protocol_version = self.ledger_manager.current_header().ledger_version;
         let soroban_tx_max = self
             .soroban_network_info()
