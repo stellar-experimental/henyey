@@ -34,6 +34,21 @@ use crate::bucket::Bucket;
 use crate::merge::{merge_buckets, DeadEntryPolicy, InitEntryPolicy, MergeOptions};
 use crate::{BucketError, Result};
 
+/// Load a bucket via the provided closure and verify the hash matches.
+fn load_and_verify<F>(hash: &Hash256, load_bucket: &F) -> Result<Bucket>
+where
+    F: Fn(&Hash256) -> Result<Bucket>,
+{
+    let bucket = load_bucket(hash)?;
+    if bucket.hash() != *hash {
+        return Err(BucketError::HashMismatch {
+            expected: hash.to_hex(),
+            actual: bucket.hash().to_hex(),
+        });
+    }
+    Ok(bucket)
+}
+
 /// State of a FutureBucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -560,7 +575,7 @@ impl FutureBucket {
                     .output_hash
                     .as_ref()
                     .ok_or_else(|| BucketError::Merge("missing output hash".to_string()))?;
-                let bucket = load_bucket(hash)?;
+                let bucket = load_and_verify(hash, &load_bucket)?;
                 self.output = Some(Arc::new(bucket));
                 self.state = FutureBucketState::LiveOutput;
                 Ok(())
@@ -575,8 +590,8 @@ impl FutureBucket {
                     .as_ref()
                     .ok_or_else(|| BucketError::Merge("missing snap hash".to_string()))?;
 
-                let curr = Arc::new(load_bucket(curr_hash)?);
-                let snap = Arc::new(load_bucket(snap_hash)?);
+                let curr = Arc::new(load_and_verify(curr_hash, &load_bucket)?);
+                let snap = Arc::new(load_and_verify(snap_hash, &load_bucket)?);
 
                 // Start the merge
                 let (sender, receiver) = oneshot::channel();
@@ -1225,5 +1240,122 @@ mod tests {
             result.err()
         );
         assert_eq!(fb.state(), FutureBucketState::LiveOutput);
+    }
+
+    #[test]
+    fn test_make_live_hash_output_mismatch() {
+        // Create a FutureBucket in HashOutput state with a known hash
+        let entry = make_account_entry([1u8; 32], 100);
+        let bucket = Bucket::from_entries(vec![BucketEntry::Liveentry(entry.clone())]).unwrap();
+        let expected_hash = bucket.hash();
+
+        let snapshot = FutureBucketSnapshot {
+            state: FutureBucketState::HashOutput,
+            curr: None,
+            snap: None,
+            output: Some(expected_hash.to_hex()),
+        };
+        let mut fb = FutureBucket::from_snapshot(snapshot).unwrap();
+        assert_eq!(fb.state(), FutureBucketState::HashOutput);
+
+        // Loader returns a bucket with a different hash
+        let wrong_entry = make_account_entry([2u8; 32], 200);
+        let wrong_bucket =
+            Bucket::from_entries(vec![BucketEntry::Liveentry(wrong_entry)]).unwrap();
+        assert_ne!(wrong_bucket.hash(), expected_hash);
+
+        let result = fb.make_live(
+            |_| Ok(wrong_bucket.clone()),
+            25,
+            DeadEntryPolicy::Keep,
+            InitEntryPolicy::Preserve,
+        );
+
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+        // Verify no partial state transition
+        assert_eq!(fb.state(), FutureBucketState::HashOutput);
+        assert!(!fb.is_live());
+        assert!(!fb.is_merging());
+        assert!(fb.output().is_none());
+    }
+
+    #[test]
+    fn test_make_live_hash_inputs_curr_mismatch() {
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let bucket1 = Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap();
+        let bucket2 = Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap();
+        let h1 = bucket1.hash();
+        let h2 = bucket2.hash();
+
+        let snapshot = FutureBucketSnapshot {
+            state: FutureBucketState::HashInputs,
+            curr: Some(h1.to_hex()),
+            snap: Some(h2.to_hex()),
+            output: None,
+        };
+        let mut fb = FutureBucket::from_snapshot(snapshot).unwrap();
+        assert_eq!(fb.state(), FutureBucketState::HashInputs);
+
+        // Loader returns wrong bucket for curr (swaps them)
+        let b2_clone = bucket2.clone();
+        let result = fb.make_live(
+            |hash| {
+                if *hash == h1 {
+                    // Return wrong bucket for curr
+                    Ok(b2_clone.clone())
+                } else {
+                    Ok(bucket2.clone())
+                }
+            },
+            25,
+            DeadEntryPolicy::Keep,
+            InitEntryPolicy::Preserve,
+        );
+
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+        assert_eq!(fb.state(), FutureBucketState::HashInputs);
+        assert!(!fb.is_live());
+        assert!(!fb.is_merging());
+    }
+
+    #[test]
+    fn test_make_live_hash_inputs_snap_mismatch() {
+        let entry1 = make_account_entry([1u8; 32], 100);
+        let entry2 = make_account_entry([2u8; 32], 200);
+        let bucket1 = Bucket::from_entries(vec![BucketEntry::Liveentry(entry1)]).unwrap();
+        let bucket2 = Bucket::from_entries(vec![BucketEntry::Liveentry(entry2)]).unwrap();
+        let h1 = bucket1.hash();
+        let h2 = bucket2.hash();
+
+        let snapshot = FutureBucketSnapshot {
+            state: FutureBucketState::HashInputs,
+            curr: Some(h1.to_hex()),
+            snap: Some(h2.to_hex()),
+            output: None,
+        };
+        let mut fb = FutureBucket::from_snapshot(snapshot).unwrap();
+        assert_eq!(fb.state(), FutureBucketState::HashInputs);
+
+        // Loader returns correct curr but wrong snap
+        let b1_clone = bucket1.clone();
+        let result = fb.make_live(
+            |hash| {
+                if *hash == h1 {
+                    Ok(b1_clone.clone())
+                } else {
+                    // Return wrong bucket for snap
+                    Ok(b1_clone.clone())
+                }
+            },
+            25,
+            DeadEntryPolicy::Keep,
+            InitEntryPolicy::Preserve,
+        );
+
+        assert!(matches!(result, Err(BucketError::HashMismatch { .. })));
+        assert_eq!(fb.state(), FutureBucketState::HashInputs);
+        assert!(!fb.is_live());
+        assert!(!fb.is_merging());
     }
 }
