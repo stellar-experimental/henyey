@@ -84,8 +84,8 @@ fn make_header(
 fn empty_bucket_list() -> BucketList {
     let hashes = vec![Hash256::ZERO; BUCKET_LIST_LEVELS * 2];
     let load_bucket = |hash: &Hash256| -> henyey_bucket::Result<Bucket> {
-        if hash.is_zero() {
-            return Ok(Bucket::empty());
+        if let Some(bucket) = Bucket::for_sentinel_hash(hash) {
+            return Ok(bucket);
         }
         Bucket::from_xdr_bytes(&[])
     };

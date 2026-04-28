@@ -108,8 +108,8 @@ pub fn make_bucket_list_with_hash(bucket_hash: Hash256, bucket: Bucket) -> Bucke
     }
 
     let load_bucket = move |hash: &Hash256| -> henyey_bucket::Result<Bucket> {
-        if hash.is_zero() {
-            return Ok(Bucket::empty());
+        if let Some(bucket) = Bucket::for_sentinel_hash(hash) {
+            return Ok(bucket);
         }
         if *hash == bucket_hash {
             return Ok(bucket.clone());

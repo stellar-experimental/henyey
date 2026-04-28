@@ -255,8 +255,8 @@ impl HistoryArchive {
     ///
     /// The raw (decompressed) bucket data.
     pub async fn fetch_bucket(&self, hash: &Hash256) -> Result<Vec<u8>, HistoryError> {
-        // Skip zero hash (empty bucket)
-        if hash.is_zero() {
+        // Skip sentinel hashes (zero hash and SHA-256("") both represent empty buckets)
+        if hash.is_empty_bucket_sentinel() {
             return Ok(Vec::new());
         }
 
@@ -482,4 +482,22 @@ mod tests {
     }
 
     // Integration tests that require network access would go in tests/ directory
+
+    #[tokio::test]
+    async fn test_fetch_bucket_zero_hash_returns_empty() {
+        let archive =
+            HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001")
+                .unwrap();
+        let result = archive.fetch_bucket(&Hash256::ZERO).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_bucket_empty_hash_returns_empty() {
+        let archive =
+            HistoryArchive::new("https://history.stellar.org/prd/core-testnet/core_testnet_001")
+                .unwrap();
+        let result = archive.fetch_bucket(Hash256::empty_hash()).await.unwrap();
+        assert!(result.is_empty());
+    }
 }
