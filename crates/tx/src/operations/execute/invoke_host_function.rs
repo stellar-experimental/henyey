@@ -932,8 +932,12 @@ fn apply_soroban_storage_changes(
             continue;
         }
 
-        // Only delete Soroban entries (ContractData, ContractCode)
-        // Account and Trustline entries are handled differently
+        // Only delete Soroban entries (ContractData, ContractCode).
+        // Parity: stellar-core asserts isSorobanEntry(lk) after a
+        // successful erase. If an existing non-Soroban entry is omitted
+        // from the host output, that is a host/protocol bug. Non-existent
+        // entries are a no-op (matches eraseLedgerEntryIfExists returning
+        // false in stellar-core).
         match key {
             LedgerKey::ContractData(cd_key) => {
                 if state
@@ -956,8 +960,26 @@ fn apply_soroban_storage_changes(
             }
             // TTL entries are handled along with their associated data/code entries above
             LedgerKey::Ttl(_) => {}
-            // Classic entries (Account, Trustline) are not deleted this way
-            _ => {}
+            _ => {
+                // Assert that no existing non-Soroban entry is implicitly
+                // deleted. Check per type since we don't have a generic
+                // entry_exists helper.
+                let exists = match key {
+                    LedgerKey::Account(k) => state.get_account(&k.account_id).is_some(),
+                    LedgerKey::Trustline(k) => state
+                        .get_trustline_by_trustline_asset(&k.account_id, &k.asset)
+                        .is_some(),
+                    // Other classic types (Offer, Data, etc.) should never
+                    // appear in a Soroban footprint. If they do and exist,
+                    // we still want to catch the parity violation.
+                    _ => false,
+                };
+                assert!(
+                    !exists,
+                    "implicit Soroban deletion of existing non-Soroban entry: {:?}",
+                    std::mem::discriminant(key)
+                );
+            }
         }
     }
 }
@@ -1239,6 +1261,12 @@ fn apply_soroban_storage_change(
 }
 
 /// Delete a Soroban storage entry and its associated TTL.
+///
+/// Parity: stellar-core's `recordStorageChanges` asserts
+/// `isSorobanEntry(lk)` after a successful erase — only ContractData
+/// and ContractCode (plus their associated TTL) may be deleted through
+/// the Soroban storage-change path. Classic entries (Account, Trustline,
+/// etc.) must never reach here.
 fn apply_deletion(
     state: &mut LedgerStateManager,
     key: &LedgerKey,
@@ -1258,18 +1286,14 @@ fn apply_deletion(
         LedgerKey::Ttl(k) => {
             state.delete_ttl(&k.key_hash);
         }
-        LedgerKey::Account(k) => {
-            state.delete_account(&k.account_id);
-        }
-        LedgerKey::Trustline(k) => {
-            state.delete_trustline_by_trustline_asset(&k.account_id, &k.asset);
-        }
         other => {
-            // stellar-core generically erases any entry. If we reach here,
-            // the host requested deletion of an entry type we don't handle,
-            // which would cause state divergence.
+            // Parity: stellar-core asserts isSorobanEntry(lk) after erase.
+            // Classic entries (Account, Trustline, etc.) must not be deleted
+            // through the Soroban path — doing so would skip sponsorship
+            // validation and corrupt num_sponsoring/num_sponsored counters.
             panic!(
-                "apply_deletion: unhandled key type {:?}",
+                "apply_deletion: only Soroban entries (ContractData, ContractCode, Ttl) \
+                 expected, got {:?}",
                 std::mem::discriminant(other)
             );
         }
@@ -3405,6 +3429,95 @@ mod tests {
                 None,
             ),
             "archived entry validation should pass for normal-sized restore"
+        );
+    }
+
+    // --- Parity assertion tests for Soroban deletion paths ---
+
+    #[test]
+    #[should_panic(expected = "only Soroban entries")]
+    fn test_apply_deletion_panics_on_account_key() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        apply_deletion(&mut state, &key, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "only Soroban entries")]
+    fn test_apply_deletion_panics_on_trustline_key() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: account_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: create_test_account_id(2),
+            }),
+        });
+        apply_deletion(&mut state, &key, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "implicit Soroban deletion of existing non-Soroban entry")]
+    fn test_implicit_sweep_panics_on_existing_account() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+        let account = create_test_account(account_id.clone(), 1_000_000_000);
+        state.create_account(account);
+
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+
+        // Build a footprint with the account key in read_write but NOT in
+        // the host's created_and_modified_keys — simulating the host
+        // omitting an existing classic entry.
+        let footprint = LedgerFootprint {
+            read_only: vec![].try_into().unwrap(),
+            read_write: vec![key.clone()].try_into().unwrap(),
+        };
+        let changes: Vec<StorageChange> = vec![];
+        let no_restored_keys = std::collections::HashSet::new();
+        let context = create_test_context();
+        apply_soroban_storage_changes(
+            &mut state,
+            &changes,
+            &footprint,
+            &no_restored_keys,
+            None,
+            context.protocol_version,
+        );
+    }
+
+    #[test]
+    fn test_implicit_sweep_noop_for_nonexistent_account() {
+        // Non-existent classic entry in footprint should be a no-op
+        // (matches stellar-core's eraseLedgerEntryIfExists returning false).
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: vec![].try_into().unwrap(),
+            read_write: vec![key.clone()].try_into().unwrap(),
+        };
+        let changes: Vec<StorageChange> = vec![];
+        let no_restored_keys = std::collections::HashSet::new();
+        let context = create_test_context();
+        // Should not panic — non-existent entry is silently skipped
+        apply_soroban_storage_changes(
+            &mut state,
+            &changes,
+            &footprint,
+            &no_restored_keys,
+            None,
+            context.protocol_version,
         );
     }
 }
