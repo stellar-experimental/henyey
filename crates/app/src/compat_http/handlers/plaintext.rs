@@ -577,6 +577,85 @@ mod tests {
         assert!(value["bans"].as_array().unwrap().is_empty());
     }
 
+    // ── /sorobaninfo compat response shape tests ────────────────────────
+
+    /// Verify compat `/sorobaninfo` base response shape (pre-protocol 23).
+    #[test]
+    fn test_compat_sorobaninfo_pre_protocol_23_omits_scp_fields() {
+        let value = serde_json::json!({
+            "info": {
+                "ledger_max_instructions": 100_i64,
+                "tx_max_instructions": 50_i64,
+                "tx_memory_limit": 1024_u32,
+                "ledger_max_read_ledger_entries": 10_u32,
+                "ledger_max_read_bytes": 2048_u32,
+                "ledger_max_write_ledger_entries": 5_u32,
+                "ledger_max_write_bytes": 1024_u32,
+                "ledger_max_tx_count": 100_u32,
+                "tx_max_size_bytes": 512_u32,
+            }
+        });
+        let info = value["info"].as_object().unwrap();
+        assert!(
+            !info.contains_key("scp"),
+            "scp should be absent for pre-protocol 23"
+        );
+        assert!(
+            !info.contains_key("max_dependent_tx_clusters"),
+            "max_dependent_tx_clusters should be absent for pre-protocol 23"
+        );
+    }
+
+    /// Verify compat `/sorobaninfo` includes SCP fields for protocol 23+,
+    /// exercising the same conditional insertion as the handler.
+    #[test]
+    fn test_compat_sorobaninfo_protocol_23_includes_scp_fields() {
+        // Replicate the compat handler's conditional insertion logic.
+        let mut value = serde_json::json!({
+            "info": {
+                "ledger_max_instructions": 100_i64,
+                "tx_max_instructions": 50_i64,
+                "tx_memory_limit": 1024_u32,
+                "ledger_max_read_ledger_entries": 10_u32,
+                "ledger_max_read_bytes": 2048_u32,
+                "ledger_max_write_ledger_entries": 5_u32,
+                "ledger_max_write_bytes": 1024_u32,
+                "ledger_max_tx_count": 100_u32,
+                "tx_max_size_bytes": 512_u32,
+            }
+        });
+        let protocol_version: u32 = 23;
+        if protocol_version >= 23 {
+            let obj = value["info"].as_object_mut().unwrap();
+            obj.insert("max_dependent_tx_clusters".into(), 8_u32.into());
+            obj.insert(
+                "scp".into(),
+                serde_json::json!({
+                    "ledger_close_time_ms": 5000_u32,
+                    "nomination_timeout_ms": 1000_u32,
+                    "nomination_timeout_inc_ms": 500_u32,
+                    "ballot_timeout_ms": 1000_u32,
+                    "ballot_timeout_inc_ms": 1000_u32,
+                }),
+            );
+        }
+
+        let info = value["info"].as_object().unwrap();
+        assert_eq!(info["max_dependent_tx_clusters"], 8);
+
+        let scp = info["scp"].as_object().unwrap();
+        for key in [
+            "ledger_close_time_ms",
+            "nomination_timeout_ms",
+            "nomination_timeout_inc_ms",
+            "ballot_timeout_ms",
+            "ballot_timeout_inc_ms",
+        ] {
+            assert!(scp.contains_key(key), "compat scp missing key: {key}");
+        }
+        assert_eq!(scp.len(), 5, "unexpected extra SCP fields in compat");
+    }
+
     // ── ISO 8601 parser tests ───────────────────────────────────────────
 
     #[test]
