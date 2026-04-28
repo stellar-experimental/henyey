@@ -423,6 +423,10 @@ impl App {
                                 self.sync_recovery_pending.store(true, Ordering::SeqCst);
                             }
 
+                            // Refresh the overlay query window after catchup — the
+                            // protocol may have advanced, changing the close duration.
+                            self.refresh_overlay_query_window().await;
+
                             // Spawn catchup persist task on a blocking thread.
                             // Dispatched from the event loop (not inside the catchup
                             // task) to avoid nested spawn_blocking (#1713, #1735).
@@ -1159,11 +1163,7 @@ impl App {
 
         // Set the initial per-peer query rate-limit window from the current
         // ledger close duration before the overlay starts accepting messages.
-        // Parity: stellar-core's Peer::process() reads the dynamic close time
-        // on every call (Peer.cpp:1426-1429).
-        overlay.set_query_rate_limit_window(query_rate_limit_window(
-            self.herder.ledger_close_duration(),
-        ));
+        overlay.set_query_rate_limit_window(self.rate_limit_window());
 
         overlay.start().await?;
 
@@ -1626,6 +1626,17 @@ impl App {
     /// Compute the standard per-peer rate-limit window.
     fn rate_limit_window(&self) -> Duration {
         query_rate_limit_window(self.herder.ledger_close_duration())
+    }
+
+    /// Push the current query rate-limit window to the overlay.
+    ///
+    /// Called after startup, catchup, and each ledger close so the overlay's
+    /// per-peer pre-filter stays in sync with the dynamic close duration.
+    /// Parity: stellar-core recomputes per-call in Peer::process() (Peer.cpp:1426-1429).
+    pub(super) async fn refresh_overlay_query_window(&self) {
+        if let Some(overlay) = self.overlay().await {
+            overlay.set_query_rate_limit_window(self.rate_limit_window());
+        }
     }
 
     /// Check per-peer rate limit. Returns true if the request is allowed.

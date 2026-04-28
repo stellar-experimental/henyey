@@ -2107,13 +2107,7 @@ impl App {
         // Parity: stellar-core recomputes expectedLedgerCloseTime * MAX_SLOTS_TO_REMEMBER
         // on every Peer::process() call (Peer.cpp:1426-1429); we update the shared
         // atomic here so all peer tasks pick up the new value.
-        {
-            if let Some(overlay) = self.overlay().await {
-                let window =
-                    super::lifecycle::query_rate_limit_window(self.herder.ledger_close_duration());
-                overlay.set_query_rate_limit_window(window);
-            }
-        }
+        self.refresh_overlay_query_window().await;
 
         // Notify peers if max tx size increased due to a protocol upgrade.
         // Mirrors upstream HerderImpl::maybeHandleUpgrade().

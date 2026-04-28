@@ -10,7 +10,7 @@
 | Area | Status | Notes |
 |------|--------|-------|
 | Authentication (PeerAuth, Hmac) | Full | HKDF key derivation, HMAC-SHA256 MAC |
-| Peer Connection (Peer, TCPPeer) | Partial | Core handshake and I/O complete; rejected outbound peers may still receive SEND_MORE_EXTENDED/GET_SCP_STATE before ERR_LOAD; admin JSON and query throttle absent |
+| Peer Connection (Peer, TCPPeer) | Partial | Core handshake and I/O complete; rejected outbound peers may still receive SEND_MORE_EXTENDED/GET_SCP_STATE before ERR_LOAD; admin JSON absent |
 | OverlayManager | Partial | Core peer lifecycle present; preferred-peer eviction happens at authenticated admission; some peer-list and stats accessors absent |
 | Floodgate | Full | Message deduplication, ledger-based cleanup |
 | FlowControl | Full | Capacity tracking, throttling, SCP-aware trimming, CapacityGuard RAII |
@@ -203,7 +203,7 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `getIOTimeout()` | Idle/straggler timeout in `run_peer_loop()` | Full |
 | `beginMessageProcessing()` | `FlowControl::begin_message_processing()` | Full |
 | `endMessageProcessing()` | `FlowControl::end_message_processing()` | Full |
-| `process()` (query throttle) | N/A | None |
+| `process()` (query throttle) | `route_received_message()` query rate limiter | Full |
 | `canRead()` | `FlowControl::can_read()` | Full |
 | `retryAdvert()` | `TxAdverts::retry_incoming_advert()` | Full |
 | `hasAdvert()` | `TxAdverts::has_adverts()` | Full |
@@ -500,7 +500,6 @@ Features not yet implemented. These ARE counted against parity %.
 | stellar-core Component | Priority | Notes |
 |------------------------|----------|-------|
 | `Peer::getJsonInfo()` | Low | JSON info for admin API |
-| `Peer::process()` (query throttle) | Low | Rate limiting GetTxSet/GetQuorumSet |
 | `OverlayManagerImpl::getRandomInboundAuthenticatedPeers()` | Low | Separate inbound peer list |
 | `OverlayManagerImpl::getRandomOutboundAuthenticatedPeers()` | Low | Separate outbound peer list |
 | `OverlayManagerImpl::getInboundPendingPeers()` | Low | Pending peer tracking |
