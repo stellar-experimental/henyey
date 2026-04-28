@@ -470,10 +470,12 @@ impl TxQueueLimiter {
     ) where
         F: FnMut(&QueuedTransaction) -> VisitTxResult,
     {
-        if let Some(ref mut flood) = self.txs_to_flood {
-            let result = flood.pop_top_txs(false, ledger_version, |tx| visitor(tx), custom_limits);
-            *lane_resources_left = result.lane_left_until_limit;
-        }
+        let flood = self
+            .txs_to_flood
+            .as_mut()
+            .expect("visit_top_txs requires an initialized flood queue");
+        let result = flood.pop_top_txs(false, ledger_version, |tx| visitor(tx), custom_limits);
+        *lane_resources_left = result.lane_left_until_limit;
     }
 }
 
@@ -598,6 +600,21 @@ mod tests {
         let tx = make_test_tx(100, 1, 1);
 
         limiter.mark_tx_for_flood(&tx, 25);
+    }
+
+    #[test]
+    #[should_panic(expected = "visit_top_txs requires an initialized flood queue")]
+    fn test_visit_top_txs_requires_initialized_queue() {
+        let max_resources = Resource::new(vec![10]);
+        let mut limiter = TxQueueLimiter::new(1, max_resources, false, None);
+        let mut remaining = Vec::new();
+
+        limiter.visit_top_txs(
+            |_| VisitTxResult::Processed,
+            &mut remaining,
+            25,
+            Some(&[Resource::new(vec![1])]),
+        );
     }
 
     #[test]
