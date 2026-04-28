@@ -2911,21 +2911,15 @@ name = "test"
             format!("file://{test_history_dir}"),
             "local archive url mismatch"
         );
-        let put_cmd = local_archive
-            .put
-            .as_deref()
-            .expect("local archive should have a put command");
-        assert!(
-            put_cmd.contains(test_history_dir),
-            "local archive put command should contain history dir, got: {put_cmd}"
+        assert_eq!(
+            local_archive.put.as_deref(),
+            Some(format!("cp {{0}} {test_history_dir}/{{1}}").as_str()),
+            "local archive put command mismatch"
         );
-        let mkdir_cmd = local_archive
-            .mkdir
-            .as_deref()
-            .expect("local archive should have a mkdir command");
-        assert!(
-            mkdir_cmd.contains(test_history_dir),
-            "local archive mkdir command should contain history dir, got: {mkdir_cmd}"
+        assert_eq!(
+            local_archive.mkdir.as_deref(),
+            Some(format!("mkdir -p {test_history_dir}/{{0}}").as_str()),
+            "local archive mkdir command mismatch"
         );
     }
 
