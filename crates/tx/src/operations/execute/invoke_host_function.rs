@@ -15,6 +15,12 @@ use henyey_common::protocol::{
 };
 use henyey_common::xdr_encoded_len;
 
+use super::{OperationExecutionResult, SorobanOperationMeta};
+use crate::soroban::{PersistentModuleCache, SorobanConfig, SorobanContext};
+use crate::state::LedgerStateManager;
+use crate::validation::LedgerContext;
+use crate::{Result, TxError};
+
 /// Check if a ledger key is for a Soroban entry.
 pub(crate) fn is_soroban_key(key: &LedgerKey) -> bool {
     matches!(key, LedgerKey::ContractData(_) | LedgerKey::ContractCode(_))
@@ -184,6 +190,49 @@ fn validate_footprint_entry(
     true
 }
 
+/// Look up a soroban entry from live state, falling back to the hot archive.
+///
+/// Tries the live state first (`get_contract_data` / `get_contract_code`). If the entry
+/// is not found in live state, falls back to the hot archive. Hot-archive I/O errors are
+/// propagated as `TxError::Internal` — they must never be silently treated as absence,
+/// since a transient error on one validator would cause a consensus split.
+///
+/// The `ledger_seq` parameter is used as `last_modified_ledger_seq` in the constructed
+/// `LedgerEntry` wrapper.
+fn lookup_soroban_entry_or_hot_archive(
+    state: &LedgerStateManager,
+    key: &LedgerKey,
+    ledger_seq: u32,
+    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+) -> crate::Result<Option<LedgerEntry>> {
+    let live = match key {
+        LedgerKey::ContractData(cd_key) => state
+            .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
+            .map(|cd| LedgerEntry {
+                last_modified_ledger_seq: ledger_seq,
+                data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
+                ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            }),
+        LedgerKey::ContractCode(cc_key) => {
+            state.get_contract_code(&cc_key.hash).map(|cc| LedgerEntry {
+                last_modified_ledger_seq: ledger_seq,
+                data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
+                ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            })
+        }
+        _ => None,
+    };
+    if live.is_some() {
+        return Ok(live);
+    }
+    match hot_archive {
+        Some(ha) => ha
+            .get(key)
+            .map_err(|e| TxError::Internal(format!("hot archive lookup failed: {e}"))),
+        None => Ok(None),
+    }
+}
+
 /// Validate archived entries marked for autorestore against network config size limits.
 ///
 /// Matches stellar-core's `handleArchivedEntry()` in `InvokeHostFunctionOpFrame.cpp`
@@ -197,15 +246,15 @@ fn validate_archived_entry_sizes(
     current_ledger: u32,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-) -> bool {
+) -> Result<bool> {
     let restored_indices: std::collections::HashSet<u32> = match &soroban_data.ext {
         SorobanTransactionDataExt::V1(ext) => {
             ext.archived_soroban_entries.iter().copied().collect()
         }
-        SorobanTransactionDataExt::V0 => return true,
+        SorobanTransactionDataExt::V0 => return Ok(true),
     };
     if restored_indices.is_empty() {
-        return true;
+        return Ok(true);
     }
 
     let max_contract_size = soroban_config.max_contract_size_bytes;
@@ -237,29 +286,9 @@ fn validate_archived_entry_sizes(
             continue;
         }
 
-        // Entry is expired and marked for restore — look it up from the state
-        // (it may have been loaded) or from the hot archive.
-        let entry: Option<LedgerEntry> = match key {
-            LedgerKey::ContractData(cd_key) => state
-                .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                .map(|cd| LedgerEntry {
-                    last_modified_ledger_seq: 0,
-                    data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
-                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
-                }),
-            LedgerKey::ContractCode(cc_key) => {
-                state.get_contract_code(&cc_key.hash).map(|cc| LedgerEntry {
-                    last_modified_ledger_seq: 0,
-                    data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
-                    ext: stellar_xdr::curr::LedgerEntryExt::V0,
-                })
-            }
-            _ => None,
-        }
-        .or_else(|| {
-            // Not in state (expired and evicted) — try hot archive
-            hot_archive.and_then(|ha| ha.get(key).ok().flatten())
-        });
+        // Entry is expired and marked for restore — look it up from live state
+        // or hot archive.
+        let entry = lookup_soroban_entry_or_hot_archive(state, key, 0, hot_archive)?;
 
         if let Some(entry) = entry {
             let entry_size = xdr_encoded_len(&entry);
@@ -276,18 +305,12 @@ fn validate_archived_entry_sizes(
                     idx,
                     "Archived entry marked for restore exceeds size limit"
                 );
-                return false;
+                return Ok(false);
             }
         }
     }
-    true
+    Ok(true)
 }
-
-use super::{OperationExecutionResult, SorobanOperationMeta};
-use crate::soroban::{PersistentModuleCache, SorobanConfig, SorobanContext};
-use crate::state::LedgerStateManager;
-use crate::validation::LedgerContext;
-use crate::{Result, TxError};
 
 /// Execute an InvokeHostFunction operation.
 ///
@@ -398,7 +421,7 @@ fn execute_contract_invocation(
         context.sequence,
         hot_archive,
         ttl_key_cache,
-    ) {
+    )? {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::ResourceLimitExceeded,
             Hash([0u8; 32]),
@@ -431,7 +454,7 @@ fn execute_contract_invocation(
         context.sequence,
         hot_archive,
         ttl_key_cache,
-    ) {
+    )? {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::ResourceLimitExceeded,
             Hash([0u8; 32]),
@@ -610,34 +633,14 @@ fn disk_read_bytes_exceeded(
     current_ledger: u32,
     hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-) -> bool {
+) -> Result<bool> {
     let mut total_read_bytes = 0u32;
     let limit = soroban_data.resources.disk_read_bytes;
 
     // Helper to meter a single entry
-    let meter_entry = |key: &LedgerKey, total: &mut u32| -> bool {
+    let meter_entry = |key: &LedgerKey, total: &mut u32| -> Result<bool> {
         let entry: Option<LedgerEntry> = if is_soroban_key(key) {
-            match key {
-                LedgerKey::ContractData(cd_key) => state
-                    .get_contract_data(&cd_key.contract, &cd_key.key, cd_key.durability)
-                    .map(|cd| LedgerEntry {
-                        last_modified_ledger_seq: current_ledger,
-                        data: stellar_xdr::curr::LedgerEntryData::ContractData(cd.clone()),
-                        ext: stellar_xdr::curr::LedgerEntryExt::V0,
-                    }),
-                LedgerKey::ContractCode(cc_key) => {
-                    state.get_contract_code(&cc_key.hash).map(|cc| LedgerEntry {
-                        last_modified_ledger_seq: current_ledger,
-                        data: stellar_xdr::curr::LedgerEntryData::ContractCode(cc.clone()),
-                        ext: stellar_xdr::curr::LedgerEntryExt::V0,
-                    })
-                }
-                _ => None,
-            }
-            // Fallback to hot archive for fully-evicted entries.
-            // Matches stellar-core handleArchivedEntry() which meters disk reads
-            // for entries retrieved from both live bucket list and hot archive.
-            .or_else(|| hot_archive.and_then(|ha| ha.get(key).ok().flatten()))
+            lookup_soroban_entry_or_hot_archive(state, key, current_ledger, hot_archive)?
         } else {
             state.get_entry(key)
         };
@@ -646,23 +649,23 @@ fn disk_read_bytes_exceeded(
             let len = xdr_encoded_len(&entry);
             *total = total.saturating_add(len as u32);
             if *total > limit {
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     };
 
     // Returns true (exceeded) after metering the entry, with a warning log.
-    let mut meter_and_check = |key: &LedgerKey| -> bool {
-        if meter_entry(key, &mut total_read_bytes) {
+    let mut meter_and_check = |key: &LedgerKey| -> Result<bool> {
+        if meter_entry(key, &mut total_read_bytes)? {
             tracing::warn!(
                 total_read_bytes,
                 specified_read_bytes = limit,
                 "Disk read bytes exceeded specified limit"
             );
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     };
 
@@ -670,24 +673,24 @@ fn disk_read_bytes_exceeded(
 
     if meter_all {
         for key in soroban_data.resources.footprint.read_only.iter() {
-            if meter_and_check(key) {
-                return true;
+            if meter_and_check(key)? {
+                return Ok(true);
             }
         }
         for key in soroban_data.resources.footprint.read_write.iter() {
-            if meter_and_check(key) {
-                return true;
+            if meter_and_check(key)? {
+                return Ok(true);
             }
         }
     } else {
         for key in soroban_data.resources.footprint.read_only.iter() {
-            if !is_soroban_key(key) && meter_and_check(key) {
-                return true;
+            if !is_soroban_key(key) && meter_and_check(key)? {
+                return Ok(true);
             }
         }
         for key in soroban_data.resources.footprint.read_write.iter() {
-            if !is_soroban_key(key) && meter_and_check(key) {
-                return true;
+            if !is_soroban_key(key) && meter_and_check(key)? {
+                return Ok(true);
             }
         }
 
@@ -714,15 +717,15 @@ fn disk_read_bytes_exceeded(
                     if !is_still_archived {
                         continue;
                     }
-                    if meter_and_check(key) {
-                        return true;
+                    if meter_and_check(key)? {
+                        return Ok(true);
                     }
                 }
             }
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Compute the hash of the success preimage (return value + events).
@@ -1463,7 +1466,7 @@ fn map_host_error_to_result_code(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::soroban::StorageChange;
+    use crate::soroban::{HotArchiveLookup, StorageChange};
     use crate::test_utils::create_test_account_id;
     use stellar_xdr::curr::*;
 
@@ -1947,7 +1950,8 @@ mod tests {
             context.sequence,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(
             !exceeded,
             "disk_read_bytes should NOT be exceeded: restored entry with live TTL should be skipped"
@@ -1969,7 +1973,8 @@ mod tests {
             context.sequence,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(
             exceeded,
             "disk_read_bytes SHOULD be exceeded when archived entry has expired TTL"
@@ -2062,7 +2067,8 @@ mod tests {
             context.sequence,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert!(
             !exceeded_without,
             "Without hot archive, evicted entry should not be metered (pre-fix behavior)"
@@ -2076,7 +2082,8 @@ mod tests {
             context.sequence,
             Some(&hot_archive),
             None,
-        );
+        )
+        .unwrap();
         assert!(
             exceeded_with,
             "With hot archive, evicted entry MUST be metered for disk read bytes"
@@ -3369,7 +3376,8 @@ mod tests {
                 context.sequence,
                 None,
                 None,
-            ),
+            )
+            .unwrap(),
             "archived entry validation must reject oversized entry marked for restore"
         );
     }
@@ -3438,8 +3446,201 @@ mod tests {
                 context.sequence,
                 None,
                 None,
-            ),
+            )
+            .unwrap(),
             "archived entry validation should pass for normal-sized restore"
+        );
+    }
+
+    // --- Regression tests for #2023: hot-archive error propagation ---
+
+    /// A hot archive implementation that always returns an error.
+    struct FailingHotArchive;
+    impl HotArchiveLookup for FailingHotArchive {
+        fn get(
+            &self,
+            _key: &LedgerKey,
+        ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Err("simulated hot archive I/O error".into())
+        }
+    }
+
+    /// Regression test for #2023: lookup_soroban_entry_or_hot_archive must propagate
+    /// hot-archive errors when the entry is not in live state.
+    #[test]
+    fn test_lookup_soroban_entry_or_hot_archive_propagates_error() {
+        let state = LedgerStateManager::new(5_000_000, 100);
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([0xDD; 32]))),
+            key: ScVal::U32(1),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // Entry is NOT in live state, so the helper must fall through to hot archive.
+        let result =
+            lookup_soroban_entry_or_hot_archive(&state, &key, 100, Some(&FailingHotArchive));
+        assert!(
+            result.is_err(),
+            "hot archive error must be propagated, not swallowed"
+        );
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("hot archive lookup failed"),
+            "error should mention hot archive: {err_msg}"
+        );
+    }
+
+    /// Regression test for #2023: lookup_soroban_entry_or_hot_archive must short-circuit
+    /// and never touch the hot archive when the entry is found in live state.
+    #[test]
+    fn test_lookup_soroban_entry_or_hot_archive_short_circuits_on_live() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xEE; 32])));
+        let contract_key = ScVal::U32(2);
+        let durability = ContractDataDurability::Persistent;
+
+        // Put entry in live state
+        state.create_contract_data(ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+            val: ScVal::I32(42),
+        });
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id,
+            key: contract_key,
+            durability,
+        });
+
+        // Even with a FailingHotArchive, this must succeed because the entry is in live state.
+        let result =
+            lookup_soroban_entry_or_hot_archive(&state, &key, 100, Some(&FailingHotArchive));
+        assert!(
+            result.is_ok(),
+            "live entry should short-circuit without touching hot archive"
+        );
+        assert!(result.unwrap().is_some(), "live entry should be returned");
+    }
+
+    /// Regression test for #2023: validate_archived_entry_sizes must propagate
+    /// hot-archive errors instead of treating them as entry absence.
+    #[test]
+    fn test_validate_archived_entry_sizes_propagates_hot_archive_error() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xFF; 32])));
+        let contract_key = ScVal::U32(3);
+        let durability = ContractDataDurability::Persistent;
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id,
+            key: contract_key,
+            durability,
+        });
+
+        // Give the entry an EXPIRED TTL so it's treated as archived
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence - 1,
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: vec![key].try_into().unwrap(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0u32].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        let config = SorobanConfig {
+            max_contract_size_bytes: 65536,
+            max_contract_data_entry_size_bytes: 65536,
+            ..SorobanConfig::default()
+        };
+
+        // Entry is NOT in live state, hot archive fails → must return Err
+        let result = validate_archived_entry_sizes(
+            &state,
+            &soroban_data,
+            &config,
+            context.sequence,
+            Some(&FailingHotArchive),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "validate_archived_entry_sizes must propagate hot archive errors"
+        );
+    }
+
+    /// Regression test for #2023: disk_read_bytes_exceeded must propagate
+    /// hot-archive errors instead of treating them as entry absence.
+    #[test]
+    fn test_disk_read_bytes_exceeded_propagates_hot_archive_error() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let context = create_test_context();
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([0xAB; 32])));
+        let contract_key = ScVal::U32(4);
+        let durability = ContractDataDurability::Persistent;
+
+        let key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id,
+            key: contract_key,
+            durability,
+        });
+
+        // Give the entry an EXPIRED TTL so it's treated as archived
+        let key_hash = crate::soroban::compute_key_hash(&key);
+        state.create_ttl(TtlEntry {
+            key_hash,
+            live_until_ledger_seq: context.sequence - 1,
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: VecM::default(),
+            read_write: vec![key].try_into().unwrap(),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V1(SorobanResourcesExtV0 {
+                archived_soroban_entries: vec![0u32].try_into().unwrap(),
+            }),
+            resources: SorobanResources {
+                footprint,
+                instructions: 100_000_000,
+                disk_read_bytes: 100_000,
+                write_bytes: 100_000,
+            },
+            resource_fee: 0,
+        };
+
+        // Entry is NOT in live state, hot archive fails → must return Err
+        let result = disk_read_bytes_exceeded(
+            &state,
+            &soroban_data,
+            context.protocol_version,
+            context.sequence,
+            Some(&FailingHotArchive),
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "disk_read_bytes_exceeded must propagate hot archive errors"
         );
     }
 
