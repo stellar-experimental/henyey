@@ -336,10 +336,16 @@ pub fn run_maintenance(
                          These checkpoints will NOT be published. \
                          Check archive connectivity and credentials."
                     );
-                    // Re-read queue after eviction
-                    db.load_publish_queue(Some(1))
-                        .ok()
-                        .and_then(|q| q.first().copied())
+                    // Re-read queue after eviction. On failure, fall back
+                    // to staleness_threshold — the most conservative safe
+                    // value, since we just evicted everything below it.
+                    match db.load_publish_queue(Some(1)) {
+                        Ok(q) => q.first().copied().or(Some(staleness_threshold)),
+                        Err(e) => {
+                            warn!(error = %e, "Failed to re-read publish queue after eviction");
+                            Some(staleness_threshold)
+                        }
+                    }
                 }
                 Ok(_) => min_queued,
                 Err(e) => {
@@ -1233,5 +1239,47 @@ mod tests {
 
         // No eviction: publishing disabled
         assert_eq!(publish_queue_count(&db_clone), 2);
+    }
+
+    #[test]
+    fn test_all_entries_stale_queue_empty_after_eviction() {
+        // All entries are stale. After eviction, the queue is empty.
+        // qmin should fall back to staleness_threshold (not lcl).
+        // LCL=10000, threshold = 10000 - 1920 = 8080
+        // publish_safe_lmin = 8080 - 64 = 8016
+        let db = Arc::new(henyey_db::Database::open_in_memory().unwrap());
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // All entries are stale (all < 8080)
+        insert_publish_queue_entries(&db, &[63, 127, 191]);
+        assert_eq!(publish_queue_count(&db), 3);
+
+        // Insert headers that span the threshold
+        insert_ledger_headers(&db, &(8010..=8025).collect::<Vec<_>>());
+
+        let db_clone = db.clone();
+        let maintainer = Maintainer::with_config(
+            db.clone(),
+            MaintenanceConfig {
+                rpc_retention_window: None,
+                count: 100_000,
+                ..MaintenanceConfig::default()
+            },
+            shutdown_rx,
+            move || (10000, Some(63)),
+        );
+
+        maintainer.perform_maintenance();
+
+        // All entries evicted
+        assert_eq!(publish_queue_count(&db_clone), 0);
+
+        // publish_safe_lmin = staleness_threshold - 64 = 8080 - 64 = 8016
+        // Headers at 8010..=8016 should be pruned (<=8016), 8017..=8025 kept (9 rows)
+        assert_eq!(count_rows(&db_clone, "ledgerheaders"), 9);
+        assert_eq!(
+            min_ledger(&db_clone, "ledgerheaders", "ledgerseq"),
+            Some(8017)
+        );
     }
 }
