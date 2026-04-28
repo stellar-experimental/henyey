@@ -427,6 +427,11 @@ impl App {
                             // protocol may have advanced, changing the close duration.
                             self.refresh_overlay_query_window().await;
 
+                            // Refresh max tx size after catchup — if the protocol
+                            // advanced (e.g., Soroban activation), notify existing
+                            // peers of the increased byte limit.
+                            self.refresh_max_tx_size_bytes().await;
+
                             // Spawn catchup persist task on a blocking thread.
                             // Dispatched from the event loop (not inside the catchup
                             // task) to avoid nested spawn_blocking (#1713, #1735).
@@ -1170,6 +1175,12 @@ impl App {
         // ledger close duration before the overlay starts accepting messages.
         overlay.set_query_rate_limit_window(self.rate_limit_window());
 
+        // Initialize max_tx_size_bytes from current protocol state so the
+        // first ledger close computes an accurate diff. The overlay isn't
+        // stored in self.overlay yet, so refresh_max_tx_size_bytes won't
+        // try to notify peers (which is correct — there are none yet).
+        self.refresh_max_tx_size_bytes().await;
+
         overlay.start().await?;
 
         let peer_count = overlay.peer_count();
@@ -1641,6 +1652,45 @@ impl App {
     pub(super) async fn refresh_overlay_query_window(&self) {
         if let Some(overlay) = self.overlay().await {
             overlay.set_query_rate_limit_window(self.rate_limit_window());
+        }
+    }
+
+    /// Recompute `max_tx_size_bytes` from the given protocol state and store
+    /// it. Returns the increase (saturating) over the previous value, or 0 if
+    /// the max stayed the same or decreased.
+    ///
+    /// This is a pure bookkeeping update — it does NOT notify overlay peers.
+    /// Callers that need peer notification should use [`refresh_max_tx_size_bytes`].
+    pub(super) fn update_max_tx_size_bytes(
+        &self,
+        protocol_version: u32,
+        soroban_tx_max: Option<u32>,
+    ) -> u32 {
+        let new_max = compute_max_tx_size(protocol_version, soroban_tx_max);
+        let old_max = self.max_tx_size_bytes.swap(new_max, Ordering::Relaxed);
+        new_max.saturating_sub(old_max)
+    }
+
+    /// Refresh `max_tx_size_bytes` from current ledger state and notify
+    /// overlay peers if the value increased.
+    ///
+    /// Called at startup (before overlay starts — no peers to notify),
+    /// after catchup, and on each ledger close. The atomic is bookkeeping
+    /// for computing diffs; new peers always receive a fixed initial byte
+    /// grant (`INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES`).
+    ///
+    /// Mirrors upstream `HerderImpl::maybeHandleUpgrade()` max-tx-size
+    /// tracking plus the startup initialization in `HerderImpl::start()`.
+    pub(super) async fn refresh_max_tx_size_bytes(&self) {
+        let protocol_version = self.ledger_manager.current_header().ledger_version;
+        let soroban_tx_max = self
+            .soroban_network_info()
+            .map(|info| info.tx_max_size_bytes);
+        let increase = self.update_max_tx_size_bytes(protocol_version, soroban_tx_max);
+        if increase > 0 {
+            if let Some(overlay) = self.overlay().await {
+                overlay.handle_max_tx_size_increase(increase).await;
+            }
         }
     }
 
@@ -2220,5 +2270,97 @@ mod rate_limit_tests {
         let window = query_rate_limit_window(Duration::from_secs(5));
         assert_eq!(window, Duration::from_secs(60));
         assert_eq!(window.as_secs() as u32 * QUERY_RESPONSE_MULTIPLIER, 300);
+    }
+}
+
+#[cfg(test)]
+mod max_tx_size_tests {
+    use henyey_herder::flow_control::{compute_max_tx_size, MAX_CLASSIC_TX_SIZE_BYTES};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// Simulate the pure logic of `update_max_tx_size_bytes` without needing
+    /// a full `App` instance. The method is:
+    ///   new_max = compute_max_tx_size(protocol_version, soroban_tx_max)
+    ///   old_max = atomic.swap(new_max)
+    ///   return new_max.saturating_sub(old_max)
+    fn update(atomic: &AtomicU32, protocol_version: u32, soroban_tx_max: Option<u32>) -> u32 {
+        let new_max = compute_max_tx_size(protocol_version, soroban_tx_max);
+        let old_max = atomic.swap(new_max, Ordering::Relaxed);
+        new_max.saturating_sub(old_max)
+    }
+
+    #[test]
+    fn test_startup_soroban_initializes_correctly() {
+        // Node starts on a Soroban-enabled protocol with tx_max > classic default.
+        let atomic = AtomicU32::new(MAX_CLASSIC_TX_SIZE_BYTES);
+        let soroban_max: u32 = 130_000;
+        let expected = compute_max_tx_size(25, Some(soroban_max));
+        let increase = update(&atomic, 25, Some(soroban_max));
+
+        assert_eq!(atomic.load(Ordering::Relaxed), expected);
+        assert_eq!(increase, expected - MAX_CLASSIC_TX_SIZE_BYTES);
+        assert!(increase > 0, "Soroban max should exceed classic default");
+    }
+
+    #[test]
+    fn test_startup_classic_no_change() {
+        // Node starts on pre-Soroban protocol — no change from default.
+        let atomic = AtomicU32::new(MAX_CLASSIC_TX_SIZE_BYTES);
+        let increase = update(&atomic, 19, None);
+
+        assert_eq!(atomic.load(Ordering::Relaxed), MAX_CLASSIC_TX_SIZE_BYTES);
+        assert_eq!(increase, 0);
+    }
+
+    #[test]
+    fn test_decrease_no_notification() {
+        // Max decreases (hypothetical config change) — diff is 0, no notification.
+        let high_max = compute_max_tx_size(25, Some(200_000));
+        let low_max = compute_max_tx_size(25, Some(150_000));
+        let atomic = AtomicU32::new(high_max);
+        let increase = update(&atomic, 25, Some(150_000));
+
+        assert_eq!(atomic.load(Ordering::Relaxed), low_max);
+        assert_eq!(increase, 0);
+    }
+
+    #[test]
+    fn test_increase_after_catchup() {
+        // After catchup, protocol advanced from classic to Soroban.
+        let atomic = AtomicU32::new(MAX_CLASSIC_TX_SIZE_BYTES);
+        let soroban_max: u32 = 200_000;
+        let expected = compute_max_tx_size(25, Some(soroban_max));
+        let increase = update(&atomic, 25, Some(soroban_max));
+
+        assert_eq!(atomic.load(Ordering::Relaxed), expected);
+        assert_eq!(increase, expected - MAX_CLASSIC_TX_SIZE_BYTES);
+        assert!(increase > 0);
+    }
+
+    #[test]
+    fn test_no_spurious_notification_after_correct_init() {
+        // If startup correctly initialized to Soroban max, a subsequent
+        // ledger close with the same config should produce diff = 0.
+        let soroban_max: u32 = 130_000;
+        let atomic = AtomicU32::new(MAX_CLASSIC_TX_SIZE_BYTES);
+
+        // Startup refresh
+        let startup_increase = update(&atomic, 25, Some(soroban_max));
+        assert!(startup_increase > 0);
+
+        // First ledger close — no upgrade, same config
+        let close_increase = update(&atomic, 25, Some(soroban_max));
+        assert_eq!(close_increase, 0);
+    }
+
+    #[test]
+    fn test_soroban_below_classic_uses_classic() {
+        // Soroban max is below classic max — compute_max_tx_size returns classic.
+        let atomic = AtomicU32::new(MAX_CLASSIC_TX_SIZE_BYTES);
+        let small_soroban: u32 = 50_000;
+        let increase = update(&atomic, 25, Some(small_soroban));
+
+        assert_eq!(atomic.load(Ordering::Relaxed), MAX_CLASSIC_TX_SIZE_BYTES);
+        assert_eq!(increase, 0);
     }
 }

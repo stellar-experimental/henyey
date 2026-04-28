@@ -2111,19 +2111,8 @@ impl App {
 
         // Notify peers if max tx size increased due to a protocol upgrade.
         // Mirrors upstream HerderImpl::maybeHandleUpgrade().
-        {
-            let soroban_tx_max = soroban_info.as_ref().map(|info| info.tx_max_size_bytes);
-            let new_max = compute_max_tx_size(result.header.ledger_version, soroban_tx_max);
-            let old_max = self.max_tx_size_bytes.load(Ordering::Relaxed);
-            let diff = new_max.saturating_sub(old_max);
-            self.max_tx_size_bytes.store(new_max, Ordering::Relaxed);
-            if diff > 0 {
-                self.set_phase_sub(phase::PHASE_6_4_OVERLAY_MAX_TX_SIZE);
-                if let Some(overlay) = self.overlay().await {
-                    overlay.handle_max_tx_size_increase(diff).await;
-                }
-            }
-        }
+        self.set_phase_sub(phase::PHASE_6_4_OVERLAY_MAX_TX_SIZE);
+        self.refresh_max_tx_size_bytes().await;
 
         // Clean up old survey rate limiter entries.
         // Mirrors upstream SurveyManager::clearOldLedgers() called from clearLedgersBelow().
