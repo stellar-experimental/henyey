@@ -1,0 +1,69 @@
+# CI fixture for scripts/test-history-publish.sh — do not run as-is.
+# String values shaped like (UNDERSCORE-NAME-UNDERSCORE) are sed-substituted
+# by the script at runtime. The peer_port line is anchored on its trailing
+# marker comment (see below). Must remain parseable against AppConfig with
+# deny_unknown_fields — covered by
+# crates/app/src/config.rs::test_shipped_config_files_parse.
+# Quorum keys, archive URLs, and known_peers mirror configs/validator-testnet.toml;
+# update both files together.
+
+[node]
+name = "henyey-publish-test"
+is_validator = true
+node_seed = "__NODE_SEED__"
+
+[node.quorum_set]
+threshold_percent = 67
+validators = [
+    "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y",
+    "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP",
+    "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z"
+]
+
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[database]
+path = "__DB_PATH__"
+pool_size = 10
+
+[buckets]
+directory = "__BUCKET_DIR__"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+
+[[history.archives]]
+name = "sdf2"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_002"
+
+[[history.archives]]
+name = "sdf3"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_003"
+
+[[history.archives]]
+name = "local"
+url = "file://__HISTORY_DIR__"
+get_enabled = true
+put_enabled = true
+put = "cp {0} __HISTORY_DIR__/{1}"
+mkdir = "mkdir -p __HISTORY_DIR__/{0}"
+
+[overlay]
+# Random high port chosen at runtime; peers reject advertisements of port 0.
+peer_port = 0  # __PEER_PORT__: substituted at runtime
+max_inbound_peers = 8
+max_outbound_peers = 8
+target_outbound_peers = 8
+known_peers = [
+    "core-testnet1.stellar.org:11625",
+    "core-testnet2.stellar.org:11625",
+    "core-testnet3.stellar.org:11625"
+]
+
+[http]
+enabled = false
+
+[compat_http]
+enabled = false

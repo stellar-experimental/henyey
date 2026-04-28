@@ -105,72 +105,42 @@ PEER_PORT=$((30000 + RANDOM % 10000))
 echo "Using overlay peer port: $PEER_PORT"
 
 # --- Generate config ---
-cat > "$CONFIG_FILE" <<EOF
-[node]
-name = "henyey-publish-test"
-is_validator = true
-node_seed = "$NODE_SEED"
-max_tx_set_size = 100
+# Render configs/test-history-publish.toml with runtime values.
+# That fixture is covered by crates/app/src/config.rs::test_shipped_config_files_parse,
+# so any future schema-narrowing change is caught at unit-test time rather
+# than silently in nightly History Publish.
+TEMPLATE="$PROJECT_ROOT/configs/test-history-publish.toml"
+if [[ ! -f "$TEMPLATE" ]]; then
+  echo "ERROR: template not found at $TEMPLATE"
+  exit 1
+fi
 
-[node.quorum_set]
-threshold_percent = 67
-validators = [
-    "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y",
-    "GCUCJTIYXSOXKBSNFGNFWW5MUQ54HKRPGJUTQFJ5RQXZXNOLNXYDHRAP",
-    "GC2V2EFSXN6SQTWVYA5EPJPBWWIMSD2XQNKUOHGEKB535AQE2I6IXV2Z"
-]
+# Escape sed replacement metacharacters: \, &, and | (our delimiter).
+# Required because path values come from --data-dir and are caller-controlled.
+escape_sed_repl() {
+  printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'
+}
 
-[network]
-passphrase = "Test SDF Network ; September 2015"
+NODE_SEED_ESC=$(escape_sed_repl "$NODE_SEED")
+DB_PATH_ESC=$(escape_sed_repl "$DB_PATH")
+BUCKET_DIR_ESC=$(escape_sed_repl "$BUCKET_DIR")
+HISTORY_DIR_ESC=$(escape_sed_repl "$HISTORY_DIR")
 
-[database]
-path = "$DB_PATH"
-pool_size = 10
+sed \
+  -e "s|__NODE_SEED__|$NODE_SEED_ESC|g" \
+  -e "s|__DB_PATH__|$DB_PATH_ESC|g" \
+  -e "s|__BUCKET_DIR__|$BUCKET_DIR_ESC|g" \
+  -e "s|__HISTORY_DIR__|$HISTORY_DIR_ESC|g" \
+  -e "s|^peer_port = .*# __PEER_PORT__.*\$|peer_port = $PEER_PORT|" \
+  "$TEMPLATE" \
+  > "$CONFIG_FILE"
 
-[buckets]
-directory = "$BUCKET_DIR"
-
-[history]
-# SDF testnet archives for catchup
-[[history.archives]]
-name = "sdf1"
-url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
-
-[[history.archives]]
-name = "sdf2"
-url = "https://history.stellar.org/prd/core-testnet/core_testnet_002"
-
-[[history.archives]]
-name = "sdf3"
-url = "https://history.stellar.org/prd/core-testnet/core_testnet_003"
-
-# Local archive for publishing
-[[history.archives]]
-name = "local"
-url = "file://$HISTORY_DIR"
-get_enabled = true
-put_enabled = true
-put = "cp {0} $HISTORY_DIR/{1}"
-mkdir = "mkdir -p $HISTORY_DIR/{0}"
-
-[overlay]
-# Use a random high port so peers don't reject us for advertising port 0
-peer_port = $PEER_PORT
-max_inbound_peers = 8
-max_outbound_peers = 8
-target_outbound_peers = 8
-known_peers = [
-    "core-testnet1.stellar.org:11625",
-    "core-testnet2.stellar.org:11625",
-    "core-testnet3.stellar.org:11625"
-]
-
-[http]
-enabled = false
-
-[compat_http]
-enabled = false
-EOF
+# Fail fast if any placeholder slipped through (missing marker, typo, etc.).
+if grep -qE '__[A-Z_]+__' "$CONFIG_FILE"; then
+  echo "ERROR: rendered config still contains placeholders:"
+  grep -nE '__[A-Z_]+__' "$CONFIG_FILE"
+  exit 1
+fi
 
 echo "Config written to $CONFIG_FILE"
 echo "History will be published to $HISTORY_DIR"
