@@ -843,14 +843,25 @@ fn apply_soroban_storage_changes(
 ) {
     use std::collections::HashSet;
 
-    // Track all keys that were created or modified by the host
-    let mut created_and_modified_keys: HashSet<LedgerKey> = HashSet::new();
+    // Track all keys that were created, modified, or had TTL-only updates
+    // by the host. These entries were "returned" by the host and must NOT be
+    // implicitly deleted by the footprint sweep below.
+    // Parity: stellar-core's `createdAndModifiedKeys` is populated from
+    // `modified_ledger_entries`, which includes all entries the host touched
+    // (modified or passed through). In henyey, TtlOnly changes also represent
+    // entries the host touched — excluding them would cause the sweep to
+    // incorrectly delete Soroban entries that only had TTL extensions.
+    let mut host_returned_keys: HashSet<LedgerKey> = HashSet::new();
     for change in changes {
-        if matches!(
-            change.kind,
+        match &change.kind {
             crate::soroban::StorageChangeKind::Modified { .. }
-        ) {
-            created_and_modified_keys.insert(change.key.clone());
+            | crate::soroban::StorageChangeKind::TtlOnly { .. } => {
+                host_returned_keys.insert(change.key.clone());
+            }
+            crate::soroban::StorageChangeKind::Deleted => {
+                // Deleted entries are handled by apply_deletion — they
+                // must NOT be in the keep-set or the sweep would skip them.
+            }
         }
     }
 
@@ -918,7 +929,7 @@ fn apply_soroban_storage_changes(
     // entries NOT returned are considered deleted.
     // See: InvokeHostFunctionOpFrame.cpp recordStorageChanges()
     for key in footprint.read_write.iter() {
-        if created_and_modified_keys.contains(key) {
+        if host_returned_keys.contains(key) {
             continue;
         }
 
@@ -3518,6 +3529,167 @@ mod tests {
             &no_restored_keys,
             None,
             context.protocol_version,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "implicit Soroban deletion of existing non-Soroban entry")]
+    fn test_implicit_sweep_panics_on_existing_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+        let account = create_test_account(account_id.clone(), 1_000_000_000);
+        state.create_account(account);
+
+        let asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4(*b"USD\0"),
+            issuer: create_test_account_id(2),
+        });
+        let trustline = TrustLineEntry {
+            account_id: account_id.clone(),
+            asset: asset.clone(),
+            balance: 100,
+            limit: 1000,
+            flags: 1, // AUTHORIZED
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline);
+
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: account_id.clone(),
+            asset,
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: vec![].try_into().unwrap(),
+            read_write: vec![key.clone()].try_into().unwrap(),
+        };
+        let changes: Vec<StorageChange> = vec![];
+        let no_restored_keys = std::collections::HashSet::new();
+        let context = create_test_context();
+        apply_soroban_storage_changes(
+            &mut state,
+            &changes,
+            &footprint,
+            &no_restored_keys,
+            None,
+            context.protocol_version,
+        );
+    }
+
+    #[test]
+    fn test_implicit_sweep_noop_for_nonexistent_trustline() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let account_id = create_test_account_id(1);
+
+        let key = LedgerKey::Trustline(LedgerKeyTrustLine {
+            account_id: account_id.clone(),
+            asset: TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+                asset_code: AssetCode4(*b"USD\0"),
+                issuer: create_test_account_id(2),
+            }),
+        });
+
+        let footprint = LedgerFootprint {
+            read_only: vec![].try_into().unwrap(),
+            read_write: vec![key.clone()].try_into().unwrap(),
+        };
+        let changes: Vec<StorageChange> = vec![];
+        let no_restored_keys = std::collections::HashSet::new();
+        let context = create_test_context();
+        apply_soroban_storage_changes(
+            &mut state,
+            &changes,
+            &footprint,
+            &no_restored_keys,
+            None,
+            context.protocol_version,
+        );
+    }
+
+    #[test]
+    fn test_implicit_sweep_keeps_ttl_only_rw_entries() {
+        // Regression: TtlOnly { read_only: false } entries must be in the
+        // host-returned keep-set so the sweep doesn't delete them.
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+
+        let contract_id = ScAddress::Contract(ContractId(Hash([1u8; 32])));
+        let contract_key = ScVal::U32(7);
+        let durability = ContractDataDurability::Persistent;
+
+        // Create the contract data entry in state
+        let cd_entry = ContractDataEntry {
+            ext: ExtensionPoint::V0,
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+            val: ScVal::I32(1),
+        };
+        let ledger_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::ContractData(cd_entry.clone()),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let lk = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract_id.clone(),
+            key: contract_key.clone(),
+            durability,
+        });
+
+        // Create entry via Modified change first
+        let create_change = StorageChange {
+            key: lk.clone(),
+            kind: crate::soroban::StorageChangeKind::Modified {
+                entry: Box::new(ledger_entry),
+                live_until: Some(200),
+                ttl_extended: false,
+            },
+            is_rent_related: false,
+        };
+        let no_restored_keys = std::collections::HashSet::new();
+        apply_soroban_storage_change(
+            &mut state,
+            &create_change,
+            &no_restored_keys,
+            None,
+            &mut std::collections::HashSet::new(),
+        );
+        assert!(state
+            .get_contract_data(&contract_id, &contract_key, durability)
+            .is_some());
+
+        // Now simulate a TtlOnly RW change (TTL extension without data modification)
+        let ttl_only_change = StorageChange {
+            key: lk.clone(),
+            kind: crate::soroban::StorageChangeKind::TtlOnly {
+                live_until: 300,
+                read_only: false,
+            },
+            is_rent_related: false,
+        };
+
+        let footprint = LedgerFootprint {
+            read_only: vec![].try_into().unwrap(),
+            read_write: vec![lk.clone()].try_into().unwrap(),
+        };
+
+        let context = create_test_context();
+        // This should NOT delete the entry — TtlOnly is a host-returned key
+        apply_soroban_storage_changes(
+            &mut state,
+            &[ttl_only_change],
+            &footprint,
+            &no_restored_keys,
+            None,
+            context.protocol_version,
+        );
+
+        // The entry must still exist
+        assert!(
+            state
+                .get_contract_data(&contract_id, &contract_key, durability)
+                .is_some(),
+            "TtlOnly RW entry should NOT be deleted by the implicit sweep"
         );
     }
 }
