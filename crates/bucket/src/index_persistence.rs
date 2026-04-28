@@ -417,6 +417,7 @@ pub fn load_disk_index(
                 error = %e,
                 "Failed to read index header, will rebuild"
             );
+            let _ = std::fs::remove_file(&index_path);
             return Ok(None);
         }
     };
@@ -1062,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_version_2_rejects_version_1() {
+    fn test_load_rejects_legacy_header_and_deletes_index() {
         let temp_dir = tempdir().unwrap();
         let bucket_path = temp_dir.path().join("bucket-v1.xdr");
         let bucket_hash = create_dummy_bucket_file(&bucket_path);
@@ -1086,6 +1087,36 @@ mod tests {
         // (old format lacks bucket_hash and bucket_file_size fields)
         let result = load_disk_index(&bucket_path, 10, &bucket_hash).unwrap();
         assert!(result.is_none(), "Old format index should be rejected");
+
+        // Stale index file should be deleted
+        assert!(
+            !index_path.exists(),
+            "Malformed header index should be deleted"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_truncated_header_and_deletes_index() {
+        let temp_dir = tempdir().unwrap();
+        let bucket_path = temp_dir.path().join("bucket-truncated.xdr");
+        let bucket_hash = create_dummy_bucket_file(&bucket_path);
+        let index_path = index_path_for_bucket(&bucket_path);
+
+        // Write a truncated 2-byte file that cannot deserialize into IndexHeader
+        std::fs::write(&index_path, &[0xDE, 0xAD]).unwrap();
+        assert!(index_path.exists());
+
+        let result = load_disk_index(&bucket_path, 10, &bucket_hash).unwrap();
+        assert!(
+            result.is_none(),
+            "Truncated header index should be rejected"
+        );
+
+        // Stale index file should be deleted
+        assert!(
+            !index_path.exists(),
+            "Truncated header index should be deleted"
+        );
     }
 
     #[test]
