@@ -1155,16 +1155,14 @@ impl App {
         overlay.set_scp_callback(Arc::new(super::HerderScpCallback {
             herder: Arc::clone(&self.herder),
         }));
-        if let Ok(bans) = self
-            .db_blocking("load-bans-overlay", |db| db.load_bans().map_err(Into::into))
-            .await
-        {
-            for ban in bans {
-                if let Some(peer_id) = Self::strkey_to_peer_id(&ban) {
+        match self.banned_peers().await {
+            Ok(peers) => {
+                for peer_id in peers {
                     overlay.ban_peer(peer_id).await;
-                } else {
-                    tracing::warn!(node = %ban, "Ignoring invalid ban entry");
                 }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load bans from DB during overlay start");
             }
         }
 
