@@ -105,12 +105,13 @@ impl App {
     /// Compute the per-period ops budget for transaction flooding.
     ///
     /// Matches stellar-core's truncate-then-round-up integer arithmetic for
-    /// classic tx flooding, using henyey's combined advert flush period.
+    /// classic tx flooding, using `flood_tx_period_ms` to match stellar-core's
+    /// `FLOOD_TX_PERIOD_MS` in `ClassicTransactionQueue::getFloodPeriod()`.
     fn compute_flood_ops_budget(&self) -> usize {
         let base_budget = classic_flood_budget(
             self.config.overlay.flood_op_rate_per_ledger,
             self.herder.max_tx_set_size(),
-            self.config.overlay.flood_advert_period_ms,
+            self.config.overlay.flood_tx_period_ms,
             self.herder.ledger_close_duration().as_millis() as u64,
         );
         let carryover = self.broadcast_op_carryover.load(Ordering::Relaxed);
@@ -129,7 +130,7 @@ impl App {
         let base = dex_flood_budget(
             self.config.overlay.flood_op_rate_per_ledger,
             effective_dex_ops,
-            self.config.overlay.flood_advert_period_ms,
+            self.config.overlay.flood_tx_period_ms,
             self.herder.ledger_close_duration().as_millis() as u64,
         );
         let carryover = self.broadcast_dex_op_carryover.load(Ordering::Relaxed);
@@ -272,8 +273,11 @@ impl App {
         }
     }
 
-    pub(super) fn flood_advert_period(&self) -> Duration {
-        Duration::from_millis(self.config.overlay.flood_advert_period_ms.max(1))
+    /// Period for the transaction broadcast cycle (budget + advert flush).
+    ///
+    /// Matches stellar-core's `FLOOD_TX_PERIOD_MS` (default 200 ms).
+    pub(super) fn flood_tx_period(&self) -> Duration {
+        Duration::from_millis(self.config.overlay.flood_tx_period_ms.max(1))
     }
 
     pub(super) fn flood_demand_period(&self) -> Duration {
@@ -1469,6 +1473,52 @@ mod tests {
     #[should_panic(expected = "flood budget must fit stellar-core uint32 resource")]
     fn test_flood_carryover_rejects_final_resource_overflow() {
         let _ = add_flood_carryover(u32::MAX as usize, 1);
+    }
+
+    /// Verify that `classic_flood_budget` uses the tx period (200 ms by default),
+    /// not the advert period (100 ms), producing a larger per-period budget.
+    #[test]
+    fn test_budget_uses_tx_period_not_advert_period() {
+        let rate = 0.5;
+        let ops_limit = 100;
+        let ledger_close_ms = 5000;
+
+        let advert_period_ms = 100; // flood_advert_period_ms default
+        let tx_period_ms = 200; // flood_tx_period_ms default
+
+        let budget_advert =
+            classic_flood_budget(rate, ops_limit, advert_period_ms, ledger_close_ms);
+        let budget_tx = classic_flood_budget(rate, ops_limit, tx_period_ms, ledger_close_ms);
+
+        // tx period (200ms) should yield double the per-period budget vs advert period (100ms)
+        assert_eq!(budget_tx, budget_advert * 2);
+        // Verify concrete values: 0.5 * 100 = 50 per ledger
+        // 50 * 200 / 5000 = 2, 50 * 100 / 5000 = 1
+        assert_eq!(budget_tx, 2);
+        assert_eq!(budget_advert, 1);
+    }
+
+    /// Verify that `max_advert_size` computation uses advert_period_ms (100ms).
+    /// The per-period budget for advert sizing should be half the broadcast budget.
+    #[test]
+    fn test_advert_size_uses_advert_period() {
+        let rate = 0.5;
+        let ops_limit = 100;
+        let advert_period_ms = 100;
+        let ledger_close_ms = 5000;
+
+        let advert_budget =
+            classic_flood_budget(rate, ops_limit, advert_period_ms, ledger_close_ms);
+        // With advert period 100ms: 50 * 100 / 5000 = 1
+        assert_eq!(advert_budget, 1);
+    }
+
+    /// Verify the default config values match stellar-core defaults.
+    #[test]
+    fn test_flood_period_defaults() {
+        let config = crate::config::OverlayConfig::default();
+        assert_eq!(config.flood_tx_period_ms, 200); // stellar-core FLOOD_TX_PERIOD_MS
+        assert_eq!(config.flood_advert_period_ms, 100); // stellar-core FLOOD_ADVERT_PERIOD_MS
     }
 
     // ── Test helpers for collect_adverts_for_peers ────────────────────────

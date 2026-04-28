@@ -893,9 +893,22 @@ pub struct OverlayConfig {
     #[serde(default = "default_flood_demand_period_ms")]
     pub flood_demand_period_ms: u64,
 
-    /// Period (ms) between tx advert flushes.
+    /// Period (ms) for tx advert batch sizing.
+    ///
+    /// Controls the maximum number of tx hashes per advert message via
+    /// `max_advert_size()`. Does **not** drive the flush timer cadence —
+    /// that is governed by `flood_tx_period_ms`.
+    /// Matches stellar-core `FLOOD_ADVERT_PERIOD_MS` (default 100).
     #[serde(default = "default_flood_advert_period_ms")]
     pub flood_advert_period_ms: u64,
+
+    /// Period (ms) for the transaction broadcast cycle.
+    ///
+    /// Controls the broadcast ops budget and the timer cadence for
+    /// `flush_tx_adverts()`. Matches stellar-core `FLOOD_TX_PERIOD_MS`
+    /// (default 200).
+    #[serde(default = "default_flood_tx_period_ms")]
+    pub flood_tx_period_ms: u64,
 
     /// Backoff delay (ms) between repeated demands for the same tx.
     #[serde(default = "default_flood_demand_backoff_delay_ms")]
@@ -933,6 +946,7 @@ impl Default for OverlayConfig {
             flood_soroban_rate_per_ledger: default_flood_soroban_rate_per_ledger(),
             flood_demand_period_ms: default_flood_demand_period_ms(),
             flood_advert_period_ms: default_flood_advert_period_ms(),
+            flood_tx_period_ms: default_flood_tx_period_ms(),
             flood_demand_backoff_delay_ms: default_flood_demand_backoff_delay_ms(),
             peer_max_failures: default_peer_max_failures(),
             flood_arb_tx_base_allowance: default_flood_arb_tx_base_allowance(),
@@ -1341,6 +1355,10 @@ fn default_flood_advert_period_ms() -> u64 {
     100
 }
 
+fn default_flood_tx_period_ms() -> u64 {
+    200
+}
+
 fn default_flood_demand_backoff_delay_ms() -> u64 {
     500
 }
@@ -1634,6 +1652,9 @@ impl AppConfig {
         }
         if self.overlay.flood_advert_period_ms == 0 {
             anyhow::bail!("flood_advert_period_ms must be > 0");
+        }
+        if self.overlay.flood_tx_period_ms == 0 {
+            anyhow::bail!("flood_tx_period_ms must be > 0");
         }
         if self.overlay.flood_demand_backoff_delay_ms == 0 {
             anyhow::bail!("flood_demand_backoff_delay_ms must be > 0");
@@ -2985,5 +3006,23 @@ name = "test"
             }],
         };
         assert!(!config.publish_enabled());
+    }
+
+    #[test]
+    fn test_validation_flood_tx_period_ms_zero() {
+        let mut config = AppConfig::default();
+        config.overlay.flood_tx_period_ms = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("flood_tx_period_ms must be > 0"));
+    }
+
+    #[test]
+    fn test_flood_tx_period_ms_default_is_200() {
+        let config = AppConfig::default();
+        assert_eq!(config.overlay.flood_tx_period_ms, 200);
     }
 }

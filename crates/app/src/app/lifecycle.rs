@@ -158,7 +158,7 @@ impl App {
         let mut consensus_interval = tokio::time::interval(Duration::from_secs(1));
         let mut stats_interval = tokio::time::interval(Duration::from_secs(30));
         stats_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut tx_advert_interval = tokio::time::interval(self.flood_advert_period());
+        let mut tx_advert_interval = tokio::time::interval(self.flood_tx_period());
         let mut tx_demand_interval = tokio::time::interval(self.flood_demand_period());
         let mut survey_interval = tokio::time::interval(Duration::from_secs(1));
         let mut survey_phase_interval = tokio::time::interval(Duration::from_secs(5));

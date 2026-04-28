@@ -108,7 +108,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `setupTriggerNextLedger()` | _(not implemented)_ | None |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
-| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, and arb flood damping; missing ban-on-damping, dedicated flood queue, mark-on-attempt |
+| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, and arb flood damping; broadcast period uses `flood_tx_period_ms` (200 ms) matching stellar-core `FLOOD_TX_PERIOD_MS`; missing ban-on-damping, dedicated flood queue, mark-on-attempt, separate advert flush timer |
 | `processSCPQueue()` | pending envelope release | Full |
 | `updateTransactionQueue()` | handled in `ledger_closed()` | Full |
 | `maybeSetupSorobanQueue()` | Integrated via lane-based `TransactionQueue` | Full |

@@ -14,7 +14,7 @@
 | HTTP admin and query surfaces | Partial | Core endpoints exist including generateLoad; several compat admin routes are stubbed or absent |
 | Catchup and restart recovery | Full | Archive catchup, replay, restart restore, publish flow wired |
 | Persistent state integration | Partial | Critical state persisted through `henyey-db`; some SCP helper APIs absent |
-| Transaction flooding | Partial | Pull-mode advert/demand scheduling; classic flood budgets use stellar-core truncate-then-round integer arithmetic; Soroban advert/demand capacity and distinct `FLOOD_TX_PERIOD_MS` remain gaps |
+| Transaction flooding | Partial | Pull-mode advert/demand scheduling; classic flood budgets use stellar-core truncate-then-round integer arithmetic with distinct `FLOOD_TX_PERIOD_MS` for broadcast budget; Soroban advert/demand capacity remains a gap; advert flush cadence is consolidated with broadcast (200 ms) rather than separate (100 ms) |
 | Background maintenance | Full | Periodic pruning and RPC-retention cleanup implemented; **divergence**: stale publish queue entries are evicted after `MAX_PUBLISH_QUEUE_CHECKPOINT_DISTANCE` (30) intervals to prevent unbounded retention from failing archives — stellar-core does not evict (#2004) |
 | Survey and network diagnostics | Partial | Time-sliced surveys implemented; `Diagnostics::bucketStats()` absent |
 | Metadata streaming | Full | Main stream, debug rotation, gzip segments supported |
@@ -33,7 +33,7 @@
 | `ApplicationImpl.cpp` | `src/app/peers.rs` | Peer inspection, connect/drop/unban helpers |
 | `ApplicationImpl.cpp` | `src/app/publish.rs` | History checkpoint publishing |
 | `ApplicationImpl.cpp` | `src/app/survey_impl.rs` | Survey command execution and aggregation |
-| `ApplicationImpl.cpp`, `TransactionQueue.cpp`, `TxAdverts.cpp`, `TxDemandsManager.cpp` | `src/app/tx_flooding.rs` | Tx advert/demand scheduling; classic flood budget rounding matches stellar-core integer arithmetic |
+| `ApplicationImpl.cpp`, `TransactionQueue.cpp`, `TxAdverts.cpp`, `TxDemandsManager.cpp` | `src/app/tx_flooding.rs` | Tx advert/demand scheduling; classic flood budget rounding matches stellar-core integer arithmetic; broadcast period uses `flood_tx_period_ms` (200 ms, matching `FLOOD_TX_PERIOD_MS`) |
 | `Config.h` / `Config.cpp` | `src/config.rs`, `src/compat_config.rs` | Native TOML config plus stellar-core-format translation |
 | `CommandHandler.h` / `CommandHandler.cpp` | `src/http/mod.rs`, `src/http/handlers/`, `src/compat_http/` | Native Axum server plus compat wire-format server |
 | `QueryServer.h` / `QueryServer.cpp` | `src/http/mod.rs`, `src/http/handlers/query.rs` | Separate query server with snapshot lookups |

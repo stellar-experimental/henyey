@@ -71,6 +71,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "FORCE_OLD_STYLE_LEADER_ELECTION",
     "FLOOD_ARB_TX_BASE_ALLOWANCE",
     "FLOOD_ARB_TX_DAMPING_FACTOR",
+    "FLOOD_TX_PERIOD_MS",
 ];
 
 /// Valid stellar-core keys that henyey intentionally does not support.
@@ -260,6 +261,17 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
     if let Some(v) = get_f64(table, "FLOOD_ARB_TX_DAMPING_FACTOR") {
         config.overlay.flood_arb_tx_damping_factor = v;
+    }
+    if let Some(v) = get_i64(table, "FLOOD_TX_PERIOD_MS") {
+        if v >= 1 {
+            config.overlay.flood_tx_period_ms = v as u64;
+        } else {
+            tracing::warn!(
+                key = "FLOOD_TX_PERIOD_MS",
+                value = v,
+                "Compat config key value must be >= 1"
+            );
+        }
     }
 
     // --- Metadata ---
@@ -2151,5 +2163,29 @@ FLOOD_ARB_TX_BASE_ALLOWANCE=4294967295
         let config = translate_stellar_core_config(&raw).unwrap();
         // Value overflows i32 — should be ignored, keeping the default.
         assert_eq!(config.overlay.flood_arb_tx_base_allowance, 5);
+    }
+
+    #[test]
+    fn test_flood_tx_period_ms_parsed() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOOD_TX_PERIOD_MS=300
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.overlay.flood_tx_period_ms, 300);
+    }
+
+    #[test]
+    fn test_flood_tx_period_ms_default() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // Default should be 200 (matching stellar-core FLOOD_TX_PERIOD_MS)
+        assert_eq!(config.overlay.flood_tx_period_ms, 200);
     }
 }
