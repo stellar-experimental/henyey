@@ -14,12 +14,22 @@
 //! This module corresponds to `TxQueueLimiter.h` in stellar-core v25.
 
 use henyey_common::Resource;
+use thiserror::Error;
 
 use crate::surge_pricing::{
     DexLimitingLaneConfig, FloodLaneConfig, QueueEntry, SorobanGenericLaneConfig,
     SurgePricingLaneConfig, SurgePricingPriorityQueue, VisitTxResult, GENERIC_LANE,
 };
 use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
+
+/// Returned when flood traversal APIs are used without an initialized flood queue
+/// (`txs_to_flood` is missing). Use [`TxQueueLimiter::new_flood`] for dedicated flood
+/// traversal, or initialize the limiter through normal admission paths (for example
+/// [`TxQueueLimiter::can_add_tx`]) before calling [`TxQueueLimiter::mark_tx_for_flood`]
+/// or [`TxQueueLimiter::visit_top_txs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("flood queue is not initialized")]
+pub struct FloodQueueNotInitialized;
 
 /// Scale a resource by a multiplier with saturating arithmetic.
 fn scale_resource(resource: &Resource, multiplier: i64) -> Resource {
@@ -449,12 +459,14 @@ impl TxQueueLimiter {
     }
 
     /// Mark a transaction for flooding.
-    pub fn mark_tx_for_flood(&mut self, tx: &QueuedTransaction, ledger_version: u32) {
-        let flood = self
-            .txs_to_flood
-            .as_mut()
-            .expect("mark_tx_for_flood requires an initialized flood queue");
+    pub fn mark_tx_for_flood(
+        &mut self,
+        tx: &QueuedTransaction,
+        ledger_version: u32,
+    ) -> Result<(), FloodQueueNotInitialized> {
+        let flood = self.txs_to_flood.as_mut().ok_or(FloodQueueNotInitialized)?;
         flood.add(tx.clone(), ledger_version);
+        Ok(())
     }
 
     /// Visit transactions in priority order for flooding.
@@ -467,15 +479,14 @@ impl TxQueueLimiter {
         lane_resources_left: &mut Vec<Resource>,
         ledger_version: u32,
         custom_limits: Option<&[Resource]>,
-    ) where
+    ) -> Result<(), FloodQueueNotInitialized>
+    where
         F: FnMut(&QueuedTransaction) -> VisitTxResult,
     {
-        let flood = self
-            .txs_to_flood
-            .as_mut()
-            .expect("visit_top_txs requires an initialized flood queue");
+        let flood = self.txs_to_flood.as_mut().ok_or(FloodQueueNotInitialized)?;
         let result = flood.pop_top_txs(false, ledger_version, |tx| visitor(tx), custom_limits);
         *lane_resources_left = result.lane_left_until_limit;
+        Ok(())
     }
 }
 
@@ -593,28 +604,30 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "mark_tx_for_flood requires an initialized flood queue")]
     fn test_mark_tx_for_flood_requires_initialized_queue() {
         let max_resources = Resource::new(vec![10]);
         let mut limiter = TxQueueLimiter::new(1, max_resources, false, None);
         let tx = make_test_tx(100, 1, 1);
 
-        limiter.mark_tx_for_flood(&tx, 25);
+        let err = limiter.mark_tx_for_flood(&tx, 25).unwrap_err();
+        assert_eq!(err, FloodQueueNotInitialized);
     }
 
     #[test]
-    #[should_panic(expected = "visit_top_txs requires an initialized flood queue")]
     fn test_visit_top_txs_requires_initialized_queue() {
         let max_resources = Resource::new(vec![10]);
         let mut limiter = TxQueueLimiter::new(1, max_resources, false, None);
         let mut remaining = Vec::new();
 
-        limiter.visit_top_txs(
-            |_| VisitTxResult::Processed,
-            &mut remaining,
-            25,
-            Some(&[Resource::new(vec![1])]),
-        );
+        let err = limiter
+            .visit_top_txs(
+                |_| VisitTxResult::Processed,
+                &mut remaining,
+                25,
+                Some(&[Resource::new(vec![1])]),
+            )
+            .unwrap_err();
+        assert_eq!(err, FloodQueueNotInitialized);
     }
 
     #[test]
@@ -625,16 +638,18 @@ mod tests {
         let mut remaining = Vec::new();
         let mut visited = Vec::new();
 
-        limiter.mark_tx_for_flood(&tx, 25);
-        limiter.visit_top_txs(
-            |tx| {
-                visited.push(tx.hash);
-                VisitTxResult::Processed
-            },
-            &mut remaining,
-            25,
-            Some(&limits),
-        );
+        limiter.mark_tx_for_flood(&tx, 25).unwrap();
+        limiter
+            .visit_top_txs(
+                |tx| {
+                    visited.push(tx.hash);
+                    VisitTxResult::Processed
+                },
+                &mut remaining,
+                25,
+                Some(&limits),
+            )
+            .unwrap();
 
         assert_eq!(visited, vec![tx.hash]);
         assert_eq!(remaining, vec![Resource::new(vec![0])]);
@@ -648,13 +663,15 @@ mod tests {
         let limits = vec![Resource::new(vec![1])];
         let mut remaining = Vec::new();
 
-        limiter.mark_tx_for_flood(&tx, 25);
-        limiter.visit_top_txs(
-            |_| VisitTxResult::Processed,
-            &mut remaining,
-            25,
-            Some(&limits),
-        );
+        limiter.mark_tx_for_flood(&tx, 25).unwrap();
+        limiter
+            .visit_top_txs(
+                |_| VisitTxResult::Processed,
+                &mut remaining,
+                25,
+                Some(&limits),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -665,13 +682,15 @@ mod tests {
         let limits = vec![Resource::new(vec![1, 1])];
         let mut remaining = Vec::new();
 
-        limiter.mark_tx_for_flood(&tx, 25);
-        limiter.visit_top_txs(
-            |_| VisitTxResult::Processed,
-            &mut remaining,
-            25,
-            Some(&limits),
-        );
+        limiter.mark_tx_for_flood(&tx, 25).unwrap();
+        limiter
+            .visit_top_txs(
+                |_| VisitTxResult::Processed,
+                &mut remaining,
+                25,
+                Some(&limits),
+            )
+            .unwrap();
     }
 
     #[test]

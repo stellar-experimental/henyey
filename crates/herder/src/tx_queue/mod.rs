@@ -2720,12 +2720,18 @@ impl TransactionQueue {
         {
             let store = self.store.read();
             for tx in store.values() {
-                limiter.mark_tx_for_flood(tx, ledger_version);
+                if let Err(e) = limiter.mark_tx_for_flood(tx, ledger_version) {
+                    tracing::error!(
+                        error = %e,
+                        "mark_tx_for_flood: flood queue not initialized (invariant violation)"
+                    );
+                    return;
+                }
             }
         }
 
         let mut lane_resources_left = Vec::new();
-        limiter.visit_top_txs(
+        if let Err(e) = limiter.visit_top_txs(
             |tx| {
                 let candidate = BroadcastCandidate {
                     hash: tx.hash,
@@ -2737,7 +2743,13 @@ impl TransactionQueue {
             &mut lane_resources_left,
             ledger_version,
             Some(&custom_limits),
-        );
+        ) {
+            tracing::error!(
+                error = %e,
+                "visit_top_txs: flood queue not initialized (invariant violation)"
+            );
+            return;
+        }
 
         budget.ops_remaining = lane_resources_left
             .first()

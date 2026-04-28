@@ -186,7 +186,7 @@ pub use parallel_tx_set_builder::build_two_phase_tx_set;
 
 // TxQueueLimiter and surge pricing
 pub use surge_pricing::VisitTxResult;
-pub use tx_queue_limiter::TxQueueLimiter;
+pub use tx_queue_limiter::{FloodQueueNotInitialized, TxQueueLimiter};
 
 // Timer management
 pub use timer_manager::{
