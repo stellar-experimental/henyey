@@ -211,15 +211,16 @@ impl Peer {
     /// Uses the default initial byte grant (300KB). For production connections
     /// where `max_tx_size` may exceed the threshold, use
     /// [`connect_with_connection`] with a computed grant instead.
-    pub async fn connect(
+    #[allow(dead_code)]
+    pub(crate) async fn connect(
         addr: &PeerAddress,
         local_node: LocalNode,
-        timeout_secs: u64,
+        timeouts: crate::OutboundTimeouts,
     ) -> Result<Self> {
         debug!("Connecting to peer: {}", addr);
 
         // Establish TCP connection
-        let connection = Connection::connect(addr, timeout_secs).await?;
+        let connection = Connection::connect(addr, timeouts.connect_secs).await?;
 
         // Create auth context (we called them)
         let auth = AuthContext::new(local_node, true);
@@ -243,7 +244,7 @@ impl Peer {
 
         // Perform handshake
         peer.handshake(
-            timeout_secs,
+            timeouts.auth_secs,
             None,
             None,
             INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
@@ -261,7 +262,7 @@ impl Peer {
         addr: &PeerAddress,
         connection: Connection,
         local_node: LocalNode,
-        timeout_secs: u64,
+        auth_timeout_secs: u64,
         pending_peer_ids: Option<Arc<DashMap<PeerId, Instant>>>,
         initial_byte_grant: u32,
     ) -> Result<Self> {
@@ -284,8 +285,13 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
         };
 
-        peer.handshake(timeout_secs, None, pending_peer_ids, initial_byte_grant)
-            .await?;
+        peer.handshake(
+            auth_timeout_secs,
+            None,
+            pending_peer_ids,
+            initial_byte_grant,
+        )
+        .await?;
         Ok(peer)
     }
 
@@ -346,7 +352,7 @@ impl Peer {
     /// control and GET_SCP_STATE to synchronize consensus state.
     async fn handshake(
         &mut self,
-        timeout_secs: u64,
+        auth_timeout_secs: u64,
         banned_peers: Option<Arc<RwLock<HashSet<PeerId>>>>,
         pending_peer_ids: Option<Arc<DashMap<PeerId, Instant>>>,
         initial_byte_grant: u32,
@@ -358,7 +364,7 @@ impl Peer {
         if self.connection.we_called_remote() {
             // --- Initiator (outbound): Send HELLO first, then receive ---
             self.send_hello().await?;
-            self.recv_hello(timeout_secs).await?;
+            self.recv_hello(auth_timeout_secs).await?;
 
             // Reserve pending peer_id after learning remote identity.
             // Matches stellar-core Peer::recvHello() duplicate check.
@@ -380,7 +386,7 @@ impl Peer {
 
             let result: Result<()> = async {
                 self.send_auth_msg().await?;
-                self.recv_auth(timeout_secs).await?;
+                self.recv_auth(auth_timeout_secs).await?;
                 Ok(())
             }
             .await;
@@ -392,7 +398,7 @@ impl Peer {
             }
         } else {
             // --- Responder (inbound): Receive HELLO first, then reply ---
-            self.recv_hello(timeout_secs).await?;
+            self.recv_hello(auth_timeout_secs).await?;
 
             // Check ban status immediately after learning peer identity,
             // before sending any response. Mirrors stellar-core's
@@ -432,7 +438,7 @@ impl Peer {
             // If any step fails, clean up the pending peer_id reservation.
             let result: Result<()> = async {
                 self.send_hello().await?;
-                self.recv_auth(timeout_secs).await?;
+                self.recv_auth(auth_timeout_secs).await?;
                 self.send_auth_msg().await?;
                 Ok(())
             }

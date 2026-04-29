@@ -225,8 +225,7 @@ pub(super) enum OutboundMessage {
 /// (`connect_preferred_peers`, `fill_outbound_slots`).
 pub(super) struct TickConnectCtx {
     pub(super) local_node: LocalNode,
-    pub(super) connect_timeout: u64,
-    pub(super) auth_timeout: u64,
+    pub(super) timeouts: crate::OutboundTimeouts,
     pub(super) target_outbound: usize,
     pub(super) connection_factory: Arc<dyn ConnectionFactory>,
 }
@@ -798,14 +797,11 @@ impl OverlayManager {
             return Err(OverlayError::PeerLimitReached);
         }
 
-        let timeout = self
-            .config
-            .connect_timeout_secs
-            .max(self.config.auth_timeout_secs);
+        let timeouts = crate::OutboundTimeouts::from_config(&self.config);
         connection::connect_to_explicit_peer(
             addr,
             self.local_node.clone(),
-            timeout,
+            timeouts,
             Arc::clone(&self.outbound_pool),
             self.shared_state(),
             Arc::clone(&self.connection_factory),

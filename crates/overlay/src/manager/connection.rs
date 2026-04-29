@@ -399,7 +399,7 @@ impl OverlayManager {
     async fn connect_to_discovered_peer(
         addr: PeerAddress,
         local_node: LocalNode,
-        connect_timeout: u64,
+        timeouts: crate::OutboundTimeouts,
         pool: Arc<ConnectionPool>,
         shared: SharedPeerState,
         connection_factory: Arc<dyn ConnectionFactory>,
@@ -418,7 +418,10 @@ impl OverlayManager {
             return;
         }
 
-        let connection = match connection_factory.connect(&addr, connect_timeout).await {
+        let connection = match connection_factory
+            .connect(&addr, timeouts.connect_secs)
+            .await
+        {
             Ok(c) => c,
             Err(e) => {
                 debug!("Failed to connect to discovered peer {}: {}", addr, e);
@@ -442,7 +445,7 @@ impl OverlayManager {
             &addr,
             connection,
             local_node,
-            connect_timeout,
+            timeouts.auth_secs,
             pending_peer_ids,
             initial_byte_grant,
         )
@@ -565,10 +568,7 @@ impl OverlayManager {
         let shared = self.shared_state();
         let local_node = self.local_node.clone();
         let pool = Arc::clone(&self.outbound_pool);
-        let connect_timeout = self
-            .config
-            .connect_timeout_secs
-            .max(self.config.auth_timeout_secs);
+        let timeouts = crate::OutboundTimeouts::from_config(&self.config);
         let connection_factory = Arc::clone(&self.connection_factory);
 
         let peer_handles = Arc::clone(&shared.peer_handles);
@@ -576,7 +576,7 @@ impl OverlayManager {
             Self::connect_to_discovered_peer(
                 addr,
                 local_node,
-                connect_timeout,
+                timeouts,
                 pool,
                 shared,
                 connection_factory,
@@ -636,7 +636,7 @@ impl OverlayManager {
 pub(super) async fn connect_to_explicit_peer(
     addr: &PeerAddress,
     local_node: LocalNode,
-    timeout_secs: u64,
+    timeouts: crate::OutboundTimeouts,
     pool: Arc<ConnectionPool>,
     shared: SharedPeerState,
     connection_factory: Arc<dyn ConnectionFactory>,
@@ -654,7 +654,10 @@ pub(super) async fn connect_to_explicit_peer(
         )));
     }
 
-    let connection = match connection_factory.connect(addr, timeout_secs).await {
+    let connection = match connection_factory
+        .connect(addr, timeouts.connect_secs)
+        .await
+    {
         Ok(connection) => connection,
         Err(e) => {
             shared.pending_connections.release_address(&addr_key);
@@ -677,7 +680,7 @@ pub(super) async fn connect_to_explicit_peer(
         addr,
         connection,
         local_node,
-        timeout_secs,
+        timeouts.auth_secs,
         pending_peer_ids,
         initial_byte_grant,
     )

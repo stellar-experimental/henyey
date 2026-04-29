@@ -132,6 +132,30 @@ use tokio::sync::mpsc;
 /// Result type for overlay operations.
 pub type Result<T> = std::result::Result<T, OverlayError>;
 
+/// Timeouts for outbound peer connections.
+///
+/// Separates the TCP connect phase (governed by network latency) from the
+/// post-connect authentication handshake. The `auth_secs` field governs each
+/// individual unauthenticated receive gap (recv_hello, recv_auth), matching
+/// stellar-core's `PEER_AUTHENTICATION_TIMEOUT` for unauthenticated I/O idle
+/// timeouts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OutboundTimeouts {
+    /// Maximum time to establish the TCP connection.
+    pub connect_secs: u64,
+    /// Maximum idle time per unauthenticated receive (recv_hello, recv_auth).
+    pub auth_secs: u64,
+}
+
+impl OutboundTimeouts {
+    pub fn from_config(config: &OverlayConfig) -> Self {
+        Self {
+            connect_secs: config.connect_timeout_secs,
+            auth_secs: config.auth_timeout_secs,
+        }
+    }
+}
+
 /// Configuration for the overlay network.
 ///
 /// Controls peer connection limits, timeouts, and network-specific settings.
@@ -201,10 +225,12 @@ pub struct OverlayConfig {
 
     /// Peer authentication timeout in seconds.
     ///
-    /// Maximum time to wait for the Hello/Auth handshake to complete.
-    /// Matches stellar-core's `Peer::getIOTimeout()` which returns 2s
-    /// for unauthenticated peers (during handshake). The separate 30s
-    /// idle timeout for authenticated peers is enforced in the peer loop.
+    /// Maximum idle time per unauthenticated receive operation (recv_hello,
+    /// recv_auth). Each receive independently times out after this duration.
+    /// Matches stellar-core's `Peer::getIOTimeout()` which returns
+    /// `PEER_AUTHENTICATION_TIMEOUT` (2s) for unauthenticated I/O idle
+    /// timeouts. The separate 30s idle timeout for authenticated peers is
+    /// enforced in the peer loop.
     pub auth_timeout_secs: u64,
 
     /// Connection timeout in seconds.

@@ -173,8 +173,7 @@ impl OverlayManager {
         let mut shutdown_rx = self.shutdown_tx.lock().as_ref().unwrap().subscribe();
         let ctx = TickConnectCtx {
             local_node: self.local_node.clone(),
-            connect_timeout: self.config.connect_timeout_secs,
-            auth_timeout: self.config.auth_timeout_secs,
+            timeouts: crate::OutboundTimeouts::from_config(&self.config),
             target_outbound: self.config.target_outbound_peers,
             connection_factory: Arc::clone(&self.connection_factory),
         };
@@ -416,11 +415,10 @@ impl OverlayManager {
                 return 0;
             }
 
-            let timeout = ctx.connect_timeout.max(ctx.auth_timeout);
             match super::connection::connect_to_explicit_peer(
                 addr,
                 ctx.local_node.clone(),
-                timeout,
+                ctx.timeouts,
                 Arc::clone(pool),
                 shared.clone(),
                 Arc::clone(&ctx.connection_factory),
@@ -478,11 +476,10 @@ impl OverlayManager {
                 break;
             }
 
-            let timeout = ctx.connect_timeout.max(ctx.auth_timeout);
             match super::connection::connect_to_explicit_peer(
                 addr,
                 ctx.local_node.clone(),
-                timeout,
+                ctx.timeouts,
                 Arc::clone(pool),
                 shared.clone(),
                 Arc::clone(&ctx.connection_factory),
@@ -719,8 +716,10 @@ mod tests {
         let mut retry_after = HashMap::new();
         let ctx = TickConnectCtx {
             local_node,
-            connect_timeout: 1,
-            auth_timeout: 1,
+            timeouts: crate::OutboundTimeouts {
+                connect_secs: 1,
+                auth_secs: 1,
+            },
             target_outbound: 1,
             connection_factory: Arc::new(FailingConnectionFactory),
         };
