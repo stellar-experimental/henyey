@@ -60,7 +60,7 @@ use crate::{
     verify, CatchupResult, HistoryError, Result,
 };
 use henyey_bucket::{canonical_bucket_filename, BucketList, BucketManager, HotArchiveBucketList};
-use henyey_common::fs_utils::atomic_write_with;
+use henyey_common::fs_utils::atomic_copy;
 use henyey_common::{Hash256, NetworkId};
 use henyey_db::Database;
 use std::collections::HashMap;
@@ -800,12 +800,7 @@ impl CatchupManager {
                 let src = data.bucket_dir.join(canonical_bucket_filename(hash));
                 let dst = bucket_mgr_dir.join(canonical_bucket_filename(hash));
                 if src.exists() && !dst.exists() {
-                    atomic_write_with(&dst, |out_file| {
-                        let mut src_file = std::fs::File::open(&src)?;
-                        std::io::copy(&mut src_file, out_file)?;
-                        Ok(())
-                    })
-                    .map_err(|e| {
+                    atomic_copy(&src, &dst).map_err(|e| {
                         HistoryError::CatchupFailed(format!(
                             "failed to copy bucket {} to bucket manager dir: {}",
                             hash, e

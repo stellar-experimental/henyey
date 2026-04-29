@@ -486,13 +486,9 @@ impl HotArchiveBucket {
             HotArchiveStorage::DiskBacked {
                 path: source_path, ..
             } => {
-                if source_path != &path {
-                    henyey_common::fs_utils::atomic_write_with(&path, |file| {
-                        let mut src = std::fs::File::open(source_path)?;
-                        std::io::copy(&mut src, file)?;
-                        Ok(())
-                    })?;
-                }
+                // `atomic_copy` is a no-op when source and destination are
+                // path-equal, so no separate guard is required here.
+                henyey_common::fs_utils::atomic_copy(source_path, &path)?;
             }
         }
 

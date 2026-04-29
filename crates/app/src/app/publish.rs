@@ -232,23 +232,7 @@ impl App {
                     // Find the backing file on disk
                     let src = bucket_dir.join(henyey_bucket::canonical_bucket_filename(&hash));
                     if src.exists() {
-                        use flate2::write::GzEncoder;
-                        use flate2::Compression;
-                        use std::io::{Read, Write};
-                        henyey_common::fs_utils::atomic_write_with(&dest, |file| {
-                            let mut encoder = GzEncoder::new(&mut *file, Compression::default());
-                            let mut src_file = std::fs::File::open(&src)?;
-                            let mut buf = [0u8; 64 * 1024];
-                            loop {
-                                let n = src_file.read(&mut buf)?;
-                                if n == 0 {
-                                    break;
-                                }
-                                encoder.write_all(&buf[..n])?;
-                            }
-                            encoder.finish()?;
-                            Ok(())
-                        })?;
+                        henyey_common::fs_utils::atomic_gzip_copy(&src, &dest)?;
                         tracing::debug!(hash = %hash.to_hex(), "Published hot archive bucket");
                     } else {
                         anyhow::bail!(

@@ -571,15 +571,10 @@ impl Bucket {
                 henyey_common::fs_utils::atomic_write_bytes(&path, &uncompressed)?;
             }
             BucketStorage::DiskBacked { disk_bucket } => {
-                // For disk-backed buckets, the file is already uncompressed XDR
-                let source = disk_bucket.file_path();
-                if source != path {
-                    henyey_common::fs_utils::atomic_write_with(&path, |file| {
-                        let mut src = std::fs::File::open(source)?;
-                        std::io::copy(&mut src, file)?;
-                        Ok(())
-                    })?;
-                }
+                // For disk-backed buckets, the file is already uncompressed XDR.
+                // `atomic_copy` is a no-op when source and destination are
+                // path-equal, so no separate guard is required here.
+                henyey_common::fs_utils::atomic_copy(disk_bucket.file_path(), &path)?;
             }
         }
 

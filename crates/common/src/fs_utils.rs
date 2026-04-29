@@ -13,6 +13,11 @@
 //! - [`atomic_write_with`] and [`atomic_write_bytes`] write data to a temp file,
 //!   fsync, then durably rename to the final path. This guarantees the final path
 //!   is never left in a partial state after a crash.
+//!
+//! - [`atomic_copy`] and [`atomic_gzip_copy`] are file-to-file conveniences
+//!   built on [`atomic_write_with`]: they stream `from` into a temp file
+//!   (optionally through a gzip encoder), then durably rename. Both treat
+//!   `from == to` (path-equality, not canonicalized) as a no-op.
 
 use std::fs;
 use std::io::{self, Write};
@@ -121,6 +126,73 @@ where
 /// for error contract and platform notes.
 pub fn atomic_write_bytes(final_path: &Path, data: &[u8]) -> io::Result<()> {
     atomic_write_with(final_path, |file| file.write_all(data))
+}
+
+/// Atomically copy `from` to `to` via a temp file + durable rename.
+///
+/// Reads `from` and streams it through `std::io::copy` into a temp file
+/// in `to`'s parent directory, then `fsync`s and durably renames the
+/// temp into place. Composes [`atomic_write_with`] with `File::open` +
+/// `io::copy`; the durability and error contract of the underlying
+/// primitive applies unchanged.
+///
+/// `to` is replaced atomically (POSIX `rename(2)`).
+///
+/// If `from` and `to` refer to the same path (path-equality, *not*
+/// canonicalized — symlinks and different spellings of the same file
+/// are not detected), this returns `Ok(())` without touching disk.
+/// Callers that need same-inode detection must canonicalize before
+/// calling.
+///
+/// # Errors
+///
+/// Inherits [`atomic_write_with`]'s contract:
+/// - Pre-rename errors (open `from`, write to temp, sync_all): temp
+///   file is removed; `to` is untouched.
+/// - Post-rename errors (parent dir fsync): rename succeeded but
+///   durability is not guaranteed; error is propagated.
+pub fn atomic_copy(from: &Path, to: &Path) -> io::Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    atomic_write_with(to, |file| {
+        let mut src = fs::File::open(from)?;
+        io::copy(&mut src, file)?;
+        Ok(())
+    })
+}
+
+/// Atomically gzip-compress `from` and write the result to `to`.
+///
+/// Streams the source through a `flate2::write::GzEncoder` with default
+/// compression into a temp file in `to`'s parent, then durably renames
+/// into place. The output is standard gzip — the same format produced
+/// by `gzip(1)` on the source.
+///
+/// If `from` and `to` are path-equal, returns `Ok(())` without touching
+/// disk. As with [`atomic_copy`], this is path equality only; symlinks
+/// and alternate spellings are not detected.
+///
+/// # Errors
+///
+/// Same contract as [`atomic_write_with`]: the pre-rename phase
+/// (opening `from`, encoding, finishing the encoder, syncing the temp)
+/// cleans up on error and leaves `to` untouched. Post-rename errors
+/// (parent dir fsync) propagate but the rename has already succeeded.
+pub fn atomic_gzip_copy(from: &Path, to: &Path) -> io::Result<()> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+
+    if from == to {
+        return Ok(());
+    }
+    atomic_write_with(to, |file| {
+        let mut encoder = GzEncoder::new(&mut *file, Compression::default());
+        let mut src = fs::File::open(from)?;
+        io::copy(&mut src, &mut encoder)?;
+        encoder.finish()?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -264,5 +336,154 @@ mod tests {
             b"original content",
             "existing file must be untouched after write error"
         );
+    }
+
+    #[test]
+    fn test_atomic_copy_basic() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.dat");
+        let dst = dir.path().join("dst.dat");
+
+        fs::write(&src, b"hello copy").unwrap();
+        atomic_copy(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"hello copy");
+        // Source must remain readable and unchanged.
+        assert_eq!(fs::read(&src).unwrap(), b"hello copy");
+    }
+
+    #[test]
+    fn test_atomic_copy_overwrite() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.dat");
+        let dst = dir.path().join("dst.dat");
+
+        fs::write(&src, b"new content").unwrap();
+        fs::write(&dst, b"old content").unwrap();
+
+        atomic_copy(&src, &dst).unwrap();
+
+        assert_eq!(fs::read(&dst).unwrap(), b"new content");
+    }
+
+    #[test]
+    fn test_atomic_copy_missing_source() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("does_not_exist.dat");
+        let dst = dir.path().join("dst.dat");
+
+        let result = atomic_copy(&src, &dst);
+        assert!(result.is_err());
+        assert!(!dst.exists(), "dst must not exist when src is missing");
+    }
+
+    #[test]
+    fn test_atomic_copy_preserves_existing_on_missing_source() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("does_not_exist.dat");
+        let dst = dir.path().join("dst.dat");
+
+        fs::write(&dst, b"original").unwrap();
+        let result = atomic_copy(&src, &dst);
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(&dst).unwrap(),
+            b"original",
+            "existing dst must be untouched when src is missing"
+        );
+    }
+
+    #[test]
+    fn test_atomic_copy_no_temp_left_on_error() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("missing.dat");
+        let dst = dir.path().join("dst.dat");
+
+        let _ = atomic_copy(&src, &dst);
+
+        let temps: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(temps.is_empty(), "no temp files should remain after error");
+    }
+
+    #[test]
+    fn test_atomic_copy_same_path_noop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("file.dat");
+
+        fs::write(&path, b"unchanged").unwrap();
+        atomic_copy(&path, &path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"unchanged");
+
+        let temps: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            temps.is_empty(),
+            "same-path no-op must not create temp files"
+        );
+    }
+
+    #[test]
+    fn test_atomic_gzip_copy_roundtrip() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.dat");
+        let dst = dir.path().join("dst.gz");
+
+        let original: Vec<u8> = (0..1024u32).flat_map(|i| i.to_le_bytes()).collect();
+        fs::write(&src, &original).unwrap();
+
+        atomic_gzip_copy(&src, &dst).unwrap();
+
+        let mut decoded = Vec::new();
+        let gz_file = fs::File::open(&dst).unwrap();
+        GzDecoder::new(gz_file).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_atomic_gzip_copy_large_input() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src.dat");
+        let dst = dir.path().join("dst.gz");
+
+        // ~200KB of pseudo-random bytes that don't compress to near-zero,
+        // exercising the streaming read/write path well past the default
+        // 64KB internal buffer.
+        let original: Vec<u8> = (0..200_000u32)
+            .map(|i| i.wrapping_mul(2654435761) as u8)
+            .collect();
+        fs::write(&src, &original).unwrap();
+
+        atomic_gzip_copy(&src, &dst).unwrap();
+
+        let mut decoded = Vec::new();
+        let gz_file = fs::File::open(&dst).unwrap();
+        GzDecoder::new(gz_file).read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn test_atomic_gzip_copy_same_path_noop() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("file.gz");
+
+        fs::write(&path, b"unchanged").unwrap();
+        atomic_gzip_copy(&path, &path).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"unchanged");
     }
 }
