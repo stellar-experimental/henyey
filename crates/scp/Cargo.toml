@@ -24,6 +24,13 @@ parking_lot.workspace = true
 hex.workspace = true
 rand.workspace = true
 
+[features]
+# Exposes #[cfg(any(test, feature = "test-helpers"))] helpers (e.g.
+# `Slot::test_set_fully_validated`, `SCP::test_clear_slot_fully_validated`)
+# to downstream crates that need to drive SCP into specific states from
+# their own integration tests. Not enabled in production.
+test-helpers = []
+
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true

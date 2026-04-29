@@ -131,9 +131,27 @@ pub enum ValidationLevel {
     /// Behaviorally, this level is identical to `MaybeValid` — it DOES
     /// cause the ballot protocol to clear `Slot::fully_validated`, gating
     /// emission until the herder restores it after the deferred condition
-    /// resolves (see `Slot::restore_fully_validated`).  The original
-    /// issues #1795 and #1798 were fixed by adding a restoration mechanism
-    /// rather than suppressing the clear.
+    /// resolves (see `Slot::restore_fully_validated`).
+    ///
+    /// Each of the two reasons above has a matching restoration trigger
+    /// in the herder, both routed through
+    /// `SCP::restore_slot_fully_validated`:
+    ///
+    /// - Missing tx_set (#1795) — restored when the tx_set is cached, via
+    ///   `Herder::cache_tx_set` →
+    ///   `ScpDriver::resolve_missing_tx_set`. This was the original fix
+    ///   for #1795.
+    /// - Apply-lag (#1798 / H-014, issue #2096) — restored when the
+    ///   ledger apply catches up, via `Herder::ledger_closed` →
+    ///   `ScpDriver::resolve_apply_lag_for_next_index`. The H-014 audit
+    ///   discovered the apply-lag path was clearing `fully_validated`
+    ///   without registering this trigger; #2096 added the missing
+    ///   `record_apply_lag` call and the corresponding resolver, closing
+    ///   the permanent-silence regression for the apply-lag case.
+    ///
+    /// A slot may be deferred for both reasons at once if an LCL advance
+    /// races between the two recordings; restoration requires ALL causes
+    /// to clear (see `crates/herder/src/scp_driver.rs::DeferredCauses`).
     ///
     /// See [`ValidationLevel::clears_fully_validated`] for the
     /// callsite.
@@ -151,9 +169,11 @@ impl ValidationLevel {
     ///
     /// Matches stellar-core `BallotProtocol.cpp:208-211` which clears
     /// only on `kMaybeValidValue`.  The henyey-specific
-    /// [`ValidationLevel::MaybeValidDeferred`] also clears — the
-    /// restoration mechanism in `Slot::restore_fully_validated` prevents
-    /// the permanent-silence regression of issues #1795 / #1798.
+    /// [`ValidationLevel::MaybeValidDeferred`] also clears — paired
+    /// herder-side restoration triggers
+    /// (`Herder::cache_tx_set` for missing-tx-set, `Herder::ledger_closed`
+    /// for apply-lag) prevent the permanent-silence regression of issues
+    /// #1795 / #1798 / #2096.
     pub fn clears_fully_validated(self) -> bool {
         matches!(self, Self::MaybeValid | Self::MaybeValidDeferred)
     }

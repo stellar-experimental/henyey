@@ -479,10 +479,54 @@ pub struct ScpDriver {
     /// Externalize lag tracker for per-node lag statistics.
     /// Mirrors stellar-core's `mQSetLag` in `HerderSCPDriver`.
     externalize_lag: RwLock<ExternalizeLagTracker>,
-    /// Slots deferred for `MaybeValidDeferred` validation, keyed by slot index
-    /// with the set of tx_set hashes that are pending. A slot is resolved when
-    /// all its pending hashes become available.
-    deferred_slots: Mutex<HashMap<u64, HashSet<Hash256>>>,
+    /// Slots deferred for `MaybeValidDeferred` validation, keyed by slot
+    /// index. Each entry records the set of *causes* that are deferring
+    /// the slot — see [`DeferredCauses`].
+    ///
+    /// A slot may carry multiple causes concurrently (e.g. an LCL race
+    /// can leave both `apply_lag` and `missing_tx_sets` set on the same
+    /// slot). The slot is restorable only when ALL causes have cleared.
+    deferred_slots: Mutex<HashMap<SlotIndex, DeferredCauses>>,
+}
+
+/// Causes that are deferring full validation for a slot.
+///
+/// A slot's `MaybeValidDeferred` validation can have two independent causes:
+///
+/// - `missing_tx_sets`: one or more tx-set hashes were not yet cached when
+///   `validate_value_against_local_state` ran on the LCL+1 path. Multiple
+///   distinct hashes can accumulate across different ballot/nominated
+///   values for the same slot; the cause is cleared only when EVERY
+///   recorded hash has arrived.
+/// - `apply_lag`: ledger apply was behind SCP tracking when
+///   `validate_past_or_future_value` ran. Cleared when LCL advances to
+///   `slot - 1` or beyond (the slot's predecessor has applied).
+///
+/// At any single LCL snapshot the two causes are mutually exclusive per
+/// slot (the tx-set-missing branch only runs on `slot == lcl_seq + 1`,
+/// the apply-lag branch only on `slot != lcl_seq + 1`). However, an LCL
+/// advance between `record_apply_lag(N)` and a subsequent
+/// `record_missing_tx_set(N, _)` can leave both causes set on the same
+/// slot. Restoration requires ALL causes to be clear.
+#[derive(Clone, Default, Eq, PartialEq, Debug)]
+pub(crate) struct DeferredCauses {
+    /// Tx-set hashes missing at validation time. The cause is cleared
+    /// only when EVERY recorded hash has been resolved via
+    /// [`ScpDriver::resolve_missing_tx_set`].
+    pub(crate) missing_tx_sets: HashSet<Hash256>,
+    /// `true` if `validate_past_or_future_value` returned
+    /// `MaybeValidDeferred` because ledger apply was behind SCP tracking.
+    /// Cleared when LCL advances past the slot's predecessor (via
+    /// [`ScpDriver::resolve_apply_lag_for_next_index`]).
+    pub(crate) apply_lag: bool,
+}
+
+impl DeferredCauses {
+    /// True iff the slot has no remaining deferred causes — i.e., it is
+    /// safe to call `restore_slot_fully_validated`.
+    fn is_clear(&self) -> bool {
+        self.missing_tx_sets.is_empty() && !self.apply_lag
+    }
 }
 
 /// Timing snapshot for the most recently externalized slot.
@@ -685,26 +729,63 @@ impl ScpDriver {
         self.tx_tracker.is_cached(hash)
     }
 
-    /// Record a slot as deferred for a specific tx_set hash.
-    /// Called from `validate_value` when returning `MaybeValidDeferred`.
-    pub(crate) fn record_deferred_slot(&self, slot: u64, tx_set_hash: Hash256) {
+    /// Record a missing-tx-set cause for `slot`. Adds `hash` to the slot's
+    /// pending-hashes set; creates the entry if absent. Called from
+    /// `validate_value_against_local_state` on the LCL+1 path when the
+    /// referenced tx_set is not yet cached.
+    ///
+    /// Multiple distinct hashes can accumulate for the same slot across
+    /// different ballot/nominated values. The slot is restorable only
+    /// when every recorded hash has been resolved via
+    /// [`Self::resolve_missing_tx_set`].
+    pub(crate) fn record_missing_tx_set(&self, slot: SlotIndex, tx_set_hash: Hash256) {
         self.deferred_slots
             .lock()
             .unwrap()
             .entry(slot)
             .or_default()
+            .missing_tx_sets
             .insert(tx_set_hash);
     }
 
-    /// Resolve deferred slots for a newly-arrived tx_set hash.
-    /// Returns the list of slot indices where ALL pending hashes are now
-    /// available (i.e., slots ready for restoration).
-    pub(crate) fn try_resolve_deferred_slot(&self, hash: Hash256) -> Vec<u64> {
+    /// Mark `slot` as deferred for apply-lag. Called from
+    /// `validate_past_or_future_value` when SCP tracking has advanced ahead
+    /// of ledger apply (`tracking_index == slot_index AND
+    /// slot_index != lcl_seq + 1`).
+    ///
+    /// Idempotent: re-recording a slot that already has `apply_lag = true`
+    /// is a no-op. Recording an `apply_lag` cause on top of an existing
+    /// `missing_tx_sets` cause is also valid — the two causes coexist and
+    /// the slot is restorable only when ALL are clear.
+    ///
+    /// The matching restoration trigger is
+    /// [`Self::resolve_apply_lag_for_next_index`], called by
+    /// `Herder::ledger_closed` after each LCL advance.
+    pub(crate) fn record_apply_lag(&self, slot: SlotIndex) {
+        self.deferred_slots
+            .lock()
+            .unwrap()
+            .entry(slot)
+            .or_default()
+            .apply_lag = true;
+    }
+
+    /// Resolve the missing-tx-set cause for `hash` across all slots.
+    ///
+    /// Removes `hash` from every slot's `missing_tx_sets` set; for any
+    /// slot whose causes are now ALL clear (no remaining pending hashes
+    /// AND `apply_lag == false`), removes the entry from the deferred map
+    /// and returns it.
+    ///
+    /// Slots whose causes are NOT yet all clear (e.g. another hash is
+    /// still pending, or `apply_lag` is still set due to an LCL race)
+    /// remain in the map.
+    pub(crate) fn resolve_missing_tx_set(&self, hash: &Hash256) -> Vec<SlotIndex> {
         let mut deferred = self.deferred_slots.lock().unwrap();
         let mut resolved = Vec::new();
-        for (slot, hashes) in deferred.iter_mut() {
-            hashes.remove(&hash);
-            if hashes.is_empty() {
+        for (slot, causes) in deferred.iter_mut() {
+            causes.missing_tx_sets.remove(hash);
+            if causes.is_clear() {
                 resolved.push(*slot);
             }
         }
@@ -714,12 +795,56 @@ impl ScpDriver {
         resolved
     }
 
+    /// Resolve the apply-lag cause for slots whose predecessor has now
+    /// applied — i.e. slots with `slot <= next_index`, where `next_index`
+    /// is `lcl_seq + 1` (the next slot to close).
+    ///
+    /// Clears `apply_lag` on each eligible slot. For any slot whose
+    /// causes are now ALL clear (no remaining `missing_tx_sets`),
+    /// removes the entry from the deferred map and returns it.
+    ///
+    /// Slots with `slot > next_index` are not yet eligible (their
+    /// predecessor has not applied) and remain deferred. Slots whose
+    /// `missing_tx_sets` is non-empty after clearing `apply_lag` also
+    /// remain — they will be restored when the missing tx_sets arrive
+    /// (or, for purged slots, when `purge_deferred_slots` drops them).
+    ///
+    /// Called by `Herder::ledger_closed` after each LCL advance.
+    pub(crate) fn resolve_apply_lag_for_next_index(&self, next_index: SlotIndex) -> Vec<SlotIndex> {
+        let mut deferred = self.deferred_slots.lock().unwrap();
+        let mut resolved = Vec::new();
+        for (slot, causes) in deferred.iter_mut() {
+            if *slot <= next_index && causes.apply_lag {
+                causes.apply_lag = false;
+                if causes.is_clear() {
+                    resolved.push(*slot);
+                }
+            }
+        }
+        for slot in &resolved {
+            deferred.remove(slot);
+        }
+        resolved
+    }
+
     /// Clean up deferred entries for slots at or below `max_slot`.
-    pub(crate) fn purge_deferred_slots(&self, max_slot: u64) {
+    pub(crate) fn purge_deferred_slots(&self, max_slot: SlotIndex) {
         self.deferred_slots
             .lock()
             .unwrap()
             .retain(|slot, _| *slot > max_slot);
+    }
+
+    /// Test-only: snapshot of the deferred causes for a slot.
+    #[cfg(test)]
+    pub(crate) fn deferred_causes_for_slot(&self, slot: SlotIndex) -> Option<DeferredCauses> {
+        self.deferred_slots.lock().unwrap().get(&slot).cloned()
+    }
+
+    /// Test-only: number of slots with pending deferred causes.
+    #[cfg(test)]
+    pub(crate) fn deferred_slot_count(&self) -> usize {
+        self.deferred_slots.lock().unwrap().len()
     }
 
     /// Register a pending tx set request.
@@ -1079,35 +1204,40 @@ impl ScpDriver {
 
         // `tracking_index == slot_index` combined with `slot_index !=
         // lcl_seq + 1` (the assertion at the top of this function)
-        // implies `lcl_seq + 1 < slot_index` — i.e. ledger apply is
-        // lagging behind SCP externalization, and the caller is
-        // processing a peer envelope that henyey's
-        // `advance_tracking_slot` →
+        // means SCP tracking has caught up to or moved past `slot_index`
+        // while the local ledger apply is at a different point. The
+        // dominant case is `lcl_seq + 1 < slot_index` — apply lagging
+        // behind SCP externalization, processing a peer envelope that
+        // henyey's `advance_tracking_slot` →
         // `drain_and_process_pending(consensus_index)` just released
         // synchronously, ahead of apply.
         //
         // Stellar-core's `safelyProcessSCPQueue` defers the drain to
         // the main thread via `postOnMainThread`
         // (`HerderImpl.cpp:1194`), giving apply a chance to complete
-        // first. Henyey's fast-path does not — so we see this code
+        // first. Henyey's fast-path does not — so we reach this code
         // path with `lcl_seq + 1 < slot_index`, whereas stellar-core
-        // typically would not. Return `MaybeValidDeferred` rather than
-        // `MaybeValid` so the ballot protocol does NOT clear the
-        // slot's `fully_validated` flag. If we cleared it here, the
-        // validator would later reach consensus on this slot but
-        // `send_latest_envelope` would refuse to emit the local
-        // EXTERNALIZE — silently dropping out of consensus from that
-        // slot onward. This was the observed stall in issue #1798.
+        // typically would not.
+        //
+        // Return `MaybeValidDeferred` so the ballot protocol clears
+        // `fully_validated` (preventing premature local EXTERNALIZE on
+        // a value we cannot fully validate yet) AND record the slot in
+        // `deferred_slots` with `apply_lag = true` so that
+        // `Herder::ledger_closed` →
+        // `resolve_apply_lag_for_next_index(lcl_seq + 1)` will trigger
+        // `restore_slot_fully_validated` once apply catches up.
+        //
+        // The matching restoration trigger closes audit finding H-014
+        // (issue #2096): without it, the validator could permanently
+        // suppress its own EXTERNALIZE for the slot.
         //
         // See the `ValidationLevel::MaybeValidDeferred` doc comment
         // (`crates/scp/src/driver.rs`) for the full rationale.
-        //
-        // No re-validation is needed when apply catches up — see #1796
-        // and the SCP/herder PARITY_STATUS.md sections on
-        // MaybeValidDeferred for the analysis.
+        self.record_apply_lag(slot_index);
         trace!(
             "Can't validate locally, value may be valid for slot {} \
-             (MaybeValidDeferred; apply lagging SCP)",
+             (MaybeValidDeferred; apply lagging SCP — recorded for \
+             restoration on next ledger_closed)",
             slot_index
         );
         ValueValidation::MaybeValidDeferred
@@ -1263,8 +1393,10 @@ impl ScpDriver {
                 // the complete rationale (issues #1795 and #1798).
                 if !nomination {
                     // Record the deferred slot so the herder can restore
-                    // fully_validated when the tx_set arrives.
-                    self.record_deferred_slot(slot_index, tx_set_hash);
+                    // fully_validated when the tx_set arrives. Restoration
+                    // is triggered by `Herder::cache_tx_set` →
+                    // `resolve_missing_tx_set`.
+                    self.record_missing_tx_set(slot_index, tx_set_hash);
 
                     debug!(
                         "Missing transaction set during ballot protocol: {} \
@@ -4748,6 +4880,201 @@ mod tests {
             ),
             "MaxSorobanTxSetSize upgrade should not need ledger manager"
         );
+    }
+
+    // ========== Deferred-causes regression tests (issue #2096 / H-014) =========
+    //
+    // These tests cover the herder-side deferred-validation registry.
+    // `validate_value` returns `MaybeValidDeferred` for two reasons:
+    //   - missing-tx-set on the LCL+1 path (resolved by `Herder::cache_tx_set`)
+    //   - apply-lag on the past/future-slot path (resolved by
+    //     `Herder::ledger_closed`)
+    // Both reasons clear `Slot::fully_validated` in SCP; restoration is
+    // gated on ALL recorded causes for the slot being clear.
+
+    /// The apply-lag branch records a slot in `deferred_slots` with
+    /// `apply_lag = true` AND returns `MaybeValidDeferred`. Without the
+    /// recording, `Herder::ledger_closed` has nothing to resolve and the
+    /// slot's `fully_validated` flag stays cleared forever (H-014).
+    #[test]
+    fn test_apply_lag_deferred_slot_recorded() {
+        let driver = make_test_driver();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // tracking_index == slot_index > lcl_seq + 1 → apply-lag branch.
+        let result = driver.validate_past_or_future_value(
+            150,
+            now,
+            ValueValidationContext {
+                lcl_seq: 100,
+                lcl_close_time: now - 50,
+                tracking: Some(SharedTrackingState {
+                    is_tracking: true,
+                    consensus_index: 150,
+                    consensus_close_time: now - 5,
+                }),
+            },
+        );
+        assert_eq!(result, ValueValidation::MaybeValidDeferred);
+
+        let causes = driver
+            .deferred_causes_for_slot(150)
+            .expect("apply-lag branch must record slot in deferred_slots");
+        assert!(
+            causes.apply_lag,
+            "apply-lag branch must set apply_lag = true"
+        );
+        assert!(
+            causes.missing_tx_sets.is_empty(),
+            "apply-lag branch must not record any missing-tx-set hashes"
+        );
+    }
+
+    /// `resolve_apply_lag_for_next_index(next_index)` clears `apply_lag`
+    /// only for slots with `slot <= next_index`. Future slots remain
+    /// deferred for the next `ledger_closed` tick.
+    #[test]
+    fn test_resolve_apply_lag_threshold() {
+        let driver = make_test_driver();
+        driver.record_apply_lag(101);
+        driver.record_apply_lag(105);
+
+        // next_index = 101 (LCL = 100): only slot 101 is eligible.
+        let resolved = driver.resolve_apply_lag_for_next_index(101);
+        assert_eq!(resolved, vec![101]);
+        assert!(driver.deferred_causes_for_slot(101).is_none());
+        assert!(
+            driver.deferred_causes_for_slot(105).is_some(),
+            "slot 105 must remain deferred when next_index < 105"
+        );
+
+        // next_index = 105 (LCL = 104): slot 105 is now eligible.
+        let resolved = driver.resolve_apply_lag_for_next_index(105);
+        assert_eq!(resolved, vec![105]);
+        assert_eq!(
+            driver.deferred_slot_count(),
+            0,
+            "deferred_slots must be empty after both slots resolved"
+        );
+    }
+
+    /// `record_apply_lag` does not gate by slot index. Past-slot recording
+    /// is benign — the entry is resolved on the next `ledger_closed` tick
+    /// and `restore_slot_fully_validated` is idempotent / a no-op on
+    /// already-restored or purged slots.
+    #[test]
+    fn test_resolve_apply_lag_past_slot_idempotent() {
+        let driver = make_test_driver();
+        driver.record_apply_lag(50); // older than any plausible LCL
+
+        let resolved = driver.resolve_apply_lag_for_next_index(101);
+        assert_eq!(
+            resolved,
+            vec![50],
+            "past-slot apply-lag entries are eligible at next ledger_closed"
+        );
+        assert_eq!(driver.deferred_slot_count(), 0);
+    }
+
+    /// The two reasons resolve independently. A slot deferred only on
+    /// `MissingTxSet` is not affected by `resolve_apply_lag_for_next_index`,
+    /// and vice versa.
+    #[test]
+    fn test_resolve_missing_tx_set_independence() {
+        let driver = make_test_driver();
+        let h1 = Hash256::hash(b"tx-set-1");
+        driver.record_missing_tx_set(100, h1);
+        driver.record_apply_lag(101);
+
+        let resolved = driver.resolve_missing_tx_set(&h1);
+        assert_eq!(resolved, vec![100]);
+        assert!(driver.deferred_causes_for_slot(100).is_none());
+        let s101 = driver
+            .deferred_causes_for_slot(101)
+            .expect("slot 101 must still be deferred on apply_lag");
+        assert!(s101.apply_lag);
+
+        let resolved = driver.resolve_apply_lag_for_next_index(101);
+        assert_eq!(resolved, vec![101]);
+        assert_eq!(driver.deferred_slot_count(), 0);
+    }
+
+    /// Multi-hash semantics: when multiple distinct tx-set hashes are
+    /// recorded for the same slot (different ballot/nominated values),
+    /// the slot is restorable only when EVERY recorded hash has arrived.
+    #[test]
+    fn test_record_missing_tx_set_accumulates_hashes() {
+        let driver = make_test_driver();
+        let h1 = Hash256::hash(b"tx-set-1");
+        let h2 = Hash256::hash(b"tx-set-2");
+        driver.record_missing_tx_set(100, h1);
+        driver.record_missing_tx_set(100, h2);
+
+        // Only h1 arrives — slot 100 stays deferred.
+        let resolved = driver.resolve_missing_tx_set(&h1);
+        assert!(
+            resolved.is_empty(),
+            "slot must not resolve until all recorded hashes have arrived"
+        );
+        assert!(driver.deferred_causes_for_slot(100).is_some());
+
+        // h2 arrives — slot 100 is now restorable.
+        let resolved = driver.resolve_missing_tx_set(&h2);
+        assert_eq!(resolved, vec![100]);
+        assert_eq!(driver.deferred_slot_count(), 0);
+    }
+
+    /// Per-slot coexistence: at any single LCL snapshot the two reasons
+    /// are mutually exclusive (`MissingTxSet` only on LCL+1, `ApplyLag`
+    /// only on `slot != lcl_seq + 1`). But an LCL advance between two
+    /// validate_value calls can leave both causes set on the same slot.
+    /// Restoration must require ALL causes clear, regardless of clear
+    /// order.
+    #[test]
+    fn test_record_coexistent_causes_resolve_independently() {
+        let driver = make_test_driver();
+        let h = Hash256::hash(b"tx-set");
+
+        // Order 1: ApplyLag first, then MissingTxSet.
+        driver.record_apply_lag(100);
+        driver.record_missing_tx_set(100, h);
+
+        // Resolving apply-lag alone must NOT remove the slot — missing tx_set
+        // is still pending.
+        let resolved = driver.resolve_apply_lag_for_next_index(100);
+        assert!(
+            resolved.is_empty(),
+            "slot must not resolve while missing_tx_sets is non-empty"
+        );
+        let causes = driver
+            .deferred_causes_for_slot(100)
+            .expect("slot must remain deferred");
+        assert!(
+            !causes.apply_lag,
+            "apply_lag must be cleared even when slot is still deferred"
+        );
+        assert_eq!(causes.missing_tx_sets.len(), 1);
+
+        // Resolving the missing tx_set now empties causes — slot is restorable.
+        let resolved = driver.resolve_missing_tx_set(&h);
+        assert_eq!(resolved, vec![100]);
+        assert_eq!(driver.deferred_slot_count(), 0);
+
+        // Order 2: MissingTxSet first, then ApplyLag — same final result.
+        driver.record_missing_tx_set(200, h);
+        driver.record_apply_lag(200);
+
+        let resolved = driver.resolve_missing_tx_set(&h);
+        assert!(
+            resolved.is_empty(),
+            "slot must not resolve while apply_lag is set"
+        );
+        let resolved = driver.resolve_apply_lag_for_next_index(200);
+        assert_eq!(resolved, vec![200]);
+        assert_eq!(driver.deferred_slot_count(), 0);
     }
 }
 

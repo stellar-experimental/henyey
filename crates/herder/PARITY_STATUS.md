@@ -534,7 +534,7 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: No metrics infrastructure; statistics tracked via simple structs
    - **Rationale**: Metrics will use Rust ecosystem libraries (prometheus, metrics crate) when added
 
-7. **Fast-path + `MaybeValidDeferred`** (issues #1795 and #1798)
+7. **Fast-path + `MaybeValidDeferred`** (issues #1795, #1798, and H-014 / #2096)
    - **stellar-core**: `PendingEnvelopes` buffers peer EXTERNALIZE
      envelopes until their tx_set arrives. By the time
      `validateValueAgainstLocalState` runs, the tx_set is always
@@ -543,7 +543,10 @@ Features not yet implemented. These ARE counted against parity %.
      `safelyProcessSCPQueue` defers the SCP queue drain to the main
      thread via `postOnMainThread` (`HerderImpl.cpp:1194`), giving
      ledger apply a chance to complete before peer envelopes for the
-     next tracking slot are processed.
+     next tracking slot are processed. `setupTriggerNextLedger`
+     (`HerderImpl.cpp:1237-1254`) further asserts that apply is not
+     in flight and tracking equals the LCL — together these mean the
+     henyey-specific apply-lag window does not occur upstream.
    - **Rust**: `process_scp_envelope` forwards peer EXTERNALIZE to SCP
      before the tx_set is fetched, so tracking advance can proceed
      during catchup (#1795). `advance_tracking_slot` then runs
@@ -553,23 +556,50 @@ Features not yet implemented. These ARE counted against parity %.
      `validate_past_or_future_value` return
      `ValueValidation::MaybeValidDeferred`, which maps to
      `ValidationLevel::MaybeValidDeferred` — a henyey extension that
-     does NOT clear `Slot::fully_validated`.
+     **does** clear `Slot::fully_validated` (matching stellar-core's
+     `kMaybeValidValue` clear) and is restored by paired herder-side
+     triggers when the deferred condition resolves.
+   - **Restoration triggers**: `MaybeValidDeferred` registers each
+     deferred slot in `ScpDriver::deferred_slots` keyed by
+     `DeferredCauses { missing_tx_sets, apply_lag }`. The slot is
+     restored only when ALL recorded causes have cleared:
+     - **Missing tx_set** (#1795): cleared when the tx_set is cached.
+       `Herder::cache_tx_set` calls
+       `ScpDriver::resolve_missing_tx_set(&hash)` and then
+       `SCP::restore_slot_fully_validated(slot)` for each newly
+       all-clear slot.
+     - **Apply-lag** (#1798 / H-014, #2096): cleared when the LCL
+       advances past the slot's predecessor. `Herder::ledger_closed`
+       calls `ScpDriver::resolve_apply_lag_for_next_index(slot + 1)`
+       and then `SCP::restore_slot_fully_validated(slot)` for each
+       newly all-clear slot.
+     A slot may carry both causes simultaneously if an LCL advance
+     races between the two recordings; restoration still requires ALL
+     causes clear (the structure permits coexistence — see
+     `DeferredCauses` in `crates/herder/src/scp_driver.rs`).
    - **Rationale**: The fast-path fixed a post-catchup stall where
      evicted tx_sets blocked EXTERNALIZE from reaching SCP, and the
      synchronous drain avoided an extra round-trip during catchup. The
-     `MaybeValidDeferred` variant preserves both behaviors while
-     avoiding the secondary bugs (#1795 / #1798) where `MaybeValid`
-     cleared `fully_validated` and permanently suppressed the
-     validator's own EXTERNALIZE emission.
+     `MaybeValidDeferred` variant + paired restoration triggers preserve
+     both behaviors while avoiding the secondary bugs where the local
+     validator's own EXTERNALIZE emission would be permanently
+     suppressed.
    - **No re-validation after tx_set arrival (#1796):**
      `process_ready_fetching_envelopes` only drains buffered
      non-EXTERNALIZE envelopes. The EXTERNALIZE that bypassed buffering
      via the fast-path is NOT re-validated when the tx_set arrives
      because `ValidationLevel` is ephemeral (not stored per-envelope in
-     SCP). Both `MaybeValidDeferred` and `FullyValidated` return `false`
-     from `clears_fully_validated()`, producing identical slot end
-     states: externalized, `fully_validated=true`, same emission
-     visibility.
+     SCP). The end-state symmetry with `FullyValidated` is achieved by
+     the herder-side restoration trigger flipping `fully_validated`
+     back to `true` once the tx_set is cached (or apply catches up),
+     producing identical slot end states: externalized,
+     `fully_validated=true`, same emission visibility.
+   - **Long-term direction**: The structural divergence is henyey's
+     synchronous `drain_and_process_pending` on the externalize
+     callback. Mirroring stellar-core's `safelyProcessSCPQueue →
+     postOnMainThread` would close the apply-lag window entirely and
+     obsolete `MaybeValidDeferred` and the herder-side restoration
+     mechanism. Tracked as a follow-up.
 
 8. **Error Handling**
    - **stellar-core**: C++ exceptions and integer result codes

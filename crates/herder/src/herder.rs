@@ -1999,6 +1999,27 @@ impl Herder {
             .scp_driver
             .cleanup_old_pending_slots(slot.saturating_add(1));
 
+        // Restore `fully_validated` for any slot that was deferred only on
+        // apply-lag and whose predecessor has now applied (i.e. the slot
+        // is at or below the next-to-close index `lcl_seq + 1`).
+        //
+        // Without this call, peer envelopes that arrived for slot `S`
+        // while the local LCL was still at `S - 2` or earlier would have
+        // cleared the local node's `fully_validated` for slot `S` and
+        // never restored it, silently dropping local participation in
+        // the slot's consensus (audit finding H-014, issue #2096).
+        //
+        // Run BEFORE the purges below so a slot resolved this tick is
+        // not also dropped by `purge_deferred_slots`/`purge_slots`. The
+        // resolve call drains the deferred-slots mutex; the restore
+        // calls take a separate SCP slots-write lock per slot. Late
+        // inserts into `deferred_slots` between the resolve and the
+        // restore loop are picked up by the next `ledger_closed` call.
+        let next_index = slot.saturating_add(1);
+        for s in self.scp_driver.resolve_apply_lag_for_next_index(next_index) {
+            self.scp.restore_slot_fully_validated(s);
+        }
+
         // Clean up old SCP state
         self.scp.purge_slots(slot.saturating_sub(10), None);
         // Purge deferred slot tracking alongside SCP slot cleanup
@@ -2710,9 +2731,13 @@ impl Herder {
 
         // Resolve any deferred slots that were waiting for this tx_set.
         // When MaybeValidDeferred clears fully_validated, the validator
-        // stops emitting for the slot.  Once the tx_set arrives, we
+        // stops emitting for the slot. Once the tx_set arrives — and any
+        // other deferred causes (e.g. apply_lag) have also cleared — we
         // restore fully_validated so emission can resume.
-        let resolved = self.scp_driver.try_resolve_deferred_slot(hash);
+        //
+        // The companion restoration trigger for `apply_lag` causes lives
+        // in `Herder::ledger_closed`.
+        let resolved = self.scp_driver.resolve_missing_tx_set(&hash);
         for slot in resolved {
             self.scp.restore_slot_fully_validated(slot);
         }
@@ -6593,6 +6618,94 @@ mod advance_tracking_slot_tests {
             before,
             after
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // H-014 / issue #2096 regression: ledger_closed must restore
+    // fully_validated for slots that were deferred only on apply-lag,
+    // and must NOT restore slots whose apply-lag is for a future slot
+    // whose predecessor has not yet applied.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// `Herder::ledger_closed(slot)` calls
+    /// `resolve_apply_lag_for_next_index(slot + 1)` and then
+    /// `restore_slot_fully_validated` on each resolved slot. A slot
+    /// recorded as deferred on apply-lag whose predecessor has now
+    /// applied must have its `fully_validated` flag flipped back to true.
+    #[test]
+    fn test_ledger_closed_restores_apply_lag_deferred_slots() {
+        let herder = Herder::new(HerderConfig::default());
+
+        // Initial tracking state: LCL = 99, tracking_index = 100.
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.consensus_index = 100;
+            ts.is_tracking = true;
+        }
+        herder.pending_envelopes.set_current_slot(100);
+
+        // Simulate the apply-lag-deferred state for slot 100: SCP slot
+        // exists with `fully_validated == false`, and an `apply_lag`
+        // entry is recorded in the herder's deferred_slots.
+        herder.scp.test_clear_slot_fully_validated(100);
+        herder.scp_driver.record_apply_lag(100);
+        assert!(
+            !herder.scp.is_slot_fully_validated(100),
+            "precondition: slot 100 must be cleared"
+        );
+
+        // Apply ledger 99 — `ledger_closed(99)` runs, computing
+        // next_index = 100. Slot 100 is eligible (slot <= next_index
+        // and apply_lag == true), so it is resolved and restored.
+        herder.ledger_closed(99, &[], &[], 1_000_000);
+
+        assert!(
+            herder.scp.is_slot_fully_validated(100),
+            "slot 100 must be fully_validated after ledger_closed restores apply-lag deferred slots"
+        );
+        assert_eq!(
+            herder.scp_driver.deferred_slot_count(),
+            0,
+            "deferred_slots must be drained for slot 100"
+        );
+    }
+
+    /// Slots whose `apply_lag` cause is for a future slot (predecessor
+    /// not yet applied) must NOT be restored by `ledger_closed`. They
+    /// remain deferred until the LCL advances enough.
+    #[test]
+    fn test_ledger_closed_does_not_restore_future_apply_lag() {
+        let herder = Herder::new(HerderConfig::default());
+
+        // Two future slots: 100 (next_index after this close = 99) and 105.
+        herder.scp.test_clear_slot_fully_validated(100);
+        herder.scp.test_clear_slot_fully_validated(105);
+        herder.scp_driver.record_apply_lag(100);
+        herder.scp_driver.record_apply_lag(105);
+
+        // Apply ledger 98 — next_index = 99. Neither 100 nor 105 is
+        // eligible (both > 99), so neither restoration fires.
+        herder.ledger_closed(98, &[], &[], 1_000_000);
+
+        assert!(
+            !herder.scp.is_slot_fully_validated(100),
+            "slot 100 must remain not-fully-validated when next_index < 100"
+        );
+        assert!(
+            !herder.scp.is_slot_fully_validated(105),
+            "slot 105 must remain not-fully-validated when next_index < 105"
+        );
+        // Both entries still in deferred_slots.
+        let causes_100 = herder
+            .scp_driver
+            .deferred_causes_for_slot(100)
+            .expect("slot 100 must remain deferred");
+        assert!(causes_100.apply_lag);
+        let causes_105 = herder
+            .scp_driver
+            .deferred_causes_for_slot(105)
+            .expect("slot 105 must remain deferred");
+        assert!(causes_105.apply_lag);
     }
 }
 

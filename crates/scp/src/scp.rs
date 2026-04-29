@@ -388,6 +388,18 @@ impl<D: SCPDriver> SCP<D> {
         self.slots.read().keys().copied().collect()
     }
 
+    /// Test-only: create a slot at `slot_index` (if not already present) and
+    /// force its `fully_validated` flag to `false`. Used by tests that need
+    /// to verify the herder's restoration triggers (`cache_tx_set`,
+    /// `ledger_closed`) flip the flag back via
+    /// [`Self::restore_slot_fully_validated`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_clear_slot_fully_validated(&self, slot_index: u64) {
+        let mut slots = self.slots.write();
+        let slot = self.get_or_create_slot(&mut slots, slot_index);
+        slot.test_set_fully_validated(false);
+    }
+
     /// Get all envelopes for a specific slot.
     pub fn get_slot_envelopes(&self, slot_index: u64) -> Vec<ScpEnvelope> {
         let slots = self.slots.read();

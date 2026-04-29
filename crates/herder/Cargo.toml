@@ -51,4 +51,5 @@ tempfile.workspace = true
 henyey-bucket.workspace = true
 henyey-crypto.workspace = true
 henyey-ledger = { workspace = true, features = ["test-utils"] }
+henyey-scp = { workspace = true, features = ["test-helpers"] }
 sha2.workspace = true

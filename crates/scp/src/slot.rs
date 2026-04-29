@@ -193,6 +193,12 @@ impl Slot {
         }
     }
 
+    /// Test-only: directly set the `fully_validated` flag.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn test_set_fully_validated(&mut self, validated: bool) {
+        self.set_fully_validated(validated);
+    }
+
     /// Restore `fully_validated` and emit any deferred ballot/nomination envelopes.
     ///
     /// Called by the herder after all deferred validation conditions for this
