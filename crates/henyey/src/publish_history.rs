@@ -273,20 +273,8 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
         let command_publish_dir = if command_targets.is_empty() {
             None
         } else {
-            let sanitized_name = config
-                .node
-                .name
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect::<String>();
-            let publish_dir = std::env::temp_dir().join(format!(
-                "rs-stellar-core-publish-{}-{}",
-                sanitized_name, checkpoint
-            ));
-            if publish_dir.exists() {
-                std::fs::remove_dir_all(&publish_dir)?;
-            }
-            std::fs::create_dir_all(&publish_dir)?;
+            let publish_tmp = bucket_manager.create_staging_dir()?;
+            let publish_dir = publish_tmp.path().to_path_buf();
 
             let publish_config = PublishConfig {
                 local_path: publish_dir.clone(),
@@ -304,7 +292,7 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
             )?;
 
             write_root_has(&publish_dir, &has)?;
-            Some(publish_dir)
+            Some((publish_dir, publish_tmp))
         };
 
         let mut published_any = false;
@@ -332,7 +320,7 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
             published_any = true;
         }
 
-        if let Some(ref publish_dir) = command_publish_dir {
+        if let Some((ref publish_dir, _)) = command_publish_dir {
             write_scp_history_file(publish_dir, checkpoint, &scp_entries)?;
             for archive in &command_targets {
                 upload_publish_directory(archive, publish_dir)?;
@@ -341,12 +329,11 @@ pub(crate) async fn cmd_publish_history(config: AppConfig, force: bool) -> anyho
             }
         }
 
-        if let Some(publish_dir) = command_publish_dir {
-            if let Err(err) = std::fs::remove_dir_all(&publish_dir) {
+        if let Some((_publish_dir, publish_tmp)) = command_publish_dir {
+            if let Err(err) = publish_tmp.close() {
                 tracing::warn!(
-                    path = %publish_dir.display(),
                     error = %err,
-                    "Failed to remove publish temp directory"
+                    "Failed to remove publish staging directory"
                 );
             }
         }

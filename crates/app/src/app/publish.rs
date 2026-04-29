@@ -186,12 +186,10 @@ impl App {
             .ok_or_else(|| anyhow::anyhow!("Missing HAS for checkpoint {}", checkpoint))?;
         let has: henyey_history::HistoryArchiveState = serde_json::from_str(&has_json)?;
 
-        // Build checkpoint files in a temp directory
-        let publish_dir = std::env::temp_dir().join(format!("henyey-publish-{}", checkpoint));
-        if publish_dir.exists() {
-            std::fs::remove_dir_all(&publish_dir)?;
-        }
-        std::fs::create_dir_all(&publish_dir)?;
+        // Build checkpoint files in a staging directory under the bucket dir.
+        // Uses a randomly-named temp dir to avoid predictable paths in /tmp.
+        let publish_tmp = bucket_manager.create_staging_dir()?;
+        let publish_dir = publish_tmp.path().to_path_buf();
 
         let publish_config = PublishConfig {
             local_path: publish_dir.clone(),
@@ -263,13 +261,10 @@ impl App {
             upload_publish_directory(put_cmd, mkdir_cmd, &publish_dir)?;
         }
 
-        // Clean up temp directory
-        if let Err(e) = std::fs::remove_dir_all(&publish_dir) {
-            tracing::warn!(
-                path = %publish_dir.display(),
-                error = %e,
-                "Failed to remove publish temp directory"
-            );
+        // Clean up staging directory (TempDir drops silently on error paths;
+        // on success we use close() for observable cleanup)
+        if let Err(e) = publish_tmp.close() {
+            tracing::warn!(error = %e, "Failed to remove publish staging directory");
         }
 
         Ok(())

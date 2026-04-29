@@ -255,6 +255,18 @@ impl BucketManager {
         &self.bucket_dir
     }
 
+    /// Create a randomly-named staging directory under `<bucket_dir>/tmp/`.
+    ///
+    /// This aligns with stellar-core's strategy of staging temporary work
+    /// under the private bucket directory rather than the system temp
+    /// directory, avoiding predictable paths in world-writable `/tmp`.
+    /// Returns a `TempDir` guard that cleans up on drop.
+    pub fn create_staging_dir(&self) -> Result<tempfile::TempDir> {
+        let staging_root = self.bucket_dir.join("tmp");
+        std::fs::create_dir_all(&staging_root)?;
+        Ok(tempfile::tempdir_in(&staging_root)?)
+    }
+
     /// Get the file path for a bucket with the given hash.
     ///
     /// Returns the path using the canonical `.bucket.xdr` extension
@@ -2515,5 +2527,23 @@ mod tests {
         let (_temp_dir, manager) = create_manager();
         assert!(manager.bucket_exists(Hash256::empty_hash()));
         assert!(manager.bucket_exists(&Hash256::ZERO));
+    }
+
+    #[test]
+    fn test_create_staging_dir_under_bucket_tmp() {
+        let (_temp_dir, manager) = create_manager();
+        let staging = manager.create_staging_dir().unwrap();
+        let staging_path = staging.path().to_path_buf();
+
+        // Staging dir must be under <bucket_dir>/tmp/
+        let expected_root = manager.bucket_dir().join("tmp");
+        assert!(staging_path.starts_with(&expected_root));
+
+        // Directory must exist
+        assert!(staging_path.is_dir());
+
+        // Cleanup on drop
+        drop(staging);
+        assert!(!staging_path.exists());
     }
 }
