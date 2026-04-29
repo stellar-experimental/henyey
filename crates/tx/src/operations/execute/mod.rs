@@ -1048,18 +1048,14 @@ pub fn execute_operation_with_soroban(
                             // restored from hot archive earlier in this ledger and then
                             // deleted, skip it. The immutable hot archive snapshot would
                             // still return the entry, but restoring it again diverges.
-                            if let Some(restored) = soroban.previously_restored_keys {
-                                if restored.contains(key) {
-                                    continue;
-                                }
-                            }
+                            // GuardedHotArchive::get() handles this check transparently.
                             // Per stellar-core createEntryRentChangeWithoutModification():
                             // When entryLiveUntilLedger is std::nullopt (no previous TTL):
                             //   - old_size_bytes = 0
                             //   - old_live_until_ledger = 0
                             // This is different from expired entries where we use the actual old size.
-                            if let Some(ha) = soroban.hot_archive {
-                                if let Some(entry) = ha.get(key).map_err(|e| {
+                            if let Some(ref guarded) = soroban.guarded_hot_archive {
+                                if let Some(entry) = guarded.get(key).map_err(|e| {
                                     TxError::Internal(format!(
                                         "hot archive lookup failed during restore: {e}"
                                     ))

@@ -323,13 +323,8 @@ impl PersistentModuleCache {
 struct LedgerSnapshotAdapterP25<'a> {
     state: &'a LedgerStateManager,
     current_ledger: u32,
-    hot_archive: Option<&'a dyn super::HotArchiveLookup>,
+    guarded_hot_archive: Option<super::GuardedHotArchive<'a>>,
     ttl_key_cache: Option<&'a super::TtlKeyCache>,
-    /// Keys already restored from hot archive earlier in this cluster/ledger.
-    /// When set, `get_archived()` returns `None` for these keys instead of
-    /// consulting the hot archive. Mirrors stellar-core's
-    /// `previouslyRestoredFromHotArchive()`.
-    previously_restored_keys: Option<&'a std::collections::HashSet<stellar_xdr::curr::LedgerKey>>,
 }
 
 impl<'a> LedgerSnapshotAdapterP25<'a> {
@@ -337,18 +332,14 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
     pub fn with_hot_archive(
         state: &'a LedgerStateManager,
         current_ledger: u32,
-        hot_archive: Option<&'a dyn super::HotArchiveLookup>,
+        guarded_hot_archive: Option<super::GuardedHotArchive<'a>>,
         ttl_key_cache: Option<&'a super::TtlKeyCache>,
-        previously_restored_keys: Option<
-            &'a std::collections::HashSet<stellar_xdr::curr::LedgerKey>,
-        >,
     ) -> Self {
         Self {
             state,
             current_ledger,
-            hot_archive,
+            guarded_hot_archive,
             ttl_key_cache,
-            previously_restored_keys,
         }
     }
 
@@ -415,13 +406,9 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         // was already restored from hot archive earlier in this ledger and then
         // deleted. The immutable hot archive snapshot would still return the entry,
         // but restoring it again would diverge from stellar-core behavior.
-        if let Some(restored) = self.previously_restored_keys {
-            if restored.contains(key.as_ref()) {
-                return Ok(None);
-            }
-        }
-        if let Some(hot_archive) = self.hot_archive {
-            if let Some(archived_entry) = hot_archive.get(key.as_ref()).map_err(|e| {
+        // GuardedHotArchive::get() handles this check transparently.
+        if let Some(ref guarded) = self.guarded_hot_archive {
+            if let Some(archived_entry) = guarded.get(key.as_ref()).map_err(|e| {
                 tracing::error!(error = ?e, "Hot archive lookup failed during restore");
                 HostErrorP25::from(soroban_env_host25::Error::from_type_and_code(
                     soroban_env_host25::xdr::ScErrorType::Storage,
@@ -1081,7 +1068,7 @@ fn execute_host_function_p24(
         context,
         soroban_data,
         soroban_config,
-        hot_archive,
+        guarded_hot_archive,
         ttl_key_cache,
         ..
     } = request;
@@ -1154,9 +1141,8 @@ fn execute_host_function_p24(
     let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(
         state,
         context.sequence,
-        hot_archive,
+        guarded_hot_archive,
         ttl_key_cache,
-        request.previously_restored_keys,
     );
 
     // ── Gather footprint entries ──
@@ -1321,7 +1307,7 @@ fn execute_host_function_p25(
         context,
         soroban_data,
         soroban_config,
-        hot_archive,
+        guarded_hot_archive,
         ttl_key_cache,
         ..
     } = request;
@@ -1397,9 +1383,8 @@ fn execute_host_function_p25(
     let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(
         state,
         context.sequence,
-        hot_archive,
+        guarded_hot_archive,
         ttl_key_cache,
-        request.previously_restored_keys,
     );
 
     // ── Gather footprint entries ──
@@ -1676,7 +1661,7 @@ fn execute_host_function_p26(
         context,
         soroban_data,
         soroban_config,
-        hot_archive,
+        guarded_hot_archive,
         ttl_key_cache,
         ..
     } = request;
@@ -1737,9 +1722,8 @@ fn execute_host_function_p26(
     let snapshot = LedgerSnapshotAdapterP25::with_hot_archive(
         state,
         context.sequence,
-        hot_archive,
+        guarded_hot_archive,
         ttl_key_cache,
-        request.previously_restored_keys,
     );
 
     // ── Gather footprint entries ──
@@ -2396,26 +2380,21 @@ mod tests {
 
         let state = crate::state::LedgerStateManager::new(1_000_000, 100);
 
-        // Without previously_restored_keys, hot archive entry is returned.
-        let adapter_no_guard =
-            LedgerSnapshotAdapterP25::with_hot_archive(&state, 100, Some(&hot_archive), None, None);
+        // Without guarded hot archive, no entry is returned.
+        let adapter_no_guard = LedgerSnapshotAdapterP25::with_hot_archive(&state, 100, None, None);
         let rc_key = Rc::new(key.clone());
         let result = adapter_no_guard.get_archived(&rc_key).unwrap();
         assert!(
-            result.is_some(),
-            "Without guard, hot archive entry should be returned"
+            result.is_none(),
+            "Without guarded hot archive, no entry should be returned"
         );
 
         // With key in previously_restored_keys, get_archived returns None.
         let mut restored = HashSet::new();
         restored.insert(key.clone());
-        let adapter_with_guard = LedgerSnapshotAdapterP25::with_hot_archive(
-            &state,
-            100,
-            Some(&hot_archive),
-            None,
-            Some(&restored),
-        );
+        let guarded = crate::soroban::GuardedHotArchive::new(&hot_archive, &restored);
+        let adapter_with_guard =
+            LedgerSnapshotAdapterP25::with_hot_archive(&state, 100, Some(guarded), None);
         let result = adapter_with_guard.get_archived(&rc_key).unwrap();
         assert!(
             result.is_none(),

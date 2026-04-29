@@ -203,8 +203,7 @@ fn lookup_soroban_entry_or_hot_archive(
     state: &LedgerStateManager,
     key: &LedgerKey,
     ledger_seq: u32,
-    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
-    previously_restored_keys: Option<&std::collections::HashSet<LedgerKey>>,
+    guarded_hot_archive: Option<&crate::soroban::GuardedHotArchive<'_>>,
 ) -> crate::Result<Option<LedgerEntry>> {
     let live = match key {
         LedgerKey::ContractData(cd_key) => state
@@ -228,13 +227,9 @@ fn lookup_soroban_entry_or_hot_archive(
     }
     // stellar-core: previouslyRestoredFromHotArchive(lk) — skip the hot archive
     // if the entry was already restored and then deleted in this ledger.
-    if let Some(restored) = previously_restored_keys {
-        if restored.contains(key) {
-            return Ok(None);
-        }
-    }
-    match hot_archive {
-        Some(ha) => ha
+    // GuardedHotArchive::get() handles this check transparently.
+    match guarded_hot_archive {
+        Some(guarded) => guarded
             .get(key)
             .map_err(|e| TxError::Internal(format!("hot archive lookup failed: {e}"))),
         None => Ok(None),
@@ -252,9 +247,8 @@ fn validate_archived_entry_sizes(
     soroban_data: &SorobanTransactionData,
     soroban_config: &SorobanConfig,
     current_ledger: u32,
-    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    guarded_hot_archive: Option<&crate::soroban::GuardedHotArchive<'_>>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-    previously_restored_keys: Option<&std::collections::HashSet<LedgerKey>>,
 ) -> Result<bool> {
     let restored_indices: std::collections::HashSet<u32> = match &soroban_data.ext {
         SorobanTransactionDataExt::V1(ext) => {
@@ -297,13 +291,7 @@ fn validate_archived_entry_sizes(
 
         // Entry is expired and marked for restore — look it up from live state
         // or hot archive.
-        let entry = lookup_soroban_entry_or_hot_archive(
-            state,
-            key,
-            0,
-            hot_archive,
-            previously_restored_keys,
-        )?;
+        let entry = lookup_soroban_entry_or_hot_archive(state, key, 0, guarded_hot_archive)?;
 
         if let Some(entry) = entry {
             let entry_size = xdr_encoded_len(&entry);
@@ -376,9 +364,8 @@ pub(crate) fn execute_invoke_host_function(
             soroban_data,
             soroban_config,
             module_cache: soroban.module_cache,
-            hot_archive: soroban.hot_archive,
+            guarded_hot_archive: soroban.guarded_hot_archive,
             ttl_key_cache: soroban.ttl_key_cache,
-            previously_restored_keys: soroban.previously_restored_keys,
         },
         state,
         context,
@@ -392,9 +379,8 @@ struct ContractInvocationRequest<'a> {
     soroban_data: &'a SorobanTransactionData,
     soroban_config: &'a SorobanConfig,
     module_cache: Option<&'a PersistentModuleCache>,
-    hot_archive: Option<&'a dyn crate::soroban::HotArchiveLookup>,
+    guarded_hot_archive: Option<crate::soroban::GuardedHotArchive<'a>>,
     ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
-    previously_restored_keys: Option<&'a std::collections::HashSet<LedgerKey>>,
 }
 
 fn execute_contract_invocation(
@@ -410,9 +396,8 @@ fn execute_contract_invocation(
         soroban_data,
         soroban_config,
         module_cache,
-        hot_archive,
+        guarded_hot_archive,
         ttl_key_cache,
-        previously_restored_keys,
     } = request;
 
     // Convert auth entries to a slice
@@ -423,9 +408,8 @@ fn execute_contract_invocation(
         &soroban_data.resources.footprint,
         &soroban_data.ext,
         context.sequence,
-        hot_archive,
+        guarded_hot_archive.as_ref(),
         ttl_key_cache,
-        previously_restored_keys,
     )? {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::EntryArchived,
@@ -438,9 +422,8 @@ fn execute_contract_invocation(
         soroban_data,
         context.protocol_version,
         context.sequence,
-        hot_archive,
+        guarded_hot_archive.as_ref(),
         ttl_key_cache,
-        previously_restored_keys,
     )? {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::ResourceLimitExceeded,
@@ -472,9 +455,8 @@ fn execute_contract_invocation(
         soroban_data,
         soroban_config,
         context.sequence,
-        hot_archive,
+        guarded_hot_archive.as_ref(),
         ttl_key_cache,
-        previously_restored_keys,
     )? {
         return Ok(OperationExecutionResult::new(make_result(
             InvokeHostFunctionResultCode::ResourceLimitExceeded,
@@ -492,9 +474,8 @@ fn execute_contract_invocation(
         soroban_data,
         soroban_config,
         module_cache,
-        hot_archive,
+        guarded_hot_archive,
         ttl_key_cache,
-        previously_restored_keys,
     }) {
         Ok(result) => {
             // stellar-core check: event size (collectEvents in doApply)
@@ -653,9 +634,8 @@ fn disk_read_bytes_exceeded(
     soroban_data: &SorobanTransactionData,
     protocol_version: u32,
     current_ledger: u32,
-    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    guarded_hot_archive: Option<&crate::soroban::GuardedHotArchive<'_>>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-    previously_restored_keys: Option<&std::collections::HashSet<LedgerKey>>,
 ) -> Result<bool> {
     let mut total_read_bytes = 0u32;
     let limit = soroban_data.resources.disk_read_bytes;
@@ -663,13 +643,7 @@ fn disk_read_bytes_exceeded(
     // Helper to meter a single entry
     let meter_entry = |key: &LedgerKey, total: &mut u32| -> Result<bool> {
         let entry: Option<LedgerEntry> = if is_soroban_key(key) {
-            lookup_soroban_entry_or_hot_archive(
-                state,
-                key,
-                current_ledger,
-                hot_archive,
-                previously_restored_keys,
-            )?
+            lookup_soroban_entry_or_hot_archive(state, key, current_ledger, guarded_hot_archive)?
         } else {
             state.get_entry(key)
         };
@@ -743,13 +717,9 @@ fn disk_read_bytes_exceeded(
                         Some(ttl) => ttl.live_until_ledger_seq < current_ledger,
                         // No TTL = not in live state. Could be archived, but also
                         // could have been restored from hot archive and then deleted
-                        // in this same ledger. Check previously_restored_keys.
+                        // in this same ledger.
                         None => {
-                            if let Some(restored) = previously_restored_keys {
-                                !restored.contains(key)
-                            } else {
-                                true
-                            }
+                            guarded_hot_archive.map_or(true, |g| !g.was_previously_restored(key))
                         }
                     };
                     if !is_still_archived {
@@ -1357,9 +1327,8 @@ fn footprint_has_unrestored_archived_entries(
     footprint: &stellar_xdr::curr::LedgerFootprint,
     ext: &stellar_xdr::curr::SorobanTransactionDataExt,
     current_ledger: u32,
-    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    guarded_hot_archive: Option<&crate::soroban::GuardedHotArchive<'_>>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-    previously_restored_keys: Option<&std::collections::HashSet<LedgerKey>>,
 ) -> crate::Result<bool> {
     let mut archived_rw = std::collections::HashSet::new();
     if let stellar_xdr::curr::SorobanTransactionDataExt::V1(resources_ext) = ext {
@@ -1373,9 +1342,8 @@ fn footprint_has_unrestored_archived_entries(
             state,
             key,
             current_ledger,
-            hot_archive,
+            guarded_hot_archive,
             ttl_key_cache,
-            previously_restored_keys,
         )? {
             return Ok(true);
         }
@@ -1386,9 +1354,8 @@ fn footprint_has_unrestored_archived_entries(
             state,
             key,
             current_ledger,
-            hot_archive,
+            guarded_hot_archive,
             ttl_key_cache,
-            previously_restored_keys,
         )? {
             continue;
         }
@@ -1412,9 +1379,8 @@ fn is_archived_contract_entry(
     state: &LedgerStateManager,
     key: &LedgerKey,
     current_ledger: u32,
-    hot_archive: Option<&dyn crate::soroban::HotArchiveLookup>,
+    guarded_hot_archive: Option<&crate::soroban::GuardedHotArchive<'_>>,
     ttl_key_cache: Option<&crate::soroban::TtlKeyCache>,
-    previously_restored_keys: Option<&std::collections::HashSet<LedgerKey>>,
 ) -> crate::Result<bool> {
     // Only persistent Soroban entries can be "archived".
     // Temporary entries just disappear when expired.
@@ -1454,13 +1420,9 @@ fn is_archived_contract_entry(
     // restored from hot archive earlier in this ledger and then deleted, don't
     // treat it as archived. The immutable hot archive snapshot would still have
     // the entry, but classifying it as archived again diverges.
-    if let Some(restored) = previously_restored_keys {
-        if restored.contains(key) {
-            return Ok(false);
-        }
-    }
-    if let Some(archive) = hot_archive {
-        if archive
+    // GuardedHotArchive::get() handles this check transparently.
+    if let Some(guarded) = guarded_hot_archive {
+        if guarded
             .get(key)
             .map_err(|e| TxError::Internal(format!("hot archive lookup failed: {e}")))?
             .is_some()
@@ -1579,9 +1541,8 @@ mod tests {
             soroban_data: None,
             config: Some(&config),
             module_cache: None,
-            hot_archive: None,
+            guarded_hot_archive: None,
             ttl_key_cache: None,
-            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1631,9 +1592,8 @@ mod tests {
             soroban_data: Some(&soroban_data),
             config: Some(&config),
             module_cache: None,
-            hot_archive: None,
+            guarded_hot_archive: None,
             ttl_key_cache: None,
-            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1711,9 +1671,8 @@ mod tests {
             soroban_data: Some(&soroban_data),
             config: Some(&config),
             module_cache: None,
-            hot_archive: None,
+            guarded_hot_archive: None,
             ttl_key_cache: None,
-            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1787,9 +1746,8 @@ mod tests {
             soroban_data: Some(&soroban_data),
             config: Some(&config),
             module_cache: None,
-            hot_archive: None,
+            guarded_hot_archive: None,
             ttl_key_cache: None,
-            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1873,9 +1831,8 @@ mod tests {
             soroban_data: Some(&soroban_data),
             config: Some(&config),
             module_cache: Some(&module_cache),
-            hot_archive: None,
+            guarded_hot_archive: None,
             ttl_key_cache: None,
-            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1928,9 +1885,8 @@ mod tests {
             soroban_data: Some(&soroban_data),
             config: Some(&config),
             module_cache: None,
-            hot_archive: None,
+            guarded_hot_archive: None,
             ttl_key_cache: None,
-            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -2020,7 +1976,6 @@ mod tests {
             context.sequence,
             None,
             None,
-            None,
         )
         .unwrap();
         assert!(
@@ -2042,7 +1997,6 @@ mod tests {
             &soroban_data,
             context.protocol_version,
             context.sequence,
-            None,
             None,
             None,
         )
@@ -2139,7 +2093,6 @@ mod tests {
             context.sequence,
             None,
             None,
-            None,
         )
         .unwrap();
         assert!(
@@ -2148,13 +2101,14 @@ mod tests {
         );
 
         // With hot archive: entry found, its bytes should be metered — exceeds limit
+        let empty = std::collections::HashSet::new();
+        let guarded = crate::soroban::GuardedHotArchive::new(&hot_archive, &empty);
         let exceeded_with = disk_read_bytes_exceeded(
             &state,
             &soroban_data,
             context.protocol_version,
             context.sequence,
-            Some(&hot_archive),
-            None,
+            Some(&guarded),
             None,
         )
         .unwrap();
@@ -3450,7 +3404,6 @@ mod tests {
                 context.sequence,
                 None,
                 None,
-                None,
             )
             .unwrap(),
             "archived entry validation must reject oversized entry marked for restore"
@@ -3521,7 +3474,6 @@ mod tests {
                 context.sequence,
                 None,
                 None,
-                None,
             )
             .unwrap(),
             "archived entry validation should pass for normal-sized restore"
@@ -3567,6 +3519,8 @@ mod tests {
 
         let mut restored = HashSet::new();
         restored.insert(cd_key.clone());
+        let guarded =
+            crate::soroban::GuardedHotArchive::new(&crate::soroban::NoHotArchive, &restored);
 
         // With previously_restored_keys containing this key, it should NOT
         // be metered as archived even though it has no TTL.
@@ -3575,20 +3529,14 @@ mod tests {
             &soroban_data,
             context.protocol_version,
             context.sequence,
+            Some(&guarded),
             None,
-            None,
-            Some(&restored),
         )
         .unwrap();
         assert!(
             !exceeded,
             "previously-restored key with no TTL must not be metered as archived"
         );
-
-        // Without previously_restored_keys, the same key WOULD be treated as
-        // archived (no TTL = still in hot archive). We can't test exceeding
-        // without a hot archive that actually returns the entry, but we can
-        // verify it's not short-circuited.
     }
 
     // --- Regression tests for #2023: hot-archive error propagation ---
@@ -3621,19 +3569,13 @@ mod tests {
 
         let mut restored = HashSet::new();
         restored.insert(cd_key.clone());
+        let guarded = crate::soroban::GuardedHotArchive::new(&FailingHotArchive, &restored);
 
         // No TTL, no live entry — without guard this would hit hot archive.
         // With the guard, it should return Ok(false) (not archived).
         // Use FailingHotArchive — if the guard doesn't work, hot archive error.
-        let result = is_archived_contract_entry(
-            &state,
-            &cd_key,
-            100,
-            Some(&FailingHotArchive),
-            None,
-            Some(&restored),
-        )
-        .unwrap();
+        let result =
+            is_archived_contract_entry(&state, &cd_key, 100, Some(&guarded), None).unwrap();
         assert!(
             !result,
             "previously-restored key must not be considered archived"
@@ -3657,15 +3599,10 @@ mod tests {
 
         let mut restored = HashSet::new();
         restored.insert(cd_key.clone());
+        let guarded = crate::soroban::GuardedHotArchive::new(&FailingHotArchive, &restored);
 
         // Use FailingHotArchive — if the guard doesn't work, this will error.
-        let result = lookup_soroban_entry_or_hot_archive(
-            &state,
-            &cd_key,
-            100,
-            Some(&FailingHotArchive),
-            Some(&restored),
-        );
+        let result = lookup_soroban_entry_or_hot_archive(&state, &cd_key, 100, Some(&guarded));
         // Should return Ok(None) — key is previously-restored, so we skip hot archive.
         assert!(
             result.unwrap().is_none(),
@@ -3685,8 +3622,9 @@ mod tests {
         });
 
         // Entry is NOT in live state, so the helper must fall through to hot archive.
-        let result =
-            lookup_soroban_entry_or_hot_archive(&state, &key, 100, Some(&FailingHotArchive), None);
+        let empty = std::collections::HashSet::new();
+        let guarded = crate::soroban::GuardedHotArchive::new(&FailingHotArchive, &empty);
+        let result = lookup_soroban_entry_or_hot_archive(&state, &key, 100, Some(&guarded));
         assert!(
             result.is_err(),
             "hot archive error must be propagated, not swallowed"
@@ -3724,8 +3662,9 @@ mod tests {
         });
 
         // Even with a FailingHotArchive, this must succeed because the entry is in live state.
-        let result =
-            lookup_soroban_entry_or_hot_archive(&state, &key, 100, Some(&FailingHotArchive), None);
+        let empty = std::collections::HashSet::new();
+        let guarded = crate::soroban::GuardedHotArchive::new(&FailingHotArchive, &empty);
+        let result = lookup_soroban_entry_or_hot_archive(&state, &key, 100, Some(&guarded));
         assert!(
             result.is_ok(),
             "live entry should short-circuit without touching hot archive"
@@ -3781,13 +3720,14 @@ mod tests {
         };
 
         // Entry is NOT in live state, hot archive fails → must return Err
+        let empty = std::collections::HashSet::new();
+        let guarded = crate::soroban::GuardedHotArchive::new(&FailingHotArchive, &empty);
         let result = validate_archived_entry_sizes(
             &state,
             &soroban_data,
             &config,
             context.sequence,
-            Some(&FailingHotArchive),
-            None,
+            Some(&guarded),
             None,
         );
         assert!(
@@ -3838,13 +3778,14 @@ mod tests {
         };
 
         // Entry is NOT in live state, hot archive fails → must return Err
+        let empty = std::collections::HashSet::new();
+        let guarded = crate::soroban::GuardedHotArchive::new(&FailingHotArchive, &empty);
         let result = disk_read_bytes_exceeded(
             &state,
             &soroban_data,
             context.protocol_version,
             context.sequence,
-            Some(&FailingHotArchive),
-            None,
+            Some(&guarded),
             None,
         );
         assert!(

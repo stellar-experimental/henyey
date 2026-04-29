@@ -119,10 +119,8 @@ pub struct HostFunctionInvocation<'a> {
     pub soroban_data: &'a SorobanTransactionData,
     pub soroban_config: &'a SorobanConfig,
     pub module_cache: Option<&'a PersistentModuleCache>,
-    pub hot_archive: Option<&'a dyn HotArchiveLookup>,
+    pub guarded_hot_archive: Option<GuardedHotArchive<'a>>,
     pub ttl_key_cache: Option<&'a TtlKeyCache>,
-    /// Keys already restored from hot archive earlier in this cluster/ledger.
-    pub previously_restored_keys: Option<&'a std::collections::HashSet<LedgerKey>>,
 }
 
 /// Bundles the optional Soroban parameters that thread through operation execution.
@@ -137,12 +135,8 @@ pub struct SorobanContext<'a> {
     pub soroban_data: Option<&'a SorobanTransactionData>,
     pub config: Option<&'a SorobanConfig>,
     pub module_cache: Option<&'a PersistentModuleCache>,
-    pub hot_archive: Option<&'a dyn HotArchiveLookup>,
+    pub guarded_hot_archive: Option<GuardedHotArchive<'a>>,
     pub ttl_key_cache: Option<&'a TtlKeyCache>,
-    /// Keys already restored from the hot archive earlier in this cluster/ledger.
-    /// When set, RestoreFootprint and InvokeHostFunction skip hot-archive lookup
-    /// for these keys. Mirrors stellar-core's `entryWasRestored()`.
-    pub previously_restored_keys: Option<&'a std::collections::HashSet<LedgerKey>>,
 }
 
 impl SorobanContext<'_> {
@@ -152,9 +146,8 @@ impl SorobanContext<'_> {
             soroban_data: None,
             config: None,
             module_cache: None,
-            hot_archive: None,
+            guarded_hot_archive: None,
             ttl_key_cache: None,
-            previously_restored_keys: None,
         }
     }
 }
@@ -231,6 +224,47 @@ impl HotArchiveLookup for NoHotArchive {
         _key: &LedgerKey,
     ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(None)
+    }
+}
+
+/// A hot-archive lookup that automatically skips keys already restored in this ledger.
+///
+/// Wraps a `HotArchiveLookup` together with the set of keys that were previously
+/// restored from the hot archive. `get()` transparently returns `Ok(None)` for any
+/// key in that set, and `was_previously_restored()` lets callers query the set
+/// independently (e.g., for archival-status checks in disk-read metering).
+#[derive(Clone, Copy)]
+pub struct GuardedHotArchive<'a> {
+    inner: &'a dyn HotArchiveLookup,
+    restored_keys: &'a std::collections::HashSet<LedgerKey>,
+}
+
+impl<'a> GuardedHotArchive<'a> {
+    pub fn new(
+        inner: &'a dyn HotArchiveLookup,
+        restored_keys: &'a std::collections::HashSet<LedgerKey>,
+    ) -> Self {
+        Self {
+            inner,
+            restored_keys,
+        }
+    }
+
+    /// Look up an entry, returning `Ok(None)` if the key was already restored.
+    pub fn get(
+        &self,
+        key: &LedgerKey,
+    ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>> {
+        if self.restored_keys.contains(key) {
+            return Ok(None);
+        }
+        self.inner.get(key)
+    }
+
+    /// Check whether a key was previously restored from the hot archive.
+    /// Used independently of `get()` — e.g., for archival-status checks.
+    pub fn was_previously_restored(&self, key: &LedgerKey) -> bool {
+        self.restored_keys.contains(key)
     }
 }
 

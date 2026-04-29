@@ -2235,10 +2235,13 @@ impl TransactionExecutor {
 
         // Create a hot archive lookup wrapper if hot archive is available
         let hot_archive_lookup;
-        let hot_archive_ref: Option<&dyn henyey_tx::soroban::HotArchiveLookup> =
+        let guarded_hot_archive: Option<henyey_tx::soroban::GuardedHotArchive<'_>> =
             if let Some(ref ha) = self.hot_archive {
                 hot_archive_lookup = HotArchiveLookupImpl::new(ha.clone());
-                Some(&hot_archive_lookup)
+                Some(henyey_tx::soroban::GuardedHotArchive::new(
+                    &hot_archive_lookup,
+                    &self.hot_archive_restored_keys,
+                ))
             } else {
                 None
             };
@@ -2252,9 +2255,8 @@ impl TransactionExecutor {
             soroban_data,
             config: Some(&self.soroban_config),
             module_cache: self.module_cache.as_ref(),
-            hot_archive: hot_archive_ref,
+            guarded_hot_archive,
             ttl_key_cache: self.ttl_key_cache.as_ref(),
-            previously_restored_keys: Some(&self.hot_archive_restored_keys),
         };
 
         // Use the central operation dispatcher which handles all operation types
