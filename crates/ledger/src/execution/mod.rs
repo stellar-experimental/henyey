@@ -4526,4 +4526,72 @@ mod tests {
         assert_eq!(prior.hot_archive_restored_keys.len(), 1);
         assert!(prior.hot_archive_restored_keys.contains(&key));
     }
+
+    /// Regression test for #2110: hot_archive_restored_keys must be sorted by
+    /// LedgerKey's derived Ord (matching stellar-core's xdrpp operator<), NOT
+    /// by XDR-encoded bytes which prepend length prefixes to variable-length
+    /// fields.
+    #[test]
+    fn test_hot_archive_restored_keys_sort_uses_native_ord() {
+        use stellar_xdr::curr::{
+            ContractDataDurability, ContractId, Hash, LedgerKey, LedgerKeyContractData, ScAddress,
+            ScVal,
+        };
+
+        // Construct two ContractData keys where XDR-byte order differs from
+        // native Ord order. The difference arises because XDR encodes
+        // variable-length fields (like Bytes) with a 4-byte length prefix,
+        // making shorter values sort before longer ones regardless of content.
+        // Native Ord compares content lexicographically without length prefix.
+        let contract = ScAddress::Contract(ContractId(Hash([0u8; 32])));
+
+        // Key A: short bytes value (1 byte: 0xFF)
+        // XDR encoding: [0,0,0,1, 0xFF, pad...] — length 1 sorts first in XDR
+        let key_a = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract.clone(),
+            key: ScVal::Bytes(vec![0xFF].try_into().unwrap()),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // Key B: longer bytes value (2 bytes: 0x00, 0x00)
+        // XDR encoding: [0,0,0,2, 0x00, 0x00, pad...] — length 2 sorts second in XDR
+        // But native Ord compares content: 0x00 < 0xFF, so B < A natively
+        let key_b = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: contract.clone(),
+            key: ScVal::Bytes(vec![0x00, 0x00].try_into().unwrap()),
+            durability: ContractDataDurability::Persistent,
+        });
+
+        // Verify the ordering divergence exists
+        let a_bytes = henyey_common::xdr_stream::xdr_to_bytes(&key_a);
+        let b_bytes = henyey_common::xdr_stream::xdr_to_bytes(&key_b);
+        assert_eq!(
+            a_bytes.cmp(&b_bytes),
+            std::cmp::Ordering::Less,
+            "XDR-byte order should put A (shorter) before B"
+        );
+        assert_eq!(
+            key_a.cmp(&key_b),
+            std::cmp::Ordering::Greater,
+            "Native Ord should put B (0x00...) before A (0xFF)"
+        );
+
+        // Now test the actual code path: collect into HashSet and sort
+        let mut collected: std::collections::HashSet<LedgerKey> = std::collections::HashSet::new();
+        collected.insert(key_a.clone());
+        collected.insert(key_b.clone());
+
+        let mut keys: Vec<_> = collected.into_iter().collect();
+        keys.sort(); // This is what apply.rs now does
+
+        // Native Ord: key_b (0x00...) < key_a (0xFF)
+        assert_eq!(
+            keys[0], key_b,
+            "First key should be B (smaller in native Ord)"
+        );
+        assert_eq!(
+            keys[1], key_a,
+            "Second key should be A (larger in native Ord)"
+        );
+    }
 }

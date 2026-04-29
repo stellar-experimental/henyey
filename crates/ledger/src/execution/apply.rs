@@ -734,16 +734,13 @@ impl TransactionExecutor {
             fee_changes: Some(fee_changes),
             post_fee_changes: Some(post_fee_changes),
             // Convert HashSet to a deterministically-ordered Vec.
-            // HashSet iteration order is arbitrary; sorting by XDR-encoded key
-            // ensures all validators produce identical hot archive bucket list
-            // updates for the same ledger.
+            // Uses LedgerKey's derived Ord which matches stellar-core's xdrpp
+            // operator< (discriminant first, then fields in XDR declaration
+            // order). Do NOT sort by XDR-encoded bytes — that prepends length
+            // prefixes to variable-length fields, diverging from native order.
             hot_archive_restored_keys: {
                 let mut keys: Vec<_> = collected_hot_archive_keys.into_iter().collect();
-                keys.sort_by(|a, b| {
-                    let a_bytes = henyey_common::xdr_stream::xdr_to_bytes(a);
-                    let b_bytes = henyey_common::xdr_stream::xdr_to_bytes(b);
-                    a_bytes.cmp(&b_bytes)
-                });
+                keys.sort();
                 keys
             },
             timings: TxExecTimings {
