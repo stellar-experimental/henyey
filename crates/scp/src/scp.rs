@@ -1400,6 +1400,38 @@ mod tests {
         assert!(!scp.got_v_blocking(1));
     }
 
+    /// Regression test for #2083: after SCP::nominate() on a 1-of-1 validator,
+    /// got_v_blocking must be true. Validates that local self-envelopes update
+    /// the slot-level v-blocking flag, matching stellar-core's self-envelope
+    /// processing through Slot::processEnvelope(envW, self=true).
+    #[test]
+    fn test_got_v_blocking_after_local_nominate() {
+        let node = make_node_id(1);
+        // 1-of-1 quorum: self is the only validator
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(quorum_set.clone())
+                .build(),
+        );
+        let scp = SCP::new(node.clone(), true, quorum_set, driver);
+
+        assert!(!scp.got_v_blocking(1), "should not be v-blocking initially");
+
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let prev_value: Value = vec![].try_into().unwrap();
+        scp.nominate(1, value, &prev_value);
+
+        assert!(
+            scp.got_v_blocking(1),
+            "1-of-1 validator: got_v_blocking must be true after local nominate"
+        );
+    }
+
     #[test]
     fn test_get_cumulative_statement_count() {
         let node_a = make_node_id(1);

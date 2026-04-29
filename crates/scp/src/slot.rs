@@ -319,6 +319,14 @@ impl Slot {
         // Check if we've externalized
         self.maybe_record_externalization(driver);
 
+        // Processing an external envelope can trigger local emission (ballot
+        // via advance_slot → emit_current_state, or nomination via
+        // self-processing). If the external node's `prev` was true the
+        // first-message check above was skipped, so the local node's first
+        // latest message would not have triggered maybe_set_got_v_blocking.
+        // Call unconditionally; it short-circuits when already set.
+        self.maybe_set_got_v_blocking();
+
         result
     }
 
@@ -358,6 +366,12 @@ impl Slot {
         // Check if the ballot protocol already externalized (possible for
         // solo validators where the entire SCP round completes synchronously).
         self.maybe_record_externalization(driver);
+
+        // Local emission (nomination or ballot via check_nomination_to_ballot)
+        // may have recorded the first latest message from the local node.
+        // Update v-blocking to match stellar-core's self-envelope processing
+        // through Slot::processEnvelope(envW, self=true).
+        self.maybe_set_got_v_blocking();
 
         // stellar-core always sets up the nomination timer after nominate() succeeds
         // in reaching the main logic (i.e., didn't return early due to
@@ -408,7 +422,9 @@ impl Slot {
 
         let composite = self.nomination.latest_composite().cloned();
         let ctx = slot_ctx!(self, driver);
-        self.ballot.bump_timeout(&ctx, composite.as_ref())
+        let result = self.ballot.bump_timeout(&ctx, composite.as_ref());
+        self.maybe_set_got_v_blocking();
+        result
     }
 
     /// Get all envelopes received for this slot.
@@ -799,7 +815,9 @@ impl Slot {
     pub fn abandon_ballot<D: SCPDriver>(&mut self, driver: &Arc<D>, counter: u32) -> bool {
         self.sync_composite_candidate();
         let ctx = slot_ctx!(self, driver);
-        self.ballot.abandon_ballot(counter, &ctx)
+        let result = self.ballot.abandon_ballot(counter, &ctx);
+        self.maybe_set_got_v_blocking();
+        result
     }
 
     /// Bump the ballot to a specific counter value.
@@ -821,7 +839,9 @@ impl Slot {
         counter: u32,
     ) -> bool {
         let ctx = slot_ctx!(self, driver);
-        self.ballot.bump_state(&ctx, value, counter)
+        let result = self.ballot.bump_state(&ctx, value, counter);
+        self.maybe_set_got_v_blocking();
+        result
     }
 
     /// Force-bump the ballot state, auto-computing the counter.
@@ -830,7 +850,9 @@ impl Slot {
     /// Counter is `current_counter + 1`, or 1 if no current ballot.
     pub fn force_bump_state<D: SCPDriver>(&mut self, driver: &Arc<D>, value: Value) -> bool {
         let ctx = slot_ctx!(self, driver);
-        self.ballot.bump(&ctx, value, true)
+        let result = self.ballot.bump(&ctx, value, true);
+        self.maybe_set_got_v_blocking();
+        result
     }
 
     /// Get mutable access to the nomination protocol.
@@ -1950,6 +1972,127 @@ mod tests {
             slot_a.get_externalizing_state().len(),
             slot_b.get_externalizing_state().len(),
             "externalizing state visibility must be identical"
+        );
+    }
+
+    // ==================== v-blocking after local emission tests ====================
+    // Regression tests for issue #2083: local self-envelopes must update
+    // Slot::got_v_blocking, matching stellar-core's self-envelope path through
+    // Slot::processEnvelope(envW, self=true).
+
+    /// 1-of-1 validator: after nominate(), got_v_blocking must be true.
+    /// In stellar-core, the local nomination envelope passes through
+    /// processEnvelope(self=true) which calls maybeSetGotVBlocking().
+    #[test]
+    fn test_local_nominate_sets_got_v_blocking_solo_validator() {
+        let node = make_node_id(1);
+        // 1-of-1 quorum set: self is the only validator
+        let quorum_set = Arc::new(ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        });
+        let driver = Arc::new(MockDriver::with_quorum_set((*quorum_set).clone()));
+        let mut slot = Slot::new(1, node.clone(), quorum_set, true);
+
+        assert!(!slot.got_v_blocking(), "should not be v-blocking initially");
+
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let prev_value: Value = vec![].try_into().unwrap();
+        slot.nominate(value, &prev_value, false, &driver);
+
+        assert!(
+            slot.got_v_blocking(),
+            "1-of-1 validator: got_v_blocking must be true after local nominate"
+        );
+    }
+
+    /// Multi-node: local emission completes a v-blocking set.
+    /// Quorum set: threshold 3 of {self, peer1, peer2, peer3}.
+    /// V-blocking needs > (4 - 3) = 1 node, so 2 nodes.
+    /// Process peer1's nomination first (1 node, not v-blocking), then local
+    /// nominate should add self as a second heard node and flip the flag.
+    #[test]
+    fn test_local_nominate_completes_v_blocking_with_peer() {
+        let node = make_node_id(1);
+        let peer1 = make_node_id(2);
+        let peer2 = make_node_id(3);
+        let peer3 = make_node_id(4);
+        // threshold=3 of 4: v-blocking requires > 1 node, i.e. 2+ nodes
+        let quorum_set = Arc::new(ScpQuorumSet {
+            threshold: 3,
+            validators: vec![node.clone(), peer1.clone(), peer2.clone(), peer3.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        });
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set((*quorum_set).clone())
+                .build(),
+        );
+        let mut slot = Slot::new(1, node.clone(), quorum_set.clone(), true);
+
+        // Process a peer nomination envelope
+        let peer_nomination = stellar_xdr::curr::ScpNomination {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&quorum_set).into(),
+            votes: vec![vec![1u8, 2, 3].try_into().unwrap()]
+                .try_into()
+                .unwrap(),
+            accepted: vec![].try_into().unwrap(),
+        };
+        let peer_envelope = ScpEnvelope {
+            statement: stellar_xdr::curr::ScpStatement {
+                node_id: peer1.clone(),
+                slot_index: 1,
+                pledges: ScpStatementPledges::Nominate(peer_nomination),
+            },
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        slot.process_envelope(peer_envelope, &driver);
+
+        // With threshold=3 of 4, one peer alone is not v-blocking (need 2+)
+        assert!(
+            !slot.got_v_blocking(),
+            "one peer should not be v-blocking for threshold 3 of 4"
+        );
+
+        // Now local nominate — adds self as second heard node
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let prev_value: Value = vec![].try_into().unwrap();
+        slot.nominate(value, &prev_value, false, &driver);
+
+        assert!(
+            slot.got_v_blocking(),
+            "self + peer should be v-blocking for threshold 3 of 4"
+        );
+    }
+
+    /// Negative test: nominate on a slot with no quorum-set members heard
+    /// from should not flip got_v_blocking when the local node is not in
+    /// its own quorum set.
+    #[test]
+    fn test_got_v_blocking_not_set_without_quorum_membership() {
+        let node = make_node_id(1);
+        let other = make_node_id(2);
+        // Quorum set contains only 'other', not self
+        let quorum_set = Arc::new(ScpQuorumSet {
+            threshold: 1,
+            validators: vec![other.clone()].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        });
+        let driver = Arc::new(MockDriver::with_quorum_set((*quorum_set).clone()));
+        let mut slot = Slot::new(1, node.clone(), quorum_set, true);
+
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let prev_value: Value = vec![].try_into().unwrap();
+        slot.nominate(value, &prev_value, false, &driver);
+
+        // Self is not in the quorum set, so local emission alone cannot
+        // form a v-blocking set.
+        assert!(
+            !slot.got_v_blocking(),
+            "got_v_blocking should remain false when self is not in quorum set"
         );
     }
 }
