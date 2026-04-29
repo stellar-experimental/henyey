@@ -2810,6 +2810,12 @@ impl TransactionQueue {
     ///
     /// Budget-fit checks happen before invoking the visitor. Remaining budget is
     /// decremented only for [`BroadcastVisitResult::Processed`] candidates.
+    ///
+    /// Transactions dampened by arbitrage flood damping are collected during
+    /// traversal and banned after `visit_top_txs` completes, mirroring
+    /// stellar-core's `broadcastSome → ban(banningTxs)` pattern. Banned
+    /// transactions are removed from the queue and recorded in the ban window
+    /// so they are not reconsidered on subsequent flood periods.
     pub fn broadcast_with_visitor<F>(&self, budget: &mut BroadcastBudget, mut visitor: F)
     where
         F: FnMut(&BroadcastCandidate) -> BroadcastVisitResult,
@@ -2841,6 +2847,7 @@ impl TransactionQueue {
         }
 
         let mut lane_resources_left = Vec::new();
+        let mut banning_hashes: Vec<Hash256> = Vec::new();
         if let Err(e) = limiter.visit_top_txs(
             |tx| {
                 // Arbitrage flood damping: check before visitor.
@@ -2853,6 +2860,7 @@ impl TransactionQueue {
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.arb_tx_dropped
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        banning_hashes.push(tx.hash);
                         return VisitTxResult::Skipped;
                     }
                     arb_flood_damping::ArbBroadcastResult::Allowed => {
@@ -2892,6 +2900,10 @@ impl TransactionQueue {
                 .and_then(|ops| usize::try_from(ops).ok())
                 .unwrap_or(0);
         }
+
+        // Ban dampened arbitrage transactions after traversal.
+        // Mirrors stellar-core's broadcastSome → ban(banningTxs).
+        self.ban(&banning_hashes);
     }
 
     /// Return transaction hashes ordered by fee per op (desc) then received time (asc).
@@ -9816,5 +9828,91 @@ mod broadcast_visitor_tests {
             pairs_before, pairs_after,
             "reset_and_rebuild must preserve arb damper state"
         );
+    }
+
+    #[test]
+    fn test_broadcast_dampened_arb_txs_are_banned() {
+        // With base_allowance=1, damping_factor=1.0:
+        //   - TX1: allowed (under base allowance, counter 0 → 1)
+        //   - TX2: allowed (k=0, geometric sample always >= 0, counter 1 → 2)
+        //   - TX3+: dampened (k≥1, geometric sample=0 < k with factor=1.0)
+        //
+        // Using damping_factor=1.0 makes the geometric distribution always
+        // return 0, ensuring deterministic damping for k≥1.
+        let config = TxQueueConfig {
+            max_size: 100,
+            flood_arb_tx_base_allowance: 1,
+            flood_arb_tx_damping_factor: 1.0,
+            ..Default::default()
+        };
+        let queue = TransactionQueue::new(config);
+
+        // Add 5 arb-loop txs from different sources (same asset pair).
+        let mut hashes = Vec::new();
+        for i in 0..5u8 {
+            let mut env = make_arb_loop_envelope(200);
+            set_source(&mut env, 10 + i);
+            let hash = Hash256::hash_xdr(&env);
+            queue.try_add(env);
+            hashes.push(hash);
+        }
+
+        assert_eq!(queue.len(), 5);
+        assert_eq!(queue.banned_count(), 0);
+
+        // Broadcast with large budget — TX1 and TX2 allowed, TX3-5 dampened.
+        let mut budget = BroadcastBudget {
+            ops_remaining: 100,
+            dex_ops_remaining: None,
+        };
+        let mut visited = Vec::new();
+        queue.broadcast_with_visitor(&mut budget, |candidate| {
+            visited.push(candidate.hash);
+            BroadcastVisitResult::Processed
+        });
+
+        // Exactly 2 txs should have been visited (allowed through damping).
+        assert_eq!(visited.len(), 2, "Only 2 txs should pass damping");
+
+        // The 3 dampened txs should now be banned and removed from the queue.
+        assert_eq!(
+            queue.len(),
+            2,
+            "Queue should only contain 2 non-dampened txs"
+        );
+        assert_eq!(queue.banned_count(), 3, "3 dampened txs should be banned");
+
+        // Verify specific dampened hashes are banned and not in queue.
+        // The dampened ones are those NOT in `visited`.
+        let dampened_hashes: Vec<_> = hashes.iter().filter(|h| !visited.contains(h)).collect();
+        assert_eq!(dampened_hashes.len(), 3);
+        for hash in &dampened_hashes {
+            assert!(queue.is_banned(hash), "Dampened tx should be banned");
+            assert!(
+                !queue.contains(hash),
+                "Dampened tx should be removed from queue"
+            );
+        }
+
+        // A second broadcast should not encounter the dampened hashes at all.
+        let mut budget2 = BroadcastBudget {
+            ops_remaining: 100,
+            dex_ops_remaining: None,
+        };
+        let mut visited2 = Vec::new();
+        queue.broadcast_with_visitor(&mut budget2, |candidate| {
+            visited2.push(candidate.hash);
+            BroadcastVisitResult::Processed
+        });
+
+        // The remaining 2 txs may or may not pass damping again (their counter
+        // is now 2, so k=1, dampened with factor=1.0). But crucially, the 3
+        // banned txs are never seen.
+        for hash in &dampened_hashes {
+            assert!(
+                !visited2.contains(hash),
+                "Banned tx must not be revisited on subsequent broadcast"
+            );
+        }
     }
 }

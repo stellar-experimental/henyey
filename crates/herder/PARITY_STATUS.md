@@ -16,7 +16,7 @@
 | LedgerCloseData | Full | All accessors and XDR round-trip |
 | PendingEnvelopes (fetching, caching) | Partial | Missing cost tracking, value size cache; release-up-to drain now matches `processSCPQueueUpToIndex`; intra-slot LIFO ordering now matches `pop()` |
 | QuorumTracker | Full | expand, rebuild, closest validators |
-| TransactionQueue | Partial | Arb flood damping implemented; missing ban-on-damping, dedicated flood queue |
+| TransactionQueue | Partial | Arb flood damping implemented with ban-on-damping; missing dedicated flood queue |
 | TxQueueLimiter | Partial | `visitTopTxs` custom limits implemented; missing total flood resource tracking |
 | TxSetFrame / ApplicableTxSetFrame | Partial | No ApplicableTxSetFrame abstraction |
 | SurgePricingUtils | Full | All lane configs and priority queue; `erase()` guard matches `releaseAssert(res <= mLaneCurrentCount[lane])` |
@@ -108,7 +108,7 @@ Corresponds to: `Herder.h`, `HerderImpl.h`
 | `setupTriggerNextLedger()` | _(not implemented)_ | None |
 | `startOutOfSyncTimer()` | `SyncRecoveryManager` | Full |
 | `outOfSyncRecovery()` | `out_of_sync_recovery()` | Full |
-| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, and arb flood damping; broadcast period uses `flood_tx_period_ms` (200 ms) matching stellar-core `FLOOD_TX_PERIOD_MS`; missing ban-on-damping, dedicated flood queue, mark-on-attempt, separate advert flush timer |
+| `broadcast()` | `flush_tx_adverts()` in `App` | Partial — priority-ordered via `TransactionQueue::broadcast_with_visitor()` with DEX-lane flood budget, budget-neutral skipped txs, arb flood damping, and ban-on-damping; broadcast period uses `flood_tx_period_ms` (200 ms) matching stellar-core `FLOOD_TX_PERIOD_MS`; missing dedicated flood queue, mark-on-attempt, separate advert flush timer |
 | `processSCPQueue()` | pending envelope release | Full |
 | `updateTransactionQueue()` | handled in `ledger_closed()` | Full |
 | `maybeSetupSorobanQueue()` | Integrated via lane-based `TransactionQueue` | Full |
@@ -306,7 +306,7 @@ Corresponds to: `TransactionQueue.h`
 | `dropTransaction()` | `drop_transaction()` | Full |
 | `isFiltered()` | `is_filtered()` | Full |
 | `broadcastTx()` | _(removed — replaced by `broadcast_with_visitor()`)_ | N/A |
-| `broadcastSome()` | `TransactionQueue::broadcast_with_visitor()` | Partial — priority-ordered with ops budget, DEX-lane limits, budget-neutral skipped txs, arb flood damping; missing ban-on-damping |
+| `broadcastSome()` | `TransactionQueue::broadcast_with_visitor()` | Partial — priority-ordered with ops budget, DEX-lane limits, budget-neutral skipped txs, arb flood damping with ban-on-damping; missing dedicated flood queue |
 | `SorobanTransactionQueue::resetAndRebuild()` | `reset_and_rebuild()` in `tx_queue.rs` | Full |
 | `SorobanTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
 | `ClassicTransactionQueue::getMaxQueueSizeOps()` | via config | Full |
