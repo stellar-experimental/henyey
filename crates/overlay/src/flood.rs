@@ -549,4 +549,42 @@ mod tests {
             assert!(!gate.has_seen(&make_hash(i)));
         }
     }
+
+    #[test]
+    fn test_flood_gate_not_polluted_by_pull_control() {
+        use crate::codec::helpers;
+
+        let gate = FloodGate::new();
+
+        // Simulate the corrected receive path: only record_seen for
+        // is_flood_gate_tracked messages.
+        let advert = StellarMessage::FloodAdvert(Default::default());
+        let demand = StellarMessage::FloodDemand(Default::default());
+        let tx = StellarMessage::Transaction(stellar_xdr::curr::TransactionEnvelope::TxV0(
+            Default::default(),
+        ));
+
+        // Pull-control messages are flood messages but NOT gate-tracked
+        assert!(helpers::is_flood_message(&advert));
+        assert!(helpers::is_flood_message(&demand));
+        assert!(!helpers::is_flood_gate_tracked(&advert));
+        assert!(!helpers::is_flood_gate_tracked(&demand));
+
+        // Simulating the fixed routing: only gate-tracked messages get recorded
+        if helpers::is_flood_gate_tracked(&advert) {
+            gate.record_seen(compute_message_hash(&advert), None, 1);
+        }
+        if helpers::is_flood_gate_tracked(&demand) {
+            gate.record_seen(compute_message_hash(&demand), None, 1);
+        }
+        // FloodGate should be empty — pull-control does NOT pollute it
+        assert_eq!(gate.seen.len(), 0);
+
+        // Transaction IS gate-tracked and should be recorded
+        assert!(helpers::is_flood_gate_tracked(&tx));
+        if helpers::is_flood_gate_tracked(&tx) {
+            gate.record_seen(compute_message_hash(&tx), None, 1);
+        }
+        assert_eq!(gate.seen.len(), 1);
+    }
 }

@@ -296,13 +296,25 @@ pub mod helpers {
         henyey_common::Hash256::hash(&bytes)
     }
 
-    /// Returns true if this message type should be flooded to peers.
-    ///
-    /// Flood messages are propagated to all connected peers (except the sender)
-    /// to ensure network-wide distribution. This matches the same set of variants
-    /// as [`crate::flow_control::is_flow_controlled_message`].
+    /// Returns true if this message type is flow-controlled (uses flood/flow
+    /// capacity). This includes both globally-deduplicated flood payloads
+    /// (transactions, SCP envelopes) and peer-local pull-control messages
+    /// (FloodAdvert, FloodDemand). Use [`is_flood_gate_tracked`] to distinguish
+    /// messages that should be recorded in the global FloodGate for dedup.
     pub fn is_flood_message(message: &StellarMessage) -> bool {
         crate::flow_control::is_flow_controlled_message(message)
+    }
+
+    /// Returns true if this message should be tracked in the global FloodGate
+    /// for deduplication and forwarding. Only transaction and SCP messages are
+    /// FloodGate-tracked. Pull-control messages (FloodAdvert, FloodDemand)
+    /// are flow-controlled but peer-local — stellar-core's recvFloodAdvert /
+    /// recvFloodDemand do not call recvFloodedMsgID.
+    pub fn is_flood_gate_tracked(message: &StellarMessage) -> bool {
+        matches!(
+            message,
+            StellarMessage::Transaction(_) | StellarMessage::ScpMessage(_)
+        )
     }
 
     /// Returns true if this message should be dropped for watcher (non-validator) nodes.
@@ -681,6 +693,45 @@ mod tests {
         ));
         assert!(helpers::is_watcher_droppable(
             &StellarMessage::TimeSlicedSurveyStopCollecting(Default::default())
+        ));
+    }
+
+    #[test]
+    fn test_flood_gate_tracked_excludes_pull_control() {
+        // Pull-control messages are flow-controlled but NOT FloodGate-tracked
+        assert!(!helpers::is_flood_gate_tracked(
+            &StellarMessage::FloodAdvert(Default::default())
+        ));
+        assert!(!helpers::is_flood_gate_tracked(
+            &StellarMessage::FloodDemand(Default::default())
+        ));
+
+        // Transaction and SCP messages ARE FloodGate-tracked
+        assert!(helpers::is_flood_gate_tracked(
+            &StellarMessage::Transaction(stellar_xdr::curr::TransactionEnvelope::TxV0(
+                Default::default()
+            ))
+        ));
+        assert!(helpers::is_flood_gate_tracked(&StellarMessage::ScpMessage(
+            Default::default()
+        )));
+    }
+
+    #[test]
+    fn test_pull_control_is_flood_but_not_gate_tracked() {
+        // FloodAdvert and FloodDemand are flood messages (flow-controlled)...
+        assert!(helpers::is_flood_message(&StellarMessage::FloodAdvert(
+            Default::default()
+        )));
+        assert!(helpers::is_flood_message(&StellarMessage::FloodDemand(
+            Default::default()
+        )));
+        // ...but they are NOT FloodGate-tracked
+        assert!(!helpers::is_flood_gate_tracked(
+            &StellarMessage::FloodAdvert(Default::default())
+        ));
+        assert!(!helpers::is_flood_gate_tracked(
+            &StellarMessage::FloodDemand(Default::default())
         ));
     }
 }

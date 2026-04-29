@@ -768,22 +768,24 @@ impl OverlayManager {
 
         let message_size = msg_body_size(message);
         if helpers::is_flood_message(message) {
-            let hash = compute_message_hash(message);
-            let lcl = state.last_closed_ledger.load(Ordering::Relaxed);
-            let unique = state
-                .flood_gate
-                .record_seen(hash, Some(peer_id.clone()), lcl);
-            ctx.peer.record_flood_stats(unique, message_size);
-            let is_scp = matches!(message, StellarMessage::ScpMessage(_));
-            // FloodAdvert/FloodDemand are peer-specific control messages and
-            // must not be globally deduplicated. Stellar-core delivers them
-            // directly to per-peer handlers, not through Floodgate.
-            let is_pull_control = matches!(
-                message,
-                StellarMessage::FloodAdvert(_) | StellarMessage::FloodDemand(_)
-            );
-            if !unique && !is_scp && !is_pull_control {
-                return Some(false);
+            if helpers::is_flood_gate_tracked(message) {
+                let hash = compute_message_hash(message);
+                let lcl = state.last_closed_ledger.load(Ordering::Relaxed);
+                let unique = state
+                    .flood_gate
+                    .record_seen(hash, Some(peer_id.clone()), lcl);
+                ctx.peer.record_flood_stats(unique, message_size);
+                let is_scp = matches!(message, StellarMessage::ScpMessage(_));
+                if !unique && !is_scp {
+                    return Some(false);
+                }
+            } else {
+                // Pull-control messages (FloodAdvert/FloodDemand) use flow-control
+                // capacity but are NOT globally deduplicated or tracked in FloodGate.
+                // stellar-core's recvFloodAdvert/recvFloodDemand do not call
+                // recvFloodedMsgID. Every pull-control message is "unique" from
+                // the receiver's perspective since there is no global dedup.
+                ctx.peer.record_flood_stats(true, message_size);
             }
         } else if is_fetch_message(message) {
             ctx.peer.record_fetch_stats(true, message_size);

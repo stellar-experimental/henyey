@@ -825,17 +825,21 @@ impl OverlayManager {
         let msg_type = helpers::message_type_name(&message);
         let is_flood = helpers::is_flood_message(&message);
 
-        // Record in flood gate and get filtered peer list
-        let forward_peers: Option<Vec<PeerId>> = if is_flood {
-            let hash = compute_message_hash(&message);
-            let lcl = self.last_closed_ledger.load(Ordering::Relaxed);
-            self.flood_gate.record_seen(hash, None, lcl);
-            // Only forward to peers that haven't already sent us this message
-            let all_peers: Vec<PeerId> = self.peers.iter().map(|e| e.key().clone()).collect();
-            Some(self.flood_gate.get_forward_peers(&hash, &all_peers))
-        } else {
-            None // non-flood: send to all
-        };
+        // Record in flood gate and get filtered peer list.
+        // Only FloodGate-tracked messages (tx, SCP) are recorded for dedup.
+        // Pull-control messages are sent via try_send_to(), not broadcast(),
+        // but guard here for defense-in-depth.
+        let forward_peers: Option<Vec<PeerId>> =
+            if is_flood && helpers::is_flood_gate_tracked(&message) {
+                let hash = compute_message_hash(&message);
+                let lcl = self.last_closed_ledger.load(Ordering::Relaxed);
+                self.flood_gate.record_seen(hash, None, lcl);
+                // Only forward to peers that haven't already sent us this message
+                let all_peers: Vec<PeerId> = self.peers.iter().map(|e| e.key().clone()).collect();
+                Some(self.flood_gate.get_forward_peers(&hash, &all_peers))
+            } else {
+                None // non-flood or pull-control: send to all
+            };
 
         // Collect target peer IDs so we can move the message into the last send.
         let target_peers: Vec<PeerId> = self
