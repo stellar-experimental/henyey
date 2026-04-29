@@ -224,6 +224,7 @@ mod tests {
         let config = ReplayConfig {
             verify_results: false, // Skip verification for test
             verify_bucket_list: false,
+            verify_header_hash: false,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: false,

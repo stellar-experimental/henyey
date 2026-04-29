@@ -147,6 +147,14 @@ pub struct ReplayConfig {
     /// because intermediate states may differ.
     pub verify_bucket_list: bool,
 
+    /// Verify the computed header hash against the archive header.
+    ///
+    /// When true, the replay caller sets `expected_header_hash` on
+    /// `LedgerCloseData`, enabling pre-commit validation of the full
+    /// header hash. Disable only for synthetic tests that use simplified
+    /// headers which cannot match the computed output.
+    pub verify_header_hash: bool,
+
     /// Emit classic contract events during replay.
     ///
     /// When enabled, generates events for classic operations like
@@ -207,6 +215,7 @@ impl Default for ReplayConfig {
             // authoritative verification of correct ledger state.
             verify_results: false,
             verify_bucket_list: true,
+            verify_header_hash: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: true,

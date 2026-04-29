@@ -245,23 +245,32 @@ impl CatchupManager {
             let upgrades = decode_upgrades_from_header(data.header());
 
             // Compute expected header hash from archive header for pre-commit validation.
-            let expected_hash = henyey_ledger::compute_header_hash(data.header()).map_err(|e| {
-                HistoryError::CatchupFailed(format!(
-                    "Failed to compute header hash for ledger {}: {}",
-                    data.header().ledger_seq,
-                    e
-                ))
-            })?;
+            let expected_hash = if self.replay_config.verify_header_hash {
+                Some(
+                    henyey_ledger::compute_header_hash(data.header()).map_err(|e| {
+                        HistoryError::CatchupFailed(format!(
+                            "Failed to compute header hash for ledger {}: {}",
+                            data.header().ledger_seq,
+                            e
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
 
-            let close_data = LedgerCloseData::new(
+            let mut close_data = LedgerCloseData::new(
                 data.header().ledger_seq,
                 data.tx_set(),
                 data.header().scp_value.close_time.0,
                 ledger_manager.current_header_hash(),
             )
             .with_stellar_value_ext(data.header().scp_value.ext.clone())
-            .with_upgrades(upgrades)
-            .with_expected_header_hash(expected_hash);
+            .with_upgrades(upgrades);
+
+            if let Some(hash) = expected_hash {
+                close_data = close_data.with_expected_header_hash(hash);
+            }
 
             let result = ledger_manager.close_ledger(close_data, None).map_err(|e| {
                 if matches!(e, henyey_ledger::LedgerError::HashMismatch { .. }) {

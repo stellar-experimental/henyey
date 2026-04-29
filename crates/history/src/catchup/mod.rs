@@ -1111,6 +1111,7 @@ impl CatchupManagerBuilder {
         manager.replay_config = ReplayConfig {
             verify_results: self.options.verify_headers,
             verify_bucket_list: self.options.verify_buckets,
+            verify_header_hash: self.options.verify_headers,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: true,

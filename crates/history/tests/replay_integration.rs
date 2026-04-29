@@ -335,6 +335,7 @@ async fn test_catchup_replay_bucket_hash_verification() {
     manager.set_replay_config(henyey_history::ReplayConfig {
         verify_bucket_list: false,
         verify_results: false,
+        verify_header_hash: false,
         ..Default::default()
     });
 
@@ -560,6 +561,7 @@ async fn test_catchup_recent_large_gap_bucket_apply() {
     manager.set_replay_config(henyey_history::ReplayConfig {
         verify_bucket_list: false,
         verify_results: false,
+        verify_header_hash: false,
         ..Default::default()
     });
 

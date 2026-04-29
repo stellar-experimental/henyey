@@ -939,6 +939,7 @@ mod tests {
         let config = ReplayConfig {
             verify_results: false,
             verify_bucket_list: true,
+            verify_header_hash: true,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: true, // Required for P23+ verification
@@ -980,6 +981,7 @@ mod tests {
         let config = ReplayConfig {
             verify_results: true,
             verify_bucket_list: false,
+            verify_header_hash: false,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: false,
@@ -1021,6 +1023,7 @@ mod tests {
         let config = ReplayConfig {
             verify_results: true,
             verify_bucket_list: false,
+            verify_header_hash: false,
             emit_classic_events: false,
             backfill_stellar_asset_events: false,
             run_eviction: false,
