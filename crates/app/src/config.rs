@@ -911,6 +911,19 @@ pub struct OverlayConfig {
     #[serde(default)]
     pub preferred_peers: Vec<String>,
 
+    /// Preferred peer public keys (G... format) for node-ID-based preference.
+    ///
+    /// Peers whose authenticated node ID matches any of these keys are treated
+    /// as preferred, regardless of their address. Matches stellar-core's
+    /// `PREFERRED_PEER_KEYS` config field.
+    #[serde(default)]
+    pub preferred_peer_keys: Vec<String>,
+
+    /// When `true`, reject any authenticated peer that is not preferred
+    /// (by address or by key). Matches stellar-core's `PREFERRED_PEERS_ONLY`.
+    #[serde(default)]
+    pub preferred_peers_only: bool,
+
     /// Allowed surveyor node public keys (G...); empty means follow quorum/defaults.
     #[serde(default)]
     pub surveyor_keys: Vec<String>,
@@ -978,6 +991,8 @@ impl Default for OverlayConfig {
             target_outbound_peers: default_target_outbound(),
             known_peers: Vec::new(),
             preferred_peers: Vec::new(),
+            preferred_peer_keys: Vec::new(),
+            preferred_peers_only: false,
             surveyor_keys: Vec::new(),
             auto_survey: false,
             flood_op_rate_per_ledger: default_flood_op_rate_per_ledger(),
@@ -1714,6 +1729,11 @@ impl AppConfig {
         for key in &self.overlay.surveyor_keys {
             if henyey_crypto::PublicKey::from_strkey(key).is_err() {
                 anyhow::bail!("Invalid surveyor key: {}", key);
+            }
+        }
+        for key in &self.overlay.preferred_peer_keys {
+            if henyey_crypto::PublicKey::from_strkey(key).is_err() {
+                anyhow::bail!("Invalid preferred_peer_keys entry: {}", key);
             }
         }
 

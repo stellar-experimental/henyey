@@ -106,15 +106,22 @@ pub(super) struct PreferredPeerSet {
     /// Resolved IPs only. Used for ConnectionPool preferred_ips updates
     /// and fast IP-based matching.
     resolved_ips: HashSet<IpAddr>,
+    /// Preferred peer public keys for node-ID-based preference.
+    /// Matches stellar-core's `PREFERRED_PEER_KEYS`.
+    preferred_keys: HashSet<PeerId>,
 }
 
 impl PreferredPeerSet {
     /// Create initial snapshot from config (no DNS resolution yet).
-    pub(super) fn from_config(config_entries: Vec<PeerAddress>) -> Self {
+    pub(super) fn from_config(
+        config_entries: Vec<PeerAddress>,
+        preferred_keys: HashSet<PeerId>,
+    ) -> Self {
         Self {
             config_entries,
             resolved: Vec::new(),
             resolved_ips: HashSet::new(),
+            preferred_keys,
         }
     }
 
@@ -128,15 +135,23 @@ impl PreferredPeerSet {
             config_entries: self.config_entries.clone(),
             resolved,
             resolved_ips,
+            preferred_keys: self.preferred_keys.clone(),
         }
     }
 
-    /// Check if a peer matches any preferred entry (hostname OR resolved IP).
+    /// Check if a peer matches any preferred entry (hostname, resolved IP,
+    /// or node-ID key).
     ///
     /// For outbound peers (with `original_address`), the hostname config entry
     /// matches directly. For inbound peers (no `original_address`), the resolved
-    /// IP addresses are checked.
+    /// IP addresses are checked. For all authenticated peers, the node ID is
+    /// checked against `preferred_keys`.
     pub(super) fn is_preferred(&self, info: &PeerInfo) -> bool {
+        // Key-based preference (stellar-core PREFERRED_PEER_KEYS)
+        if self.preferred_keys.contains(&info.peer_id) {
+            return true;
+        }
+        // Address-based preference
         self.config_entries
             .iter()
             .any(|pref| OverlayManager::peer_info_matches_address(info, pref))
@@ -357,6 +372,9 @@ pub(super) struct SharedPeerState {
     /// Preferred peer set shared by all connection tasks and updated after DNS
     /// resolution so admission decisions use current config and resolved IPs.
     pub(super) preferred_peers: Arc<RwLock<PreferredPeerSet>>,
+    /// When `true`, reject non-preferred authenticated peers even with capacity.
+    /// Matches stellar-core's `PREFERRED_PEERS_ONLY`. Immutable after init.
+    pub(super) preferred_peers_only: bool,
     /// Serialized authenticated admission state.
     pub(super) admission_state: Arc<Mutex<AdmissionState>>,
     /// Current depth of the dedicated fetch channel. Incremented on every
@@ -654,6 +672,7 @@ impl OverlayManager {
         let (fetch_response_tx, fetch_response_rx) = mpsc::unbounded_channel();
         let preferred_peers = Arc::new(RwLock::new(PreferredPeerSet::from_config(
             config.preferred_peers.clone(),
+            config.preferred_peer_keys.clone(),
         )));
 
         Ok(Self {
@@ -731,6 +750,7 @@ impl OverlayManager {
             is_tracking: Arc::clone(&self.is_tracking),
             pending_connections: self.pending_connections.clone(),
             preferred_peers: Arc::clone(&self.preferred_peers),
+            preferred_peers_only: self.config.preferred_peers_only,
             admission_state: Arc::clone(&self.admission_state),
             fetch_channel_depth: Arc::clone(&self.fetch_channel_depth),
             fetch_channel_depth_max: Arc::clone(&self.fetch_channel_depth_max),
@@ -1795,7 +1815,11 @@ mod tests {
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
-            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(preferred))),
+            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
+                preferred,
+                HashSet::new(),
+            ))),
+            preferred_peers_only: false,
             admission_state: Arc::new(Mutex::new(AdmissionState::default())),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
@@ -2308,7 +2332,11 @@ mod tests {
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
-            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(Vec::new()))),
+            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
+                Vec::new(),
+                HashSet::new(),
+            ))),
+            preferred_peers_only: false,
             admission_state: Arc::new(Mutex::new(AdmissionState::default())),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
@@ -2393,7 +2421,11 @@ mod tests {
             extra_subscribers: Arc::new(RwLock::new(Vec::new())),
             is_tracking: Arc::new(AtomicBool::new(true)),
             pending_connections: PendingConnections::new(),
-            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(Vec::new()))),
+            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
+                Vec::new(),
+                HashSet::new(),
+            ))),
+            preferred_peers_only: false,
             admission_state: Arc::new(Mutex::new(AdmissionState::default())),
             fetch_channel_depth: Arc::new(AtomicI64::new(0)),
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
@@ -2710,7 +2742,7 @@ mod tests {
             PeerAddress::new("validator1.example.com", 11625),
             PeerAddress::new("10.0.0.1", 11625),
         ];
-        let set = PreferredPeerSet::from_config(entries.clone());
+        let set = PreferredPeerSet::from_config(entries.clone(), HashSet::new());
         assert_eq!(set.config_entries.len(), 2);
         assert!(set.resolved.is_empty());
         assert!(set.resolved_ips.is_empty());
@@ -2719,7 +2751,7 @@ mod tests {
     #[test]
     fn test_preferred_peer_set_with_resolved() {
         let config = vec![PeerAddress::new("validator1.example.com", 11625)];
-        let set = PreferredPeerSet::from_config(config);
+        let set = PreferredPeerSet::from_config(config, HashSet::new());
 
         let resolved = vec![PeerAddress::new("10.0.0.42", 11625)];
         let updated = set.with_resolved(resolved);
@@ -2736,7 +2768,7 @@ mod tests {
     fn test_preferred_peer_set_is_preferred_outbound_hostname() {
         // Outbound peers have original_address set — should match config hostname.
         let config = vec![PeerAddress::new("validator1.example.com", 11625)];
-        let set = PreferredPeerSet::from_config(config);
+        let set = PreferredPeerSet::from_config(config, HashSet::new());
 
         let peer_info = crate::peer::PeerInfo {
             peer_id: PeerId::from_bytes([1u8; 32]),
@@ -2759,7 +2791,7 @@ mod tests {
     fn test_preferred_peer_set_is_preferred_inbound_resolved_ip() {
         // Inbound peers have no original_address — must match by resolved IP.
         let config = vec![PeerAddress::new("validator1.example.com", 11625)];
-        let set = PreferredPeerSet::from_config(config);
+        let set = PreferredPeerSet::from_config(config, HashSet::new());
 
         // Before DNS resolution: inbound peer should NOT match (hostname can't parse as IP)
         let peer_info = crate::peer::PeerInfo {
@@ -2791,7 +2823,7 @@ mod tests {
     fn test_preferred_peer_set_is_preferred_no_match() {
         let config = vec![PeerAddress::new("validator1.example.com", 11625)];
         let resolved = vec![PeerAddress::new("10.0.0.42", 11625)];
-        let set = PreferredPeerSet::from_config(config).with_resolved(resolved);
+        let set = PreferredPeerSet::from_config(config, HashSet::new()).with_resolved(resolved);
 
         let peer_info = crate::peer::PeerInfo {
             peer_id: PeerId::from_bytes([3u8; 32]),
@@ -2817,7 +2849,7 @@ mod tests {
             PeerAddress::new("b.example.com", 11625),
             PeerAddress::new("c.example.com", 11625),
         ];
-        let set = PreferredPeerSet::from_config(config.clone());
+        let set = PreferredPeerSet::from_config(config.clone(), HashSet::new());
 
         // Use a seeded RNG for determinism
         use rand::SeedableRng;
@@ -2858,7 +2890,7 @@ mod tests {
 
         // Create a set where 10.0.0.1:11625 is preferred
         let preferred = vec![PeerAddress::new("10.0.0.1", 11625)];
-        let set = PreferredPeerSet::from_config(preferred);
+        let set = PreferredPeerSet::from_config(preferred, HashSet::new());
 
         // Preferred peer
         let preferred_info = crate::peer::PeerInfo {
@@ -2919,6 +2951,206 @@ mod tests {
         assert!(
             shared.preferred_peers.read().is_preferred(info.value()),
             "shared preferred_peers set should recognize the peer"
+        );
+    }
+
+    // ──────── Key-based preferred peer tests ────────
+
+    #[test]
+    fn test_preferred_peer_set_key_based_preference() {
+        use crate::connection::ConnectionDirection;
+        let peer_id = PeerId::from_bytes([42u8; 32]);
+        let mut keys = HashSet::new();
+        keys.insert(peer_id.clone());
+
+        let set = PreferredPeerSet::from_config(Vec::new(), keys);
+
+        // A peer matching the key should be preferred
+        let info = PeerInfo {
+            peer_id: PeerId::from_bytes([42u8; 32]),
+            address: "10.0.0.1:11625".parse().unwrap(),
+            direction: ConnectionDirection::Inbound,
+            version_string: "test".to_string(),
+            overlay_version: 35,
+            ledger_version: 22,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        };
+        assert!(
+            set.is_preferred(&info),
+            "key-matched peer should be preferred"
+        );
+
+        // A peer NOT matching the key should not be preferred
+        let other_info = PeerInfo {
+            peer_id: PeerId::from_bytes([99u8; 32]),
+            address: "10.0.0.2:11625".parse().unwrap(),
+            direction: ConnectionDirection::Inbound,
+            version_string: "test".to_string(),
+            overlay_version: 35,
+            ledger_version: 22,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        };
+        assert!(
+            !set.is_preferred(&other_info),
+            "non-key peer should not be preferred"
+        );
+    }
+
+    #[test]
+    fn test_preferred_peer_set_with_resolved_preserves_keys() {
+        use crate::connection::ConnectionDirection;
+        let peer_id = PeerId::from_bytes([42u8; 32]);
+        let mut keys = HashSet::new();
+        keys.insert(peer_id.clone());
+
+        let set = PreferredPeerSet::from_config(Vec::new(), keys);
+        let resolved = vec![PeerAddress::new("10.0.0.42", 11625)];
+        let updated = set.with_resolved(resolved);
+
+        // Keys should survive the DNS resolution update
+        let info = PeerInfo {
+            peer_id: PeerId::from_bytes([42u8; 32]),
+            address: "10.0.0.1:11625".parse().unwrap(),
+            direction: ConnectionDirection::Inbound,
+            version_string: "test".to_string(),
+            overlay_version: 35,
+            ledger_version: 22,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        };
+        assert!(
+            updated.is_preferred(&info),
+            "keys should be preserved after with_resolved"
+        );
+    }
+
+    #[test]
+    fn test_admission_rejects_non_preferred_under_strict_mode() {
+        use crate::connection::ConnectionDirection;
+        let (message_tx, _) = broadcast::channel(16);
+        let (scp_tx, _scp_rx) = mpsc::unbounded_channel();
+        let (fetch_tx, _fetch_rx) = mpsc::unbounded_channel();
+
+        let shared = SharedPeerState {
+            peers: Arc::new(DashMap::new()),
+            flood_gate: Arc::new(FloodGate::with_ttl(std::time::Duration::from_secs(30))),
+            running: Arc::new(AtomicBool::new(true)),
+            message_tx,
+            scp_message_tx: scp_tx,
+            fetch_response_tx: fetch_tx,
+            peer_handles: Arc::new(RwLock::new(Vec::new())),
+            advertised_outbound_peers: Arc::new(RwLock::new(Vec::new())),
+            advertised_inbound_peers: Arc::new(RwLock::new(Vec::new())),
+            added_authenticated_peers: Arc::new(AtomicU64::new(0)),
+            dropped_authenticated_peers: Arc::new(AtomicU64::new(0)),
+            banned_peers: Arc::new(RwLock::new(HashSet::new())),
+            peer_info_cache: Arc::new(DashMap::new()),
+            last_closed_ledger: Arc::new(AtomicU32::new(0)),
+            scp_callback: None,
+            is_validator: true,
+            peer_event_tx: None,
+            extra_subscribers: Arc::new(RwLock::new(Vec::new())),
+            is_tracking: Arc::new(AtomicBool::new(true)),
+            pending_connections: PendingConnections::new(),
+            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(
+                Vec::new(),
+                HashSet::new(),
+            ))),
+            preferred_peers_only: true, // STRICT MODE
+            admission_state: Arc::new(Mutex::new(AdmissionState::default())),
+            fetch_channel_depth: Arc::new(AtomicI64::new(0)),
+            fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
+            metrics: Arc::new(OverlayMetrics::new()),
+            query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
+            max_tx_size_bytes: Arc::new(AtomicU32::new(
+                crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
+            )),
+        };
+
+        // Pool with capacity (max=10, current authenticated=0)
+        let pool = ConnectionPool::new(10);
+
+        // Non-preferred peer should be rejected even with capacity
+        let peer_info = PeerInfo {
+            peer_id: PeerId::from_bytes([99u8; 32]),
+            address: "10.0.0.99:11625".parse().unwrap(),
+            direction: ConnectionDirection::Inbound,
+            version_string: "test".to_string(),
+            overlay_version: 35,
+            ledger_version: 22,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        };
+        assert!(
+            !OverlayManager::try_accept_authenticated_peer(&peer_info, &shared, &pool),
+            "non-preferred peer should be rejected under strict mode even with capacity"
+        );
+    }
+
+    #[test]
+    fn test_admission_accepts_key_preferred_under_strict_mode() {
+        use crate::connection::ConnectionDirection;
+        let (message_tx, _) = broadcast::channel(16);
+        let (scp_tx, _scp_rx) = mpsc::unbounded_channel();
+        let (fetch_tx, _fetch_rx) = mpsc::unbounded_channel();
+
+        let preferred_key = PeerId::from_bytes([42u8; 32]);
+        let mut keys = HashSet::new();
+        keys.insert(preferred_key.clone());
+
+        let shared = SharedPeerState {
+            peers: Arc::new(DashMap::new()),
+            flood_gate: Arc::new(FloodGate::with_ttl(std::time::Duration::from_secs(30))),
+            running: Arc::new(AtomicBool::new(true)),
+            message_tx,
+            scp_message_tx: scp_tx,
+            fetch_response_tx: fetch_tx,
+            peer_handles: Arc::new(RwLock::new(Vec::new())),
+            advertised_outbound_peers: Arc::new(RwLock::new(Vec::new())),
+            advertised_inbound_peers: Arc::new(RwLock::new(Vec::new())),
+            added_authenticated_peers: Arc::new(AtomicU64::new(0)),
+            dropped_authenticated_peers: Arc::new(AtomicU64::new(0)),
+            banned_peers: Arc::new(RwLock::new(HashSet::new())),
+            peer_info_cache: Arc::new(DashMap::new()),
+            last_closed_ledger: Arc::new(AtomicU32::new(0)),
+            scp_callback: None,
+            is_validator: true,
+            peer_event_tx: None,
+            extra_subscribers: Arc::new(RwLock::new(Vec::new())),
+            is_tracking: Arc::new(AtomicBool::new(true)),
+            pending_connections: PendingConnections::new(),
+            preferred_peers: Arc::new(RwLock::new(PreferredPeerSet::from_config(Vec::new(), keys))),
+            preferred_peers_only: true, // STRICT MODE
+            admission_state: Arc::new(Mutex::new(AdmissionState::default())),
+            fetch_channel_depth: Arc::new(AtomicI64::new(0)),
+            fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
+            metrics: Arc::new(OverlayMetrics::new()),
+            query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
+            max_tx_size_bytes: Arc::new(AtomicU32::new(
+                crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
+            )),
+        };
+
+        // Pool with capacity — reserve a pending slot (required before promote)
+        let pool = ConnectionPool::new(10);
+        assert!(pool.try_reserve());
+
+        // Preferred-by-key peer should be admitted under strict mode
+        let peer_info = PeerInfo {
+            peer_id: PeerId::from_bytes([42u8; 32]),
+            address: "10.0.0.42:11625".parse().unwrap(),
+            direction: ConnectionDirection::Inbound,
+            version_string: "test".to_string(),
+            overlay_version: 35,
+            ledger_version: 22,
+            connected_at: std::time::Instant::now(),
+            original_address: None,
+        };
+        assert!(
+            OverlayManager::try_accept_authenticated_peer(&peer_info, &shared, &pool),
+            "key-preferred peer should be admitted under strict mode"
         );
     }
 }

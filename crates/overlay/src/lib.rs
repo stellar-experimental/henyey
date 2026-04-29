@@ -126,6 +126,7 @@ pub use tx_demands::{
     TxDemandsStats, TxKnownStatus, TxPullLatency, MAX_RETRY_COUNT, TX_DEMAND_VECTOR_MAX_SIZE,
 };
 
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 
 /// Result type for overlay operations.
@@ -180,6 +181,17 @@ pub struct OverlayConfig {
     /// These peers are given priority when establishing outbound
     /// connections and will be reconnected if disconnected.
     pub preferred_peers: Vec<PeerAddress>,
+
+    /// Preferred peer public keys for node-ID-based preference.
+    ///
+    /// Peers whose authenticated node ID matches any of these keys are treated
+    /// as preferred, regardless of their network address. Matches stellar-core's
+    /// `PREFERRED_PEER_KEYS`.
+    pub preferred_peer_keys: HashSet<PeerId>,
+
+    /// When `true`, reject any authenticated peer that is not preferred
+    /// (by address or by key). Matches stellar-core's `PREFERRED_PEERS_ONLY`.
+    pub preferred_peers_only: bool,
 
     /// Network passphrase for authentication.
     ///
@@ -260,6 +272,8 @@ impl Default for OverlayConfig {
             listen_port: 11625,
             known_peers: Vec::new(),
             preferred_peers: Vec::new(),
+            preferred_peer_keys: HashSet::new(),
+            preferred_peers_only: false,
             network_passphrase: "Test SDF Network ; September 2015".to_string(),
             auth_timeout_secs: 2,
             connect_timeout_secs: 10,

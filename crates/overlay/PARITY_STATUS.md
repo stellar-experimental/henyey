@@ -321,8 +321,8 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `maybeAddInboundConnection()` | (in listener accept flow) | Full |
 | `addOutboundConnection()` | (in connector flow) | Full |
 | `removePeer()` | (via peer drop) | Full |
-| `acceptAuthenticatedPeer()` | `try_accept_authenticated_peer()` after handshake completion | Partial (preferred eviction and load rejection match admission semantics; outbound rejection still occurs after SEND_MORE_EXTENDED/GET_SCP_STATE) |
-| `isPreferred()` | `PreferredPeerSet::is_preferred()` | Full (config hostname + resolved IP matching) |
+| `acceptAuthenticatedPeer()` | `try_accept_authenticated_peer()` after handshake completion | Partial (preferred eviction, load rejection, and `PREFERRED_PEERS_ONLY` strict mode match admission semantics; outbound rejection still occurs after SEND_MORE_EXTENDED/GET_SCP_STATE) |
+| `isPreferred()` | `PreferredPeerSet::is_preferred()` | Full (config hostname + resolved IP matching + `PREFERRED_PEER_KEYS` identity matching) |
 | `isPossiblyPreferred()` | `ConnectionPool::try_reserve_with_ip()` | Full (runtime update via `update_preferred_ips()`) |
 | `haveSpaceForConnection()` | `ConnectionPool::can_accept()` | Full |
 | `getInboundPendingPeers()` | N/A | None |

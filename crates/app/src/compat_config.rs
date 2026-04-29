@@ -49,6 +49,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "PEER_PORT",
     "KNOWN_PEERS",
     "PREFERRED_PEERS",
+    "PREFERRED_PEER_KEYS",
+    "PREFERRED_PEERS_ONLY",
     "METADATA_OUTPUT_STREAM",
     "EMIT_SOROBAN_TRANSACTION_META_EXT_V1",
     "EMIT_LEDGER_CLOSE_META_EXT_V1",
@@ -93,8 +95,6 @@ const UNSUPPORTED_KNOWN_KEYS: &[&str] = &[
     "MAX_PENDING_CONNECTIONS",
     "PEER_AUTHENTICATION_TIMEOUT",
     "PEER_TIMEOUT",
-    "PREFERRED_PEER_KEYS",
-    "PREFERRED_PEERS_ONLY",
     "MINIMUM_IDLE_PERCENT",
     "WORKER_THREADS",
     "MAX_CONCURRENT_SUBPROCESSES",
@@ -250,6 +250,18 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     if let Some(peers) = get_string_array(table, "PREFERRED_PEERS") {
         config.overlay.preferred_peers = peers;
     }
+    // PREFERRED_PEER_KEYS: security-sensitive — strict parsing to avoid
+    // silently dropping entries under PREFERRED_PEERS_ONLY mode.
+    if let Some(keys) = get_string_array_strict(table, "PREFERRED_PEER_KEYS")
+        .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
+    {
+        config.overlay.preferred_peer_keys = keys;
+    }
+    if let Some(v) = get_bool_strict(table, "PREFERRED_PEERS_ONLY")
+        .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
+    {
+        config.overlay.preferred_peers_only = v;
+    }
     if let Some(v) = get_i64(table, "FLOOD_ARB_TX_BASE_ALLOWANCE") {
         match i32::try_from(v) {
             Ok(i) => config.overlay.flood_arb_tx_base_allowance = i,
@@ -290,21 +302,9 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     // SURVEYOR_KEYS: security-sensitive — strict validation instead of
     // get_string_array (which silently drops non-string elements and could
     // leave the list empty, widening survey access to the full quorum).
-    if let Some(val) = table.get("SURVEYOR_KEYS") {
-        let arr = val.as_array().ok_or_else(|| {
-            anyhow::anyhow!("SURVEYOR_KEYS must be an array, got: {}", val.type_str())
-        })?;
-        let mut keys = Vec::with_capacity(arr.len());
-        for (i, elem) in arr.iter().enumerate() {
-            let s = elem.as_str().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "SURVEYOR_KEYS[{}] must be a string, got: {}",
-                    i,
-                    elem.type_str()
-                )
-            })?;
-            keys.push(s.to_string());
-        }
+    if let Some(keys) = get_string_array_strict(table, "SURVEYOR_KEYS")
+        .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
+    {
         config.overlay.surveyor_keys = keys;
     }
 
@@ -1135,6 +1135,46 @@ fn get_string_array(table: &toml::map::Map<String, toml::Value>, key: &str) -> O
             None
         }
     }
+}
+
+/// Like `get_string_array` but returns an error if any element is not a string.
+/// Use for security-sensitive fields where silent element drops would widen
+/// attack surface (e.g., `PREFERRED_PEER_KEYS` under `PREFERRED_PEERS_ONLY`).
+fn get_string_array_strict(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let val = match table.get(key) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let arr = val
+        .as_array()
+        .ok_or_else(|| format!("{key}: expected array, got {}", val.type_str()))?;
+    let mut result = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        let s = v
+            .as_str()
+            .ok_or_else(|| format!("{key}[{i}]: expected string, got {}", v.type_str()))?;
+        result.push(s.to_string());
+    }
+    Ok(Some(result))
+}
+
+/// Like `get_bool` but returns an error on wrong type instead of warn+None.
+/// Use for security-sensitive boolean fields where a silent default would
+/// widen attack surface.
+fn get_bool_strict(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Result<Option<bool>, String> {
+    let val = match table.get(key) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    val.as_bool()
+        .map(|b| Some(b))
+        .ok_or_else(|| format!("{key}: expected boolean, got {}", val.type_str()))
 }
 
 #[cfg(test)]
@@ -2929,8 +2969,7 @@ FLOOD_ADVERT_PERIOD_MS=-1
         );
         let err = translate(&cfg).unwrap_err();
         assert!(
-            err.to_string()
-                .contains("SURVEYOR_KEYS[1] must be a string"),
+            err.to_string().contains("SURVEYOR_KEYS[1]"),
             "Expected type error, got: {}",
             err
         );
@@ -2948,9 +2987,90 @@ FLOOD_ADVERT_PERIOD_MS=-1
         );
         let err = translate(&cfg).unwrap_err();
         assert!(
-            err.to_string().contains("SURVEYOR_KEYS must be an array"),
+            err.to_string().contains("SURVEYOR_KEYS: expected array"),
             "Expected array error, got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_translate_preferred_peer_keys() {
+        let cfg = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/core.db"
+            HTTP_PORT = 11626
+            UNSAFE_QUORUM = true
+            PREFERRED_PEER_KEYS = [
+                "GDEX3JU2AUGVPQFGFKMEOGHEUQ4YGRIYDJIKQSC7QLHAJ4RV63MJKGAS",
+                "GCKWUQOSX4MMMCEHQ34E7EE7XQHJEMHEBMMXBS2SXMP3KV3HQQISBUU7"
+            ]
+            PREFERRED_PEERS_ONLY = true
+            "#
+        );
+        let config = translate(&cfg).unwrap();
+        assert_eq!(config.overlay.preferred_peer_keys.len(), 2);
+        assert!(config
+            .overlay
+            .preferred_peer_keys
+            .contains(&"GDEX3JU2AUGVPQFGFKMEOGHEUQ4YGRIYDJIKQSC7QLHAJ4RV63MJKGAS".to_string()));
+        assert!(config
+            .overlay
+            .preferred_peer_keys
+            .contains(&"GCKWUQOSX4MMMCEHQ34E7EE7XQHJEMHEBMMXBS2SXMP3KV3HQQISBUU7".to_string()));
+        assert!(config.overlay.preferred_peers_only);
+    }
+
+    #[test]
+    fn test_translate_preferred_peer_keys_invalid_element() {
+        let cfg = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/core.db"
+            HTTP_PORT = 11626
+            UNSAFE_QUORUM = true
+            PREFERRED_PEER_KEYS = ["valid-string", 42]
+            "#
+        );
+        let err = translate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("PREFERRED_PEER_KEYS[1]"),
+            "Expected element error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_translate_preferred_peers_only_wrong_type() {
+        let cfg = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/core.db"
+            HTTP_PORT = 11626
+            UNSAFE_QUORUM = true
+            PREFERRED_PEERS_ONLY = "yes"
+            "#
+        );
+        let err = translate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("PREFERRED_PEERS_ONLY"),
+            "Expected type error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_translate_preferred_peers_only_default_false() {
+        let cfg = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/core.db"
+            HTTP_PORT = 11626
+            UNSAFE_QUORUM = true
+            "#
+        );
+        let config = translate(&cfg).unwrap();
+        assert!(!config.overlay.preferred_peers_only);
+        assert!(config.overlay.preferred_peer_keys.is_empty());
     }
 }

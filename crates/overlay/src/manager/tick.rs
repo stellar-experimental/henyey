@@ -167,6 +167,7 @@ impl OverlayManager {
         let inbound_pool = Arc::clone(&self.inbound_pool);
         let known_peers = Arc::clone(&self.known_peers);
         let preferred_peers_config = self.config.preferred_peers.clone();
+        let preferred_peer_keys = self.config.preferred_peer_keys.clone();
         let max_outbound = self.config.max_outbound_peers;
         let config_known_peers = self.config.known_peers.clone();
         let mut shutdown_rx = self.shutdown_tx.lock().as_ref().unwrap().subscribe();
@@ -194,6 +195,7 @@ impl OverlayManager {
             // after each DNS resolution cycle.
             let mut preferred_set = Arc::new(PreferredPeerSet::from_config(
                 preferred_peers_config.clone(),
+                preferred_peer_keys.clone(),
             ));
 
             // Trigger initial DNS resolution.
@@ -613,6 +615,7 @@ mod tests {
     use crate::{LocalNode, OverlayConfig, OverlayError, PeerAddress, Result};
     use async_trait::async_trait;
     use henyey_crypto::SecretKey;
+    use std::collections::HashSet;
     use tokio::sync::mpsc;
 
     // ---- G8 tests: maybe_drop_random_peer ----
@@ -711,7 +714,8 @@ mod tests {
         let mut victim_rx =
             register_fake_peer_with_rx(&shared.peers, &shared.peer_info_cache, victim_info);
 
-        let preferred_set = PreferredPeerSet::from_config(vec![preferred_addr.clone()]);
+        let preferred_set =
+            PreferredPeerSet::from_config(vec![preferred_addr.clone()], HashSet::new());
         let mut retry_after = HashMap::new();
         let ctx = TickConnectCtx {
             local_node,
@@ -763,7 +767,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &PreferredPeerSet::from_config(vec![]),
+            &PreferredPeerSet::from_config(vec![], HashSet::new()),
             8,    // max_outbound = 8 (full)
             true, // tracking = true
             &mut last_reconnect,
@@ -790,7 +794,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &PreferredPeerSet::from_config(vec![]),
+            &PreferredPeerSet::from_config(vec![], HashSet::new()),
             8,
             false, // not tracking
             &mut last_reconnect,
@@ -813,7 +817,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &PreferredPeerSet::from_config(vec![]),
+            &PreferredPeerSet::from_config(vec![], HashSet::new()),
             8,
             false,
             &mut last_reconnect,
@@ -838,7 +842,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &PreferredPeerSet::from_config(vec![]),
+            &PreferredPeerSet::from_config(vec![], HashSet::new()),
             8,
             false,
             &mut last_reconnect,
@@ -862,7 +866,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &PreferredPeerSet::from_config(vec![]),
+            &PreferredPeerSet::from_config(vec![], HashSet::new()),
             8,
             false,
             &mut last_reconnect,
@@ -889,7 +893,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &PreferredPeerSet::from_config(preferred.clone()),
+            &PreferredPeerSet::from_config(preferred.clone(), HashSet::new()),
             1, // max_outbound = 1 (full)
             false,
             &mut last_reconnect,
@@ -914,7 +918,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &PreferredPeerSet::from_config(vec![]),
+            &PreferredPeerSet::from_config(vec![], HashSet::new()),
             8,
             false,
             &mut last_reconnect,
@@ -936,7 +940,7 @@ mod tests {
         let dropped = OverlayManager::maybe_drop_random_peer(
             &peers,
             &info_cache,
-            &PreferredPeerSet::from_config(vec![]),
+            &PreferredPeerSet::from_config(vec![], HashSet::new()),
             8,
             true, // tracking again
             &mut last_reconnect,
@@ -1098,7 +1102,7 @@ mod tests {
             info_cache.insert(info.peer_id.clone(), info);
         }
 
-        let preferred_set = PreferredPeerSet::from_config(preferred_addrs);
+        let preferred_set = PreferredPeerSet::from_config(preferred_addrs, HashSet::new());
         let count = OverlayManager::count_non_preferred_outbound_peers(&info_cache, &preferred_set);
         assert_eq!(count, 3, "should only count non-preferred outbound peers");
     }
@@ -1115,7 +1119,7 @@ mod tests {
             info_cache.insert(info.peer_id.clone(), info);
         }
 
-        let preferred_set = PreferredPeerSet::from_config(preferred_addrs);
+        let preferred_set = PreferredPeerSet::from_config(preferred_addrs, HashSet::new());
         let count = OverlayManager::count_non_preferred_outbound_peers(&info_cache, &preferred_set);
         assert_eq!(count, 0, "all outbound are preferred");
     }
@@ -1134,7 +1138,7 @@ mod tests {
             info_cache.insert(info.peer_id.clone(), info);
         }
 
-        let preferred_set = PreferredPeerSet::from_config(vec![]);
+        let preferred_set = PreferredPeerSet::from_config(vec![], HashSet::new());
         let outbound_count = OverlayManager::count_outbound_peers(&info_cache);
         let available = max_outbound.saturating_sub(outbound_count);
         assert_eq!(available, 0, "no free slots");
@@ -1163,7 +1167,7 @@ mod tests {
             info_cache.insert(info.peer_id.clone(), info);
         }
 
-        let preferred_set = PreferredPeerSet::from_config(preferred_addrs);
+        let preferred_set = PreferredPeerSet::from_config(preferred_addrs, HashSet::new());
         let outbound_count = OverlayManager::count_outbound_peers(&info_cache);
         let available = max_outbound.saturating_sub(outbound_count);
         let non_preferred_count =

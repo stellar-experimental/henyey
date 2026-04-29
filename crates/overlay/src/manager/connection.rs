@@ -50,71 +50,88 @@ impl OverlayManager {
     /// This is deliberately synchronous: admission state and pool counters are
     /// updated under one short critical section, and no async I/O happens while
     /// holding the admission lock.
+    ///
+    /// Matches stellar-core's `acceptAuthenticatedPeer()` order:
+    /// 1. Preferred peers: try promote, or evict a non-preferred same-direction peer.
+    /// 2. Non-preferred + `preferred_peers_only`: reject immediately.
+    /// 3. Non-preferred + !`preferred_peers_only`: try promote if capacity exists.
     pub(super) fn try_accept_authenticated_peer(
         peer_info: &PeerInfo,
         shared: &SharedPeerState,
         pool: &ConnectionPool,
     ) -> bool {
         let mut admission = shared.admission_state.lock();
-
-        if pool.try_promote_to_authenticated() {
-            return true;
-        }
-
         let preferred = shared.preferred_peers.read();
-        if !preferred.is_preferred(peer_info) {
-            return false;
-        }
+        let is_preferred = preferred.is_preferred(peer_info);
 
-        let direction = peer_info.direction;
-        let mut candidates: Vec<PeerId> = shared
-            .peer_info_cache
-            .iter()
-            .filter_map(|entry| {
-                let candidate_id = entry.key();
-                let candidate_info = entry.value();
-                if candidate_info.direction != direction {
-                    return None;
-                }
-                if preferred.is_preferred(candidate_info) {
-                    return None;
-                }
-                if admission.is_evicting(candidate_id) {
-                    return None;
-                }
-                if !shared.peers.contains_key(candidate_id) {
-                    return None;
-                }
-                Some(candidate_id.clone())
-            })
-            .collect();
-        candidates.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-
-        for victim_id in candidates {
-            if let Some(entry) = shared.peers.get(&victim_id) {
-                info!(
-                    "Evicting non-preferred {:?} peer {} for preferred peer {}",
-                    direction, victim_id, peer_info.peer_id
-                );
-                if !super::peer_loop::send_error_and_drop(
-                    &victim_id,
-                    &entry.value().outbound_tx,
-                    ErrorCode::Load,
-                    "preferred peer selected instead",
-                ) {
-                    debug!(
-                        "Could not queue shutdown for non-preferred peer {}; trying next victim",
-                        victim_id
-                    );
-                    continue;
-                }
-                admission.mark_evicting(victim_id.clone());
-                pool.force_promote_authenticated();
+        if is_preferred {
+            // Preferred peer: try normal promotion first.
+            if pool.try_promote_to_authenticated() {
                 return true;
             }
-        }
 
-        false
+            // No capacity — try evicting a non-preferred peer of same direction.
+            let direction = peer_info.direction;
+            let mut candidates: Vec<PeerId> = shared
+                .peer_info_cache
+                .iter()
+                .filter_map(|entry| {
+                    let candidate_id = entry.key();
+                    let candidate_info = entry.value();
+                    if candidate_info.direction != direction {
+                        return None;
+                    }
+                    if preferred.is_preferred(candidate_info) {
+                        return None;
+                    }
+                    if admission.is_evicting(candidate_id) {
+                        return None;
+                    }
+                    if !shared.peers.contains_key(candidate_id) {
+                        return None;
+                    }
+                    Some(candidate_id.clone())
+                })
+                .collect();
+            candidates.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+            for victim_id in candidates {
+                if let Some(entry) = shared.peers.get(&victim_id) {
+                    info!(
+                        "Evicting non-preferred {:?} peer {} for preferred peer {}",
+                        direction, victim_id, peer_info.peer_id
+                    );
+                    if !super::peer_loop::send_error_and_drop(
+                        &victim_id,
+                        &entry.value().outbound_tx,
+                        ErrorCode::Load,
+                        "preferred peer selected instead",
+                    ) {
+                        debug!(
+                            "Could not queue shutdown for non-preferred peer {}; trying next victim",
+                            victim_id
+                        );
+                        continue;
+                    }
+                    admission.mark_evicting(victim_id.clone());
+                    pool.force_promote_authenticated();
+                    return true;
+                }
+            }
+
+            false
+        } else if shared.preferred_peers_only {
+            // Non-preferred peer under strict mode: reject immediately.
+            // Matches stellar-core: `if (!PREFERRED_PEERS_ONLY && capacity)`
+            info!(
+                "Non-preferred peer {} rejected: PREFERRED_PEERS_ONLY is set",
+                peer_info.peer_id
+            );
+            false
+        } else {
+            // Non-preferred peer, normal mode: admit if capacity exists.
+            pool.try_promote_to_authenticated()
+        }
     }
 
     async fn reject_authenticated_load(peer: &mut Peer, shared: &SharedPeerState) {
@@ -462,9 +479,14 @@ impl OverlayManager {
 
         let peer_info = peer.info().clone();
         if !Self::try_accept_authenticated_peer(&peer_info, &shared, &pool) {
+            let reason = if shared.preferred_peers_only {
+                "PREFERRED_PEERS_ONLY is set"
+            } else {
+                "all available slots are taken"
+            };
             info!(
-                "Outbound discovered peer {} rejected because all available slots are taken",
-                peer_id
+                "Outbound discovered peer {} rejected because {}",
+                peer_id, reason
             );
             Self::reject_authenticated_load(&mut peer, &shared).await;
             shared.pending_connections.release_peer_id(&peer_id);
@@ -685,10 +707,12 @@ pub(super) async fn connect_to_explicit_peer(
 
     let peer_info = peer.info().clone();
     if !OverlayManager::try_accept_authenticated_peer(&peer_info, &shared, &pool) {
-        info!(
-            "Outbound peer {} rejected because all available slots are taken",
-            peer_id
-        );
+        let reason = if shared.preferred_peers_only {
+            "PREFERRED_PEERS_ONLY is set"
+        } else {
+            "all available slots are taken"
+        };
+        info!("Outbound peer {} rejected because {}", peer_id, reason);
         OverlayManager::reject_authenticated_load(&mut peer, &shared).await;
         shared.pending_connections.release_peer_id(&peer_id);
         pool.release_pending();

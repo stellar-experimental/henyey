@@ -88,6 +88,7 @@ Corresponds to: `Config.h`
 | network, overlay, history, maintenance, metadata, diagnostics, query fields | `AppConfig` sub-structs | Full |
 | `FORCE_SCP`, `MANUAL_CLOSE`, `CATCHUP_COMPLETE`, `CATCHUP_RECENT` | native fields in `AppConfig` | Full |
 | stellar-core flat config parsing | `translate_stellar_core_config()` | Full |
+| `PREFERRED_PEER_KEYS`, `PREFERRED_PEERS_ONLY` | Translated via strict helpers in compat config; passed to overlay | Full |
 | testing knobs (`ARTIFICIALLY_*`, `LOADGEN_*`, `APPLY_LOAD_*`) | small supported subset only | Partial |
 | helper methods such as `modeDoesCatchupWithBucketList()`, `allBucketsInMemory()`, `parallelLedgerClose()`, `setNoListen()`, `setNoPublish()` | — | None |
 

@@ -1128,6 +1128,20 @@ impl App {
                 .collect();
         }
 
+        // Convert preferred peer keys (node-ID-based preference)
+        for key_str in &self.config.overlay.preferred_peer_keys {
+            match henyey_overlay::PeerId::from_strkey(key_str) {
+                Ok(peer_id) => {
+                    overlay_config.preferred_peer_keys.insert(peer_id);
+                }
+                Err(e) => {
+                    // Config::validate() should catch this first, but guard here too.
+                    tracing::error!(key = key_str, error = %e, "Invalid preferred_peer_keys entry");
+                }
+            }
+        }
+        overlay_config.preferred_peers_only = self.config.overlay.preferred_peers_only;
+
         let (peer_event_tx, mut peer_event_rx) = mpsc::channel(1024);
         overlay_config.peer_event_tx = Some(peer_event_tx);
 
