@@ -786,33 +786,33 @@ impl NominationProtocol {
         Self::is_sorted_unique(&nomination.votes) && Self::is_sorted_unique(&nomination.accepted)
     }
 
+    /// Strictly-increasing check using `Value`'s native `Ord` impl.
+    ///
+    /// `Value` is XDR `opaque<>` (a length-prefixed byte vector). Its derived
+    /// `Ord` compares the inner `Vec<u8>` lexicographically, which matches
+    /// stellar-core's `stellar::Value` operator< (a `std::vector<uint8_t>`
+    /// lexicographic compare). It is therefore consensus-critical that this
+    /// function does NOT use the XDR-encoded byte form (which would prepend
+    /// a 4-byte length and induce length-then-bytes ordering, diverging from
+    /// stellar-core). See issue #2105.
     fn is_sorted_unique(values: &[Value]) -> bool {
-        if values.is_empty() {
-            return true;
-        }
-        let mut prev = Self::value_key(&values[0]);
-        for value in values.iter().skip(1) {
-            let key = Self::value_key(value);
-            if key <= prev {
-                return false;
-            }
-            prev = key;
-        }
-        true
+        values.windows(2).all(|w| w[0] < w[1])
     }
 
-    fn value_set(values: &[Value]) -> HashSet<Vec<u8>> {
-        values.iter().map(|v| Self::value_key(v)).collect()
+    /// Set of values for subset / growth comparisons in `is_newer_nomination`.
+    /// Uses `Value`'s derived `Hash`/`Eq`, which are equivalent to comparing
+    /// the inner `Vec<u8>` directly — no XDR-encoded keying required.
+    fn value_set(values: &[Value]) -> HashSet<Value> {
+        values.iter().cloned().collect()
     }
 
-    fn value_key(value: &Value) -> Vec<u8> {
-        henyey_common::xdr_stream::xdr_to_bytes(value)
-    }
-
+    /// Sort and deduplicate a vector of `Value`s using stellar-core
+    /// lexicographic ordering (the derived `Ord` on `Value`). See the comment
+    /// on `is_sorted_unique` for why we must not sort by XDR-encoded bytes.
     fn sorted_values(values: &[Value]) -> Vec<Value> {
         let mut values = values.to_vec();
-        values.sort_by_key(|a| Self::value_key(a));
-        values.dedup_by(|a, b| Self::value_key(a) == Self::value_key(b));
+        values.sort();
+        values.dedup();
         values
     }
 
@@ -1181,11 +1181,107 @@ mod tests {
         let driver = Arc::new(MockDriver::with_quorum_set(quorum_set.clone()));
         let mut nom = NominationProtocol::new();
 
-        let v1 = make_value(&[1]);
-        let v2 = make_value(&[2]);
-        let env = make_nomination_envelope(make_node_id(2), 7, &quorum_set, vec![v2, v1], vec![]);
+        // Use a length-divergent pair so this test catches both same-length and
+        // different-length ordering bugs. Under stellar-core's lexicographic
+        // ordering of `Value`, `[0x01, 0x00] < [0x02]`. Submitting them in the
+        // reverse order (`[0x02]` first) must be rejected as not-sane.
+        let v_short = make_value(&[0x02]);
+        let v_long = make_value(&[0x01, 0x00]);
+        let env = make_nomination_envelope(
+            make_node_id(2),
+            7,
+            &quorum_set,
+            vec![v_short, v_long],
+            vec![],
+        );
         let state = nom.process_envelope(&env, &ctx!(&node, &quorum_set, &driver, 7));
         assert_eq!(state, EnvelopeState::Invalid);
+    }
+
+    /// Regression test for issue #2105: nomination value ordering must use
+    /// lexicographic byte-vector compare (matching stellar-core's
+    /// `stellar::Value` operator<), NOT XDR-encoded bytes (which prepend a
+    /// 4-byte length and therefore induce length-then-bytes ordering).
+    ///
+    /// stellar-core sorts `[0x01, 0x00]` before `[0x02]` (byte-by-byte).
+    /// The buggy XDR-encoded ordering sorts `[0x02]` first because its
+    /// length prefix `1` is less than `[0x01, 0x00]`'s length prefix `2`.
+    #[test]
+    fn test_is_sorted_unique_lexicographic_not_xdr_length_first() {
+        let v_short = make_value(&[0x02]);
+        let v_long = make_value(&[0x01, 0x00]);
+
+        // stellar-core ordering: [0x01, 0x00] < [0x02]
+        assert!(NominationProtocol::is_sorted_unique(&[
+            v_long.clone(),
+            v_short.clone()
+        ]));
+        assert!(!NominationProtocol::is_sorted_unique(&[
+            v_short.clone(),
+            v_long.clone()
+        ]));
+        // Equal values must be rejected (strictly increasing).
+        assert!(!NominationProtocol::is_sorted_unique(&[
+            v_short.clone(),
+            v_short.clone()
+        ]));
+        // Single element and empty are sorted-unique.
+        assert!(NominationProtocol::is_sorted_unique(&[v_short.clone()]));
+        assert!(NominationProtocol::is_sorted_unique(&[]));
+    }
+
+    /// A nomination whose `votes` are in stellar-core lexicographic order
+    /// must be accepted as sane.
+    #[test]
+    fn test_is_sane_statement_accepts_stellar_core_ordering() {
+        let v_short = make_value(&[0x02]);
+        let v_long = make_value(&[0x01, 0x00]);
+        let nom = ScpNomination {
+            quorum_set_hash: Hash([0u8; 32]),
+            votes: vec![v_long, v_short].try_into().unwrap(),
+            accepted: Vec::<Value>::new().try_into().unwrap(),
+        };
+        assert!(NominationProtocol::is_sane_statement(&nom));
+    }
+
+    /// A nomination whose `votes` are in the order produced by the buggy
+    /// XDR-length-first sort must be rejected as not-sane.
+    #[test]
+    fn test_is_sane_statement_rejects_xdr_length_ordering() {
+        let v_short = make_value(&[0x02]);
+        let v_long = make_value(&[0x01, 0x00]);
+        let nom = ScpNomination {
+            quorum_set_hash: Hash([0u8; 32]),
+            votes: vec![v_short, v_long].try_into().unwrap(),
+            accepted: Vec::<Value>::new().try_into().unwrap(),
+        };
+        assert!(!NominationProtocol::is_sane_statement(&nom));
+    }
+
+    #[test]
+    fn test_sorted_values_lexicographic() {
+        let v_short = make_value(&[0x02]);
+        let v_long = make_value(&[0x01, 0x00]);
+        let result = NominationProtocol::sorted_values(&[v_short.clone(), v_long.clone()]);
+        assert_eq!(result, vec![v_long, v_short]);
+    }
+
+    #[test]
+    fn test_sorted_values_dedup() {
+        let a = make_value(&[0x01]);
+        let b = make_value(&[0x02]);
+        let result = NominationProtocol::sorted_values(&[a.clone(), a.clone(), b.clone()]);
+        assert_eq!(result, vec![a, b]);
+    }
+
+    #[test]
+    fn test_value_set_uses_value_equality() {
+        let a = make_value(&[0x01, 0x00]);
+        let b = make_value(&[0x02]);
+        let set = NominationProtocol::value_set(&[a.clone(), a.clone(), b.clone()]);
+        assert_eq!(set.len(), 2);
+        assert!(set.contains(&a));
+        assert!(set.contains(&b));
     }
 
     #[test]
