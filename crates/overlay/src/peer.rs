@@ -25,7 +25,7 @@ use crate::{
     auth::AuthContext,
     codec::helpers,
     connection::{Connection, ConnectionDirection},
-    flow_control::{msg_body_size, FlowControlConfig},
+    flow_control::{msg_body_size, FlowControlConfig, INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES},
     LocalNode, OverlayError, PeerAddress, PeerId, Result,
 };
 use dashmap::DashMap;
@@ -44,12 +44,6 @@ use tracing::{debug, info, trace, warn};
 /// Both peers must set this flag in their Auth message to enable byte-based
 /// flow control (as opposed to the legacy message-only mode).
 const AUTH_MSG_FLAG_FLOW_CONTROL_BYTES_REQUESTED: i32 = 200;
-
-/// Initial byte-level flood reading capacity sent in the first
-/// `SendMoreExtended` message after authentication.
-///
-/// Matches stellar-core `INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES` (300 000).
-pub(crate) const INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES: u32 = 300_000;
 
 /// Current state of a peer connection.
 ///
@@ -213,6 +207,10 @@ pub struct Peer {
 
 impl Peer {
     /// Connect to a peer and perform handshake.
+    ///
+    /// Uses the default initial byte grant (300KB). For production connections
+    /// where `max_tx_size` may exceed the threshold, use
+    /// [`connect_with_connection`] with a computed grant instead.
     pub async fn connect(
         addr: &PeerAddress,
         local_node: LocalNode,
@@ -244,18 +242,28 @@ impl Peer {
         };
 
         // Perform handshake
-        peer.handshake(timeout_secs, None, None).await?;
+        peer.handshake(
+            timeout_secs,
+            None,
+            None,
+            INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+        )
+        .await?;
 
         Ok(peer)
     }
 
     /// Create an outbound peer from a pre-established transport connection.
+    ///
+    /// `initial_byte_grant` is the byte capacity sent in the initial
+    /// SEND_MORE_EXTENDED — typically from [`compute_flow_control_bytes_total`].
     pub async fn connect_with_connection(
         addr: &PeerAddress,
         connection: Connection,
         local_node: LocalNode,
         timeout_secs: u64,
         pending_peer_ids: Option<Arc<DashMap<PeerId, Instant>>>,
+        initial_byte_grant: u32,
     ) -> Result<Self> {
         let auth = AuthContext::new(local_node, true);
 
@@ -276,17 +284,22 @@ impl Peer {
             stats: Arc::new(PeerStats::default()),
         };
 
-        peer.handshake(timeout_secs, None, pending_peer_ids).await?;
+        peer.handshake(timeout_secs, None, pending_peer_ids, initial_byte_grant)
+            .await?;
         Ok(peer)
     }
 
     /// Create a peer from an accepted connection.
+    ///
+    /// `initial_byte_grant` is the byte capacity sent in the initial
+    /// SEND_MORE_EXTENDED — typically from [`compute_flow_control_bytes_total`].
     pub async fn accept(
         connection: Connection,
         local_node: LocalNode,
         timeout_secs: u64,
         banned_peers: Arc<RwLock<HashSet<PeerId>>>,
         pending_peer_ids: Arc<DashMap<PeerId, Instant>>,
+        initial_byte_grant: u32,
     ) -> Result<Self> {
         debug!("Accepting peer from: {}", connection.remote_addr());
 
@@ -311,8 +324,13 @@ impl Peer {
         };
 
         // Perform handshake (with ban + pending-dedup checks after HELLO for inbound)
-        peer.handshake(timeout_secs, Some(banned_peers), Some(pending_peer_ids))
-            .await?;
+        peer.handshake(
+            timeout_secs,
+            Some(banned_peers),
+            Some(pending_peer_ids),
+            initial_byte_grant,
+        )
+        .await?;
 
         Ok(peer)
     }
@@ -331,6 +349,7 @@ impl Peer {
         timeout_secs: u64,
         banned_peers: Option<Arc<RwLock<HashSet<PeerId>>>>,
         pending_peer_ids: Option<Arc<DashMap<PeerId, Instant>>>,
+        initial_byte_grant: u32,
     ) -> Result<()> {
         self.state = PeerState::Handshaking;
         let handshake_start = std::time::Instant::now();
@@ -436,9 +455,12 @@ impl Peer {
 
         // Send SEND_MORE_EXTENDED to enable flow control.
         // Matches stellar-core Peer::recvAuth() → sendSendMore().
+        // The byte grant is computed from max_tx_size by the caller via
+        // compute_flow_control_bytes_total() — must match the FlowControl
+        // initial capacity for this peer.
         let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
             num_messages: FlowControlConfig::default().peer_flood_reading_capacity as u32,
-            num_bytes: INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+            num_bytes: initial_byte_grant,
         });
         self.send(send_more).await?;
         debug!("Sent SEND_MORE_EXTENDED to {}", self.info.peer_id);

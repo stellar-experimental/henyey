@@ -9,7 +9,7 @@ use super::{OutboundMessage, OverlayManager, SharedPeerState};
 use crate::{
     connection::ConnectionPool,
     connection_factory::ConnectionFactory,
-    flow_control::{FlowControl, FlowControlConfig},
+    flow_control::{compute_flow_control_bytes_total, FlowControl, FlowControlConfig},
     peer::{Peer, PeerInfo},
     LocalNode, OverlayError, PeerAddress, PeerEvent, PeerId, PeerType, Result,
 };
@@ -135,12 +135,14 @@ impl OverlayManager {
         peer_id: &PeerId,
         peer_info: PeerInfo,
         shared: &SharedPeerState,
+        initial_byte_grant: u32,
     ) -> std::result::Result<(mpsc::Receiver<OutboundMessage>, Arc<FlowControl>), OverlayError>
     {
         let (outbound_tx, outbound_rx) = mpsc::channel(OUTBOUND_MESSAGE_CHANNEL_SIZE);
         let stats = peer.stats();
         let flow_control = Arc::new(FlowControl::with_scp_callback(
             FlowControlConfig::default(),
+            initial_byte_grant,
             shared.scp_callback.clone(),
         ));
         flow_control.set_peer_id(peer_id.clone());
@@ -207,6 +209,7 @@ impl OverlayManager {
         mut peer: Peer,
         shared: SharedPeerState,
         pool: Arc<ConnectionPool>,
+        initial_byte_grant: u32,
     ) {
         let peer_id = peer.id().clone();
         if shared.banned_peers.read().contains(&peer_id) {
@@ -259,7 +262,7 @@ impl OverlayManager {
             .await;
 
         let (outbound_rx, flow_control) =
-            match Self::register_peer(&peer, &peer_id, peer_info, &shared) {
+            match Self::register_peer(&peer, &peer_id, peer_info, &shared, initial_byte_grant) {
                 Ok(result) => result,
                 Err(_) => {
                     debug!("Rejected duplicate inbound peer {} (race)", peer_id);
@@ -326,9 +329,14 @@ impl OverlayManager {
                                 let peer_handle = tokio::spawn(async move {
                                     let remote_addr = connection.remote_addr();
                                     let pending_peer_ids = Arc::clone(&shared.pending_connections.by_peer_id);
-                                    match Peer::accept(connection, local_node, auth_timeout, Arc::clone(&shared.banned_peers), pending_peer_ids).await {
+                                    // Single snapshot: compute the initial byte grant once
+                                    // and reuse for both SEND_MORE_EXTENDED and FlowControl.
+                                    let initial_byte_grant = compute_flow_control_bytes_total(
+                                        shared.max_tx_size_bytes.load(Ordering::Relaxed),
+                                    );
+                                    match Peer::accept(connection, local_node, auth_timeout, Arc::clone(&shared.banned_peers), pending_peer_ids, initial_byte_grant).await {
                                         Ok(peer) => {
-                                            Self::handle_accepted_inbound_peer(peer, shared, pool).await;
+                                            Self::handle_accepted_inbound_peer(peer, shared, pool, initial_byte_grant).await;
                                         }
                                         Err(e) => {
                                             debug!("Failed to accept peer: {}", e);
@@ -402,6 +410,11 @@ impl OverlayManager {
             }
         };
 
+        // Single snapshot: compute the initial byte grant once and reuse for
+        // both SEND_MORE_EXTENDED and FlowControl.
+        let initial_byte_grant =
+            compute_flow_control_bytes_total(shared.max_tx_size_bytes.load(Ordering::Relaxed));
+
         let pending_peer_ids = Some(Arc::clone(&shared.pending_connections.by_peer_id));
         let mut peer = match Peer::connect_with_connection(
             &addr,
@@ -409,6 +422,7 @@ impl OverlayManager {
             local_node,
             connect_timeout,
             pending_peer_ids,
+            initial_byte_grant,
         )
         .await
         {
@@ -460,7 +474,7 @@ impl OverlayManager {
 
         info!("Connected to discovered peer: {} at {}", peer_id, addr);
         let (outbound_rx, flow_control) =
-            match Self::register_peer(&peer, &peer_id, peer_info, &shared) {
+            match Self::register_peer(&peer, &peer_id, peer_info, &shared, initial_byte_grant) {
                 Ok(result) => result,
                 Err(_) => {
                     debug!("Rejected duplicate discovered peer {} (race)", peer_id);
@@ -625,6 +639,11 @@ pub(super) async fn connect_to_explicit_peer(
         }
     };
 
+    // Single snapshot: compute the initial byte grant once and reuse for
+    // both SEND_MORE_EXTENDED and FlowControl.
+    let initial_byte_grant =
+        compute_flow_control_bytes_total(shared.max_tx_size_bytes.load(Ordering::Relaxed));
+
     let pending_peer_ids = Some(Arc::clone(&shared.pending_connections.by_peer_id));
     let mut peer = match Peer::connect_with_connection(
         addr,
@@ -632,6 +651,7 @@ pub(super) async fn connect_to_explicit_peer(
         local_node,
         timeout_secs,
         pending_peer_ids,
+        initial_byte_grant,
     )
     .await
     {
@@ -678,17 +698,22 @@ pub(super) async fn connect_to_explicit_peer(
     }
 
     info!("Connected to peer: {} at {}", peer_id, addr);
-    let (outbound_rx, flow_control) =
-        match OverlayManager::register_peer(&peer, &peer_id, peer_info, &shared) {
-            Ok(result) => result,
-            Err(e) => {
-                debug!("Rejected duplicate peer {} (race)", peer_id);
-                peer.close().await;
-                shared.pending_connections.release_peer_id(&peer_id);
-                pool.release_authenticated();
-                return Err(e);
-            }
-        };
+    let (outbound_rx, flow_control) = match OverlayManager::register_peer(
+        &peer,
+        &peer_id,
+        peer_info,
+        &shared,
+        initial_byte_grant,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            debug!("Rejected duplicate peer {} (race)", peer_id);
+            peer.close().await;
+            shared.pending_connections.release_peer_id(&peer_id);
+            pool.release_authenticated();
+            return Err(e);
+        }
+    };
 
     shared.pending_connections.release_peer_id(&peer_id);
     shared

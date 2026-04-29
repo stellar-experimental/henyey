@@ -374,6 +374,10 @@ pub(super) struct SharedPeerState {
     /// Per-peer query rate-limit window in whole seconds, updated by the app
     /// layer after each ledger close. See `OverlayManager::set_query_rate_limit_window`.
     pub(super) query_rate_limit_window_secs: Arc<AtomicU64>,
+    /// Current maximum transaction size in bytes. Shared with the app layer
+    /// (same `Arc<AtomicU32>`) so the overlay can dynamically compute the
+    /// initial byte grant for new peers via `compute_flow_control_bytes_total`.
+    pub(super) max_tx_size_bytes: Arc<AtomicU32>,
 }
 
 impl SharedPeerState {
@@ -593,21 +597,13 @@ pub struct OverlayManager {
     /// via [`set_query_rate_limit_window`] after each ledger close; peer tasks
     /// read it through `SharedPeerState`.
     pub(super) query_rate_limit_window_secs: Arc<AtomicU64>,
+    /// Current maximum transaction size in bytes. Shared with the app layer
+    /// via the same `Arc<AtomicU32>` so the overlay reads the latest value
+    /// when computing initial byte grants for new peers.
+    pub(super) max_tx_size_bytes: Arc<AtomicU32>,
 }
 
 impl OverlayManager {
-    #[cfg(test)]
-    pub(super) fn initial_send_more_grant(
-        config: &crate::flow_control::FlowControlConfig,
-    ) -> (u32, u32) {
-        // Flow control bytes credit is granted in byte-batch units.
-        // This must match the local byte capacity tracked in FlowControl.
-        (
-            config.peer_flood_reading_capacity as u32,
-            config.flow_control_bytes_batch_size as u32,
-        )
-    }
-
     /// Create a new overlay manager with the given configuration.
     pub fn new(config: OverlayConfig, local_node: LocalNode) -> Result<Self> {
         Self::new_with_connection_factory(config, local_node, Arc::new(TcpConnectionFactory))
@@ -626,6 +622,9 @@ impl OverlayManager {
             connection_factory,
             Arc::new(AtomicI64::new(0)),
             Arc::new(AtomicI64::new(0)),
+            Arc::new(AtomicU32::new(
+                crate::flow_control::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+            )),
         )
     }
 
@@ -633,6 +632,10 @@ impl OverlayManager {
     /// fetch channel depth metrics. The caller (typically `App`) keeps its
     /// own `Arc` handles so the same atomics back `/metrics` and the
     /// watchdog. Issue #1741.
+    ///
+    /// `max_tx_size_bytes` is the shared atomic tracking the current maximum
+    /// transaction size in bytes. The overlay reads this to compute the
+    /// initial byte grant for new peers via [`compute_flow_control_bytes_total`].
     // SECURITY: subscriber count bounded by internal callers; no external input
     pub fn new_with_fetch_metrics(
         config: OverlayConfig,
@@ -640,6 +643,7 @@ impl OverlayManager {
         connection_factory: Arc<dyn ConnectionFactory>,
         fetch_channel_depth: Arc<AtomicI64>,
         fetch_channel_depth_max: Arc<AtomicI64>,
+        max_tx_size_bytes: Arc<AtomicU32>,
     ) -> Result<Self> {
         // Broadcast channel for non-critical overlay messages (TX floods, etc.).
         // SCP and fetch-response messages bypass this channel via dedicated mpsc
@@ -699,6 +703,7 @@ impl OverlayManager {
             fetch_channel_depth_max,
             metrics: Arc::new(OverlayMetrics::new()),
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
+            max_tx_size_bytes,
         })
     }
 
@@ -731,6 +736,7 @@ impl OverlayManager {
             fetch_channel_depth_max: Arc::clone(&self.fetch_channel_depth_max),
             metrics: Arc::clone(&self.metrics),
             query_rate_limit_window_secs: Arc::clone(&self.query_rate_limit_window_secs),
+            max_tx_size_bytes: Arc::clone(&self.max_tx_size_bytes),
         }
     }
 
@@ -1795,6 +1801,9 @@ mod tests {
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             metrics: Arc::new(OverlayMetrics::new()),
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
+            max_tx_size_bytes: Arc::new(AtomicU32::new(
+                crate::flow_control::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+            )),
         }
     }
 
@@ -2305,6 +2314,9 @@ mod tests {
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             metrics: Arc::new(OverlayMetrics::new()),
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
+            max_tx_size_bytes: Arc::new(AtomicU32::new(
+                crate::flow_control::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+            )),
         };
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
@@ -2387,6 +2399,9 @@ mod tests {
             fetch_channel_depth_max: Arc::new(AtomicI64::new(0)),
             metrics: Arc::new(OverlayMetrics::new()),
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
+            max_tx_size_bytes: Arc::new(AtomicU32::new(
+                crate::flow_control::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+            )),
         };
         (shared, broadcast_rx, fetch_rx)
     }

@@ -46,6 +46,54 @@ pub trait ScpQueueCallback: Send + Sync {
     fn most_recent_checkpoint_seq(&self) -> u64;
 }
 
+/// Initial byte-level flood reading capacity.
+///
+/// Matches stellar-core `INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES` (300 000).
+/// Used as the default initial byte grant for new peer connections.
+pub const INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES: u32 = 300_000;
+
+/// Initial byte batch size for flow control SEND_MORE messages.
+///
+/// Matches stellar-core `INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES` (100 000).
+pub const INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES: u32 = 100_000;
+
+/// Compute the initial byte grant for flow control based on current max tx size.
+///
+/// Mirrors stellar-core `OverlayManagerImpl::getFlowControlBytesTotal()`
+/// (auto-compute branch — config overrides not yet supported).
+///
+/// When `max_tx_size` exceeds the headroom between the default reading capacity
+/// and the batch size (300KB − 100KB = 200KB), the grant is expanded to
+/// `max_tx_size + batch_size`. Otherwise the default 300KB applies.
+///
+/// # Panics
+///
+/// Panics if `max_tx_size` is 0 or if the result would overflow `u32`.
+///
+/// # Example
+///
+/// ```ignore
+/// use henyey_overlay::flow_control::compute_flow_control_bytes_total;
+///
+/// // Below threshold — default 300KB
+/// assert_eq!(compute_flow_control_bytes_total(100_000), 300_000);
+///
+/// // Above threshold — max_tx_size + batch
+/// assert_eq!(compute_flow_control_bytes_total(250_000), 350_000);
+/// ```
+pub fn compute_flow_control_bytes_total(max_tx_size: u32) -> u32 {
+    assert!(max_tx_size > 0, "max_tx_size must be > 0");
+    let threshold =
+        INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES - INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES;
+    if max_tx_size > threshold {
+        max_tx_size
+            .checked_add(INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES)
+            .expect("flow control bytes total overflow")
+    } else {
+        INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES
+    }
+}
+
 /// Configuration for flow control.
 ///
 /// Default values match stellar-core Config.cpp defaults:
@@ -349,20 +397,25 @@ pub struct FlowControl {
 }
 
 impl FlowControl {
-    /// Create a new flow control instance.
+    /// Create a new flow control instance with default initial byte capacity (300KB).
+    ///
+    /// For production peer connections, prefer [`with_scp_callback`] with the
+    /// grant from [`compute_flow_control_bytes_total`] so the initial capacity
+    /// matches the dynamically-computed SEND_MORE_EXTENDED grant.
     pub fn new(config: FlowControlConfig) -> Self {
-        Self::with_scp_callback(config, None)
+        Self::with_scp_callback(config, INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES, None)
     }
 
     /// Create a new flow control instance with an SCP queue callback.
+    ///
+    /// `initial_bytes_capacity` must match the SEND_MORE_EXTENDED byte grant
+    /// sent to the peer — typically from [`compute_flow_control_bytes_total`].
     pub fn with_scp_callback(
         config: FlowControlConfig,
+        initial_bytes_capacity: u32,
         scp_callback: Option<Arc<dyn ScpQueueCallback>>,
     ) -> Self {
-        // stellar-core: FlowControl initializes byte capacity from
-        // getFlowControlBytesTotal() which returns INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES
-        // (300,000) by default. This must match the SEND_MORE_EXTENDED grant sent to peers.
-        let initial_bytes_capacity = crate::peer::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES as u64;
+        let initial_bytes_capacity = initial_bytes_capacity as u64;
 
         Self {
             state: Mutex::new(FlowControlState {
@@ -1124,15 +1177,70 @@ mod tests {
 
     #[test]
     fn test_initial_byte_capacity_matches_send_more_grant() {
-        // stellar-core: FlowControl initializes byte capacity from
-        // getFlowControlBytesTotal() = INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES (300,000),
-        // matching the SEND_MORE_EXTENDED grant sent to peers.
+        // FlowControl::new() uses the default 300KB capacity, matching the
+        // default SEND_MORE_EXTENDED grant when max_tx_size is below threshold.
         let fc = FlowControl::default();
         let stats = fc.get_stats();
         assert_eq!(
             stats.local_flood_bytes_capacity, 300_000,
             "initial byte capacity must match SEND_MORE_EXTENDED grant (300,000)"
         );
+    }
+
+    // ── compute_flow_control_bytes_total tests ───────────────────────────
+
+    #[test]
+    fn test_compute_flow_control_bytes_total_below_threshold() {
+        // max_tx_size well below threshold (200KB) → default 300KB grant
+        assert_eq!(compute_flow_control_bytes_total(100_000), 300_000);
+        assert_eq!(compute_flow_control_bytes_total(1), 300_000);
+        assert_eq!(compute_flow_control_bytes_total(199_999), 300_000);
+    }
+
+    #[test]
+    fn test_compute_flow_control_bytes_total_at_threshold() {
+        // max_tx_size == threshold (200_000) → still default (condition is `>`, not `>=`)
+        assert_eq!(compute_flow_control_bytes_total(200_000), 300_000);
+    }
+
+    #[test]
+    fn test_compute_flow_control_bytes_total_above_threshold() {
+        // max_tx_size just above threshold → max_tx_size + batch_size (100KB)
+        assert_eq!(compute_flow_control_bytes_total(200_001), 300_001);
+        assert_eq!(compute_flow_control_bytes_total(250_000), 350_000);
+        assert_eq!(compute_flow_control_bytes_total(500_000), 600_000);
+    }
+
+    #[test]
+    fn test_compute_flow_control_bytes_total_large_value() {
+        // Very large but not overflowing
+        assert_eq!(
+            compute_flow_control_bytes_total(u32::MAX - 100_000),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "max_tx_size must be > 0")]
+    fn test_compute_flow_control_bytes_total_zero_panics() {
+        compute_flow_control_bytes_total(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn test_compute_flow_control_bytes_total_overflow_panics() {
+        // max_tx_size above threshold + batch_size would overflow u32
+        compute_flow_control_bytes_total(u32::MAX);
+    }
+
+    #[test]
+    fn test_with_scp_callback_uses_custom_initial_bytes() {
+        // Production path: FlowControl::with_scp_callback() should respect
+        // the initial_bytes_capacity parameter (e.g., when max_tx_size > 200KB).
+        let grant = compute_flow_control_bytes_total(250_000); // 350_000
+        let fc = FlowControl::with_scp_callback(FlowControlConfig::default(), grant, None);
+        let stats = fc.get_stats();
+        assert_eq!(stats.local_flood_bytes_capacity, 350_000);
     }
 
     #[test]
@@ -1388,7 +1496,11 @@ mod tests {
             min_slot: 100,
             checkpoint_seq: 50,
         });
-        let fc = FlowControl::with_scp_callback(config, Some(callback));
+        let fc = FlowControl::with_scp_callback(
+            config,
+            INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+            Some(callback),
+        );
 
         // Add messages at various slots
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(10)); // old, should drop
@@ -1418,7 +1530,11 @@ mod tests {
             min_slot: 100,
             checkpoint_seq: 50,
         });
-        let fc = FlowControl::with_scp_callback(config, Some(callback));
+        let fc = FlowControl::with_scp_callback(
+            config,
+            INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+            Some(callback),
+        );
 
         // Fill past limit with old slots including the checkpoint
         fc.add_msg_and_maybe_trim_queue(make_scp_message_at_slot(50)); // checkpoint

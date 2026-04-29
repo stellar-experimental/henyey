@@ -648,8 +648,9 @@ pub struct App {
     /// Mirrors stellar-core's `ledger.transaction.count` histogram `.count`.
     ledger_tx_count: AtomicU64,
     /// Current max tx size in bytes for flow control (tracks upgrades).
-    /// Mirrors upstream `mMaxTxSize` in HerderImpl.
-    max_tx_size_bytes: AtomicU32,
+    /// Mirrors upstream `mMaxTxSize` in HerderImpl. Shared with the overlay
+    /// via `Arc` so new peer connections can compute dynamic initial grants.
+    max_tx_size_bytes: Arc<AtomicU32>,
     /// Monotonic counter used for ping IDs.
     ping_counter: AtomicU64,
     /// Unified in-flight ping state (hash→info + peer→hash).
@@ -1036,9 +1037,9 @@ impl App {
             recovery_throttles: log_throttle::RecoveryLogThrottles::new(),
             max_observed_externalize_slot: AtomicU64::new(0),
             ledger_tx_count: AtomicU64::new(0),
-            max_tx_size_bytes: AtomicU32::new(
+            max_tx_size_bytes: Arc::new(AtomicU32::new(
                 henyey_herder::flow_control::MAX_CLASSIC_TX_SIZE_BYTES,
-            ),
+            )),
             ping_counter: AtomicU64::new(0),
             ping_state: tokio::sync::Mutex::new(PingState::default()),
             self_arc: RwLock::new(std::sync::Weak::new()),

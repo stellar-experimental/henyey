@@ -341,7 +341,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `getPeerManager()` | N/A (not exposed directly) | Partial |
 | `getSurveyManager()` | N/A (not exposed directly) | Partial |
 | `recordMessageMetric()` | (via OverlayMetrics) | Full |
-| `getFlowControlBytesTotal()` | N/A | None |
+| `getFlowControlBytesTotal()` | `compute_flow_control_bytes_total()` | Full |
 | `checkScheduledAndCache()` | (via FloodGate.has_seen) | Full |
 | `getOverlayThreadSnapshot()` | N/A | None |
 | `tick()` | `start_tick_loop()` (3s interval) | Full |
@@ -508,7 +508,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `OverlayManagerImpl::getPendingPeersCount()` | Low | Pending count |
 | `OverlayManagerImpl::getInboundAuthenticatedPeers()` | Low | Separate inbound map |
 | `OverlayManagerImpl::getOutboundAuthenticatedPeers()` | Low | Separate outbound map |
-| `OverlayManagerImpl::getFlowControlBytesTotal()` | Low | Aggregate flow control bytes |
 | `OverlayManagerImpl::createTxBatch()` | Low | Batch TX message creation |
 | `OverlayManagerImpl::getFlowControlBytesBatch()` | Low | Config-based batch size |
 | `OverlayManagerImpl::nonPreferredAuthenticatedCount()` | Low | Count for peer eviction |

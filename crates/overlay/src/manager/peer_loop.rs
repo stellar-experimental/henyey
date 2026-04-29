@@ -1433,12 +1433,18 @@ mod tests {
     }
 
     #[test]
-    fn test_initial_send_more_grant_uses_byte_batch_size() {
+    fn test_initial_send_more_grant_matches_default_capacity() {
+        // When max_tx_size is below the threshold (200KB), the initial byte
+        // grant should be the default 300KB. This is the common mainnet case.
+        use crate::flow_control::{
+            compute_flow_control_bytes_total, INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+        };
         let config = FlowControlConfig::default();
-        let (msgs, bytes) = OverlayManager::initial_send_more_grant(&config);
+        let msgs = config.peer_flood_reading_capacity;
+        let bytes = compute_flow_control_bytes_total(100_000); // typical max_tx_size
 
         assert_eq!(msgs, 200);
-        assert_eq!(bytes, 100_000);
+        assert_eq!(bytes, INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES);
     }
 
     // --- G16: Per-peer capacity enforcement tests ---

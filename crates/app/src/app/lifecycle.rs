@@ -1153,6 +1153,7 @@ impl App {
             Arc::clone(&self.overlay_connection_factory),
             Arc::clone(&self.fetch_channel_depth),
             Arc::clone(&self.fetch_channel_depth_max),
+            Arc::clone(&self.max_tx_size_bytes),
         )?;
         overlay.set_scp_callback(Arc::new(super::HerderScpCallback {
             herder: Arc::clone(&self.herder),
@@ -1649,9 +1650,10 @@ impl App {
     /// overlay peers if the value increased.
     ///
     /// Called at startup (before overlay starts — no peers to notify),
-    /// after catchup, and on each ledger close. The atomic is bookkeeping
-    /// for computing diffs; new peers always receive a fixed initial byte
-    /// grant (`INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES`).
+    /// after catchup, and on each ledger close. The overlay reads this
+    /// atomic to compute dynamic initial byte grants for new peers via
+    /// `compute_flow_control_bytes_total()`. Existing peers are notified
+    /// of increases via `handle_max_tx_size_increase()`.
     ///
     /// Mirrors upstream `HerderImpl::maybeHandleUpgrade()` max-tx-size
     /// tracking plus the startup initialization in `HerderImpl::start()`.
