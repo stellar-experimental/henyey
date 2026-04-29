@@ -326,6 +326,23 @@ review_round = 0
 current_proposal = <issue body + any relevant context>
 ```
 
+### Proposal Output Requirements
+
+Every proposal (initial and subsequent rewrites) should include:
+
+- **## Problem** — clear statement of the root cause
+- **## Proposed Fix** — concrete changes and their rationale
+- **## Affected Paths** — files, functions, and code paths that will be modified
+- **### Parity Verification** — evidence that this change maintains stellar-core parity:
+  - Feature behavior vs stellar-core v25: [link to code reference or "N/A — new feature"]
+  - Determinism/config assumptions: [file:line evidence or rationale]
+  - Edge cases checked: [list or "n/a"]
+- **### Test Strategy** — (optional but strongly recommended) outline of how the fix will be tested:
+  - Unit tests: [areas to cover]
+  - Integration/regression tests: [scenarios]
+  - Existing tests affected: [changes needed or "none"]
+- **### Affected/Similar Paths Searched** — list search terms, call graph paths checked, confirmed affected locations, and "not affected because…" notes. Allow `n/a` only with concrete justification (e.g., "new invariant local to this module").
+
 ---
 
 ## Step 2: Proposal Convergence Loop
@@ -411,30 +428,33 @@ Evaluate this proposal thoroughly:
    code paths exist and behave as described?
 2. **Completeness**: Does the proposal cover all affected code paths? Are
    there cases it misses?
-3. **Feasibility**: Can this be implemented as described? Are there
+3. **Spec clarity**: Does the proposal define exact ledger state, protocol
+   version limits, config flags, pre/post conditions, and determinism
+   assumptions? Are boundary conditions explicit?
+4. **Feasibility**: Can this be implemented as described? Are there
    practical obstacles?
-4. **Risk**: What could go wrong? What edge cases are not addressed?
-5. **Scope**: Is the scope appropriate? Too broad? Too narrow?
-6. **Stellar-core parity**: Will the proposed changes maintain or improve
-   parity with stellar-core?
-7. **Structural ambition**: Does the proposal go far enough? Could a
+5. **Risk**: What could go wrong? What edge cases are not addressed?
+6. **Scope**: Is the scope appropriate? Too broad? Too narrow?
+7. **Stellar-core parity**: Will the proposed changes maintain or improve
+   parity with stellar-core? Are citations to stellar-core code provided?
+8. **Structural ambition**: Does the proposal go far enough? Could a
    bigger refactor — changing public APIs, restructuring types, using
    Arc/Cow/lifetimes, redesigning enums, splitting or merging modules —
    eliminate the *class* of bug rather than patching the one symptom?
    Prefer structural solutions that make incorrect states
    unrepresentable over minimal fixes that address one instance.
-8. **Readability & sustainability**: Will the resulting code be easy to
+9. **Readability & sustainability**: Will the resulting code be easy to
    read, modify, and extend in six months? Does it push invariants into
    types (newtypes, enums, constructors) or shared helpers so future
    callers can't silently get it wrong? Does it use idiomatic Rust —
    ownership over cloning, iterators over index loops, `?` over match
    chains, `Result`/`Option` over sentinel values? Does it name things
    well and keep functions focused?
-9. **Long-term vs. short-term tradeoff**: Is the proposed fix a durable
-   building block, or a short-term patch that leaves the underlying
-   design problem in place? If the latter, flag it — this skill
-   explicitly prefers significant refactors that produce sound
-   foundations over narrow patches that will need to be undone.
+10. **Long-term vs. short-term tradeoff**: Is the proposed fix a durable
+    building block, or a short-term patch that leaves the underlying
+    design problem in place? If the latter, flag it — this skill
+    explicitly prefers significant refactors that produce sound
+    foundations over narrow patches that will need to be undone.
 
 ## Output Format
 
