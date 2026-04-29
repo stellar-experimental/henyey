@@ -168,7 +168,17 @@ impl App {
             (last_processed + 1, last_processed)
         } else if latest_externalized.saturating_sub(last_processed) > TX_SET_REQUEST_WINDOW {
             let skip_to = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW);
-            (skip_to + 1, skip_to)
+            // When there's a gap (last_processed <= current_ledger, e.g.
+            // after catchup), don't skip past current_ledger — gap slots
+            // between current_ledger+1 and skip_to need to be iterable.
+            // In normal operation (last_processed > current_ledger), the
+            // original skip optimization is preserved.
+            let effective_skip = if last_processed <= current_ledger as u64 {
+                skip_to.min(current_ledger as u64)
+            } else {
+                skip_to
+            };
+            (effective_skip + 1, effective_skip)
         } else {
             (last_processed + 1, last_processed)
         }
@@ -1191,8 +1201,7 @@ impl App {
             }
         };
 
-        self.update_buffered_tx_set(slot as u32, close_info.tx_set)
-            .await;
+        self.ensure_buffered_slot(slot as u32, close_info).await;
         // The actual close is handled by the event loop's pending_close
         // chaining (try_start_ledger_close), not inline here.
     }
@@ -1381,11 +1390,12 @@ impl App {
                     }
                 } else {
                     // check_ledger_close returned None and slot not buffered.
-                    // Legacy code still advanced `advance_to` if contiguous
-                    // (old ledger_close.rs:1211).
-                    if slot == advance_to + 1 {
-                        advance_to = slot;
-                    }
+                    // Do NOT advance advance_to — this slot was never
+                    // materialized. The loop continues to process later
+                    // slots (they may have SCP data or be already buffered),
+                    // but the contiguous watermark stays at the last
+                    // materialized slot so this gap is retried on the next
+                    // process_externalized_slots call.
                 }
             }
             super::warn_if_slow(
@@ -1545,30 +1555,79 @@ impl App {
         }
     }
 
-    async fn update_buffered_tx_set(
+    /// Ensure a slot is in the syncing_ledgers buffer with the best
+    /// available data.
+    ///
+    /// - Vacant: insert the full `LedgerCloseInfo`.
+    /// - Occupied, `tx_set_hash` matches: upgrade `tx_set` if `info` has
+    ///   one the existing entry lacks.
+    /// - Occupied, `tx_set_hash` differs: log a warning and keep the
+    ///   existing entry (SCP consensus data is authoritative).
+    ///
+    /// Returns `true` if a `tx_set` is present for the slot after the call.
+    pub(super) async fn ensure_buffered_slot(
         &self,
         slot: u32,
-        tx_set: Option<henyey_herder::TransactionSet>,
-    ) {
-        let Some(tx_set) = tx_set else {
-            return;
-        };
+        info: henyey_herder::LedgerCloseInfo,
+    ) -> bool {
         let mut buffer =
             tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
-        if let Some(entry) = buffer.get_mut(&slot) {
-            if *tx_set.hash() != entry.tx_set_hash {
-                tracing::warn!(
-                    slot,
-                    expected = %entry.tx_set_hash.to_hex(),
-                    found = %tx_set.hash().to_hex(),
-                    "Buffered tx set hash mismatch (dropping)"
-                );
-                return;
+        match buffer.entry(slot) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if existing.tx_set_hash != info.tx_set_hash {
+                    tracing::warn!(
+                        slot,
+                        existing_hash = %existing.tx_set_hash.to_hex(),
+                        new_hash = %info.tx_set_hash.to_hex(),
+                        "ensure_buffered_slot: tx_set_hash mismatch, keeping existing"
+                    );
+                    return existing.tx_set.is_some();
+                }
+                if existing.tx_set.is_none() && info.tx_set.is_some() {
+                    existing.tx_set = info.tx_set;
+                    tracing::debug!(slot, "ensure_buffered_slot: upgraded tx_set");
+                }
+                existing.tx_set.is_some()
             }
-            entry.tx_set = Some(tx_set);
-            tracing::debug!(slot, "Buffered tx set attached");
-        } else {
-            tracing::debug!(slot, "Received tx set for unbuffered slot");
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let has_tx_set = info.tx_set.is_some();
+                tracing::debug!(slot, has_tx_set, "ensure_buffered_slot: inserted new entry");
+                entry.insert(info);
+                has_tx_set
+            }
+        }
+    }
+
+    /// Try to populate gap slots between `current_ledger` and the first
+    /// buffered slot from the externalized SCP cache. Called by recovery
+    /// when a sequence gap is detected.
+    pub(super) async fn populate_gap_slots(&self, current_ledger: u32) {
+        let first_buffered = {
+            let buffer = tracked_lock::tracked_read("syncing_ledgers", &self.syncing_ledgers).await;
+            buffer.keys().next().copied()
+        };
+        let Some(first) = first_buffered else {
+            return;
+        };
+        let gap_start = current_ledger + 1;
+        if gap_start >= first {
+            return;
+        }
+        let mut populated = 0u32;
+        for gap_slot in gap_start..first {
+            if let Some(info) = self.herder.check_ledger_close(gap_slot as u64) {
+                self.ensure_buffered_slot(gap_slot, info).await;
+                populated += 1;
+            }
+        }
+        if populated > 0 {
+            tracing::info!(
+                populated,
+                current_ledger,
+                first_buffered = first,
+                "Populated gap slots from externalized cache"
+            );
         }
     }
 
@@ -1601,13 +1660,7 @@ impl App {
         let Some(info) = self.herder.check_ledger_close(slot) else {
             return false;
         };
-        {
-            let mut buffer =
-                tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
-            buffer.entry(info.slot as u32).or_insert(info);
-        }
-        self.update_buffered_tx_set(slot as u32, Some(tx_set.clone()))
-            .await;
+        self.ensure_buffered_slot(info.slot as u32, info).await;
         tracing::debug!(
             slot,
             hash = %tx_set.hash(),

@@ -656,6 +656,12 @@ impl App {
 
             match classify_cannot_apply_reason(without_tx_set, sequence_gap) {
                 CannotApplyReason::BufferedSequenceGap => {
+                    // Proactively populate gap slots from externalized
+                    // SCP cache. This provides immediate population rather
+                    // than waiting for the next process_externalized_slots
+                    // tick.
+                    self.populate_gap_slots(current_ledger).await;
+
                     let now_secs = self.start_instant.elapsed().as_secs();
                     if self
                         .recovery_throttles

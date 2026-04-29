@@ -479,18 +479,13 @@ impl App {
         {
             let current_ledger = self.get_current_ledger().await.unwrap_or(new_lcl);
             let latest_ext = self.herder.latest_externalized_slot().unwrap_or(0);
-            let mut buffer = self.syncing_ledgers.write().await;
             let mut populated = 0u32;
             for slot in (current_ledger as u64 + 1)..=latest_ext {
-                let seq = slot as u32;
-                if buffer.contains_key(&seq) {
-                    continue;
-                }
                 if let Some(info) = self.herder.check_ledger_close(slot) {
                     if info.tx_set.is_some() {
                         populated += 1;
                     }
-                    buffer.insert(seq, info);
+                    self.ensure_buffered_slot(slot as u32, info).await;
                 }
             }
             if populated > 0 {

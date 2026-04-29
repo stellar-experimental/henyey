@@ -383,7 +383,7 @@ pub struct App {
     /// `.write()` callers are reachable from the event-loop select!
     /// arms (`process_externalized_slots`, `maybe_start_buffered_catchup`,
     /// `attach_tx_set_by_hash`, `buffer_externalized_tx_set`,
-    /// `update_buffered_tx_set`, `out_of_sync_recovery`,
+    /// `ensure_buffered_slot`, `out_of_sync_recovery`,
     /// `handle_catchup_result`).
     ///
     /// Holders of `.write()` MUST NOT hold the write guard across a
@@ -4328,11 +4328,11 @@ mod tests {
 
     #[test]
     fn test_externalized_iteration_window_published_checkpoint_trims_to_window() {
-        // first_replay checkpoint is published, so large gaps should trim to
-        // the TX_SET_REQUEST_WINDOW tail.
-        let last_processed = 100u64;
+        // Normal operation: last_processed > current_ledger, so the
+        // TX_SET_REQUEST_WINDOW trimming applies unchanged.
+        let last_processed = 130u64;
         let current_ledger = 110u32;
-        let latest_externalized = 150u64; // gap from last_processed is 50 > 12
+        let latest_externalized = 150u64; // gap from last_processed is 20 > 12
 
         let (iter_start, advance_to) =
             App::externalized_iteration_window(last_processed, current_ledger, latest_externalized);
@@ -4340,6 +4340,42 @@ mod tests {
         let expected_skip_to = latest_externalized.saturating_sub(TX_SET_REQUEST_WINDOW);
         assert_eq!(iter_start, expected_skip_to + 1);
         assert_eq!(advance_to, expected_skip_to);
+    }
+
+    /// After catchup at ledger N with last_processed = N = current_ledger,
+    /// the window must NOT skip past current_ledger — gap slots between
+    /// current_ledger+1 and skip_to need to be iterable.
+    #[test]
+    fn test_externalized_iteration_window_gap_after_catchup() {
+        // Simulates: catchup completes at N=100, latest_externalized = 143.
+        // Gap of 43 > TX_SET_REQUEST_WINDOW (12).
+        // Old behavior: iter_start = 132, skipping gap slot 101.
+        // New behavior: iter_start = 101, covering the gap.
+        let last_processed = 100u64;
+        let current_ledger = 100u32;
+        let latest_externalized = 143u64;
+
+        let (iter_start, advance_to) =
+            App::externalized_iteration_window(last_processed, current_ledger, latest_externalized);
+
+        // Should start at current_ledger + 1 (= 101), not skip_to + 1 (= 132)
+        assert_eq!(iter_start, 101);
+        assert_eq!(advance_to, 100);
+    }
+
+    /// When last_processed < current_ledger (e.g., just after catchup reset)
+    /// but the gap is within TX_SET_REQUEST_WINDOW, normal behavior applies.
+    #[test]
+    fn test_externalized_iteration_window_small_gap_no_skip() {
+        let last_processed = 100u64;
+        let current_ledger = 100u32;
+        let latest_externalized = 110u64; // gap = 10 <= 12
+
+        let (iter_start, advance_to) =
+            App::externalized_iteration_window(last_processed, current_ledger, latest_externalized);
+
+        assert_eq!(iter_start, 101);
+        assert_eq!(advance_to, 100);
     }
 
     #[test]
@@ -8197,5 +8233,121 @@ mod tests {
             result.is_err(),
             "malformed authoritative HAS should cause an error"
         );
+    }
+
+    // ── ensure_buffered_slot tests ───────────────────────────────────────
+
+    /// Helper to create a minimal LedgerCloseInfo for testing.
+    fn make_close_info(
+        slot: u64,
+        tx_set_hash: henyey_common::Hash256,
+        tx_set: Option<henyey_herder::TransactionSet>,
+    ) -> henyey_herder::LedgerCloseInfo {
+        henyey_herder::LedgerCloseInfo {
+            slot,
+            close_time: slot,
+            tx_set_hash,
+            tx_set,
+            upgrades: Vec::new(),
+            stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ensure_buffered_slot_vacant_insert() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("test.db"))
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let hash = henyey_common::Hash256::from_bytes([1u8; 32]);
+        let info = make_close_info(100, hash, None);
+
+        // Insert into vacant slot — should succeed, return false (no tx_set)
+        let has_tx_set = app.ensure_buffered_slot(100, info).await;
+        assert!(!has_tx_set, "No tx_set was provided");
+
+        // Verify the entry exists
+        let buffer = app.syncing_ledgers.read().await;
+        assert!(buffer.contains_key(&100));
+        assert_eq!(buffer[&100].tx_set_hash, hash);
+        assert!(buffer[&100].tx_set.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_buffered_slot_upgrade_tx_set() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("test.db"))
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let hash = henyey_common::Hash256::from_bytes([2u8; 32]);
+        // First: insert without tx_set
+        let info1 = make_close_info(200, hash, None);
+        app.ensure_buffered_slot(200, info1).await;
+
+        // Second: insert with tx_set (same hash) — should upgrade
+        let tx_set =
+            henyey_herder::TransactionSet::new_legacy(henyey_common::Hash256::ZERO, Vec::new());
+        let info2 = make_close_info(200, hash, Some(tx_set));
+        let has_tx_set = app.ensure_buffered_slot(200, info2).await;
+        assert!(has_tx_set, "tx_set should be upgraded");
+
+        let buffer = app.syncing_ledgers.read().await;
+        assert!(buffer[&200].tx_set.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_buffered_slot_noop_when_already_has_tx_set() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("test.db"))
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let hash = henyey_common::Hash256::from_bytes([3u8; 32]);
+        let tx_set =
+            henyey_herder::TransactionSet::new_legacy(henyey_common::Hash256::ZERO, Vec::new());
+        // Insert with tx_set
+        let info1 = make_close_info(300, hash, Some(tx_set.clone()));
+        app.ensure_buffered_slot(300, info1).await;
+
+        // Try again with no tx_set — should be no-op, return true
+        let info2 = make_close_info(300, hash, None);
+        let has_tx_set = app.ensure_buffered_slot(300, info2).await;
+        assert!(has_tx_set, "existing tx_set should be preserved");
+    }
+
+    #[tokio::test]
+    async fn test_ensure_buffered_slot_hash_mismatch_keeps_existing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("test.db"))
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        let hash1 = henyey_common::Hash256::from_bytes([4u8; 32]);
+        let hash2 = henyey_common::Hash256::from_bytes([5u8; 32]);
+
+        // Insert with hash1
+        let info1 = make_close_info(400, hash1, None);
+        app.ensure_buffered_slot(400, info1).await;
+
+        // Try to insert with different hash — should be rejected
+        let tx_set =
+            henyey_herder::TransactionSet::new_legacy(henyey_common::Hash256::ZERO, Vec::new());
+        let info2 = make_close_info(400, hash2, Some(tx_set));
+        let has_tx_set = app.ensure_buffered_slot(400, info2).await;
+        assert!(
+            !has_tx_set,
+            "hash mismatch should keep existing (no tx_set)"
+        );
+
+        // Verify existing entry preserved
+        let buffer = app.syncing_ledgers.read().await;
+        assert_eq!(buffer[&400].tx_set_hash, hash1);
+        assert!(buffer[&400].tx_set.is_none());
     }
 }
