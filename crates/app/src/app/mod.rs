@@ -8350,4 +8350,157 @@ mod tests {
         assert_eq!(buffer[&400].tx_set_hash, hash1);
         assert!(buffer[&400].tx_set.is_none());
     }
+
+    /// Regression: cursor must not advance past an unmaterialized slot.
+    ///
+    /// Setup: externalized slots {N+1, N+3}, but NOT N+2. N+2 is also
+    /// not in syncing_ledgers. After process_externalized_slots,
+    /// last_processed_slot should be N+1 (not N+3), because N+2 was
+    /// never materialized.
+    #[tokio::test]
+    async fn test_process_externalized_slots_cursor_stops_at_gap() {
+        let app = mk_test_app_for_pes_split().await;
+        app.herder.set_state(henyey_herder::HerderState::Tracking);
+
+        let n: u64 = 50;
+        let driver = app.herder.scp_driver();
+        // Externalize N+1 and N+3 — but NOT N+2
+        for (slot, hash_byte) in &[(n + 1, 0x11u8), (n + 3, 0x33u8)] {
+            let hash = [*hash_byte; 32];
+            let xdr = mk_stellar_value_xdr(hash);
+            driver.record_externalized(*slot, mk_value(xdr), None);
+        }
+
+        *app.last_processed_slot.write().await = n;
+
+        let _pending = app.process_externalized_slots().await;
+
+        // Cursor should have stopped at N+1 (contiguous from N),
+        // not advanced to N+3.
+        let last = *app.last_processed_slot.read().await;
+        assert_eq!(
+            last,
+            n + 1,
+            "cursor must stop at N+1, not advance past unmaterialized N+2"
+        );
+
+        // N+3 should still be in buffer though (it was materialized)
+        let buf = app.syncing_ledgers.read().await;
+        assert!(
+            buf.contains_key(&((n + 3) as u32)),
+            "N+3 should be buffered"
+        );
+    }
+
+    /// Test that populate_gap_slots fills slots between current_ledger
+    /// and the first buffered slot from externalized SCP cache.
+    #[tokio::test]
+    async fn test_populate_gap_slots_fills_gap() {
+        let app = mk_test_app_for_pes_split().await;
+        app.herder.set_state(henyey_herder::HerderState::Tracking);
+
+        let current = 100u32;
+        let first_buffered = 105u32;
+
+        // Externalize gap slots 101..105
+        let driver = app.herder.scp_driver();
+        for slot in (current as u64 + 1)..(first_buffered as u64) {
+            let hash = [slot as u8; 32];
+            let xdr = mk_stellar_value_xdr(hash);
+            driver.record_externalized(slot, mk_value(xdr), None);
+        }
+
+        // Pre-seed the buffer with first_buffered only
+        {
+            let mut buf = app.syncing_ledgers.write().await;
+            buf.insert(
+                first_buffered,
+                henyey_herder::LedgerCloseInfo {
+                    slot: first_buffered as u64,
+                    close_time: 0,
+                    tx_set_hash: henyey_common::Hash256::from_bytes([0xAA; 32]),
+                    tx_set: None,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                },
+            );
+        }
+
+        app.populate_gap_slots(current).await;
+
+        // All gap slots should now be in the buffer
+        let buf = app.syncing_ledgers.read().await;
+        for slot in (current + 1)..first_buffered {
+            assert!(
+                buf.contains_key(&slot),
+                "Gap slot {} should have been populated",
+                slot
+            );
+        }
+        // First buffered should still be there
+        assert!(buf.contains_key(&first_buffered));
+    }
+
+    /// Test that populate_gap_slots is a no-op when there's no gap.
+    #[tokio::test]
+    async fn test_populate_gap_slots_no_gap() {
+        let app = mk_test_app_for_pes_split().await;
+
+        // Buffer starts at current_ledger + 1 — no gap
+        let current = 100u32;
+        {
+            let mut buf = app.syncing_ledgers.write().await;
+            buf.insert(
+                101,
+                henyey_herder::LedgerCloseInfo {
+                    slot: 101,
+                    close_time: 0,
+                    tx_set_hash: henyey_common::Hash256::from_bytes([0xBB; 32]),
+                    tx_set: None,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                },
+            );
+        }
+
+        app.populate_gap_slots(current).await;
+
+        // Should still only have the one entry
+        let buf = app.syncing_ledgers.read().await;
+        assert_eq!(buf.len(), 1);
+    }
+
+    /// Regression: buffer_externalized_tx_set must use the provided
+    /// tx_set even when check_ledger_close returns info without one
+    /// (unsolicited tx_set scenario).
+    #[tokio::test]
+    async fn test_buffer_externalized_tx_set_uses_provided_tx_set() {
+        let app = mk_test_app_for_pes_split().await;
+        app.herder.set_state(henyey_herder::HerderState::Tracking);
+
+        let slot: u64 = 200;
+        let tx_set_hash_bytes = [0x42u8; 32];
+
+        // Externalize the slot (which seeds check_ledger_close, but
+        // the returned info.tx_set will be None since we don't seed
+        // the tx_set cache).
+        let xdr = mk_stellar_value_xdr(tx_set_hash_bytes);
+        let driver = app.herder.scp_driver();
+        driver.record_externalized(slot, mk_value(xdr), None);
+
+        // Create a tx_set with matching hash via with_hash
+        let hash = henyey_common::Hash256::from_bytes(tx_set_hash_bytes);
+        let zero_hash = henyey_common::Hash256::from_bytes([0u8; 32]);
+        let tx_set = henyey_herder::TransactionSet::with_hash(zero_hash, hash, Vec::new());
+        let result = app.buffer_externalized_tx_set(&tx_set).await;
+        assert!(result, "should return true when slot is found");
+
+        // The buffered entry should have the tx_set populated
+        let buf = app.syncing_ledgers.read().await;
+        let entry = buf.get(&(slot as u32)).expect("slot should be in buffer");
+        assert!(
+            entry.tx_set.is_some(),
+            "tx_set must be populated from the provided tx_set, not from check_ledger_close"
+        );
+    }
 }

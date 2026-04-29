@@ -1657,9 +1657,16 @@ impl App {
         else {
             return false;
         };
-        let Some(info) = self.herder.check_ledger_close(slot) else {
+        let Some(mut info) = self.herder.check_ledger_close(slot) else {
             return false;
         };
+        // The caller already has the tx_set; ensure it is propagated into
+        // the buffered slot even when check_ledger_close returned an info
+        // without one (e.g. unsolicited tx sets that are not cached by
+        // TxSetTracker).
+        if info.tx_set.is_none() {
+            info.tx_set = Some(tx_set.clone());
+        }
         self.ensure_buffered_slot(info.slot as u32, info).await;
         tracing::debug!(
             slot,
