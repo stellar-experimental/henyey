@@ -2254,34 +2254,17 @@ impl Herder {
             "Proposing transaction set"
         );
 
-        // 3.5. Self-validation roundtrip (parity: stellar-core
-        // `makeTxSetFromTransactions` @ TxSetFrame.cpp:898-952).
-        // Defense-in-depth against future tx-set construction bugs that
-        // produce a set our own validator would reject. Abort nomination on
-        // failure rather than caching a known-bad set (#2103, #2113).
-        if !self.self_validate_nomination_tx_set(
+        // 3.5. Self-validation roundtrip + cache. Aborts nomination on
+        // self-validation failure rather than caching a known-bad set
+        // (defense-in-depth #2103, #2113).
+        self.validate_and_cache_built_tx_set(
             &tx_set,
             &header,
+            previous_hash,
             close_time_offset,
             soroban_info.as_ref(),
             snapshot_providers.as_ref(),
-        ) {
-            error!(
-                tx_set_hash = %tx_set.hash(),
-                tx_count = tx_set.len(),
-                previous_hash = %previous_hash,
-                close_time_offset,
-                ledger_seq = header.ledger_seq,
-                "Self-validation rejected the freshly-built nomination tx \
-                 set; aborting nomination (defense-in-depth #2113)"
-            );
-            return None;
-        }
-
-        // Cache the tx set and notify FetchingEnvelopes. Does NOT drain the
-        // ready queue — callers (trigger_next_ledger, handle_nomination_timeout)
-        // are responsible for draining via process_ready_fetching_envelopes().
-        self.cache_tx_set(tx_set.clone());
+        )?;
 
         // 4. Upgrades: config + runtime, filtered against current state.
         // Use lcl_close_time (not candidate close_time) for upgrade parameter
@@ -2387,10 +2370,68 @@ impl Herder {
         Some(value)
     }
 
-    /// Run a post-build self-validation roundtrip on `tx_set`, mirroring
-    /// stellar-core's `makeTxSetFromTransactions` (TxSetFrame.cpp:898-952).
+    /// Run self-validation on `tx_set` and, on success, cache it. On failure
+    /// log an `error!` with full nomination context and return `None` so the
+    /// caller (`build_nomination_value`) can abort nomination via `?`.
     ///
-    /// Returns `true` if the tx set passes our own validator, `false` if it
+    /// This is the integration point for the defense-in-depth check
+    /// introduced in #2113. It is intentionally a separate function from
+    /// `self_validate_nomination_tx_set` so the wiring contract — "if the
+    /// helper rejects, do not cache and propagate `None`" — can be tested
+    /// directly without staging a full ledger-manager scenario.
+    fn validate_and_cache_built_tx_set(
+        &self,
+        tx_set: &TransactionSet,
+        header: &LedgerHeader,
+        previous_hash: Hash256,
+        close_time_offset: u64,
+        soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
+        snapshot_providers: Option<&crate::tx_queue::SnapshotProviders>,
+    ) -> Option<()> {
+        if !self.self_validate_nomination_tx_set(
+            tx_set,
+            header,
+            close_time_offset,
+            soroban_info,
+            snapshot_providers,
+        ) {
+            error!(
+                tx_set_hash = %tx_set.hash(),
+                tx_count = tx_set.len(),
+                previous_hash = %previous_hash,
+                close_time_offset,
+                ledger_seq = header.ledger_seq,
+                "Self-validation rejected the freshly-built nomination tx \
+                 set; aborting nomination (defense-in-depth #2113)"
+            );
+            return None;
+        }
+
+        // Cache the tx set and notify FetchingEnvelopes. Does NOT drain the
+        // ready queue — callers (trigger_next_ledger, handle_nomination_timeout)
+        // are responsible for draining via process_ready_fetching_envelopes().
+        self.cache_tx_set(tx_set.clone());
+        Some(())
+    }
+
+    /// Run a post-build self-validation roundtrip on `tx_set`, mirroring
+    /// stellar-core's `makeTxSetFromTransactions` (TxSetFrame.cpp:898-952)
+    /// and matching the structure of the incoming-SCP path
+    /// (`ScpDriver::check_and_cache_tx_set_valid`).
+    ///
+    /// Sequence:
+    /// 1. `prepare_for_apply` — validates XDR structure, sort order, fee map
+    ///    well-formedness, and the cross-phase no-duplicate-source-account
+    ///    invariant (HERDER_SPEC §8.3 / §6.5). This mirrors stellar-core's
+    ///    `prepareForApply` step in `makeTxSetFromTransactions`.
+    /// 2. `check_tx_set_valid` — content validation against the same ledger
+    ///    state used to build the set.
+    ///
+    /// The recomputed hash from `prepare_for_apply` is compared against the
+    /// builder's stored hash as an invariant check (analogous to the
+    /// per-phase tx-count check in stellar-core's roundtrip).
+    ///
+    /// Returns `true` if the tx set passes self-validation, `false` if it
     /// should be rejected and nomination aborted.
     ///
     /// On protocol < V20 this returns `true` unconditionally — generalized
@@ -2418,7 +2459,39 @@ impl Herder {
         if !protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20) {
             return true;
         }
-        let Some(gen) = tx_set.generalized_tx_set() else {
+
+        // Step 1: XDR-structure / sort-order / cross-phase duplicate-source
+        // checks. Parity: stellar-core `prepareForApply` step in
+        // `makeTxSetFromTransactions`. Also matches the incoming SCP path
+        // (`scp_driver.rs::check_and_cache_tx_set_valid`).
+        let prepared = match tx_set.prepare_for_apply(NetworkId(self.scp_driver.network_id())) {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                warn!(
+                    tx_set_hash = %tx_set.hash(),
+                    error = %e,
+                    "build_nomination_value: prepare_for_apply rejected the freshly-built \
+                     tx set (construction bug)"
+                );
+                return false;
+            }
+        };
+
+        // Hash invariant: the prepared XDR-roundtrip hash must match the
+        // builder's stored hash. A mismatch indicates the builder produced
+        // a hash that disagrees with the canonical XDR encoding — analogous
+        // to stellar-core's per-phase tx-count check after the roundtrip.
+        if prepared.hash() != tx_set.hash() {
+            warn!(
+                builder_hash = %tx_set.hash(),
+                prepared_hash = %prepared.hash(),
+                "build_nomination_value: prepare_for_apply hash differs from builder \
+                 hash; rejecting (construction bug)"
+            );
+            return false;
+        }
+
+        let Some(gen) = prepared.generalized_tx_set() else {
             warn!(
                 tx_set_hash = %tx_set.hash(),
                 ledger_version = header.ledger_version,
@@ -2427,6 +2500,9 @@ impl Herder {
             );
             return false;
         };
+
+        // Step 2: content validation against the same snapshot used to build
+        // the set. Parity: stellar-core `checkValidInternal` step.
         crate::tx_set_utils::check_tx_set_valid(
             gen,
             header,
@@ -6755,12 +6831,12 @@ mod advance_tracking_slot_tests {
     }
 
     /// Build an N-phase generalized tx set for self-validate tests. Each phase
-    /// is an empty `TransactionPhase::V0`. The hash is deterministic but
-    /// not the wire SHA-256 — `check_tx_set_valid` does not re-hash, so a
-    /// placeholder is sufficient.
+    /// is an empty `TransactionPhase::V0`. The hash is computed from the XDR
+    /// encoding so that `prepare_for_apply` accepts the recomputed hash.
     fn empty_n_phase_generalized_tx_set(n_phases: usize) -> TransactionSet {
         use stellar_xdr::curr::{
-            GeneralizedTransactionSet, Hash, TransactionPhase, TransactionSetV1, VecM,
+            GeneralizedTransactionSet, Hash, Limits, TransactionPhase, TransactionSetV1, VecM,
+            WriteXdr,
         };
         let phases: VecM<TransactionPhase> = (0..n_phases)
             .map(|_| TransactionPhase::V0(VecM::default()))
@@ -6771,7 +6847,11 @@ mod advance_tracking_slot_tests {
             previous_ledger_hash: Hash([0u8; 32]),
             phases,
         });
-        TransactionSet::new_generalized(Hash256::ZERO, gen)
+        let hash = gen
+            .to_xdr(Limits::none())
+            .map(|bytes| Hash256::hash(&bytes))
+            .unwrap_or(Hash256::ZERO);
+        TransactionSet::new_generalized(hash, gen)
     }
 
     /// Helper accepts a valid empty 2-phase generalized V0 tx set on protocol
@@ -6833,6 +6913,77 @@ mod advance_tracking_slot_tests {
         assert!(
             herder.self_validate_nomination_tx_set(&tx_set, &header, 0, None, None),
             "self-validation must be skipped on protocol < 20"
+        );
+    }
+
+    /// Wiring test: when the helper returns `false`, the integration wrapper
+    /// `validate_and_cache_built_tx_set` must (a) return `None` and (b) NOT
+    /// cache the tx set. Together with Tests 2-3 (helper-rejection) and
+    /// Test 5 (success path), this covers the contract that
+    /// `build_nomination_value` aborts nomination on self-validation failure
+    /// without publishing the bad set to peers. Catches the specific bug
+    /// of someone flipping the `!` on the gate.
+    #[test]
+    fn test_validate_and_cache_built_tx_set_aborts_on_helper_failure() {
+        let herder = make_herder_for_self_validate_tests();
+        // 3-phase generalized set on V24 — helper rejects via the
+        // check_tx_set_valid phase-count guard.
+        let tx_set = empty_n_phase_generalized_tx_set(3);
+        let header = v24_header();
+        let cache_count_before = herder.scp_driver.tx_set_cache_count();
+
+        let result =
+            herder.validate_and_cache_built_tx_set(&tx_set, &header, Hash256::ZERO, 0, None, None);
+
+        assert!(
+            result.is_none(),
+            "wrapper must return None when helper rejects"
+        );
+        let cache_count_after = herder.scp_driver.tx_set_cache_count();
+        assert_eq!(
+            cache_count_before, cache_count_after,
+            "rejected tx set must NOT be cached"
+        );
+        assert!(
+            !herder.scp_driver.has_tx_set(tx_set.hash()),
+            "rejected tx set hash must not be queryable in the cache"
+        );
+    }
+
+    /// Wiring test (positive path): when the helper returns `true`, the
+    /// integration wrapper must (a) return `Some(())` and (b) cache the set.
+    /// Pair with the negative test above.
+    #[test]
+    fn test_validate_and_cache_built_tx_set_caches_on_helper_success() {
+        let herder = make_herder_for_self_validate_tests();
+        let tx_set = empty_n_phase_generalized_tx_set(2);
+        let mut header = v24_header();
+        header.ledger_version = 22; // V0 Soroban phase OK on V20..V23
+        let soroban_info = henyey_ledger::SorobanNetworkInfo::default();
+        let cache_count_before = herder.scp_driver.tx_set_cache_count();
+
+        let result = herder.validate_and_cache_built_tx_set(
+            &tx_set,
+            &header,
+            Hash256::ZERO,
+            0,
+            Some(&soroban_info),
+            None,
+        );
+
+        assert!(
+            result.is_some(),
+            "wrapper must return Some(()) when helper accepts"
+        );
+        let cache_count_after = herder.scp_driver.tx_set_cache_count();
+        assert_eq!(
+            cache_count_after,
+            cache_count_before + 1,
+            "accepted tx set must be cached exactly once"
+        );
+        assert!(
+            herder.scp_driver.has_tx_set(tx_set.hash()),
+            "accepted tx set hash must be queryable in the cache"
         );
     }
 

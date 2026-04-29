@@ -729,6 +729,14 @@ impl ScpDriver {
         self.tx_tracker.is_cached(hash)
     }
 
+    /// Number of tx sets currently cached in the tracker. Test-only — used
+    /// to assert that nomination paths cache (or skip caching) the freshly
+    /// built tx set.
+    #[cfg(test)]
+    pub(crate) fn tx_set_cache_count(&self) -> usize {
+        self.tx_tracker.cache_count()
+    }
+
     /// Record a missing-tx-set cause for `slot`. Adds `hash` to the slot's
     /// pending-hashes set; creates the entry if absent. Called from
     /// `validate_value_against_local_state` on the LCL+1 path when the
