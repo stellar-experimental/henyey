@@ -341,7 +341,8 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `getPeerManager()` | N/A (not exposed directly) | Partial |
 | `getSurveyManager()` | N/A (not exposed directly) | Partial |
 | `recordMessageMetric()` | (via OverlayMetrics) | Full |
-| `getFlowControlBytesTotal()` | `compute_flow_control_bytes_total()` | Full |
+| `getFlowControlBytesTotal()` | `FlowControlBytesConfig::bytes_total()` | Full |
+| `getFlowControlBytesBatch()` | `FlowControlBytesConfig::bytes_batch()` | Full |
 | `checkScheduledAndCache()` | (via FloodGate.has_seen) | Full |
 | `getOverlayThreadSnapshot()` | N/A | None |
 | `tick()` | `start_tick_loop()` (3s interval) | Full |

@@ -64,40 +64,107 @@ pub const INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES: u32 = 100_000;
 /// The app layer updates this to the actual protocol-derived value on startup.
 pub const DEFAULT_MAX_TX_SIZE_BYTES: u32 = 100 * 1024;
 
-/// Compute the initial byte grant for flow control based on current max tx size.
+/// Resolved flow-control byte parameters.
 ///
-/// Mirrors stellar-core `OverlayManagerImpl::getFlowControlBytesTotal()`
-/// (auto-compute branch — config overrides not yet supported).
+/// Mirrors the semantics of stellar-core's `getFlowControlBytesTotal()` /
+/// `getFlowControlBytesBatch()`:
+/// - When both raw config values are 0 → [`Auto`](Self::Auto): compute from max_tx_size
+/// - Otherwise → [`Fixed`](Self::Fixed): use the raw config values directly
 ///
-/// When `max_tx_size` exceeds the headroom between the default reading capacity
-/// and the batch size (300KB − 100KB = 200KB), the grant is expanded to
-/// `max_tx_size + batch_size`. Otherwise the default 300KB applies.
-///
-/// # Panics
-///
-/// Panics if `max_tx_size` is 0 or if the result would overflow `u32`.
-///
-/// # Example
-///
-/// ```ignore
-/// use henyey_overlay::flow_control::compute_flow_control_bytes_total;
-///
-/// // Below threshold — default 300KB
-/// assert_eq!(compute_flow_control_bytes_total(100_000), 300_000);
-///
-/// // Above threshold — max_tx_size + batch
-/// assert_eq!(compute_flow_control_bytes_total(250_000), 350_000);
-/// ```
-pub fn compute_flow_control_bytes_total(max_tx_size: u32) -> u32 {
-    assert!(max_tx_size > 0, "max_tx_size must be > 0");
-    let threshold =
-        INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES - INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES;
-    if max_tx_size > threshold {
-        max_tx_size
-            .checked_add(INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES)
-            .expect("flow control bytes total overflow")
-    } else {
-        INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES
+/// Construct via [`FlowControlBytesConfig::new`] which validates invariants.
+#[derive(Debug, Clone, Copy, Default)]
+pub enum FlowControlBytesConfig {
+    /// Both config values are 0 — auto-compute from max_tx_size.
+    #[default]
+    Auto,
+    /// Operator-supplied overrides (validated at construction).
+    Fixed {
+        /// `PEER_FLOOD_READING_CAPACITY_BYTES` — initial byte grant.
+        total: u32,
+        /// `FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES` — byte batch size.
+        batch: u32,
+    },
+}
+
+impl FlowControlBytesConfig {
+    /// Create a new config from raw config values.
+    ///
+    /// - `(0, 0)` → [`Auto`](Self::Auto)
+    /// - `(capacity, batch)` where `batch > capacity` → error
+    ///   (includes `(0, nonzero)`, matching `Config.cpp:1973`)
+    /// - Otherwise → [`Fixed`](Self::Fixed)
+    pub fn new(capacity: u32, batch: u32) -> std::result::Result<Self, String> {
+        if capacity == 0 && batch == 0 {
+            return Ok(Self::Auto);
+        }
+        if batch > capacity {
+            return Err(format!(
+                "FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES ({batch}) \
+                 can't be greater than PEER_FLOOD_READING_CAPACITY_BYTES ({capacity})"
+            ));
+        }
+        Ok(Self::Fixed {
+            total: capacity,
+            batch,
+        })
+    }
+
+    /// Compute the initial byte grant for flow control.
+    ///
+    /// Mirrors stellar-core `OverlayManagerImpl::getFlowControlBytesTotal()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_tx_size` is 0 or if the auto-compute result overflows.
+    pub fn bytes_total(&self, max_tx_size: u32) -> u32 {
+        assert!(max_tx_size > 0, "max_tx_size must be > 0");
+        match self {
+            Self::Auto => {
+                let threshold = INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES
+                    - INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES;
+                if max_tx_size > threshold {
+                    max_tx_size
+                        .checked_add(INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES)
+                        .expect("flow control bytes total overflow")
+                } else {
+                    INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES
+                }
+            }
+            Self::Fixed { total, .. } => *total,
+        }
+    }
+
+    /// Compute the byte batch size for SEND_MORE messages.
+    ///
+    /// Mirrors stellar-core `OverlayManager::getFlowControlBytesBatch()`.
+    pub fn bytes_batch(&self) -> u32 {
+        match self {
+            Self::Auto => INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES,
+            Self::Fixed { batch, .. } => *batch,
+        }
+    }
+
+    /// Returns true when auto-computing from max_tx_size.
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    /// Validate that the configured headroom is sufficient for the given
+    /// max tx size. Only meaningful for [`Fixed`](Self::Fixed) configs.
+    ///
+    /// Mirrors `HerderImpl::start()` (`HerderImpl.cpp:2354-2372`).
+    pub fn validate_headroom(&self, max_tx_size: u32) -> std::result::Result<(), String> {
+        if let Self::Fixed { total, batch } = self {
+            if total.saturating_sub(*batch) < max_tx_size {
+                return Err(format!(
+                    "Invalid configuration: the difference between \
+                     PEER_FLOOD_READING_CAPACITY_BYTES ({total}) and \
+                     FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES ({batch}) must be at \
+                     least {max_tx_size} bytes"
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -407,7 +474,7 @@ impl FlowControl {
     /// Create a new flow control instance with default initial byte capacity (300KB).
     ///
     /// For production peer connections, prefer [`with_scp_callback`] with the
-    /// grant from [`compute_flow_control_bytes_total`] so the initial capacity
+    /// grant from [`FlowControlBytesConfig::bytes_total`] so the initial capacity
     /// matches the dynamically-computed SEND_MORE_EXTENDED grant.
     pub fn new(config: FlowControlConfig) -> Self {
         Self::with_scp_callback(config, INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES, None)
@@ -416,7 +483,7 @@ impl FlowControl {
     /// Create a new flow control instance with an SCP queue callback.
     ///
     /// `initial_bytes_capacity` must match the SEND_MORE_EXTENDED byte grant
-    /// sent to the peer — typically from [`compute_flow_control_bytes_total`].
+    /// sent to the peer — typically from [`FlowControlBytesConfig::bytes_total`].
     pub fn with_scp_callback(
         config: FlowControlConfig,
         initial_bytes_capacity: u32,
@@ -1194,57 +1261,156 @@ mod tests {
         );
     }
 
-    // ── compute_flow_control_bytes_total tests ───────────────────────────
+    // ── FlowControlBytesConfig tests ────────────────────────────────────
 
     #[test]
-    fn test_compute_flow_control_bytes_total_below_threshold() {
-        // max_tx_size well below threshold (200KB) → default 300KB grant
-        assert_eq!(compute_flow_control_bytes_total(100_000), 300_000);
-        assert_eq!(compute_flow_control_bytes_total(1), 300_000);
-        assert_eq!(compute_flow_control_bytes_total(199_999), 300_000);
+    fn test_bytes_config_auto_from_zeros() {
+        let cfg = FlowControlBytesConfig::new(0, 0).unwrap();
+        assert!(cfg.is_auto());
     }
 
     #[test]
-    fn test_compute_flow_control_bytes_total_at_threshold() {
-        // max_tx_size == threshold (200_000) → still default (condition is `>`, not `>=`)
-        assert_eq!(compute_flow_control_bytes_total(200_000), 300_000);
+    fn test_bytes_config_fixed_from_nonzero() {
+        let cfg = FlowControlBytesConfig::new(300_000, 100_000).unwrap();
+        assert!(!cfg.is_auto());
+        match cfg {
+            FlowControlBytesConfig::Fixed { total, batch } => {
+                assert_eq!(total, 300_000);
+                assert_eq!(batch, 100_000);
+            }
+            _ => panic!("expected Fixed"),
+        }
     }
 
     #[test]
-    fn test_compute_flow_control_bytes_total_above_threshold() {
-        // max_tx_size just above threshold → max_tx_size + batch_size (100KB)
-        assert_eq!(compute_flow_control_bytes_total(200_001), 300_001);
-        assert_eq!(compute_flow_control_bytes_total(250_000), 350_000);
-        assert_eq!(compute_flow_control_bytes_total(500_000), 600_000);
+    fn test_bytes_config_fixed_with_zero_batch() {
+        // nonzero/0 is valid — batch of 0 means no byte-based send-more
+        let cfg = FlowControlBytesConfig::new(500_000, 0).unwrap();
+        assert!(!cfg.is_auto());
+        assert_eq!(cfg.bytes_batch(), 0);
     }
 
     #[test]
-    fn test_compute_flow_control_bytes_total_large_value() {
-        // Very large but not overflowing
-        assert_eq!(
-            compute_flow_control_bytes_total(u32::MAX - 100_000),
-            u32::MAX
-        );
+    fn test_bytes_config_batch_exceeds_capacity_error() {
+        let err = FlowControlBytesConfig::new(100, 200).unwrap_err();
+        assert!(err.contains("can't be greater than"));
+    }
+
+    #[test]
+    fn test_bytes_config_zero_capacity_nonzero_batch_error() {
+        let err = FlowControlBytesConfig::new(0, 100).unwrap_err();
+        assert!(err.contains("can't be greater than"));
+    }
+
+    #[test]
+    fn test_bytes_total_auto_below_threshold() {
+        let cfg = FlowControlBytesConfig::default();
+        assert_eq!(cfg.bytes_total(100_000), 300_000);
+        assert_eq!(cfg.bytes_total(1), 300_000);
+        assert_eq!(cfg.bytes_total(199_999), 300_000);
+    }
+
+    #[test]
+    fn test_bytes_total_auto_at_threshold() {
+        let cfg = FlowControlBytesConfig::default();
+        // threshold (200_000) → still default (condition is `>`, not `>=`)
+        assert_eq!(cfg.bytes_total(200_000), 300_000);
+    }
+
+    #[test]
+    fn test_bytes_total_auto_above_threshold() {
+        let cfg = FlowControlBytesConfig::default();
+        assert_eq!(cfg.bytes_total(200_001), 300_001);
+        assert_eq!(cfg.bytes_total(250_000), 350_000);
+        assert_eq!(cfg.bytes_total(500_000), 600_000);
+    }
+
+    #[test]
+    fn test_bytes_total_auto_large_value() {
+        let cfg = FlowControlBytesConfig::default();
+        assert_eq!(cfg.bytes_total(u32::MAX - 100_000), u32::MAX);
     }
 
     #[test]
     #[should_panic(expected = "max_tx_size must be > 0")]
-    fn test_compute_flow_control_bytes_total_zero_panics() {
-        compute_flow_control_bytes_total(0);
+    fn test_bytes_total_auto_zero_panics() {
+        FlowControlBytesConfig::default().bytes_total(0);
     }
 
     #[test]
     #[should_panic(expected = "overflow")]
-    fn test_compute_flow_control_bytes_total_overflow_panics() {
-        // max_tx_size above threshold + batch_size would overflow u32
-        compute_flow_control_bytes_total(u32::MAX);
+    fn test_bytes_total_auto_overflow_panics() {
+        FlowControlBytesConfig::default().bytes_total(u32::MAX);
+    }
+
+    #[test]
+    fn test_bytes_total_fixed_ignores_max_tx_size() {
+        let cfg = FlowControlBytesConfig::new(500_000, 50_000).unwrap();
+        // Fixed always returns total regardless of max_tx_size
+        assert_eq!(cfg.bytes_total(1), 500_000);
+        assert_eq!(cfg.bytes_total(100_000), 500_000);
+        assert_eq!(cfg.bytes_total(400_000), 500_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_tx_size must be > 0")]
+    fn test_bytes_total_fixed_zero_max_tx_size_panics() {
+        let cfg = FlowControlBytesConfig::new(500_000, 50_000).unwrap();
+        cfg.bytes_total(0);
+    }
+
+    #[test]
+    fn test_bytes_batch_auto() {
+        let cfg = FlowControlBytesConfig::default();
+        assert_eq!(
+            cfg.bytes_batch(),
+            INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES
+        );
+    }
+
+    #[test]
+    fn test_bytes_batch_fixed() {
+        let cfg = FlowControlBytesConfig::new(500_000, 75_000).unwrap();
+        assert_eq!(cfg.bytes_batch(), 75_000);
+    }
+
+    #[test]
+    fn test_validate_headroom_auto_ok() {
+        FlowControlBytesConfig::default()
+            .validate_headroom(1_000_000)
+            .unwrap(); // Auto always passes
+    }
+
+    #[test]
+    fn test_validate_headroom_fixed_ok() {
+        FlowControlBytesConfig::new(500_000, 100_000)
+            .unwrap()
+            .validate_headroom(400_000)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_validate_headroom_fixed_exact() {
+        FlowControlBytesConfig::new(500_000, 100_000)
+            .unwrap()
+            .validate_headroom(400_000)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_validate_headroom_fixed_insufficient() {
+        let err = FlowControlBytesConfig::new(500_000, 100_000)
+            .unwrap()
+            .validate_headroom(400_001)
+            .unwrap_err();
+        assert!(err.contains("must be at least 400001 bytes"));
     }
 
     #[test]
     fn test_with_scp_callback_uses_custom_initial_bytes() {
         // Production path: FlowControl::with_scp_callback() should respect
         // the initial_bytes_capacity parameter (e.g., when max_tx_size > 200KB).
-        let grant = compute_flow_control_bytes_total(250_000); // 350_000
+        let grant = FlowControlBytesConfig::default().bytes_total(250_000); // 350_000
         let fc = FlowControl::with_scp_callback(FlowControlConfig::default(), grant, None);
         let stats = fc.get_stats();
         assert_eq!(stats.local_flood_bytes_capacity, 350_000);

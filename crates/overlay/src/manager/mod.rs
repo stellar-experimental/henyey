@@ -41,7 +41,7 @@ use crate::{
     connection::ConnectionPool,
     connection_factory::{ConnectionFactory, TcpConnectionFactory},
     flood::{compute_message_hash, FloodGate, FloodGateStats},
-    flow_control::{FlowControl, ScpQueueCallback},
+    flow_control::{FlowControl, FlowControlBytesConfig, ScpQueueCallback},
     metrics::OverlayMetrics,
     peer::{PeerInfo, PeerStats, PeerStatsSnapshot},
     LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerId, Result,
@@ -394,8 +394,11 @@ pub(super) struct SharedPeerState {
     pub(super) query_rate_limit_window_secs: Arc<AtomicU64>,
     /// Current maximum transaction size in bytes. Shared with the app layer
     /// (same `Arc<AtomicU32>`) so the overlay can dynamically compute the
-    /// initial byte grant for new peers via `compute_flow_control_bytes_total`.
+    /// initial byte grant for new peers via `FlowControlBytesConfig::bytes_total`.
     pub(super) max_tx_size_bytes: Arc<AtomicU32>,
+    /// Flow control byte parameters (initial grant and batch size).
+    /// Immutable after initialization — no atomic needed.
+    pub(super) flow_control_bytes_config: FlowControlBytesConfig,
 }
 
 impl SharedPeerState {
@@ -653,7 +656,7 @@ impl OverlayManager {
     ///
     /// `max_tx_size_bytes` is the shared atomic tracking the current maximum
     /// transaction size in bytes. The overlay reads this to compute the
-    /// initial byte grant for new peers via [`compute_flow_control_bytes_total`].
+    /// initial byte grant for new peers via [`FlowControlBytesConfig::bytes_total`].
     // SECURITY: subscriber count bounded by internal callers; no external input
     pub fn new_with_fetch_metrics(
         config: OverlayConfig,
@@ -757,6 +760,7 @@ impl OverlayManager {
             metrics: Arc::clone(&self.metrics),
             query_rate_limit_window_secs: Arc::clone(&self.query_rate_limit_window_secs),
             max_tx_size_bytes: Arc::clone(&self.max_tx_size_bytes),
+            flow_control_bytes_config: self.config.flow_control_bytes_config,
         }
     }
 
@@ -1245,6 +1249,12 @@ impl OverlayManager {
     /// Mirrors upstream `Peer::handleMaxTxSizeIncrease()` which updates
     /// flow control byte capacity and sends `SEND_MORE_EXTENDED` with the
     /// additional bytes so the remote peer can unblock.
+    ///
+    /// **Parity note:** This is called unconditionally regardless of whether
+    /// flow control byte config overrides are active. With `Fixed` config,
+    /// new peers use the fixed total while existing peers accumulate the
+    /// increase on top of their current capacity — matching stellar-core
+    /// `HerderImpl.cpp:2304-2308`.
     pub async fn handle_max_tx_size_increase(&self, increase: u32) {
         if increase == 0 {
             return;
@@ -1828,10 +1838,9 @@ mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            flow_control_bytes_config: FlowControlBytesConfig::default(),
         }
     }
-
-    /// Insert a fake authenticated peer into the shared state.
     fn insert_fake_peer(
         shared: &SharedPeerState,
         peer_id: PeerId,
@@ -2345,6 +2354,7 @@ mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            flow_control_bytes_config: FlowControlBytesConfig::default(),
         };
 
         let peer_id = PeerId::from_bytes([42u8; 32]);
@@ -2434,6 +2444,7 @@ mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            flow_control_bytes_config: FlowControlBytesConfig::default(),
         };
         (shared, broadcast_rx, fetch_rx)
     }
@@ -3067,6 +3078,7 @@ mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            flow_control_bytes_config: FlowControlBytesConfig::default(),
         };
 
         // Pool with capacity (max=10, current authenticated=0)
@@ -3131,6 +3143,7 @@ mod tests {
             max_tx_size_bytes: Arc::new(AtomicU32::new(
                 crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
+            flow_control_bytes_config: FlowControlBytesConfig::default(),
         };
 
         // Pool with capacity — reserve a pending slot (required before promote)

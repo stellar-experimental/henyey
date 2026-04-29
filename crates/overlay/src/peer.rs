@@ -256,7 +256,7 @@ impl Peer {
     /// Create an outbound peer from a pre-established transport connection.
     ///
     /// `initial_byte_grant` is the byte capacity sent in the initial
-    /// SEND_MORE_EXTENDED — typically from [`compute_flow_control_bytes_total`].
+    /// SEND_MORE_EXTENDED — typically from [`FlowControlBytesConfig::bytes_total`].
     pub async fn connect_with_connection(
         addr: &PeerAddress,
         connection: Connection,
@@ -292,7 +292,7 @@ impl Peer {
     /// Create a peer from an accepted connection.
     ///
     /// `initial_byte_grant` is the byte capacity sent in the initial
-    /// SEND_MORE_EXTENDED — typically from [`compute_flow_control_bytes_total`].
+    /// SEND_MORE_EXTENDED — typically from [`FlowControlBytesConfig::bytes_total`].
     pub async fn accept(
         connection: Connection,
         local_node: LocalNode,
@@ -456,7 +456,7 @@ impl Peer {
         // Send SEND_MORE_EXTENDED to enable flow control.
         // Matches stellar-core Peer::recvAuth() → sendSendMore().
         // The byte grant is computed from max_tx_size by the caller via
-        // compute_flow_control_bytes_total() — must match the FlowControl
+        // FlowControlBytesConfig::bytes_total() — must match the FlowControl
         // initial capacity for this peer.
         let send_more = StellarMessage::SendMoreExtended(stellar_xdr::curr::SendMoreExtended {
             num_messages: FlowControlConfig::default().peer_flood_reading_capacity as u32,

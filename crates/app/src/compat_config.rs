@@ -79,6 +79,8 @@ const SUPPORTED_KEYS: &[&str] = &[
     "FAILURE_SAFETY",
     "UNSAFE_QUORUM",
     "SURVEYOR_KEYS",
+    "PEER_FLOOD_READING_CAPACITY_BYTES",
+    "FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES",
 ];
 
 /// Valid stellar-core keys that henyey intentionally does not support.
@@ -306,6 +308,28 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
     {
         config.overlay.surveyor_keys = keys;
+    }
+    if let Some(v) = get_i64(table, "PEER_FLOOD_READING_CAPACITY_BYTES") {
+        if v >= 0 {
+            config.overlay.peer_flood_reading_capacity_bytes = v as u32;
+        } else {
+            tracing::warn!(
+                key = "PEER_FLOOD_READING_CAPACITY_BYTES",
+                value = v,
+                "Compat config key value must be >= 0"
+            );
+        }
+    }
+    if let Some(v) = get_i64(table, "FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES") {
+        if v >= 0 {
+            config.overlay.flow_control_send_more_batch_size_bytes = v as u32;
+        } else {
+            tracing::warn!(
+                key = "FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES",
+                value = v,
+                "Compat config key value must be >= 0"
+            );
+        }
     }
 
     // --- Metadata ---

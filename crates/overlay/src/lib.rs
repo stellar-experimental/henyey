@@ -101,8 +101,8 @@ pub use connection_factory::{ConnectionFactory, TcpConnectionFactory};
 pub use error::OverlayError;
 pub use flood::{compute_message_hash, FloodGate, FloodGateStats, FloodRecord};
 pub use flow_control::{
-    is_flow_controlled_message, FlowControl, FlowControlConfig, FlowControlStats, MessagePriority,
-    QueuedOutboundMessage, ScpQueueCallback, SendMoreCapacity,
+    is_flow_controlled_message, FlowControl, FlowControlBytesConfig, FlowControlConfig,
+    FlowControlStats, MessagePriority, QueuedOutboundMessage, ScpQueueCallback, SendMoreCapacity,
 };
 pub use item_fetcher::{
     ItemFetcher, ItemFetcherConfig, ItemFetcherStats, ItemType, NextPeerResult, PendingRequest,
@@ -240,6 +240,13 @@ pub struct OverlayConfig {
     /// If set, the overlay manager will send [`PeerEvent`] notifications
     /// when peers connect or disconnect.
     pub peer_event_tx: Option<mpsc::Sender<PeerEvent>>,
+
+    /// Flow control byte parameters (initial grant and batch size).
+    ///
+    /// Controls the per-peer byte-level flow control behavior. When [`Auto`](FlowControlBytesConfig::Auto),
+    /// values are auto-computed from max tx size. When [`Fixed`](FlowControlBytesConfig::Fixed),
+    /// operator-supplied overrides are used directly.
+    pub flow_control_bytes_config: FlowControlBytesConfig,
 }
 
 /// Peer connection events emitted by the overlay.
@@ -282,6 +289,7 @@ impl Default for OverlayConfig {
             is_validator: true,
             version_string: henyey_common::version::build_version_string(env!("CARGO_PKG_VERSION")),
             peer_event_tx: None,
+            flow_control_bytes_config: FlowControlBytesConfig::default(),
         }
     }
 }

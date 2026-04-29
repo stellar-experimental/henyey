@@ -980,6 +980,19 @@ pub struct OverlayConfig {
     /// Matches stellar-core `FLOOD_ARB_TX_DAMPING_FACTOR`.
     #[serde(default = "default_flood_arb_tx_damping_factor")]
     pub flood_arb_tx_damping_factor: f64,
+
+    /// Override for `PEER_FLOOD_READING_CAPACITY_BYTES` — initial byte-level
+    /// flood reading capacity. When 0 (default), auto-computed from max tx size.
+    /// Both this and `flow_control_send_more_batch_size_bytes` must be 0 for
+    /// auto-compute, or both may be set to override.
+    #[serde(default)]
+    pub peer_flood_reading_capacity_bytes: u32,
+
+    /// Override for `FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES` — byte batch
+    /// size for SEND_MORE messages. When 0 (default), uses the initial
+    /// constant (100 000). Must not exceed `peer_flood_reading_capacity_bytes`.
+    #[serde(default)]
+    pub flow_control_send_more_batch_size_bytes: u32,
 }
 
 impl Default for OverlayConfig {
@@ -1004,6 +1017,8 @@ impl Default for OverlayConfig {
             peer_max_failures: default_peer_max_failures(),
             flood_arb_tx_base_allowance: default_flood_arb_tx_base_allowance(),
             flood_arb_tx_damping_factor: default_flood_arb_tx_damping_factor(),
+            peer_flood_reading_capacity_bytes: 0,
+            flow_control_send_more_batch_size_bytes: 0,
         }
     }
 }
@@ -1736,6 +1751,13 @@ impl AppConfig {
                 anyhow::bail!("Invalid preferred_peer_keys entry: {}", key);
             }
         }
+
+        // Validate flow control byte config overrides (matching Config.cpp:1973-1981).
+        henyey_overlay::FlowControlBytesConfig::new(
+            self.overlay.peer_flood_reading_capacity_bytes,
+            self.overlay.flow_control_send_more_batch_size_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("Invalid configuration: {e}"))?;
 
         let total_bytes = self
             .surge_pricing

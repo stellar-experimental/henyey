@@ -1141,6 +1141,13 @@ impl App {
             }
         }
         overlay_config.preferred_peers_only = self.config.overlay.preferred_peers_only;
+        // Map flow control byte config overrides.
+        // Validated in AppConfig::validate(), so unwrap is safe here.
+        overlay_config.flow_control_bytes_config = henyey_overlay::FlowControlBytesConfig::new(
+            self.config.overlay.peer_flood_reading_capacity_bytes,
+            self.config.overlay.flow_control_send_more_batch_size_bytes,
+        )
+        .expect("flow control bytes config already validated");
 
         let (peer_event_tx, mut peer_event_rx) = mpsc::channel(1024);
         overlay_config.peer_event_tx = Some(peer_event_tx);
@@ -1161,6 +1168,7 @@ impl App {
             "Creating overlay with config"
         );
 
+        let flow_control_bytes_config = overlay_config.flow_control_bytes_config;
         let mut overlay = OverlayManager::new_with_fetch_metrics(
             overlay_config,
             local_node,
@@ -1192,6 +1200,14 @@ impl App {
         // stored in self.overlay yet, so refresh_max_tx_size_bytes won't
         // try to notify peers (which is correct — there are none yet).
         self.refresh_max_tx_size_bytes().await;
+
+        // Runtime headroom validation for fixed flow control byte config.
+        // Mirrors HerderImpl.cpp:2354-2372 — the configured capacity minus
+        // batch must be at least max_tx_size_bytes (which now reflects the
+        // real Soroban-aware value from the ledger).
+        flow_control_bytes_config
+            .validate_headroom(self.max_tx_size_bytes.load(Ordering::Relaxed))
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         overlay.start().await?;
 
@@ -1666,7 +1682,7 @@ impl App {
     /// Called at startup (before overlay starts — no peers to notify),
     /// after catchup, and on each ledger close. The overlay reads this
     /// atomic to compute dynamic initial byte grants for new peers via
-    /// `compute_flow_control_bytes_total()`. Existing peers are notified
+    /// `FlowControlBytesConfig::bytes_total()`. Existing peers are notified
     /// of increases via `handle_max_tx_size_increase()`.
     ///
     /// Mirrors upstream `HerderImpl::maybeHandleUpgrade()` max-tx-size
