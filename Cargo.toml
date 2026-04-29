@@ -107,7 +107,7 @@ tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "catch-panic"] }
 
 # Database
-rusqlite = { version = "0.31", features = ["bundled", "blob"] }
+rusqlite = { version = "0.31", features = ["bundled", "blob", "hooks"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.24"
 

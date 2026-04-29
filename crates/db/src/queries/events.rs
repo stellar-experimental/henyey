@@ -3,10 +3,25 @@
 //! This module provides database operations for contract events,
 //! used by the `getEvents` RPC endpoint.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+
 use rusqlite::{params, Connection};
 use stellar_xdr::curr::ContractEventType;
 
 use crate::error::DbError;
+
+/// RAII guard that clears the SQLite progress handler on drop.
+/// Ensures pooled connections are never left with a stale handler.
+struct ProgressHandlerGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl Drop for ProgressHandlerGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
+}
 
 /// A stored contract event record.
 #[derive(Debug, Clone)]
@@ -48,6 +63,10 @@ pub struct EventQueryParams<'a> {
     /// Maximum cumulative stored bytes (event_xdr + topics) to load.
     /// The first row is always returned regardless of size.
     pub max_total_bytes: usize,
+    /// Maximum SQLite VM opcodes allowed for this query (0 = no limit).
+    /// When exceeded, the query is interrupted and `DbError::QueryBudgetExceeded`
+    /// is returned.
+    pub max_query_ops: u32,
 }
 
 /// Query trait for contract event operations.
@@ -198,53 +217,88 @@ impl EventQueries for Connection {
         const COL_SUCCESS: usize = 12;
         const COL_ROW_BYTES: usize = 13;
 
-        let mut stmt = self.prepare(&sql)?;
-        let mut rows = stmt.query(params_refs.as_slice())?;
+        // Install progress handler if budget is configured.
+        let _guard = if params.max_query_ops > 0 {
+            let budget = params.max_query_ops;
+            let counter = Arc::new(AtomicU32::new(0));
+            let counter_clone = counter.clone();
+            // Check every 1000 VM opcodes; interrupt when budget exceeded.
+            self.progress_handler(
+                1000,
+                Some(move || {
+                    let count = counter_clone.fetch_add(1, Ordering::Relaxed);
+                    // Each callback = 1000 ops, so total ops = (count+1) * 1000
+                    (count + 1) * 1000 >= budget
+                }),
+            );
+            Some(ProgressHandlerGuard { conn: self })
+        } else {
+            None
+        };
+
+        let mut stmt = match self.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) if is_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+            Err(e) => return Err(e.into()),
+        };
+        let mut rows = match stmt.query(params_refs.as_slice()) {
+            Ok(r) => r,
+            Err(e) if is_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+            Err(e) => return Err(e.into()),
+        };
         let mut results = Vec::new();
         let mut cumulative_bytes: usize = 0;
 
-        while let Some(row) = rows.next()? {
-            let row_bytes: i64 = row.get(COL_ROW_BYTES)?;
-            let row_bytes = row_bytes.max(0) as usize;
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let row_bytes: i64 = row.get(COL_ROW_BYTES)?;
+                    let row_bytes = row_bytes.max(0) as usize;
 
-            // First row always returned for forward progress; subsequent
-            // rows are subject to the cumulative byte budget.
-            if !results.is_empty() && cumulative_bytes + row_bytes > params.max_total_bytes {
-                break;
-            }
+                    // First row always returned for forward progress; subsequent
+                    // rows are subject to the cumulative byte budget.
+                    if !results.is_empty() && cumulative_bytes + row_bytes > params.max_total_bytes
+                    {
+                        break;
+                    }
 
-            let mut topics = Vec::new();
-            for i in COL_TOPIC_START..=COL_TOPIC_END {
-                if let Some(t) = row.get::<_, Option<String>>(i)? {
-                    topics.push(t);
+                    let mut topics = Vec::new();
+                    for i in COL_TOPIC_START..=COL_TOPIC_END {
+                        if let Some(t) = row.get::<_, Option<String>>(i)? {
+                            topics.push(t);
+                        }
+                    }
+
+                    let in_success: i32 = row.get(COL_SUCCESS)?;
+
+                    let record = EventRecord {
+                        id: row.get(COL_ID)?,
+                        ledger_seq: row.get(COL_LEDGER)?,
+                        tx_index: row.get(COL_TX_INDEX)?,
+                        op_index: row.get(COL_OP_INDEX)?,
+                        tx_hash: row.get(COL_TX_HASH)?,
+                        contract_id: row.get(COL_CONTRACT_ID)?,
+                        event_type: {
+                            let raw: i32 = row.get(COL_EVENT_TYPE)?;
+                            ContractEventType::try_from(raw).map_err(|_| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    COL_EVENT_TYPE,
+                                    rusqlite::types::Type::Integer,
+                                    format!("invalid event type: {raw}").into(),
+                                )
+                            })?
+                        },
+                        topics,
+                        event_xdr: row.get(COL_EVENT_XDR)?,
+                        in_successful_contract_call: in_success != 0,
+                    };
+                    cumulative_bytes += row_bytes;
+                    results.push(record);
                 }
+                Ok(None) => break,
+                Err(e) if is_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+                Err(e) => return Err(e.into()),
             }
-
-            let in_success: i32 = row.get(COL_SUCCESS)?;
-
-            let record = EventRecord {
-                id: row.get(COL_ID)?,
-                ledger_seq: row.get(COL_LEDGER)?,
-                tx_index: row.get(COL_TX_INDEX)?,
-                op_index: row.get(COL_OP_INDEX)?,
-                tx_hash: row.get(COL_TX_HASH)?,
-                contract_id: row.get(COL_CONTRACT_ID)?,
-                event_type: {
-                    let raw: i32 = row.get(COL_EVENT_TYPE)?;
-                    ContractEventType::try_from(raw).map_err(|_| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            COL_EVENT_TYPE,
-                            rusqlite::types::Type::Integer,
-                            format!("invalid event type: {raw}").into(),
-                        )
-                    })?
-                },
-                topics,
-                event_xdr: row.get(COL_EVENT_XDR)?,
-                in_successful_contract_call: in_success != 0,
-            };
-            cumulative_bytes += row_bytes;
-            results.push(record);
         }
 
         Ok(results)
@@ -263,6 +317,20 @@ impl EventQueries for Connection {
         )?;
         Ok(deleted as u32)
     }
+}
+
+/// Check if a rusqlite error is an SQLITE_INTERRUPT (from progress handler).
+fn is_interrupted(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::OperationInterrupted,
+                ..
+            },
+            _
+        )
+    )
 }
 
 #[cfg(test)]
@@ -411,6 +479,7 @@ mod tests {
             cursor: None,
             limit: 100,
             max_total_bytes: usize::MAX,
+            max_query_ops: 0,
         });
         assert!(result.is_err(), "should reject invalid event type from DB");
     }
@@ -427,6 +496,7 @@ mod tests {
             cursor: None,
             limit: 100,
             max_total_bytes: usize::MAX,
+            max_query_ops: 0,
         });
         assert!(result.is_err(), "should reject unknown event type filter");
     }
@@ -475,6 +545,7 @@ mod tests {
                 cursor: None,
                 limit: 100,
                 max_total_bytes: budget,
+                max_query_ops: 0,
             })
             .unwrap();
         assert_eq!(result.len(), 2, "should truncate to 2 events");
@@ -498,6 +569,7 @@ mod tests {
                 cursor: None,
                 limit: 100,
                 max_total_bytes: 1, // budget smaller than event
+                max_query_ops: 0,
             })
             .unwrap();
         assert_eq!(
@@ -523,6 +595,7 @@ mod tests {
                 cursor: None,
                 limit: 100,
                 max_total_bytes: usize::MAX,
+                max_query_ops: 0,
             })
             .unwrap();
         assert_eq!(result.len(), 10, "unlimited budget returns all events");
@@ -554,6 +627,7 @@ mod tests {
                 cursor: None,
                 limit: 100,
                 max_total_bytes: usize::MAX,
+                max_query_ops: 0,
             })
             .unwrap();
         assert_eq!(result.len(), 2);
@@ -570,6 +644,7 @@ mod tests {
                 cursor: None,
                 limit: 100,
                 max_total_bytes: usize::MAX,
+                max_query_ops: 0,
             })
             .unwrap();
         assert_eq!(result.len(), 1);
@@ -586,9 +661,136 @@ mod tests {
                 cursor: Some("10-0001"),
                 limit: 100,
                 max_total_bytes: usize::MAX,
+                max_query_ops: 0,
             })
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "10-0002");
+    }
+
+    #[test]
+    fn test_query_events_budget_interrupts_expensive_scan() {
+        let conn = setup_db();
+        // Insert many events so a full scan is expensive
+        let events: Vec<EventRecord> = (0..500)
+            .map(|i| {
+                let mut e = make_event_sized(10, i, 100);
+                e.topics = vec![format!("topic-{}", i % 50)]; // diverse topics
+                e
+            })
+            .collect();
+        conn.store_events(&events).unwrap();
+
+        // Query with a nonexistent topic1 — forces full scan
+        let topics = vec![vec!["nonexistent-topic-xyz".to_string()]];
+        let result = conn.query_events(&EventQueryParams {
+            start_ledger: 1,
+            end_ledger: Some(100),
+            event_type: None,
+            contract_ids: &[],
+            topics: &topics,
+            cursor: None,
+            limit: 100,
+            max_total_bytes: usize::MAX,
+            max_query_ops: 100, // very low budget — will be exceeded
+        });
+        assert!(
+            matches!(result, Err(DbError::QueryBudgetExceeded)),
+            "expected QueryBudgetExceeded, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_query_events_budget_normal_query_succeeds() {
+        let conn = setup_db();
+        let events: Vec<EventRecord> = (0..5).map(|i| make_event_sized(10, i, 50)).collect();
+        conn.store_events(&events).unwrap();
+
+        // Normal query with generous budget succeeds
+        let result = conn
+            .query_events(&EventQueryParams {
+                start_ledger: 1,
+                end_ledger: Some(100),
+                event_type: None,
+                contract_ids: &[],
+                topics: &[],
+                cursor: None,
+                limit: 100,
+                max_total_bytes: usize::MAX,
+                max_query_ops: 5_000_000,
+            })
+            .unwrap();
+        assert_eq!(result.len(), 5);
+    }
+
+    #[test]
+    fn test_query_events_budget_guard_cleanup() {
+        let conn = setup_db();
+        let events: Vec<EventRecord> = (0..500)
+            .map(|i| {
+                let mut e = make_event_sized(10, i, 100);
+                e.topics = vec![format!("topic-{}", i % 50)];
+                e
+            })
+            .collect();
+        conn.store_events(&events).unwrap();
+
+        // First query: exceeds budget
+        let topics = vec![vec!["nonexistent-topic-xyz".to_string()]];
+        let result = conn.query_events(&EventQueryParams {
+            start_ledger: 1,
+            end_ledger: Some(100),
+            event_type: None,
+            contract_ids: &[],
+            topics: &topics,
+            cursor: None,
+            limit: 100,
+            max_total_bytes: usize::MAX,
+            max_query_ops: 100,
+        });
+        assert!(matches!(result, Err(DbError::QueryBudgetExceeded)));
+
+        // Second query on same connection: should work fine (handler cleared)
+        let result = conn
+            .query_events(&EventQueryParams {
+                start_ledger: 1,
+                end_ledger: Some(100),
+                event_type: None,
+                contract_ids: &[],
+                topics: &[],
+                cursor: None,
+                limit: 10,
+                max_total_bytes: usize::MAX,
+                max_query_ops: 0, // no budget
+            })
+            .unwrap();
+        assert!(
+            !result.is_empty(),
+            "connection should be usable after budget exceeded"
+        );
+    }
+
+    #[test]
+    fn test_query_events_budget_zero_means_unlimited() {
+        let conn = setup_db();
+        let events: Vec<EventRecord> = (0..100).map(|i| make_event_sized(10, i, 50)).collect();
+        conn.store_events(&events).unwrap();
+
+        // max_query_ops = 0 means no limit
+        let result = conn
+            .query_events(&EventQueryParams {
+                start_ledger: 1,
+                end_ledger: Some(100),
+                event_type: None,
+                contract_ids: &[],
+                topics: &[],
+                cursor: None,
+                limit: 200,
+                max_total_bytes: usize::MAX,
+                max_query_ops: 0,
+            })
+            .unwrap();
+        assert_eq!(result.len(), 100);
     }
 }

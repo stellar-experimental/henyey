@@ -34,7 +34,7 @@ use tracing::info;
 /// This should be incremented whenever a new migration is added.
 /// The database initialization and migration system uses this to
 /// determine if upgrades are needed.
-pub(crate) const CURRENT_VERSION: i32 = 8;
+pub(crate) const CURRENT_VERSION: i32 = 9;
 
 /// Represents a single database migration.
 ///
@@ -159,6 +159,14 @@ const MIGRATIONS: &[Migration] = &[
             ALTER TABLE txhistory ADD COLUMN status INTEGER NOT NULL DEFAULT 0;
         "#,
         description: "Add status column to txhistory for DB-level transaction status filtering",
+    },
+    Migration {
+        from_version: 8,
+        to_version: 9,
+        upgrade_sql: r#"
+            CREATE INDEX IF NOT EXISTS events_topic1_id ON events(topic1, id);
+        "#,
+        description: "Add topic1+id index for efficient topic-filtered event queries",
     },
 ];
 
@@ -370,5 +378,52 @@ mod tests {
         if CURRENT_VERSION > 1 {
             assert!(verify_schema(&conn).is_err());
         }
+    }
+
+    #[test]
+    fn test_migration_8_to_9_adds_topic1_id_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Set up a minimal v8 schema with the events table
+        conn.execute_batch(
+            r#"
+            CREATE TABLE storestate (statename TEXT PRIMARY KEY, state TEXT);
+            CREATE TABLE events (
+                id TEXT PRIMARY KEY NOT NULL,
+                ledgerseq INTEGER NOT NULL,
+                tx_index INTEGER NOT NULL,
+                op_index INTEGER NOT NULL,
+                tx_hash TEXT NOT NULL,
+                contract_id TEXT,
+                event_type INTEGER NOT NULL,
+                topic1 TEXT,
+                topic2 TEXT,
+                topic3 TEXT,
+                topic4 TEXT,
+                event_xdr TEXT NOT NULL,
+                in_successful_contract_call INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX events_ledger ON events(ledgerseq);
+            CREATE INDEX events_contract ON events(contract_id, ledgerseq);
+            "#,
+        )
+        .unwrap();
+        set_schema_version(&conn, 8).unwrap();
+
+        // Apply migration
+        run_migrations(&conn).unwrap();
+
+        // Verify index exists
+        let index_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_index_list('events') WHERE name = 'events_topic1_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_exists,
+            "events_topic1_id index should exist after migration"
+        );
+        assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_VERSION);
     }
 }

@@ -1241,6 +1241,14 @@ pub struct RpcConfig {
     /// base64-encoded TEXT length as stored in SQLite.  Defaults to 10 MiB.
     #[serde(default = "default_max_event_load_bytes")]
     pub max_event_load_bytes: usize,
+
+    /// Maximum SQLite VM opcodes per `getEvents` query.  When exceeded,
+    /// the query is interrupted and a "query budget exceeded" error is
+    /// returned.  This bounds worst-case scan work for unindexed or
+    /// poorly-selective filter combinations.  0 = unlimited (not
+    /// recommended for production).  Default: 5,000,000.
+    #[serde(default = "default_max_event_query_ops")]
+    pub max_event_query_ops: u32,
 }
 
 impl Default for RpcConfig {
@@ -1258,6 +1266,7 @@ impl Default for RpcConfig {
             max_ledger_meta_load_bytes: default_max_ledger_meta_load_bytes(),
             max_tx_load_bytes: default_max_tx_load_bytes(),
             max_event_load_bytes: default_max_event_load_bytes(),
+            max_event_query_ops: default_max_event_query_ops(),
         }
     }
 }
@@ -1279,6 +1288,12 @@ impl RpcConfig {
         }
         if self.bucket_io_concurrency == 0 {
             return Err("rpc.bucket_io_concurrency must be > 0".to_string());
+        }
+        if self.max_event_query_ops == 0 {
+            tracing::warn!(
+                "rpc.max_event_query_ops is 0 (unlimited) — \
+                 getEvents queries have no computational budget"
+            );
         }
         Ok(())
     }
@@ -1326,6 +1341,10 @@ fn default_max_tx_load_bytes() -> usize {
 
 fn default_max_event_load_bytes() -> usize {
     10 * 1024 * 1024 // 10 MiB
+}
+
+fn default_max_event_query_ops() -> u32 {
+    5_000_000
 }
 
 /// Build-time metadata populated by the binary crate's `build.rs`.

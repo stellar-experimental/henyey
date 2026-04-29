@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS events_ledger ON events(ledgerseq);
 CREATE INDEX IF NOT EXISTS events_contract ON events(contract_id, ledgerseq);
+CREATE INDEX IF NOT EXISTS events_topic1_id ON events(topic1, id);
 
 -- Ledger close metadata (full LedgerCloseMeta XDR, for RPC serving)
 CREATE TABLE IF NOT EXISTS ledger_close_meta (

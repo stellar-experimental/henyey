@@ -59,6 +59,7 @@ pub async fn handle(
     // On pruning race (require_close_times fails), fall back to batch_close_times
     // and skip events with missing headers rather than returning a 500.
     let event_load_budget = ctx.app.config().rpc.max_event_load_bytes;
+    let event_query_ops = ctx.app.config().rpc.max_event_query_ops;
     let (events, close_time_cache) = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
             use henyey_db::{EventQueries, LedgerQueries};
@@ -71,6 +72,7 @@ pub async fn handle(
                 cursor: cursor_owned.as_deref(),
                 limit,
                 max_total_bytes: event_load_budget,
+                max_query_ops: event_query_ops,
             })?;
             let seqs: Vec<u32> = events
                 .iter()
@@ -94,6 +96,13 @@ pub async fn handle(
     })
     .await
     .map_err(|e| {
+        use crate::util::DbAccessError;
+        if let DbAccessError::Db(henyey_db::DbError::QueryBudgetExceeded) = &e {
+            return JsonRpcError::query_budget_exceeded(
+                "query exceeded computational budget; narrow your filter criteria \
+                 (add contractIds or specific topic values)",
+            );
+        }
         tracing::warn!(error = ?e, "get_events DB error");
         JsonRpcError::internal("database error")
     })?;

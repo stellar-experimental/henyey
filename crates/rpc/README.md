@@ -156,6 +156,10 @@ Paginated endpoints that load variable-size blobs (`getLedgers`, `getTransaction
 
 The first row is always returned regardless of its size so that cursor-based pagination can always make forward progress.
 
+### Query Computational Budget
+
+`getEvents` additionally enforces a SQLite VM-instruction budget (`max_event_query_ops`, default: 5,000,000 opcodes) to prevent denial-of-service via expensive unindexed filter combinations. When a query exceeds this budget, it is interrupted and returns a JSON-RPC error (`-32002`) advising the client to add more selective filters (e.g., `contractIds` or a specific first topic value). This is defense-in-depth — a `(topic1, id)` composite index handles the common efficient path.
+
 ## stellar-core Mapping
 
 This crate has no direct `stellar-core` counterpart. The implemented API surface is a native Stellar JSON-RPC surface for henyey nodes, while henyey-specific integrations replace captive-core and standalone ingestion components with direct access to `henyey-app`, `henyey-db`, and bucket snapshots.

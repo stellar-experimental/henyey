@@ -70,4 +70,12 @@ pub enum DbError {
     /// version is incompatible or a migration fails to apply.
     #[error("Migration error: {0}")]
     Migration(String),
+
+    /// Query exceeded its VM-step budget.
+    ///
+    /// Returned when a query's SQLite virtual-machine instruction count
+    /// exceeds the configured limit. This is a defense-in-depth mechanism
+    /// to prevent expensive unindexed scans from monopolizing DB workers.
+    #[error("query exceeded computational budget")]
+    QueryBudgetExceeded,
 }

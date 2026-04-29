@@ -10,6 +10,8 @@ pub(crate) const INTERNAL_ERROR: i32 = -32603;
 pub(crate) const SERVER_BUSY: i32 = -32000;
 /// Server is not yet ready (e.g., bucket snapshot not populated during boot).
 pub(crate) const SERVER_NOT_READY: i32 = -32001;
+/// Query exceeded its computational budget.
+pub(crate) const QUERY_BUDGET_EXCEEDED: i32 = -32002;
 
 /// JSON-RPC 2.0 error object.
 #[derive(Debug, Clone, Serialize)]
@@ -55,6 +57,10 @@ impl JsonRpcError {
 
     pub(crate) fn server_not_ready() -> Self {
         Self::new(SERVER_NOT_READY, "server is not ready, try again later")
+    }
+
+    pub(crate) fn query_budget_exceeded(msg: impl Into<String>) -> Self {
+        Self::new(QUERY_BUDGET_EXCEEDED, msg)
     }
 
     /// Internal error that logs full details server-side and returns only a
