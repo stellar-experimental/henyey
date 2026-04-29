@@ -6889,7 +6889,9 @@ mod advance_tracking_slot_tests {
 
     /// Helper rejects a malformed generalized tx set with a wrong phase count
     /// (3 phases — generalized sets must have exactly 2). This exercises the
-    /// real `check_tx_set_valid` rejection path through the helper.
+    /// real `prepare_for_apply` rejection path (via
+    /// `validate_generalized_tx_set_xdr_structure` at `tx_set.rs:520-524`)
+    /// through the helper.
     #[test]
     fn test_self_validate_nomination_tx_set_rejects_three_phase() {
         let herder = make_herder_for_self_validate_tests();
@@ -6897,7 +6899,7 @@ mod advance_tracking_slot_tests {
         let header = v24_header();
         assert!(
             !herder.self_validate_nomination_tx_set(&tx_set, &header, 0, None, None),
-            "3-phase generalized tx set must be rejected by check_tx_set_valid"
+            "3-phase generalized tx set must be rejected by prepare_for_apply"
         );
     }
 
@@ -6927,7 +6929,8 @@ mod advance_tracking_slot_tests {
     fn test_validate_and_cache_built_tx_set_aborts_on_helper_failure() {
         let herder = make_herder_for_self_validate_tests();
         // 3-phase generalized set on V24 — helper rejects via the
-        // check_tx_set_valid phase-count guard.
+        // prepare_for_apply / validate_generalized_tx_set_xdr_structure
+        // phase-count guard (tx_set.rs:520-524).
         let tx_set = empty_n_phase_generalized_tx_set(3);
         let header = v24_header();
         let cache_count_before = herder.scp_driver.tx_set_cache_count();
