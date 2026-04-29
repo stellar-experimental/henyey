@@ -125,7 +125,6 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
             let (fee_changes, charged_fee) = executor.process_fee_only(snapshot, tx, tx_fee)?;
             results.push(PreChargedFee {
                 charged_fee,
-                should_apply: true,
                 fee_changes,
             });
         }
@@ -160,16 +159,8 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
         let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);
         // Execute with deduct_fee=false — fees were already pre-deducted above
         // (when deduct_fee=true) or not needed (when deduct_fee=false from caller).
-        // When fees were pre-charged, use the should_apply flag from fee
-        // pre-deduction: if the fee source had insufficient balance,
-        // should_apply=false and the executor will skip the operation body.
-        // This matches stellar-core's parallelApply which checks
-        // txResult.isSuccess() before executing ops.
-        let should_apply = if has_pre_charged {
-            pre_fee_results[tx_index].should_apply
-        } else {
-            true
-        };
+        // For protocol 24+, the body always executes after fee pre-deduction,
+        // matching stellar-core's behavior where feeToPay=0 in applying mode.
         let mut result = executor.execute_transaction_with_arc(
             snapshot,
             TransactionExecutionRequest {
@@ -177,7 +168,6 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
                 base_fee: tx_fee,
                 soroban_prng_seed: Some(tx_prng_seed),
                 deduct_fee: false,
-                should_apply,
             },
         )?;
 
@@ -901,7 +891,6 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
             .expect("total_fee_pool overflow");
         classic_pre_charged.push(PreChargedFee {
             charged_fee,
-            should_apply: charged_fee >= computed_fee,
             fee_changes,
         });
     }
@@ -928,7 +917,6 @@ pub(crate) fn pre_deduct_all_fees_on_delta(
                     .expect("total_fee_pool overflow");
                 soroban_pre_charged.push(PreChargedFee {
                     charged_fee,
-                    should_apply: charged_fee >= computed_fee,
                     fee_changes,
                 });
             }
@@ -1073,7 +1061,7 @@ pub(super) fn execute_single_cluster(
             match pp {
                 PreParallelResult::Success(pre_apply) => {
                     // Pre-apply succeeded globally; run only the operation body.
-                    executor.execute_with_pre_apply_result(snapshot, pre_apply, pre.should_apply)?
+                    executor.execute_with_pre_apply_result(snapshot, pre_apply)?
                 }
                 PreParallelResult::Failed(early_result) => {
                     // Pre-apply failed globally (validation error); use result directly.
@@ -1093,7 +1081,6 @@ pub(super) fn execute_single_cluster(
                     base_fee: tx_fee,
                     soroban_prng_seed: Some(tx_prng_seed),
                     deduct_fee: false,
-                    should_apply: pre.should_apply,
                 },
             )?
         };
@@ -1162,10 +1149,7 @@ pub(super) fn execute_single_cluster(
     let flush_final_us = flush_final_start.elapsed().as_micros() as u64;
 
     // Collect hot archive restored keys from SUCCESSFUL transactions only.
-    // With the should_apply early-exit fix, skipped TXs no longer produce hot
-    // archive keys (the operation body never executes). This guard is retained
-    // as defense-in-depth against future regressions — if a TX somehow fails
-    // after execution, its hot archive keys must not propagate as they would
+    // Failed transactions' hot archive keys must not propagate as they would
     // produce spurious HOT_ARCHIVE_LIVE tombstones (VE-06 class bug).
     let mut restored_keys: Vec<LedgerKey> = Vec::new();
     for r in &results {
@@ -1346,7 +1330,6 @@ pub(super) fn execute_stage_clusters(
                 .iter()
                 .map(|f| PreChargedFee {
                     charged_fee: f.charged_fee,
-                    should_apply: f.should_apply,
                     fee_changes: f.fee_changes.clone(),
                 })
                 .collect();

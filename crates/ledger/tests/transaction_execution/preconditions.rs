@@ -730,10 +730,9 @@ fn test_operation_failure_rolls_back_changes() {
         .expect("execute");
 
     assert!(!result.success);
-    assert_eq!(
-        result.failure,
-        Some(ExecutionFailure::TxInsufficientBalance)
-    );
+    // The body now executes (no fee-gate skip). The payment to non-existent
+    // destination fails, producing TxFailed (not TxInsufficientBalance).
+    assert_eq!(result.failure, Some(ExecutionFailure::TxFailed));
 
     let state = executor.state();
     assert!(state.get_account(&destination).is_none());

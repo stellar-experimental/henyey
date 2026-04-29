@@ -54,10 +54,10 @@ use henyey_tx::{
     TransactionFrame, TxError, TxEventManager,
 };
 use stellar_xdr::curr::{
-    AccountEntry, AccountEntryExt, AccountId, AccountMergeResult, AllowTrustOp, AlphaNum12,
-    AlphaNum4, Asset, AssetCode, ClaimableBalanceEntry, ClaimableBalanceId, ConfigSettingEntry,
-    ConfigSettingId, ContractEvent, CreateClaimableBalanceResult, DiagnosticEvent, ExtensionPoint,
-    InflationResult, InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
+    AccountEntry, AccountId, AccountMergeResult, AllowTrustOp, AlphaNum12, AlphaNum4, Asset,
+    AssetCode, ClaimableBalanceEntry, ClaimableBalanceId, ConfigSettingEntry, ConfigSettingId,
+    ContractEvent, CreateClaimableBalanceResult, DiagnosticEvent, ExtensionPoint, InflationResult,
+    InnerTransactionResult, InnerTransactionResultExt, InnerTransactionResultPair,
     InnerTransactionResultResult, LedgerEntry, LedgerEntryChange, LedgerEntryChanges,
     LedgerEntryData, LedgerKey, LedgerKeyClaimableBalance, LedgerKeyConfigSetting,
     LedgerKeyLiquidityPool, LedgerKeyTrustLine, Limits, LiquidityPoolEntry, LiquidityPoolEntryBody,
@@ -114,7 +114,6 @@ pub struct TransactionExecutionRequest {
     pub base_fee: u32,
     pub soroban_prng_seed: Option<[u8; 32]>,
     pub deduct_fee: bool,
-    pub should_apply: bool,
 }
 
 impl TransactionExecutionRequest {
@@ -123,14 +122,12 @@ impl TransactionExecutionRequest {
         base_fee: u32,
         soroban_prng_seed: Option<[u8; 32]>,
         deduct_fee: bool,
-        should_apply: bool,
     ) -> Self {
         Self {
             tx_envelope: Arc::new(tx_envelope.clone()),
             base_fee,
             soroban_prng_seed,
             deduct_fee,
-            should_apply,
         }
     }
 }
@@ -931,22 +928,6 @@ impl TransactionExecutor {
 
         tracing::debug!(account = %account_id_to_strkey(account_id), "{}: NOT FOUND in bucket list", label);
         Ok(false)
-    }
-
-    fn available_balance_for_fee(&self, account: &AccountEntry) -> Result<i64> {
-        let min_balance = self
-            .state
-            .minimum_balance_for_account(account, self.protocol_version, 0)
-            .map_err(|e| LedgerError::Internal(e.to_string()))?;
-        let mut available = account.balance - min_balance;
-        if protocol_version_starts_from(self.protocol_version, ProtocolVersion::V10) {
-            let selling = match &account.ext {
-                AccountEntryExt::V1(v1) => v1.liabilities.selling,
-                AccountEntryExt::V0 => 0,
-            };
-            available -= selling;
-        }
-        Ok(available)
     }
 
     /// Load a trustline from the snapshot into the state manager.
@@ -1813,7 +1794,6 @@ impl TransactionExecutor {
                 base_fee,
                 soroban_prng_seed,
                 deduct_fee,
-                true, // should_apply: always execute body in sequential path
             ),
         )
     }
@@ -1916,14 +1896,11 @@ impl TransactionExecutor {
         let mut fee = frame.fee_to_charge(base_fee as i64);
 
         let fee_deduct_start = std::time::Instant::now();
-        let mut preflight_failure = None;
-        if deduct_fee {
-            if let Some(acc) = self.state.get_account(&fee_source_id) {
-                if self.available_balance_for_fee(acc)? < fee {
-                    preflight_failure = Some(TransactionResultCode::TxInsufficientBalance);
-                }
-            }
-        }
+        // For protocol 24+ (all Henyey-supported protocols), stellar-core's
+        // commonPreApply(applying=true) sets feeToPay=0 after fee pre-deduction,
+        // so partial fee charge never blocks body application. The fee is capped
+        // at available balance during deduction below.
+        let preflight_failure = None;
 
         let tx_event_manager = TxEventManager::new(
             true,
@@ -2164,80 +2141,6 @@ impl TransactionExecutor {
         }))
     }
 
-    /// Build a `TransactionExecutionResult` for a TX whose operation body was
-    /// skipped (e.g., insufficient fee source balance in the parallel path).
-    ///
-    /// This matches stellar-core's `parallelApply` returning `{false, {}}` when
-    /// `!txResult.isSuccess()` after `preParallelApply`.
-    pub(super) fn build_skipped_result(
-        pre: PreApplyResult,
-        emit_soroban_tx_meta_ext_v1: bool,
-        enable_soroban_diagnostic_events: bool,
-    ) -> TransactionExecutionResult {
-        let soroban_fee_info = pre.refundable_fee_tracker.as_ref().map(|t| {
-            (
-                t.non_refundable_fee,
-                t.consumed_refundable_fee,
-                t.consumed_rent_fee,
-            )
-        });
-        let fee_refund = pre
-            .refundable_fee_tracker
-            .as_ref()
-            .map(|t| t.refund_amount())
-            .unwrap_or(0);
-
-        let tx_meta = build_transaction_meta(TransactionMetaParts {
-            tx_changes_before: pre.tx_changes_before,
-            op_changes: vec![],
-            op_events: vec![],
-            tx_events: vec![],
-            soroban_return_value: None,
-            diagnostic_events: vec![],
-            soroban_fee_info,
-            emit_soroban_tx_meta_ext_v1,
-            enable_soroban_diagnostic_events,
-        });
-
-        let total_us = pre.tx_timing_start.elapsed().as_micros() as u64;
-        TransactionExecutionResult {
-            success: false,
-            fee_charged: 0, // overridden by caller from pre-charged fees
-            fee_refund,
-            operation_results: vec![],
-            error: Some("Insufficient balance for fee".into()),
-            failure: Some(TransactionResultCode::TxInsufficientBalance),
-            tx_meta: Some(tx_meta),
-            fee_changes: Some(pre.fee_changes),
-            post_fee_changes: Some(empty_entry_changes()),
-            hot_archive_restored_keys: Vec::new(),
-            timings: TxExecTimings {
-                op_type_timings: HashMap::new(),
-                exec_time_us: total_us,
-                validation_us: pre.validation_us,
-                fee_seq_us: pre.fee_seq_us,
-                footprint_us: 0,
-                ops_us: 0,
-                meta_build_us: 0,
-                meta_commit_us: 0,
-                meta_fee_refund_us: 0,
-                meta_build_phase_us: 0,
-                val_account_load_us: pre.val_account_load_us,
-                val_tx_hash_us: pre.val_tx_hash_us,
-                val_ed25519_us: pre.val_ed25519_us,
-                val_other_us: pre.val_other_us,
-                fee_deduct_us: pre.fee_deduct_us,
-                op_sig_check_us: pre.op_sig_check_us,
-                signer_removal_us: pre.signer_removal_us,
-                seq_bump_us: pre.seq_bump_us,
-            },
-            tx_hash: pre.tx_hash,
-            // TxInsufficientBalance from fee deduction is an outer failure for
-            // fee-bump transactions (stellar-core's commonValid → setError).
-            fee_bump_outer_failure: pre.frame.is_fee_bump(),
-        }
-    }
-
     /// Execute a transaction with a pre-built execution request.
     ///
     /// This is the main orchestrator that calls `pre_apply()` for validation,
@@ -2256,25 +2159,17 @@ impl TransactionExecutor {
 
     /// Execute a transaction whose pre-apply phase was already completed by
     /// a global `preParallelApply` pass. Skips `pre_apply_arc` entirely and
-    /// goes straight to `apply_body` (or builds a skipped result when
-    /// `should_apply` is false).
+    /// goes straight to `apply_body`.
     ///
     /// This matches stellar-core's `parallelApply` which consumes the result
-    /// of `preParallelApply` and only runs `doApply`.
+    /// of `preParallelApply` and runs `doApply`. For protocol 24+, the body
+    /// always executes after fee pre-deduction (stellar-core sets feeToPay=0
+    /// in applying mode).
     pub(super) fn execute_with_pre_apply_result(
         &mut self,
         snapshot: &SnapshotHandle,
         mut pre: PreApplyResult,
-        should_apply: bool,
     ) -> Result<TransactionExecutionResult> {
-        if !should_apply {
-            return Ok(Self::build_skipped_result(
-                pre,
-                self.emit_soroban_tx_meta_ext_v1,
-                self.enable_soroban_diagnostic_events,
-            ));
-        }
-
         // Clear rollback delta entries. The global pre_parallel_apply already
         // committed fee/seq/signer mutations to the main delta. If apply_body
         // fails, rollback_failed_tx must NOT re-record these on the cluster
@@ -2304,7 +2199,6 @@ impl TransactionExecutor {
             base_fee,
             soroban_prng_seed,
             deduct_fee,
-            should_apply,
         } = request;
 
         // Phase 1: Pre-apply (validate, charge fees, remove signers, bump seq)
@@ -2319,16 +2213,7 @@ impl TransactionExecutor {
             Err(early_result) => return Ok(early_result),
         };
 
-        // Phase 2: Skip operation body when caller determined TX should not apply
-        if !should_apply {
-            return Ok(Self::build_skipped_result(
-                pre,
-                self.emit_soroban_tx_meta_ext_v1,
-                self.enable_soroban_diagnostic_events,
-            ));
-        }
-
-        // Phase 3: Execute operation body
+        // Phase 2: Execute operation body
         self.apply_body(snapshot, pre)
     }
 
@@ -3107,8 +2992,6 @@ pub(crate) fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
 pub struct PreChargedFee {
     /// The fee actually charged (min(balance, computed_fee)).
     pub charged_fee: i64,
-    /// Whether the transaction should be applied (charged_fee >= computed_fee).
-    pub should_apply: bool,
     /// Fee processing LedgerEntryChanges: [State(before), Updated(after)].
     pub fee_changes: LedgerEntryChanges,
 }
@@ -3150,14 +3033,12 @@ fn pre_deduct_soroban_fees(
                     snapshot,
                     ledger_seq,
                 )?;
-                let should_apply = charged_fee >= computed_fee;
 
                 total_fee_pool = total_fee_pool
                     .checked_add(charged_fee)
                     .expect("total_fee_pool overflow");
                 pre_charged.push(PreChargedFee {
                     charged_fee,
-                    should_apply,
                     fee_changes,
                 });
             }

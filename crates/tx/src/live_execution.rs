@@ -208,8 +208,6 @@ impl LiveExecutionContext {
 pub struct FeeSeqNumResult {
     /// The fee actually charged (may be less than requested if account is underfunded).
     pub fee_charged: i64,
-    /// Whether the transaction should proceed to operation application.
-    pub should_apply: bool,
     /// The mutable transaction result initialized for this transaction.
     pub tx_result: MutableTransactionResult,
 }
@@ -246,7 +244,6 @@ pub fn process_fee_seq_num(
     base_fee: Option<i64>,
 ) -> Result<FeeSeqNumResult> {
     let source_account_id = muxed_to_account_id(&frame.source_account());
-    let protocol_version = ctx.protocol_version();
 
     // Calculate the fee to charge (before borrowing state mutably)
     let effective_base_fee = base_fee.unwrap_or(crate::NETWORK_MIN_BASE_FEE);
@@ -266,7 +263,10 @@ pub fn process_fee_seq_num(
     // Cap fee at available balance
     let fee_charged = std::cmp::min(fee, available_balance);
 
-    // Create the mutable result
+    // Create the mutable result — fee pre-deduction always produces a
+    // successful result. For protocol 24+ (all Henyey-supported protocols),
+    // stellar-core's commonPreApply(applying=true) sets feeToPay=0, so
+    // partial fee charge never blocks body application.
     let mut tx_result = MutableTransactionResult::new(fee_charged);
 
     // Initialize refundable fee tracker for Soroban transactions
@@ -274,13 +274,6 @@ pub fn process_fee_seq_num(
         if let Some(refundable_fee) = frame.refundable_fee() {
             tx_result.initialize_refundable_fee_tracker(refundable_fee);
         }
-    }
-
-    // Check if we have sufficient balance for the fee
-    let should_apply = fee_charged >= fee;
-
-    if !should_apply {
-        tx_result.set_error(TransactionResultCode::TxInsufficientBalance);
     }
 
     // Now get mutable state for modifications
@@ -291,13 +284,6 @@ pub fn process_fee_seq_num(
 
         // Charge the fee (or whatever is available)
         charge_fee_to_account(state, &source_account_id, fee_charged)?;
-
-        // Update sequence number for pre-protocol 10 (only if applying).
-        // Sequence belongs to the inner source (matters for fee bumps).
-        if should_apply && protocol_version_is_before(protocol_version, ProtocolVersion::V10) {
-            let inner_source_id = frame.inner_source_account_id();
-            update_sequence_number(state, &inner_source_id, frame.sequence_number())?;
-        }
     }
 
     // Add to fee pool after releasing state borrow
@@ -305,7 +291,6 @@ pub fn process_fee_seq_num(
 
     Ok(FeeSeqNumResult {
         fee_charged,
-        should_apply,
         tx_result,
     })
 }
@@ -657,10 +642,6 @@ pub fn apply_transaction(
     // Phase 1: Fee and sequence number
     let fee_result = process_fee_seq_num(frame, ctx, None)?;
 
-    if !fee_result.should_apply {
-        return Ok(fee_result.tx_result);
-    }
-
     let mut tx_result = fee_result.tx_result;
 
     // Phase 2: Process sequence number (protocol 10+)
@@ -831,7 +812,6 @@ mod tests {
 
         let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
 
-        assert!(result.should_apply);
         // Fee charged is min(declared_fee=200, base_fee*ops=100*1) = 100
         assert_eq!(result.fee_charged, 100);
         assert_eq!(ctx.fee_pool_delta(), 100);
@@ -857,7 +837,8 @@ mod tests {
 
         let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
 
-        assert!(!result.should_apply);
+        // Fee is capped at available balance, but result is still successful
+        // (matching stellar-core's processFeeSeqNum which always returns success).
         assert_eq!(result.fee_charged, 50); // Capped at available balance
         assert_eq!(ctx.fee_pool_delta(), 50);
     }
@@ -1221,7 +1202,6 @@ mod tests {
     fn test_fee_seq_num_result_debug() {
         let result = FeeSeqNumResult {
             fee_charged: 100,
-            should_apply: true,
             tx_result: MutableTransactionResult::new(100),
         };
         let debug_str = format!("{:?}", result);
@@ -1233,12 +1213,10 @@ mod tests {
     fn test_fee_seq_num_result_fields() {
         let result = FeeSeqNumResult {
             fee_charged: 250,
-            should_apply: false,
             tx_result: MutableTransactionResult::new(250),
         };
 
         assert_eq!(result.fee_charged, 250);
-        assert!(!result.should_apply);
     }
 
     // === Protocol constants tests ===
@@ -1268,7 +1246,7 @@ mod tests {
 
         let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
 
-        assert!(!result.should_apply);
+        // Fee is capped at 0 (zero balance), result is still successful.
         assert_eq!(result.fee_charged, 0);
     }
 
@@ -1288,7 +1266,6 @@ mod tests {
         let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
 
         // Should succeed with exactly 100 charged
-        assert!(result.should_apply);
         assert_eq!(result.fee_charged, 100);
 
         // Account should be at 0
@@ -1445,8 +1422,7 @@ mod tests {
         assert!(frame.is_fee_bump());
 
         // Process fee (charges fee source B)
-        let fee_result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
-        assert!(fee_result.should_apply);
+        let _fee_result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
 
         // Process seq num (should advance inner source A, not fee source B)
         process_seq_num(&frame, &mut ctx).unwrap();
@@ -1639,7 +1615,6 @@ mod tests {
         let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
 
         // fee_to_charge = min(declared=1000, base_fee * resource_ops = 100 * 2) = 200
-        assert!(result.should_apply);
         assert_eq!(
             result.fee_charged, 200,
             "fee-bump with 1 inner op should charge base_fee * 2 = 200"
@@ -1713,7 +1688,6 @@ mod tests {
 
         let result = process_fee_seq_num(&frame, &mut ctx, None).unwrap();
 
-        assert!(result.should_apply);
         assert_eq!(
             result.fee_charged, 350,
             "Soroban fee-bump: resource_fee(150) + min(inclusion(750), min_inclusion(200)) = 350"
