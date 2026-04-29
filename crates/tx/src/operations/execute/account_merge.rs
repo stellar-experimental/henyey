@@ -2,8 +2,7 @@
 
 use stellar_xdr::curr::{
     AccountEntry, AccountEntryExt, AccountEntryExtensionV1Ext, AccountFlags, AccountId,
-    AccountMergeResult, AccountMergeResultCode, LedgerKey, LedgerKeyAccount, MuxedAccount,
-    OperationResult, OperationResultTr,
+    AccountMergeResult, AccountMergeResultCode, MuxedAccount, OperationResult, OperationResultTr,
 };
 
 use super::{add_account_balance, require_source_account_cloned};
@@ -80,12 +79,10 @@ pub(crate) fn execute_account_merge(
         state.update_num_sponsoring(&sponsor, -1)?;
     }
 
-    let ledger_key = LedgerKey::Account(LedgerKeyAccount {
-        account_id: source.clone(),
-    });
-    if state.entry_sponsor(&ledger_key).is_some() {
-        state.remove_entry_sponsorship_and_update_counts(&ledger_key, source, 2)?;
-    }
+    // Account-merge-specific sponsorship cleanup: clear sponsor metadata and
+    // decrement sponsor's num_sponsoring + source's num_sponsored. Mirrors
+    // stellar-core MergeOpFrame.cpp:180,262 -> removeEntryWithPossibleSponsorship.
+    state.remove_account_merge_sponsorship(source, 2)?;
 
     // Flush ALL account changes EXCEPT the source being deleted, before recording deletion.
     // stellar-core records all pending account STATE/UPDATED pairs
@@ -704,6 +701,15 @@ mod tests {
 
         // Source should be deleted
         assert!(state.get_account(&source_id).is_none());
+
+        // Sponsor's num_sponsoring must be decremented from 2 to 0 by the
+        // account-merge sponsorship cleanup helper. This pins the wiring of
+        // remove_account_merge_sponsorship at the call site.
+        assert_eq!(
+            num_sponsoring(state.get_account(&sponsor_id).unwrap()),
+            0,
+            "sponsor num_sponsoring must be decremented from 2 to 0 by the merge cleanup"
+        );
     }
 
     /// Test that ImmutableSet is checked before HasSubEntries.

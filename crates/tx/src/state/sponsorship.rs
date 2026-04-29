@@ -387,6 +387,101 @@ impl LedgerStateManager {
         Ok(())
     }
 
+    /// Atomically clear sponsorship for the source account ledger entry
+    /// during account-merge: validate sponsor counts and `num_sponsored`,
+    /// then decrement them.
+    ///
+    /// Account-merge has special semantics versus generic
+    /// [`remove_sponsored_subentry`](Self::remove_sponsored_subentry):
+    ///
+    /// - `num_sub_entries` is **not** decremented. This matches stellar-core's
+    ///   `SponsorshipUtils.cpp:685` (`if (le.data.type() != ACCOUNT)` guard
+    ///   in `removeEntryWithoutSponsorship`) and is irrelevant anyway because
+    ///   the caller will delete the account immediately after.
+    /// - `num_sponsored` IS decremented on the source, matching stellar-core's
+    ///   `removeEntrySponsorship` (`SponsorshipUtils.cpp:391-397`). The
+    ///   decrement is technically wasted (the account is about to be
+    ///   deleted), but eliding it would change observable transaction meta
+    ///   and is therefore deferred to a separate parity investigation.
+    /// - `num_sponsoring` IS decremented on the sponsor.
+    /// - The entry-sponsorship metadata is cleared.
+    /// - If the source is its own sponsor (corrupt state — impossible by
+    ///   sponsorship invariants), returns `TxError::Internal` matching
+    ///   stellar-core's `SponsorshipUtils.cpp:822-824` `runtime_error`.
+    ///
+    /// If the source key has no sponsor, this is a no-op (matching the
+    /// pre-existing `if entry_sponsor(...).is_some()` guard at the
+    /// account-merge call site).
+    ///
+    /// Mirrors stellar-core's `MergeOpFrame.cpp:180,262` →
+    /// `removeEntryWithPossibleSponsorship` flow for an ACCOUNT entry.
+    ///
+    /// # Errors
+    ///
+    /// - `TxError::Internal` if `multiplier < 0`.
+    /// - `TxError::Internal` if Phase-1 validation fails (sponsor's
+    ///   `num_sponsoring < multiplier`, or source's
+    ///   `num_sponsored < multiplier`).
+    /// - `TxError::Internal` if source is listed as its own sponsor.
+    ///
+    /// State is **not** mutated on any error path.
+    pub fn remove_account_merge_sponsorship(
+        &mut self,
+        source: &AccountId,
+        multiplier: i64,
+    ) -> Result<()> {
+        if multiplier < 0 {
+            return Err(TxError::Internal(
+                "negative sponsorship multiplier".to_string(),
+            ));
+        }
+        let key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: source.clone(),
+        });
+        let Some(sponsor) = self.entry_sponsor(&key) else {
+            return Ok(());
+        };
+        // Fail-loud on self-sponsor (impossible by invariant; matches
+        // stellar-core SponsorshipUtils.cpp:822-824 runtime_error).
+        if sponsor == *source {
+            return Err(TxError::Internal(
+                "source account is listed as its own sponsor".to_string(),
+            ));
+        }
+
+        // Phase 1: validate. validate_can_remove_sponsorship checks the
+        // sponsor's num_sponsoring and (with sponsored=Some) the source's
+        // num_sponsored. It explicitly skips the num_sub_entries check for
+        // ACCOUNT keys, which is exactly what we need here.
+        self.validate_can_remove_sponsorship(&key, Some(source), multiplier)?;
+
+        // Phase 2: mutate (direct field writes — preconditions verified).
+        let sponsor_removed = self
+            .remove_entry_sponsor(&key)
+            .expect("sponsor verified present in Phase 1");
+        debug_assert_eq!(sponsor_removed, sponsor);
+
+        let sponsor_acc = self
+            .get_account_mut(&sponsor)
+            .expect("sponsor account loaded by validate_can_remove_sponsorship");
+        let ext = ensure_account_ext_v2(sponsor_acc);
+        ext.num_sponsoring = ext
+            .num_sponsoring
+            .checked_sub(multiplier as u32)
+            .expect("Phase 1 verified num_sponsoring >= multiplier");
+
+        let source_acc = self
+            .get_account_mut(source)
+            .expect("source account loaded by validate_can_remove_sponsorship");
+        let ext = ensure_account_ext_v2(source_acc);
+        ext.num_sponsored = ext
+            .num_sponsored
+            .checked_sub(multiplier as u32)
+            .expect("Phase 1 verified num_sponsored >= multiplier");
+
+        Ok(())
+    }
+
     /// Atomically remove a sponsored claimable balance entry.
     ///
     /// Like `remove_sponsored_subentry` but for entries that are NOT
@@ -1498,5 +1593,291 @@ mod tests {
         let sponsor = state.get_account(&sponsor_id).unwrap();
         let sv2 = get_ext_v2(sponsor);
         assert_eq!(sv2.num_sponsoring, 1);
+    }
+
+    // ========================================================================
+    // remove_account_merge_sponsorship tests (issue #2048 — account-merge-
+    // specific sponsorship removal helper)
+    // ========================================================================
+
+    /// Helper: build the source account ledger key for tests.
+    fn source_account_key(source: &AccountId) -> LedgerKey {
+        LedgerKey::Account(LedgerKeyAccount {
+            account_id: source.clone(),
+        })
+    }
+
+    /// remove_account_merge_sponsorship decrements sponsor's num_sponsoring AND
+    /// source's num_sponsored, leaves num_sub_entries untouched, and clears
+    /// sponsorship metadata.
+    #[test]
+    fn test_remove_account_merge_sponsorship_decrements_both_counts() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source_id = create_test_account_id(150);
+        let sponsor_id = create_test_account_id(151);
+
+        // Source: num_sub_entries = 0 (account-merge precondition: no
+        // non-signer subentries), num_sponsored = 2 (account = 2 reserve units).
+        state.create_account(create_test_account_with_sponsorship(
+            source_id.clone(),
+            100_000_000,
+            0, // num_sub_entries
+            2, // num_sponsored
+            0,
+        ));
+        // Sponsor: num_sponsoring = 2 to match the sponsored source account.
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            2, // num_sponsoring
+        ));
+
+        let key = source_account_key(&source_id);
+        state.set_entry_sponsor(key.clone(), sponsor_id.clone());
+
+        state
+            .remove_account_merge_sponsorship(&source_id, 2)
+            .unwrap();
+
+        let source = state.get_account(&source_id).unwrap();
+        assert_eq!(
+            source.num_sub_entries, 0,
+            "num_sub_entries must not be touched"
+        );
+        let v2 = get_ext_v2(source);
+        assert_eq!(v2.num_sponsored, 0);
+
+        let sponsor = state.get_account(&sponsor_id).unwrap();
+        let sv2 = get_ext_v2(sponsor);
+        assert_eq!(sv2.num_sponsoring, 0);
+
+        assert!(
+            state.entry_sponsor(&key).is_none(),
+            "sponsorship metadata must be cleared"
+        );
+    }
+
+    /// remove_account_merge_sponsorship is a no-op when the source has no
+    /// entry-sponsorship metadata (matches the legacy call-site `if` guard).
+    #[test]
+    fn test_remove_account_merge_sponsorship_no_sponsor_is_noop() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source_id = create_test_account_id(160);
+
+        state.create_account(create_test_account_with_sponsorship(
+            source_id.clone(),
+            100_000_000,
+            3, // unrelated num_sub_entries — must be unchanged
+            5, // unrelated num_sponsored — must be unchanged
+            0,
+        ));
+
+        // No set_entry_sponsor call.
+        state
+            .remove_account_merge_sponsorship(&source_id, 2)
+            .unwrap();
+
+        let source = state.get_account(&source_id).unwrap();
+        assert_eq!(source.num_sub_entries, 3);
+        let v2 = get_ext_v2(source);
+        assert_eq!(v2.num_sponsored, 5);
+        assert!(state
+            .entry_sponsor(&source_account_key(&source_id))
+            .is_none());
+    }
+
+    /// Negative multiplier returns Internal error and does not mutate state.
+    #[test]
+    fn test_remove_account_merge_sponsorship_negative_multiplier_errors() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source_id = create_test_account_id(170);
+        let sponsor_id = create_test_account_id(171);
+
+        state.create_account(create_test_account_with_sponsorship(
+            source_id.clone(),
+            100_000_000,
+            0,
+            2,
+            0,
+        ));
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            2,
+        ));
+        let key = source_account_key(&source_id);
+        state.set_entry_sponsor(key.clone(), sponsor_id.clone());
+
+        let result = state.remove_account_merge_sponsorship(&source_id, -1);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TxError::Internal(msg) => assert!(msg.contains("negative")),
+            other => panic!("expected Internal, got {:?}", other),
+        }
+
+        // State must be unchanged.
+        let v2 = get_ext_v2(state.get_account(&source_id).unwrap());
+        assert_eq!(v2.num_sponsored, 2);
+        let sv2 = get_ext_v2(state.get_account(&sponsor_id).unwrap());
+        assert_eq!(sv2.num_sponsoring, 2);
+        assert!(state.entry_sponsor(&key).is_some());
+    }
+
+    /// Sponsor with insufficient num_sponsoring errors before any mutation.
+    #[test]
+    fn test_remove_account_merge_sponsorship_low_num_sponsoring_errors_before_mutation() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source_id = create_test_account_id(180);
+        let sponsor_id = create_test_account_id(181);
+
+        state.create_account(create_test_account_with_sponsorship(
+            source_id.clone(),
+            100_000_000,
+            0,
+            2, // num_sponsored
+            0,
+        ));
+        // Sponsor has num_sponsoring = 1, less than the multiplier of 2.
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            1, // ← invalid for multiplier 2
+        ));
+
+        let key = source_account_key(&source_id);
+        state.set_entry_sponsor(key.clone(), sponsor_id.clone());
+
+        let result = state.remove_account_merge_sponsorship(&source_id, 2);
+        assert!(result.is_err());
+
+        // Phase-1 atomic failure: nothing mutated.
+        let v2 = get_ext_v2(state.get_account(&source_id).unwrap());
+        assert_eq!(v2.num_sponsored, 2);
+        let sv2 = get_ext_v2(state.get_account(&sponsor_id).unwrap());
+        assert_eq!(sv2.num_sponsoring, 1);
+        assert!(state.entry_sponsor(&key).is_some());
+    }
+
+    /// Source with insufficient num_sponsored errors before any mutation.
+    #[test]
+    fn test_remove_account_merge_sponsorship_low_num_sponsored_errors_before_mutation() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source_id = create_test_account_id(190);
+        let sponsor_id = create_test_account_id(191);
+
+        // Source has num_sponsored = 1, less than the multiplier of 2.
+        state.create_account(create_test_account_with_sponsorship(
+            source_id.clone(),
+            100_000_000,
+            0,
+            1, // ← invalid for multiplier 2
+            0,
+        ));
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            2,
+        ));
+
+        let key = source_account_key(&source_id);
+        state.set_entry_sponsor(key.clone(), sponsor_id.clone());
+
+        let result = state.remove_account_merge_sponsorship(&source_id, 2);
+        assert!(result.is_err());
+
+        // Phase-1 atomic failure: nothing mutated.
+        let v2 = get_ext_v2(state.get_account(&source_id).unwrap());
+        assert_eq!(v2.num_sponsored, 1);
+        let sv2 = get_ext_v2(state.get_account(&sponsor_id).unwrap());
+        assert_eq!(sv2.num_sponsoring, 2);
+        assert!(state.entry_sponsor(&key).is_some());
+    }
+
+    /// remove_account_merge_sponsorship must not touch source's num_sub_entries
+    /// regardless of its value. Matches stellar-core's
+    /// `removeEntryWithoutSponsorship` no-op for ACCOUNT entries
+    /// (SponsorshipUtils.cpp:685 guard).
+    #[test]
+    fn test_remove_account_merge_sponsorship_does_not_touch_num_sub_entries() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source_id = create_test_account_id(200);
+        let sponsor_id = create_test_account_id(201);
+
+        // Set num_sub_entries = 5 directly. The helper must be agnostic to
+        // why it's set — it must never touch this field.
+        state.create_account(create_test_account_with_sponsorship(
+            source_id.clone(),
+            100_000_000,
+            5, // num_sub_entries — to be left untouched
+            2,
+            0,
+        ));
+        state.create_account(create_test_account_with_sponsorship(
+            sponsor_id.clone(),
+            100_000_000,
+            0,
+            0,
+            2,
+        ));
+
+        let key = source_account_key(&source_id);
+        state.set_entry_sponsor(key.clone(), sponsor_id.clone());
+
+        state
+            .remove_account_merge_sponsorship(&source_id, 2)
+            .unwrap();
+
+        let source = state.get_account(&source_id).unwrap();
+        assert_eq!(
+            source.num_sub_entries, 5,
+            "num_sub_entries must remain 5 — helper must not touch it"
+        );
+    }
+
+    /// Source listed as its own sponsor is corrupt state. Helper must fail
+    /// loud, matching stellar-core's SponsorshipUtils.cpp:822-824 runtime_error.
+    #[test]
+    fn test_remove_account_merge_sponsorship_self_sponsor_errors() {
+        let mut state = LedgerStateManager::new(5_000_000, 100);
+        let source_id = create_test_account_id(210);
+
+        state.create_account(create_test_account_with_sponsorship(
+            source_id.clone(),
+            100_000_000,
+            0,
+            2,
+            2, // self-sponsor scenario: source has its own num_sponsoring too
+        ));
+
+        let key = source_account_key(&source_id);
+        // Manually corrupt: source listed as its own sponsor.
+        state.set_entry_sponsor(key.clone(), source_id.clone());
+
+        let result = state.remove_account_merge_sponsorship(&source_id, 2);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TxError::Internal(msg) => {
+                assert!(
+                    msg.contains("source") && msg.contains("own sponsor"),
+                    "expected self-sponsor error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Internal error, got {:?}", other),
+        }
+
+        // State unchanged.
+        let v2 = get_ext_v2(state.get_account(&source_id).unwrap());
+        assert_eq!(v2.num_sponsored, 2);
+        assert_eq!(v2.num_sponsoring, 2);
+        assert!(state.entry_sponsor(&key).is_some());
     }
 }

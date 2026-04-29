@@ -298,7 +298,7 @@ Corresponds to: `SponsorshipUtils.h`
 | `canRemoveEntrySponsorship()` | `remove_entry_sponsorship_and_update_counts()` | Full |
 | `canTransferEntrySponsorship()` | `apply_entry_sponsorship_with_sponsor()` | Full |
 | `establishEntrySponsorship()` | `apply_entry_sponsorship()` | Full |
-| `removeEntrySponsorship()` | `remove_entry_sponsorship_and_update_counts()` | Full |
+| `removeEntrySponsorship()` | `remove_entry_sponsorship_and_update_counts()` (and `remove_account_merge_sponsorship()` for the account-merge call site) | Full |
 | `transferEntrySponsorship()` | `apply_entry_sponsorship_with_sponsor()` | Full |
 | `canEstablishSignerSponsorship()` | Inline in `set_options.rs` | Full |
 | `canRemoveSignerSponsorship()` | Inline in `set_options.rs` | Full |
