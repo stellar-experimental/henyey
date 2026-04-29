@@ -1215,17 +1215,16 @@ impl ScpDriver {
         // means SCP tracking has caught up to or moved past `slot_index`
         // while the local ledger apply is at a different point. The
         // dominant case is `lcl_seq + 1 < slot_index` — apply lagging
-        // behind SCP externalization, processing a peer envelope that
-        // henyey's `advance_tracking_slot` →
-        // `drain_and_process_pending(consensus_index)` just released
-        // synchronously, ahead of apply.
+        // behind SCP externalization.
         //
-        // Stellar-core's `safelyProcessSCPQueue` defers the drain to
-        // the main thread via `postOnMainThread`
-        // (`HerderImpl.cpp:1194`), giving apply a chance to complete
-        // first. Henyey's fast-path does not — so we reach this code
-        // path with `lcl_seq + 1 < slot_index`, whereas stellar-core
-        // typically would not.
+        // This path is now limited to fresh peer envelopes arriving
+        // between externalization and `ledger_closed` (via the select!
+        // loop, `receive_tx_set`, or `process_ready_fetching_envelopes`).
+        // The former dominant trigger — synchronous drain in
+        // `advance_tracking_slot` — was removed in #2115; pending
+        // envelopes are now drained post-apply in `Herder::ledger_closed`,
+        // mirroring stellar-core's `safelyProcessSCPQueue(false)` →
+        // `postOnMainThread` (HerderImpl.cpp:1194).
         //
         // Return `MaybeValidDeferred` so the ballot protocol clears
         // `fully_validated` (preventing premature local EXTERNALIZE on

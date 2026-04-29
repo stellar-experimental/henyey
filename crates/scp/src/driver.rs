@@ -111,22 +111,19 @@ pub enum ValidationLevel {
     ///
     /// 2. **Future-slot envelope while apply lags SCP (#1798).**
     ///    After SCP externalizes slot N, henyey's
-    ///    `advance_tracking_slot`
-    ///    (`crates/herder/src/herder.rs`) runs
-    ///    `drain_and_process_pending(N+1)` synchronously on the SCP
-    ///    externalize callback, ahead of ledger apply. While apply for
-    ///    slot N is still in flight, `lcl_seq < N` but
-    ///    `consensus_index = N+1`. A peer envelope for slot N+1 drains
-    ///    out of `PendingEnvelopes`, reaches
-    ///    `validate_value_against_local_state`, and takes the
-    ///    past/future path (not the `is_current_ledger` path, because
-    ///    `lcl_seq + 1 < N+1 == slot_index`). In
-    ///    `validate_past_or_future_value`, the
-    ///    `tracking_index == slot_index` branch returns this level —
-    ///    stellar-core's parallel-apply mode can also enter the same
-    ///    code path, but its `safelyProcessSCPQueue` defers drain to
-    ///    the main thread (`HerderImpl.cpp:1194`), giving apply a
-    ///    chance to catch up first.
+    ///    `advance_tracking_slot` sets `consensus_index = N+1`
+    ///    immediately. Fresh peer envelopes arriving for slot N+1
+    ///    between externalization and `ledger_closed(N)` (via the
+    ///    select! loop, `receive_tx_set`, or
+    ///    `process_ready_fetching_envelopes`) may reach
+    ///    `validate_past_or_future_value` before LCL has advanced,
+    ///    hitting the `tracking_index == slot_index > lcl_seq + 1`
+    ///    branch. Stellar-core avoids this entirely because its
+    ///    single-threaded `postOnMainThread` defers drain until after
+    ///    apply. Henyey's `ledger_closed` now handles the drain
+    ///    post-apply (closing the dominant trigger), but the narrow
+    ///    window for fresh arrivals between externalization and ledger
+    ///    close remains due to the async select! model.
     ///
     /// Behaviorally, this level is identical to `MaybeValid` — it DOES
     /// cause the ballot protocol to clear `Slot::fully_validated`, gating

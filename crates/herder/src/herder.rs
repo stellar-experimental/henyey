@@ -1733,17 +1733,18 @@ impl Herder {
                 }
             }
 
-            // Release any pending envelopes up to and including the new slot.
-            // Uses release_up_to (via drain_and_process_pending) to match
-            // stellar-core's processSCPQueueUpToIndex which drains all
-            // slots up to the target index, not just a single slot.
-            self.drain_and_process_pending(externalized_slot + 1);
+            // NOTE: Pending envelope drain is NOT performed here.
+            // stellar-core's `newSlotExternalized` defers the drain via
+            // `safelyProcessSCPQueue(false)` → `postOnMainThread`
+            // (HerderImpl.cpp:1194), so envelopes are processed only after
+            // ledger apply completes and LCL advances. In henyey, the
+            // equivalent post-apply hook is `Herder::ledger_closed`, which
+            // calls `drain_and_process_pending(slot + 1)` after the close
+            // pipeline has applied the ledger.
 
             // Check if quorum map changed and re-analyze intersection.
             // Matches stellar-core's checkAndMaybeReanalyzeQuorumMapV2()
             // called from valueExternalized (HerderImpl.cpp:486-501).
-            // Placed AFTER drain_and_process_pending so the quorum tracker
-            // is up-to-date with newly processed envelopes.
             self.check_and_maybe_reanalyze_quorum_map(externalized_slot as u32);
         }
     }
@@ -2020,6 +2021,24 @@ impl Herder {
         for s in self.scp_driver.resolve_apply_lag_for_next_index(next_index) {
             self.scp.restore_slot_fully_validated(s);
         }
+
+        // Drain pending envelopes up to and including the next slot.
+        //
+        // This is henyey's approximation of stellar-core's
+        // `safelyProcessSCPQueue(false)` → `postOnMainThread` pattern
+        // (HerderImpl.cpp:1194). In stellar-core, `newSlotExternalized`
+        // posts the drain to the main thread; by the time the callback
+        // runs, `processExternalized` has applied the ledger and LCL has
+        // advanced. In henyey, `ledger_closed` is the post-apply hook —
+        // by this point `ledger_manager.current_ledger_seq() == slot`,
+        // so drained envelopes for `slot + 1` see
+        // `lcl_seq + 1 == slot_index`, taking the `is_current_ledger`
+        // validation path instead of the apply-lag future-value path.
+        //
+        // Uses `release_up_to` which drains ALL pending envelopes for
+        // slots ≤ target, preserving jump-ahead semantics for
+        // intermediate slots that were externalized rapidly.
+        self.drain_and_process_pending(next_index);
 
         // Clean up old SCP state
         self.scp.purge_slots(slot.saturating_sub(10), None);
@@ -6493,8 +6512,8 @@ mod scp_pipeline_tests {
 }
 
 // =============================================================================
-// AUDIT-166 regression test: advance_tracking_slot must drain all intermediate
-// pending envelopes, not just the single target slot.
+// #2115: advance_tracking_slot no longer drains (moved to ledger_closed).
+// Tests verify the new drain placement and sequencing.
 // =============================================================================
 
 #[cfg(test)]
@@ -6536,13 +6555,12 @@ mod advance_tracking_slot_tests {
         }
     }
 
-    /// AUDIT-166: advance_tracking_slot must drain all intermediate pending
-    /// envelopes via drain_and_process_pending (release_up_to), not just the
-    /// single target+1 slot.
+    /// #2115: advance_tracking_slot no longer drains pending envelopes.
+    /// The drain was moved to `ledger_closed` to run post-apply, mirroring
+    /// stellar-core's `safelyProcessSCPQueue(false)` → `postOnMainThread`.
     ///
-    /// Before fix: release(externalized_slot + 1) only drained one slot.
-    /// After fix: drain_and_process_pending(externalized_slot + 1) drains all
-    /// slots up to the target, matching stellar-core's processSCPQueueUpToIndex.
+    /// This test verifies advance_tracking_slot updates tracking state
+    /// but does NOT drain pending envelopes (they remain buffered).
     #[test]
     fn test_advance_tracking_slot_drains_intermediate_pending() {
         let herder = Herder::new(HerderConfig::default());
@@ -6561,24 +6579,99 @@ mod advance_tracking_slot_tests {
         }
         assert_eq!(herder.pending_envelopes.slot_count(), 4);
 
-        // Simulate fast-forward: externalize slot 103 (jumps from 100 to 103)
-        // advance_tracking_slot sets consensus_index = 104 and calls
-        // drain_and_process_pending(104)
+        // advance_tracking_slot sets consensus_index = 104 but does NOT drain.
         herder.advance_tracking_slot(103);
 
-        // All intermediate slots (101-104) should have been drained.
-        // Before the fix, only slot 104 would have been released.
+        // Pending envelopes are NOT drained — they remain buffered until
+        // ledger_closed is called post-apply.
         assert_eq!(
             herder.pending_envelopes.slot_count(),
-            0,
-            "All intermediate pending envelopes (101-104) must be drained after \
-             fast-forward externalization of slot 103"
+            4,
+            "advance_tracking_slot must NOT drain pending envelopes (drain \
+             is now deferred to ledger_closed, matching stellar-core's \
+             safelyProcessSCPQueue(false) → postOnMainThread)"
         );
 
         // Verify tracking state was updated
         let ts = herder.tracking_state.read();
         assert_eq!(ts.consensus_index, 104);
         assert!(ts.is_tracking);
+    }
+
+    /// #2115: ledger_closed drains pending envelopes for slot + 1.
+    /// This is where the drain now lives, post-apply, mirroring
+    /// stellar-core's `safelyProcessSCPQueue(false)`.
+    #[test]
+    fn test_ledger_closed_drains_pending_envelopes() {
+        let herder = Herder::new(HerderConfig::default());
+
+        // Set current_slot low so envelopes are accepted by add()
+        herder.pending_envelopes.set_current_slot(101);
+
+        // Buffer envelopes for slots 101-104
+        for slot in 101..=104 {
+            herder.pending_envelopes.add(slot, make_test_envelope(slot));
+        }
+        assert_eq!(herder.pending_envelopes.slot_count(), 4);
+
+        // Set tracking state: consensus_index = 104 (simulates externalize of 103)
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.consensus_index = 104;
+            ts.is_tracking = true;
+        }
+
+        // ledger_closed(103) drains pending envelopes up to slot 104
+        herder.ledger_closed(103, &[], &[], 0);
+
+        // All envelopes for slots <= 104 should be drained
+        assert_eq!(
+            herder.pending_envelopes.slot_count(),
+            0,
+            "ledger_closed must drain all pending envelopes up to slot + 1"
+        );
+    }
+
+    /// #2115: Multi-slot sequencing test. If multiple slots externalize
+    /// before ledger_closed, each ledger_closed drains up to its slot + 1.
+    #[test]
+    fn test_ledger_closed_multi_slot_sequencing() {
+        let herder = Herder::new(HerderConfig::default());
+
+        // Set current_slot low so envelopes are accepted by add()
+        herder.pending_envelopes.set_current_slot(104);
+
+        // Buffer envelopes for slots 104, 105, 106
+        for slot in 104..=106 {
+            herder.pending_envelopes.add(slot, make_test_envelope(slot));
+        }
+        assert_eq!(herder.pending_envelopes.slot_count(), 3);
+
+        // Set tracking: already externalized slot 105
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.consensus_index = 106;
+            ts.is_tracking = true;
+        }
+
+        // ledger_closed(104) drains slots <= 105
+        herder.ledger_closed(104, &[], &[], 0);
+
+        // Slot 106 should remain (only slots <= 105 drained)
+        assert_eq!(
+            herder.pending_envelopes.slot_count(),
+            1,
+            "ledger_closed(104) must only drain slots <= 105, leaving 106 pending"
+        );
+
+        // ledger_closed(105) drains slots <= 106
+        herder.ledger_closed(105, &[], &[], 0);
+
+        assert_eq!(
+            herder.pending_envelopes.slot_count(),
+            0,
+            "ledger_closed(105) must drain remaining slot 106"
+        );
     }
 
     /// AUDIT-1972 regression: for one released slot, herder drain must consume

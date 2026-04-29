@@ -286,7 +286,7 @@ Corresponds to: `SCPDriver.h`
 | `ballotDidHearFromQuorum()` | `ballot_did_hear_from_quorum()` | Full |
 | `ValidationLevel` enum | `ValidationLevel` enum | Extended |
 
-**Extension note (issues #1795 and #1798):** henyey's `ValidationLevel`
+**Extension note (issues #1795, #1798, and #2115):** henyey's `ValidationLevel`
 adds a fourth variant `MaybeValidDeferred` that has no upstream
 equivalent. The variant covers two related divergences where henyey's
 fast-path forwards an SCP envelope to the ballot protocol earlier than
@@ -297,13 +297,15 @@ stellar-core's `PendingEnvelopes` / `processSCPQueue` would:
    arrives, so `validateValueAgainstLocalState` never sees that case.
    Henyey forwards EXTERNALIZE to SCP before the tx_set arrives (to
    allow tracking advance during catchup).
-2. **Future slot while apply lags SCP (#1798).** Henyey's
-   `advance_tracking_slot` runs `drain_and_process_pending` synchronously
-   on the SCP externalize callback, ahead of ledger apply. Peer
-   envelopes for the new tracking slot drain through while
-   `lcl_seq + 1 < slot_index == tracking_index`. Stellar-core's
-   `safelyProcessSCPQueue` defers the drain to the main thread via
-   `postOnMainThread` (`HerderImpl.cpp:1194`).
+2. **Future slot while apply lags SCP (#1798, improved in #2115).**
+   Pending envelope drain now runs post-apply in `Herder::ledger_closed`,
+   approximating stellar-core's `safelyProcessSCPQueue(false)` →
+   `postOnMainThread` (HerderImpl.cpp:1194). The dominant trigger
+   (synchronous drain in `advance_tracking_slot`) is eliminated. A
+   narrow window remains for fresh peer envelopes arriving between
+   externalization and `ledger_closed` due to henyey's async select!
+   model — stellar-core's single-threaded event loop prevents this
+   entirely.
 
 In both cases henyey uses `MaybeValidDeferred` to signal "we could not
 fully validate because of a fast-path divergence — do NOT clear

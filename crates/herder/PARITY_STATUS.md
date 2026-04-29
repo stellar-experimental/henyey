@@ -534,26 +534,29 @@ Features not yet implemented. These ARE counted against parity %.
    - **Rust**: No metrics infrastructure; statistics tracked via simple structs
    - **Rationale**: Metrics will use Rust ecosystem libraries (prometheus, metrics crate) when added
 
-7. **Fast-path + `MaybeValidDeferred`** (issues #1795, #1798, and H-014 / #2096)
+7. **Fast-path + `MaybeValidDeferred`** (issues #1795, #1798, H-014 / #2096, and #2115)
    - **stellar-core**: `PendingEnvelopes` buffers peer EXTERNALIZE
      envelopes until their tx_set arrives. By the time
      `validateValueAgainstLocalState` runs, the tx_set is always
      present; missing tx_set on LCL+1 returns `kInvalidValue`
-     (`HerderSCPDriver.cpp:306-311`). In parallel-apply mode,
-     `safelyProcessSCPQueue` defers the SCP queue drain to the main
-     thread via `postOnMainThread` (`HerderImpl.cpp:1194`), giving
-     ledger apply a chance to complete before peer envelopes for the
-     next tracking slot are processed. `setupTriggerNextLedger`
-     (`HerderImpl.cpp:1237-1254`) further asserts that apply is not
-     in flight and tracking equals the LCL — together these mean the
-     henyey-specific apply-lag window does not occur upstream.
+     (`HerderSCPDriver.cpp:306-311`). `safelyProcessSCPQueue` defers
+     the SCP queue drain to the main thread via `postOnMainThread`
+     (`HerderImpl.cpp:1194`), giving ledger apply a chance to complete
+     before peer envelopes for the next tracking slot are processed.
+     `setupTriggerNextLedger` (`HerderImpl.cpp:1237-1254`) asserts that
+     apply is not in flight and tracking equals the LCL.
    - **Rust**: `process_scp_envelope` forwards peer EXTERNALIZE to SCP
      before the tx_set is fetched, so tracking advance can proceed
-     during catchup (#1795). `advance_tracking_slot` then runs
-     `drain_and_process_pending(consensus_index)` synchronously on the
-     SCP externalize callback, ahead of ledger apply (#1798). In both
-     windows, `validate_value_against_local_state` /
-     `validate_past_or_future_value` return
+     during catchup (#1795). Pending envelope drain now runs post-apply
+     in `Herder::ledger_closed` (#2115), approximating stellar-core's
+     `safelyProcessSCPQueue(false)` → `postOnMainThread` pattern.
+     However, henyey's async select! model means fresh peer envelopes
+     arriving between externalization and `ledger_closed` (via
+     `verified_rx`, `receive_tx_set`, or
+     `process_ready_fetching_envelopes`) can still reach
+     `validate_past_or_future_value` before LCL advances — a narrow
+     window that does not exist in stellar-core's single-threaded
+     model. In this window, `validate_past_or_future_value` returns
      `ValueValidation::MaybeValidDeferred`, which maps to
      `ValidationLevel::MaybeValidDeferred` — a henyey extension that
      **does** clear `Slot::fully_validated` (matching stellar-core's
@@ -572,16 +575,17 @@ Features not yet implemented. These ARE counted against parity %.
        advances past the slot's predecessor. `Herder::ledger_closed`
        calls `ScpDriver::resolve_apply_lag_for_next_index(slot + 1)`
        and then `SCP::restore_slot_fully_validated(slot)` for each
-       newly all-clear slot.
+       newly all-clear slot. Post-#2115 this trigger only fires for
+       fresh arrivals during the narrow race window, not for
+       drain-pumped envelopes.
      A slot may carry both causes simultaneously if an LCL advance
      races between the two recordings; restoration still requires ALL
      causes clear (the structure permits coexistence — see
      `DeferredCauses` in `crates/herder/src/scp_driver.rs`).
    - **Rationale**: The fast-path fixed a post-catchup stall where
-     evicted tx_sets blocked EXTERNALIZE from reaching SCP, and the
-     synchronous drain avoided an extra round-trip during catchup. The
+     evicted tx_sets blocked EXTERNALIZE from reaching SCP. The
      `MaybeValidDeferred` variant + paired restoration triggers preserve
-     both behaviors while avoiding the secondary bugs where the local
+     the behavior while avoiding the secondary bugs where the local
      validator's own EXTERNALIZE emission would be permanently
      suppressed.
    - **No re-validation after tx_set arrival (#1796):**
@@ -594,12 +598,14 @@ Features not yet implemented. These ARE counted against parity %.
      back to `true` once the tx_set is cached (or apply catches up),
      producing identical slot end states: externalized,
      `fully_validated=true`, same emission visibility.
-   - **Long-term direction**: The structural divergence is henyey's
-     synchronous `drain_and_process_pending` on the externalize
-     callback. Mirroring stellar-core's `safelyProcessSCPQueue →
-     postOnMainThread` would close the apply-lag window entirely and
-     obsolete `MaybeValidDeferred` and the herder-side restoration
-     mechanism. Tracked as a follow-up.
+   - **Long-term direction**: The remaining divergence is henyey's
+     async select! model allowing fresh envelope processing between
+     externalization and ledger close. Fully eliminating this window
+     would require serializing SCP envelope processing with ledger
+     close (gating `process_verified` while the close pipeline is
+     active) or delaying `consensus_index` update until post-apply.
+     Both require significant select! loop restructuring. Tracked as
+     a follow-up.
 
 8. **Error Handling**
    - **stellar-core**: C++ exceptions and integer result codes
