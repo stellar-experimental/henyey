@@ -167,8 +167,50 @@ ticks so STUCK can be detected by a single invocation:
 - **Fresh-start carveout (`FRESH_START=yes`, uptime < 4h)**: a large gap is
   expected during initial bucket apply — report CATCHING UP, not SYNC FAILURE.
 
-**(3) Process alive** — find by `comm` not `pgrep -f`: `for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done`. The earlier `pgrep -f 'henyey.*run'` form is unsafe in environments with parallel `claude --print` agent processes whose prompt args contain "henyey" — they false-match, yielding wrong PIDs for kill/restart. If not running:
-Rotate-log with suffix `crashed`, then Relaunch.
+**(3) Process alive** — find by `comm` not `pgrep -f`: `for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done`. The earlier `pgrep -f 'henyey.*run'` form is unsafe in environments with parallel `claude --print` agent processes whose prompt args contain "henyey" — they false-match, yielding wrong PIDs for kill/restart. If not running: Rotate-log with suffix `crashed`, then before Relaunch evaluate the **(3a) Repeated-FATAL state-wipe trigger** below.
+
+**(3a) Repeated-FATAL state-wipe trigger** — a kill-loop on the same persisted state means the local lcl is corrupt and forward replay can never reconcile. When this happens, restart-without-wipe just accumulates crashed logs and stays offline. Detect and self-heal once per kill-loop:
+
+```bash
+logs_dir=/home/tomer/data/$MONITOR_SESSION_ID/logs
+recent_crashed=$(find "$logs_dir" -maxdepth 1 -type f -name 'monitor.log.crashed-*' \
+  -newermt '30 minutes ago' -printf '%T@ %p\n' 2>/dev/null | sort -rn)
+recent_count=$(printf '%s\n' "$recent_crashed" | grep -c .)
+latest_crashed=$(printf '%s\n' "$recent_crashed" | head -1 | cut -d' ' -f2-)
+hash_mismatch_signal="no"
+if [ -n "$latest_crashed" ] && grep -qE 'FATAL: pre-close hash mismatch|Catchup failed:.*Header hash mismatch' "$latest_crashed" 2>/dev/null; then
+  hash_mismatch_signal="yes"
+fi
+```
+
+Trigger the wipe when ALL hold:
+1. `recent_count >= 3` (3+ crashed rotations in the last 30 min — proves restart-without-fix isn't recovering)
+2. `hash_mismatch_signal == "yes"` (the most recent crash is hash-mismatch family — the symptom that uniquely identifies persisted state corruption rather than a transient bug)
+3. `FRESH_START=no` (don't fire on a fresh sync that hasn't completed yet)
+
+When triggered:
+
+```bash
+# Stop any partially-running process first (defensive — should already be dead)
+PID=$(for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = "henyey" ] && basename $p; done | head -1)
+[ -n "$PID" ] && kill "$PID" && sleep 5 && kill -0 "$PID" 2>/dev/null && kill -9 "$PID"
+
+# Wipe the corrupt persisted state (recoverable from public network archive)
+rm -f /home/tomer/data/mainnet/mainnet.db \
+      /home/tomer/data/mainnet/mainnet.db-shm \
+      /home/tomer/data/mainnet/mainnet.db-wal \
+      /home/tomer/data/mainnet/mainnet.lock
+rm -rf /home/tomer/data/mainnet/buckets
+
+# Reset progression tracker so the next tick treats this as a fresh start
+rm -f /home/tomer/data/$MONITOR_SESSION_ID/last_ledger
+```
+
+Then Relaunch. The next tick will see `FRESH_START=yes` (mainnet.db absent), apply the 4h sync deadline, and let the node fresh-catchup from network archive (~10–20 min to validating).
+
+File a new `urgent` GH issue documenting the wipe with the count of crashed rotations, the hash-mismatch evidence from the latest crashed log, and the cumulative downtime — this is a data point for whether the underlying recovery code path needs further hardening even though the immediate cause was already fixed.
+
+The trigger is self-rate-limiting: after a wipe, the new `.crashed-*` rotations stop accumulating (the symptom is gone), so the 3-in-30-min window can't fire again until something else goes wrong.
 
 **(3b) Wedge detection** — a process can be alive but have a frozen event
 loop (watchdog fires, HTTP hangs, ledger progression stops). Check 3 alone
