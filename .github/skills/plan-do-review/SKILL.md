@@ -144,6 +144,13 @@ in place.
 
 ## Step 1: Fetch and Parse the Issue
 
+Initialize context variables:
+
+```bash
+HARNESS="${HARNESS:-Copilot CLI}"
+export HARNESS
+```
+
 Run:
 ```bash
 gh issue view $ISSUE --json title,body,labels,state,comments,number
@@ -373,6 +380,7 @@ tmpfile=$(mktemp)
   printf '## 📝 Proposal Draft (Round %s/%s)\n\n' "$proposal_round" "$max_proposal_rounds"
   cat /tmp/pdr-$ISSUE/proposal_r$proposal_round.md
   printf '\n\n---\n\n*Submitting to adversarial critic for review…*\n'
+  printf '\n---\n\n*Created by `/plan-do-review` skill (%s, model: %s)*\n' "$HARNESS" "$MODEL"
 } > "$tmpfile"
 gh issue comment $ISSUE --body-file "$tmpfile"
 rm -f "$tmpfile"
@@ -513,6 +521,7 @@ tmpfile=$(mktemp)
   printf '**Verdict: %s**\n\n' "$verdict"
   # If REVISE, append the numbered feedback items outside the <details> block
   # here (either inline printf lines or cat a second file).
+  printf '---\n\n*Created by `/plan-do-review` skill → `critic-round-%s` sub-agent (%s, model: %s)*\n' "$proposal_round" "$HARNESS" "$MODEL"
 } > "$tmpfile"
 gh issue comment $ISSUE --body-file "$tmpfile"
 rm -f "$tmpfile"
@@ -554,6 +563,7 @@ tmpfile=$(mktemp)
   printf '## Converged Proposal (Round %s/%s)\n\n' "$proposal_round" "$max_proposal_rounds"
   cat /tmp/pdr-$ISSUE/proposal_final.md
   printf '\n\n---\n\n*This proposal was refined through %s round(s) of adversarial review using the `plan-do-review` skill.*\n' "$proposal_round"
+  printf '\n---\n\n*Skill: `/plan-do-review` | Harness: %s | Model: %s*\n' "$HARNESS" "$MODEL"
 } > "$tmpfile"
 gh issue comment $ISSUE --body-file "$tmpfile"
 rm -f "$tmpfile"
@@ -765,6 +775,7 @@ tmpfile=$(mktemp)
   printf '\n\n</details>\n\n'
   printf '**Verdict: %s**\n\n' "$verdict"
   # If not SOUND, append the key issues outside the <details> block.
+  printf '---\n\n*Created by `/plan-do-review` skill → `review-fix-round-%s` sub-agent (%s, model: %s)*\n' "$review_round" "$HARNESS" "$MODEL"
 } > "$tmpfile"
 gh issue comment $ISSUE --body-file "$tmpfile"
 rm -f "$tmpfile"
@@ -832,6 +843,7 @@ tmpfile=$(mktemp)
 {bullet list of follow-up items with issue links}
 
   printf -- '---\n\n*Implemented and reviewed using the `plan-do-review` skill.*\n'
+  printf '\n---\n\n*Skill: `/plan-do-review` | Harness: %s | Model: %s*\n' "$HARNESS" "$MODEL"
 } > "$tmpfile"
 gh issue comment $ISSUE --body-file "$tmpfile"
 rm -f "$tmpfile"
