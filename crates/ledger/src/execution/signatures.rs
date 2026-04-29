@@ -688,8 +688,9 @@ pub(super) fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
 /// Per-operation structural validation (isOpSupported + doCheckValid).
 ///
 /// Mirrors stellar-core's per-op `OperationFrame::checkValid()` loop from
-/// `checkValidWithOptionallyChargedFee`. Runs BEFORE `check_operation_signatures`
-/// in the apply path.
+/// `checkValidWithOptionallyChargedFee`. Runs AFTER `check_operation_signatures`
+/// in the apply path, matching stellar-core where `processSignatures` precedes
+/// the per-op `checkValid` loop.
 ///
 /// For each operation, checks:
 /// 1. `is_op_supported()` → `OpNotSupported`

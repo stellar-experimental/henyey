@@ -2046,40 +2046,42 @@ impl TransactionExecutor {
         let op_sig_check_start = std::time::Instant::now();
         let mut sig_check_failure: Option<(Vec<OperationResult>, ExecutionFailure)> = None;
         if preflight_failure.is_none() {
-            // Per-op structural validation: isOpSupported + doCheckValid.
-            // Mirrors stellar-core's per-op OperationFrame::checkValid() loop
-            // from checkValidWithOptionallyChargedFee, which runs BEFORE
-            // processSignatures. Stops at first failing op.
-            sig_check_failure =
-                check_operations_valid(&frame, self.protocol_version, self.ledger_flags);
-
-            // Per-op auth: only if structural validation passed.
-            if sig_check_failure.is_none() {
-                // Pre-load per-operation source accounts from snapshot so they're
-                // available to check_operation_signatures.
-                for op in frame.operations().iter() {
-                    if let Some(ref source) = op.source_account {
-                        let op_source_id = henyey_tx::muxed_to_account_id(source);
-                        self.load_account(snapshot, &op_source_id)?;
-                    }
+            // Pre-load per-operation source accounts from snapshot so they're
+            // available to check_operation_signatures.
+            for op in frame.operations().iter() {
+                if let Some(ref source) = op.source_account {
+                    let op_source_id = henyey_tx::muxed_to_account_id(source);
+                    self.load_account(snapshot, &op_source_id)?;
                 }
-                let sig_hash = if frame.is_fee_bump() {
-                    fee_bump_inner_hash(&frame, &self.network_id)?
-                } else {
-                    outer_hash
-                };
-                let sig_signatures = if frame.is_fee_bump() {
-                    frame.inner_signatures()
-                } else {
-                    frame.signatures()
-                };
-                sig_check_failure = check_operation_signatures(
-                    &frame,
-                    &self.state,
-                    &sig_hash,
-                    sig_signatures,
-                    &inner_source_id,
-                );
+            }
+            let sig_hash = if frame.is_fee_bump() {
+                fee_bump_inner_hash(&frame, &self.network_id)?
+            } else {
+                outer_hash
+            };
+            let sig_signatures = if frame.is_fee_bump() {
+                frame.inner_signatures()
+            } else {
+                frame.signatures()
+            };
+
+            // Per-op auth (processSignatures equivalent). Checks ALL ops.
+            // Mirrors stellar-core: processSignatures runs BEFORE per-op
+            // checkValid, so auth failures take precedence over structural errors.
+            sig_check_failure = check_operation_signatures(
+                &frame,
+                &self.state,
+                &sig_hash,
+                sig_signatures,
+                &inner_source_id,
+            );
+
+            // Per-op structural validation: isOpSupported + doCheckValid.
+            // Only runs if auth passed (same as stellar-core's per-op
+            // OperationFrame::checkValid loop in checkValidWithOptionallyChargedFee).
+            if sig_check_failure.is_none() {
+                sig_check_failure =
+                    check_operations_valid(&frame, self.protocol_version, self.ledger_flags);
             }
         }
 
