@@ -1171,7 +1171,9 @@ impl Herder {
     /// Order preserved from the original `receive_scp_envelope`:
     /// 1. `can_receive_scp` state check (HerderState.cpp)
     /// 2. Close-time pre-filter (tracking / non-tracking, checkpoint exception)
-    /// 3. Slot-range check with `effective_min` derived from LCL
+    /// 3. Slot-range check using `min_ledger_seq` derived from `tracking_slot`
+    ///    and `MAX_SLOTS_TO_REMEMBER` (matches
+    ///    `HerderImpl::getMinLedgerSeqToRemember()`).
     ///
     /// Signature verification is **not** performed here. Accepted envelopes are
     /// returned as a [`PipelinedIntake`] carrying metadata needed downstream.
@@ -1220,26 +1222,26 @@ impl Herder {
             }
         }
 
+        // Slot-range check: parity with stellar-core
+        // `HerderImpl::recvSCPEnvelope` (HerderImpl.cpp:815-873). The lower
+        // bound is purely `getMinLedgerSeqToRemember()` — derived from the
+        // tracking slot and `MAX_SLOTS_TO_REMEMBER` — and explicitly does
+        // NOT clamp to LCL. Recent post-LCL slots within the retained window
+        // must reach SCP so that `validate_value` can return `MaybeValid`
+        // for already-moved-on slots and the node can still relay finalization
+        // messages (see HerderSCPDriver.cpp:244-253 and
+        // crates/herder/src/scp_driver.rs:1055-1063).
         let min_ledger_seq = if current_slot > MAX_SLOTS_TO_REMEMBER {
             current_slot - MAX_SLOTS_TO_REMEMBER + 1
         } else {
             1
         };
 
-        let lcl = self
-            .ledger_manager
-            .read()
-            .as_ref()
-            .map(|m| m.current_ledger_seq() as u64);
-
-        let effective_min = lcl.map_or(min_ledger_seq, |l| min_ledger_seq.max(l + 1));
-
-        if (slot > max_ledger_seq || slot < effective_min) && slot != checkpoint {
+        if (slot > max_ledger_seq || slot < min_ledger_seq) && slot != checkpoint {
             debug!(
                 slot,
                 current_slot,
                 min_ledger_seq,
-                effective_min,
                 max_ledger_seq,
                 checkpoint,
                 "Rejecting envelope: slot outside validity bracket"
@@ -6129,6 +6131,181 @@ mod scp_pipeline_tests {
             3,
             "three enqueued items must report queue_len == 3"
         );
+    }
+
+    // ---------- AUDIT-211 / issue #2100 regression tests ----------
+    //
+    // The herder pre-filter previously clamped the slot-range lower bound to
+    // `max(min_ledger_seq, lcl + 1)`. That rejected in-window SCP envelopes
+    // for slots Henyey had already moved past in tracking but whose finalization
+    // messages stellar-core still accepts and forwards through SCP (see
+    // `HerderImpl::recvSCPEnvelope` and `HerderSCPDriver::validateValue`'s
+    // "already moved on" branch). The clamp was active in essentially all
+    // steady-state operation because `lcl + 1` typically sits at or just below
+    // `tracking_slot`, far above `min_ledger_seq = tracking_slot - 12 + 1`.
+    //
+    // The fix removes the clamp so the lower bound matches stellar-core's
+    // `getMinLedgerSeqToRemember()` exactly. The tests below exercise the
+    // post-LCL retained-window band that the clamp used to reject.
+
+    fn make_ledger_manager_at_seq(ledger_seq: u32) -> Arc<henyey_ledger::LedgerManager> {
+        use henyey_ledger::{LedgerManager, LedgerManagerConfig};
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        let config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = LedgerManager::new("Test Network".to_string(), config);
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            henyey_bucket::BucketList::new(),
+            henyey_bucket::HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        Arc::new(lm)
+    }
+
+    /// Build a Herder in Syncing state with a ledger manager at `lcl` and
+    /// tracking_slot set to `tracking_slot`. Returns the herder ready for
+    /// `pre_filter_scp_envelope` exercise.
+    fn herder_with_lcl_and_tracking(lcl: u32, tracking_slot: u64) -> Herder {
+        let herder = make_test_herder();
+        herder.set_ledger_manager(make_ledger_manager_at_seq(lcl));
+        herder.start_syncing();
+        // Set tracking_slot directly (we're inside the crate, so private
+        // fields are accessible). is_tracking is set so the
+        // `state.is_tracking()` branch in pre_filter computes max_ledger_seq
+        // via tracking, not the non-tracking close-time path.
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.consensus_index = tracking_slot;
+            ts.is_tracking = true;
+        }
+        herder.pending_envelopes.set_current_slot(tracking_slot);
+        herder
+    }
+
+    /// Core regression: a slot in `[min_ledger_seq, lcl]` must be accepted.
+    /// Pre-fix this returned `Reject(Range)` because of the `lcl + 1` clamp.
+    #[test]
+    fn test_pre_filter_accepts_recent_post_lcl_envelope() {
+        // tracking=100, lcl=99, min_ledger_seq=89. Slot 95 is post-LCL but
+        // within the retained window.
+        let herder = herder_with_lcl_and_tracking(99, 100);
+        let secret = SecretKey::from_seed(&[1u8; 32]);
+        let env = make_signed_test_envelope_outer(95, &herder, &secret);
+        match herder.pre_filter_scp_envelope(&env) {
+            PreFilter::Accept(intake) => assert_eq!(intake.slot, 95),
+            PreFilter::Reject(r) => panic!(
+                "expected Accept for post-LCL slot in retained window, got Reject({:?})",
+                r
+            ),
+        }
+    }
+
+    /// Worst-case regression: when apply has caught up to tracking
+    /// (`lcl == tracking_slot`), the pre-fix clamp set
+    /// `effective_min = lcl + 1 = tracking_slot + 1`, rejecting every
+    /// non-checkpoint slot in the entire retained window.
+    #[test]
+    fn test_pre_filter_accepts_envelope_when_lcl_equals_tracking() {
+        // tracking=100, lcl=100. Pre-fix this rejected slot 95 (and any other
+        // non-checkpoint slot in 89..=100).
+        let herder = herder_with_lcl_and_tracking(100, 100);
+        let secret = SecretKey::from_seed(&[2u8; 32]);
+        let env = make_signed_test_envelope_outer(95, &herder, &secret);
+        match herder.pre_filter_scp_envelope(&env) {
+            PreFilter::Accept(intake) => assert_eq!(intake.slot, 95),
+            PreFilter::Reject(r) => panic!(
+                "expected Accept when lcl == tracking_slot, got Reject({:?})",
+                r
+            ),
+        }
+    }
+
+    /// Lower-edge boundary: slot exactly at `min_ledger_seq` is accepted.
+    #[test]
+    fn test_pre_filter_accepts_at_min_ledger_seq() {
+        // tracking=100, min_ledger_seq=89.
+        let herder = herder_with_lcl_and_tracking(99, 100);
+        let secret = SecretKey::from_seed(&[3u8; 32]);
+        let env = make_signed_test_envelope_outer(89, &herder, &secret);
+        match herder.pre_filter_scp_envelope(&env) {
+            PreFilter::Accept(intake) => assert_eq!(intake.slot, 89),
+            PreFilter::Reject(r) => panic!(
+                "slot at min_ledger_seq must be accepted, got Reject({:?})",
+                r
+            ),
+        }
+    }
+
+    /// Lower boundary: slot below `min_ledger_seq` is still rejected (the
+    /// retained-window check is preserved; we only removed the LCL clamp).
+    #[test]
+    fn test_pre_filter_rejects_below_min_ledger_seq() {
+        // tracking=100, min_ledger_seq=89. Slot 88 is below; should reject.
+        let herder = herder_with_lcl_and_tracking(99, 100);
+        let secret = SecretKey::from_seed(&[4u8; 32]);
+        let env = make_signed_test_envelope_outer(88, &herder, &secret);
+        match herder.pre_filter_scp_envelope(&env) {
+            PreFilter::Reject(PreFilterRejectReason::Range) => {}
+            other => panic!(
+                "slot below min_ledger_seq must reject as Range, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Checkpoint exception: a slot below `min_ledger_seq` is accepted when
+    /// it equals the most-recent-checkpoint seq. Mirrors stellar-core's
+    /// `index != checkpoint` exception in `recvSCPEnvelope`.
+    #[test]
+    fn test_pre_filter_checkpoint_exception_below_min_ledger_seq() {
+        // tracking=101 → most_recent_checkpoint_seq = 64 (with default
+        // checkpoint_frequency=64). min_ledger_seq = 90. Slot 64 is below 90
+        // but equals checkpoint, so the `slot != checkpoint` exception fires.
+        let herder = herder_with_lcl_and_tracking(99, 101);
+        assert_eq!(herder.get_most_recent_checkpoint_seq(), 64);
+        let secret = SecretKey::from_seed(&[5u8; 32]);
+        let env = make_signed_test_envelope_outer(64, &herder, &secret);
+        match herder.pre_filter_scp_envelope(&env) {
+            PreFilter::Accept(intake) => assert_eq!(intake.slot, 64),
+            PreFilter::Reject(r) => panic!(
+                "checkpoint slot below min_ledger_seq must be accepted via checkpoint exception, got Reject({:?})",
+                r
+            ),
+        }
     }
 }
 

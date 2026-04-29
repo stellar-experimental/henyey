@@ -363,10 +363,9 @@ fn row_03_close_time_too_far_future_prefilter() {
 #[test]
 fn row_04_slot_too_old_prefilter() {
     let fix = fixture_tracking();
-    // Slot below `effective_min = min_ledger_seq.max(lcl+1)`. No ledger
-    // manager is attached, so effective_min = min_ledger_seq = max(1, current_slot
-    // - MAX_SLOTS_TO_REMEMBER + 1). With TRACKING_SLOT=101 and window=12 →
-    // min=90. Slot 1 is deep below.
+    // Slot below `min_ledger_seq = max(1, current_slot - MAX_SLOTS_TO_REMEMBER
+    // + 1)`. With TRACKING_SLOT=101 and window=12 → min=90. Slot 1 is deep
+    // below. Matches stellar-core `getMinLedgerSeqToRemember`.
     let env = nominate_envelope(1, NOW, &fix.peer_secret, &fix.network_id);
     assert_eq!(
         run(&fix, env, |_| {}),
@@ -607,11 +606,12 @@ fn smoke_fixture_envelopes_round_trip_sign_verify() {
 // Checkpoint exception tests (issue #1733 observability polish)
 // ---------------------------------------------------------------------------
 
-/// Row 16: Range checkpoint exception — slot = checkpoint, below effective_min,
-/// bypasses the range gate via `slot != checkpoint` exception.
+/// Row 16: Range checkpoint exception — slot = checkpoint, below
+/// `min_ledger_seq`, bypasses the range gate via `slot != checkpoint`
+/// exception.
 ///
 /// With TRACKING_SLOT=101 and checkpoint_frequency=64, the most recent
-/// checkpoint seq is 64. effective_min = max(1, 101-12+1) = 90. Slot 64 is
+/// checkpoint seq is 64. min_ledger_seq = max(1, 101-12+1) = 90. Slot 64 is
 /// below 90 and would normally be rejected, but the checkpoint exception
 /// exempts it.
 #[test]
