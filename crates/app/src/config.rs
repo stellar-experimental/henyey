@@ -65,6 +65,39 @@ use crate::maintainer;
 
 /// Main application configuration.
 ///
+/// Quorum safety configuration from stellar-core compat configs.
+///
+/// These fields mirror stellar-core's `FAILURE_SAFETY` and `UNSAFE_QUORUM`
+/// config knobs, which control minimum fault-tolerance requirements for the
+/// quorum set. Not used by native henyey configs.
+#[derive(Debug, Clone)]
+pub struct CompatQuorumSafety {
+    /// Operator-specified failure safety requirement.
+    pub failure_safety: FailureSafety,
+    /// When true, relaxes quorum safety checks (low thresholds, zero failure safety).
+    pub unsafe_quorum: bool,
+    /// Validation threshold level, derived from quorum set provenance.
+    pub threshold_level: ValidationThresholdLevel,
+}
+
+/// How the failure safety target was specified.
+#[derive(Debug, Clone, Copy)]
+pub enum FailureSafety {
+    /// Compute default from quorum set structure (stellar-core FAILURE_SAFETY=-1).
+    Auto,
+    /// Operator-specified explicit value (>= 0).
+    Explicit(i32),
+}
+
+/// Threshold validation level, matching stellar-core's `ValidationThresholdLevels`.
+#[derive(Debug, Clone, Copy)]
+pub enum ValidationThresholdLevel {
+    /// Simple majority: n - (n-1)/2. Used for single-domain auto-generated quorum sets.
+    SimpleMajority,
+    /// Byzantine fault tolerance: n - (n-1)/3. Used for multi-domain or manual quorum sets.
+    ByzantineFaultTolerance,
+}
+
 /// This struct represents the complete configuration for a Stellar Core node.
 /// It can be loaded from a TOML file using [`AppConfig::from_file`], or constructed
 /// programmatically using [`ConfigBuilder`].
@@ -178,6 +211,11 @@ pub struct AppConfig {
     /// `None` for manual quorum set configs or non-validator nodes.
     #[serde(skip)]
     pub validator_weight_config: Option<henyey_herder::ValidatorWeightConfig>,
+
+    /// Quorum safety configuration from stellar-core compat config translation.
+    /// `None` for native henyey configs (which skip FAILURE_SAFETY validation).
+    #[serde(skip)]
+    pub compat_quorum_safety: Option<CompatQuorumSafety>,
 }
 
 /// Node identity and behavior configuration.
@@ -1464,6 +1502,7 @@ impl AppConfig {
             build: BuildMetadata::default(),
             is_compat_config: false,
             validator_weight_config: None,
+            compat_quorum_safety: None,
         }
     }
 
@@ -1538,6 +1577,7 @@ impl AppConfig {
             build: BuildMetadata::default(),
             is_compat_config: false,
             validator_weight_config: None,
+            compat_quorum_safety: None,
         }
     }
 
@@ -1791,8 +1831,21 @@ impl AppConfig {
                 .quorum_set
                 .to_xdr()
                 .context("Invalid quorum set configuration")?;
-            if let Err(err) = henyey_scp::is_quorum_set_sane(&quorum_set, true) {
+
+            // UNSAFE_QUORUM=true in compat configs disables the >50% threshold
+            // check in is_quorum_set_sane, matching stellar-core behavior.
+            // Native configs always get extra_checks=true.
+            let extra_checks = self
+                .compat_quorum_safety
+                .as_ref()
+                .map_or(true, |s| !s.unsafe_quorum);
+            if let Err(err) = henyey_scp::is_quorum_set_sane(&quorum_set, extra_checks) {
                 anyhow::bail!("Invalid quorum set: {}", err);
+            }
+
+            // Compat configs: validate FAILURE_SAFETY and threshold requirements.
+            if let Some(ref safety) = self.compat_quorum_safety {
+                validate_quorum_safety(&quorum_set, safety)?;
             }
         }
 
@@ -1813,6 +1866,103 @@ impl AppConfig {
     pub fn sample_config() -> String {
         let config = Self::testnet();
         toml::to_string_pretty(&config).unwrap_or_default()
+    }
+}
+
+/// Compute the minimum acceptable threshold for a quorum set at the given
+/// validation level. Ports stellar-core's `computeDefaultThreshold`
+/// (Config.cpp:91-123).
+fn compute_default_threshold(
+    qset: &stellar_xdr::curr::ScpQuorumSet,
+    level: ValidationThresholdLevel,
+) -> u32 {
+    let top_size = (qset.validators.len() + qset.inner_sets.len()) as u32;
+    if top_size == 0 {
+        return 0;
+    }
+    match level {
+        // n=2f+1 → res = n - (n-1)/2 (only for flat sets)
+        ValidationThresholdLevel::SimpleMajority if qset.inner_sets.is_empty() => {
+            top_size - (top_size - 1) / 2
+        }
+        // n=3f+1 → res = n - (n-1)/3
+        _ => top_size - (top_size - 1) / 3,
+    }
+}
+
+/// Validate quorum safety for a compat config, mirroring stellar-core's
+/// `Config::validateConfig` (Config.cpp:2306-2357).
+fn validate_quorum_safety(
+    quorum_set: &stellar_xdr::curr::ScpQuorumSet,
+    safety: &CompatQuorumSafety,
+) -> anyhow::Result<()> {
+    use std::collections::HashSet;
+
+    // Collect all node IDs from the quorum set.
+    let mut all_nodes = HashSet::new();
+    collect_nodes(quorum_set, &mut all_nodes);
+
+    if all_nodes.is_empty() {
+        anyhow::bail!("no validators defined in VALIDATORS/QUORUM_SET");
+    }
+
+    // Find the closest v-blocking set.
+    let closest_vblocking = henyey_scp::find_closest_v_blocking(quorum_set, &all_nodes, None);
+
+    let min_threshold = compute_default_threshold(quorum_set, safety.threshold_level);
+
+    // Compute effective failure safety.
+    let failure_safety = match safety.failure_safety {
+        FailureSafety::Auto => {
+            let top_level_count =
+                (quorum_set.validators.len() + quorum_set.inner_sets.len()) as i32;
+            let default = top_level_count - min_threshold as i32;
+            tracing::info!(
+                failure_safety = default,
+                "Assigning calculated value to FAILURE_SAFETY"
+            );
+            default
+        }
+        FailureSafety::Explicit(n) => n,
+    };
+
+    // Reject if failure safety is incompatible with the quorum set.
+    if failure_safety >= closest_vblocking.len() as i32 {
+        anyhow::bail!(
+            "Not enough nodes / thresholds too strict in your Quorum set to ensure \
+             your desired level of FAILURE_SAFETY. Reduce FAILURE_SAFETY or fix quorum set"
+        );
+    }
+
+    if !safety.unsafe_quorum {
+        if failure_safety == 0 {
+            anyhow::bail!(
+                "Can't have FAILURE_SAFETY=0 unless you also set UNSAFE_QUORUM=true. \
+                 Be sure you know what you are doing!"
+            );
+        }
+
+        if quorum_set.threshold < min_threshold {
+            anyhow::bail!(
+                "Your THRESHOLD_PERCENTAGE is too low. If you really want this \
+                 set UNSAFE_QUORUM=true. Be sure you know what you are doing!"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Recursively collect all node IDs from a quorum set.
+fn collect_nodes(
+    qset: &stellar_xdr::curr::ScpQuorumSet,
+    nodes: &mut std::collections::HashSet<stellar_xdr::curr::NodeId>,
+) {
+    for v in qset.validators.iter() {
+        nodes.insert(v.clone());
+    }
+    for inner in qset.inner_sets.iter() {
+        collect_nodes(inner, nodes);
     }
 }
 

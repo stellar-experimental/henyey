@@ -25,7 +25,8 @@
 //! into henyey's [`AppConfig`](crate::config::AppConfig).
 
 use crate::config::{
-    AppConfig, CompatHttpConfig, DatabaseConfig, HistoryArchiveEntry, HistoryConfig, HttpConfig,
+    AppConfig, CompatHttpConfig, CompatQuorumSafety, DatabaseConfig, FailureSafety,
+    HistoryArchiveEntry, HistoryConfig, HttpConfig, ValidationThresholdLevel,
 };
 use henyey_herder::{ValidatorEntryInfo, ValidatorQuality, ValidatorWeightConfig};
 use std::collections::{HashMap, HashSet};
@@ -73,15 +74,15 @@ const SUPPORTED_KEYS: &[&str] = &[
     "FLOOD_ARB_TX_DAMPING_FACTOR",
     "FLOOD_TX_PERIOD_MS",
     "FLOOD_ADVERT_PERIOD_MS",
+    "FAILURE_SAFETY",
+    "UNSAFE_QUORUM",
 ];
 
 /// Valid stellar-core keys that henyey intentionally does not support.
 /// These are logged at `info` level rather than `warn`.
 const UNSUPPORTED_KNOWN_KEYS: &[&str] = &[
-    "UNSAFE_QUORUM",
     "FORCE_SCP",
     "DISABLE_XDR_FSYNC",
-    "FAILURE_SAFETY",
     "COMMANDS",
     "EXPERIMENTAL_BUCKETLIST_DB",
     "EXPERIMENTAL_BUCKETLIST_DB_INDEX_PAGE_SIZE_EXPONENT",
@@ -394,6 +395,10 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     // Track validator metadata for building ValidatorWeightConfig later.
     let mut validator_entries: Vec<(String, String, Option<String>, Option<String>)> = Vec::new(); // (pubkey, name, home_domain, quality)
     let has_manual_quorum_set = table.contains_key("QUORUM_SET");
+    let has_validators_section = table
+        .get("VALIDATORS")
+        .and_then(|v| v.as_array())
+        .map_or(false, |a| !a.is_empty());
 
     if let Some(validators) = table.get("VALIDATORS").and_then(|v| v.as_array()) {
         let mut validator_keys = Vec::new();
@@ -471,6 +476,14 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     //   [QUORUM_SET]
     //   THRESHOLD_PERCENT=100
     //   VALIDATORS=["$self"]
+
+    // Snapshot auto-generated quorum set for UNSAFE_QUORUM override comparison.
+    let auto_generated_qset = if has_validators_section {
+        Some(config.node.quorum_set.clone())
+    } else {
+        None
+    };
+
     if let Some(qs_table) = table.get("QUORUM_SET").and_then(|v| v.as_table()) {
         if let Some(validators) = qs_table.get("VALIDATORS").and_then(|v| v.as_array()) {
             let mut keys: Vec<String> = Vec::new();
@@ -496,8 +509,8 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
                     }
                 }
             }
-            // Only override if the [[VALIDATORS]] section didn't already set the quorum set
-            if !keys.is_empty() && config.node.quorum_set.validators.is_empty() {
+            // [QUORUM_SET] always overrides [[VALIDATORS]]-generated quorum set.
+            if !keys.is_empty() {
                 config.node.quorum_set.validators = keys;
             }
         }
@@ -534,7 +547,83 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     }
 
     // --- Ignored keys (accepted silently for compatibility) ---
-    // UNSAFE_QUORUM, FORCE_SCP, DISABLE_XDR_FSYNC, etc.
+    // FORCE_SCP, DISABLE_XDR_FSYNC, etc.
+
+    // --- FAILURE_SAFETY and UNSAFE_QUORUM ---
+    // Parse these quorum safety knobs from stellar-core compat configs.
+    let unsafe_quorum = match table.get("UNSAFE_QUORUM") {
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("UNSAFE_QUORUM must be a boolean, got: {}", v))?,
+        None => false,
+    };
+
+    let failure_safety = match table.get("FAILURE_SAFETY") {
+        Some(v) => {
+            let n = v
+                .as_integer()
+                .ok_or_else(|| anyhow::anyhow!("FAILURE_SAFETY must be an integer, got: {}", v))?;
+            if n < -1 || n > i32::MAX as i64 - 1 {
+                anyhow::bail!(
+                    "FAILURE_SAFETY must be between -1 and {}, got: {}",
+                    i32::MAX - 1,
+                    n
+                );
+            }
+            if n == -1 {
+                FailureSafety::Auto
+            } else {
+                FailureSafety::Explicit(n as i32)
+            }
+        }
+        None => FailureSafety::Auto,
+    };
+
+    // Gate manual [QUORUM_SET] override on UNSAFE_QUORUM when [[VALIDATORS]]
+    // were also present. stellar-core rejects overrides that differ from the
+    // auto-generated set unless UNSAFE_QUORUM=true (Config.cpp:2087-2099).
+    if has_validators_section && has_manual_quorum_set {
+        if let Some(ref auto_qset) = auto_generated_qset {
+            // Compare canonicalized representations: sorted validators + threshold.
+            let mut auto_validators = auto_qset.validators.clone();
+            auto_validators.sort();
+            let mut manual_validators = config.node.quorum_set.validators.clone();
+            manual_validators.sort();
+            let sets_differ = auto_validators != manual_validators
+                || auto_qset.threshold_percent != config.node.quorum_set.threshold_percent;
+
+            if sets_differ && !unsafe_quorum {
+                anyhow::bail!(
+                    "Can't override [[VALIDATORS]] with QUORUM_SET unless you also set \
+                     UNSAFE_QUORUM=true. Be sure you know what you are doing!"
+                );
+            }
+        }
+    }
+
+    // Determine threshold validation level.
+    let threshold_level = if has_manual_quorum_set {
+        // Manual [QUORUM_SET] always uses BFT (assumes validators are from
+        // different entities). Matches stellar-core Config.cpp:2101-2103.
+        ValidationThresholdLevel::ByzantineFaultTolerance
+    } else {
+        // Auto-generated from [[VALIDATORS]]: use BFT if >1 unique home domain.
+        let unique_domains: HashSet<&str> = validator_entries
+            .iter()
+            .filter_map(|(_, _, domain, _)| domain.as_deref())
+            .collect();
+        if unique_domains.len() > 1 {
+            ValidationThresholdLevel::ByzantineFaultTolerance
+        } else {
+            ValidationThresholdLevel::SimpleMajority
+        }
+    };
+
+    config.compat_quorum_safety = Some(CompatQuorumSafety {
+        failure_safety,
+        unsafe_quorum,
+        threshold_level,
+    });
 
     warn_unrecognized_keys(table);
 
@@ -1862,14 +1951,9 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
         .unwrap();
         let table = core_toml.as_table().unwrap();
         let classified = classify_keys(table);
-        assert_eq!(classified.unsupported.len(), 3);
-        assert!(classified
-            .unsupported
-            .contains(&"UNSAFE_QUORUM".to_string()));
+        // UNSAFE_QUORUM and FAILURE_SAFETY are now supported (actively translated).
+        assert_eq!(classified.unsupported.len(), 1);
         assert!(classified.unsupported.contains(&"FORCE_SCP".to_string()));
-        assert!(classified
-            .unsupported
-            .contains(&"FAILURE_SAFETY".to_string()));
         assert!(classified.unknown.is_empty());
     }
 
@@ -2237,5 +2321,462 @@ FLOOD_ADVERT_PERIOD_MS=-1
         let config = translate_stellar_core_config(&raw).unwrap();
         // Invalid value should be ignored, keeping the default 100.
         assert_eq!(config.overlay.flood_advert_period_ms, 100);
+    }
+
+    // --- FAILURE_SAFETY / UNSAFE_QUORUM tests ---
+
+    /// Helper: create a minimal compat config string for a validator with the
+    /// given quorum-related fields appended.
+    fn compat_validator_config(extra: &str) -> String {
+        format!(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            NODE_SEED = "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2 self"
+            NODE_IS_VALIDATOR = true
+            DATABASE = "sqlite3:///tmp/test.db"
+            {extra}
+            [HISTORY.testnet]
+            get = "curl -sf https://history.stellar.org/prd/core-testnet/core_testnet_001/{{0}}/{{1}}/{{2}}/{{3}} -o {{4}}"
+            "#
+        )
+    }
+
+    /// Helper: translate a compat config string and return the AppConfig.
+    fn translate(config_str: &str) -> anyhow::Result<crate::config::AppConfig> {
+        let raw: toml::Value = toml::from_str(config_str).unwrap();
+        translate_stellar_core_config(&raw)
+    }
+
+    #[test]
+    fn test_failure_safety_auto_passes_good_quorum() {
+        // 4 validators from different domains, default threshold (67%)
+        // BFT: min_threshold = 4 - (4-1)/3 = 3, FAILURE_SAFETY = 4 - 3 = 1
+        // closest v-blocking size = 4 - 3 + 1 = 2, so 1 < 2 → passes
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let key2 = henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey();
+        let key3 = henyey_crypto::SecretKey::from_seed(&[3u8; 32])
+            .public_key()
+            .to_strkey();
+        let key4 = henyey_crypto::SecretKey::from_seed(&[4u8; 32])
+            .public_key()
+            .to_strkey();
+        let cfg = compat_validator_config(&format!(
+            r#"
+            [[VALIDATORS]]
+            NAME = "v1"
+            PUBLIC_KEY = "{key1}"
+            HOME_DOMAIN = "a.com"
+
+            [[VALIDATORS]]
+            NAME = "v2"
+            PUBLIC_KEY = "{key2}"
+            HOME_DOMAIN = "b.com"
+
+            [[VALIDATORS]]
+            NAME = "v3"
+            PUBLIC_KEY = "{key3}"
+            HOME_DOMAIN = "c.com"
+
+            [[VALIDATORS]]
+            NAME = "v4"
+            PUBLIC_KEY = "{key4}"
+            HOME_DOMAIN = "d.com"
+            "#
+        ));
+        let config = translate(&cfg).unwrap();
+        assert!(config.compat_quorum_safety.is_some());
+        // Validation should pass
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_failure_safety_explicit_rejects_incompatible() {
+        // 2-of-3 quorum set with FAILURE_SAFETY=2
+        // closest v-blocking size = 2, so FAILURE_SAFETY(2) >= 2 → rejected
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let key2 = henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey();
+        let key3 = henyey_crypto::SecretKey::from_seed(&[3u8; 32])
+            .public_key()
+            .to_strkey();
+        let cfg = compat_validator_config(&format!(
+            r#"
+            FAILURE_SAFETY = 2
+            UNSAFE_QUORUM = true
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 67
+            VALIDATORS = ["{key1}", "{key2}", "{key3}"]
+            "#
+        ));
+        let config = translate(&cfg).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("FAILURE_SAFETY") && err.to_string().contains("quorum"),
+            "Expected FAILURE_SAFETY incompatible error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_failure_safety_zero_rejected_without_unsafe() {
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let cfg = compat_validator_config(&format!(
+            r#"
+            FAILURE_SAFETY = 0
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["{key1}"]
+            "#
+        ));
+        let config = translate(&cfg).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("FAILURE_SAFETY=0"),
+            "Expected FAILURE_SAFETY=0 error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_failure_safety_zero_accepted_with_unsafe() {
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let cfg = compat_validator_config(&format!(
+            r#"
+            FAILURE_SAFETY = 0
+            UNSAFE_QUORUM = true
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["{key1}"]
+            "#
+        ));
+        let config = translate(&cfg).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_low_threshold_rejected_without_unsafe() {
+        // 4 validators, threshold 51% → passes is_quorum_set_sane (>50%)
+        // but fails BFT check (min threshold = 3 for 4 nodes, 51% of 4 = 3, just barely ok)
+        // Try 7 validators with threshold 58%: ceil(7*0.58) = 5, BFT min = 7-(7-1)/3 = 5.
+        // That passes. Use 57%: ceil(7*0.57) = 4 < 5 BFT min. And 4/7 > 50% so sanity passes.
+        let keys: Vec<String> = (1..=7u8)
+            .map(|i| {
+                henyey_crypto::SecretKey::from_seed(&[i; 32])
+                    .public_key()
+                    .to_strkey()
+            })
+            .collect();
+        let validators_str = keys
+            .iter()
+            .map(|k| format!(r#""{k}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cfg = compat_validator_config(&format!(
+            r#"
+            FAILURE_SAFETY = 1
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 57
+            VALIDATORS = [{validators_str}]
+            "#
+        ));
+        let config = translate(&cfg).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("THRESHOLD_PERCENTAGE is too low"),
+            "Expected threshold too low error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_low_threshold_accepted_with_unsafe() {
+        // Same 7 validators with low threshold, but UNSAFE_QUORUM=true bypasses checks.
+        let keys: Vec<String> = (1..=7u8)
+            .map(|i| {
+                henyey_crypto::SecretKey::from_seed(&[i; 32])
+                    .public_key()
+                    .to_strkey()
+            })
+            .collect();
+        let validators_str = keys
+            .iter()
+            .map(|k| format!(r#""{k}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cfg = compat_validator_config(&format!(
+            r#"
+            UNSAFE_QUORUM = true
+            FAILURE_SAFETY = 0
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 57
+            VALIDATORS = [{validators_str}]
+            "#
+        ));
+        let config = translate(&cfg).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_manual_quorum_set_differs_from_validators_rejected() {
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let key2 = henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey();
+        let key3 = henyey_crypto::SecretKey::from_seed(&[3u8; 32])
+            .public_key()
+            .to_strkey();
+        let key4 = henyey_crypto::SecretKey::from_seed(&[4u8; 32])
+            .public_key()
+            .to_strkey();
+        // [[VALIDATORS]] has 4 keys, but [QUORUM_SET] overrides with only 2
+        let cfg = compat_validator_config(&format!(
+            r#"
+            [[VALIDATORS]]
+            NAME = "v1"
+            PUBLIC_KEY = "{key1}"
+            HOME_DOMAIN = "a.com"
+
+            [[VALIDATORS]]
+            NAME = "v2"
+            PUBLIC_KEY = "{key2}"
+            HOME_DOMAIN = "b.com"
+
+            [[VALIDATORS]]
+            NAME = "v3"
+            PUBLIC_KEY = "{key3}"
+            HOME_DOMAIN = "c.com"
+
+            [[VALIDATORS]]
+            NAME = "v4"
+            PUBLIC_KEY = "{key4}"
+            HOME_DOMAIN = "d.com"
+
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["{key1}", "{key2}"]
+            "#
+        ));
+        let err = translate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("UNSAFE_QUORUM=true"),
+            "Expected UNSAFE_QUORUM gate error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_manual_quorum_set_identical_to_validators_accepted() {
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let key2 = henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey();
+        let key3 = henyey_crypto::SecretKey::from_seed(&[3u8; 32])
+            .public_key()
+            .to_strkey();
+        let key4 = henyey_crypto::SecretKey::from_seed(&[4u8; 32])
+            .public_key()
+            .to_strkey();
+        let cfg = compat_validator_config(&format!(
+            r#"
+            [[VALIDATORS]]
+            NAME = "v1"
+            PUBLIC_KEY = "{key1}"
+            HOME_DOMAIN = "a.com"
+
+            [[VALIDATORS]]
+            NAME = "v2"
+            PUBLIC_KEY = "{key2}"
+            HOME_DOMAIN = "b.com"
+
+            [[VALIDATORS]]
+            NAME = "v3"
+            PUBLIC_KEY = "{key3}"
+            HOME_DOMAIN = "c.com"
+
+            [[VALIDATORS]]
+            NAME = "v4"
+            PUBLIC_KEY = "{key4}"
+            HOME_DOMAIN = "d.com"
+
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 67
+            VALIDATORS = ["{key1}", "{key2}", "{key3}", "{key4}"]
+            "#
+        ));
+        // Same validators and same effective threshold → should be accepted
+        let config = translate(&cfg).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_manual_quorum_set_differs_accepted_with_unsafe() {
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let key2 = henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey();
+        let key3 = henyey_crypto::SecretKey::from_seed(&[3u8; 32])
+            .public_key()
+            .to_strkey();
+        let key4 = henyey_crypto::SecretKey::from_seed(&[4u8; 32])
+            .public_key()
+            .to_strkey();
+        let cfg = compat_validator_config(&format!(
+            r#"
+            UNSAFE_QUORUM = true
+            FAILURE_SAFETY = 0
+
+            [[VALIDATORS]]
+            NAME = "v1"
+            PUBLIC_KEY = "{key1}"
+            HOME_DOMAIN = "a.com"
+
+            [[VALIDATORS]]
+            NAME = "v2"
+            PUBLIC_KEY = "{key2}"
+            HOME_DOMAIN = "b.com"
+
+            [[VALIDATORS]]
+            NAME = "v3"
+            PUBLIC_KEY = "{key3}"
+            HOME_DOMAIN = "c.com"
+
+            [[VALIDATORS]]
+            NAME = "v4"
+            PUBLIC_KEY = "{key4}"
+            HOME_DOMAIN = "d.com"
+
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["{key1}", "{key2}"]
+            "#
+        ));
+        let config = translate(&cfg).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_manual_quorum_set_lower_threshold_rejected() {
+        // Same validators but lower threshold → differs → rejected without UNSAFE_QUORUM
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let key2 = henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey();
+        let key3 = henyey_crypto::SecretKey::from_seed(&[3u8; 32])
+            .public_key()
+            .to_strkey();
+        let key4 = henyey_crypto::SecretKey::from_seed(&[4u8; 32])
+            .public_key()
+            .to_strkey();
+        let cfg = compat_validator_config(&format!(
+            r#"
+            [[VALIDATORS]]
+            NAME = "v1"
+            PUBLIC_KEY = "{key1}"
+            HOME_DOMAIN = "a.com"
+
+            [[VALIDATORS]]
+            NAME = "v2"
+            PUBLIC_KEY = "{key2}"
+            HOME_DOMAIN = "b.com"
+
+            [[VALIDATORS]]
+            NAME = "v3"
+            PUBLIC_KEY = "{key3}"
+            HOME_DOMAIN = "c.com"
+
+            [[VALIDATORS]]
+            NAME = "v4"
+            PUBLIC_KEY = "{key4}"
+            HOME_DOMAIN = "d.com"
+
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 34
+            VALIDATORS = ["{key1}", "{key2}", "{key3}", "{key4}"]
+            "#
+        ));
+        let err = translate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("UNSAFE_QUORUM=true"),
+            "Expected UNSAFE_QUORUM gate error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_standalone_quorum_set_without_validators_allowed() {
+        // [QUORUM_SET] without [[VALIDATORS]] — always allowed, no UNSAFE_QUORUM needed
+        let key1 = henyey_crypto::SecretKey::from_seed(&[1u8; 32])
+            .public_key()
+            .to_strkey();
+        let key2 = henyey_crypto::SecretKey::from_seed(&[2u8; 32])
+            .public_key()
+            .to_strkey();
+        let cfg = compat_validator_config(&format!(
+            r#"
+            FAILURE_SAFETY = 0
+            UNSAFE_QUORUM = true
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["{key1}", "{key2}"]
+            "#
+        ));
+        let config = translate(&cfg).unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_failure_safety_below_minus_one_rejected() {
+        let cfg = compat_validator_config(
+            r#"
+            FAILURE_SAFETY = -5
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"]
+            "#,
+        );
+        let err = translate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("FAILURE_SAFETY must be between"),
+            "Expected range error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_failure_safety_non_integer_rejected() {
+        let cfg = compat_validator_config(
+            r#"
+            FAILURE_SAFETY = "foo"
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"]
+            "#,
+        );
+        let err = translate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("FAILURE_SAFETY must be an integer"),
+            "Expected type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_native_config_skips_failure_safety_validation() {
+        // Native henyey config has no compat_quorum_safety
+        let config = crate::config::AppConfig::testnet();
+        assert!(config.compat_quorum_safety.is_none());
     }
 }
