@@ -51,7 +51,8 @@ use crate::tracked_lock::{tracked_read, tracked_write};
 const LOCK_HERDER_STATE: &str = "herder.state";
 const LOCK_TRACKING_STATE: &str = "shared.tracking_state";
 
-use henyey_common::Hash256;
+use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::{PublicKey, SecretKey};
 use henyey_ledger::LedgerManager;
 use henyey_scp::{BallotPhase, SlotIndex, SCP};
@@ -2141,15 +2142,18 @@ impl Herder {
             max_soroban_tx_set_size,
             snapshot_providers,
             config_ctx,
+            soroban_info,
         ) = {
             let guard = self.ledger_manager.read();
             if let Some(manager) = guard.as_ref() {
                 let snap = manager.header_snapshot();
                 let lcl_ct = snap.header.scp_value.close_time.0;
                 let max = snap.header.max_tx_set_size as usize;
-                let soroban_max = manager
-                    .soroban_network_info()
-                    .map(|info| info.ledger_max_tx_count);
+                // Capture the full SorobanNetworkInfo so it can be reused by the
+                // post-build self-validation (#2113). Derive `soroban_max` from
+                // the same value to keep both views consistent.
+                let soroban_info = manager.soroban_network_info();
+                let soroban_max = soroban_info.as_ref().map(|info| info.ledger_max_tx_count);
 
                 // Build one snapshot for both seq-map and validation providers.
                 let providers = match manager.create_snapshot() {
@@ -2201,6 +2205,7 @@ impl Herder {
                     soroban_max,
                     sp,
                     cfg_ctx,
+                    soroban_info,
                 )
             } else {
                 (
@@ -2209,6 +2214,7 @@ impl Herder {
                     None,
                     LedgerHeader::default(),
                     0,
+                    None,
                     None,
                     None,
                     None,
@@ -2247,6 +2253,31 @@ impl Herder {
             tx_count = tx_set.len(),
             "Proposing transaction set"
         );
+
+        // 3.5. Self-validation roundtrip (parity: stellar-core
+        // `makeTxSetFromTransactions` @ TxSetFrame.cpp:898-952).
+        // Defense-in-depth against future tx-set construction bugs that
+        // produce a set our own validator would reject. Abort nomination on
+        // failure rather than caching a known-bad set (#2103, #2113).
+        if !self.self_validate_nomination_tx_set(
+            &tx_set,
+            &header,
+            close_time_offset,
+            soroban_info.as_ref(),
+            snapshot_providers.as_ref(),
+        ) {
+            error!(
+                tx_set_hash = %tx_set.hash(),
+                tx_count = tx_set.len(),
+                previous_hash = %previous_hash,
+                close_time_offset,
+                ledger_seq = header.ledger_seq,
+                "Self-validation rejected the freshly-built nomination tx \
+                 set; aborting nomination (defense-in-depth #2113)"
+            );
+            return None;
+        }
+
         // Cache the tx set and notify FetchingEnvelopes. Does NOT drain the
         // ready queue — callers (trigger_next_ledger, handle_nomination_timeout)
         // are responsible for draining via process_ready_fetching_envelopes().
@@ -2354,6 +2385,57 @@ impl Herder {
         let value_bytes = henyey_common::xdr_to_bytes(&stellar_value);
         let value = Value(value_bytes.try_into().ok()?);
         Some(value)
+    }
+
+    /// Run a post-build self-validation roundtrip on `tx_set`, mirroring
+    /// stellar-core's `makeTxSetFromTransactions` (TxSetFrame.cpp:898-952).
+    ///
+    /// Returns `true` if the tx set passes our own validator, `false` if it
+    /// should be rejected and nomination aborted.
+    ///
+    /// On protocol < V20 this returns `true` unconditionally — generalized
+    /// tx sets are not expected at those versions and `check_tx_set_valid`
+    /// would unconditionally reject them. Only simulation environments hit
+    /// the pre-V20 path; production validators run on protocol 24+.
+    ///
+    /// On protocol >= V20 a non-generalized result from the builder is a
+    /// construction bug, not a routine "skip" condition, so it is logged at
+    /// `warn!` and rejected.
+    ///
+    /// Unlike the SCP-incoming path in `ScpDriver::check_and_cache_tx_set_valid`
+    /// (which passes `None, None` for the providers because incoming-message
+    /// validation can race against peers' construction), this builder path
+    /// validates against the **same** snapshot used to build the tx set, so
+    /// passing the providers is correct and stricter.
+    fn self_validate_nomination_tx_set(
+        &self,
+        tx_set: &TransactionSet,
+        header: &LedgerHeader,
+        close_time_offset: u64,
+        soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
+        snapshot_providers: Option<&crate::tx_queue::SnapshotProviders>,
+    ) -> bool {
+        if !protocol_version_starts_from(header.ledger_version, ProtocolVersion::V20) {
+            return true;
+        }
+        let Some(gen) = tx_set.generalized_tx_set() else {
+            warn!(
+                tx_set_hash = %tx_set.hash(),
+                ledger_version = header.ledger_version,
+                "build_nomination_value: built tx set is not generalized on \
+                 protocol >= 20; rejecting (construction bug)"
+            );
+            return false;
+        };
+        crate::tx_set_utils::check_tx_set_valid(
+            gen,
+            header,
+            close_time_offset,
+            NetworkId(self.scp_driver.network_id()),
+            soroban_info,
+            snapshot_providers.map(|sp| sp as &dyn crate::tx_queue::FeeBalanceProvider),
+            snapshot_providers.map(|sp| sp as &dyn crate::tx_queue::AccountProvider),
+        )
     }
 
     /// Create a signed StellarValue.
@@ -6617,6 +6699,238 @@ mod advance_tracking_slot_tests {
             delta,
             before,
             after
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // #2113 regression: build_nomination_value must self-validate the
+    // freshly-built tx set against `check_tx_set_valid` and abort
+    // nomination on failure (defense-in-depth follow-up to #2103).
+    //
+    // The tests below exercise the helper directly with hand-crafted
+    // GeneralizedTransactionSet values and verify the protocol gate,
+    // happy path, malformed-shape rejection, and integration into
+    // `build_nomination_value` on a real v24 LedgerManager.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Build a `Herder` (observer mode) with default config — sufficient for
+    /// helper-level tests that don't exercise nomination signing.
+    fn make_herder_for_self_validate_tests() -> Herder {
+        Herder::new(HerderConfig::default())
+    }
+
+    /// Build a v24 `LedgerHeader` with a non-zero `max_tx_set_size`. Mirrors
+    /// the header shape used by `test_nomination_value_uses_single_snapshot`.
+    fn v24_header() -> LedgerHeader {
+        use stellar_xdr::curr::{
+            Hash, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+        LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 10,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        }
+    }
+
+    /// Build an N-phase generalized tx set for self-validate tests. Each phase
+    /// is an empty `TransactionPhase::V0`. The hash is deterministic but
+    /// not the wire SHA-256 — `check_tx_set_valid` does not re-hash, so a
+    /// placeholder is sufficient.
+    fn empty_n_phase_generalized_tx_set(n_phases: usize) -> TransactionSet {
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, Hash, TransactionPhase, TransactionSetV1, VecM,
+        };
+        let phases: VecM<TransactionPhase> = (0..n_phases)
+            .map(|_| TransactionPhase::V0(VecM::default()))
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("phase vec");
+        let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases,
+        });
+        TransactionSet::new_generalized(Hash256::ZERO, gen)
+    }
+
+    /// Helper accepts a valid empty 2-phase generalized V0 tx set on protocol
+    /// 22 (in V20..V23 — generalized format applies, but parallel Soroban is
+    /// not yet required so a `TransactionPhase::V0` Soroban phase is valid).
+    /// `soroban_info` must be `Some` because `check_tx_set_valid` rejects an
+    /// empty Soroban phase when config is unavailable
+    /// (`tx_set_utils.rs:1602-1606`).
+    #[test]
+    fn test_self_validate_nomination_tx_set_accepts_empty() {
+        let herder = make_herder_for_self_validate_tests();
+        let tx_set = empty_n_phase_generalized_tx_set(2);
+        let mut header = v24_header();
+        header.ledger_version = 22;
+        let soroban_info = henyey_ledger::SorobanNetworkInfo::default();
+        assert!(
+            herder.self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,),
+            "empty 2-phase generalized V0 tx set on v22 must pass self-validation"
+        );
+    }
+
+    /// Helper rejects a legacy (non-generalized) tx set on protocol >= 20 —
+    /// generalized sets are required at V20+. Rejecting (rather than silently
+    /// passing) is load-bearing: it surfaces a construction bug at `warn!`.
+    #[test]
+    fn test_self_validate_nomination_tx_set_rejects_legacy_on_v24() {
+        let herder = make_herder_for_self_validate_tests();
+        let tx_set = TransactionSet::new_legacy(Hash256::ZERO, vec![]);
+        let header = v24_header();
+        assert!(
+            !herder.self_validate_nomination_tx_set(&tx_set, &header, 0, None, None),
+            "legacy tx set on v24 must be rejected by self-validation"
+        );
+    }
+
+    /// Helper rejects a malformed generalized tx set with a wrong phase count
+    /// (3 phases — generalized sets must have exactly 2). This exercises the
+    /// real `check_tx_set_valid` rejection path through the helper.
+    #[test]
+    fn test_self_validate_nomination_tx_set_rejects_three_phase() {
+        let herder = make_herder_for_self_validate_tests();
+        let tx_set = empty_n_phase_generalized_tx_set(3);
+        let header = v24_header();
+        assert!(
+            !herder.self_validate_nomination_tx_set(&tx_set, &header, 0, None, None),
+            "3-phase generalized tx set must be rejected by check_tx_set_valid"
+        );
+    }
+
+    /// Helper short-circuits to `true` on protocol < 20: even an otherwise-bad
+    /// set (here: legacy) is accepted because the protocol gate runs first.
+    /// Only simulation environments hit this path; production runs on V24+.
+    #[test]
+    fn test_self_validate_nomination_tx_set_skipped_pre_v20() {
+        let herder = make_herder_for_self_validate_tests();
+        let tx_set = TransactionSet::new_legacy(Hash256::ZERO, vec![]);
+        let mut header = v24_header();
+        header.ledger_version = 19;
+        assert!(
+            herder.self_validate_nomination_tx_set(&tx_set, &header, 0, None, None),
+            "self-validation must be skipped on protocol < 20"
+        );
+    }
+
+    /// Integration test: `build_nomination_value` on a v24 LedgerManager with
+    /// an empty queue produces a valid tx set, passes self-validation, caches
+    /// it, and returns `Some(_)`. Confirms the new self-validation gate does
+    /// not regress the empty-set baseline (the primary risk: false positives).
+    #[tokio::test]
+    async fn test_build_nomination_value_self_check_passes_on_v24() {
+        use henyey_bucket::{BucketList, HotArchiveBucketList};
+        use henyey_ledger::LedgerManagerConfig;
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+
+        // Validator herder so build_nomination_value can sign.
+        let seed = [13u8; 32];
+        let secret_for_herder = henyey_crypto::SecretKey::from_seed(&seed);
+        let public = secret_for_herder.public_key();
+        let node_id = super::node_id_from_public_key(&public);
+        let quorum_set = stellar_xdr::curr::ScpQuorumSet {
+            threshold: 1,
+            validators: vec![node_id].try_into().unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+        let herder = Herder::with_secret_key(config, secret_for_herder);
+
+        let lm_config = LedgerManagerConfig {
+            validate_bucket_hash: false,
+            ..Default::default()
+        };
+        let lm = henyey_ledger::LedgerManager::new("Test Network".to_string(), lm_config);
+        let header = LedgerHeader {
+            ledger_version: 24,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 10,
+            total_coins: 1_000_000_000_000,
+            fee_pool: 0,
+            inflation_seq: 0,
+            id_pool: 0,
+            base_fee: 100,
+            base_reserve: 5_000_000,
+            max_tx_set_size: 100,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+        };
+        let header_hash = henyey_ledger::compute_header_hash(&header).expect("hash");
+        lm.initialize(
+            BucketList::new(),
+            HotArchiveBucketList::new(),
+            header,
+            header_hash,
+        )
+        .expect("init");
+        // Populate Soroban network info so `check_tx_set_valid` accepts the
+        // (empty) Soroban phase. The default values are sufficient — the
+        // builder produces an empty V1 parallel phase that has no resource
+        // demand to compare against.
+        lm.set_soroban_network_info_for_test(henyey_ledger::SorobanNetworkInfo::default());
+        herder.set_ledger_manager(Arc::new(lm));
+        herder.bootstrap(10);
+
+        // Empty tx queue → empty 2-phase tx set → passes self-validation.
+        let value = herder
+            .build_nomination_value()
+            .expect("nomination value must be Some when self-validation passes");
+
+        // Decode the StellarValue to extract the tx_set_hash and verify the
+        // tx set was actually cached (caching only happens after the
+        // self-validation gate accepts it).
+        let stellar_value = stellar_xdr::curr::StellarValue::from_xdr(
+            &value.0[..],
+            stellar_xdr::curr::Limits::none(),
+        )
+        .expect("decode StellarValue");
+        let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
+        assert!(
+            herder.scp_driver().has_tx_set(&tx_set_hash),
+            "freshly-built tx set must be cached after self-validation passes"
         );
     }
 
