@@ -1017,7 +1017,7 @@ pub fn check_valid_pre_seq_num(
 pub fn check_valid_pre_seq_num_with_config(
     frame: &TransactionFrame,
     protocol_version: u32,
-    ledger_flags: u32,
+    _ledger_flags: u32,
     max_contract_size_bytes: Option<u32>,
 ) -> std::result::Result<(), PreSeqNumError> {
     // 1. Structure: op count, fee > 0, soroban single-op consistency
@@ -1075,31 +1075,12 @@ pub fn check_valid_pre_seq_num_with_config(
         }
     }
 
-    // 3. Per-op: isOpSupported + doCheckValid
-    // For fee-bump envelopes, operations inherit from the inner tx source,
-    // not the outer fee source (parity: stellar-core FeeBumpTransactionFrame
-    // delegates getSourceID() to mInnerTx->getSourceID()).
-    let tx_source = frame.inner_source_account_id();
-    for op in frame.operations() {
-        let effective_source = match &op.source_account {
-            Some(muxed) => crate::frame::muxed_to_account_id(muxed),
-            None => tx_source.clone(),
-        };
-        match crate::operations::validate_operation(
-            op,
-            protocol_version,
-            ledger_flags,
-            Some(&effective_source),
-        ) {
-            Ok(()) => {}
-            Err(crate::operations::OperationValidationError::NotSupported(_)) => {
-                return Err(PreSeqNumError::OpNotSupported);
-            }
-            Err(e) => {
-                return Err(PreSeqNumError::Malformed(e.to_string()));
-            }
-        }
-    }
+    // 3. Per-op classic validation is NOT done here.
+    // stellar-core's commonValidPreSeqNum does NOT iterate classic operations.
+    // Classic isOpSupported + doCheckValid run later in OperationFrame::checkValid(),
+    // called from checkValidWithOptionallyChargedFee after account loading, sequence,
+    // and signature checks. Failures there produce txFAILED with per-op results.
+    // See: stellar-core/src/transactions/TransactionFrame.cpp:1273-1503
 
     // 4. Soroban-specific stateless checks
     if frame.is_soroban() {
@@ -2517,8 +2498,10 @@ mod tests {
     }
 
     #[test]
-    fn test_check_valid_pre_seq_num_op_not_supported() {
-        // Inflation is not supported on protocol >= 12
+    fn test_check_valid_pre_seq_num_inflation_not_rejected() {
+        // Inflation is not supported on protocol >= 12, but classic ops are no
+        // longer validated in pre-seq-num (issue #2063). This test verifies
+        // that pre-seq-num passes; the rejection now happens in the apply path.
         let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
         let tx = Transaction {
             source_account: source,
@@ -2539,10 +2522,9 @@ mod tests {
             signatures: vec![].try_into().unwrap(),
         });
         let frame = TransactionFrame::from_owned(envelope);
-        let err = check_valid_pre_seq_num(&frame, 21, 0).unwrap_err();
         assert!(
-            matches!(err, PreSeqNumError::OpNotSupported),
-            "expected OpNotSupported, got {err:?}"
+            check_valid_pre_seq_num(&frame, 21, 0).is_ok(),
+            "pre-seq-num must not reject classic ops (issue #2063)"
         );
     }
 
@@ -2837,6 +2819,48 @@ mod tests {
         assert!(
             check_valid_pre_seq_num(&frame, 25, 0).is_ok(),
             "fee-bump pre-seq validation should use inner source, not outer fee source"
+        );
+    }
+
+    /// Regression test for issue #2063: classic op validation errors must NOT
+    /// surface as pre-seq-num txMALFORMED. Instead, they should be caught later
+    /// in the apply path and produce txFAILED with per-op results.
+    #[test]
+    fn test_pre_seq_num_does_not_reject_malformed_classic_ops() {
+        use stellar_xdr::curr::*;
+
+        let source_key = Uint256([1u8; 32]);
+        // ManageBuyOffer with same selling/buying asset: structurally invalid
+        let bad_op = Operation {
+            source_account: None,
+            body: OperationBody::ManageBuyOffer(ManageBuyOfferOp {
+                selling: Asset::Native,
+                buying: Asset::Native,
+                buy_amount: 100,
+                price: Price { n: 1, d: 1 },
+                offer_id: 0,
+            }),
+        };
+
+        let tx = TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(source_key),
+                fee: 100,
+                seq_num: SequenceNumber(1),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![bad_op].try_into().unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: VecM::default(),
+        };
+        let env = TransactionEnvelope::Tx(tx);
+        let frame = TransactionFrame::from_owned(env);
+
+        // Pre-seq-num should pass — classic op structural errors are deferred
+        assert!(
+            check_valid_pre_seq_num(&frame, 25, 0).is_ok(),
+            "pre-seq-num must not reject malformed classic ops (issue #2063)"
         );
     }
 }

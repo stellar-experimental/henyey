@@ -1025,6 +1025,186 @@ pub fn get_threshold_level(op: &Operation) -> ThresholdLevel {
     }
 }
 
+/// Validate classic operation structural checks only (doCheckValid equivalent).
+///
+/// Runs per-operation structural validation WITHOUT the `is_op_supported()` check.
+/// This mirrors stellar-core's `OperationFrame::doCheckValid()` which is called
+/// after `isOpSupported()` and `checkSignature()` have already passed.
+///
+/// For Soroban operations this is a no-op — their structural validation is handled
+/// by `doCheckValidForSoroban` in the pre-seq-num path.
+pub fn validate_classic_op_structure(
+    op: &Operation,
+    protocol_version: u32,
+    source_account: Option<&AccountId>,
+) -> std::result::Result<(), OperationValidationError> {
+    match &op.body {
+        OperationBody::CreateAccount(inner) => validate_create_account(inner, source_account),
+        OperationBody::Payment(inner) => validate_payment(inner, protocol_version),
+        OperationBody::PathPaymentStrictReceive(inner) => {
+            validate_path_payment_strict_receive(inner, protocol_version)
+        }
+        OperationBody::PathPaymentStrictSend(inner) => {
+            validate_path_payment_strict_send(inner, protocol_version)
+        }
+        OperationBody::ManageSellOffer(inner) => {
+            validate_manage_sell_offer(inner, protocol_version)
+        }
+        OperationBody::ManageBuyOffer(inner) => validate_manage_buy_offer(inner, protocol_version),
+        OperationBody::CreatePassiveSellOffer(inner) => {
+            validate_create_passive_sell_offer(inner, protocol_version)
+        }
+        OperationBody::SetOptions(inner) => {
+            validate_set_options(inner, protocol_version, source_account)
+        }
+        OperationBody::ChangeTrust(inner) => {
+            validate_change_trust(inner, protocol_version, source_account)
+        }
+        OperationBody::AllowTrust(inner) => {
+            validate_allow_trust(inner, protocol_version, source_account)
+        }
+        OperationBody::AccountMerge(dest) => validate_account_merge(dest, source_account),
+        OperationBody::Inflation => Ok(()), // Caught by is_op_supported, not doCheckValid
+        OperationBody::ManageData(inner) => validate_manage_data(inner, protocol_version),
+        OperationBody::BumpSequence(inner) => validate_bump_sequence(inner),
+        OperationBody::CreateClaimableBalance(inner) => {
+            validate_create_claimable_balance(inner, protocol_version)
+        }
+        OperationBody::ClaimClaimableBalance(inner) => validate_claim_claimable_balance(inner),
+        OperationBody::BeginSponsoringFutureReserves(inner) => {
+            validate_begin_sponsoring_future_reserves(inner, source_account)
+        }
+        OperationBody::EndSponsoringFutureReserves => Ok(()),
+        OperationBody::RevokeSponsorship(inner) => {
+            validate_revoke_sponsorship(inner, protocol_version)
+        }
+        OperationBody::Clawback(inner) => {
+            validate_clawback(inner, protocol_version, source_account)
+        }
+        OperationBody::ClawbackClaimableBalance(inner) => {
+            validate_clawback_claimable_balance(inner)
+        }
+        OperationBody::SetTrustLineFlags(inner) => {
+            validate_set_trust_line_flags(inner, protocol_version, source_account)
+        }
+        OperationBody::LiquidityPoolDeposit(inner) => validate_liquidity_pool_deposit(inner),
+        OperationBody::LiquidityPoolWithdraw(inner) => validate_liquidity_pool_withdraw(inner),
+        // Soroban ops: structural validation handled in pre-seq-num path
+        OperationBody::InvokeHostFunction(_)
+        | OperationBody::ExtendFootprintTtl(_)
+        | OperationBody::RestoreFootprint(_) => Ok(()),
+    }
+}
+
+/// Map an operation body and validation error to the XDR `OperationResult` that
+/// stellar-core's `doCheckValid()` would produce on failure.
+///
+/// Most operations use `*Result::Malformed`. Some operations use error-specific
+/// codes (e.g., `SetOptionsResult::UnknownFlag`, `ManageDataResult::InvalidName`).
+pub fn malformed_operation_result(
+    body: &OperationBody,
+    err: &OperationValidationError,
+) -> stellar_xdr::curr::OperationResult {
+    use stellar_xdr::curr::*;
+    let tr = match body {
+        OperationBody::CreateAccount(_) => {
+            OperationResultTr::CreateAccount(CreateAccountResult::Malformed)
+        }
+        OperationBody::Payment(_) => OperationResultTr::Payment(PaymentResult::Malformed),
+        OperationBody::PathPaymentStrictReceive(_) => {
+            OperationResultTr::PathPaymentStrictReceive(PathPaymentStrictReceiveResult::Malformed)
+        }
+        OperationBody::PathPaymentStrictSend(_) => {
+            OperationResultTr::PathPaymentStrictSend(PathPaymentStrictSendResult::Malformed)
+        }
+        OperationBody::ManageSellOffer(_) => {
+            OperationResultTr::ManageSellOffer(ManageSellOfferResult::Malformed)
+        }
+        OperationBody::ManageBuyOffer(_) => {
+            OperationResultTr::ManageBuyOffer(ManageBuyOfferResult::Malformed)
+        }
+        OperationBody::CreatePassiveSellOffer(_) => {
+            OperationResultTr::CreatePassiveSellOffer(ManageSellOfferResult::Malformed)
+        }
+        // SetOptions: stellar-core maps to specific codes per check.
+        OperationBody::SetOptions(_) => {
+            let code = match err {
+                OperationValidationError::InvalidWeight
+                | OperationValidationError::InvalidThreshold => {
+                    SetOptionsResult::ThresholdOutOfRange
+                }
+                OperationValidationError::Other(msg) if msg.contains("overlap") => {
+                    SetOptionsResult::BadFlags
+                }
+                OperationValidationError::Other(msg) if msg.contains("unknown") => {
+                    SetOptionsResult::UnknownFlag
+                }
+                _ => SetOptionsResult::BadFlags,
+            };
+            OperationResultTr::SetOptions(code)
+        }
+        OperationBody::ChangeTrust(_) => {
+            OperationResultTr::ChangeTrust(ChangeTrustResult::Malformed)
+        }
+        OperationBody::AllowTrust(_) => OperationResultTr::AllowTrust(AllowTrustResult::Malformed),
+        OperationBody::AccountMerge(_) => {
+            OperationResultTr::AccountMerge(AccountMergeResult::Malformed)
+        }
+        OperationBody::Inflation => OperationResultTr::Inflation(InflationResult::NotTime),
+        // ManageData: stellar-core uses INVALID_NAME for doCheckValid failures at p24+.
+        OperationBody::ManageData(_) => {
+            OperationResultTr::ManageData(ManageDataResult::InvalidName)
+        }
+        // BumpSequence: stellar-core uses BAD_SEQ for negative bump_to.
+        OperationBody::BumpSequence(_) => {
+            OperationResultTr::BumpSequence(BumpSequenceResult::BadSeq)
+        }
+        OperationBody::CreateClaimableBalance(_) => {
+            OperationResultTr::CreateClaimableBalance(CreateClaimableBalanceResult::Malformed)
+        }
+        OperationBody::ClaimClaimableBalance(_) => {
+            OperationResultTr::ClaimClaimableBalance(ClaimClaimableBalanceResult::DoesNotExist)
+        }
+        OperationBody::BeginSponsoringFutureReserves(_) => {
+            OperationResultTr::BeginSponsoringFutureReserves(
+                BeginSponsoringFutureReservesResult::Malformed,
+            )
+        }
+        OperationBody::EndSponsoringFutureReserves => {
+            OperationResultTr::EndSponsoringFutureReserves(
+                EndSponsoringFutureReservesResult::NotSponsored,
+            )
+        }
+        OperationBody::RevokeSponsorship(_) => {
+            OperationResultTr::RevokeSponsorship(RevokeSponsorshipResult::DoesNotExist)
+        }
+        OperationBody::Clawback(_) => OperationResultTr::Clawback(ClawbackResult::Malformed),
+        OperationBody::ClawbackClaimableBalance(_) => OperationResultTr::ClawbackClaimableBalance(
+            ClawbackClaimableBalanceResult::DoesNotExist,
+        ),
+        OperationBody::SetTrustLineFlags(_) => {
+            OperationResultTr::SetTrustLineFlags(SetTrustLineFlagsResult::Malformed)
+        }
+        OperationBody::LiquidityPoolDeposit(_) => {
+            OperationResultTr::LiquidityPoolDeposit(LiquidityPoolDepositResult::Malformed)
+        }
+        OperationBody::LiquidityPoolWithdraw(_) => {
+            OperationResultTr::LiquidityPoolWithdraw(LiquidityPoolWithdrawResult::Malformed)
+        }
+        // Soroban ops: structural validation handled in pre-seq-num path.
+        OperationBody::InvokeHostFunction(_) => {
+            OperationResultTr::InvokeHostFunction(InvokeHostFunctionResult::Malformed)
+        }
+        OperationBody::ExtendFootprintTtl(_) => {
+            OperationResultTr::ExtendFootprintTtl(ExtendFootprintTtlResult::Malformed)
+        }
+        OperationBody::RestoreFootprint(_) => {
+            OperationResultTr::RestoreFootprint(RestoreFootprintResult::Malformed)
+        }
+    };
+    OperationResult::OpInner(tr)
+}
+
 #[cfg(test)]
 /// Get the needed weight for an operation from the source account.
 ///
@@ -1858,5 +2038,115 @@ mod tests {
             sponsored_id: other,
         };
         assert!(validate_begin_sponsoring_future_reserves(&op, Some(&src)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_classic_op_structure_valid_payment() {
+        let src = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+                asset: Asset::Native,
+                amount: 1000,
+            }),
+        };
+        assert!(validate_classic_op_structure(&op, 24, Some(&src)).is_ok());
+    }
+
+    #[test]
+    fn test_validate_classic_op_structure_invalid_payment() {
+        let src = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+                asset: Asset::Native,
+                amount: 0, // invalid: zero amount
+            }),
+        };
+        assert!(validate_classic_op_structure(&op, 24, Some(&src)).is_err());
+    }
+
+    #[test]
+    fn test_validate_classic_op_structure_manage_buy_offer_malformed() {
+        let src = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([1u8; 32])));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::ManageBuyOffer(ManageBuyOfferOp {
+                selling: Asset::Native,
+                buying: Asset::Native, // invalid: same asset
+                buy_amount: 100,
+                price: Price { n: 1, d: 1 },
+                offer_id: 0,
+            }),
+        };
+        assert!(validate_classic_op_structure(&op, 24, Some(&src)).is_err());
+    }
+
+    #[test]
+    fn test_malformed_operation_result_payment() {
+        let body = OperationBody::Payment(PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256([2u8; 32])),
+            asset: Asset::Native,
+            amount: 0,
+        });
+        let err = OperationValidationError::InvalidAmount(0);
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::Payment(PaymentResult::Malformed)) => {}
+            other => panic!("expected Payment::Malformed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_manage_buy_offer() {
+        let body = OperationBody::ManageBuyOffer(ManageBuyOfferOp {
+            selling: Asset::Native,
+            buying: Asset::Native,
+            buy_amount: 100,
+            price: Price { n: 1, d: 1 },
+            offer_id: 0,
+        });
+        let err = OperationValidationError::InvalidAsset("same assets".to_string());
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::ManageBuyOffer(
+                ManageBuyOfferResult::Malformed,
+            )) => {}
+            other => panic!("expected ManageBuyOffer::Malformed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_malformed_operation_result_bump_sequence() {
+        let body = OperationBody::BumpSequence(BumpSequenceOp {
+            bump_to: SequenceNumber(-1),
+        });
+        let err = OperationValidationError::Other("bad seq".to_string());
+        let result = malformed_operation_result(&body, &err);
+        match result {
+            OperationResult::OpInner(OperationResultTr::BumpSequence(
+                BumpSequenceResult::BadSeq,
+            )) => {}
+            other => panic!("expected BumpSequence::BadSeq, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_validate_classic_op_structure_skips_soroban() {
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: VecM::default(),
+                }),
+                auth: VecM::default(),
+            }),
+        };
+        // Soroban ops should pass through (no classic validation)
+        assert!(validate_classic_op_structure(&op, 24, None).is_ok());
     }
 }

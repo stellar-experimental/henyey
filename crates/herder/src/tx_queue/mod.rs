@@ -1449,6 +1449,35 @@ impl TransactionQueue {
         )
         .map_err(|e| e.to_tx_result_code())?;
 
+        // Per-op structural validation (isOpSupported + doCheckValid).
+        // Classic ops were previously validated in pre-seq-num; now they're
+        // checked separately to match stellar-core's checkValid ordering.
+        if !frame.is_soroban() {
+            use henyey_tx::OperationTypeExt;
+            let inner_source_id = frame.inner_source_account_id();
+            for op in frame.operations().iter() {
+                let op_type = henyey_tx::OperationType::from_body(&op.body);
+                if henyey_tx::is_op_supported(&op_type, ctx.protocol_version, ctx.ledger_flags)
+                    .is_err()
+                {
+                    return Err(stellar_xdr::curr::TransactionResultCode::TxFailed);
+                }
+                let effective_source = match &op.source_account {
+                    Some(muxed) => henyey_tx::muxed_to_account_id(muxed),
+                    None => inner_source_id.clone(),
+                };
+                if henyey_tx::validate_classic_op_structure(
+                    op,
+                    ctx.protocol_version,
+                    Some(&effective_source),
+                )
+                .is_err()
+                {
+                    return Err(stellar_xdr::curr::TransactionResultCode::TxFailed);
+                }
+            }
+        }
+
         // Queue admission only: validate host function pairing.
         // stellar-core enforces this at queue admission but not tx-set checkValid.
         if frame.is_soroban() && !frame.validate_host_fn() {
@@ -6223,8 +6252,10 @@ mod tests {
         });
 
         match queue.try_add(envelope) {
-            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxMalformed)) => {}
-            other => panic!("expected Invalid(TxMalformed), got {:?}", other),
+            // Issue #2063: classic op structural errors now produce TxFailed
+            // (not TxMalformed) to match stellar-core parity
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxFailed)) => {}
+            other => panic!("expected Invalid(TxFailed), got {:?}", other),
         }
     }
 
@@ -6276,8 +6307,9 @@ mod tests {
         });
 
         match queue.try_add(envelope) {
-            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxMalformed)) => {}
-            other => panic!("expected Invalid(TxMalformed), got {:?}", other),
+            // Issue #2063: classic op structural errors now produce TxFailed
+            TxQueueResult::Invalid(Some(henyey_tx::TxResultCode::TxFailed)) => {}
+            other => panic!("expected Invalid(TxFailed), got {:?}", other),
         }
     }
 

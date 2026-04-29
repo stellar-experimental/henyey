@@ -5,6 +5,7 @@
 //! for each operation type, and handles signed payload authentication.
 
 use super::*;
+use henyey_tx::OperationTypeExt;
 
 /// Check if an operation result indicates success.
 pub(super) fn is_operation_success(result: &OperationResult) -> bool {
@@ -682,4 +683,60 @@ pub(super) fn has_signed_payload_signature(
 /// types used by the ledger execution layer.
 pub(super) fn sub_sha256(base_seed: &[u8; 32], index: u32) -> [u8; 32] {
     henyey_crypto::sub_sha256(base_seed, index as u64).0
+}
+
+/// Per-operation structural validation (isOpSupported + doCheckValid).
+///
+/// Mirrors stellar-core's per-op `OperationFrame::checkValid()` loop from
+/// `checkValidWithOptionallyChargedFee`. Runs BEFORE `check_operation_signatures`
+/// in the apply path.
+///
+/// For each operation, checks:
+/// 1. `is_op_supported()` → `OpNotSupported`
+/// 2. `validate_classic_op_structure()` → op-specific malformed result
+///
+/// Stops at the first failing operation. Returns `None` if all ops pass, or
+/// `Some((op_results, TxFailed))` on failure with typed defaults for non-failing ops.
+///
+/// For Soroban frames, this is a no-op — their structural validation is handled
+/// in the pre-seq-num path.
+pub(super) fn check_operations_valid(
+    frame: &TransactionFrame,
+    protocol_version: u32,
+    ledger_flags: u32,
+) -> Option<(Vec<OperationResult>, ExecutionFailure)> {
+    // Soroban structural validation is in the pre-seq-num path
+    if frame.is_soroban() {
+        return None;
+    }
+
+    let ops = frame.operations();
+    let inner_source_id = frame.inner_source_account_id();
+
+    for (i, op) in ops.iter().enumerate() {
+        // Step 1: is_op_supported
+        let op_type = henyey_tx::OperationType::from_body(&op.body);
+        if let Err(_) = henyey_tx::is_op_supported(&op_type, protocol_version, ledger_flags) {
+            let mut results: Vec<OperationResult> =
+                ops.iter().map(|o| default_success_op_result(o)).collect();
+            results[i] = OperationResult::OpNotSupported;
+            return Some((results, TransactionResultCode::TxFailed));
+        }
+
+        // Step 2: doCheckValid (structural validation)
+        let effective_source = match &op.source_account {
+            Some(muxed) => henyey_tx::muxed_to_account_id(muxed),
+            None => inner_source_id.clone(),
+        };
+        if let Err(e) =
+            henyey_tx::validate_classic_op_structure(op, protocol_version, Some(&effective_source))
+        {
+            let mut results: Vec<OperationResult> =
+                ops.iter().map(|o| default_success_op_result(o)).collect();
+            results[i] = henyey_tx::malformed_operation_result(&op.body, &e);
+            return Some((results, TransactionResultCode::TxFailed));
+        }
+    }
+
+    None
 }

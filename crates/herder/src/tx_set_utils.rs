@@ -18,7 +18,8 @@ use henyey_common::{Hash256, NetworkId};
 use henyey_ledger::SorobanNetworkInfo;
 use henyey_tx::{
     check_valid_pre_seq_num_with_config, collect_signers_for_account, get_threshold_level,
-    muxed_to_account_id, validate_basic, LedgerContext, SignatureChecker, TransactionFrame,
+    muxed_to_account_id, validate_basic, LedgerContext, OperationTypeExt, SignatureChecker,
+    TransactionFrame,
 };
 use stellar_xdr::curr::{
     AccountEntry, AccountId, GeneralizedTransactionSet, LedgerHeader, Preconditions, SignerKey,
@@ -345,6 +346,11 @@ fn validate_regular_for_tx_set(
         return false;
     }
 
+    // Phase A: Per-op structural validation (isOpSupported + doCheckValid)
+    if !validate_ops_structure(frame, ctx.protocol_version, ctx.ledger_flags) {
+        return false;
+    }
+
     // Phase A: TX-level signature check (LOW threshold for tx source)
     let tx_hash = match frame.hash(&ctx.network_id) {
         Ok(h) => h,
@@ -442,6 +448,11 @@ fn validate_fee_bump_for_tx_set(
         lower_close_time,
         ctx.next_ledger_seq,
     ) {
+        return false;
+    }
+
+    // Inner per-op structural validation (isOpSupported + doCheckValid)
+    if !validate_ops_structure(frame, ctx.protocol_version, ctx.ledger_flags) {
         return false;
     }
 
@@ -567,6 +578,43 @@ fn validate_min_seq_age_gap(
                 min_seq_ledger_gap,
                 next_ledger_seq, acc_seq_ledger, "tx-set validation: min seq ledger gap not met"
             );
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Validate per-operation structural validity (isOpSupported + doCheckValid).
+///
+/// Mirrors stellar-core's per-op OperationFrame::checkValid() structural checks.
+/// Returns false if any operation is unsupported or structurally invalid.
+fn validate_ops_structure(
+    frame: &TransactionFrame,
+    protocol_version: u32,
+    ledger_flags: u32,
+) -> bool {
+    if frame.is_soroban() {
+        return true;
+    }
+
+    let inner_source_id = frame.inner_source_account_id();
+
+    for op in frame.operations().iter() {
+        let op_type = henyey_tx::OperationType::from_body(&op.body);
+        if henyey_tx::is_op_supported(&op_type, protocol_version, ledger_flags).is_err() {
+            debug!("tx-set validation: op not supported");
+            return false;
+        }
+
+        let effective_source = match &op.source_account {
+            Some(muxed) => muxed_to_account_id(muxed),
+            None => inner_source_id.clone(),
+        };
+        if henyey_tx::validate_classic_op_structure(op, protocol_version, Some(&effective_source))
+            .is_err()
+        {
+            debug!("tx-set validation: op structurally invalid");
             return false;
         }
     }
@@ -801,6 +849,14 @@ fn get_invalid_hashed_core(
         )
         .is_err()
         {
+            seen_invalid.insert(htx.hash);
+            invalid_txs.push(htx.clone());
+            continue;
+        }
+
+        // Per-op structural validation (isOpSupported + doCheckValid).
+        // This is stateless and always runs, even when account_provider is None.
+        if !validate_ops_structure(&frame, ctx.protocol_version, ctx.ledger_flags) {
             seen_invalid.insert(htx.hash);
             invalid_txs.push(htx.clone());
             continue;

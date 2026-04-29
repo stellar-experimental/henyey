@@ -188,8 +188,9 @@ pub use validation::{
 
 // Re-export operation types
 pub use operations::{
-    collect_prefetch_keys, get_threshold_level, is_op_supported, validate_operation,
-    OperationTypeExt, OperationValidationError, ThresholdLevel,
+    collect_prefetch_keys, get_threshold_level, is_op_supported, malformed_operation_result,
+    validate_classic_op_structure, validate_operation, OperationTypeExt, OperationValidationError,
+    ThresholdLevel,
 };
 pub use stellar_xdr::curr::OperationType;
 
