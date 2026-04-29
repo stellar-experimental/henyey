@@ -309,27 +309,11 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     {
         config.overlay.surveyor_keys = keys;
     }
-    if let Some(v) = get_i64(table, "PEER_FLOOD_READING_CAPACITY_BYTES") {
-        if v >= 0 {
-            config.overlay.peer_flood_reading_capacity_bytes = v as u32;
-        } else {
-            tracing::warn!(
-                key = "PEER_FLOOD_READING_CAPACITY_BYTES",
-                value = v,
-                "Compat config key value must be >= 0"
-            );
-        }
+    if let Some(v) = get_u32(table, "PEER_FLOOD_READING_CAPACITY_BYTES") {
+        config.overlay.peer_flood_reading_capacity_bytes = v;
     }
-    if let Some(v) = get_i64(table, "FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES") {
-        if v >= 0 {
-            config.overlay.flow_control_send_more_batch_size_bytes = v as u32;
-        } else {
-            tracing::warn!(
-                key = "FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES",
-                value = v,
-                "Compat config key value must be >= 0"
-            );
-        }
+    if let Some(v) = get_u32(table, "FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES") {
+        config.overlay.flow_control_send_more_batch_size_bytes = v;
     }
 
     // --- Metadata ---
@@ -2406,6 +2390,64 @@ FLOOD_ADVERT_PERIOD_MS=-1
         let config = translate_stellar_core_config(&raw).unwrap();
         // Invalid value should be ignored, keeping the default 100.
         assert_eq!(config.overlay.flood_advert_period_ms, 100);
+    }
+
+    // --- PEER_FLOOD_READING_CAPACITY_BYTES / FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES ---
+
+    #[test]
+    fn test_flow_control_bytes_compat_parsed() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+PEER_FLOOD_READING_CAPACITY_BYTES=500000
+FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES=100000
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.overlay.peer_flood_reading_capacity_bytes, 500_000);
+        assert_eq!(
+            config.overlay.flow_control_send_more_batch_size_bytes,
+            100_000
+        );
+    }
+
+    #[test]
+    fn test_flow_control_bytes_compat_overflow_ignored() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+PEER_FLOOD_READING_CAPACITY_BYTES=4294967296
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // Value exceeds u32::MAX — should be silently ignored, keeping default 0.
+        assert_eq!(config.overlay.peer_flood_reading_capacity_bytes, 0);
+    }
+
+    #[test]
+    fn test_flow_control_bytes_compat_negative_ignored() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES=-1
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // Negative value should be ignored, keeping default 0.
+        assert_eq!(config.overlay.flow_control_send_more_batch_size_bytes, 0);
+    }
+
+    #[test]
+    fn test_flow_control_bytes_compat_defaults() {
+        let toml_str = r#"
+NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
+NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
+"#;
+        let raw: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&raw).unwrap();
+        // When not specified, defaults are 0 (auto-compute).
+        assert_eq!(config.overlay.peer_flood_reading_capacity_bytes, 0);
+        assert_eq!(config.overlay.flow_control_send_more_batch_size_bytes, 0);
     }
 
     // --- FAILURE_SAFETY / UNSAFE_QUORUM tests ---

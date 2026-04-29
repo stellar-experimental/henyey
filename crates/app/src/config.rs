@@ -3468,4 +3468,49 @@ name = "test"
         let config = AppConfig::default();
         assert_eq!(config.overlay.flood_tx_period_ms, 200);
     }
+
+    #[test]
+    fn test_validation_flow_control_bytes_batch_exceeds_capacity() {
+        let mut config = AppConfig::default();
+        config.overlay.peer_flood_reading_capacity_bytes = 100_000;
+        config.overlay.flow_control_send_more_batch_size_bytes = 200_000;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES"));
+    }
+
+    #[test]
+    fn test_validation_flow_control_bytes_valid_fixed() {
+        let mut config = AppConfig::default();
+        config.overlay.peer_flood_reading_capacity_bytes = 500_000;
+        config.overlay.flow_control_send_more_batch_size_bytes = 100_000;
+        // Should not fail on flow control bytes validation (may fail on other
+        // things like missing quorum set — we just check it doesn't fail on
+        // FlowControlBytesConfig).
+        let result = config.validate();
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("FlowControlBytesConfig"),
+                "unexpected flow control error: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validation_flow_control_bytes_defaults_auto() {
+        let config = AppConfig::default();
+        assert_eq!(config.overlay.peer_flood_reading_capacity_bytes, 0);
+        assert_eq!(config.overlay.flow_control_send_more_batch_size_bytes, 0);
+        // Defaults (0,0) → Auto, which always passes validation.
+        let result = config.validate();
+        if let Err(e) = &result {
+            assert!(
+                !e.to_string().contains("FlowControlBytesConfig"),
+                "unexpected flow control error: {e}"
+            );
+        }
+    }
 }
