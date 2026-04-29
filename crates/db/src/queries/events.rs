@@ -220,8 +220,8 @@ impl EventQueries for Connection {
         // Install progress handler if budget is configured.
         let _guard = if params.max_query_ops > 0 {
             let budget = params.max_query_ops;
-            // Max callbacks before interrupt (avoids overflow in the closure).
-            let max_callbacks = budget.saturating_add(999) / 1000;
+            // Max callbacks before interrupt (use u64 to avoid overflow/off-by-one).
+            let max_callbacks = (budget as u64).div_ceil(1000) as u32;
             let counter = Arc::new(AtomicU32::new(0));
             let counter_clone = counter.clone();
             // Check every 1000 VM opcodes; interrupt when budget exceeded.
