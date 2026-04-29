@@ -128,14 +128,12 @@ pub enum ValidationLevel {
     ///    the main thread (`HerderImpl.cpp:1194`), giving apply a
     ///    chance to catch up first.
     ///
-    /// Behaviorally, this level is identical to `MaybeValid` except it
-    /// does NOT cause the ballot protocol to clear
-    /// `Slot::fully_validated`. Clearing on a transient fast-path
-    /// divergence was the root cause of issue #1795 (tx_set trigger)
-    /// and its sequel #1798 (future-slot trigger) — once
-    /// `fully_validated` flipped to false it was never restored, and
-    /// the validator stopped broadcasting its own EXTERNALIZE
-    /// envelopes.
+    /// Behaviorally, this level is identical to `MaybeValid` — it DOES
+    /// cause the ballot protocol to clear `Slot::fully_validated`, gating
+    /// emission until the herder restores it after the deferred condition
+    /// resolves (see `Slot::restore_fully_validated`).  The original
+    /// issues #1795 and #1798 were fixed by adding a restoration mechanism
+    /// rather than suppressing the clear.
     ///
     /// See [`ValidationLevel::clears_fully_validated`] for the
     /// callsite.
@@ -152,9 +150,10 @@ impl ValidationLevel {
     /// to clear the slot's `fully_validated` flag.
     ///
     /// Matches stellar-core `BallotProtocol.cpp:208-211` which clears
-    /// only on `kMaybeValidValue`. The henyey-specific
-    /// [`ValidationLevel::MaybeValidDeferred`] does not clear — see its
-    /// doc comment for the rationale (issues #1795 and #1798).
+    /// only on `kMaybeValidValue`.  The henyey-specific
+    /// [`ValidationLevel::MaybeValidDeferred`] also clears — the
+    /// restoration mechanism in `Slot::restore_fully_validated` prevents
+    /// the permanent-silence regression of issues #1795 / #1798.
     pub fn clears_fully_validated(self) -> bool {
         matches!(self, Self::MaybeValid | Self::MaybeValidDeferred)
     }

@@ -90,9 +90,9 @@ pub enum ValueValidation {
     /// henyey-specific fast-path divergence from stellar-core. Covers
     /// the missing-tx_set-for-current-ledger case (#1795) and the
     /// future-slot-while-apply-lags-SCP case (#1798). Maps to
-    /// `ValidationLevel::MaybeValidDeferred`, which does NOT clear
-    /// `fully_validated`. See the `ValidationLevel` enum in
-    /// `henyey_scp::driver` for the full rationale.
+    /// `ValidationLevel::MaybeValidDeferred`, which DOES clear
+    /// `fully_validated` (restored later by the herder after the
+    /// deferred condition resolves — see issue #2061).
     MaybeValidDeferred,
     /// Value is invalid.
     Invalid,
