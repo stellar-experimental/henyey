@@ -1,6 +1,12 @@
 //! Ballot protocol envelope emission and recording.
+//!
+//! Local self-emission mirrors stellar-core's `emitCurrentStateStatement()` →
+//! `Slot::processEnvelope(envW, true)` → `BallotProtocol::processEnvelope(self)`
+//! path: sanity check, freshness, value validation, reject invalid, clear
+//! fully_validated for MaybeValid, record, advance, emit.
 
 use super::*;
+use crate::ValidationLevel;
 
 impl BallotProtocol {
     pub(crate) fn send_latest_envelope<D: SCPDriver>(&mut self, driver: &Arc<D>) {
@@ -24,22 +30,41 @@ impl BallotProtocol {
         driver.emit_envelope(envelope);
     }
 
-    /// Build and record a prepare statement envelope.
-    /// Returns the statement if a new envelope was recorded (for self-processing).
+    /// Create and sign an envelope for the given pledges without recording it.
     ///
-    /// When `current_ballot` is `None` (pristine state, no `bumpState` call),
-    /// a PREPARE with `ballot = {0, ""}` is still created and recorded as a
-    /// self-envelope. This matches stellar-core `emitCurrentStateStatement` which always
-    /// calls `createStatement()` and `processEnvelope(self)`, even when
-    /// `mCurrentBallot` is null. The self-envelope is needed so that the local
-    /// node counts itself in subsequent quorum calculations (e.g., prepared
-    /// fields in the self-envelope contribute to `federated_accept`/`federated_ratify`).
-    /// However, the envelope is NOT emitted to the network when `current_ballot`
-    /// is `None` (matching stellar-core `canEmit = mCurrentBallot != nullptr`).
-    fn emit_prepare<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) -> Option<ScpStatement> {
-        // Use the current ballot if set, otherwise use a default zero ballot
-        // (matching stellar-core which creates a PREPARE with default ballot {0, ""} when
-        // mCurrentBallot is null).
+    /// Returns the statement and signed envelope. Recording is deferred to
+    /// `emit_current_state` which validates before storing.
+    fn create_signed_envelope<D: SCPDriver>(
+        &self,
+        pledges: ScpStatementPledges,
+        ctx: &SlotContext<'_, D>,
+    ) -> (ScpStatement, ScpEnvelope) {
+        let statement = ScpStatement {
+            node_id: ctx.local_node_id.clone(),
+            slot_index: ctx.slot_index,
+            pledges,
+        };
+
+        let mut envelope = ScpEnvelope {
+            statement: statement.clone(),
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+
+        ctx.driver.sign_envelope(&mut envelope);
+        (statement, envelope)
+    }
+
+    /// Build a PREPARE statement envelope.
+    ///
+    /// Returns `(statement, envelope, can_emit)`. Always returns Some — even when
+    /// `current_ballot` is None, a zero-ballot PREPARE is created (matching
+    /// stellar-core `createStatement(SCP_ST_PREPARE)` with null `mCurrentBallot`).
+    /// `can_emit` is false for zero-ballot PREPAREs (stellar-core:
+    /// `canEmit = mCurrentBallot != nullptr`).
+    fn emit_prepare<D: SCPDriver>(
+        &self,
+        ctx: &SlotContext<'_, D>,
+    ) -> Option<(ScpStatement, ScpEnvelope, bool)> {
         let can_emit = self.current_ballot.is_some();
         let ballot = self.current_ballot.clone().unwrap_or_else(|| ScpBallot {
             counter: 0,
@@ -55,112 +80,142 @@ impl BallotProtocol {
             n_h: self.high_ballot.as_ref().map(|b| b.counter).unwrap_or(0),
         };
 
-        // Only update last_envelope (for network emission) when we have a
-        // real ballot. Matches stellar-core `canEmit = mCurrentBallot != nullptr`.
-        self.record_envelope(ScpStatementPledges::Prepare(prep), can_emit, ctx)
+        let (statement, envelope) =
+            self.create_signed_envelope(ScpStatementPledges::Prepare(prep), ctx);
+        Some((statement, envelope, can_emit))
     }
 
-    /// Sign, record, and optionally publish an envelope built from the given pledges.
+    /// Build a CONFIRM statement envelope.
     ///
-    /// Shared scaffolding for emit_prepare / emit_confirm / emit_externalize.
-    /// When `set_last` is true the envelope is stored for network emission.
-    fn record_envelope<D: SCPDriver>(
-        &mut self,
-        pledges: ScpStatementPledges,
-        set_last: bool,
+    /// Returns None when `current_ballot` is None (no ballot to confirm).
+    fn emit_confirm<D: SCPDriver>(
+        &self,
         ctx: &SlotContext<'_, D>,
-    ) -> Option<ScpStatement> {
-        let statement = ScpStatement {
-            node_id: ctx.local_node_id.clone(),
-            slot_index: ctx.slot_index,
-            pledges,
+    ) -> Option<(ScpStatement, ScpEnvelope, bool)> {
+        let ballot = self.current_ballot.as_ref()?;
+        let conf = ScpStatementConfirm {
+            ballot: ballot.clone(),
+            n_prepared: self.prepared.as_ref().map(|b| b.counter).unwrap_or(0),
+            n_commit: self.commit.as_ref().map(|b| b.counter).unwrap_or(0),
+            n_h: self.high_ballot.as_ref().map(|b| b.counter).unwrap_or(0),
+            quorum_set_hash: hash_quorum_set(ctx.local_quorum_set).into(),
         };
 
-        let mut envelope = ScpEnvelope {
-            statement: statement.clone(),
-            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
-        };
-
-        ctx.driver.sign_envelope(&mut envelope);
-        if self.record_local_envelope(ctx.local_node_id, envelope.clone()) {
-            if set_last {
-                self.last_envelope = Some(envelope);
-            }
-            return Some(statement);
-        }
-        None
+        let (statement, envelope) =
+            self.create_signed_envelope(ScpStatementPledges::Confirm(conf), ctx);
+        Some((statement, envelope, true))
     }
 
-    /// Build and record a confirm statement envelope.
-    /// Returns the statement if a new envelope was recorded (for self-processing).
-    fn emit_confirm<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) -> Option<ScpStatement> {
-        if let Some(ref ballot) = self.current_ballot {
-            let conf = ScpStatementConfirm {
-                ballot: ballot.clone(),
-                n_prepared: self.prepared.as_ref().map(|b| b.counter).unwrap_or(0),
-                n_commit: self.commit.as_ref().map(|b| b.counter).unwrap_or(0),
-                n_h: self.high_ballot.as_ref().map(|b| b.counter).unwrap_or(0),
-                quorum_set_hash: hash_quorum_set(ctx.local_quorum_set).into(),
-            };
-
-            self.record_envelope(ScpStatementPledges::Confirm(conf), true, ctx)
-        } else {
-            None
-        }
-    }
-
-    /// Build and record an externalize statement envelope.
-    /// Returns the statement if a new envelope was recorded (for self-processing).
-    fn emit_externalize<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) -> Option<ScpStatement> {
-        if let Some(ref commit) = self.commit {
-            let ext = ScpStatementExternalize {
-                commit: commit.clone(),
-                n_h: self.high_ballot.as_ref().map(|b| b.counter).unwrap_or(0),
-                commit_quorum_set_hash: hash_quorum_set(ctx.local_quorum_set).into(),
-            };
-
-            self.record_envelope(ScpStatementPledges::Externalize(ext), true, ctx)
-        } else {
-            None
-        }
-    }
-
-    /// Emit current state and recursively self-process (matching stellar-core emitCurrentStateStatement).
+    /// Build an EXTERNALIZE statement envelope.
     ///
-    /// After emitting, feeds the self-envelope back into `advance_slot` so that
-    /// cascading state transitions (e.g., accept-prepared → confirm-prepared →
-    /// accept-commit) can happen within a single top-level `receiveEnvelope` call.
-    /// The `current_message_level` guard in `send_latest_envelope` ensures only the
-    /// final envelope is actually emitted to the network.
+    /// Returns None when `commit` is None (no commit to externalize).
+    fn emit_externalize<D: SCPDriver>(
+        &self,
+        ctx: &SlotContext<'_, D>,
+    ) -> Option<(ScpStatement, ScpEnvelope, bool)> {
+        let commit = self.commit.as_ref()?;
+        let ext = ScpStatementExternalize {
+            commit: commit.clone(),
+            n_h: self.high_ballot.as_ref().map(|b| b.counter).unwrap_or(0),
+            commit_quorum_set_hash: hash_quorum_set(ctx.local_quorum_set).into(),
+        };
+
+        let (statement, envelope) =
+            self.create_signed_envelope(ScpStatementPledges::Externalize(ext), ctx);
+        Some((statement, envelope, true))
+    }
+
+    /// Emit current state with full self-processing validation.
+    ///
+    /// Mirrors stellar-core `emitCurrentStateStatement()` → `processEnvelope(self)`:
+    /// 1. Create and sign the self-envelope
+    /// 2. Sanity check (`isStatementSane(statement, self)`)
+    /// 3. Freshness check (`isNewerStatement`)
+    /// 4. Validate values (`validateValues`)
+    /// 5. Reject if Invalid
+    /// 6. Clear `fully_validated` if MaybeValid/MaybeValidDeferred (non-Externalize only)
+    /// 7. Record envelope
+    /// 8. Advance slot (non-Externalize) or just record (Externalize)
+    /// 9. Emit via `send_latest_envelope`
     pub(super) fn emit_current_state<D: SCPDriver>(&mut self, ctx: &SlotContext<'_, D>) {
-        let maybe_statement = match self.phase {
+        // 1. Create and sign the self-envelope (phase-specific)
+        let Some((statement, envelope, can_emit)) = (match self.phase {
             BallotPhase::Prepare => self.emit_prepare(ctx),
             BallotPhase::Confirm => self.emit_confirm(ctx),
             BallotPhase::Externalize => self.emit_externalize(ctx),
+        }) else {
+            return;
         };
-        // Recursive self-processing: feed the self-envelope back into advance_slot
-        // so cascading state transitions complete within a single receiveEnvelope.
-        // This matches stellar-core emitCurrentStateStatement() calling processEnvelope(self).
-        if let Some(statement) = maybe_statement {
-            self.advance_slot(&statement, ctx);
-        }
-        // Emit the latest envelope after self-processing completes.
-        // If advance_slot caused cascading state changes, last_envelope
-        // was updated to the final envelope and already emitted via
-        // advance_slot's send_latest_envelope call. The dedup check in
-        // send_latest_envelope (last_envelope_emit) prevents double-emit.
-        // If no cascading happened, this ensures the original envelope
-        // is emitted. Matches stellar-core sendLatestEnvelope() in
-        // emitCurrentStateStatement after processEnvelope(self).
-        self.send_latest_envelope(ctx.driver);
-    }
 
-    fn record_local_envelope(&mut self, local_node_id: &NodeId, envelope: ScpEnvelope) -> bool {
-        if !self.is_newer_statement(local_node_id, &envelope.statement) {
-            return false;
+        // 2. Sanity check (stellar-core: isStatementSane(statement, self))
+        // Defense-in-depth: locally generated statements should be sane.
+        if !self.is_statement_sane(&statement, ctx) {
+            tracing::error!(
+                target: "henyey::envelope_path",
+                slot = ctx.slot_index,
+                "not sane statement from self in emit_current_state, skipping",
+            );
+            return;
         }
-        self.latest_envelopes
-            .insert(local_node_id.clone(), envelope);
-        true
+
+        // 3. Freshness check (stellar-core: isNewerStatement)
+        if !self.is_newer_statement(ctx.local_node_id, &statement) {
+            return;
+        }
+
+        // 4. Validate statement values (stellar-core: validateValues)
+        let validation = self.validate_statement_values(&statement, ctx.driver, ctx.slot_index);
+
+        // 5. Reject Invalid (stellar-core: CLOG_ERROR + return INVALID for self)
+        if validation == ValidationLevel::Invalid {
+            tracing::error!(
+                target: "henyey::envelope_path",
+                slot = ctx.slot_index,
+                "invalid value from self in emit_current_state, skipping",
+            );
+            return;
+        }
+
+        // 6-8. Phase-specific handling
+        if self.phase != BallotPhase::Externalize {
+            // Non-Externalize: clear fully_validated, record, advance
+            // (stellar-core BallotProtocol.cpp:206-215)
+            if validation.clears_fully_validated() {
+                self.fully_validated = false;
+                self.needs_clear_slot_validation = true;
+            }
+
+            self.latest_envelopes
+                .insert(ctx.local_node_id.clone(), envelope.clone());
+
+            if can_emit {
+                self.last_envelope = Some(envelope);
+            }
+
+            // Recursive self-processing: advance_slot so cascading state
+            // transitions complete within a single receiveEnvelope call.
+            self.advance_slot(&statement, ctx);
+        } else {
+            // Externalize: record only if value matches commit, no advance_slot.
+            // (stellar-core BallotProtocol.cpp:220-224)
+            if !self.statement_value_matches_commit(&statement) {
+                tracing::error!(
+                    target: "henyey::envelope_path",
+                    slot = ctx.slot_index,
+                    "externalize statement with invalid value from self, skipping",
+                );
+                return;
+            }
+
+            self.latest_envelopes
+                .insert(ctx.local_node_id.clone(), envelope.clone());
+
+            if can_emit {
+                self.last_envelope = Some(envelope);
+            }
+        }
+
+        // 9. Emit the latest envelope (gated on fully_validated + message_level + dedup)
+        self.send_latest_envelope(ctx.driver);
     }
 }

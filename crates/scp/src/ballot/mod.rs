@@ -173,6 +173,17 @@ pub struct BallotProtocol {
     /// In Rust, we set this flag and let the Slot handle it.
     needs_stop_nomination: bool,
 
+    /// Signal that slot-level `fully_validated` should be cleared.
+    ///
+    /// Set by `emit_current_state` when local self-envelope validation returns
+    /// MaybeValid/MaybeValidDeferred. The ballot protocol cannot directly reach
+    /// the slot's `fully_validated` flag, so this flag is consumed by the slot
+    /// after ballot processing returns (same pattern as `needs_stop_nomination`).
+    ///
+    /// Matches stellar-core `mSlot.setFullyValidated(false)` inside
+    /// `BallotProtocol::processEnvelope` for self-envelopes.
+    needs_clear_slot_validation: bool,
+
     /// Count of ballot protocol timer expirations (used for reporting).
     ///
     /// Incremented on each `bump_timeout` call, matching
@@ -200,6 +211,7 @@ impl BallotProtocol {
             last_envelope_emit: None,
             fully_validated: true,
             needs_stop_nomination: false,
+            needs_clear_slot_validation: false,
             timer_exp_count: 0,
         }
     }
@@ -248,6 +260,17 @@ impl BallotProtocol {
     pub(crate) fn take_needs_stop_nomination(&mut self) -> bool {
         let val = self.needs_stop_nomination;
         self.needs_stop_nomination = false;
+        val
+    }
+
+    /// Check and clear the needs_clear_slot_validation flag.
+    ///
+    /// Returns true if the slot should clear its `fully_validated` flag
+    /// (set by `emit_current_state` when local self-validation returns
+    /// MaybeValid/MaybeValidDeferred).
+    pub(crate) fn take_needs_clear_slot_validation(&mut self) -> bool {
+        let val = self.needs_clear_slot_validation;
+        self.needs_clear_slot_validation = false;
         val
     }
 
@@ -925,7 +948,9 @@ impl BallotProtocol {
 mod tests {
     use super::*;
     use crate::driver::ValidationLevel;
-    use crate::test_utils::{make_node_id, make_quorum_set, make_value, MockDriver};
+    use crate::test_utils::{
+        make_node_id, make_quorum_set, make_value, MockDriver, MockDriverBuilder,
+    };
     use crate::SlotContext;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -4128,5 +4153,188 @@ mod tests {
 
         ballot.bump_timeout(&ctx!(&node, &qs, &driver, 1), None);
         assert_eq!(ballot.timer_exp_count, 2);
+    }
+
+    // ---- Self-emission validation gate tests (issue #2089) ----
+
+    /// Test that self-emission rejects Invalid local ballot values.
+    /// Matches stellar-core processEnvelope returning INVALID for self when
+    /// validateValues returns kInvalidValue.
+    #[test]
+    fn test_self_emission_invalid_value_rejected() {
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(qs.clone())
+                .validation_level(ValidationLevel::Invalid)
+                .return_qset_by_hash()
+                .build(),
+        );
+
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[42]);
+
+        // Bump to set current_ballot (counter=1, value=[42])
+        let ctx = ctx!(&node, &qs, &driver, 1);
+        ballot.update_current_value(&ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+
+        // Now emit — validation should reject
+        ballot.emit_current_state(&ctx);
+
+        // Envelope should NOT be recorded
+        assert!(
+            !ballot.latest_envelopes.contains_key(&node),
+            "Invalid self-envelope should not be recorded"
+        );
+        // No emission
+        assert_eq!(
+            driver.emit_count.load(Ordering::SeqCst),
+            0,
+            "Invalid self-envelope should not be emitted"
+        );
+        // fully_validated unchanged
+        assert!(
+            ballot.fully_validated,
+            "fully_validated should remain true for Invalid (envelope rejected entirely)"
+        );
+    }
+
+    /// Test that self-emission clears fully_validated for MaybeValid values
+    /// and suppresses network emission.
+    /// Matches stellar-core processEnvelope setting mSlot.setFullyValidated(false)
+    /// for kMaybeValidValue.
+    #[test]
+    fn test_self_emission_maybe_valid_clears_fully_validated() {
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(qs.clone())
+                .validation_level(ValidationLevel::MaybeValid)
+                .return_qset_by_hash()
+                .build(),
+        );
+
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[42]);
+
+        let ctx = ctx!(&node, &qs, &driver, 1);
+        ballot.update_current_value(&ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+
+        ballot.emit_current_state(&ctx);
+
+        // Envelope IS recorded (for quorum self-counting)
+        assert!(
+            ballot.latest_envelopes.contains_key(&node),
+            "MaybeValid self-envelope should be recorded"
+        );
+        // fully_validated cleared
+        assert!(
+            !ballot.fully_validated,
+            "fully_validated should be false after MaybeValid self-emission"
+        );
+        // NOT emitted (send_latest_envelope gates on fully_validated)
+        assert_eq!(
+            driver.emit_count.load(Ordering::SeqCst),
+            0,
+            "MaybeValid self-envelope should not be emitted"
+        );
+        // needs_clear_slot_validation flag set for slot propagation
+        assert!(
+            ballot.needs_clear_slot_validation,
+            "needs_clear_slot_validation should be set for slot to consume"
+        );
+    }
+
+    /// Test that self-emission with FullyValidated values records and emits.
+    #[test]
+    fn test_self_emission_fully_validated_emits() {
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(qs.clone())
+                .validation_level(ValidationLevel::FullyValidated)
+                .return_qset_by_hash()
+                .build(),
+        );
+
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[42]);
+
+        let ctx = ctx!(&node, &qs, &driver, 1);
+        ballot.update_current_value(&ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+
+        ballot.emit_current_state(&ctx);
+
+        // Envelope recorded
+        assert!(
+            ballot.latest_envelopes.contains_key(&node),
+            "FullyValidated self-envelope should be recorded"
+        );
+        // fully_validated stays true
+        assert!(
+            ballot.fully_validated,
+            "fully_validated should remain true for FullyValidated"
+        );
+        // Emitted
+        assert_eq!(
+            driver.emit_count.load(Ordering::SeqCst),
+            1,
+            "FullyValidated self-envelope should be emitted"
+        );
+    }
+
+    /// Test that MaybeValidDeferred also clears fully_validated on self-emission,
+    /// consistent with the peer path behavior via clears_fully_validated().
+    #[test]
+    fn test_self_emission_maybe_valid_deferred_clears_fully_validated() {
+        let node = make_node_id(1);
+        let qs = make_quorum_set(vec![node.clone()], 1);
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .quorum_set(qs.clone())
+                .validation_level(ValidationLevel::MaybeValidDeferred)
+                .return_qset_by_hash()
+                .build(),
+        );
+
+        let mut ballot = BallotProtocol::new();
+        let value = make_value(&[42]);
+
+        let ctx = ctx!(&node, &qs, &driver, 1);
+        ballot.update_current_value(&ScpBallot {
+            counter: 1,
+            value: value.clone(),
+        });
+
+        ballot.emit_current_state(&ctx);
+
+        // Envelope IS recorded
+        assert!(
+            ballot.latest_envelopes.contains_key(&node),
+            "MaybeValidDeferred self-envelope should be recorded"
+        );
+        // fully_validated cleared (same as MaybeValid via clears_fully_validated())
+        assert!(
+            !ballot.fully_validated,
+            "fully_validated should be false after MaybeValidDeferred self-emission"
+        );
+        // NOT emitted
+        assert_eq!(
+            driver.emit_count.load(Ordering::SeqCst),
+            0,
+            "MaybeValidDeferred self-envelope should not be emitted"
+        );
     }
 }

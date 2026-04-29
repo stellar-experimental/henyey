@@ -178,6 +178,21 @@ impl Slot {
         self.ballot.set_fully_validated(validated);
     }
 
+    /// Consume the ballot's `needs_clear_slot_validation` flag and propagate
+    /// the clearing to the slot and nomination protocols.
+    ///
+    /// Called after any slot-level method that invokes ballot protocol code
+    /// which may trigger `emit_current_state` (and thus local self-validation).
+    /// Matches stellar-core's `mSlot.setFullyValidated(false)` inside
+    /// `BallotProtocol::processEnvelope` for self-envelopes.
+    fn propagate_ballot_clear_slot_validation(&mut self) {
+        if self.ballot.take_needs_clear_slot_validation() && self.externalized_value.is_none() {
+            self.fully_validated = false;
+            self.nomination.set_fully_validated(false);
+            // Note: ballot already cleared its own flag in emit_current_state.
+        }
+    }
+
     /// Restore `fully_validated` and emit any deferred ballot/nomination envelopes.
     ///
     /// Called by the herder after all deferred validation conditions for this
@@ -595,6 +610,12 @@ impl Slot {
             driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
         }
 
+        // Check if local self-emission (via advance_slot → emit_current_state)
+        // validated a self-envelope as MaybeValid/MaybeValidDeferred and needs
+        // the slot-level fully_validated cleared. Matches stellar-core
+        // mSlot.setFullyValidated(false) inside processEnvelope(self).
+        self.propagate_ballot_clear_slot_validation();
+
         result
     }
 
@@ -620,6 +641,10 @@ impl Slot {
             // Start ballot protocol with the composite value
             let ctx = slot_ctx!(self, driver);
             self.ballot.bump(&ctx, composite.clone(), false);
+
+            // Propagate slot-level fully_validated clearing if the initial
+            // bump → emit_current_state validated the composite as MaybeValid.
+            self.propagate_ballot_clear_slot_validation();
         }
     }
 
@@ -840,6 +865,7 @@ impl Slot {
     ) -> bool {
         let ctx = slot_ctx!(self, driver);
         let result = self.ballot.bump_state(&ctx, value, counter);
+        self.propagate_ballot_clear_slot_validation();
         self.maybe_set_got_v_blocking();
         result
     }
@@ -851,6 +877,7 @@ impl Slot {
     pub fn force_bump_state<D: SCPDriver>(&mut self, driver: &Arc<D>, value: Value) -> bool {
         let ctx = slot_ctx!(self, driver);
         let result = self.ballot.bump(&ctx, value, true);
+        self.propagate_ballot_clear_slot_validation();
         self.maybe_set_got_v_blocking();
         result
     }
