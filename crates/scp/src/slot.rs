@@ -438,6 +438,7 @@ impl Slot {
         let composite = self.nomination.latest_composite().cloned();
         let ctx = slot_ctx!(self, driver);
         let result = self.ballot.bump_timeout(&ctx, composite.as_ref());
+        self.propagate_ballot_clear_slot_validation();
         self.maybe_set_got_v_blocking();
         result
     }
@@ -841,6 +842,7 @@ impl Slot {
         self.sync_composite_candidate();
         let ctx = slot_ctx!(self, driver);
         let result = self.ballot.abandon_ballot(counter, &ctx);
+        self.propagate_ballot_clear_slot_validation();
         self.maybe_set_got_v_blocking();
         result
     }
