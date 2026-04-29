@@ -121,6 +121,8 @@ pub struct HostFunctionInvocation<'a> {
     pub module_cache: Option<&'a PersistentModuleCache>,
     pub hot_archive: Option<&'a dyn HotArchiveLookup>,
     pub ttl_key_cache: Option<&'a TtlKeyCache>,
+    /// Keys already restored from hot archive earlier in this cluster/ledger.
+    pub previously_restored_keys: Option<&'a std::collections::HashSet<LedgerKey>>,
 }
 
 /// Bundles the optional Soroban parameters that thread through operation execution.
@@ -137,6 +139,10 @@ pub struct SorobanContext<'a> {
     pub module_cache: Option<&'a PersistentModuleCache>,
     pub hot_archive: Option<&'a dyn HotArchiveLookup>,
     pub ttl_key_cache: Option<&'a TtlKeyCache>,
+    /// Keys already restored from the hot archive earlier in this cluster/ledger.
+    /// When set, RestoreFootprint and InvokeHostFunction skip hot-archive lookup
+    /// for these keys. Mirrors stellar-core's `entryWasRestored()`.
+    pub previously_restored_keys: Option<&'a std::collections::HashSet<LedgerKey>>,
 }
 
 impl SorobanContext<'_> {
@@ -148,6 +154,7 @@ impl SorobanContext<'_> {
             module_cache: None,
             hot_archive: None,
             ttl_key_cache: None,
+            previously_restored_keys: None,
         }
     }
 }

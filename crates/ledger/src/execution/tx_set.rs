@@ -234,6 +234,12 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
             "Executed transaction"
         );
 
+        // Record hot-archive restored keys from successful TXs so subsequent
+        // TXs see them. Only successful TXs contribute (failed TXs are rolled back).
+        if result.success {
+            executor.record_hot_archive_restores(&result.hot_archive_restored_keys);
+        }
+
         results.push(result);
         tx_results.push(tx_result);
         tx_result_metas.push(tx_result_meta);
@@ -572,6 +578,11 @@ pub fn execute_soroban_parallel_phase(
     let mut all_tx_results: Vec<TransactionResultPair> = Vec::new();
     let mut all_tx_result_metas: Vec<TransactionResultMetaV1> = Vec::new();
     let mut all_hot_archive_restored_keys: Vec<LedgerKey> = Vec::new();
+    // Accumulate hot-archive restored keys across stages for cross-stage propagation.
+    // Each stage's clusters see the accumulated set from prior stages to prevent
+    // re-restoration. Mirrors stellar-core's `mPreviouslyRestoredEntries`.
+    let mut accumulated_restored_keys: std::collections::HashSet<LedgerKey> =
+        std::collections::HashSet::new();
     let mut id_pool = snapshot.header().id_pool;
     // Global TX offset tracks the canonical position for PRNG seed computation.
     // In stellar-core, phases are applied in order [Classic (phase 0), Soroban (phase 1)],
@@ -679,7 +690,7 @@ pub fn execute_soroban_parallel_phase(
         // shared accounts).  PriorStageState::from_delta bundles both
         // current_entries() and dead_entries() to match this behavior.
         let prior_stage_start = std::time::Instant::now();
-        let prior_stage = PriorStageState::from_delta(delta);
+        let prior_stage = PriorStageState::from_delta(delta, accumulated_restored_keys.clone());
         total_prior_stage_us += prior_stage_start.elapsed().as_micros() as u64;
 
         // Slice pre_charged_fees for this stage's clusters.
@@ -734,6 +745,10 @@ pub fn execute_soroban_parallel_phase(
             all_tx_results.extend(cr.tx_results.iter().cloned());
             all_tx_result_metas.extend(cr.tx_result_metas.iter().cloned());
             all_hot_archive_restored_keys.extend(cr.hot_archive_restored_keys.iter().cloned());
+        }
+        // Merge this stage's restored keys into the cross-stage accumulator.
+        for cr in &cluster_results {
+            accumulated_restored_keys.extend(cr.hot_archive_restored_keys.iter().cloned());
         }
         total_result_merge_us += result_merge_start.elapsed().as_micros() as u64;
 
@@ -992,6 +1007,9 @@ pub(super) fn execute_single_cluster(
     for key in &params.prior_stage.deleted_keys {
         executor.state.mark_entry_deleted(key);
     }
+    // Seed hot-archive restored keys from prior stages so this cluster
+    // won't re-restore entries that were already restored and then deleted.
+    executor.seed_hot_archive_restored_keys(&params.prior_stage.hot_archive_restored_keys);
     let prior_load_us = prior_load_start.elapsed().as_micros() as u64;
 
     let mut results = Vec::with_capacity(cluster.len());
@@ -1124,6 +1142,13 @@ pub(super) fn execute_single_cluster(
             tx_apply_processing: tx_meta,
             post_tx_apply_fee_processing: post_fee_changes,
         };
+
+        // Record hot-archive restored keys from successful TXs so subsequent
+        // TXs in this cluster see them and won't re-restore entries that were
+        // restored and then deleted. Only successful TXs contribute.
+        if result.success {
+            executor.record_hot_archive_restores(&result.hot_archive_restored_keys);
+        }
 
         results.push(result);
         tx_results.push(tx_result);
@@ -1308,6 +1333,7 @@ pub(super) fn execute_stage_clusters(
     let prior_stage: std::sync::Arc<PriorStageState> = std::sync::Arc::new(PriorStageState {
         entries: params.prior_stage.entries.clone(),
         deleted_keys: params.prior_stage.deleted_keys.clone(),
+        hot_archive_restored_keys: params.prior_stage.hot_archive_restored_keys.clone(),
     });
     // For multi-cluster parallel execution, we need to split pre_charged_fees per cluster.
     // Each cluster gets its own Vec since the spawn_blocking closure needs 'static data.

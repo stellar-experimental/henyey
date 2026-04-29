@@ -1041,7 +1041,18 @@ pub fn execute_operation_with_soroban(
                                 old_live_until: ttl,
                             });
                         } else {
-                            // Case 2: No TTL -> check hot archive
+                            // Case 2: No TTL -> check if already restored in this
+                            // cluster, then check hot archive.
+                            //
+                            // stellar-core: entryWasRestored(lk) — if the entry was
+                            // restored from hot archive earlier in this ledger and then
+                            // deleted, skip it. The immutable hot archive snapshot would
+                            // still return the entry, but restoring it again diverges.
+                            if let Some(restored) = soroban.previously_restored_keys {
+                                if restored.contains(key) {
+                                    continue;
+                                }
+                            }
                             // Per stellar-core createEntryRentChangeWithoutModification():
                             // When entryLiveUntilLedger is std::nullopt (no previous TTL):
                             //   - old_size_bytes = 0

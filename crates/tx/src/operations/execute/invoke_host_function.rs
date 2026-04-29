@@ -363,6 +363,7 @@ pub(crate) fn execute_invoke_host_function(
             module_cache: soroban.module_cache,
             hot_archive: soroban.hot_archive,
             ttl_key_cache: soroban.ttl_key_cache,
+            previously_restored_keys: soroban.previously_restored_keys,
         },
         state,
         context,
@@ -378,6 +379,7 @@ struct ContractInvocationRequest<'a> {
     module_cache: Option<&'a PersistentModuleCache>,
     hot_archive: Option<&'a dyn crate::soroban::HotArchiveLookup>,
     ttl_key_cache: Option<&'a crate::soroban::TtlKeyCache>,
+    previously_restored_keys: Option<&'a std::collections::HashSet<LedgerKey>>,
 }
 
 fn execute_contract_invocation(
@@ -395,6 +397,7 @@ fn execute_contract_invocation(
         module_cache,
         hot_archive,
         ttl_key_cache,
+        previously_restored_keys,
     } = request;
 
     // Convert auth entries to a slice
@@ -473,6 +476,7 @@ fn execute_contract_invocation(
         module_cache,
         hot_archive,
         ttl_key_cache,
+        previously_restored_keys,
     }) {
         Ok(result) => {
             // stellar-core check: event size (collectEvents in doApply)
@@ -1517,6 +1521,7 @@ mod tests {
             module_cache: None,
             hot_archive: None,
             ttl_key_cache: None,
+            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1568,6 +1573,7 @@ mod tests {
             module_cache: None,
             hot_archive: None,
             ttl_key_cache: None,
+            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1647,6 +1653,7 @@ mod tests {
             module_cache: None,
             hot_archive: None,
             ttl_key_cache: None,
+            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1722,6 +1729,7 @@ mod tests {
             module_cache: None,
             hot_archive: None,
             ttl_key_cache: None,
+            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1807,6 +1815,7 @@ mod tests {
             module_cache: Some(&module_cache),
             hot_archive: None,
             ttl_key_cache: None,
+            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");
@@ -1861,6 +1870,7 @@ mod tests {
             module_cache: None,
             hot_archive: None,
             ttl_key_cache: None,
+            previously_restored_keys: None,
         };
         let result = execute_invoke_host_function(&op, &source, &mut state, &context, &soroban)
             .expect("invoke host function");

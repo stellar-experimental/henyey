@@ -325,6 +325,11 @@ struct LedgerSnapshotAdapterP25<'a> {
     current_ledger: u32,
     hot_archive: Option<&'a dyn super::HotArchiveLookup>,
     ttl_key_cache: Option<&'a super::TtlKeyCache>,
+    /// Keys already restored from hot archive earlier in this cluster/ledger.
+    /// When set, `get_archived()` returns `None` for these keys instead of
+    /// consulting the hot archive. Mirrors stellar-core's
+    /// `previouslyRestoredFromHotArchive()`.
+    previously_restored_keys: Option<&'a std::collections::HashSet<stellar_xdr::curr::LedgerKey>>,
 }
 
 impl<'a> LedgerSnapshotAdapterP25<'a> {
@@ -334,12 +339,16 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         current_ledger: u32,
         hot_archive: Option<&'a dyn super::HotArchiveLookup>,
         ttl_key_cache: Option<&'a super::TtlKeyCache>,
+        previously_restored_keys: Option<
+            &'a std::collections::HashSet<stellar_xdr::curr::LedgerKey>,
+        >,
     ) -> Self {
         Self {
             state,
             current_ledger,
             hot_archive,
             ttl_key_cache,
+            previously_restored_keys,
         }
     }
 
@@ -401,6 +410,16 @@ impl<'a> LedgerSnapshotAdapterP25<'a> {
         // Entry not found in live state - try the hot archive bucket list.
         // This handles the case where the entry was evicted from the live bucket list
         // and is now in the hot archive, waiting to be restored.
+        //
+        // stellar-core: previouslyRestoredFromHotArchive(lk) — skip if the entry
+        // was already restored from hot archive earlier in this ledger and then
+        // deleted. The immutable hot archive snapshot would still return the entry,
+        // but restoring it again would diverge from stellar-core behavior.
+        if let Some(restored) = self.previously_restored_keys {
+            if restored.contains(key.as_ref()) {
+                return Ok(None);
+            }
+        }
         if let Some(hot_archive) = self.hot_archive {
             if let Some(archived_entry) = hot_archive.get(key.as_ref()).map_err(|e| {
                 tracing::error!(error = ?e, "Hot archive lookup failed during restore");
@@ -1137,6 +1156,7 @@ fn execute_host_function_p24(
         context.sequence,
         hot_archive,
         ttl_key_cache,
+        request.previously_restored_keys,
     );
 
     // ── Gather footprint entries ──
@@ -1379,6 +1399,7 @@ fn execute_host_function_p25(
         context.sequence,
         hot_archive,
         ttl_key_cache,
+        request.previously_restored_keys,
     );
 
     // ── Gather footprint entries ──
@@ -1718,6 +1739,7 @@ fn execute_host_function_p26(
         context.sequence,
         hot_archive,
         ttl_key_cache,
+        request.previously_restored_keys,
     );
 
     // ── Gather footprint entries ──
@@ -2324,5 +2346,80 @@ mod tests {
         match &result[1].event.body {
             ContractEventBody::V0(v0) => assert_eq!(v0.data, ScVal::U32(2)),
         }
+    }
+
+    /// Regression test for #2062: get_archived must skip keys in
+    /// previously_restored_keys even when the hot archive has the entry.
+    /// Without this guard, a restore→delete→restore sequence in the same
+    /// ledger would re-restore from the immutable hot archive snapshot,
+    /// diverging from stellar-core.
+    #[test]
+    fn test_get_archived_skips_previously_restored_keys() {
+        use std::collections::{HashMap, HashSet};
+        use std::rc::Rc;
+
+        struct TestHotArchive {
+            entries: HashMap<Vec<u8>, LedgerEntry>,
+        }
+        impl crate::soroban::HotArchiveLookup for TestHotArchive {
+            fn get(
+                &self,
+                key: &LedgerKey,
+            ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                let key_bytes =
+                    stellar_xdr::curr::WriteXdr::to_xdr(key, stellar_xdr::curr::Limits::none())?;
+                Ok(self.entries.get(&key_bytes).cloned())
+            }
+        }
+
+        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: Hash([99u8; 32]),
+        });
+        let entry = LedgerEntry {
+            last_modified_ledger_seq: 42,
+            data: LedgerEntryData::ContractCode(stellar_xdr::curr::ContractCodeEntry {
+                ext: stellar_xdr::curr::ContractCodeEntryExt::V0,
+                hash: Hash([99u8; 32]),
+                code: vec![0xCA, 0xFE].try_into().unwrap(),
+            }),
+            ext: stellar_xdr::curr::LedgerEntryExt::V0,
+        };
+
+        let key_bytes =
+            stellar_xdr::curr::WriteXdr::to_xdr(&key, stellar_xdr::curr::Limits::none()).unwrap();
+        let mut ha_entries = HashMap::new();
+        ha_entries.insert(key_bytes, entry);
+        let hot_archive = TestHotArchive {
+            entries: ha_entries,
+        };
+
+        let state = crate::state::LedgerStateManager::new(1_000_000, 100);
+
+        // Without previously_restored_keys, hot archive entry is returned.
+        let adapter_no_guard =
+            LedgerSnapshotAdapterP25::with_hot_archive(&state, 100, Some(&hot_archive), None, None);
+        let rc_key = Rc::new(key.clone());
+        let result = adapter_no_guard.get_archived(&rc_key).unwrap();
+        assert!(
+            result.is_some(),
+            "Without guard, hot archive entry should be returned"
+        );
+
+        // With key in previously_restored_keys, get_archived returns None.
+        let mut restored = HashSet::new();
+        restored.insert(key.clone());
+        let adapter_with_guard = LedgerSnapshotAdapterP25::with_hot_archive(
+            &state,
+            100,
+            Some(&hot_archive),
+            None,
+            Some(&restored),
+        );
+        let result = adapter_with_guard.get_archived(&rc_key).unwrap();
+        assert!(
+            result.is_none(),
+            "With key in previously_restored_keys, hot archive must be skipped"
+        );
     }
 }

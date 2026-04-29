@@ -600,6 +600,10 @@ pub struct TransactionExecutor {
     ttl_key_cache: Option<henyey_tx::soroban::TtlKeyCache>,
     /// Frozen ledger keys configuration (CAP-77, Protocol 26+).
     frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig,
+    /// Keys restored from the hot archive so far in this executor's lifetime.
+    /// Prevents re-restoration of an entry that was restored and then deleted
+    /// within the same cluster/ledger. Mirrors stellar-core's `entryWasRestored()`.
+    hot_archive_restored_keys: std::collections::HashSet<LedgerKey>,
 }
 
 impl TransactionExecutor {
@@ -630,6 +634,7 @@ impl TransactionExecutor {
             enable_soroban_diagnostic_events: false,
             ttl_key_cache: None,
             frozen_key_config: context.frozen_key_config.clone(),
+            hot_archive_restored_keys: std::collections::HashSet::new(),
         }
     }
 
@@ -666,6 +671,26 @@ impl TransactionExecutor {
         hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
     ) {
         self.hot_archive = Some(hot_archive);
+    }
+
+    /// Seed the hot-archive restored keys set from a prior stage.
+    ///
+    /// In the parallel Soroban path, each stage gets a fresh executor per cluster.
+    /// To prevent re-restoration across stages, the prior stage's accumulated
+    /// restored keys must be seeded into the new executor. Mirrors stellar-core's
+    /// `mPreviouslyRestoredEntries`.
+    pub fn seed_hot_archive_restored_keys(&mut self, keys: &std::collections::HashSet<LedgerKey>) {
+        self.hot_archive_restored_keys.extend(keys.iter().cloned());
+    }
+
+    /// Record that keys were restored from the hot archive during a successful TX.
+    pub fn record_hot_archive_restores(&mut self, keys: &[LedgerKey]) {
+        self.hot_archive_restored_keys.extend(keys.iter().cloned());
+    }
+
+    /// Get a reference to the accumulated hot-archive restored keys.
+    pub fn hot_archive_restored_keys(&self) -> &std::collections::HashSet<LedgerKey> {
+        &self.hot_archive_restored_keys
     }
 
     /// Set the persistent module cache for WASM compilation.
@@ -740,6 +765,8 @@ impl TransactionExecutor {
         self.state.clear_cached_entries_preserving_offers();
         // Clear loaded_accounts cache (non-offer)
         self.loaded_accounts.clear();
+        // Clear hot-archive restored keys from the previous ledger.
+        self.hot_archive_restored_keys.clear();
     }
 
     /// Look up an entry from the snapshot, respecting delta deletions.
@@ -2330,6 +2357,7 @@ impl TransactionExecutor {
             module_cache: self.module_cache.as_ref(),
             hot_archive: hot_archive_ref,
             ttl_key_cache: self.ttl_key_cache.as_ref(),
+            previously_restored_keys: Some(&self.hot_archive_restored_keys),
         };
 
         // Use the central operation dispatcher which handles all operation types
@@ -2992,6 +3020,10 @@ pub struct SorobanContext<'a> {
 pub struct PriorStageState {
     pub entries: Vec<LedgerEntry>,
     pub deleted_keys: Vec<LedgerKey>,
+    /// Keys restored from hot archive by prior stages.
+    /// Seeded into fresh cluster executors to prevent re-restoration
+    /// across stages. Mirrors stellar-core's `mPreviouslyRestoredEntries`.
+    pub hot_archive_restored_keys: std::collections::HashSet<LedgerKey>,
 }
 
 impl PriorStageState {
@@ -3003,7 +3035,10 @@ impl PriorStageState {
     /// from the snapshot. Including classic deletions would be harmless
     /// (mark_entry_deleted skips them) but filtering here keeps the invariant
     /// explicit and avoids unnecessary work.
-    pub fn from_delta(delta: &crate::LedgerDelta) -> Self {
+    pub fn from_delta(
+        delta: &crate::LedgerDelta,
+        hot_archive_restored_keys: std::collections::HashSet<LedgerKey>,
+    ) -> Self {
         Self {
             entries: delta.current_entries(),
             deleted_keys: delta
@@ -3011,6 +3046,7 @@ impl PriorStageState {
                 .into_iter()
                 .filter(is_soroban_key)
                 .collect(),
+            hot_archive_restored_keys,
         }
     }
 }
@@ -3628,7 +3664,7 @@ mod tests {
         delta.record_delete(code_entry.clone()).unwrap();
         delta.record_delete(ttl_entry.clone()).unwrap();
 
-        let prior_stage = PriorStageState::from_delta(&delta);
+        let prior_stage = PriorStageState::from_delta(&delta, std::collections::HashSet::new());
         // Verify the deleted keys are captured.
         assert!(
             prior_stage.deleted_keys.contains(&code_key),
@@ -4484,7 +4520,7 @@ mod tests {
         );
 
         // PriorStageState should only include the Soroban key.
-        let prior = PriorStageState::from_delta(&delta);
+        let prior = PriorStageState::from_delta(&delta, std::collections::HashSet::new());
         assert_eq!(
             prior.deleted_keys.len(),
             1,
@@ -4498,5 +4534,101 @@ mod tests {
             !prior.deleted_keys.contains(&account_key),
             "PriorStageState must NOT include classic Account deletion"
         );
+    }
+
+    /// Regression test for #2062: TransactionExecutor tracks hot-archive restored
+    /// keys, seeds from prior stage, and clears on advance_to_ledger.
+    #[test]
+    fn test_hot_archive_restored_keys_tracking() {
+        let context = LedgerContext::new(100, 1234567890, 100, 5_000_000, 21, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+
+        // Initially empty.
+        assert!(executor.hot_archive_restored_keys().is_empty());
+
+        // Record some keys.
+        let key1 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: stellar_xdr::curr::Hash([1u8; 32]),
+        });
+        let key2 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: stellar_xdr::curr::Hash([2u8; 32]),
+        });
+        executor.record_hot_archive_restores(&[key1.clone(), key2.clone()]);
+        assert_eq!(executor.hot_archive_restored_keys().len(), 2);
+        assert!(executor.hot_archive_restored_keys().contains(&key1));
+        assert!(executor.hot_archive_restored_keys().contains(&key2));
+
+        // Duplicate record is idempotent.
+        executor.record_hot_archive_restores(&[key1.clone()]);
+        assert_eq!(executor.hot_archive_restored_keys().len(), 2);
+
+        // advance_to_ledger clears the set.
+        executor.advance_to_ledger(LedgerAdvanceParams {
+            ledger_seq: 101,
+            close_time: 1234567891,
+            base_reserve: 5_000_000,
+            protocol_version: 21,
+            soroban_config: SorobanConfig::default(),
+            frozen_key_config: henyey_tx::frozen_keys::FrozenKeyConfig::default(),
+            ledger_flags: 0,
+        });
+        assert!(
+            executor.hot_archive_restored_keys().is_empty(),
+            "advance_to_ledger must clear hot_archive_restored_keys"
+        );
+    }
+
+    /// Regression test for #2062: seed_hot_archive_restored_keys merges prior
+    /// stage keys into the executor for cross-stage propagation.
+    #[test]
+    fn test_seed_hot_archive_restored_keys_cross_stage() {
+        let context = LedgerContext::new(100, 1234567890, 100, 5_000_000, 21, NetworkId::testnet());
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            SorobanConfig::default(),
+            ClassicEventConfig::default(),
+        );
+
+        let key1 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: stellar_xdr::curr::Hash([10u8; 32]),
+        });
+        let key2 = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: stellar_xdr::curr::Hash([20u8; 32]),
+        });
+
+        // Record one key from "this cluster's" work.
+        executor.record_hot_archive_restores(&[key1.clone()]);
+
+        // Seed from prior stage with a different key.
+        let mut prior_keys = std::collections::HashSet::new();
+        prior_keys.insert(key2.clone());
+        executor.seed_hot_archive_restored_keys(&prior_keys);
+
+        // Both keys should be present.
+        assert_eq!(executor.hot_archive_restored_keys().len(), 2);
+        assert!(executor.hot_archive_restored_keys().contains(&key1));
+        assert!(executor.hot_archive_restored_keys().contains(&key2));
+    }
+
+    /// Regression test for #2062: PriorStageState::from_delta carries
+    /// hot_archive_restored_keys through for cross-stage propagation.
+    #[test]
+    fn test_prior_stage_state_carries_restored_keys() {
+        let delta = crate::LedgerDelta::new(100);
+        let mut restored = std::collections::HashSet::new();
+        let key = LedgerKey::ContractCode(stellar_xdr::curr::LedgerKeyContractCode {
+            hash: stellar_xdr::curr::Hash([77u8; 32]),
+        });
+        restored.insert(key.clone());
+
+        let prior = PriorStageState::from_delta(&delta, restored);
+        assert_eq!(prior.hot_archive_restored_keys.len(), 1);
+        assert!(prior.hot_archive_restored_keys.contains(&key));
     }
 }
