@@ -379,6 +379,14 @@ impl FetchingEnvelopes {
         slot_state.ready.extend(envelopes);
     }
 
+    /// Check whether a tx set hash is present in the private dependency cache.
+    ///
+    /// Test-only: used to verify unsolicited tx sets do not poison the cache.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn has_cached_tx_set(&self, hash: &Hash256) -> bool {
+        self.tx_set_cache.contains_key(hash)
+    }
+
     /// Get all ready slots in ascending order.
     ///
     /// Parity: stellar-core returns slots in sorted order since it uses std::map.
@@ -561,11 +569,17 @@ impl FetchingEnvelopes {
         self.tx_set_cache.insert(hash, (slot, data));
     }
 
-    /// Mark a TxSet as available and process any waiting envelopes.
+    /// Sync the private `tx_set_cache` with an authoritatively-accepted tx set.
     ///
-    /// This is used when we receive a tx set through other means (not the fetcher)
-    /// but want to notify waiting envelopes that the dependency is satisfied.
-    pub fn tx_set_available(&self, hash: Hash256, slot: SlotIndex) {
+    /// **Precondition:** the tx set identified by `hash` must already be stored
+    /// in the authoritative `ScpDriver` cache (via `cache_tx_set` or
+    /// `receive_tx_set`). This method only syncs the `FetchingEnvelopes`
+    /// private dependency cache so that waiting envelopes can be unblocked.
+    ///
+    /// Do NOT call this for unsolicited or unvalidated tx sets — doing so
+    /// would poison the private cache and let non-EXTERNALIZE ballot
+    /// envelopes bypass the fetch gate. See #2066.
+    pub fn notify_tx_set_available(&self, hash: Hash256, slot: SlotIndex) {
         // Cache it (eviction handled in cache_tx_set)
         self.evict_tx_set_cache_if_full();
         self.tx_set_cache.insert(hash, (slot, Vec::new()));
@@ -627,7 +641,7 @@ impl FetchingEnvelopes {
 
     /// Add a QuorumSet to the cache directly and process any waiting envelopes.
     ///
-    /// Parallel to `tx_set_available` — used when a quorum-set is received
+    /// Parallel to `notify_tx_set_available` — used when a quorum-set is received
     /// through means other than the quorum-set fetcher.
     pub fn cache_quorum_set(&self, hash: Hash256, quorum_set: ScpQuorumSet) {
         self.evict_quorum_set_cache_if_full();
@@ -1599,7 +1613,7 @@ mod tests {
     ///
     /// Uses a timeout channel to detect deadlock without hanging the test binary.
     #[test]
-    fn test_tx_set_available_does_not_deadlock() {
+    fn test_notify_tx_set_available_does_not_deadlock() {
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -1638,7 +1652,7 @@ mod tests {
         };
 
         // Insert directly into slots.fetching, bypassing the fetcher tracker.
-        // This ensures recv_tx_set (called inside tx_set_available) won't
+        // This ensures recv_tx_set (called inside notify_tx_set_available) won't
         // handle it, forcing the fallback scan in move_ready_envelopes_for_tx_set.
         let env_hash = FetchingEnvelopes::compute_envelope_hash(&envelope);
         fetching
@@ -1651,18 +1665,18 @@ mod tests {
         assert_eq!(fetching.fetching_count(), 1);
         assert_eq!(fetching.ready_count(), 0);
 
-        // Call tx_set_available on a separate thread with a timeout.
+        // Call notify_tx_set_available on a separate thread with a timeout.
         // Before the fix, this deadlocked inside move_ready_envelopes_for_tx_set.
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let fe = fetching.clone();
         std::thread::spawn(move || {
-            fe.tx_set_available(tx_set_hash, slot);
+            fe.notify_tx_set_available(tx_set_hash, slot);
             let _ = done_tx.send(());
         });
 
         done_rx
             .recv_timeout(Duration::from_secs(5))
-            .expect("tx_set_available deadlocked (regression #1719)");
+            .expect("notify_tx_set_available deadlocked (regression #1719)");
 
         // Envelope should have moved from fetching to ready.
         assert_eq!(
