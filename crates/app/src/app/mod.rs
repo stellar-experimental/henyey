@@ -1596,9 +1596,19 @@ impl App {
     ///
     /// Uses `fetch_max` (not `store`) so that a counter already past the
     /// threshold is never regressed — see issue #1843.
+    /// Escalate recovery to archive-catchup mode AND switch the archive
+    /// checkpoint cache to urgent polling (10 s TTL).
+    ///
+    /// This is the only production API for escalation — it couples the two
+    /// signals that must always move together.  A raw counter bump without
+    /// urgent mode is what caused the 5-minute wedge in #2073: the node
+    /// was in catchup mode but still polling the archive at the 60 s
+    /// normal cadence, delaying detection of the newly published
+    /// checkpoint.
     pub(super) fn escalate_recovery_to_catchup(&self) {
         self.recovery_attempts_without_progress
             .fetch_max(RECOVERY_ESCALATION_CATCHUP, Ordering::SeqCst);
+        self.archive_checkpoint_cache.set_urgent(true);
     }
 
     /// Reset (or re-arm) the recovery attempt counter and snapshot the current
@@ -6778,6 +6788,40 @@ mod tests {
                 .load(Ordering::SeqCst);
             assert_eq!(actual, expected, "{desc}");
         }
+    }
+
+    /// Regression test for issue #2073: `escalate_recovery_to_catchup` must
+    /// couple the attempt-counter bump with `set_urgent(true)` on the archive
+    /// checkpoint cache.  Before this fix, urgent mode was only activated when
+    /// `tx_set_all_peers_exhausted` was true, delaying archive-behind detection
+    /// by up to 60 s.
+    #[tokio::test]
+    async fn test_escalate_recovery_to_catchup_sets_urgent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Pre-condition: urgent mode is off.
+        assert!(
+            !app.archive_checkpoint_cache.is_urgent(),
+            "urgent must be off initially"
+        );
+
+        app.escalate_recovery_to_catchup();
+
+        assert!(
+            app.archive_checkpoint_cache.is_urgent(),
+            "escalate_recovery_to_catchup must activate urgent mode (#2073)"
+        );
+        assert_eq!(
+            app.recovery_attempts_without_progress
+                .load(Ordering::SeqCst),
+            RECOVERY_ESCALATION_CATCHUP,
+            "attempt counter must be raised to threshold"
+        );
     }
 
     /// Regression test: the out-of-sync recovery path in `consensus.rs`

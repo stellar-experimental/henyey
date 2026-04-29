@@ -39,9 +39,11 @@ use crate::metrics::ARCHIVE_CACHE_REFRESH_DURATION_SECONDS;
 /// not serve values that are 7+ checkpoints out of date.
 pub(super) const ARCHIVE_CHECKPOINT_CACHE_SECS: u64 = 60;
 
-/// Reduced cache TTL used when the node is archive-dependent and peers
-/// cannot supply tx_sets (urgent mode — see [`ArchiveCheckpointCache::set_urgent`]).
-/// Set to one recovery-timer tick so the cache refreshes on every cycle.
+/// Reduced cache TTL used when the node is archive-dependent (urgent mode —
+/// see [`ArchiveCheckpointCache::set_urgent`]).  Activated whenever the archive
+/// is confirmed behind the next checkpoint, regardless of peer tx_set state
+/// (#2073).  Set to one recovery-timer tick so the cache refreshes on every
+/// cycle.
 pub(super) const ARCHIVE_CHECKPOINT_CACHE_URGENT_SECS: u64 = 10;
 
 /// Return the effective cache TTL given the current checkpoint frequency.
@@ -381,9 +383,19 @@ impl ArchiveCheckpointCache {
     /// When urgent, the effective cache TTL is reduced to
     /// [`ARCHIVE_CHECKPOINT_CACHE_URGENT_SECS`] so background refreshes
     /// fire on every recovery tick (~10 s) instead of every 60 s.
-    /// This is activated by `trigger_recovery_catchup` when the archive
-    /// is the sole recovery path (peers' tx_sets evicted), and cleared
-    /// on ledger progress or successful catchup.
+    ///
+    /// Activated by:
+    /// - `trigger_recovery_catchup` when the archive is confirmed behind
+    ///   the next checkpoint (Fresh/Stale branch)
+    /// - `escalate_recovery_to_catchup` (coupled with escalation counter)
+    /// - catchup validation paths when the archive is confirmed behind
+    ///
+    /// Cleared on ledger progress or successful catchup.
+    ///
+    /// Prior to #2073 this was gated on `tx_set_all_peers_exhausted`,
+    /// which delayed activation by up to 60 s (one full normal-TTL
+    /// cycle).  It is now set unconditionally on any archive-behind
+    /// signal.
     pub(super) fn set_urgent(&self, urgent: bool) {
         self.urgent.store(urgent, Ordering::Relaxed);
     }
