@@ -27,7 +27,7 @@
 use crate::externalize_lag::ExternalizeLagTracker;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use parking_lot::RwLock;
 use tracing::{debug, trace, warn};
@@ -479,6 +479,10 @@ pub struct ScpDriver {
     /// Externalize lag tracker for per-node lag statistics.
     /// Mirrors stellar-core's `mQSetLag` in `HerderSCPDriver`.
     externalize_lag: RwLock<ExternalizeLagTracker>,
+    /// Slots deferred for `MaybeValidDeferred` validation, keyed by slot index
+    /// with the set of tx_set hashes that are pending. A slot is resolved when
+    /// all its pending hashes become available.
+    deferred_slots: Mutex<HashMap<u64, HashSet<Hash256>>>,
 }
 
 /// Timing snapshot for the most recently externalized slot.
@@ -528,6 +532,7 @@ impl ScpDriver {
             slot_timing: RwLock::new(HashMap::new()),
             last_externalize_timing: RwLock::new(None),
             externalize_lag: RwLock::new(ExternalizeLagTracker::new()),
+            deferred_slots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -678,6 +683,43 @@ impl ScpDriver {
     /// Check if a transaction set is cached.
     pub fn has_tx_set(&self, hash: &Hash256) -> bool {
         self.tx_tracker.is_cached(hash)
+    }
+
+    /// Record a slot as deferred for a specific tx_set hash.
+    /// Called from `validate_value` when returning `MaybeValidDeferred`.
+    pub(crate) fn record_deferred_slot(&self, slot: u64, tx_set_hash: Hash256) {
+        self.deferred_slots
+            .lock()
+            .unwrap()
+            .entry(slot)
+            .or_default()
+            .insert(tx_set_hash);
+    }
+
+    /// Resolve deferred slots for a newly-arrived tx_set hash.
+    /// Returns the list of slot indices where ALL pending hashes are now
+    /// available (i.e., slots ready for restoration).
+    pub(crate) fn try_resolve_deferred_slot(&self, hash: Hash256) -> Vec<u64> {
+        let mut deferred = self.deferred_slots.lock().unwrap();
+        let mut resolved = Vec::new();
+        for (slot, hashes) in deferred.iter_mut() {
+            hashes.remove(&hash);
+            if hashes.is_empty() {
+                resolved.push(*slot);
+            }
+        }
+        for slot in &resolved {
+            deferred.remove(slot);
+        }
+        resolved
+    }
+
+    /// Clean up deferred entries for slots at or below `max_slot`.
+    pub(crate) fn purge_deferred_slots(&self, max_slot: u64) {
+        self.deferred_slots
+            .lock()
+            .unwrap()
+            .retain(|slot, _| *slot > max_slot);
     }
 
     /// Register a pending tx set request.
@@ -1220,10 +1262,10 @@ impl ScpDriver {
                 // the `ValidationLevel::MaybeValidDeferred` doc comment for
                 // the complete rationale (issues #1795 and #1798).
                 if !nomination {
-                    // No re-validation is needed when the tx_set arrives
-                    // later — ValidationLevel is ephemeral (not stored
-                    // per-envelope), and MaybeValidDeferred produces the
-                    // same end state as FullyValidated. See #1796.
+                    // Record the deferred slot so the herder can restore
+                    // fully_validated when the tx_set arrives.
+                    self.record_deferred_slot(slot_index, tx_set_hash);
+
                     debug!(
                         "Missing transaction set during ballot protocol: {} \
                          (MaybeValidDeferred)",

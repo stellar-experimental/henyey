@@ -3544,18 +3544,12 @@ mod tests {
         }
     }
 
-    /// Regression test for issue #1795: `MaybeValidDeferred` must NOT
-    /// clear the ballot protocol's `fully_validated` flag on the
-    /// tx_set-pending trigger.
-    ///
-    /// Scenario: validator is tracking; a peer sends a PREPARE envelope
-    /// for the current slot; the tx_set is not yet cached, so the herder
-    /// driver returns `MaybeValidDeferred`. The ballot protocol MUST
-    /// leave `fully_validated` untouched so the validator can continue
-    /// broadcasting its own EXTERNALIZE envelopes once the slot
-    /// externalizes.
+    /// Regression test for issue #2061: `MaybeValidDeferred` MUST
+    /// clear the ballot protocol's `fully_validated` flag (matching
+    /// `MaybeValid` behavior).  Emission is deferred until the herder
+    /// restores `fully_validated` after the deferred condition resolves.
     #[test]
-    fn test_issue_1795_maybe_valid_deferred_does_not_clear_fully_validated_tx_set_pending() {
+    fn test_issue_1795_maybe_valid_deferred_clears_fully_validated_tx_set_pending() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let driver = Arc::new(ConfigurableValidationDriver::new(
@@ -3582,27 +3576,17 @@ mod tests {
         bp.process_envelope(&envelope, &ctx, ValidationLevel::MaybeValidDeferred);
 
         assert!(
-            bp.fully_validated,
-            "MaybeValidDeferred must NOT clear fully_validated on the \
-             tx_set-pending trigger — this is the root cause of #1795"
+            !bp.fully_validated,
+            "MaybeValidDeferred must clear fully_validated — emission is deferred \
+             until the herder restores it (issue #2061)"
         );
     }
 
-    /// Regression test for issue #1798: `MaybeValidDeferred` must NOT
+    /// Regression test for issue #2061: `MaybeValidDeferred` MUST
     /// clear the ballot protocol's `fully_validated` flag on the
-    /// future-slot trigger (apply lagging SCP).
-    ///
-    /// Scenario: SCP has externalized slot N; tracking advanced to
-    /// `consensus_index = N+1`; ledger apply for slot N has not
-    /// finished, so LCL is still < N. A peer envelope for slot N+1
-    /// drains from `PendingEnvelopes` and reaches the ballot protocol.
-    /// `validate_past_or_future_value` returns `MaybeValidDeferred`
-    /// because `tracking_index == slot_index` but `slot_index > LCL+1`.
-    /// The ballot protocol MUST leave `fully_validated` untouched so
-    /// the validator can later broadcast its own EXTERNALIZE for
-    /// slot N+1 once it reaches consensus.
+    /// future-slot trigger (apply lagging SCP), matching `MaybeValid`.
     #[test]
-    fn test_issue_1798_maybe_valid_deferred_does_not_clear_fully_validated_future_slot() {
+    fn test_issue_1798_maybe_valid_deferred_clears_fully_validated_future_slot() {
         let node = make_node_id(1);
         let quorum_set = make_quorum_set(vec![node.clone()], 1);
         let driver = Arc::new(ConfigurableValidationDriver::new(
@@ -3612,9 +3596,6 @@ mod tests {
         let mut bp = BallotProtocol::new();
         bp.fully_validated = true;
 
-        // A CONFIRM envelope (non-EXTERNALIZE, so the Externalize-phase
-        // early return does not apply) arrives from a peer for this
-        // future slot.
         let value = make_value(&[4, 5, 6]);
         let envelope = make_prepare_envelope(
             make_node_id(2),
@@ -3635,9 +3616,9 @@ mod tests {
         bp.process_envelope(&envelope, &ctx, ValidationLevel::MaybeValidDeferred);
 
         assert!(
-            bp.fully_validated,
-            "MaybeValidDeferred must NOT clear fully_validated on the \
-             future-slot trigger — this is the root cause of #1798"
+            !bp.fully_validated,
+            "MaybeValidDeferred must clear fully_validated on the \
+             future-slot trigger (issue #2061)"
         );
     }
 
@@ -3682,12 +3663,16 @@ mod tests {
     }
 
     /// Unit test for `ValidationLevel::clears_fully_validated`: the gate
-    /// used by both the ballot protocol and the slot.
+    /// used by both the slot and ballot protocol to decide whether to
+    /// clear `fully_validated`.  `MaybeValidDeferred` now clears —
+    /// matching `MaybeValid`'s behavior — because the SCP layer
+    /// restoration mechanism ensures emission resumes after deferred
+    /// conditions resolve (issue #2061).
     #[test]
     fn test_validation_level_clears_fully_validated_helper() {
         assert!(!ValidationLevel::Invalid.clears_fully_validated());
         assert!(ValidationLevel::MaybeValid.clears_fully_validated());
-        assert!(!ValidationLevel::MaybeValidDeferred.clears_fully_validated());
+        assert!(ValidationLevel::MaybeValidDeferred.clears_fully_validated());
         assert!(!ValidationLevel::FullyValidated.clears_fully_validated());
     }
 

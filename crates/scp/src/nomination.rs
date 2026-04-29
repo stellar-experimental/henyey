@@ -31,6 +31,7 @@
 //! to start the ballot protocol.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
 use stellar_xdr::curr::{
     NodeId, ScpEnvelope, ScpNomination, ScpQuorumSet, ScpStatement, ScpStatementPledges, Value,
@@ -163,6 +164,21 @@ impl NominationProtocol {
     /// Update fully-validated state for local emission gating.
     pub(crate) fn set_fully_validated(&mut self, fully_validated: bool) {
         self.fully_validated = fully_validated;
+    }
+
+    /// Emit the latest nomination envelope if it has changed since last emit
+    /// and `fully_validated` is true.  Mirrors BallotProtocol::send_latest_envelope.
+    /// Called after `restore_fully_validated` unblocks a slot that was deferred.
+    pub(crate) fn emit_deferred<D: SCPDriver>(&mut self, driver: &Arc<D>) {
+        if !self.fully_validated {
+            return;
+        }
+        if let Some(env) = self.last_envelope.as_ref() {
+            if self.last_envelope_emit.as_ref() != Some(env) {
+                self.last_envelope_emit = Some(env.clone());
+                driver.emit_envelope(env);
+            }
+        }
     }
 
     /// Get the voted values.

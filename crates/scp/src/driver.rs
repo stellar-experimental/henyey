@@ -156,7 +156,7 @@ impl ValidationLevel {
     /// [`ValidationLevel::MaybeValidDeferred`] does not clear — see its
     /// doc comment for the rationale (issues #1795 and #1798).
     pub fn clears_fully_validated(self) -> bool {
-        matches!(self, Self::MaybeValid)
+        matches!(self, Self::MaybeValid | Self::MaybeValidDeferred)
     }
 }
 

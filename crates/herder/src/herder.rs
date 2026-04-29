@@ -1999,6 +1999,9 @@ impl Herder {
 
         // Clean up old SCP state
         self.scp.purge_slots(slot.saturating_sub(10), None);
+        // Purge deferred slot tracking alongside SCP slot cleanup
+        self.scp_driver
+            .purge_deferred_slots(slot.saturating_sub(10));
 
         // Clean up old fetching envelopes and cached tx sets (keep a small buffer)
         // Keep the current slot and 2 slots back for any late envelopes
@@ -2702,6 +2705,15 @@ impl Herder {
     fn cache_tx_set(&self, tx_set: TransactionSet) {
         let hash = *tx_set.hash();
         self.scp_driver.cache_tx_set(tx_set);
+
+        // Resolve any deferred slots that were waiting for this tx_set.
+        // When MaybeValidDeferred clears fully_validated, the validator
+        // stops emitting for the slot.  Once the tx_set arrives, we
+        // restore fully_validated so emission can resume.
+        let resolved = self.scp_driver.try_resolve_deferred_slot(hash);
+        for slot in resolved {
+            self.scp.restore_slot_fully_validated(slot);
+        }
 
         let slot = self.tracking_slot();
         self.fetching_envelopes.notify_tx_set_available(hash, slot);

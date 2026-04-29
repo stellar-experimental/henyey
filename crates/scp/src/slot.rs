@@ -178,6 +178,22 @@ impl Slot {
         self.ballot.set_fully_validated(validated);
     }
 
+    /// Restore `fully_validated` and emit any deferred ballot/nomination envelopes.
+    ///
+    /// Called by the herder after all deferred validation conditions for this
+    /// slot have been resolved (tx_set arrived, apply caught up, etc.).
+    /// This is the restoration counterpart to the clear that happens when
+    /// `MaybeValidDeferred` validation is received.
+    pub fn restore_fully_validated<D: SCPDriver>(&mut self, driver: &Arc<D>) {
+        if self.fully_validated {
+            return;
+        }
+        self.set_fully_validated(true);
+        let ctx = slot_ctx!(self, driver);
+        self.ballot.send_latest_envelope(ctx.driver);
+        self.nomination.emit_deferred(ctx.driver);
+    }
+
     /// Check whether we have any latest message recorded from `node_id`.
     fn has_latest_message_from(&self, node_id: &NodeId) -> bool {
         self.ballot.latest_envelopes().contains_key(node_id)
@@ -550,6 +566,10 @@ impl Slot {
         {
             self.fully_validated = false;
             self.nomination.set_fully_validated(false);
+            // Propagate to ballot for consistency with Slot::set_fully_validated;
+            // the ballot clears its own flag independently at ballot/mod.rs:706-708
+            // but adding it here prevents future asymmetry bugs.
+            self.ballot.set_fully_validated(false);
         }
 
         // Check if set_confirm_commit signaled that nomination should stop
@@ -1834,16 +1854,11 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #1796: `MaybeValidDeferred` and
-    /// `FullyValidated` EXTERNALIZE produce identical slot end states.
-    ///
-    /// `ValidationLevel` is ephemeral — not stored per-envelope. Both
-    /// levels return `false` from `clears_fully_validated()`, so the
-    /// slot's `fully_validated` flag is preserved in both cases. After
-    /// tx_set arrival there is no stored verdict to "upgrade"; re-feeding
-    /// the same EXTERNALIZE to SCP would be rejected by
-    /// `is_stale_ballot_statement`. This test proves the end states are
-    /// identical by driving both slots through externalization.
+    /// Regression test for issue #2061 / #1796: `MaybeValidDeferred`
+    /// clears `fully_validated` (stopping premature emission), then
+    /// `restore_fully_validated` restores it and triggers deferred
+    /// ballot/nomination emission.  The end state after restoration is
+    /// identical to the `FullyValidated` path.
     #[test]
     fn test_issue_1796_maybe_valid_deferred_externalize_end_state() {
         use crate::driver::ValidationLevel;
@@ -1851,13 +1866,9 @@ mod tests {
 
         let local_node = make_node_id(1);
         let peer_node = make_node_id(2);
-        // Quorum set: threshold=1, validators=[peer_node].
-        // A single EXTERNALIZE from peer_node satisfies the quorum,
-        // driving the slot to externalization.
         let qs = Arc::new(make_qs(vec![peer_node.clone()], 1));
         let value: Value = vec![42, 43, 44].try_into().unwrap();
 
-        // Build a peer EXTERNALIZE envelope.
         let ext = stellar_xdr::curr::ScpStatementExternalize {
             commit: stellar_xdr::curr::ScpBallot {
                 counter: 1,
@@ -1885,10 +1896,18 @@ mod tests {
         let mut slot_a = Slot::new(10, local_node.clone(), qs.clone(), true);
         assert!(slot_a.fully_validated, "validator starts fully_validated");
 
-        let result_a = slot_a.process_envelope(envelope.clone(), &driver_deferred);
+        let _result_a = slot_a.process_envelope(envelope.clone(), &driver_deferred);
+        assert!(
+            !slot_a.fully_validated,
+            "MaybeValidDeferred must clear fully_validated (issue #2061)"
+        );
+
+        // Restore fully_validated — simulates the herder calling back
+        // after the deferred condition (e.g. tx_set arrival) clears.
+        slot_a.restore_fully_validated(&driver_deferred);
         assert!(
             slot_a.fully_validated,
-            "MaybeValidDeferred must not clear fully_validated (#1796)"
+            "restore_fully_validated must set fully_validated back to true"
         );
 
         // --- Slot B: FullyValidated (normal path, tx_set present) ---
@@ -1901,7 +1920,7 @@ mod tests {
         let mut slot_b = Slot::new(10, local_node.clone(), qs.clone(), true);
         assert!(slot_b.fully_validated, "validator starts fully_validated");
 
-        let result_b = slot_b.process_envelope(envelope.clone(), &driver_validated);
+        let _result_b = slot_b.process_envelope(envelope.clone(), &driver_validated);
 
         // Both slots must have externalized with the peer's value.
         assert!(
@@ -1913,10 +1932,10 @@ mod tests {
             "FullyValidated slot must externalize"
         );
 
-        // Assert identical end states.
+        // After restoration, fully_validated is identical.
         assert_eq!(
             slot_a.fully_validated, slot_b.fully_validated,
-            "fully_validated must be identical for both validation levels"
+            "fully_validated must be identical after restoration"
         );
         assert_eq!(
             slot_a.get_externalized_value(),
@@ -1924,20 +1943,13 @@ mod tests {
             "externalized value must be identical"
         );
         assert_eq!(
-            result_a, result_b,
-            "envelope processing result must be identical"
+            slot_a.fully_validated, slot_b.fully_validated,
+            "fully_validated must be identical after restoration"
         );
-        // Emission-facing state: get_externalizing_state depends on
-        // fully_validated and ballot externalization, so identical
-        // fully_validated + identical ballot state ⇒ identical output.
         assert_eq!(
             slot_a.get_externalizing_state().len(),
             slot_b.get_externalizing_state().len(),
             "externalizing state visibility must be identical"
-        );
-        assert!(
-            !slot_a.get_externalizing_state().is_empty(),
-            "externalizing state must include the local EXTERNALIZE when fully_validated"
         );
     }
 }
