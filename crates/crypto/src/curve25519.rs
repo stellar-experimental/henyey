@@ -108,17 +108,17 @@ impl Curve25519Secret {
     /// Performs ECDH to derive a shared secret.
     ///
     /// Computes `localSecret * remotePublic` (scalar multiplication).
-    /// Returns an error if the result is all zeros (small-order public key),
+    /// Returns an error if the result is not contributory (small-order public key),
     /// matching stellar-core's crypto_scalarmult() return-code check.
     pub fn diffie_hellman(
         &self,
         remote_public: &Curve25519Public,
     ) -> Result<[u8; 32], CryptoError> {
-        let shared = self.inner.diffie_hellman(&remote_public.inner).to_bytes();
-        if shared == [0u8; 32] {
+        let shared = self.inner.diffie_hellman(&remote_public.inner);
+        if !shared.was_contributory() {
             return Err(CryptoError::SmallOrderPublicKey);
         }
-        Ok(shared)
+        Ok(shared.to_bytes())
     }
 
     /// Derives a shared HMAC-SHA256 key for authenticated encryption.
@@ -168,6 +168,33 @@ impl Curve25519Secret {
         // Apply HKDF-extract
         Ok(hkdf_extract(&buf))
     }
+}
+
+/// A Curve25519 public key that passed a contributory check.
+/// Only constructible through [`check_public_key_contributory`].
+pub(crate) struct ContributoryPublicKey(pub(crate) [u8; 32]);
+
+/// Checks whether the given 32 bytes represent a Curve25519 public key that
+/// does NOT produce a predictable all-zero shared secret.
+///
+/// # Probabilistic behavior
+///
+/// This check catches the Curve25519 identity point (`[0u8; 32]`) 100% of the time.
+/// Other small-order points (order 1, 2, 4, 8) are caught with probability matching
+/// libsodium's `crypto_scalarmult` return-code semantics (contributory check on the
+/// scalar-multiplication result). This is the same parity contract as stellar-core.
+///
+/// Valid keys pass this check deterministically.
+pub(crate) fn check_public_key_contributory(
+    bytes: &[u8; 32],
+) -> Result<ContributoryPublicKey, CryptoError> {
+    let ephemeral = StaticSecret::from(random_bytes());
+    let pk = PublicKey::from(*bytes);
+    let shared = ephemeral.diffie_hellman(&pk);
+    if !shared.was_contributory() {
+        return Err(CryptoError::SmallOrderPublicKey);
+    }
+    Ok(ContributoryPublicKey(*bytes))
 }
 
 impl std::fmt::Debug for Curve25519Secret {
@@ -388,5 +415,25 @@ mod tests {
         let result = secret.diffie_hellman(&zero_key);
         assert!(result.is_err(), "DH with all-zeros public key should fail");
         assert!(matches!(result, Err(CryptoError::SmallOrderPublicKey)));
+    }
+
+    #[test]
+    fn test_check_public_key_contributory_rejects_zero() {
+        let result = check_public_key_contributory(&[0u8; 32]);
+        assert!(
+            result.is_err(),
+            "all-zeros public key should fail contributory check"
+        );
+        assert!(matches!(result, Err(CryptoError::SmallOrderPublicKey)));
+    }
+
+    #[test]
+    fn test_check_public_key_contributory_accepts_valid_key() {
+        let valid_pk = Curve25519Secret::random().derive_public();
+        let result = check_public_key_contributory(&valid_pk.to_bytes());
+        assert!(
+            result.is_ok(),
+            "valid random public key should pass contributory check"
+        );
     }
 }

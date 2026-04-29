@@ -98,6 +98,7 @@ Corresponds to: `Curve25519.h`
 | `curve25519DerivePublic(secret)` | `Curve25519Secret::derive_public()` | Full |
 | `curve25519DeriveSharedKey(sec, lpub, rpub, first)` | `Curve25519Secret::derive_shared_key(sec, lpub, rpub, first)` | Full |
 | `hash<Curve25519Public>::operator()` | `Hash for Curve25519Public` | Full |
+| `crypto_scalarmult` contributory check (reject small-order) | `Curve25519Secret::diffie_hellman` + `check_public_key_contributory` | Full |
 
 ### sealed_box.rs (`sealed_box.rs`)
 
@@ -107,6 +108,8 @@ Corresponds to: `Curve25519.h` (encrypt/decrypt portion)
 |--------------|------|--------|
 | `curve25519Encrypt<N>(pub, bin)` | `seal_to_public_key(pub, &[u8])` / `seal_to_curve25519_public_key(&[u8;32], &[u8])` | Full |
 | `curve25519Decrypt(sec, pub, enc)` | `open_from_secret_key(sec, &[u8])` / `open_from_curve25519_secret_key(&[u8;32], &[u8])` | Full |
+| Small-order Curve25519 key rejection | `check_public_key_contributory` + `ContributoryPublicKey` newtype | Full |
+| `crypto_scalarmult` contributory check (via `was_contributory`) | `Curve25519Secret::diffie_hellman` | Full |
 
 ### keys.rs (`keys.rs`)
 

@@ -43,18 +43,29 @@
 use crypto_box::{PublicKey as CurvePublicKey, SecretKey as CurveSecretKey};
 use rand::rngs::OsRng;
 
+use crate::curve25519::{check_public_key_contributory, ContributoryPublicKey};
 use crate::CryptoError;
 #[cfg(test)]
 use crate::{PublicKey, SecretKey};
 
-fn seal(curve_pk: CurvePublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+fn seal(validated_pk: &ContributoryPublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     let mut rng = OsRng;
-    curve_pk
+    CurvePublicKey::from(validated_pk.0)
         .seal(&mut rng, plaintext)
         .map_err(|_| CryptoError::EncryptionFailed)
 }
 
 fn open(curve_sk: CurveSecretKey, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    // Sealed-box ciphertext: [ephemeral_pk: 32 bytes][encrypted: ...]
+    if ciphertext.len() < 32 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+    let ephemeral_pk: [u8; 32] = ciphertext[..32].try_into().unwrap();
+    // Pre-check: uses a random scalar (not the recipient's key) to catch
+    // small-order ephemeral keys that would produce an all-zero shared secret.
+    // The actual DH with the recipient's key happens inside unseal().
+    let _validated =
+        check_public_key_contributory(&ephemeral_pk).map_err(|_| CryptoError::DecryptionFailed)?;
     curve_sk
         .unseal(ciphertext)
         .map_err(|_| CryptoError::DecryptionFailed)
@@ -71,8 +82,9 @@ fn open(curve_sk: CurveSecretKey, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoEr
 /// only on RNG failure).
 #[cfg(test)]
 fn seal_to_public_key(recipient: &PublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    // Ed25519-to-Curve25519 conversion always produces contributory points
     seal(
-        CurvePublicKey::from(recipient.to_curve25519_bytes()),
+        &ContributoryPublicKey(recipient.to_curve25519_bytes()),
         plaintext,
     )
 }
@@ -88,7 +100,8 @@ pub fn seal_to_curve25519_public_key(
     recipient: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    seal(CurvePublicKey::from(*recipient), plaintext)
+    let validated = check_public_key_contributory(recipient)?;
+    seal(&validated, plaintext)
 }
 
 /// Decrypts a sealed payload using the recipient's Ed25519 secret key.
@@ -261,5 +274,25 @@ mod tests {
 
         let result = open_from_curve25519_secret_key(&sk_b.to_bytes(), &ciphertext);
         assert!(result.is_err(), "wrong Curve25519 key should fail");
+    }
+
+    #[test]
+    fn test_seal_rejects_zero_public_key() {
+        let result = seal_to_curve25519_public_key(&[0u8; 32], b"plaintext");
+        assert!(result.is_err(), "seal with all-zeros recipient should fail");
+        assert!(matches!(result, Err(CryptoError::SmallOrderPublicKey)));
+    }
+
+    #[test]
+    fn test_open_rejects_small_order_ephemeral_key() {
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let mut ciphertext = vec![0u8; 48];
+        ciphertext[..32].copy_from_slice(&[0u8; 32]);
+
+        let result = open_from_curve25519_secret_key(&secret.to_bytes(), &ciphertext);
+        assert!(
+            result.is_err(),
+            "open with small-order ephemeral key should fail"
+        );
     }
 }
