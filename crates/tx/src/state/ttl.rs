@@ -469,16 +469,8 @@ impl LedgerStateManager {
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
-        // Get pre-state (current value BEFORE deletion)
-        let pre_state = self
-            .ttl_entries
-            .get(key_hash)
-            .map(|ttl| self.ttl_to_ledger_entry(ttl));
-
-        // Record in delta with pre-state
-        if let Some(pre) = pre_state {
-            self.delta.record_delete(ledger_key.clone(), pre);
-        }
+        // Record delete with snapshot pre-state (not current mutated state)
+        self.record_snapshot_delete(&ledger_key);
 
         // Remove from state and track deletion
         self.clear_entry_sponsorship_metadata(&ledger_key);

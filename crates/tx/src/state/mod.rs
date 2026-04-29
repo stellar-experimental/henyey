@@ -1546,6 +1546,25 @@ impl LedgerStateManager {
             .unwrap_or(fallback)
     }
 
+    /// Record a delete using the snapshot pre-state (not the current mutated state).
+    ///
+    /// Must be called AFTER `capture_op_snapshot_for_key` and BEFORE removing
+    /// the entry from the live map / clearing metadata. Prefers the per-op
+    /// snapshot (`op_entry_snapshots`) over the per-tx snapshot
+    /// (`snapshot_entry`), matching stellar-core's parent-scope semantics
+    /// where `getChanges` emits `mParent.getNewestVersion(key)` for deleted
+    /// entries (LedgerTxn.cpp:1356-1367).
+    fn record_snapshot_delete(&mut self, key: &LedgerKey) {
+        let pre_state = self
+            .op_entry_snapshots
+            .get(key)
+            .cloned()
+            .or_else(|| self.snapshot_entry(key));
+        if let Some(pre) = pre_state {
+            self.delta.record_delete(key.clone(), pre);
+        }
+    }
+
     /// Record a flush update: resolve pre-state, set last_modified, and record delta.
     ///
     /// Common tail shared by every entry-type block in `flush_modified_entries`.
@@ -4091,5 +4110,242 @@ mod tests {
         assert!(manager.entry_loader.is_none());
         assert!(manager.batch_entry_loader.is_none());
         assert!(manager.pool_share_tls_by_account_loader.is_none());
+    }
+
+    /// Regression test: delete_account must record the pre-op snapshot as STATE,
+    /// not the current mutated state. When remove_account_merge_sponsorship
+    /// decrements num_sponsored before delete_account, the delete STATE must
+    /// still contain the original num_sponsored value.
+    #[test]
+    fn test_delete_account_uses_snapshot_pre_state() {
+        let mut state = new_manager_with_offers(5_000_000, 100);
+
+        let source_id = create_test_account_id(0);
+        let sponsor_id = create_test_account_id(1);
+
+        // Source account: sponsored with num_sponsored = 2
+        let mut source = create_test_account_entry(0);
+        source.ext = AccountEntryExt::V1(AccountEntryExtensionV1 {
+            liabilities: Liabilities {
+                buying: 0,
+                selling: 0,
+            },
+            ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                num_sponsored: 2,
+                num_sponsoring: 0,
+                signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                ext: AccountEntryExtensionV2Ext::V0,
+            }),
+        });
+        state.create_account(source);
+
+        // Sponsor with num_sponsoring = 2
+        let sponsor = AccountEntry {
+            account_id: sponsor_id.clone(),
+            balance: 500_000_000,
+            seq_num: SequenceNumber(1),
+            num_sub_entries: 0,
+            inflation_dest: None,
+            flags: 0,
+            home_domain: String32::default(),
+            thresholds: Thresholds([1, 0, 0, 0]),
+            signers: vec![].try_into().unwrap(),
+            ext: AccountEntryExt::V1(AccountEntryExtensionV1 {
+                liabilities: Liabilities {
+                    buying: 0,
+                    selling: 0,
+                },
+                ext: AccountEntryExtensionV1Ext::V2(AccountEntryExtensionV2 {
+                    num_sponsored: 0,
+                    num_sponsoring: 2,
+                    signer_sponsoring_i_ds: vec![].try_into().unwrap(),
+                    ext: AccountEntryExtensionV2Ext::V0,
+                }),
+            }),
+        };
+        state.create_account(sponsor);
+
+        // Mark source as sponsored by sponsor
+        let source_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: source_id.clone(),
+        });
+        state.set_entry_sponsor(source_key, sponsor_id.clone());
+
+        // Save snapshot of source — override the None from create_account
+        // to simulate the account existing before this tx
+        let snapshot = state.accounts.get(&source_id).cloned();
+        state.account_snapshots.insert(source_id.clone(), snapshot);
+
+        // Simulate account-merge: sponsorship removal mutates num_sponsored
+        state
+            .remove_account_merge_sponsorship(&source_id, 2)
+            .unwrap();
+
+        // Verify the in-memory mutation happened (num_sponsored = 0)
+        let acc = state.get_account(&source_id).unwrap();
+        match &acc.ext {
+            AccountEntryExt::V1(v1) => match &v1.ext {
+                AccountEntryExtensionV1Ext::V2(v2) => {
+                    assert_eq!(
+                        v2.num_sponsored, 0,
+                        "mutation should have set num_sponsored=0"
+                    );
+                }
+                _ => panic!("expected V2 ext"),
+            },
+            _ => panic!("expected V1 ext"),
+        }
+
+        // Now delete — the pre-state in delete_states should have num_sponsored = 2
+        state.delete_account(&source_id);
+
+        let delta = state.delta();
+        let delete_states = delta.delete_states();
+        // Find the source account's delete state
+        let source_delete = delete_states
+            .iter()
+            .find(|e| matches!(&e.data, LedgerEntryData::Account(a) if a.account_id == source_id))
+            .expect("should have a delete state for source account");
+
+        if let LedgerEntryData::Account(acc) = &source_delete.data {
+            match &acc.ext {
+                AccountEntryExt::V1(v1) => match &v1.ext {
+                    AccountEntryExtensionV1Ext::V2(v2) => {
+                        assert_eq!(
+                            v2.num_sponsored, 2,
+                            "delete STATE must use pre-op snapshot (num_sponsored=2), \
+                             not mutated state (num_sponsored=0)"
+                        );
+                    }
+                    _ => panic!("expected V2 ext"),
+                },
+                _ => panic!("expected V1 ext"),
+            }
+        } else {
+            panic!("expected Account entry in delete_states");
+        }
+    }
+
+    /// Regression test: in multi-op transactions, delete STATE must use the
+    /// per-op snapshot (start of current op), not the per-tx snapshot (start
+    /// of transaction). Op1 modifies balance, op2 deletes — delete STATE
+    /// should reflect op1's result.
+    #[test]
+    fn test_delete_account_op_snapshot_precedence_over_tx_snapshot() {
+        let mut state = new_manager_with_offers(5_000_000, 100);
+        let account_id = create_test_account_id(0);
+
+        let account = create_test_account_entry(0);
+        let original_balance = account.balance;
+        state.create_account(account);
+
+        // Save tx-level snapshot — override the None from create_account
+        let snapshot = state.accounts.get(&account_id).cloned();
+        state.account_snapshots.insert(account_id.clone(), snapshot);
+
+        // Op1: modify balance
+        state.begin_op_snapshot();
+        let mut modified = state.get_account(&account_id).unwrap().clone();
+        modified.balance = 999_999;
+        state.update_account(modified);
+        // Flush op1 changes
+        state.flush_all_accounts();
+        let _op1_snapshots = state.end_op_snapshot();
+
+        // Op2: begin new op snapshot, then delete
+        state.begin_op_snapshot();
+
+        // Access the account to capture per-op snapshot (balance=999_999)
+        let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        state.capture_op_snapshot_for_key(&ledger_key);
+
+        // Delete the account
+        state.delete_account(&account_id);
+
+        let delta = state.delta();
+        let delete_states = delta.delete_states();
+        let delete_state = delete_states
+            .iter()
+            .find(|e| matches!(&e.data, LedgerEntryData::Account(a) if a.account_id == account_id))
+            .expect("should have a delete state for account");
+
+        if let LedgerEntryData::Account(acc) = &delete_state.data {
+            assert_eq!(
+                acc.balance, 999_999,
+                "delete STATE must use per-op snapshot (balance=999_999 from op1), \
+                 not per-tx snapshot (balance={})",
+                original_balance
+            );
+        } else {
+            panic!("expected Account entry in delete_states");
+        }
+    }
+
+    /// Regression test: delete STATE must preserve the pre-mutation
+    /// sponsorship ext (last_modified_ledger_seq and ext fields).
+    #[test]
+    fn test_delete_preserves_snapshot_ext_and_last_modified() {
+        let mut state = new_manager_with_offers(5_000_000, 100);
+        let account_id = create_test_account_id(0);
+
+        let account = create_test_account_entry(0);
+        state.create_account(account);
+
+        let ledger_key = LedgerKey::Account(LedgerKeyAccount {
+            account_id: account_id.clone(),
+        });
+        let sponsor_id = create_test_account_id(1);
+
+        // Set up sponsorship (this snapshots the pre-sponsor ext as V0)
+        state.set_entry_sponsor(ledger_key.clone(), sponsor_id.clone());
+
+        // Override snapshots to simulate: account had sponsor BEFORE this tx.
+        // Account snapshot: current account state (with sponsor applied).
+        let snapshot = state.accounts.get(&account_id).cloned();
+        state.account_snapshots.insert(account_id.clone(), snapshot);
+        // Ext snapshot: sponsor existed pre-tx.
+        state
+            .entry_sponsorship_snapshots
+            .insert(ledger_key.clone(), Some(sponsor_id.clone()));
+        state
+            .entry_sponsorship_ext_snapshots
+            .insert(ledger_key.clone(), true);
+
+        // Verify entry has sponsor ext before mutation
+        let pre_entry = state.get_entry(&ledger_key).unwrap();
+        assert!(
+            matches!(pre_entry.ext, LedgerEntryExt::V1(_)),
+            "entry should have V1 ext with sponsor"
+        );
+
+        // Mutate: remove the sponsor metadata (simulates account-merge)
+        state.remove_entry_sponsor(&ledger_key);
+
+        // Delete the account
+        state.delete_account(&account_id);
+
+        let delta = state.delta();
+        let delete_states = delta.delete_states();
+        let delete_state = delete_states
+            .iter()
+            .find(|e| matches!(&e.data, LedgerEntryData::Account(a) if a.account_id == account_id))
+            .expect("should have a delete state for account");
+
+        // The delete STATE must have the pre-mutation ext (with sponsor)
+        match &delete_state.ext {
+            LedgerEntryExt::V1(ext_v1) => {
+                assert_eq!(
+                    ext_v1.sponsoring_id,
+                    SponsorshipDescriptor(Some(sponsor_id)),
+                    "delete STATE ext must preserve pre-mutation sponsor"
+                );
+            }
+            _ => panic!(
+                "delete STATE must have V1 ext with sponsor, got {:?}",
+                delete_state.ext
+            ),
+        }
     }
 }

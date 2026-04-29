@@ -537,16 +537,8 @@ impl LedgerStateManager {
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
-        // Get pre-state (current value BEFORE deletion)
-        let pre_state = self
-            .accounts
-            .get(account_id)
-            .map(|acc| self.account_to_ledger_entry(acc));
-
-        // Record in delta with pre-state
-        if let Some(pre) = pre_state {
-            self.delta.record_delete(ledger_key.clone(), pre);
-        }
+        // Record delete with snapshot pre-state (not current mutated state)
+        self.record_snapshot_delete(&ledger_key);
 
         // Remove from state
         self.clear_entry_sponsorship_metadata(&ledger_key);
@@ -812,16 +804,8 @@ impl LedgerStateManager {
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
-        // Get pre-state (current value BEFORE deletion)
-        let pre_state = self
-            .trustlines
-            .get(&key)
-            .map(|tl| self.trustline_to_ledger_entry(tl));
-
-        // Record in delta with pre-state
-        if let Some(pre) = pre_state {
-            self.delta.record_delete(ledger_key.clone(), pre);
-        }
+        // Record delete with snapshot pre-state (not current mutated state)
+        self.record_snapshot_delete(&ledger_key);
 
         // Remove from state
         self.clear_entry_sponsorship_metadata(&ledger_key);
@@ -849,16 +833,8 @@ impl LedgerStateManager {
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
-        // Get pre-state (current value BEFORE deletion)
-        let pre_state = self
-            .trustlines
-            .get(&key)
-            .map(|tl| self.trustline_to_ledger_entry(tl));
-
-        // Record in delta with pre-state
-        if let Some(pre) = pre_state {
-            self.delta.record_delete(ledger_key.clone(), pre);
-        }
+        // Record delete with snapshot pre-state (not current mutated state)
+        self.record_snapshot_delete(&ledger_key);
 
         // Remove from state
         self.clear_entry_sponsorship_metadata(&ledger_key);
@@ -1040,16 +1016,8 @@ impl LedgerStateManager {
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
 
-        // Get pre-state from canonical store (current value BEFORE deletion)
-        let pre_state = {
-            let store = self.offer_store_lock();
-            store.get(&key).map(|r| r.to_ledger_entry())
-        };
-
-        // Record in delta with pre-state
-        if let Some(pre) = pre_state {
-            self.delta.record_delete(ledger_key.clone(), pre);
-        }
+        // Record delete with snapshot pre-state (not current mutated state)
+        self.record_snapshot_delete(&ledger_key);
 
         // Remove from canonical store (handles index cleanup internally)
         {
@@ -1234,8 +1202,7 @@ impl LedgerStateManager {
             });
             self.capture_op_snapshot_for_key(&ledger_key);
             self.snapshot_last_modified_key(&ledger_key);
-            let pre_state = self.data_to_ledger_entry(&entry);
-            self.delta.record_delete(ledger_key.clone(), pre_state);
+            self.record_snapshot_delete(&ledger_key);
             self.clear_entry_sponsorship_metadata(&ledger_key);
             self.data_entries.remove_deleted(&key, false, false);
             self.remove_last_modified_key(&ledger_key);
@@ -1329,13 +1296,7 @@ impl LedgerStateManager {
         self.contract_data.ensure_snapshot_on_first(&lookup_key);
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
-        let pre_state = self
-            .contract_data
-            .get(&lookup_key)
-            .map(|cd| self.contract_data_to_ledger_entry(cd));
-        if let Some(pre) = pre_state {
-            self.delta.record_delete(ledger_key.clone(), pre);
-        }
+        self.record_snapshot_delete(&ledger_key);
         self.clear_entry_sponsorship_metadata(&ledger_key);
         self.contract_data.remove_deleted(&lookup_key, true, false);
         self.remove_last_modified_key(&ledger_key);
@@ -1400,13 +1361,7 @@ impl LedgerStateManager {
         self.contract_code.ensure_snapshot_on_first(&key);
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
-        let pre_state = self
-            .contract_code
-            .get(&key)
-            .map(|cc| self.contract_code_to_ledger_entry(cc));
-        if let Some(pre) = pre_state {
-            self.delta.record_delete(ledger_key.clone(), pre);
-        }
+        self.record_snapshot_delete(&ledger_key);
         self.clear_entry_sponsorship_metadata(&ledger_key);
         self.contract_code.remove_deleted(&key, true, false);
         self.remove_last_modified_key(&ledger_key);
@@ -1464,13 +1419,7 @@ impl LedgerStateManager {
         self.claimable_balances.ensure_snapshot_on_first(&key);
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
-        let pre_state = self
-            .claimable_balances
-            .get(&key)
-            .map(|e| self.claimable_balance_to_ledger_entry(e));
-        if let Some(pre) = pre_state {
-            self.delta.record_delete(ledger_key.clone(), pre);
-        }
+        self.record_snapshot_delete(&ledger_key);
         self.clear_entry_sponsorship_metadata(&ledger_key);
         self.claimable_balances.remove_deleted(&key, false, false);
         self.remove_last_modified_key(&ledger_key);
@@ -1564,13 +1513,7 @@ impl LedgerStateManager {
         self.liquidity_pools.ensure_snapshot_on_first(&key);
         self.capture_op_snapshot_for_key(&ledger_key);
         self.snapshot_last_modified_key(&ledger_key);
-        let pre_state = self
-            .liquidity_pools
-            .get(&key)
-            .map(|e| self.liquidity_pool_to_ledger_entry(e));
-        if let Some(pre) = pre_state {
-            self.delta.record_delete(ledger_key.clone(), pre);
-        }
+        self.record_snapshot_delete(&ledger_key);
         self.clear_entry_sponsorship_metadata(&ledger_key);
         self.liquidity_pools.remove_deleted(&key, false, true);
         self.remove_last_modified_key(&ledger_key);
