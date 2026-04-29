@@ -15,7 +15,7 @@
 //!
 //! 1. **Initialization** ([`App::new`]): Load configuration, open database, initialize
 //!    subsystems, and restore state from disk
-//! 2. **Catchup** ([`App::catchup`]): If behind, download and apply history from archives
+//! 2. **Catchup** ([`App::catchup_with_mode`]): If behind, download and apply history from archives
 //! 3. **Run** ([`App::run`]): Enter the main event loop, processing peer messages
 //!    and participating in consensus
 //! 4. **Shutdown** ([`App::shutdown`]): Gracefully stop all subsystems

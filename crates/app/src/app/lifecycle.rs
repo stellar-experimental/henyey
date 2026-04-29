@@ -48,7 +48,13 @@ impl App {
                 self.ledger_manager.clone(),
                 persist_tx,
             );
-            let _result = self.catchup(CatchupTarget::Current, finalize).await?;
+            // Honor the operator's configured CATCHUP_COMPLETE /
+            // CATCHUP_RECENT policy on this no-state-startup fallback,
+            // matching the explicit run_cmd path. See #2104.
+            let mode = self.live_catchup_mode();
+            let _result = self
+                .catchup_with_mode(CatchupTarget::Current, mode, finalize)
+                .await?;
             if let Ok(ready) = persist_rx.try_recv() {
                 // Drive the persist task to completion before continuing.
                 // The persist task aborts the process on failure, so we only

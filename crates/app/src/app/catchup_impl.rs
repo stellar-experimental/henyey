@@ -12,21 +12,22 @@ impl App {
         target_checkpoint > latest_externalized as u32 && have_next_externalize
     }
 
-    /// Run catchup to a target ledger with minimal mode.
+    /// Returns the catchup mode configured for live recovery.
     ///
-    /// This downloads history from archives and applies it to bring the
-    /// node up to date with the network. Uses Minimal mode by default.
+    /// This is the single source of truth for honoring the operator's
+    /// `CATCHUP_COMPLETE` / `CATCHUP_RECENT` policy on online recovery
+    /// catchup paths (`spawn_catchup` and the no-state-startup fallback).
     ///
-    /// `finalize` specifies how post-catchup state (final header, HAS,
-    /// last_closed_ledger) is persisted — see [`CatchupFinalizer`]. It is
-    /// a required argument; there is no way to skip persistence.
-    pub async fn catchup(
-        &self,
-        target: CatchupTarget,
-        finalize: CatchupFinalizer,
-    ) -> anyhow::Result<CatchupResult> {
-        self.catchup_with_mode(target, CatchupMode::Minimal, finalize)
-            .await
+    /// Mirrors stellar-core's
+    /// `LedgerApplyManagerImpl::getCatchupCount()` —
+    /// `CATCHUP_COMPLETE ? UINT32_MAX : CATCHUP_RECENT` — which is
+    /// applied to every online catchup (`startCatchup({…,
+    /// CatchupConfiguration::Mode::ONLINE}, …)`). Henyey previously
+    /// hardcoded `CatchupMode::Minimal` on these paths, silently
+    /// downgrading the operator's configured replay coverage. See
+    /// issue #2104.
+    pub fn live_catchup_mode(&self) -> CatchupMode {
+        self.config().catchup.to_mode()
     }
 
     /// Run catchup to a target ledger with a specific mode.
@@ -4818,5 +4819,52 @@ mod tests {
         // catchup_in_progress stays false. With archive_behind → HardReset:
         let action = decide(false, MAX, TIMER, true);
         assert!(matches!(action, ConsensusStuckAction::HardReset(_)));
+    }
+
+    /// Regression for #2104: live recovery catchup must honor the
+    /// configured `CATCHUP_COMPLETE` policy, not silently downgrade to
+    /// `Minimal`. `App::live_catchup_mode` is the single source of truth
+    /// for the live-recovery (`spawn_catchup`) and no-state-startup
+    /// fallback paths.
+    #[tokio::test]
+    async fn test_live_catchup_mode_complete() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        config.catchup.complete = true;
+        let app = App::new(config).await.unwrap();
+
+        assert_eq!(app.live_catchup_mode(), CatchupMode::Complete);
+    }
+
+    /// Regression for #2104: `CATCHUP_RECENT = N` must reach the
+    /// live-recovery path with `Recent(N)`, not `Minimal`.
+    #[tokio::test]
+    async fn test_live_catchup_mode_recent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        config.catchup.recent = 12_345;
+        let app = App::new(config).await.unwrap();
+
+        assert_eq!(app.live_catchup_mode(), CatchupMode::Recent(12_345));
+    }
+
+    /// Default (unconfigured) operators must continue to see Minimal —
+    /// preserves the prior implicit default for the live-recovery path.
+    #[tokio::test]
+    async fn test_live_catchup_mode_minimal_default() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        assert_eq!(app.live_catchup_mode(), CatchupMode::Minimal);
     }
 }

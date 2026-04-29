@@ -1464,7 +1464,11 @@ impl App {
                 app.ledger_manager().clone(),
                 persist_tx,
             );
-            let catchup_result = app.catchup(target, finalize).await;
+            // Honor the operator's configured CATCHUP_COMPLETE /
+            // CATCHUP_RECENT policy on online recovery, matching
+            // stellar-core's getCatchupCount() behavior. See #2104.
+            let mode = app.live_catchup_mode();
+            let catchup_result = app.catchup_with_mode(target, mode, finalize).await;
 
             let persist_ready = match &catchup_result {
                 Ok(_) => persist_rx.try_recv().ok(),
