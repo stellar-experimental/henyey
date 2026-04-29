@@ -1503,3 +1503,69 @@ async fn get_events_budget_pagination() {
     let events = result["events"].as_array().expect("events");
     assert_eq!(events.len(), 1, "page 3 should have 1 event");
 }
+
+// ---------------------------------------------------------------------------
+// getEvents query-budget (max_event_query_ops) tests
+// ---------------------------------------------------------------------------
+
+/// Verify that exceeding max_event_query_ops returns JSON-RPC error -32002.
+#[tokio::test]
+async fn get_events_query_budget_exceeded_returns_error_code() {
+    // Use an absurdly low budget so the query is interrupted during a scan.
+    let app = FakeRpcApp::builder()
+        .ledger_seq(10)
+        .max_event_query_ops(100)
+        .build();
+    let h = FakeRpcTestHarness::start(app).await;
+    seed_ledger_header(h.app.database(), 2, 1_700_000_002);
+    seed_ledger_header(h.app.database(), 10, 1_700_000_010);
+
+    // Seed many events so the query requires significant VM ops.
+    let valid_xdr = valid_event_xdr_b64();
+    for i in 0..500u32 {
+        let event = EventRecord {
+            id: format!("{:019}-{:010}", (2u64) << 32, i),
+            ledger_seq: 2,
+            tx_index: i,
+            op_index: 0,
+            tx_hash: format!("tx_budget_exceeded_{i:04}"),
+            contract_id: None,
+            event_type: ContractEventType::Contract,
+            topics: vec![format!("topic-{}", i % 50)],
+            event_xdr: valid_xdr.clone(),
+            in_successful_contract_call: true,
+        };
+        h.app
+            .database()
+            .with_connection(|conn| conn.store_events(&[event]))
+            .unwrap();
+    }
+
+    // Query without a topic filter — forces a full table scan that will exceed
+    // the tight budget (the index only helps when topic1 is specified).
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "budget-exceeded",
+            "method": "getEvents",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 100 }
+            }
+        }))
+        .await;
+
+    assert_eq!(status, 200, "HTTP status should be 200 for JSON-RPC errors");
+    assert!(resp.get("result").is_none(), "should not have a result");
+    let error = &resp["error"];
+    assert_eq!(
+        error["code"].as_i64().unwrap(),
+        -32002,
+        "expected QUERY_BUDGET_EXCEEDED error code"
+    );
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("budget"),
+        "error message should mention budget: {message}"
+    );
+}
