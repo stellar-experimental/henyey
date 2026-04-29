@@ -623,7 +623,7 @@ impl OverlayManager {
             Arc::new(AtomicI64::new(0)),
             Arc::new(AtomicI64::new(0)),
             Arc::new(AtomicU32::new(
-                crate::flow_control::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+                crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
         )
     }
@@ -1802,7 +1802,7 @@ mod tests {
             metrics: Arc::new(OverlayMetrics::new()),
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
             max_tx_size_bytes: Arc::new(AtomicU32::new(
-                crate::flow_control::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+                crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
         }
     }
@@ -2315,7 +2315,7 @@ mod tests {
             metrics: Arc::new(OverlayMetrics::new()),
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
             max_tx_size_bytes: Arc::new(AtomicU32::new(
-                crate::flow_control::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+                crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
         };
 
@@ -2400,7 +2400,7 @@ mod tests {
             metrics: Arc::new(OverlayMetrics::new()),
             query_rate_limit_window_secs: Arc::new(AtomicU64::new(60)),
             max_tx_size_bytes: Arc::new(AtomicU32::new(
-                crate::flow_control::INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES,
+                crate::flow_control::DEFAULT_MAX_TX_SIZE_BYTES,
             )),
         };
         (shared, broadcast_rx, fetch_rx)

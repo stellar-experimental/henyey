@@ -57,6 +57,13 @@ pub const INITIAL_PEER_FLOOD_READING_CAPACITY_BYTES: u32 = 300_000;
 /// Matches stellar-core `INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES` (100 000).
 pub const INITIAL_FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES: u32 = 100_000;
 
+/// Default maximum transaction size in bytes (classic, non-Soroban).
+///
+/// Matches stellar-core `MAX_CLASSIC_TX_SIZE_BYTES` (100 KB = 102 400).
+/// Used as the startup default for `max_tx_size_bytes` before ledger state is read.
+/// The app layer updates this to the actual protocol-derived value on startup.
+pub const DEFAULT_MAX_TX_SIZE_BYTES: u32 = 100 * 1024;
+
 /// Compute the initial byte grant for flow control based on current max tx size.
 ///
 /// Mirrors stellar-core `OverlayManagerImpl::getFlowControlBytesTotal()`
