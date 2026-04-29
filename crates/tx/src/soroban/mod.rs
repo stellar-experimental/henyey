@@ -414,4 +414,84 @@ mod tests {
             "Error message must be preserved"
         );
     }
+
+    #[test]
+    fn test_guarded_hot_archive_get_returns_none_for_restored_key() {
+        use std::collections::HashSet;
+
+        let key = test_contract_data_key();
+        let mut restored = HashSet::new();
+        restored.insert(key.clone());
+
+        // Create a GuardedHotArchive with a NoHotArchive inner and the restored key.
+        let guarded = GuardedHotArchive::new(&NoHotArchive, &restored);
+
+        // Key is in restored set → get() returns Ok(None), never calling inner.
+        let result = guarded.get(&key).unwrap();
+        assert!(result.is_none(), "guarded key must return None");
+    }
+
+    #[test]
+    fn test_guarded_hot_archive_get_delegates_for_non_restored_key() {
+        use std::collections::HashSet;
+
+        let key = test_contract_data_key();
+        let restored = HashSet::new();
+
+        // Create a GuardedHotArchive with an empty restored set.
+        let guarded = GuardedHotArchive::new(&NoHotArchive, &restored);
+
+        // Key is NOT in restored set → get() delegates to inner.
+        // NoHotArchive always returns Ok(None), so result is None.
+        let result = guarded.get(&key).unwrap();
+        assert!(result.is_none(), "unguarded key delegates to inner");
+    }
+
+    #[test]
+    fn test_guarded_hot_archive_was_previously_restored() {
+        use std::collections::HashSet;
+
+        let key = test_contract_data_key();
+        let mut restored = HashSet::new();
+        restored.insert(key.clone());
+
+        // A key with a different ScVal value
+        let other_key = LedgerKey::ContractData(LedgerKeyContractData {
+            contract: ScAddress::Contract(ContractId(Hash([2u8; 32]))),
+            key: ScVal::U32(42),
+            durability: ContractDataDurability::Persistent,
+        });
+        let guarded = GuardedHotArchive::new(&NoHotArchive, &restored);
+
+        assert!(guarded.was_previously_restored(&key));
+        assert!(!guarded.was_previously_restored(&other_key));
+    }
+
+    #[test]
+    fn test_guarded_hot_archive_error_propagation() {
+        use std::collections::HashSet;
+
+        struct FailingHotArchive;
+        impl HotArchiveLookup for FailingHotArchive {
+            fn get(
+                &self,
+                _key: &LedgerKey,
+            ) -> std::result::Result<Option<LedgerEntry>, Box<dyn std::error::Error + Send + Sync>>
+            {
+                Err("simulated I/O error".into())
+            }
+        }
+
+        let key = test_contract_data_key();
+        let mut other_key = key.clone();
+        if let LedgerKey::ContractData(ref mut cd) = other_key {
+            cd.key = ScVal::U32(999);
+        }
+        let restored = HashSet::new();
+        let guarded = GuardedHotArchive::new(&FailingHotArchive, &restored);
+
+        // Non-restored key → delegates to inner → error propagates
+        let result = guarded.get(&other_key);
+        assert!(result.is_err(), "error must propagate for non-restored key");
+    }
 }

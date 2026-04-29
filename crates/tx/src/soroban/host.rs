@@ -2389,6 +2389,17 @@ mod tests {
             "Without guarded hot archive, no entry should be returned"
         );
 
+        // With empty restored set, hot archive entry is returned (pass-through).
+        let empty = HashSet::new();
+        let guarded_pass = crate::soroban::GuardedHotArchive::new(&hot_archive, &empty);
+        let adapter_pass =
+            LedgerSnapshotAdapterP25::with_hot_archive(&state, 100, Some(guarded_pass), None);
+        let result = adapter_pass.get_archived(&rc_key).unwrap();
+        assert!(
+            result.is_some(),
+            "With empty restored set, hot archive entry should be returned"
+        );
+
         // With key in previously_restored_keys, get_archived returns None.
         let mut restored = HashSet::new();
         restored.insert(key.clone());
