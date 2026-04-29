@@ -934,12 +934,13 @@ pub fn extract_transaction_set(meta: &LedgerCloseMeta) -> henyey_ledger::Transac
 ///
 /// # Example
 /// ```ignore
-/// let close_data = extract_ledger_close_data(&cdp_meta, prev_hash);
+/// let close_data = extract_ledger_close_data(&cdp_meta, prev_hash, Some(expected_hash));
 /// let result = ledger_manager.close_ledger(close_data)?;
 /// ```
 pub fn extract_ledger_close_data(
     meta: &LedgerCloseMeta,
     prev_ledger_hash: henyey_common::Hash256,
+    expected_header_hash: Option<henyey_common::Hash256>,
 ) -> henyey_ledger::LedgerCloseData {
     use henyey_ledger::LedgerCloseData;
     use stellar_xdr::curr::{LedgerUpgrade, Limits, ReadXdr};
@@ -957,14 +958,20 @@ pub fn extract_ledger_close_data(
         })
         .collect();
 
-    LedgerCloseData::new(
+    let mut data = LedgerCloseData::new(
         header.ledger_seq,
         tx_set,
         header.scp_value.close_time.0,
         prev_ledger_hash,
     )
     .with_upgrades(upgrades)
-    .with_stellar_value_ext(header.scp_value.ext.clone())
+    .with_stellar_value_ext(header.scp_value.ext.clone());
+
+    if let Some(hash) = expected_header_hash {
+        data = data.with_expected_header_hash(hash);
+    }
+
+    data
 }
 
 /// Extract evicted ledger keys from LedgerCloseMeta (V2 only).

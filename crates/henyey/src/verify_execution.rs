@@ -875,8 +875,8 @@ async fn verify_single_ledger(
         return Ok(());
     }
 
-    // Create LedgerCloseData from CDP
-    let close_data = extract_ledger_close_data(&lcm, *prev_ledger_hash);
+    // Create LedgerCloseData from CDP with expected header hash for pre-commit validation.
+    let close_data = extract_ledger_close_data(&lcm, *prev_ledger_hash, Some(verified_header_hash));
 
     // Execute via close_ledger
     let result = match ctx.ledger_manager.close_ledger(close_data, None) {

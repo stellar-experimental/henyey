@@ -244,6 +244,15 @@ impl CatchupManager {
             // Decode upgrades from the header's scp_value.upgrades
             let upgrades = decode_upgrades_from_header(data.header());
 
+            // Compute expected header hash from archive header for pre-commit validation.
+            let expected_hash = henyey_ledger::compute_header_hash(data.header()).map_err(|e| {
+                HistoryError::CatchupFailed(format!(
+                    "Failed to compute header hash for ledger {}: {}",
+                    data.header().ledger_seq,
+                    e
+                ))
+            })?;
+
             let close_data = LedgerCloseData::new(
                 data.header().ledger_seq,
                 data.tx_set(),
@@ -251,35 +260,24 @@ impl CatchupManager {
                 ledger_manager.current_header_hash(),
             )
             .with_stellar_value_ext(data.header().scp_value.ext.clone())
-            .with_upgrades(upgrades);
+            .with_upgrades(upgrades)
+            .with_expected_header_hash(expected_hash);
 
             let result = ledger_manager.close_ledger(close_data, None).map_err(|e| {
-                HistoryError::CatchupFailed(format!(
-                    "close_ledger failed at ledger {}: {}",
-                    data.header().ledger_seq,
-                    e
-                ))
-            })?;
-
-            // Verify computed header hash matches archive
-            if self.replay_config.verify_bucket_list {
-                let expected_hash =
-                    henyey_ledger::compute_header_hash(data.header()).map_err(|e| {
-                        HistoryError::CatchupFailed(format!(
-                            "Failed to compute header hash for ledger {}: {}",
-                            data.header().ledger_seq,
-                            e
-                        ))
-                    })?;
-                if result.header_hash != expected_hash {
-                    return Err(HistoryError::CatchupFailed(format!(
-                        "Header hash mismatch at ledger {}: computed={}, expected={}",
+                if matches!(e, henyey_ledger::LedgerError::HashMismatch { .. }) {
+                    HistoryError::VerificationFailed(format!(
+                        "Header hash mismatch at ledger {}: {}",
                         data.header().ledger_seq,
-                        result.header_hash.to_hex(),
-                        expected_hash.to_hex()
-                    )));
+                        e
+                    ))
+                } else {
+                    HistoryError::CatchupFailed(format!(
+                        "close_ledger failed at ledger {}: {}",
+                        data.header().ledger_seq,
+                        e
+                    ))
                 }
-            }
+            })?;
 
             // Emit metadata to SQLite and external consumers (e.g., stellar-rpc's
             // meta pipe in bounded replay mode: `catchup --metadata-output-stream fd:3`).

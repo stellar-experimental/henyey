@@ -5287,6 +5287,18 @@ impl LedgerCloseContext<'_> {
         )?;
         let header_us = header_start.elapsed().as_micros() as u64;
 
+        // Validate expected header hash before committing state (replay mode).
+        // When set, this prevents LCL corruption on hash mismatch by failing
+        // before commit_close mutates LedgerManagerState.
+        if let Some(expected_hash) = &self.close_data.expected_header_hash {
+            if header_hash != *expected_hash {
+                return Err(LedgerError::HashMismatch {
+                    expected: expected_hash.to_hex(),
+                    actual: header_hash.to_hex(),
+                });
+            }
+        }
+
         // Record stats (counts were already computed during categorize_for_bucket_update)
         self.stats.record_entry_changes(
             bucket_created_count,
@@ -8051,6 +8063,118 @@ mod tests {
         assert_eq!(
             snapshot.hash, snapshot_expected,
             "header_snapshot() hash is stale"
+        );
+    }
+
+    /// Rejects close_ledger when expected_header_hash does not match
+    /// the computed header hash. Verifies pre-commit validation prevents
+    /// LCL corruption on hash mismatch.
+    #[tokio::test]
+    async fn test_close_ledger_rejects_wrong_expected_header_hash() {
+        use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let network_id = "Test SDF Network ; September 2015".to_string();
+        let manager = LedgerManager::new(
+            network_id.clone(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive = henyey_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        manager
+            .initialize(bucket_list, hot_archive, header.clone(), header_hash)
+            .expect("initialize should succeed");
+
+        let close_time = header.scp_value.close_time.0 + 1;
+        let close_data = LedgerCloseData::new(
+            2,
+            TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: header_hash.into(),
+                txs: VecM::default(),
+            }),
+            close_time,
+            header_hash,
+        )
+        .with_expected_header_hash(Hash256::ZERO);
+
+        let result = manager.close_ledger(close_data, None);
+        assert!(
+            result.is_err(),
+            "close_ledger with wrong expected header hash should fail"
+        );
+        let err = result.unwrap_err();
+        match err {
+            LedgerError::HashMismatch { expected, actual } => {
+                assert_eq!(expected, Hash256::ZERO.to_hex());
+                assert!(!actual.is_empty(), "actual hash should be non-empty");
+            }
+            other => panic!("expected HashMismatch, got {other:?}"),
+        }
+
+        // LCL should NOT have been corrupted — it's still at ledger 1.
+        assert_eq!(
+            manager.current_ledger_seq(),
+            1,
+            "LCL should not advance when commit rejects hash mismatch"
+        );
+        assert_eq!(
+            manager.current_header_hash(),
+            header_hash,
+            "LCL hash should not change when commit rejects hash mismatch"
+        );
+    }
+
+    /// close_ledger with expected_header_hash=None (live path) proceeds normally.
+    #[tokio::test]
+    async fn test_close_ledger_accepts_none_expected_header_hash() {
+        use henyey_common::protocol::CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let network_id = "Test SDF Network ; September 2015".to_string();
+        let manager = LedgerManager::new(
+            network_id.clone(),
+            LedgerManagerConfig {
+                validate_bucket_hash: false,
+                ..Default::default()
+            },
+        );
+
+        let mut header = create_genesis_header();
+        header.ledger_seq = 1;
+        header.ledger_version = CURRENT_LEDGER_PROTOCOL_VERSION;
+
+        let bucket_list = henyey_bucket::BucketList::new();
+        let hot_archive = henyey_bucket::HotArchiveBucketList::new();
+        let header_hash = crate::compute_header_hash(&header).expect("hash");
+
+        manager
+            .initialize(bucket_list, hot_archive, header.clone(), header_hash)
+            .expect("initialize should succeed");
+
+        let close_time = header.scp_value.close_time.0 + 1;
+        let close_data = LedgerCloseData::new(
+            2,
+            TransactionSetVariant::Classic(TransactionSet {
+                previous_ledger_hash: header_hash.into(),
+                txs: VecM::default(),
+            }),
+            close_time,
+            header_hash,
+        );
+
+        // expected_header_hash defaults to None — no pre-commit validation
+        let result = manager.close_ledger(close_data, None);
+        assert!(
+            result.is_ok(),
+            "close_ledger with None expected_header_hash should succeed"
         );
     }
 }

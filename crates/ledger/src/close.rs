@@ -153,6 +153,16 @@ pub struct LedgerCloseData {
     /// When true, skip per-TX hashing and sorting in prepare_with_hash.
     /// Only safe when the TX set stages are already in final execution order.
     pub presorted: SortState,
+
+    /// Expected header hash for replay-mode validation.
+    ///
+    /// When `Some`, `close_ledger` validates the computed header hash against
+    /// this value **before** committing state to `LedgerManagerState`. This
+    /// prevents state corruption when replay produces a divergent header.
+    ///
+    /// Set by catchup-replay and offline verify-execution callers; `None` for
+    /// live SCP-sourced ledger closes.
+    pub expected_header_hash: Option<Hash256>,
 }
 
 impl LedgerCloseData {
@@ -171,9 +181,20 @@ impl LedgerCloseData {
             scp_history: Vec::new(),
             prev_ledger_hash,
             stellar_value_ext: StellarValueExt::Basic,
+            expected_header_hash: None,
             cached_tx_set_hash: std::cell::OnceCell::new(),
             presorted: SortState::NeedsSorting,
         }
+    }
+
+    /// Set the expected header hash for replay-mode validation.
+    ///
+    /// When set, `close_ledger` validates the computed header hash against
+    /// this value before committing state. Use this for catchup-replay and
+    /// offline verify-execution paths.
+    pub fn with_expected_header_hash(mut self, hash: Hash256) -> Self {
+        self.expected_header_hash = Some(hash);
+        self
     }
 
     /// Add a protocol upgrade.
