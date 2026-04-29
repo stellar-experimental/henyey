@@ -1381,16 +1381,20 @@ impl ScpDriver {
                 // EXTERNALIZE to SCP immediately for faster tracking advance
                 // (see process_scp_envelope). Return MaybeValidDeferred so
                 // SCP can still externalize the slot while the tx_set fetch
-                // completes, WITHOUT clearing the slot's fully_validated flag.
+                // completes. MaybeValidDeferred clears fully_validated; the
+                // paired restoration in Herder::cache_tx_set (via
+                // resolve_missing_tx_set) restores it when the tx_set arrives.
                 //
                 // Returning ValidationLevel::MaybeValid here was the root cause
-                // of issue #1795: the ballot protocol's MaybeValid handler
-                // cleared fully_validated (matching stellar-core parity), but
-                // stellar-core never actually reaches this code path with a
-                // missing tx_set — its PendingEnvelopes buffering ensures the
-                // tx_set is always present by the time validateValue runs. See
-                // the `ValidationLevel::MaybeValidDeferred` doc comment for
-                // the complete rationale (issues #1795 and #1798).
+                // of issue #1795: MaybeValid cleared fully_validated with no
+                // restoration mechanism. MaybeValidDeferred also clears it, but
+                // comes with a deferred-cause tracking + restoration contract
+                // (see `DeferredCauses` and `Slot::restore_fully_validated`).
+                // stellar-core never reaches this code path with a missing
+                // tx_set — its PendingEnvelopes buffering ensures the tx_set
+                // is always present by the time validateValue runs. See the
+                // `ValidationLevel::MaybeValidDeferred` doc comment for the
+                // complete rationale (issues #1795 and #1798).
                 if !nomination {
                     // Record the deferred slot so the herder can restore
                     // fully_validated when the tx_set arrives. Restoration
@@ -4370,8 +4374,9 @@ mod tests {
     /// envelope for the future slot whose `tracking_index == slot_index`
     /// drains through the fast-path before apply catches up. This must
     /// return `MaybeValidDeferred` — NOT plain `MaybeValid` — so the
-    /// ballot protocol does not clear `Slot::fully_validated` and
-    /// suppress the local EXTERNALIZE.
+    /// deferred-cause restoration mechanism can restore `fully_validated`
+    /// when LCL catches up (via `Herder::ledger_closed` →
+    /// `resolve_apply_lag_for_next_index`).
     ///
     /// This is the regression test for issue #1798. See the
     /// `ValidationLevel::MaybeValidDeferred` doc comment for the full

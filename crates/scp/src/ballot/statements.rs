@@ -535,8 +535,9 @@ pub fn get_companion_quorum_set_hash(statement: &ScpStatement) -> Option<henyey_
 /// statement to `Invalid`; any `MaybeValid` forces to `MaybeValid`
 /// (which clears `fully_validated` via
 /// `BallotProtocol::process_envelope`); any `MaybeValidDeferred`
-/// forces to `MaybeValidDeferred` (which does NOT clear
-/// `fully_validated`); otherwise `FullyValidated`.
+/// forces to `MaybeValidDeferred` (which clears `fully_validated` with
+/// deferred restoration via `Slot::restore_fully_validated`); otherwise
+/// `FullyValidated`.
 ///
 /// Placing `MaybeValid` stricter than `MaybeValidDeferred` guarantees
 /// that a genuine MaybeValid (past-slot, not-tracking, etc.) in any
