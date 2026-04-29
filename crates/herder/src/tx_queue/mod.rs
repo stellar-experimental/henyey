@@ -380,8 +380,23 @@ impl QueuedTransaction {
         let hash = Hash256::hash_xdr(&envelope);
 
         let (total_fee, inclusion_fee, op_count) = Self::extract_fees_and_ops(&envelope)?;
+        // `fee_per_op` is the inclusion-fee per op, used by
+        // `ordered_hashes_by_fee` for ranking.  Using inclusion fee (not
+        // total fee) matches the rest of the queue's fee-rate metrics
+        // (`fee_rate_cmp`, `better_fee_ratio`, etc.) and stellar-core's
+        // `computePerOpFee`, which calls `tx.getInclusionFee()`
+        // (`stellar-core/src/herder/TxSetFrame.cpp:213-223`). For classic
+        // (non-Soroban) txs, `inclusion_fee == total_fee`, so this is a
+        // no-op in the classic path.
+        //
+        // `extract_fees_and_ops` already rejects negative inclusion fees;
+        // `inclusion_fee >= 0` is invariant here.
         let fee_per_op = if op_count > 0 {
-            total_fee / op_count as u64
+            debug_assert!(
+                inclusion_fee >= 0,
+                "inclusion_fee must be non-negative here"
+            );
+            inclusion_fee as u64 / op_count as u64
         } else {
             0
         };
@@ -1971,12 +1986,34 @@ impl TransactionQueue {
             return TxQueueResult::Filtered;
         }
 
-        // Check fee
-        let min_fee_per_op = {
+        // Check fee.
+        //
+        // Mirrors stellar-core TransactionFrame::commonValid (chargeFee path)
+        // at TransactionFrame.cpp:1482-1487:
+        //   getInclusionFee() < getMinInclusionFee(*this, header.current())
+        //   ⇒ txINSUFFICIENT_FEE
+        //
+        // At admission time the Soroban-phase component base fee is unknown
+        // (it's set by the nomination builder), so we use only the LCL base
+        // fee — same as stellar-core which passes std::nullopt for baseFee.
+        //
+        // `min_fee_per_op` is preserved as a node-local floor on top of LCL.
+        //
+        // Regression: AUDIT-214 (#2103). Previously this gate compared
+        // `total_fee / op_count` against `base_fee`, which let
+        // resource-fee-heavy Soroban transactions (with `inclusion_fee == 0`)
+        // through admission only to be rejected by the herder's own
+        // `check_fee_map` after nomination.
+        let lcl_base_fee = {
             let ctx = self.validation_context.read();
-            ctx.base_fee.max(self.config.min_fee_per_op) as u64
+            ctx.base_fee.max(self.config.min_fee_per_op) as i64
         };
-        if queued.fee_per_op < min_fee_per_op {
+        // queued.op_count is computed by envelope_operation_count, the same
+        // function `frame.resource_operation_count()` calls (returning
+        // inner+1 for fee-bumps), so we don't need to construct a frame.
+        let required_inclusion_fee =
+            lcl_base_fee.saturating_mul(std::cmp::max(1i64, queued.op_count as i64));
+        if queued.inclusion_fee < required_inclusion_fee {
             return TxQueueResult::FeeTooLow;
         }
 
@@ -6498,20 +6535,139 @@ mod tests {
         }
     }
 
-    /// Soroban transaction with resource_fee == total_fee is valid (inclusion_fee = 0).
+    /// Soroban transaction with resource_fee == total_fee has
+    /// `inclusion_fee == 0` and is rejected by the inclusion-fee
+    /// admission gate.
+    ///
+    /// Parity: stellar-core `TransactionFrame::commonValid` chargeFee path
+    /// at `TransactionFrame.cpp:1482-1487` rejects with
+    /// `txINSUFFICIENT_FEE` when `getInclusionFee() < getMinInclusionFee`.
+    ///
+    /// Regression test for AUDIT-214 (#2103). Previously henyey accepted
+    /// such transactions because admission compared `total_fee / op_count`
+    /// against `base_fee` rather than inclusion fee against
+    /// `min_inclusion_fee`, causing the herder to nominate tx sets that
+    /// failed its own `check_fee_map` and were rejected by stellar-core
+    /// peers.
     #[test]
-    fn test_soroban_resource_fee_equals_total_fee_accepted() {
+    fn test_soroban_zero_inclusion_fee_rejected() {
         let queue = TransactionQueue::with_defaults();
-        let mut envelope = make_soroban_envelope_with_resources(500, 100);
-        if let TransactionEnvelope::Tx(ref mut env) = envelope {
-            if let TransactionExt::V1(ref mut data) = env.tx.ext {
-                data.resource_fee = 500; // == total_fee
-            }
-        }
-        set_source(&mut envelope, 131);
+        // fee=500, resource_fee=500 → inclusion_fee=0 < min=100
+        // (base_fee=100 from with_defaults, op_count=1).
+        let envelope = make_soroban_envelope_with_resource_fee(500, 500, 100);
+        assert_eq!(queue.try_add(envelope), TxQueueResult::FeeTooLow);
+    }
 
-        // Should be accepted (inclusion_fee = 0, which is valid)
+    /// Soroban tx with `inclusion_fee < base_fee * op_count` is rejected.
+    /// Regression test for AUDIT-214 (#2103).
+    #[test]
+    fn test_soroban_low_inclusion_fee_rejected() {
+        let queue = TransactionQueue::with_defaults();
+        // fee=550, resource_fee=500 → inclusion_fee=50 < min=100
+        let envelope = make_soroban_envelope_with_resource_fee(550, 500, 100);
+        assert_eq!(queue.try_add(envelope), TxQueueResult::FeeTooLow);
+    }
+
+    /// Soroban tx with `inclusion_fee == base_fee * op_count` is accepted
+    /// (boundary case for AUDIT-214 (#2103)).
+    #[test]
+    fn test_soroban_inclusion_fee_at_minimum_accepted() {
+        let queue = TransactionQueue::with_defaults();
+        // fee=600, resource_fee=500 → inclusion_fee=100 == min=100
+        let envelope = make_soroban_envelope_with_resource_fee(600, 500, 100);
         assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
+    }
+
+    /// Fee-bump wrapping a Soroban inner tx with zero outer inclusion fee
+    /// is rejected. Parity:
+    /// `FeeBumpTransactionFrame::getInclusionFee()` at
+    /// `FeeBumpTransactionFrame.cpp:514-522` returns
+    /// `getFullFee() - declaredSorobanResourceFee()`, where
+    /// `declaredSorobanResourceFee` delegates to the inner Soroban tx
+    /// (`FeeBumpTransactionFrame.cpp:507-512`).
+    ///
+    /// Regression test for AUDIT-214 (#2103).
+    #[test]
+    fn test_fee_bump_soroban_zero_inclusion_rejected() {
+        let queue = TransactionQueue::with_defaults();
+        // Inner Soroban tx has resource_fee=500. The outer envelope's
+        // declaredSorobanResourceFee delegates to the inner, so the outer
+        // inclusion_fee = outer_fee - inner_resource_fee.
+        let inner_env = make_soroban_envelope_with_resource_fee(500, 500, 100);
+        let inner_v1 = match inner_env {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected V1 envelope"),
+        };
+        // outer fee = 500 = inner resource fee → outer inclusion_fee = 0.
+        let fb = make_fee_bump_envelope(inner_v1, 200, 500);
+        assert_eq!(queue.try_add(fb), TxQueueResult::FeeTooLow);
+    }
+
+    /// Roundtrip regression for AUDIT-214 (#2103): an admitted Soroban
+    /// transaction must produce a tx set whose every phase passes
+    /// `check_fee_map`. This guards against admission and tx-set
+    /// validation drifting apart on inclusion-fee semantics.
+    #[test]
+    fn test_admitted_soroban_tx_passes_check_fee_map() {
+        use crate::tx_set_utils::check_fee_map;
+
+        let queue = TransactionQueue::with_defaults();
+        let envelope = make_soroban_envelope_with_resource_fee(600, 500, 100);
+        assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
+
+        let tx_set = queue.build_generalized_tx_set(Hash256::ZERO, 1000);
+        let gen = tx_set
+            .generalized_tx_set()
+            .expect("generalized tx set")
+            .clone();
+        let GeneralizedTransactionSet::V1(v1) = gen;
+        let lcl_base_fee = queue.validation_context.read().base_fee;
+        for phase in v1.phases.iter() {
+            assert!(
+                check_fee_map(phase, lcl_base_fee),
+                "every phase must pass check_fee_map after the fix"
+            );
+        }
+    }
+
+    /// Negative roundtrip for AUDIT-214 (#2103): a zero-inclusion Soroban
+    /// transaction is rejected at admission and never reaches the built
+    /// tx set, so it cannot trigger the herder's own `check_fee_map`
+    /// rejection.
+    #[test]
+    fn test_zero_inclusion_soroban_never_reaches_tx_set() {
+        let queue = TransactionQueue::with_defaults();
+        let envelope = make_soroban_envelope_with_resource_fee(500, 500, 100);
+        assert_eq!(queue.try_add(envelope), TxQueueResult::FeeTooLow);
+
+        let tx_set = queue.build_generalized_tx_set(Hash256::ZERO, 1000);
+        let gen = tx_set
+            .generalized_tx_set()
+            .expect("generalized tx set")
+            .clone();
+        let GeneralizedTransactionSet::V1(v1) = gen;
+        let total: usize = v1.phases.iter().map(audit_214_phase_tx_count).sum();
+        assert_eq!(total, 0, "rejected tx must not appear in built tx set");
+    }
+
+    /// Helper for AUDIT-214 (#2103) tests: count txs in a phase.
+    fn audit_214_phase_tx_count(phase: &TransactionPhase) -> usize {
+        use stellar_xdr::curr::TxSetComponent;
+        match phase {
+            TransactionPhase::V0(components) => components
+                .iter()
+                .map(|c| {
+                    let TxSetComponent::TxsetCompTxsMaybeDiscountedFee(d) = c;
+                    d.txs.len()
+                })
+                .sum(),
+            TransactionPhase::V1(parallel) => parallel
+                .execution_stages
+                .iter()
+                .flat_map(|stage| stage.iter())
+                .map(|cluster| cluster.len())
+                .sum(),
+        }
     }
 
     // =========================================================================

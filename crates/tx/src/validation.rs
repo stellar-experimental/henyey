@@ -218,11 +218,15 @@ pub enum ValidationError {
         actual: i64,
     },
     /// Transaction fee is below the minimum required.
+    ///
+    /// Fields are `i64` to match stellar-core's inclusion-fee semantics
+    /// (`TransactionFrame::getInclusionFee()` returns `int64_t`) and
+    /// to align with `FeeBumpInsufficientFee` below.
     InsufficientFee {
-        /// Minimum required fee in stroops.
-        required: u32,
-        /// Fee provided in the transaction.
-        provided: u32,
+        /// Minimum required inclusion fee in stroops.
+        required: i64,
+        /// Inclusion fee provided in the transaction.
+        provided: i64,
     },
     /// Source account does not exist in the ledger.
     SourceAccountNotFound,
@@ -432,20 +436,30 @@ fn validate_extra_signers(
 
 /// Validate transaction fee.
 ///
-/// Checks that the fee meets the minimum required fee based on operation count.
+/// Mirrors stellar-core `TransactionFrame::commonValid` (chargeFee path)
+/// at `TransactionFrame.cpp:1482-1487`, which rejects with
+/// `txINSUFFICIENT_FEE` when
+/// `getInclusionFee() < getMinInclusionFee(*this, header.current())`.
+///
+/// `frame.min_inclusion_fee` uses `resource_operation_count()` —
+/// `inner_ops + 1` for fee-bumps, matching
+/// `FeeBumpTransactionFrame::getNumOperations()`
+/// (`stellar-core/src/transactions/FeeBumpTransactionFrame.cpp:594-598`).
+///
+/// Regression: AUDIT-214 (#2103). The previous implementation compared
+/// `frame.fee()` (total fee) against `op_count * base_fee` (using inner
+/// op count, not resource op count), which (a) accepted Soroban
+/// transactions with `resource_fee == fee` (and therefore inclusion fee
+/// zero) and (b) used the wrong op count for fee-bumps.
 pub fn validate_fee(
     frame: &TransactionFrame,
     context: &LedgerContext,
 ) -> std::result::Result<(), ValidationError> {
-    let op_count = frame.operation_count() as u32;
-    let required_fee = op_count.saturating_mul(context.base_fee);
-    let provided_fee = frame.fee();
+    let required = frame.min_inclusion_fee(context.base_fee as i64);
+    let provided = frame.inclusion_fee();
 
-    if provided_fee < required_fee {
-        return Err(ValidationError::InsufficientFee {
-            required: required_fee,
-            provided: provided_fee,
-        });
+    if provided < required {
+        return Err(ValidationError::InsufficientFee { required, provided });
     }
 
     Ok(())
