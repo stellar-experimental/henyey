@@ -90,7 +90,7 @@ pub enum FailureSafety {
 }
 
 /// Threshold validation level, matching stellar-core's `ValidationThresholdLevels`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationThresholdLevel {
     /// Simple majority: n - (n-1)/2. Used for single-domain auto-generated quorum sets.
     SimpleMajority,

@@ -584,12 +584,10 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     // auto-generated set unless UNSAFE_QUORUM=true (Config.cpp:2087-2099).
     if has_validators_section && has_manual_quorum_set {
         if let Some(ref auto_qset) = auto_generated_qset {
-            // Compare canonicalized representations: sorted validators + threshold.
-            let mut auto_validators = auto_qset.validators.clone();
-            auto_validators.sort();
-            let mut manual_validators = config.node.quorum_set.validators.clone();
-            manual_validators.sort();
-            let sets_differ = auto_validators != manual_validators
+            // Compare in declaration order (no sorting). stellar-core compares
+            // serialized qset strings which are order-sensitive
+            // (Config.cpp:2087-2099).
+            let sets_differ = auto_qset.validators != config.node.quorum_set.validators
                 || auto_qset.threshold_percent != config.node.quorum_set.threshold_percent;
 
             if sets_differ && !unsafe_quorum {
@@ -608,9 +606,11 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         ValidationThresholdLevel::ByzantineFaultTolerance
     } else {
         // Auto-generated from [[VALIDATORS]]: use BFT if >1 unique home domain.
+        // Validators without HOME_DOMAIN count as empty-string domain, matching
+        // stellar-core's mHomeDomain behavior (Config.cpp:674-687).
         let unique_domains: HashSet<&str> = validator_entries
             .iter()
-            .filter_map(|(_, _, domain, _)| domain.as_deref())
+            .map(|(_, _, domain, _)| domain.as_deref().unwrap_or(""))
             .collect();
         if unique_domains.len() > 1 {
             ValidationThresholdLevel::ByzantineFaultTolerance
@@ -2778,5 +2778,82 @@ FLOOD_ADVERT_PERIOD_MS=-1
         // Native henyey config has no compat_quorum_safety
         let config = crate::config::AppConfig::testnet();
         assert!(config.compat_quorum_safety.is_none());
+    }
+
+    #[test]
+    fn test_reordered_manual_quorum_set_rejected_without_unsafe() {
+        // Manual [QUORUM_SET] with same validators in different order is
+        // rejected without UNSAFE_QUORUM, matching stellar-core's
+        // order-sensitive serialized comparison (Config.cpp:2087-2099).
+        let cfg = compat_validator_config(
+            r#"
+            [[VALIDATORS]]
+            PUBLIC_KEY = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            NAME = "v1"
+            HOME_DOMAIN = "a.org"
+            [[VALIDATORS]]
+            PUBLIC_KEY = "GBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            NAME = "v2"
+            HOME_DOMAIN = "b.org"
+            [[VALIDATORS]]
+            PUBLIC_KEY = "GCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            NAME = "v3"
+            HOME_DOMAIN = "c.org"
+            [[VALIDATORS]]
+            PUBLIC_KEY = "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            NAME = "v4"
+            HOME_DOMAIN = "d.org"
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 67
+            VALIDATORS = [
+                "GBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                "GCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            ]
+            "#,
+        );
+        let err = translate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("UNSAFE_QUORUM"),
+            "Expected UNSAFE_QUORUM gate for reordered qset, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_mixed_home_domain_uses_bft_threshold() {
+        // Validators with missing HOME_DOMAIN count as empty-string domain,
+        // so a mix of present + missing HOME_DOMAIN gives >1 unique domain
+        // and triggers BFT threshold validation.
+        let cfg = compat_validator_config(
+            r#"
+            FAILURE_SAFETY = 1
+            [[VALIDATORS]]
+            PUBLIC_KEY = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            NAME = "v1"
+            HOME_DOMAIN = "a.org"
+            [[VALIDATORS]]
+            PUBLIC_KEY = "GBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            NAME = "v2"
+            [[VALIDATORS]]
+            PUBLIC_KEY = "GCAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            NAME = "v3"
+            HOME_DOMAIN = "a.org"
+            [[VALIDATORS]]
+            PUBLIC_KEY = "GDAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+            NAME = "v4"
+            HOME_DOMAIN = "a.org"
+            [HISTORY.testnet2]
+            get = "curl -sf https://history.stellar.org/prd/core-testnet/core_testnet_001/{0} -o {1}"
+            "#,
+        );
+        let app_config = translate(&cfg).unwrap();
+        // Should use BFT because we have 2 unique domains: "a.org" and ""
+        let safety = app_config.compat_quorum_safety.as_ref().unwrap();
+        assert_eq!(
+            safety.threshold_level,
+            crate::config::ValidationThresholdLevel::ByzantineFaultTolerance,
+            "Mixed HOME_DOMAIN validators should use BFT threshold"
+        );
     }
 }
