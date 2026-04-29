@@ -76,6 +76,7 @@ const SUPPORTED_KEYS: &[&str] = &[
     "FLOOD_ADVERT_PERIOD_MS",
     "FAILURE_SAFETY",
     "UNSAFE_QUORUM",
+    "SURVEYOR_KEYS",
 ];
 
 /// Valid stellar-core keys that henyey intentionally does not support.
@@ -285,6 +286,26 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
                 "Compat config key value must be >= 1"
             );
         }
+    }
+    // SURVEYOR_KEYS: security-sensitive — strict validation instead of
+    // get_string_array (which silently drops non-string elements and could
+    // leave the list empty, widening survey access to the full quorum).
+    if let Some(val) = table.get("SURVEYOR_KEYS") {
+        let arr = val.as_array().ok_or_else(|| {
+            anyhow::anyhow!("SURVEYOR_KEYS must be an array, got: {}", val.type_str())
+        })?;
+        let mut keys = Vec::with_capacity(arr.len());
+        for (i, elem) in arr.iter().enumerate() {
+            let s = elem.as_str().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "SURVEYOR_KEYS[{}] must be a string, got: {}",
+                    i,
+                    elem.type_str()
+                )
+            })?;
+            keys.push(s.to_string());
+        }
+        config.overlay.surveyor_keys = keys;
     }
 
     // --- Metadata ---
@@ -2854,6 +2875,82 @@ FLOOD_ADVERT_PERIOD_MS=-1
             safety.threshold_level,
             crate::config::ValidationThresholdLevel::ByzantineFaultTolerance,
             "Mixed HOME_DOMAIN validators should use BFT threshold"
+        );
+    }
+
+    #[test]
+    fn test_translate_surveyor_keys() {
+        let cfg = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/stellar-core.db"
+            UNSAFE_QUORUM = true
+            SURVEYOR_KEYS = [
+                "GDEX3JU2AUGVPQFGFKMEOGHEUQ4YGRIYDJIKQSC7QLHAJ4RV63MJKGAS",
+                "GCGB2S2KBER5MNQNJTNF5N3Y4PEPFMHONPIGXNOYIREMYCMJZ3GAVDXQ"
+            ]
+            "#
+        );
+        let app_config = translate(&cfg).unwrap();
+        assert_eq!(app_config.overlay.surveyor_keys.len(), 2);
+        assert_eq!(
+            app_config.overlay.surveyor_keys[0],
+            "GDEX3JU2AUGVPQFGFKMEOGHEUQ4YGRIYDJIKQSC7QLHAJ4RV63MJKGAS"
+        );
+        assert_eq!(
+            app_config.overlay.surveyor_keys[1],
+            "GCGB2S2KBER5MNQNJTNF5N3Y4PEPFMHONPIGXNOYIREMYCMJZ3GAVDXQ"
+        );
+    }
+
+    #[test]
+    fn test_translate_surveyor_keys_empty() {
+        let cfg = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/stellar-core.db"
+            UNSAFE_QUORUM = true
+            SURVEYOR_KEYS = []
+            "#
+        );
+        let app_config = translate(&cfg).unwrap();
+        assert!(app_config.overlay.surveyor_keys.is_empty());
+    }
+
+    #[test]
+    fn test_translate_surveyor_keys_rejects_non_string() {
+        let cfg = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/stellar-core.db"
+            UNSAFE_QUORUM = true
+            SURVEYOR_KEYS = ["GDEX3JU2AUGVPQFGFKMEOGHEUQ4YGRIYDJIKQSC7QLHAJ4RV63MJKGAS", 42]
+            "#
+        );
+        let err = translate(&cfg).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("SURVEYOR_KEYS[1] must be a string"),
+            "Expected type error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_translate_surveyor_keys_rejects_non_array() {
+        let cfg = format!(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/stellar-core.db"
+            UNSAFE_QUORUM = true
+            SURVEYOR_KEYS = "GDEX3JU2AUGVPQFGFKMEOGHEUQ4YGRIYDJIKQSC7QLHAJ4RV63MJKGAS"
+            "#
+        );
+        let err = translate(&cfg).unwrap_err();
+        assert!(
+            err.to_string().contains("SURVEYOR_KEYS must be an array"),
+            "Expected array error, got: {}",
+            err
         );
     }
 }

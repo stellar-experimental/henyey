@@ -251,7 +251,7 @@ Features not yet implemented. These ARE counted against parity %.
 - **Event loop stability**: Multiple event loop freeze bugs identified and fixed (February 2026): blocking flood demand sends, unbounded buffered ledger close loops, blocking bucket GC during catchup, and SCP drain starvation.
 - **Post-catchup convergence**: Fixed several convergence failures including dead loops targeting stale checkpoints, deadlocks from frozen `latest_externalized`, and SCP EXTERNALIZE envelope emission for validator nodes (March–April 2026).
 - **TX queue parity**: Implemented stellar-core `updateQueue` semantics with correct invalidation and revalidation ordering (March 2026).
-- **Audit fixes**: Resolved audit findings including config passphrase matching, quorum threshold rounding, unsolicited quorum set rejection, and compat config validator entry validation (March–April 2026).
+- **Audit fixes**: Resolved audit findings including config passphrase matching, quorum threshold rounding, unsolicited quorum set rejection, compat config validator entry validation, and compat `SURVEYOR_KEYS` translation (March–April 2026).
 - **Survey protocol**: Time-sliced surveys successfully collect and report topology data from testnet peers.
 
 ## Parity Calculation
