@@ -650,8 +650,14 @@ impl App {
         // Use non-blocking try_send_to to avoid stalling the event loop
         // when the peer's outbound channel is full.  The peer will re-request
         // any transactions it still needs.
+        //
+        // Match stellar-core: only send Transaction messages for found hashes.
+        // Do NOT send DontHave for unfulfilled demands — stellar-core just
+        // logs/meters misses without any outbound response.
         let mut sent = 0u32;
         let mut dropped = 0u32;
+        let mut banned = 0u32;
+        let mut unknown = 0u32;
         for hash in demand.tx_hashes.0.iter() {
             let hash256 = Hash256::from(hash.clone());
             if let Some(tx) = self.herder.tx_queue().get(&hash256) {
@@ -665,27 +671,21 @@ impl App {
                         break; // Channel full — stop sending to this peer
                     }
                 }
+            } else if self.herder.tx_queue().is_banned(&hash256) {
+                banned += 1;
             } else {
-                let dont_have = DontHave {
-                    type_: MessageType::Transaction,
-                    req_hash: stellar_xdr::curr::Uint256(hash.0),
-                };
-                if overlay
-                    .try_send_to(peer_id, StellarMessage::DontHave(dont_have))
-                    .is_err()
-                {
-                    dropped += 1;
-                    break;
-                }
+                unknown += 1;
             }
         }
-        if dropped > 0 {
+        if sent > 0 || dropped > 0 || banned > 0 || unknown > 0 {
             tracing::debug!(
                 peer = %peer_id,
                 sent,
                 dropped,
+                banned,
+                unknown,
                 total = demand.tx_hashes.0.len(),
-                "Flood demand partially served (peer outbound channel full)"
+                "Flood demand served"
             );
         }
     }

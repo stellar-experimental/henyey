@@ -91,8 +91,8 @@ use henyey_scp::hash_quorum_set;
 use henyey_tx::{envelope_sequence_number, TransactionFrame};
 use henyey_work::{WorkScheduler, WorkSchedulerConfig, WorkState};
 use stellar_xdr::curr::{
-    Curve25519Public, DontHave, EncryptedBody, FloodAdvert, FloodDemand, Hash, LedgerCloseMeta,
-    LedgerScpMessages, MessageType, ReadXdr, ScpEnvelope, ScpHistoryEntry, ScpHistoryEntryV0,
+    Curve25519Public, EncryptedBody, FloodAdvert, FloodDemand, Hash, LedgerCloseMeta,
+    LedgerScpMessages, ReadXdr, ScpEnvelope, ScpHistoryEntry, ScpHistoryEntryV0,
     ScpStatementPledges, SignedTimeSlicedSurveyResponseMessage, StellarMessage, StellarValue,
     SurveyMessageCommandType, SurveyRequestMessage, SurveyResponseBody, SurveyResponseMessage,
     TimeSlicedPeerDataList, TimeSlicedSurveyRequestMessage, TimeSlicedSurveyResponseMessage,
