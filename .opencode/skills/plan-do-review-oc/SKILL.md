@@ -1,6 +1,6 @@
 ---
 name: plan-do-review-oc
-description: Review a proposal issue with adversarial critics, converge on a plan, execute it, and iterate review-fix until clean (opencode variant — uses glm-5.1 for critics/reviewers)
+description: Review a proposal issue with adversarial critics, converge on a plan, execute it, and iterate review-fix until clean (opencode variant — uses the reviewer agent for critics/reviewers)
 argument-hint: "[issue-number] [--max-proposal-rounds N] [--max-review-rounds N]"
 ---
 
@@ -9,9 +9,10 @@ Parse `$ARGUMENTS`:
 - `--max-proposal-rounds N`: Max proposal↔critic iterations (default: 5).
 - `--max-review-rounds N`: Max implement↔review-fix iterations (default: 3).
 
-> **Model configuration.** This opencode variant hardcodes the critic and
-> review sub-agents to use `glm-5.1`. The orchestrator (you) runs as
-> `kimi-k2.6`. There is no `--model` flag — the models are fixed.
+> **Agent configuration.** This opencode variant hardcodes the critic and
+> review sub-agents to use the `reviewer` agent (configured in
+> `opencode.json`). The orchestrator (you) runs as `kimi-k2.6`. There is
+> no `--model` flag — the agent types are fixed.
 
 **If no issue number was provided, auto-select one:**
 
@@ -101,8 +102,9 @@ The orchestrator (you) manages state, rewrites proposals, and implements code.
 All reviews and critiques are delegated to independent sub-agents so that
 review is adversarial and unbiased.
 
-**Model configuration:** The orchestrator runs as `kimi-k2.6`. Critic and
-review sub-agents use `glm-5.1` for independent, adversarial analysis.
+**Agent configuration:** The orchestrator runs as `kimi-k2.6`. Critic and
+review sub-agents use the `reviewer` agent type (configured in
+`opencode.json`) for independent, adversarial analysis.
 
 ---
 
@@ -370,8 +372,7 @@ rm -f "$tmpfile"
 ```
 
 Launch a background agent using the Task tool:
-- **agent_type**: `"general"`
-- **model**: `"glm-5.1"`
+- **subagent_type**: `"reviewer"`
 - **description**: `"Critique proposal round {proposal_round}"`
 
 The critic agent prompt must include:
@@ -677,8 +678,7 @@ git log -1 --format='%H'
 ```
 
 Launch a background agent using the Task tool:
-- **agent_type**: `"general"`
-- **model**: `"glm-5.1"`
+- **subagent_type**: `"reviewer"`
 - **description**: `"Review-fix round {review_round}"`
 
 The review-fix agent prompt must include the full review-fix skill protocol.
@@ -921,6 +921,6 @@ Final verdict:      SOUND
   struct redesigns, and design-level changes are not only permitted — they
   are preferred when the result is cleaner, more idiomatic Rust, and more
   scalable. Do not artificially constrain scope to minimal patches.
-- **Model configuration.** Critic and review sub-agents always use
-  `glm-5.1`. The orchestrator (you) runs as `kimi-k2.6`. Do not change
+- **Agent configuration.** Critic and review sub-agents always use
+  the `reviewer` agent. The orchestrator (you) runs as `kimi-k2.6`. Do not change
   these model assignments — they are fixed for this skill variant.
