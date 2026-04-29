@@ -2416,7 +2416,7 @@ FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES=100000
         let toml_str = r#"
 NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
-PEER_FLOOD_READING_CAPACITY_BYTES=4294967296
+PEER_FLOOD_READING_CAPACITY_BYTES=4294967297
 "#;
         let raw: toml::Value = toml::from_str(toml_str).unwrap();
         let config = translate_stellar_core_config(&raw).unwrap();

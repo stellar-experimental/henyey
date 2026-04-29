@@ -3488,13 +3488,14 @@ name = "test"
         config.overlay.peer_flood_reading_capacity_bytes = 500_000;
         config.overlay.flow_control_send_more_batch_size_bytes = 100_000;
         // Should not fail on flow control bytes validation (may fail on other
-        // things like missing quorum set — we just check it doesn't fail on
-        // FlowControlBytesConfig).
+        // things like missing quorum set — we check it doesn't fail on
+        // the flow control specific error).
         let result = config.validate();
         if let Err(e) = &result {
+            let msg = e.to_string();
             assert!(
-                !e.to_string().contains("FlowControlBytesConfig"),
-                "unexpected flow control error: {e}"
+                !msg.contains("FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES"),
+                "unexpected flow control error: {msg}"
             );
         }
     }
@@ -3507,9 +3508,10 @@ name = "test"
         // Defaults (0,0) → Auto, which always passes validation.
         let result = config.validate();
         if let Err(e) = &result {
+            let msg = e.to_string();
             assert!(
-                !e.to_string().contains("FlowControlBytesConfig"),
-                "unexpected flow control error: {e}"
+                !msg.contains("FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES"),
+                "unexpected flow control error: {msg}"
             );
         }
     }
