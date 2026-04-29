@@ -4261,6 +4261,13 @@ mod tests {
         });
         state.capture_op_snapshot_for_key(&ledger_key);
 
+        // Mutate balance AFTER op snapshot capture — the live state is now
+        // different from the op snapshot. This ensures the test distinguishes
+        // "op snapshot" from "live state" (pre-fix, both would show 42).
+        let mut modified2 = state.get_account(&account_id).unwrap().clone();
+        modified2.balance = 42;
+        state.accounts.insert(account_id.clone(), modified2);
+
         // Delete the account
         state.delete_account(&account_id);
 
@@ -4274,8 +4281,8 @@ mod tests {
         if let LedgerEntryData::Account(acc) = &delete_state.data {
             assert_eq!(
                 acc.balance, 999_999,
-                "delete STATE must use per-op snapshot (balance=999_999 from op1), \
-                 not per-tx snapshot (balance={})",
+                "delete STATE must use per-op snapshot (balance=999_999), \
+                 not live state (balance=42) or per-tx snapshot (balance={})",
                 original_balance
             );
         } else {
@@ -4346,6 +4353,74 @@ mod tests {
                 "delete STATE must have V1 ext with sponsor, got {:?}",
                 delete_state.ext
             ),
+        }
+
+        // The delete STATE must preserve the snapshot's last_modified_ledger_seq.
+        // create_account sets last_modified = ledger_seq (100). The snapshot
+        // should capture that value, not any later mutation's ledger_seq.
+        assert_eq!(
+            delete_state.last_modified_ledger_seq, 100,
+            "delete STATE must preserve snapshot last_modified_ledger_seq"
+        );
+    }
+
+    /// Regression test: delete_trustline must record the pre-op snapshot as
+    /// STATE, not the current mutated state. This verifies a non-account
+    /// delete path also uses record_snapshot_delete correctly.
+    #[test]
+    fn test_delete_trustline_uses_snapshot_pre_state() {
+        let mut state = new_manager_with_offers(5_000_000, 100);
+
+        let account_id = create_test_account_id(0);
+        let account = create_test_account_entry(0);
+        state.create_account(account);
+
+        // Create trustline with initial balance
+        let asset = TrustLineAsset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: create_test_account_id(99),
+        });
+        let trustline = TrustLineEntry {
+            account_id: account_id.clone(),
+            asset: asset.clone(),
+            balance: 5000,
+            limit: 10000,
+            flags: TrustLineFlags::AuthorizedFlag as u32,
+            ext: TrustLineEntryExt::V0,
+        };
+        state.create_trustline(trustline);
+
+        // Override trustline snapshot to simulate pre-existing entry (balance=5000)
+        let tl_key = (account_id.clone(), asset.clone());
+        let snapshot = state.trustlines.get(&tl_key).cloned();
+        state.trustline_snapshots.insert(tl_key.clone(), snapshot);
+
+        // Mutate the trustline balance (simulates an op modifying before delete)
+        let mut modified = state.trustlines.get(&tl_key).unwrap().clone();
+        modified.balance = 0;
+        state.trustlines.insert(tl_key.clone(), modified);
+
+        // Delete the trustline
+        let xdr_asset = Asset::CreditAlphanum4(AlphaNum4 {
+            asset_code: AssetCode4([b'U', b'S', b'D', 0]),
+            issuer: create_test_account_id(99),
+        });
+        state.delete_trustline(&account_id, &xdr_asset);
+
+        let delta = state.delta();
+        let delete_states = delta.delete_states();
+        let delete_state = delete_states
+            .iter()
+            .find(|e| matches!(&e.data, LedgerEntryData::Trustline(_)))
+            .expect("should have a delete state for trustline");
+
+        if let LedgerEntryData::Trustline(tl) = &delete_state.data {
+            assert_eq!(
+                tl.balance, 5000,
+                "delete STATE must use snapshot balance (5000), not mutated balance (0)"
+            );
+        } else {
+            panic!("expected Trustline entry in delete_states");
         }
     }
 }
