@@ -1211,9 +1211,11 @@ pub fn check_valid_pre_seq_num_with_config(
         }
     } else {
         // 5. Classic: reject ext != 0 on p21+ (stellar-core commonValidPreSeqNum:1454-1467)
+        // inner_tx() handles both Tx and TxFeeBump (returning the inner Transaction),
+        // so fee-bump-wrapped classic txs with V1 extensions are correctly rejected.
         if protocol_version >= 21 {
-            if let TransactionEnvelope::Tx(env) = frame.envelope() {
-                if env.tx.ext != stellar_xdr::curr::TransactionExt::V0 {
+            if let Some(tx) = frame.inner_tx() {
+                if tx.ext != stellar_xdr::curr::TransactionExt::V0 {
                     return Err(PreSeqNumError::Malformed(
                         "classic transaction must not carry extension data".to_string(),
                     ));
@@ -2588,6 +2590,76 @@ mod tests {
         assert!(
             matches!(err, PreSeqNumError::Malformed(_)),
             "expected Malformed for classic ext, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_check_valid_pre_seq_num_classic_ext_rejection_feebump_p21() {
+        // Regression for #2059: a fee-bump envelope wrapping a classic inner tx
+        // with TransactionExt::V1 must also be rejected on p21+, matching
+        // stellar-core's inner-tx revalidation in FeeBumpTransactionFrame.cpp:307-309.
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
+
+        let inner_source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let outer_fee_source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
+        let dest = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+
+        let inner_tx = Transaction {
+            source_account: inner_source,
+            fee: 100,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::Payment(PaymentOp {
+                    destination: dest,
+                    asset: Asset::Native,
+                    amount: 1000,
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: vec![].try_into().unwrap(),
+                        read_write: vec![].try_into().unwrap(),
+                    },
+                    instructions: 0,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 0,
+            }),
+        };
+
+        let inner_env = TransactionV1Envelope {
+            tx: inner_tx,
+            signatures: vec![].try_into().unwrap(),
+        };
+
+        let fee_bump_tx = FeeBumpTransaction {
+            fee_source: outer_fee_source,
+            fee: 200,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+            ext: FeeBumpTransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: fee_bump_tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::from_owned(envelope);
+        let err = check_valid_pre_seq_num(&frame, 21, 0).unwrap_err();
+        assert!(
+            matches!(err, PreSeqNumError::Malformed(_)),
+            "expected Malformed for fee-bump classic ext, got {err:?}"
         );
     }
 

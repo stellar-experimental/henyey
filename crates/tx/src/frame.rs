@@ -147,7 +147,7 @@ impl TransactionFrame {
     /// For V1, returns `&env.tx`. For FeeBump, returns the inner transaction
     /// inside the `FeeBumpTransactionInnerTx`. Returns `None` for V0 envelopes
     /// (which use `TransactionV0`, a different type).
-    fn inner_tx(&self) -> Option<&Transaction> {
+    pub(crate) fn inner_tx(&self) -> Option<&Transaction> {
         match &*self.envelope {
             TransactionEnvelope::TxV0(_) => None,
             TransactionEnvelope::Tx(env) => Some(&env.tx),
