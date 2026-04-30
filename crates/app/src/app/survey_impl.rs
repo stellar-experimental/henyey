@@ -852,15 +852,11 @@ impl App {
             Some(bytes) => bytes,
             None => return false,
         };
-        let public_key = match henyey_crypto::PublicKey::from_bytes(&key_bytes) {
-            Ok(key) => key,
-            Err(_) => return false,
-        };
         let sig = match henyey_crypto::Signature::try_from(signature) {
             Ok(sig) => sig,
             Err(_) => return false,
         };
-        public_key.verify(message, &sig).is_ok()
+        henyey_crypto::verify_from_raw_key(&key_bytes, message, &sig).is_ok()
     }
 
     fn node_id_bytes(node_id: &stellar_xdr::curr::NodeId) -> Option<[u8; 32]> {

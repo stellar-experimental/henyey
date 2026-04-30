@@ -1518,9 +1518,10 @@ impl ScpDriver {
         tx_set_hash: &stellar_xdr::curr::Hash,
         close_time: stellar_xdr::curr::TimePoint,
     ) -> bool {
-        let public_key = match PublicKey::try_from(&node_id.0) {
-            Ok(pk) => pk,
-            Err(_) => return false,
+        let pubkey_bytes = match &node_id.0 {
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                bytes,
+            )) => bytes,
         };
 
         // Build signed data: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
@@ -1548,7 +1549,7 @@ impl ScpDriver {
         };
 
         let sig = Signature::from_bytes(sig_bytes);
-        public_key.verify(&data, &sig).is_ok()
+        henyey_crypto::verify_from_raw_key(pubkey_bytes, &data, &sig).is_ok()
     }
 
     /// Extract a valid value from a potentially invalid composite.
@@ -2160,8 +2161,11 @@ impl ScpDriver {
         node_id: &NodeId,
         sig: &stellar_xdr::curr::Signature,
     ) -> Result<()> {
-        let public_key = PublicKey::try_from(&node_id.0)
-            .map_err(|_| HerderError::Internal("Invalid node ID".to_string()))?;
+        let pubkey_bytes = match &node_id.0 {
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(stellar_xdr::curr::Uint256(
+                bytes,
+            )) => bytes,
+        };
 
         let sig_bytes: [u8; 64] = sig
             .0
@@ -2170,9 +2174,12 @@ impl ScpDriver {
             .map_err(|_| HerderError::Internal("Invalid signature length".to_string()))?;
         let signature = henyey_crypto::Signature::from_bytes(sig_bytes);
 
-        public_key
-            .verify(data, &signature)
-            .map_err(|_| HerderError::Scp(henyey_scp::ScpError::SignatureVerificationFailed))
+        henyey_crypto::verify_from_raw_key(pubkey_bytes, data, &signature).map_err(|e| match e {
+            henyey_crypto::CryptoError::InvalidPublicKey => {
+                HerderError::Internal("Invalid node ID".to_string())
+            }
+            _ => HerderError::Scp(henyey_scp::ScpError::SignatureVerificationFailed),
+        })
     }
 
     /// Verify an SCP envelope signature.
@@ -3950,6 +3957,75 @@ mod tests {
         assert_eq!(
             driver.validate_value_impl(1, &value, false),
             ValueValidation::Valid
+        );
+    }
+
+    #[test]
+    fn test_verify_signed_bytes_valid_signature() {
+        let secret = SecretKey::generate();
+        let public = secret.public_key();
+        let node_id = NodeId((&public).into());
+
+        let data = b"test message";
+        let sig_bytes = secret.sign(data);
+        let sig = stellar_xdr::curr::Signature(sig_bytes.as_bytes().to_vec().try_into().unwrap());
+
+        assert!(ScpDriver::verify_signed_bytes(data, &node_id, &sig).is_ok());
+    }
+
+    #[test]
+    fn test_verify_signed_bytes_invalid_signature() {
+        let secret = SecretKey::generate();
+        let public = secret.public_key();
+        let node_id = NodeId((&public).into());
+
+        let data = b"test message";
+        let wrong_sig = [0u8; 64];
+        let sig = stellar_xdr::curr::Signature(wrong_sig.to_vec().try_into().unwrap());
+
+        let err = ScpDriver::verify_signed_bytes(data, &node_id, &sig).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HerderError::Scp(henyey_scp::ScpError::SignatureVerificationFailed)
+            ),
+            "expected SignatureVerificationFailed, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_signed_bytes_invalid_node_id() {
+        // y=2 is not on the ed25519 curve
+        let mut bad_key = [0u8; 32];
+        bad_key[0] = 2;
+        let node_id = NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(bad_key),
+        ));
+
+        let data = b"test message";
+        let sig = stellar_xdr::curr::Signature([0u8; 64].to_vec().try_into().unwrap());
+
+        let err = ScpDriver::verify_signed_bytes(data, &node_id, &sig).unwrap_err();
+        assert!(
+            matches!(&err, HerderError::Internal(msg) if msg.contains("Invalid node ID")),
+            "expected Internal(Invalid node ID), got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_verify_signed_bytes_invalid_signature_length() {
+        let secret = SecretKey::generate();
+        let public = secret.public_key();
+        let node_id = NodeId((&public).into());
+
+        let data = b"test message";
+        // Too short signature
+        let sig = stellar_xdr::curr::Signature(vec![0u8; 32].try_into().unwrap());
+
+        let err = ScpDriver::verify_signed_bytes(data, &node_id, &sig).unwrap_err();
+        assert!(
+            matches!(&err, HerderError::Internal(msg) if msg.contains("Invalid signature length")),
+            "expected Internal(Invalid signature length), got: {err:?}"
         );
     }
 
