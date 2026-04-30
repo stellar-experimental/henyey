@@ -432,3 +432,65 @@ mod tests {
         assert_eq!(ciphertext.len(), plaintext.len() + SEALED_BOX_OVERHEAD);
     }
 }
+
+#[cfg(test)]
+mod deterministic_seal_tests {
+    use super::*;
+
+    /// Seal with a fixed ephemeral secret to produce deterministic output.
+    /// This proves the seal side produces the exact wire format.
+    fn seal_deterministic(
+        ephemeral_secret_bytes: &[u8; 32],
+        recipient_pk: &[u8; 32],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let ephemeral_secret = StaticSecret::from(*ephemeral_secret_bytes);
+        let recipient_public = PublicKey::from(*recipient_pk);
+        let ephemeral_public = PublicKey::from(&ephemeral_secret);
+        let ephemeral_pk_bytes = ephemeral_public.to_bytes();
+
+        let mut sym_key = derive_shared_key(&ephemeral_secret, &recipient_public)?;
+        let nonce = derive_seal_nonce(&ephemeral_pk_bytes, recipient_pk);
+
+        let cipher = XSalsa20Poly1305::new((&sym_key).into());
+        sym_key.zeroize();
+
+        let encrypted = cipher
+            .encrypt((&nonce).into(), plaintext)
+            .map_err(|_| CryptoError::EncryptionFailed)?;
+
+        let mut out = Vec::with_capacity(32 + encrypted.len());
+        out.extend_from_slice(&ephemeral_pk_bytes);
+        out.extend_from_slice(&encrypted);
+        Ok(out)
+    }
+
+    #[test]
+    fn test_seal_deterministic_vector() {
+        // Same keys used in the decrypt-side compatibility test.
+        let recipient_secret: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        let ephemeral_secret: [u8; 32] = [
+            0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e,
+            0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c,
+            0x5d, 0x5e, 0x5f, 0x60,
+        ];
+        let recipient_sk = StaticSecret::from(recipient_secret);
+        let recipient_pk = PublicKey::from(&recipient_sk);
+        let plaintext = b"test sealed box vector";
+
+        // Expected output captured from crypto_box 0.9.x
+        let expected_hex = "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d4846673c0fedc538f220290c003c4b9e4d2688b427b23374e4a5d00068691c238293e5bc754ff6824";
+
+        let sealed =
+            seal_deterministic(&ephemeral_secret, recipient_pk.as_bytes(), plaintext).unwrap();
+        assert_eq!(hex::encode(&sealed), expected_hex);
+
+        // Verify roundtrip
+        let decrypted = open(&recipient_secret, &sealed).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+}
