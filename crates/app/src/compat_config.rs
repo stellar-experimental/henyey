@@ -26,7 +26,7 @@
 
 use crate::config::{
     AppConfig, CompatHttpConfig, CompatQuorumSafety, DatabaseConfig, FailureSafety,
-    HistoryArchiveEntry, HistoryConfig, HttpConfig, ValidationThresholdLevel,
+    HistoryArchiveEntry, HistoryConfig, ValidationThresholdLevel,
 };
 use henyey_herder::{ValidatorEntryInfo, ValidatorQuality, ValidatorWeightConfig};
 use std::collections::{HashMap, HashSet};
@@ -223,34 +223,33 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
 
     // --- HTTP ---
     if let Some(port) = get_u16(table, "HTTP_PORT") {
-        // When stellar-core format is used, enable the compat HTTP server
-        // on this port, since stellar-rpc expects stellar-core's wire format.
-        // Disable the native HTTP server to avoid port conflict (both default
-        // to the same port).
-        config.http = HttpConfig {
-            enabled: false,
-            port,
-            ..HttpConfig::default()
-        };
-        // When PUBLIC_HTTP_PORT=true, bind to all interfaces (dual-stack) so that
-        // clients connecting via IPv4 or IPv6 localhost can reach the server.
-        // This matches stellar-core's behavior where PUBLIC_HTTP_PORT controls
-        // whether the HTTP port is accessible beyond localhost.
+        // stellar-core treats HTTP_PORT=0 as "don't listen" (CommandHandler.cpp:56-77,
+        // Config::setNoListen sets HTTP_PORT=0). Disable both native and compat HTTP.
+        // For nonzero ports, enable the compat HTTP server (stellar-rpc expects
+        // stellar-core's wire format) and disable the native HTTP server.
         let address = if get_bool(table, "PUBLIC_HTTP_PORT").unwrap_or(false) {
             "::".to_string()
         } else {
             "127.0.0.1".to_string()
         };
-        config.compat_http = CompatHttpConfig {
-            enabled: true,
-            port,
-            address,
-        };
+        if let Some(port) = nonzero_port(port) {
+            config.http.enabled = false;
+            config.compat_http = CompatHttpConfig {
+                enabled: true,
+                port,
+                address,
+            };
+        } else {
+            config.http.enabled = false;
+            config.compat_http.enabled = false;
+        }
     }
 
     // --- Query server ---
+    // stellar-core treats HTTP_QUERY_PORT=0 as "don't listen"
+    // (CommandHandler.cpp:72-83).
     if let Some(port) = get_u16(table, "HTTP_QUERY_PORT") {
-        config.query.port = Some(port);
+        config.query.port = nonzero_port(port);
     }
     if let Some(v) = get_u32(table, "QUERY_SNAPSHOT_LEDGERS") {
         config.query.snapshot_ledgers = v;
@@ -1126,6 +1125,17 @@ fn get_bool(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<bo
             );
             None
         }
+    }
+}
+
+/// In stellar-core configs, port 0 means "don't listen" (see
+/// `CommandHandler.cpp:56-77` and `Config::setNoListen`). Returns `None`
+/// for port 0, `Some(port)` otherwise.
+fn nonzero_port(port: u16) -> Option<u16> {
+    if port == 0 {
+        None
+    } else {
+        Some(port)
     }
 }
 
@@ -3544,6 +3554,97 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
         assert!(
             msg.contains("INVARIANT_CHECKS") || msg.contains("INVARIANT_EXTRA_CHECKS"),
             "expected an invariant-related error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_http_port_zero_disables_both_servers() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            HTTP_PORT = 0
+            DATABASE = "sqlite3:///tmp/stellar-core.db"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            UNSAFE_QUORUM = true
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        // HTTP_PORT=0 means "don't listen" in stellar-core (CommandHandler.cpp:56-77).
+        // Both native HTTP and compat HTTP must be disabled.
+        assert!(!config.http.enabled, "native HTTP should be disabled");
+        assert!(
+            !config.compat_http.enabled,
+            "compat HTTP should be disabled for port 0"
+        );
+    }
+
+    #[test]
+    fn test_http_port_zero_with_nonzero_query_port() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            HTTP_PORT = 0
+            HTTP_QUERY_PORT = 8080
+            DATABASE = "sqlite3:///tmp/stellar-core.db"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            NODE_IS_VALIDATOR = false
+            UNSAFE_QUORUM = true
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(!config.http.enabled, "native HTTP should be disabled");
+        assert!(
+            !config.compat_http.enabled,
+            "compat HTTP should be disabled"
+        );
+        assert_eq!(
+            config.query.port,
+            Some(8080),
+            "query server should be enabled on 8080"
+        );
+    }
+
+    #[test]
+    fn test_nonzero_http_port_with_query_port_zero() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            HTTP_PORT = 11626
+            HTTP_QUERY_PORT = 0
+            DATABASE = "sqlite3:///tmp/stellar-core.db"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            UNSAFE_QUORUM = true
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert!(!config.http.enabled, "native HTTP should be disabled");
+        assert!(config.compat_http.enabled, "compat HTTP should be enabled");
+        assert_eq!(config.compat_http.port, 11626);
+        assert_eq!(
+            config.query.port, None,
+            "query server should be disabled for port 0"
+        );
+    }
+
+    #[test]
+    fn test_http_query_port_zero_disables_query() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            HTTP_QUERY_PORT = 0
+            DATABASE = "sqlite3:///tmp/stellar-core.db"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            UNSAFE_QUORUM = true
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&core_toml).unwrap();
+        assert_eq!(
+            config.query.port, None,
+            "query server should be disabled for port 0"
         );
     }
 }
