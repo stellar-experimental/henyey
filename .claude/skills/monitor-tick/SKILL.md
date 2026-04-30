@@ -700,14 +700,31 @@ If they differ (origin/main is ahead):
    Crash-recovery restarts are exempt because they're not voluntary deploys.
    Urgent fixes can override by killing the node manually before the next
    tick — the normal startup path will pick up the latest origin/main.
-2. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
+2. **Binary-relevance check**: list changed paths with
+   `git diff --name-only HEAD origin/main`. If every changed path is
+   allowlisted as non-binary-impact, skip the rebuild + restart: run
+   `git pull --rebase` only, then report
+   `DEPLOY SYNCED (no-binary-impact: docs/scripts only — pulled <N> commits, no restart)`.
+   The non-binary-impact allowlist is:
+   - `.github/`
+   - `.claude/`
+   - `scripts/`
+   - `docs/`
+   - root-level `*.md` files, e.g. `README.md` or `CLAUDE.md`
+   - `stellar-specs` / `stellar-specs/` submodule pointer changes only
+
+   Deny by default: if any path is outside this allowlist, continue to the CI,
+   build, and restart path. In particular, changes to `Cargo.toml`,
+   `Cargo.lock`, any `build.rs`, `crates/`, `configs/`, or mixed docs+code
+   commits require a rebuild + restart.
+3. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
    If any recent run has conclusion `failure`, do NOT deploy — route the failure
    through check (11) and wait.
-3. If all conclusions are `success` (ignore `""` for in-progress and `cancelled`):
+4. If all conclusions are `success` (ignore `""` for in-progress and `cancelled`):
    `git pull --rebase`, `CARGO_TARGET_DIR=/home/tomer/data/$MONITOR_SESSION_ID/cargo-target cargo build --release -p henyey`.
-4. If build succeeds: Stop-PID, Rotate-log suffix `preredeploy`, Relaunch.
+5. If build succeeds: Stop-PID, Rotate-log suffix `preredeploy`, Relaunch.
    Report: `DEPLOY — pulled <N> commits (<old-sha>..<new-sha>), rebuilt, restarted at L<ledger>`.
-5. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
+6. If build fails: report `BUILD FAILED`, do NOT restart — the old binary is
    still running. Route the build error through check (11).
 
 If `HEAD == origin/main`: no action (already up to date).
