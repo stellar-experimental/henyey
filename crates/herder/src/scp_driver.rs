@@ -1380,89 +1380,84 @@ impl ScpDriver {
                 return ValueValidation::Invalid;
             }
 
-            // Check if we have the transaction set
+            // Fetch the transaction set in a single atomic lookup.
+            // Parity: stellar-core (HerderSCPDriver.cpp:301-313) does a single
+            // getTxSet() and returns kInvalidValue on null. We mirror the single-
+            // lookup pattern to eliminate the TOCTOU race that existed when
+            // has_tx_set() and get() were separate calls (AUDIT-220 / issue #2157).
             let tx_set_hash = Hash256::from_bytes(stellar_value.tx_set_hash.0);
-            if !self.has_tx_set(&tx_set_hash) {
-                // During ballot protocol (nomination=false), EXTERNALIZE envelopes
-                // may arrive before the tx_set is fetched. In stellar-core,
-                // PendingEnvelopes buffers all envelopes until deps are fetched,
-                // so validateValue always has the tx_set. Our code sends
-                // EXTERNALIZE to SCP immediately for faster tracking advance
-                // (see process_scp_envelope). Return MaybeValidDeferred so
-                // SCP can still externalize the slot while the tx_set fetch
-                // completes. MaybeValidDeferred clears fully_validated; the
-                // paired restoration in Herder::cache_tx_set (via
-                // resolve_missing_tx_set) restores it when the tx_set arrives.
-                //
-                // Returning ValidationLevel::MaybeValid here was the root cause
-                // of issue #1795: MaybeValid cleared fully_validated with no
-                // restoration mechanism. MaybeValidDeferred also clears it, but
-                // comes with a deferred-cause tracking + restoration contract
-                // (see `DeferredCauses` and `Slot::restore_fully_validated`).
-                // stellar-core never reaches this code path with a missing
-                // tx_set — its PendingEnvelopes buffering ensures the tx_set
-                // is always present by the time validateValue runs. See the
-                // `ValidationLevel::MaybeValidDeferred` doc comment for the
-                // complete rationale (issues #1795 and #1798).
-                if !nomination {
-                    // Record the deferred slot so the herder can restore
-                    // fully_validated when the tx_set arrives. Restoration
-                    // is triggered by `Herder::cache_tx_set` →
-                    // `resolve_missing_tx_set`.
-                    self.record_missing_tx_set(slot_index, tx_set_hash);
-
-                    debug!(
-                        "Missing transaction set during ballot protocol: {} \
-                         (MaybeValidDeferred)",
-                        tx_set_hash
-                    );
-                    return ValueValidation::MaybeValidDeferred;
+            let tx_set = match self.tx_tracker.get(&tx_set_hash) {
+                Some(ts) => ts,
+                None => {
+                    // During ballot protocol (nomination=false), EXTERNALIZE
+                    // envelopes may arrive before the tx_set is fetched. Return
+                    // MaybeValidDeferred so SCP can still externalize the slot
+                    // while the tx_set fetch completes. The paired restoration in
+                    // Herder::cache_tx_set (via resolve_missing_tx_set) restores
+                    // fully_validated when the tx_set arrives.
+                    //
+                    // Note: stellar-core returns kInvalidValue here because its
+                    // PendingEnvelopes buffering ensures the tx_set is always
+                    // present. Our MaybeValidDeferred is an intentional deviation
+                    // for EXTERNALIZE fast-tracking (issues #1795, #1798).
+                    if !nomination {
+                        self.record_missing_tx_set(slot_index, tx_set_hash);
+                        debug!(
+                            "Missing transaction set during ballot protocol: {} \
+                             (MaybeValidDeferred)",
+                            tx_set_hash
+                        );
+                        return ValueValidation::MaybeValidDeferred;
+                    }
+                    debug!("Missing transaction set: {}", tx_set_hash);
+                    return ValueValidation::Invalid;
                 }
-                debug!("Missing transaction set: {}", tx_set_hash);
+            };
+
+            // All content validation runs unconditionally on the owned tx_set.
+            // It is structurally impossible to reach Valid without passing these
+            // checks — there is no conditional skip path.
+
+            // Parity: verify hash integrity
+            let computed = tx_set.recompute_hash();
+            if computed != tx_set_hash {
+                debug!(
+                    "Tx set hash mismatch: expected {}, computed {}",
+                    tx_set_hash, computed
+                );
                 return ValueValidation::Invalid;
             }
-            if let Some(tx_set) = self.tx_tracker.get(&tx_set_hash) {
-                // Parity: verify hash integrity
-                let computed = tx_set.recompute_hash();
-                if computed != tx_set_hash {
+
+            // Parity: check previousLedgerHash matches the LCL hash.
+            // Conditional on lcl_hash_from_snapshot — preserves bootstrap/
+            // no-ledger-manager behavior where this check is skipped.
+            if let Some(hash) = lcl_hash_from_snapshot {
+                if tx_set.previous_ledger_hash() != hash {
                     debug!(
-                        "Tx set hash mismatch: expected {}, computed {}",
-                        tx_set_hash, computed
+                        "Tx set previousLedgerHash mismatch: expected {}, got {}",
+                        hash,
+                        tx_set.previous_ledger_hash()
                     );
                     return ValueValidation::Invalid;
                 }
+            }
 
-                // Parity: check previousLedgerHash matches the LCL hash.
-                // Uses the hash captured atomically with seq/close_time above.
-                if let Some(hash) = lcl_hash_from_snapshot {
-                    if tx_set.previous_ledger_hash() != hash {
-                        debug!(
-                            "Tx set previousLedgerHash mismatch: expected {}, got {}",
-                            hash,
-                            tx_set.previous_ledger_hash()
-                        );
-                        return ValueValidation::Invalid;
-                    }
-                }
-                let lcl_hash = lcl_hash_from_snapshot;
+            // Parity: validate tx set is well-formed (sorted, no duplicates)
+            // For generalized tx sets, per-component sort order is validated
+            // during extraction (tx_set.rs:validate_component). The global
+            // hash-sort check only applies to legacy (non-generalized) sets.
+            if tx_set.generalized_tx_set().is_none() && !Self::is_tx_set_well_formed(&tx_set) {
+                debug!("Legacy tx set is not well-formed (unsorted or has duplicates)");
+                return ValueValidation::Invalid;
+            }
 
-                // Parity: validate tx set is well-formed (sorted, no duplicates)
-                // For generalized tx sets, per-component sort order is validated
-                // during extraction (tx_set.rs:validate_component). The global
-                // hash-sort check only applies to legacy (non-generalized) sets.
-                if tx_set.generalized_tx_set().is_none() && !Self::is_tx_set_well_formed(&tx_set) {
-                    debug!("Legacy tx set is not well-formed (unsorted or has duplicates)");
+            // Parity: validate individual transaction content (AUDIT-033)
+            // Mirrors stellar-core's checkAndCacheTxSetValid()
+            if let Some(lcl_hash) = lcl_hash_from_snapshot {
+                let close_time_offset = close_time.saturating_sub(lcl_close_time);
+                if !self.check_and_cache_tx_set_valid(&tx_set, lcl_hash, close_time_offset) {
+                    debug!("Tx set content validation failed for slot {}", slot_index);
                     return ValueValidation::Invalid;
-                }
-
-                // Parity: validate individual transaction content (AUDIT-033)
-                // Mirrors stellar-core's checkAndCacheTxSetValid()
-                if let Some(lcl_hash) = lcl_hash {
-                    let close_time_offset = close_time.saturating_sub(lcl_close_time);
-                    if !self.check_and_cache_tx_set_valid(&tx_set, lcl_hash, close_time_offset) {
-                        debug!("Tx set content validation failed for slot {}", slot_index);
-                        return ValueValidation::Invalid;
-                    }
                 }
             }
 
@@ -1779,7 +1774,7 @@ impl ScpDriver {
         // Parity: stellar-core's ValueWrapperPtrSet iterates by raw Value byte
         // order (WrappedValuePtrComparator, SCPDriver.cpp:36-41). We sort by the
         // same key to ensure identical tie-breaking.
-        let mut decoded: Vec<(Value, StellarValue)> = values
+        let decoded: Vec<(Value, StellarValue)> = values
             .iter()
             .filter_map(|v| {
                 StellarValue::from_xdr(v, stellar_xdr::curr::Limits::none())
@@ -1792,34 +1787,48 @@ impl ScpDriver {
             return values[0].clone();
         }
 
-        // Parity: filter out candidates whose tx set is missing from cache.
-        // stellar-core crashes (releaseAssert(cTxSet)) if a tx set is missing
-        // during combineCandidates — we filter instead to be defensive.
-        decoded.retain(|(_, sv)| {
-            let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-            if self.tx_tracker.is_cached(&tx_set_hash) {
-                true
-            } else {
-                warn!(
-                    "combine_candidates: tx set {} missing from cache, filtering out",
-                    tx_set_hash
-                );
-                false
-            }
-        });
-        if decoded.is_empty() {
+        // Resolve tx sets upfront in a single atomic lookup per candidate.
+        // Parity deviation: stellar-core releaseAssert(cTxSet) on missing tx sets
+        // (HerderSCPDriver.cpp:780) — we filter instead to be defensive.
+        // This also eliminates the TOCTOU race that existed when is_cached() and
+        // get() were separate calls (AUDIT-220 / issue #2157).
+        struct ResolvedCandidate {
+            raw: Value,
+            sv: StellarValue,
+            tx_set: TransactionSet,
+            tx_set_hash: Hash256,
+        }
+        let mut candidates: Vec<ResolvedCandidate> = decoded
+            .into_iter()
+            .filter_map(|(raw, sv)| {
+                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
+                match self.tx_tracker.get(&tx_set_hash) {
+                    Some(tx_set) => Some(ResolvedCandidate {
+                        raw,
+                        sv,
+                        tx_set,
+                        tx_set_hash,
+                    }),
+                    None => {
+                        warn!(
+                            "combine_candidates: tx set {} missing from cache, filtering out",
+                            tx_set_hash
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+        if candidates.is_empty() {
             return values[0].clone();
         }
 
-        // Parity: filter out candidates whose tx set has a different previousLedgerHash
+        // Parity: filter out candidates whose tx set has a different previousLedgerHash.
+        // Uses the owned tx_set from resolve — no cache re-read needed.
         if let Some(lm) = self.ledger_manager.get() {
             let lcl_hash = lm.current_header_hash();
-            decoded.retain(|(_, sv)| {
-                let tx_set_hash = Hash256::from_bytes(sv.tx_set_hash.0);
-                let tx_set = self.tx_tracker.get(&tx_set_hash).unwrap();
-                tx_set.previous_ledger_hash() == lcl_hash
-            });
-            if decoded.is_empty() {
+            candidates.retain(|c| c.tx_set.previous_ledger_hash() == lcl_hash);
+            if candidates.is_empty() {
                 // All candidates filtered out — fall back to first value
                 return values[0].clone();
             }
@@ -1827,8 +1836,8 @@ impl ScpDriver {
 
         // Step 1: Compute candidates hash (XOR of all candidate hashes) for tiebreaking
         let mut candidates_hash = [0u8; 32];
-        for (_, sv) in &decoded {
-            let val_bytes = henyey_common::xdr_stream::xdr_to_bytes(sv);
+        for c in &candidates {
+            let val_bytes = henyey_common::xdr_stream::xdr_to_bytes(&c.sv);
             let hash = Hash256::hash(&val_bytes);
             for (i, byte) in candidates_hash.iter_mut().enumerate() {
                 *byte ^= hash.as_bytes()[i];
@@ -1838,8 +1847,8 @@ impl ScpDriver {
         // Step 2: Merge upgrades across all candidates (take max of each upgrade type)
         let mut merged_upgrades: std::collections::BTreeMap<u32, LedgerUpgrade> =
             std::collections::BTreeMap::new();
-        for (_, sv) in &decoded {
-            for upgrade_bytes in sv.upgrades.iter() {
+        for c in &candidates {
+            for upgrade_bytes in c.sv.upgrades.iter() {
                 if let Ok(upgrade) = LedgerUpgrade::from_xdr(
                     upgrade_bytes.0.as_slice(),
                     stellar_xdr::curr::Limits::none(),
@@ -1860,26 +1869,30 @@ impl ScpDriver {
         // Step 3: Sort candidates by raw Value bytes for deterministic iteration.
         // Parity: stellar-core iterates a ValueWrapperPtrSet (std::set ordered
         // by raw Value bytes via WrappedValuePtrComparator, SCPDriver.cpp:36-41).
-        decoded.sort_by(|(a_raw, _), (b_raw, _)| a_raw.cmp(b_raw));
+        candidates.sort_by(|a, b| a.raw.cmp(&b.raw));
 
         // Step 4: Select best candidate using compareTxSets logic.
         // Parity: HerderSCPDriver.cpp:775-797 — manual loop that keeps the
         // first winner on ties (stellar-core: `if (!highestTxSet || compareTxSets(...))`).
         // We use a keep-first fold instead of max_by, which returns the last
         // tied element and would be order-dependent.
+        // Uses owned tx_set references — no cache re-reads.
         let mut best_idx = 0;
-        for i in 1..decoded.len() {
-            let best_hash = Hash256::from_bytes(decoded[best_idx].1.tx_set_hash.0);
-            let cur_hash = Hash256::from_bytes(decoded[i].1.tx_set_hash.0);
-            if self.compare_tx_sets(&best_hash, &cur_hash, &candidates_hash)
-                == std::cmp::Ordering::Less
+        for i in 1..candidates.len() {
+            if Self::compare_tx_sets(
+                &candidates[best_idx].tx_set,
+                &candidates[i].tx_set,
+                &candidates[best_idx].tx_set_hash,
+                &candidates[i].tx_set_hash,
+                &candidates_hash,
+            ) == std::cmp::Ordering::Less
             {
                 best_idx = i;
             }
         }
 
         // Step 5: Compose result
-        let mut result = decoded[best_idx].1.clone();
+        let mut result = candidates[best_idx].sv.clone();
 
         // Replace upgrades with merged set (in order of upgrade type)
         let upgrade_bytes: Vec<stellar_xdr::curr::UpgradeType> = merged_upgrades
@@ -1926,54 +1939,44 @@ impl ScpDriver {
     /// 3. Highest total full fees (more is better)
     /// 4. Smallest encoded size (less is better)
     /// 5. XOR hash tiebreak (lexicographically smallest)
+    ///
+    /// Accepts owned `&TransactionSet` references directly to avoid cache
+    /// re-reads and the TOCTOU race that existed when this function fetched
+    /// from the cache internally (AUDIT-220 / issue #2157).
     fn compare_tx_sets(
-        &self,
+        a_set: &TransactionSet,
+        b_set: &TransactionSet,
         a_hash: &Hash256,
         b_hash: &Hash256,
         candidates_hash: &[u8; 32],
     ) -> std::cmp::Ordering {
-        // Parity: stellar-core releaseAssert(cTxSet) at HerderSCPDriver.cpp:780
-        // Tx sets must be in cache by the time we compare them.
-        let a_set = self.tx_tracker.get(a_hash).unwrap_or_else(|| {
-            panic!(
-                "compare_tx_sets: tx set {} not in cache (parity: releaseAssert)",
-                a_hash
-            )
-        });
-        let b_set = self.tx_tracker.get(b_hash).unwrap_or_else(|| {
-            panic!(
-                "compare_tx_sets: tx set {} not in cache (parity: releaseAssert)",
-                b_hash
-            )
-        });
-
         // 1. Compare by number of operations (more is better)
-        let a_ops = Self::tx_set_num_ops(&a_set);
-        let b_ops = Self::tx_set_num_ops(&b_set);
+        let a_ops = Self::tx_set_num_ops(a_set);
+        let b_ops = Self::tx_set_num_ops(b_set);
         let ops_cmp = a_ops.cmp(&b_ops);
         if ops_cmp != std::cmp::Ordering::Equal {
             return ops_cmp;
         }
 
         // 2. Compare by total inclusion fees (higher is better)
-        let a_inclusion_fees = Self::tx_set_total_inclusion_fees(&a_set);
-        let b_inclusion_fees = Self::tx_set_total_inclusion_fees(&b_set);
+        let a_inclusion_fees = Self::tx_set_total_inclusion_fees(a_set);
+        let b_inclusion_fees = Self::tx_set_total_inclusion_fees(b_set);
         let inclusion_fees_cmp = a_inclusion_fees.cmp(&b_inclusion_fees);
         if inclusion_fees_cmp != std::cmp::Ordering::Equal {
             return inclusion_fees_cmp;
         }
 
         // 3. Compare by total full fees (higher is better)
-        let a_fees = Self::tx_set_total_fees(&a_set);
-        let b_fees = Self::tx_set_total_fees(&b_set);
+        let a_fees = Self::tx_set_total_fees(a_set);
+        let b_fees = Self::tx_set_total_fees(b_set);
         let fees_cmp = a_fees.cmp(&b_fees);
         if fees_cmp != std::cmp::Ordering::Equal {
             return fees_cmp;
         }
 
         // 4. Compare by encoded size (smaller is better — note reversed order)
-        let a_size = Self::tx_set_encoded_size(&a_set);
-        let b_size = Self::tx_set_encoded_size(&b_set);
+        let a_size = Self::tx_set_encoded_size(a_set);
+        let b_size = Self::tx_set_encoded_size(b_set);
         let size_cmp = b_size.cmp(&a_size); // reversed: smaller is better
         if size_cmp != std::cmp::Ordering::Equal {
             return size_cmp;
@@ -4974,6 +4977,90 @@ mod tests {
         );
     }
 
+    /// Regression test for AUDIT-220 / issue #2157: validate_value_against_local_state
+    /// must not allow a value to reach Valid without full tx-set content validation.
+    ///
+    /// Before the fix, a two-step has_tx_set() + get() pattern allowed a TOCTOU
+    /// race where eviction between the two calls would skip all validation and
+    /// return Valid unconditionally. After the fix, a single atomic get() is used;
+    /// if the tx set is missing, Invalid or MaybeValidDeferred is returned.
+    #[test]
+    fn test_audit_220_validate_value_single_lookup_eliminates_toctou() {
+        let (driver, secret_key) = make_test_driver_with_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Create a signed StellarValue referencing a tx_set_hash NOT in cache
+        let uncached_hash = stellar_xdr::curr::Hash([0xAB; 32]);
+        let sv =
+            make_signed_stellar_value(uncached_hash, now, vec![], &secret_key, &driver.network_id);
+
+        // During nomination: must return Invalid (not Valid!)
+        // Before the AUDIT-220 fix, if has_tx_set() returned true but get()
+        // returned None (due to LRU eviction between the calls), the code
+        // would fall through to return Valid without any validation.
+        let result = driver.validate_value_against_local_state(1, &sv, true);
+        assert_eq!(
+            result,
+            ValueValidation::Invalid,
+            "AUDIT-220: missing tx set during nomination must return Invalid, not Valid"
+        );
+
+        // During ballot: must return MaybeValidDeferred (not Valid!)
+        let result_ballot = driver.validate_value_against_local_state(1, &sv, false);
+        assert_eq!(
+            result_ballot,
+            ValueValidation::MaybeValidDeferred,
+            "AUDIT-220: missing tx set during ballot must return MaybeValidDeferred, not Valid"
+        );
+    }
+
+    /// Regression test for AUDIT-220 / issue #2157: combine_candidates_impl must
+    /// not panic when tx sets are evicted between is_cached() and get().
+    /// After the fix, resolution and filtering happen in a single pass.
+    #[test]
+    fn test_audit_220_combine_candidates_no_panic_on_missing() {
+        use stellar_xdr::curr::{Limits, StellarValue, StellarValueExt, TimePoint, WriteXdr};
+
+        let driver = make_test_driver();
+
+        // Create two tx sets but only cache one
+        let tx_set_a = TransactionSet::new(Hash256::ZERO, vec![]);
+        let tx_set_b = TransactionSet::new(Hash256::from_bytes([1u8; 32]), vec![]);
+
+        let sv_a = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_a.hash().0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: Default::default(),
+            ext: StellarValueExt::Basic,
+        };
+        let sv_b = StellarValue {
+            tx_set_hash: stellar_xdr::curr::Hash(tx_set_b.hash().0),
+            close_time: TimePoint(1_700_000_000),
+            upgrades: Default::default(),
+            ext: StellarValueExt::Basic,
+        };
+
+        let val_a = Value(sv_a.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+        let val_b = Value(sv_b.to_xdr(Limits::none()).unwrap().try_into().unwrap());
+        let values = vec![val_a, val_b];
+
+        // Only cache B, not A — this simulates the TOCTOU scenario where A
+        // was present when is_cached() was called but evicted before get().
+        driver.cache_tx_set(tx_set_b.clone());
+
+        // Must not panic — should gracefully filter out the missing set
+        let result = driver.combine_candidates_impl(1, &values);
+        let result_sv = StellarValue::from_xdr(&result.0, Limits::none()).unwrap();
+        assert_eq!(
+            result_sv.tx_set_hash.0,
+            tx_set_b.hash().0,
+            "AUDIT-220: missing tx set A should be filtered out, B should win"
+        );
+    }
+
     // ========== Deferred-causes regression tests (issue #2096 / H-014) =========
     //
     // These tests cover the herder-side deferred-validation registry.
@@ -5237,6 +5324,19 @@ mod compare_tx_sets_tests {
         hash
     }
 
+    /// Test helper: compare two tx sets by hash, looking them up from cache.
+    /// Mirrors the old `compare_tx_sets_by_hash(&driver, &hash_a, &hash_b, &candidates_hash)` API.
+    fn compare_tx_sets_by_hash(
+        driver: &ScpDriver,
+        a_hash: &Hash256,
+        b_hash: &Hash256,
+        candidates_hash: &[u8; 32],
+    ) -> std::cmp::Ordering {
+        let a_set = driver.get_tx_set(a_hash).unwrap();
+        let b_set = driver.get_tx_set(b_hash).unwrap();
+        ScpDriver::compare_tx_sets(&a_set, &b_set, a_hash, b_hash, candidates_hash)
+    }
+
     /// Create a Soroban-like transaction with a given fee and resource fee.
     /// inclusion_fee = fee - resource_fee.
     fn make_soroban_tx(
@@ -5343,7 +5443,7 @@ mod compare_tx_sets_tests {
         let hash_b = cache_tx_set(&driver, tx_set_b);
 
         // A has more ops, so A > B
-        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        let result = compare_tx_sets_by_hash(&driver, &hash_a, &hash_b, &candidates_hash);
         assert_eq!(result, std::cmp::Ordering::Greater);
     }
 
@@ -5361,7 +5461,7 @@ mod compare_tx_sets_tests {
         let hash_b = cache_tx_set(&driver, tx_set_b);
 
         // A has fewer ops, so A < B
-        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        let result = compare_tx_sets_by_hash(&driver, &hash_a, &hash_b, &candidates_hash);
         assert_eq!(result, std::cmp::Ordering::Less);
     }
 
@@ -5379,7 +5479,7 @@ mod compare_tx_sets_tests {
 
         // For legacy tx sets (no generalized), inclusion fee == full fee.
         // A has higher fee → A > B
-        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        let result = compare_tx_sets_by_hash(&driver, &hash_a, &hash_b, &candidates_hash);
         assert_eq!(result, std::cmp::Ordering::Greater);
     }
 
@@ -5407,7 +5507,7 @@ mod compare_tx_sets_tests {
         let hash_a = cache_tx_set(&driver, tx_set_a);
         let hash_b = cache_tx_set(&driver, tx_set_b);
 
-        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        let result = compare_tx_sets_by_hash(&driver, &hash_a, &hash_b, &candidates_hash);
         assert_eq!(
             result,
             std::cmp::Ordering::Less,
@@ -5435,7 +5535,7 @@ mod compare_tx_sets_tests {
 
         // Both have ops=2, total_fee=200, inclusion_fee=200.
         // Smaller encoded size wins (criterion 4).
-        let result = driver.compare_tx_sets(&hash_small, &hash_big, &candidates_hash);
+        let result = compare_tx_sets_by_hash(&driver, &hash_small, &hash_big, &candidates_hash);
         assert_eq!(
             result,
             std::cmp::Ordering::Greater,
@@ -5457,7 +5557,7 @@ mod compare_tx_sets_tests {
         let hash_b = cache_tx_set(&driver, tx_set_b);
 
         // Both have 0 ops, 0 fees, 0 size → goes to XOR tiebreak
-        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        let result = compare_tx_sets_by_hash(&driver, &hash_a, &hash_b, &candidates_hash);
         // The result should be deterministic based on hash XOR
         let a_xored = ScpDriver::xor_hash(&hash_a.0, &candidates_hash);
         let b_xored = ScpDriver::xor_hash(&hash_b.0, &candidates_hash);
@@ -5465,20 +5565,20 @@ mod compare_tx_sets_tests {
     }
 
     #[test]
-    #[should_panic(expected = "not in cache")]
-    fn test_compare_tx_sets_missing_set_panics() {
+    fn test_compare_tx_sets_missing_set_returns_none() {
         let driver = make_driver();
-        let candidates_hash = [0u8; 32];
 
         // Only cache set A, leave B uncached
         let tx_set_a = TransactionSet::new(Hash256::ZERO, vec![make_tx(1, 300, 3)]);
-        let hash_a = cache_tx_set(&driver, tx_set_a);
+        let _hash_a = cache_tx_set(&driver, tx_set_a);
 
         // B is not cached (just a made-up hash)
         let hash_b = Hash256::from_bytes([99u8; 32]);
 
-        // Parity: stellar-core releaseAssert(cTxSet) — must panic when tx set missing
-        let _ = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        // After AUDIT-220 fix: compare_tx_sets no longer fetches from cache.
+        // The caller is responsible for resolving tx sets. Missing sets are
+        // filtered before compare_tx_sets is ever called.
+        assert!(driver.get_tx_set(&hash_b).is_none());
     }
 
     #[test]
@@ -5490,7 +5590,7 @@ mod compare_tx_sets_tests {
         let hash = cache_tx_set(&driver, tx_set);
 
         // Comparing a set with itself should return Equal
-        let result = driver.compare_tx_sets(&hash, &hash, &candidates_hash);
+        let result = compare_tx_sets_by_hash(&driver, &hash, &hash, &candidates_hash);
         assert_eq!(result, std::cmp::Ordering::Equal);
     }
 
@@ -5721,7 +5821,7 @@ mod compare_tx_sets_tests {
         // Both should compare as non-panic and produce a deterministic result.
         // The exact ordering depends on XDR size and hash tiebreaker, but it
         // must not panic from overflow.
-        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        let result = compare_tx_sets_by_hash(&driver, &hash_a, &hash_b, &candidates_hash);
         // With both fees saturated to i64::MAX, fees compare equal.
         // Result is determined by size or hash tiebreaker.
         assert!(
@@ -5761,7 +5861,7 @@ mod compare_tx_sets_tests {
         let hash_a = cache_tx_set(&driver, tx_set_a);
         let hash_b = cache_tx_set(&driver, tx_set_b);
 
-        let result = driver.compare_tx_sets(&hash_a, &hash_b, &candidates_hash);
+        let result = compare_tx_sets_by_hash(&driver, &hash_a, &hash_b, &candidates_hash);
         // A has saturated fees (i64::MAX) > B's fees (2_000_000)
         // Since ops are equal (4 each), inclusion fee comparison decides.
         assert_eq!(
