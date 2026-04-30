@@ -6340,8 +6340,9 @@ mod tests {
     }
 
     /// Regression for #2076: when the apply pass encounters a hash mismatch
-    /// (existing buffered entry has hash A, check_ledger_close returns hash B),
-    /// the existing entry must be preserved unchanged.
+    /// (existing buffered entry has hash A, check_ledger_close returns hash B
+    /// with tx_set: Some), the existing entry must be preserved unchanged and
+    /// the incoming tx_set must be rejected.
     #[tokio::test]
     async fn test_process_externalized_slots_apply_hash_mismatch_keeps_existing() {
         let app = mk_test_app_for_pes_split().await;
@@ -6350,7 +6351,15 @@ mod tests {
         let n: u64 = 200;
         let mismatch_slot = n + 1;
         let hash_a = henyey_common::Hash256::from_bytes([0xAA; 32]);
-        let hash_b = henyey_common::Hash256::from_bytes([0xBB; 32]);
+
+        // Create a tx_set and cache it so check_ledger_close returns tx_set: Some.
+        let tx_set_b =
+            henyey_herder::TransactionSet::new_legacy(henyey_common::Hash256::ZERO, Vec::new());
+        let hash_b = *tx_set_b.hash();
+        assert_ne!(hash_a, hash_b, "hashes must differ for mismatch test");
+
+        let driver = app.herder.scp_driver();
+        driver.cache_tx_set(tx_set_b);
 
         // Pre-seed buffer with hash_a, no tx_set.
         {
@@ -6369,7 +6378,7 @@ mod tests {
         }
 
         // Externalize with hash_b (different hash) for the same slot.
-        let driver = app.herder.scp_driver();
+        // check_ledger_close will find the cached tx_set_b and return it.
         let xdr = mk_stellar_value_xdr(hash_b.0);
         driver.record_externalized(mismatch_slot, mk_value(xdr), None);
 
@@ -6379,7 +6388,7 @@ mod tests {
         let _ = app.process_externalized_slots().await;
 
         // The existing entry (hash_a) must be preserved — the apply pass
-        // should reject the incoming hash_b due to mismatch.
+        // should reject the incoming hash_b + tx_set due to mismatch.
         let buf = app.syncing_ledgers.read().await;
         let entry = buf.get(&(mismatch_slot as u32)).expect("entry must exist");
         assert_eq!(
@@ -6388,7 +6397,7 @@ mod tests {
         );
         assert!(
             entry.tx_set.is_none(),
-            "existing entry had no tx_set and mismatch rejects the new one"
+            "existing entry had no tx_set and mismatch rejects the incoming tx_set"
         );
     }
 
