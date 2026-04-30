@@ -9,10 +9,16 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use henyey_common::Hash256;
+use henyey_crypto::RandomEvictionCache;
+use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
 use super::scp_driver::{CachedTxSet, PendingTxSet};
 use crate::tx_queue::TransactionSet;
+
+/// Validity cache capacity — matches stellar-core's `TXSETVALID_CACHE_SIZE`
+/// (`stellar-core/src/herder/HerderSCPDriver.cpp:39`).
+const TXSET_VALID_CACHE_SIZE: usize = 1000;
 
 /// Diagnostic sizes for the tx-set tracker.
 #[derive(Debug, Clone, Default)]
@@ -32,7 +38,8 @@ pub struct TxSetTracker {
     pending: DashMap<Hash256, PendingTxSet>,
     /// Validity cache: (lcl_hash, tx_set_hash, close_time_offset) → valid.
     /// Cleared on externalization, not during trim.
-    valid_cache: DashMap<(Hash256, Hash256, u64), bool>,
+    /// Uses `RandomEvictionCache` matching stellar-core's `mTxSetValidCache`.
+    valid_cache: Mutex<RandomEvictionCache<(Hash256, Hash256, u64), bool>>,
     /// Maximum cache size.
     max_cache_size: usize,
     /// Monotonic counter for deterministic LRU eviction ordering.
@@ -45,7 +52,7 @@ impl TxSetTracker {
         Self {
             cache: DashMap::new(),
             pending: DashMap::new(),
-            valid_cache: DashMap::new(),
+            valid_cache: Mutex::new(RandomEvictionCache::new(TXSET_VALID_CACHE_SIZE)),
             max_cache_size,
             next_seq: AtomicU64::new(0),
         }
@@ -229,28 +236,17 @@ impl TxSetTracker {
 
     /// Check if a validity result is cached.
     pub fn check_valid(&self, key: &(Hash256, Hash256, u64)) -> Option<bool> {
-        self.valid_cache.get(key).map(|v| *v)
+        self.valid_cache.lock().get(key).copied()
     }
 
-    /// Store a validity result. Evicts an arbitrary entry if at capacity (64).
+    /// Store a validity result. Uses random-two-choice eviction at capacity.
     pub fn store_valid(&self, key: (Hash256, Hash256, u64), valid: bool) {
-        if self.valid_cache.len() >= 64 {
-            // Collect the key to evict before calling remove, to avoid holding
-            // a DashMap shard read-lock while remove acquires a write-lock.
-            let to_evict: Option<(Hash256, Hash256, u64)> = {
-                let guard = self.valid_cache.iter().next();
-                guard.map(|e| *e.key())
-            };
-            if let Some(k) = to_evict {
-                self.valid_cache.remove(&k);
-            }
-        }
-        self.valid_cache.insert(key, valid);
+        self.valid_cache.lock().put(key, valid);
     }
 
     /// Clear validity cache. Called on externalization, NOT during trim.
     pub fn clear_valid_cache(&self) {
-        self.valid_cache.clear();
+        self.valid_cache.lock().clear();
     }
 
     // --- Cleanup ---
@@ -289,7 +285,7 @@ impl TxSetTracker {
         TxSetTrackerSizes {
             cache: self.cache.len(),
             pending: self.pending.len(),
-            valid_cache: self.valid_cache.len(),
+            valid_cache: self.valid_cache.lock().len(),
         }
     }
 
@@ -502,20 +498,48 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_cache_bounded_at_64() {
+    fn test_valid_cache_bounded_at_capacity() {
         let tracker = TxSetTracker::new(256);
         let lcl = Hash256::from_bytes([0; 32]);
         // Fill to capacity
-        for i in 0..64u8 {
-            let h = Hash256::from_bytes([i; 32]);
+        for i in 0..TXSET_VALID_CACHE_SIZE {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xff) as u8;
+            bytes[1] = ((i >> 8) & 0xff) as u8;
+            let h = Hash256::from_bytes(bytes);
             tracker.store_valid((lcl, h, 0), true);
         }
-        assert_eq!(tracker.sizes().valid_cache, 64);
+        assert_eq!(tracker.sizes().valid_cache, TXSET_VALID_CACHE_SIZE);
 
-        // Insert one more — should evict, staying at 64
-        let extra = Hash256::from_bytes([99; 32]);
+        // Insert one more — should evict, staying at capacity
+        let extra = Hash256::from_bytes([0xff; 32]);
         tracker.store_valid((lcl, extra, 0), true);
-        assert_eq!(tracker.sizes().valid_cache, 64);
+        assert_eq!(tracker.sizes().valid_cache, TXSET_VALID_CACHE_SIZE);
+    }
+
+    /// Regression test: overwriting an existing key at capacity must NOT
+    /// spuriously evict another entry.
+    #[test]
+    fn test_store_valid_overwrite_at_capacity() {
+        let tracker = TxSetTracker::new(256);
+        let lcl = Hash256::from_bytes([0; 32]);
+        let first_key_hash = Hash256::from_bytes([0; 32]);
+
+        // Fill to capacity
+        for i in 0..TXSET_VALID_CACHE_SIZE {
+            let mut bytes = [0u8; 32];
+            bytes[0] = (i & 0xff) as u8;
+            bytes[1] = ((i >> 8) & 0xff) as u8;
+            let h = Hash256::from_bytes(bytes);
+            tracker.store_valid((lcl, h, 0), true);
+        }
+        assert_eq!(tracker.sizes().valid_cache, TXSET_VALID_CACHE_SIZE);
+
+        // Overwrite the first key — size must remain at capacity, not shrink
+        tracker.store_valid((lcl, first_key_hash, 0), false);
+        assert_eq!(tracker.sizes().valid_cache, TXSET_VALID_CACHE_SIZE);
+        // Verify the overwritten value is accessible
+        assert_eq!(tracker.check_valid(&(lcl, first_key_hash, 0)), Some(false));
     }
 
     /// Regression test for AUDIT-080: unsolicited tx sets must not be cached.
