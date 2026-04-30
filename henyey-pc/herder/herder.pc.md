@@ -294,11 +294,7 @@ function receive_scp_envelope(envelope) -> EnvelopeState:
     current_slot - MAX_SLOTS_TO_REMEMBER + 1
   else: 1
 
-  lcl = ledger_manager.current_ledger_seq() or null
-  effective_min = max(min_ledger_seq, lcl + 1) if lcl exists
-    else min_ledger_seq
-
-  GUARD (slot > max_ledger_seq or slot < effective_min)
+  GUARD (slot > max_ledger_seq or slot < min_ledger_seq)
     and slot != checkpoint → TooOld
 
   "**** From this point, we have to check signatures"

@@ -6688,7 +6688,8 @@ mod scp_pipeline_tests {
         // Simulate gate drift: build an envelope whose signed close_time
         // is current (so pre_filter's close-time gate passes), but by the
         // time process_verified runs, the herder has advanced its current
-        // slot so far that the envelope's slot falls below `effective_min`
+        // slot so far that the envelope's slot falls below `min_ledger_seq`
+        // (tracking_slot=10000 → min_ledger_seq=9989)
         // — the Range gate must now reject it as `EnvelopeState::TooOld`.
         let herder = make_test_herder();
         herder.start_syncing();
@@ -6699,7 +6700,7 @@ mod scp_pipeline_tests {
 
         let secret = SecretKey::from_seed(&[7u8; 32]);
         // Build a Nominate envelope with a fresh, signed StellarValue so
-        // close-time passes; slot=100 is far below effective_min.
+        // close-time passes; slot=100 is far below min_ledger_seq (=9989).
         let env = make_signed_test_envelope_outer(100, &herder, &secret);
         let intake = PipelinedIntake {
             envelope: env,
