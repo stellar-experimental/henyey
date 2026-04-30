@@ -313,7 +313,7 @@ Corresponds to: `OverlayManager.h`, `OverlayManagerImpl.h`
 | `recvFloodedMsgID()` | `FloodGate::record_seen()` | Full |
 | `recvTransaction()` | (via broadcast channel + flood gate) | Full |
 | `forgetFloodedMsg()` | Handled within `clear_below()` at ledger close | Full |
-| `recvTxDemand()` | `TxDemandsManager::recv_demand()` | Full |
+| `recvTxDemand()` | Handled in app crate (`App::handle_flood_demand`) | Full (moved to app layer) |
 | `getRandomAuthenticatedPeers()` | (shuffled peer list) | Full |
 | `getRandomInboundAuthenticatedPeers()` | N/A | None |
 | `getRandomOutboundAuthenticatedPeers()` | N/A | None |
@@ -400,7 +400,7 @@ Corresponds to: `TxDemandsManager.h`
 |--------------|------|--------|
 | `TxDemandsManager()` | `TxDemandsManager::new()` | Full |
 | `recordTxPullLatency()` | `record_tx_received()` | Full |
-| `recvTxDemand()` | `recv_demand()` | Full |
+| `recvTxDemand()` | Handled in app crate (`App::handle_flood_demand`) | N/A (overlay layer) |
 | `start()` | `start()` | Full |
 | `shutdown()` | `shutdown()` | Full |
 | `startDemandTimer()` | (timer-based via caller) | Full |

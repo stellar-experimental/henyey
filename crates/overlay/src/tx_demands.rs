@@ -1,7 +1,7 @@
 //! Transaction demand manager for pull-mode flooding.
 //!
-//! This module implements the TxDemandsManager from stellar-core, which handles
-//! demand scheduling with retry logic and responds to incoming demands.
+//! This module implements demand scheduling from stellar-core's TxDemandsManager,
+//! handling outbound demand creation with retry logic and pull-latency tracking.
 //!
 //! # Overview
 //!
@@ -12,7 +12,9 @@
 //! - Tracks demand history per transaction to avoid duplicate requests
 //! - Implements linear backoff for retry attempts
 //! - Records pull latency metrics
-//! - Responds to incoming FloodDemand messages
+//!
+//! Note: Demand *fulfillment* (responding to incoming FloodDemand messages) is
+//! handled by `App::handle_flood_demand` in the app crate, not here.
 //!
 //! # Demand Lifecycle
 //!
@@ -27,7 +29,7 @@ use crate::PeerId;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
-use stellar_xdr::curr::{FloodDemand, Hash, TransactionEnvelope};
+use stellar_xdr::curr::Hash;
 use tracing::{debug, trace};
 
 /// Maximum number of retry attempts before giving up on a transaction.
@@ -129,9 +131,6 @@ pub enum TxKnownStatus {
     Banned,
 }
 
-/// Callback for fetching a transaction by hash.
-pub type GetTxFn = Box<dyn Fn(&Hash) -> Option<TransactionEnvelope> + Send + Sync>;
-
 /// Internal state protected by lock.
 struct TxDemandsState {
     /// Map of transaction hash to demand history.
@@ -152,8 +151,6 @@ pub struct TxDemandsManager {
     state: RwLock<TxDemandsState>,
     /// Callback to check transaction status.
     tx_status_fn: RwLock<Option<TxStatusFn>>,
-    /// Callback to get transaction by hash.
-    get_tx_fn: RwLock<Option<GetTxFn>>,
 }
 
 impl TxDemandsManager {
@@ -167,19 +164,12 @@ impl TxDemandsManager {
                 running: false,
             }),
             tx_status_fn: RwLock::new(None),
-            get_tx_fn: RwLock::new(None),
         }
     }
 
     /// Set the callback for checking transaction status.
     pub fn set_tx_status_fn(&self, f: TxStatusFn) {
         let mut cb = self.tx_status_fn.write();
-        *cb = Some(f);
-    }
-
-    /// Set the callback for fetching transactions.
-    pub fn set_get_tx_fn(&self, f: GetTxFn) {
-        let mut cb = self.get_tx_fn.write();
         *cb = Some(f);
     }
 
@@ -426,35 +416,6 @@ impl TxDemandsManager {
         CleanupResult { abandoned, cleaned }
     }
 
-    /// Handle an incoming FloodDemand message.
-    ///
-    /// Returns transactions to send back to the peer.
-    pub fn recv_demand(&self, demand: &FloodDemand) -> Vec<TransactionEnvelope> {
-        let get_tx = self.get_tx_fn.read();
-        let Some(ref get_tx_fn) = *get_tx else {
-            return Vec::new();
-        };
-
-        let mut result = Vec::new();
-        let mut fulfilled = 0;
-        let mut not_found = 0;
-
-        for hash in demand.tx_hashes.iter() {
-            if let Some(tx) = get_tx_fn(hash) {
-                result.push(tx);
-                fulfilled += 1;
-            } else {
-                not_found += 1;
-            }
-        }
-
-        if fulfilled > 0 || not_found > 0 {
-            trace!("Fulfilled {} demands, {} not found", fulfilled, not_found);
-        }
-
-        result
-    }
-
     /// Get statistics about the demand manager.
     pub fn stats(&self) -> TxDemandsStats {
         let state = self.state.read();
@@ -512,8 +473,6 @@ pub struct TxDemandsStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
     use std::thread::sleep;
 
     fn make_hash(id: u8) -> Hash {
@@ -708,47 +667,6 @@ mod tests {
         // Stats should show 1 pending
         let stats = manager.stats();
         assert_eq!(stats.pending_demands, 1);
-    }
-
-    #[test]
-    fn test_recv_demand() {
-        let manager = TxDemandsManager::default();
-
-        // Set up get_tx callback
-        let call_count = Arc::new(AtomicUsize::new(0));
-        let call_count_clone = call_count.clone();
-
-        manager.set_get_tx_fn(Box::new(move |hash| {
-            call_count_clone.fetch_add(1, Ordering::SeqCst);
-            if hash.0[0] == 1 {
-                // Return a dummy transaction for hash 1
-                Some(TransactionEnvelope::TxV0(
-                    stellar_xdr::curr::TransactionV0Envelope {
-                        tx: stellar_xdr::curr::TransactionV0 {
-                            source_account_ed25519: stellar_xdr::curr::Uint256([0; 32]),
-                            fee: 100,
-                            seq_num: stellar_xdr::curr::SequenceNumber(1),
-                            time_bounds: None,
-                            memo: stellar_xdr::curr::Memo::None,
-                            operations: vec![].try_into().unwrap(),
-                            ext: stellar_xdr::curr::TransactionV0Ext::V0,
-                        },
-                        signatures: vec![].try_into().unwrap(),
-                    },
-                ))
-            } else {
-                None
-            }
-        }));
-
-        let demand = FloodDemand {
-            tx_hashes: vec![make_hash(1), make_hash(2)].try_into().unwrap(),
-        };
-
-        let result = manager.recv_demand(&demand);
-
-        assert_eq!(result.len(), 1); // Only hash 1 found
-        assert_eq!(call_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
