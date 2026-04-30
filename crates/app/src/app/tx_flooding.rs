@@ -223,14 +223,25 @@ impl App {
         let max_chunk_size = self.max_advert_size().min(1000);
 
         // Phase 0: Prune stale peers and ensure entries exist for all active peers.
-        {
+        // If new peers appeared, trigger rebroadcast so they receive existing mempool txs.
+        let has_new_peers = {
             let mut adverts_by_peer = self.tx_adverts_by_peer.write().await;
             adverts_by_peer.retain(|peer, _| peer_set.contains(peer));
+            let mut new_peers = false;
             for peer_id in &peer_ids {
-                adverts_by_peer
-                    .entry(peer_id.clone())
-                    .or_insert_with(PeerTxAdverts::new);
+                adverts_by_peer.entry(peer_id.clone()).or_insert_with(|| {
+                    new_peers = true;
+                    PeerTxAdverts::new()
+                });
             }
+            new_peers
+        };
+
+        // If new peers connected, re-mark all queued txs for flooding so
+        // the new peers can receive them. Matches stellar-core's behavior
+        // where rebroadcast() is triggered on new peer connections.
+        if has_new_peers {
+            self.herder.tx_queue().rebroadcast();
         }
 
         // Phase 1: Traverse candidates with the visitor API.
@@ -1605,6 +1616,7 @@ mod tests {
         TxQueueConfig {
             validate_signatures: false,
             validate_time_bounds: false,
+            max_dex_ops: Some(1000),
             ..Default::default()
         }
     }

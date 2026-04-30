@@ -2544,6 +2544,9 @@ impl App {
                         "Banned invalid queued txs after ledger close"
                     );
                 }
+                // Re-mark all surviving transactions for flooding. Matches
+                // stellar-core's resetBestFeeTxs() + rebroadcast() on ledger close.
+                self.herder.tx_queue().rebroadcast();
             }
             Err(e) if e.is_panic() => {
                 tracing::error!(

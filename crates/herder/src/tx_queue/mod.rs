@@ -66,13 +66,13 @@ use crate::surge_pricing::{
     SorobanGenericLaneConfig, SurgePricingLaneConfig, SurgePricingPriorityQueue, VisitTxResult,
     GENERIC_LANE,
 };
-use crate::tx_queue_limiter::TxQueueLimiter;
 use crate::Result;
 use henyey_tx::envelope_sequence_number;
 use henyey_tx::FeeRate;
 use rand::Rng;
 
 pub mod arb_flood_damping;
+pub(crate) mod flood_queue;
 mod selection;
 mod tx_set;
 
@@ -656,10 +656,13 @@ struct QueueStore {
     /// Seed for eviction queue tie-breaking. Regenerated on clear() and shift()
     /// to match stellar-core's per-reset/per-ledger seed lifecycle.
     eviction_seed: u64,
+    /// Persistent flood queue: populated on insert, drained by broadcast_with_visitor.
+    /// Matches stellar-core's persistent `mTxsToFlood` inside `TxQueueLimiter`.
+    flood_queue: flood_queue::FloodQueue,
 }
 
 impl QueueStore {
-    fn new() -> Self {
+    fn new(has_dex_lane: bool) -> Self {
         let seed = if cfg!(test) {
             0
         } else {
@@ -672,6 +675,7 @@ impl QueueStore {
             soroban_eviction_queue: None,
             global_ops_queue: None,
             eviction_seed: seed,
+            flood_queue: flood_queue::FloodQueue::new(has_dex_lane),
         }
     }
 
@@ -691,6 +695,10 @@ impl QueueStore {
         if let Some(ref mut queue) = self.global_ops_queue {
             queue.add(tx.clone(), ledger_version);
         }
+
+        // Mark for flooding (persistent flood queue — matches stellar-core's
+        // markTxForFlood on addTransaction).
+        self.flood_queue.mark_for_flood(&tx, ledger_version);
 
         self.by_hash.insert(tx.hash, tx);
         self.fee_index.insert(entry);
@@ -726,6 +734,10 @@ impl QueueStore {
                 queue.remove_entry(lane, &entry, ledger_version);
             }
 
+            // Remove from flood queue (matches stellar-core: removal paths
+            // erase from mTxsToFlood).
+            self.flood_queue.remove(&tx, ledger_version);
+
             Some(tx)
         } else {
             None
@@ -739,6 +751,7 @@ impl QueueStore {
     fn clear_data(&mut self) {
         self.by_hash.clear();
         self.fee_index.clear();
+        self.flood_queue.clear();
     }
 
     /// Regenerate the eviction seed and invalidate all persistent eviction
@@ -1216,8 +1229,10 @@ impl TransactionQueue {
             config.flood_arb_tx_damping_factor,
         );
 
+        let has_dex_lane = config.max_dex_ops.is_some();
+
         Self {
-            store: RwLock::new(QueueStore::new()),
+            store: RwLock::new(QueueStore::new(has_dex_lane)),
             config,
             seen: RwLock::new(HashSet::new()),
             validation_context: RwLock::new(ctx),
@@ -2810,66 +2825,61 @@ impl TransactionQueue {
             i64::try_from(budget).expect("broadcast DEX ops budget exceeds i64::MAX")
         });
 
-        let mut custom_limits = vec![Resource::new(vec![ops_budget])];
-        if let Some(dex_budget) = dex_ops_budget {
-            custom_limits.push(Resource::new(vec![dex_budget]));
-        }
-
         let ledger_version = self.validation_context.read().protocol_version;
-        let mut limiter = TxQueueLimiter::new_flood(custom_limits.len() > 1, 0);
-        {
-            let store = self.store.read();
-            for tx in store.values() {
-                if let Err(e) = limiter.mark_tx_for_flood(tx, ledger_version) {
-                    tracing::error!(
-                        error = %e,
-                        "mark_tx_for_flood: flood queue not initialized (invariant violation)"
-                    );
-                    return;
-                }
-            }
-        }
+
+        // Pre-borrow fields needed by the visitor closure so the borrow checker
+        // sees them as independent from `self.store`.
+        let arb_damper = &self.arb_damper;
+        let arb_tx_seen = &self.arb_tx_seen;
+        let arb_tx_dropped = &self.arb_tx_dropped;
 
         let mut lane_resources_left = Vec::new();
         let mut banning_hashes: Vec<Hash256> = Vec::new();
-        if let Err(e) = limiter.visit_top_txs(
-            |tx| {
-                // Arbitrage flood damping: check before visitor.
-                // Mirrors stellar-core broadcastTx → allowTxBroadcast.
-                let ops = henyey_tx::envelope_utils::envelope_operations(&tx.envelope);
-                let arb_result = self.arb_damper.lock().allow_tx_broadcast(ops);
-                match arb_result {
-                    arb_flood_damping::ArbBroadcastResult::Dampened => {
-                        self.arb_tx_seen
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        self.arb_tx_dropped
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        banning_hashes.push(tx.hash);
-                        return VisitTxResult::Skipped;
-                    }
-                    arb_flood_damping::ArbBroadcastResult::Allowed => {
-                        self.arb_tx_seen
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    arb_flood_damping::ArbBroadcastResult::NotArb => {}
-                }
 
-                let candidate = BroadcastCandidate {
-                    hash: tx.hash,
-                    op_count: tx.op_count(),
-                    is_dex: tx.is_dex,
-                };
-                visitor(&candidate).into()
-            },
-            &mut lane_resources_left,
-            ledger_version,
-            Some(&custom_limits),
-        ) {
-            tracing::error!(
-                error = %e,
-                "visit_top_txs: flood queue not initialized (invariant violation)"
+        {
+            let mut store = self.store.write();
+
+            // Match the flood queue's lane count. If the queue has a DEX lane
+            // but the caller didn't pass a DEX budget, use i64::MAX (uncapped).
+            let mut custom_limits = vec![Resource::new(vec![ops_budget])];
+            if store.flood_queue.num_lanes() > 1 {
+                let dex_limit = dex_ops_budget.unwrap_or(i64::MAX);
+                custom_limits.push(Resource::new(vec![dex_limit]));
+            }
+
+            // Destructively drain the persistent flood queue. Visited entries
+            // are erased; entries beyond budget persist for the next tick.
+            // Matches stellar-core's popTopTxs(false) on mTxsToFlood.
+            store.flood_queue.visit_top_txs(
+                |tx| {
+                    // Arbitrage flood damping: check before visitor.
+                    // Mirrors stellar-core broadcastTx → allowTxBroadcast.
+                    let ops = henyey_tx::envelope_utils::envelope_operations(&tx.envelope);
+                    let arb_result = arb_damper.lock().allow_tx_broadcast(ops);
+                    match arb_result {
+                        arb_flood_damping::ArbBroadcastResult::Dampened => {
+                            arb_tx_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            arb_tx_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            banning_hashes.push(tx.hash);
+                            return VisitTxResult::Skipped;
+                        }
+                        arb_flood_damping::ArbBroadcastResult::Allowed => {
+                            arb_tx_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        arb_flood_damping::ArbBroadcastResult::NotArb => {}
+                    }
+
+                    let candidate = BroadcastCandidate {
+                        hash: tx.hash,
+                        op_count: tx.op_count(),
+                        is_dex: tx.is_dex,
+                    };
+                    visitor(&candidate).into()
+                },
+                &mut lane_resources_left,
+                ledger_version,
+                &custom_limits,
             );
-            return;
         }
 
         budget.ops_remaining = lane_resources_left
@@ -2888,6 +2898,25 @@ impl TransactionQueue {
         // Ban dampened arbitrage transactions after traversal.
         // Mirrors stellar-core's broadcastSome → ban(banningTxs).
         self.ban(&banning_hashes);
+    }
+
+    /// Re-mark all queued transactions for flooding.
+    ///
+    /// Called after ledger-close invalidation completes (matching stellar-core's
+    /// `resetBestFeeTxs()` + `rebroadcast()`). Ensures that:
+    /// - Surviving transactions get re-advertised to peers on subsequent ticks
+    /// - New peers receive the full mempool contents
+    ///
+    /// Note: unlike stellar-core's immediate `broadcast(false)` call, henyey
+    /// defers the actual send to the next flood tick (~200ms). This is an
+    /// intentional minor divergence affecting only propagation latency.
+    pub fn rebroadcast(&self) {
+        let mut store = self.store.write();
+        let ledger_version = self.validation_context.read().protocol_version;
+        let txs: Vec<QueuedTransaction> = store.values().cloned().collect();
+        store
+            .flood_queue
+            .reset_and_repopulate(txs.iter(), ledger_version);
     }
 
     /// Return transaction hashes ordered by fee per op (desc) then received time (asc).
@@ -9094,10 +9123,16 @@ mod broadcast_visitor_tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(budget.ops_remaining, 1);
 
+        // Rebroadcast to repopulate flood queue for next call
+        queue.rebroadcast();
+
         // Budget of 4: 2 txs fit
         let (entries, budget) = visit_all_processed(&queue, 4, None);
         assert_eq!(entries.len(), 2);
         assert_eq!(budget.ops_remaining, 0);
+
+        // Rebroadcast again
+        queue.rebroadcast();
 
         // Budget of 6: all 3 fit
         let (entries, budget) = visit_all_processed(&queue, 6, None);
@@ -9158,6 +9193,7 @@ mod broadcast_visitor_tests {
     fn test_broadcast_visitor_dex_budget_limits() {
         let config = TxQueueConfig {
             max_size: 10,
+            max_dex_ops: Some(1000),
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
@@ -9186,8 +9222,12 @@ mod broadcast_visitor_tests {
 
     #[test]
     fn test_broadcast_visitor_dex_budget_independent_of_queue_dex_config() {
+        // With the persistent flood queue, DEX lane topology is determined by
+        // max_dex_ops config (not by the caller's budget). This test verifies
+        // that flood-time DEX enforcement works regardless of max_queue_dex_ops.
         let config = TxQueueConfig {
             max_size: 10,
+            max_dex_ops: Some(1000),
             max_queue_dex_ops: None,
             ..Default::default()
         };
@@ -9272,6 +9312,7 @@ mod broadcast_visitor_tests {
         // When top DEX tx exceeds DEX budget, ALL DEX txs are dropped
         let config = TxQueueConfig {
             max_size: 10,
+            max_dex_ops: Some(1000),
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
@@ -9298,6 +9339,7 @@ mod broadcast_visitor_tests {
     fn test_broadcast_visitor_dex_lane_drop_continues_non_dex() {
         let config = TxQueueConfig {
             max_size: 10,
+            max_dex_ops: Some(1000),
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
@@ -9441,6 +9483,7 @@ mod broadcast_visitor_tests {
     fn test_broadcast_visitor_skipped_does_not_consume_dex_budget() {
         let config = TxQueueConfig {
             max_size: 10,
+            max_dex_ops: Some(1000),
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
@@ -9503,6 +9546,7 @@ mod broadcast_visitor_tests {
     fn test_broadcast_visitor_budget_carry_over_mixed() {
         let config = TxQueueConfig {
             max_size: 10,
+            max_dex_ops: Some(1000),
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);
@@ -9543,6 +9587,7 @@ mod broadcast_visitor_tests {
     fn test_broadcast_visitor_dex_budget_zero_deactivates_lane() {
         let config = TxQueueConfig {
             max_size: 10,
+            max_dex_ops: Some(1000),
             ..Default::default()
         };
         let queue = TransactionQueue::new(config);

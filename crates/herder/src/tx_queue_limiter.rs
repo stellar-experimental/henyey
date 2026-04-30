@@ -185,6 +185,7 @@ impl TxQueueLimiter {
     /// The internal flood queue is initialized immediately because
     /// `visit_top_txs` destructively drains it. Callers that need
     /// non-destructive behavior should build a fresh limiter per traversal.
+    #[allow(dead_code)] // Superseded by FloodQueue but kept for reference/testing
     pub(crate) fn new_flood(has_dex_lane: bool, seed: u64) -> Self {
         Self {
             max_resources: Resource::new(vec![i64::MAX]),
