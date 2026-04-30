@@ -5854,6 +5854,188 @@ mod tests {
             "#2066: tracked tx set must be synced to FetchingEnvelopes cache"
         );
     }
+
+    /// Helper: create a signed StellarValue with a specific tx_set_hash and
+    /// valid close time, WITHOUT caching the tx set in scp_driver.
+    fn make_value_for_tx_set_hash(
+        tx_set_hash: Hash256,
+        herder: &Herder,
+        secret_key: &SecretKey,
+    ) -> Value {
+        let xdr_tx_set_hash = stellar_xdr::curr::Hash(tx_set_hash.0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let close_time = TimePoint(now);
+
+        // Sign: (networkID, ENVELOPE_TYPE_SCPVALUE, txSetHash, closeTime)
+        let network_id = herder.scp_driver.network_id();
+        let mut sign_data = network_id.0.to_vec();
+        sign_data.extend_from_slice(&EnvelopeType::Scpvalue.to_xdr(Limits::none()).unwrap());
+        sign_data.extend_from_slice(&xdr_tx_set_hash.to_xdr(Limits::none()).unwrap());
+        sign_data.extend_from_slice(&close_time.to_xdr(Limits::none()).unwrap());
+        let sig = secret_key.sign(&sign_data);
+
+        let node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*secret_key.public_key().as_bytes()),
+        ));
+
+        let stellar_value = StellarValue {
+            tx_set_hash: xdr_tx_set_hash,
+            close_time,
+            upgrades: vec![].try_into().unwrap(),
+            ext: StellarValueExt::Signed(LedgerCloseValueSignature {
+                node_id,
+                signature: stellar_xdr::curr::Signature(
+                    sig.0.to_vec().try_into().unwrap_or_default(),
+                ),
+            }),
+        };
+        Value(
+            stellar_value
+                .to_xdr(Limits::none())
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    /// End-to-end regression test for #2069: after receiving an unsolicited
+    /// TxSet, a subsequent PREPARE ballot envelope referencing the same hash
+    /// must stay in Fetching state (not be processed through SCP). The
+    /// unsolicited tx set must NOT have poisoned the FetchingEnvelopes cache.
+    #[tokio::test]
+    async fn test_issue_2069_unsolicited_tx_set_then_ballot_stays_fetching() {
+        // Set up a validator herder with a 2-node quorum (local + other).
+        let local_secret = SecretKey::from_seed(&[7u8; 32]);
+        let local_public = local_secret.public_key();
+        let local_node_id = node_id_from_public_key(&local_public);
+
+        let other_secret = SecretKey::from_seed(&[1u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = node_id_from_public_key(&other_public);
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 1,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+        let qs_hash = hash_quorum_set(&quorum_set);
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: local_public,
+            local_quorum_set: Some(quorum_set.clone()),
+            ..HerderConfig::default()
+        };
+
+        let herder = Arc::new(Herder::with_secret_key(config, local_secret));
+        herder.bootstrap(100);
+
+        // Expand the quorum tracker so the other node passes the non-quorum filter.
+        herder
+            .quorum_tracker
+            .write()
+            .expand(&other_node_id, quorum_set.clone())
+            .unwrap();
+
+        // Store the quorum set so the envelope passes quorum-set availability.
+        herder
+            .scp_driver
+            .store_quorum_set(&other_node_id, quorum_set);
+
+        let tracking = herder.tracking_slot(); // 101
+
+        // Step 1: Send an unsolicited tx set (not tracked by the tracker).
+        let tx_set = TransactionSet::new(Hash256::from_bytes([0xEE; 32]), Vec::new());
+        let hash = *tx_set.hash();
+
+        let result = Arc::clone(&herder).receive_tx_set(tx_set).await;
+        assert!(
+            result.is_none(),
+            "#2069: unsolicited tx set must not be accepted"
+        );
+
+        // Step 2: Send a PREPARE envelope referencing the same tx_set hash.
+        let value = make_value_for_tx_set_hash(hash, &herder, &other_secret);
+        let statement = ScpStatement {
+            node_id: other_node_id,
+            slot_index: tracking,
+            pledges: ScpStatementPledges::Prepare(ScpStatementPrepare {
+                quorum_set_hash: qs_hash.into(),
+                ballot: ScpBallot { counter: 1, value },
+                prepared: None,
+                prepared_prime: None,
+                n_c: 0,
+                n_h: 0,
+            }),
+        };
+        let envelope = sign_statement(&statement, &herder, &other_secret);
+
+        let env_result = herder.receive_scp_envelope(envelope);
+        assert_eq!(
+            env_result,
+            EnvelopeState::Fetching,
+            "#2069: ballot envelope must stay in Fetching when tx set is not in scp_driver cache"
+        );
+
+        // The system must have issued a pending request for the missing hash.
+        assert!(
+            herder.scp_driver.needs_tx_set(&hash),
+            "#2069: process_scp_envelope must register a pending tx_set request"
+        );
+
+        // The FetchingEnvelopes cache must NOT contain the hash (unsolicited
+        // tx set did not poison it).
+        assert!(
+            !herder.fetching_envelopes.has_cached_tx_set(&hash),
+            "#2069: unsolicited tx set must not have poisoned FetchingEnvelopes cache"
+        );
+    }
+
+    /// Regression test for #2069: a TxSet whose content doesn't match its
+    /// declared hash (hash mismatch / malformed) must be rejected even if
+    /// the hash is pending in the tracker.
+    #[tokio::test]
+    async fn test_issue_2069_hash_mismatch_tx_set_returns_none() {
+        let herder = Arc::new(make_test_herder());
+        let slot: SlotIndex = 50;
+
+        // Register a pending request for a specific hash.
+        let expected_hash = Hash256::from_bytes([0xFA; 32]);
+        herder.scp_driver.request_tx_set(expected_hash, slot);
+
+        // Construct a tx set that claims to have `expected_hash` but whose
+        // content actually hashes to something different.
+        let malformed_tx_set =
+            TransactionSet::with_hash(Hash256::from_bytes([0x11; 32]), expected_hash, Vec::new());
+        assert_ne!(
+            malformed_tx_set.recompute_hash(),
+            expected_hash,
+            "pre-condition: tx set content must not match declared hash"
+        );
+
+        let result = Arc::clone(&herder).receive_tx_set(malformed_tx_set).await;
+        assert!(
+            result.is_none(),
+            "#2069: hash-mismatch tx set must be rejected by the tracker"
+        );
+
+        // The FetchingEnvelopes cache must NOT contain the hash.
+        assert!(
+            !herder.fetching_envelopes.has_cached_tx_set(&expected_hash),
+            "#2069: hash-mismatch tx set must not poison FetchingEnvelopes cache"
+        );
+
+        // The original pending request must still be active (not cleared).
+        assert!(
+            herder.scp_driver.needs_tx_set(&expected_hash),
+            "#2069: hash-mismatch must not clear the original pending request"
+        );
+    }
 }
 
 #[cfg(test)]
