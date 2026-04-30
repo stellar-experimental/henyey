@@ -1072,3 +1072,80 @@ async fn fake_type_validation_simulate_transaction() {
     )
     .await;
 }
+
+// --- Group 9: getLedgerEntries ---
+
+#[tokio::test]
+async fn fake_type_validation_get_ledger_entries() {
+    let h = FakeRpcTestHarness::start_default().await;
+
+    // xdrFormat wrong type (parsed before keys)
+    assert_invalid_params(
+        &h,
+        "getLedgerEntries",
+        json!({"xdrFormat": 99}),
+        "must be a string",
+    )
+    .await;
+
+    // keys missing entirely
+    assert_invalid_params(
+        &h,
+        "getLedgerEntries",
+        json!({}),
+        "missing or invalid 'keys'",
+    )
+    .await;
+
+    // keys as non-array (string)
+    assert_invalid_params(
+        &h,
+        "getLedgerEntries",
+        json!({"keys": "not-an-array"}),
+        "missing or invalid 'keys'",
+    )
+    .await;
+
+    // keys as non-array (integer)
+    assert_invalid_params(
+        &h,
+        "getLedgerEntries",
+        json!({"keys": 42}),
+        "missing or invalid 'keys'",
+    )
+    .await;
+
+    // keys[0] as non-string (integer)
+    assert_invalid_params(
+        &h,
+        "getLedgerEntries",
+        json!({"keys": [123]}),
+        "keys[0] must be a string",
+    )
+    .await;
+
+    // keys[1] as non-string (object) — use valid base64 XDR key for keys[0]
+    use stellar_xdr::curr::{LedgerKey, LedgerKeyAccount, WriteXdr};
+    let key = LedgerKey::Account(LedgerKeyAccount {
+        account_id: stellar_xdr::curr::AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([0u8; 32])),
+        ),
+    });
+    let key_b64 = BASE64.encode(key.to_xdr(Limits::none()).unwrap());
+    assert_invalid_params(
+        &h,
+        "getLedgerEntries",
+        json!({"keys": [key_b64, {"not": "string"}]}),
+        "keys[1] must be a string",
+    )
+    .await;
+
+    // keys empty array
+    assert_invalid_params(
+        &h,
+        "getLedgerEntries",
+        json!({"keys": []}),
+        "must not be empty",
+    )
+    .await;
+}
