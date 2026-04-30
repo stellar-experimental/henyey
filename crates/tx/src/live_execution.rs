@@ -1731,4 +1731,68 @@ mod tests {
             "refundable fee tracker should be initialized with resource_fee"
         );
     }
+
+    /// Regression test: `apply_transaction()` with partial fee (balance < computed fee).
+    ///
+    /// Verifies the full fee/seq/fee-pool flow when the source account cannot
+    /// cover the full computed fee. For protocol 24+ (all henyey-supported
+    /// protocols), partial fee charge must NOT block subsequent phases — matching
+    /// stellar-core's `commonPreApply(applying=true)` where `feeToPay=0`.
+    ///
+    /// This is a fee/seq/fee-pool regression test only — `apply_transaction()`
+    /// does not execute operation bodies.
+    #[test]
+    fn test_apply_transaction_partial_fee() {
+        let mut ctx = make_test_context_with_state(25);
+        let account_id = create_test_account_id(1);
+        // Account with only 50 stroops — insufficient for the computed fee of 100.
+        let account = make_account_entry(account_id.clone(), 50, 1);
+
+        if let Some(state) = ctx.state_mut() {
+            state.put_account(account);
+        }
+
+        // Transaction with declared fee=200, 1 op. Computed fee = min(200, 100*1) = 100.
+        // Available balance = 50 < 100, so fee_charged should be capped at 50.
+        let frame = make_test_frame(account_id.clone(), 200, 2);
+
+        let result = apply_transaction(&frame, &mut ctx, false).unwrap();
+
+        // Fee charged is capped at available balance.
+        assert_eq!(
+            result.fee_charged(),
+            50,
+            "fee_charged must be capped at available balance (50), not computed fee (100)"
+        );
+
+        // No early failure from partial fee — matches stellar-core parity.
+        // `apply_transaction` does not execute operation bodies, so the result
+        // stays at TxSuccess (the initial state from process_fee_seq_num).
+        assert_eq!(
+            result.result_code(),
+            stellar_xdr::curr::TransactionResultCode::TxSuccess,
+            "partial fee must not produce an error — body application is not blocked"
+        );
+
+        // Fee pool delta reflects the partial fee.
+        assert_eq!(
+            ctx.fee_pool_delta(),
+            50,
+            "fee pool must reflect the partial charged fee"
+        );
+
+        // Source account balance fully consumed.
+        if let Some(state) = ctx.state() {
+            let updated = state.get_account(&create_test_account_id(1)).unwrap();
+            assert_eq!(
+                updated.balance, 0,
+                "source balance must be 0 after partial fee deduction"
+            );
+            // Sequence number bumped to tx.seq_num (2).
+            assert_eq!(
+                updated.seq_num.0, 2,
+                "source seq_num must be bumped to tx seq_num"
+            );
+        }
+    }
 }

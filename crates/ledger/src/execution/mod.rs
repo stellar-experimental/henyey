@@ -4594,4 +4594,176 @@ mod tests {
             "Second key should be A (larger in native Ord)"
         );
     }
+
+    /// Regression test: `execute_with_pre_apply_result` with partial fee and failing body.
+    ///
+    /// This tests the parallel execution path's per-TX entry point. When a transaction's
+    /// body fails (e.g., payment to non-existent destination), the rollback must NOT
+    /// re-apply fee/seq/signer mutations because `execute_with_pre_apply_result` zeroes
+    /// those DeltaEntries before calling `apply_body`. This matches stellar-core's
+    /// `parallelApply` behavior where fee/seq are committed on the main delta by
+    /// `preParallelApply`.
+    ///
+    /// In the real parallel path:
+    /// - Fees are pre-deducted on the main delta by `pre_deduct_soroban_fees`
+    /// - `pre_apply_arc` is called with `deduct_fee=false` (fees already handled)
+    /// - The executor sees post-fee-deduction balances
+    /// - On body failure, rollback doesn't re-add fee (deduct_fee=false)
+    ///
+    /// We simulate this by setting balance=0 (as if fee was already deducted from
+    /// original 50), using deduct_fee=false, and verifying rollback integrity.
+    #[test]
+    fn test_execute_with_pre_apply_result_partial_fee_failing_body() {
+        use henyey_crypto::{sign_hash, SecretKey};
+        use stellar_xdr::curr::{
+            AccountEntry, AccountEntryExt, AccountId, DecoratedSignature, LedgerEntry,
+            LedgerEntryData, LedgerEntryExt, LedgerKey, MuxedAccount, Operation, OperationBody,
+            PaymentOp, Preconditions, PublicKey, SequenceNumber, SignatureHint, Thresholds,
+            Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        };
+
+        let network_id = NetworkId::testnet();
+        let base_fee: u32 = 100;
+        let protocol_version: u32 = 25;
+
+        // Source account with balance=0 — simulating post-fee-deduction state.
+        // In the real parallel path, `pre_deduct_soroban_fees` already took the
+        // partial fee (50) from the account (original balance 50 → 0).
+        let secret = SecretKey::from_seed(&[42u8; 32]);
+        let source_id = AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+            *secret.public_key().as_bytes(),
+        )));
+
+        let account_key = LedgerKey::Account(stellar_xdr::curr::LedgerKeyAccount {
+            account_id: source_id.clone(),
+        });
+        let account_entry = LedgerEntry {
+            last_modified_ledger_seq: 1,
+            data: LedgerEntryData::Account(AccountEntry {
+                account_id: source_id.clone(),
+                balance: 0, // Post-fee-deduction: original 50 - partial fee 50 = 0
+                seq_num: SequenceNumber(1),
+                num_sub_entries: 0,
+                inflation_dest: None,
+                flags: 0,
+                home_domain: Default::default(),
+                thresholds: Thresholds([1, 0, 0, 0]),
+                signers: vec![].try_into().unwrap(),
+                ext: AccountEntryExt::V0,
+            }),
+            ext: LedgerEntryExt::V0,
+        };
+
+        let snapshot = crate::SnapshotBuilder::new(1)
+            .add_entry(account_key, account_entry)
+            .build_with_default_header();
+        let snapshot = crate::snapshot::SnapshotHandle::new(snapshot);
+
+        // Build a Payment to a non-existent destination (body will fail).
+        let dest = MuxedAccount::Ed25519(Uint256([99u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::Payment(PaymentOp {
+                destination: dest,
+                asset: stellar_xdr::curr::Asset::Native,
+                amount: 1,
+            }),
+        };
+        let tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+            fee: 200,
+            seq_num: SequenceNumber(2),
+            cond: Preconditions::None,
+            memo: stellar_xdr::curr::Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+        let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        // Sign the transaction.
+        let frame_for_hash =
+            henyey_tx::TransactionFrame::from_owned_with_network(envelope.clone(), network_id);
+        let tx_hash = frame_for_hash.hash(&network_id).expect("tx hash");
+        let signature = sign_hash(&secret, &tx_hash);
+        let public_key = secret.public_key();
+        let pk_bytes = public_key.as_bytes();
+        let hint = SignatureHint([pk_bytes[28], pk_bytes[29], pk_bytes[30], pk_bytes[31]]);
+        let decorated = DecoratedSignature {
+            hint,
+            signature: stellar_xdr::curr::Signature(signature.0.to_vec().try_into().unwrap()),
+        };
+        if let TransactionEnvelope::Tx(ref mut env) = envelope {
+            env.signatures = vec![decorated].try_into().unwrap();
+        }
+
+        let context = henyey_tx::LedgerContext::new(
+            2,
+            1_000,
+            base_fee,
+            5_000_000,
+            protocol_version,
+            network_id,
+        );
+        let mut executor = TransactionExecutor::new(
+            &context,
+            0,
+            henyey_tx::soroban::SorobanConfig::default(),
+            henyey_tx::ClassicEventConfig::default(),
+        );
+        executor
+            .load_orderbook_offers(&snapshot)
+            .expect("load offers");
+
+        let tx_arc = Arc::new(envelope);
+
+        // Phase 1: pre_apply_arc with deduct_fee=false — matching the real parallel path.
+        // In production, fees are already on the main delta; the cluster executor
+        // doesn't re-deduct them.
+        let pre_result = executor
+            .pre_apply_arc(&snapshot, &tx_arc, base_fee, Some([0u8; 32]), false)
+            .expect("pre_apply_arc should not error");
+
+        let pre = pre_result.expect("pre_apply_arc should succeed (not validation failure)");
+
+        // With deduct_fee=false, fee is computed but not deducted.
+        // fee = fee_to_charge(100) = min(200, 100*1) = 100 (the computed fee, uncapped).
+        // In the real parallel path, the actual charged amount (50) was set by
+        // pre_deduct_soroban_fees. Here we verify the deduct_fee=false path.
+        assert_eq!(pre.deduct_fee, false);
+
+        // Verify state after pre_apply: balance still 0 (no deduction), seq bumped to 2.
+        {
+            let acc = executor.state.get_account(&source_id).unwrap();
+            assert_eq!(
+                acc.balance, 0,
+                "balance must remain 0 (deduct_fee=false, no deduction)"
+            );
+            assert_eq!(acc.seq_num.0, 2, "seq_num must be bumped to 2");
+        }
+
+        // Phase 2: execute_with_pre_apply_result — body fails (no destination).
+        // This zeroes fee_entries/seq_entries/signer_entries before calling apply_body.
+        let result = executor
+            .execute_with_pre_apply_result(&snapshot, pre)
+            .expect("execute_with_pre_apply_result should not error");
+
+        // Transaction must fail (body failed — destination doesn't exist).
+        assert!(!result.success, "TX body should fail (no destination)");
+
+        // Source account state must NOT be rolled back — seq bump is preserved.
+        // This is the key invariant: execute_with_pre_apply_result zeroes the
+        // DeltaEntries, so rollback_failed_tx cannot replay seq/signer mutations.
+        let acc = executor.state.get_account(&source_id).unwrap();
+        assert_eq!(
+            acc.balance, 0,
+            "balance must remain 0 — no fee re-deduction from rollback"
+        );
+        assert_eq!(
+            acc.seq_num.0, 2,
+            "seq_num must remain 2 — seq bump must not be rolled back"
+        );
+    }
 }
