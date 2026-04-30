@@ -413,7 +413,10 @@ impl Herder {
 
         let tx_queue = TransactionQueue::new(config.tx_queue_config.clone());
         let pending_envelopes = PendingEnvelopes::new(pending_config);
-        let fetching_envelopes = FetchingEnvelopes::with_defaults();
+        let scp_driver_for_fetching = Arc::clone(&scp_driver);
+        let fetching_envelopes = FetchingEnvelopes::with_defaults(Box::new(move |hash| {
+            scp_driver_for_fetching.has_tx_set(hash)
+        }));
 
         // Pre-cache the local quorum set in fetching_envelopes so envelopes
         // referencing it don't wait for fetching.
@@ -1584,17 +1587,12 @@ impl Herder {
 
             use crate::fetching_envelopes::RecvResult;
 
-            // Notify FetchingEnvelopes that the tx_sets are already
-            // available in scp_driver — syncs the dual caches so only
-            // the quorum set remains as a pending dependency.
-            for hash in &tx_set_hashes {
-                self.fetching_envelopes.notify_tx_set_available(*hash, slot);
-            }
-            // Note: we do NOT drain ready envelopes here. Any envelopes
-            // unblocked by notify_tx_set_available() will be drained by the next
-            // receive_tx_set() or handle_quorum_set() call, both of which
-            // run process_ready_fetching_envelopes() via spawn_blocking.
-            // Draining inline here would stall the event loop (#1907).
+            // With the read-through callback, FetchingEnvelopes queries
+            // scp_driver.has_tx_set() directly — no explicit notification
+            // needed. We only need on_tx_set_accepted when a new tx_set
+            // arrives (to stop the fetcher and drain waiting envelopes).
+            // Here the tx_sets are already in scp_driver, so the callback
+            // will find them automatically when recv_envelope checks deps.
 
             let envelope_clone = envelope.clone();
             let result = self.fetching_envelopes.recv_envelope(envelope);
@@ -2921,7 +2919,7 @@ impl Herder {
     ///
     /// Three phases:
     /// - `tracker_receive_ms` — `ScpDriver::receive_tx_set` (inline).
-    /// - `notify_tx_set_ms` — `FetchingEnvelopes::notify_tx_set_available`
+    /// - `notify_tx_set_ms` — `FetchingEnvelopes::on_tx_set_accepted`
     ///   (inline, only when the tracker accepted the tx set).
     /// - `process_ready_spawn_blocking_ms` — time the event-loop task
     ///   spends awaiting the blocking drain's `JoinHandle`. After the
@@ -2939,12 +2937,11 @@ impl Herder {
 
         // Only notify FetchingEnvelopes when the authoritative tracker
         // accepted the tx set. Unsolicited or malformed tx sets (where
-        // scp_driver returns None) must NOT poison the private cache —
-        // otherwise a later non-EXTERNALIZE envelope could bypass the
-        // fetch gate and enter SCP as MaybeValidDeferred. See #2066.
-        if let Some(accepted_slot) = slot {
-            self.fetching_envelopes
-                .notify_tx_set_available(hash, accepted_slot);
+        // scp_driver returns None) must NOT reach the fetcher — the
+        // read-through callback already queries scp_driver.has_tx_set()
+        // so no cache poisoning is possible. See #2066.
+        if let Some(_accepted_slot) = slot {
+            self.fetching_envelopes.on_tx_set_accepted(&hash);
             timer.mark("notify_tx_set_ms");
         }
 
@@ -3014,7 +3011,8 @@ impl Herder {
         }
 
         let slot = self.tracking_slot();
-        self.fetching_envelopes.notify_tx_set_available(hash, slot);
+        let _ = slot; // slot no longer needed for notification
+        self.fetching_envelopes.on_tx_set_accepted(&hash);
     }
 
     /// Cache a transaction set and drain ready envelopes off the event loop.
@@ -3436,8 +3434,8 @@ impl Herder {
     ///
     /// Called when a TxSet or GeneralizedTxSet message is received.
     /// Returns true if the TxSet was needed and envelopes may be ready.
-    pub fn recv_tx_set(&self, hash: Hash256, slot: u64, data: Vec<u8>) -> bool {
-        self.fetching_envelopes.recv_tx_set(hash, slot, data)
+    pub fn recv_tx_set(&self, hash: Hash256) -> bool {
+        self.fetching_envelopes.recv_tx_set(hash)
     }
 
     /// Receive a QuorumSet from a peer.
@@ -3492,9 +3490,9 @@ impl Herder {
             .erase_below(slot_index, slot_to_keep);
     }
 
-    /// Check if we have a cached TxSet in the fetching envelopes cache.
+    /// Check if we have a TxSet in the authoritative scp_driver cache.
     pub fn has_fetching_tx_set(&self, hash: &Hash256) -> bool {
-        self.fetching_envelopes.has_tx_set(hash)
+        self.scp_driver.has_tx_set(hash)
     }
 
     /// Check if we have a cached QuorumSet in the fetching envelopes cache.
@@ -3508,9 +3506,8 @@ impl Herder {
     }
 
     /// Get fetching envelopes cache sizes for diagnostics.
-    pub fn fetching_cache_sizes(&self) -> (usize, usize, usize) {
+    pub fn fetching_cache_sizes(&self) -> (usize, usize) {
         (
-            self.fetching_envelopes.tx_set_cache_size(),
             self.fetching_envelopes.quorum_set_cache_size(),
             self.fetching_envelopes.slots_count(),
         )
@@ -5092,9 +5089,9 @@ mod tests {
     /// Regression test for #1907: process_scp_envelope must NOT drain the
     /// ready queue inline when entering the cached-tx-set + missing-quorum-set
     /// branch. Previously, this path called process_ready_fetching_envelopes()
-    /// after notify_tx_set_available(), which could stall the event loop.
+    /// after on_tx_set_accepted(), which could stall the event loop.
     ///
-    /// After the fix, envelopes unblocked by notify_tx_set_available() remain in the
+    /// After the fix, envelopes unblocked by on_tx_set_accepted() remain in the
     /// ready queue until the next receive_tx_set() or handle_quorum_set() call
     /// drains them via spawn_blocking.
     #[test]
@@ -5147,7 +5144,7 @@ mod tests {
         let value = make_valid_value_with_cached_tx_set(&herder, &other_secret);
 
         // Seed some ready envelopes in FetchingEnvelopes. These simulate
-        // envelopes that became ready via an earlier notify_tx_set_available call.
+        // envelopes that became ready via an earlier on_tx_set_accepted call.
         let mut ready_envelopes = Vec::new();
         for i in 0..5u32 {
             let ballot = ScpBallot {
@@ -5800,14 +5797,13 @@ mod tests {
         );
     }
 
-    /// Regression test for #2066: unsolicited TxSets must NOT poison the
-    /// FetchingEnvelopes private cache. When `ScpDriver::receive_tx_set`
-    /// returns `None` (tx set not tracked), `Herder::receive_tx_set` must
-    /// NOT notify `FetchingEnvelopes`, ensuring the private `tx_set_cache`
-    /// stays clean and non-EXTERNALIZE ballot envelopes cannot bypass the
-    /// fetch gate.
+    /// Regression test for #2066: unsolicited TxSets must NOT be accepted
+    /// by the tracker. With the read-through callback design (#2070), there
+    /// is no private cache to poison — the callback queries scp_driver
+    /// directly. This test verifies the tracker still rejects unsolicited
+    /// tx sets.
     #[tokio::test]
-    async fn test_issue_2066_unsolicited_tx_set_does_not_poison_cache() {
+    async fn test_issue_2066_unsolicited_tx_set_not_accepted() {
         let herder = Arc::new(make_test_herder());
         let tx_set = TransactionSet::new(Hash256::from_bytes([0xAB; 32]), Vec::new());
         let hash = *tx_set.hash();
@@ -5820,18 +5816,18 @@ mod tests {
             "#2066: unsolicited tx set must not be accepted by the tracker"
         );
 
-        // The private FetchingEnvelopes cache must NOT contain the hash.
+        // The scp_driver must NOT have this tx set cached.
         assert!(
-            !herder.fetching_envelopes.has_cached_tx_set(&hash),
-            "#2066: unsolicited tx set must not poison FetchingEnvelopes tx_set_cache"
+            !herder.scp_driver.has_tx_set(&hash),
+            "#2066: unsolicited tx set must not appear in scp_driver cache"
         );
     }
 
     /// Regression test for #2066 (positive case): a legitimately tracked
-    /// TxSet must still notify FetchingEnvelopes and unblock waiting
-    /// envelopes after `receive_tx_set`.
+    /// TxSet must still be accepted and unblock waiting envelopes after
+    /// `receive_tx_set`.
     #[tokio::test]
-    async fn test_issue_2066_tracked_tx_set_still_notifies_fetching_envelopes() {
+    async fn test_issue_2066_tracked_tx_set_accepted_by_driver() {
         let herder = Arc::new(make_test_herder());
         let slot: SlotIndex = 42;
         let tx_set = TransactionSet::new(Hash256::from_bytes([0xCD; 32]), Vec::new());
@@ -5840,7 +5836,7 @@ mod tests {
         // Register the tx set as pending in the tracker (as if SCP requested it).
         herder.scp_driver.request_tx_set(hash, slot);
 
-        // Now receive_tx_set should accept it and notify FetchingEnvelopes.
+        // Now receive_tx_set should accept it.
         let result = Arc::clone(&herder).receive_tx_set(tx_set).await;
         assert_eq!(
             result,
@@ -5848,10 +5844,10 @@ mod tests {
             "#2066: tracked tx set must be accepted by the tracker"
         );
 
-        // The private FetchingEnvelopes cache should now contain the hash.
+        // The scp_driver should now have this tx set cached.
         assert!(
-            herder.fetching_envelopes.has_cached_tx_set(&hash),
-            "#2066: tracked tx set must be synced to FetchingEnvelopes cache"
+            herder.scp_driver.has_tx_set(&hash),
+            "#2066: tracked tx set must be in scp_driver cache"
         );
     }
 
@@ -5988,11 +5984,11 @@ mod tests {
             "#2069: process_scp_envelope must register a pending tx_set request"
         );
 
-        // The FetchingEnvelopes cache must NOT contain the hash (unsolicited
-        // tx set did not poison it).
+        // The scp_driver must NOT contain the hash (unsolicited
+        // tx set was not accepted).
         assert!(
-            !herder.fetching_envelopes.has_cached_tx_set(&hash),
-            "#2069: unsolicited tx set must not have poisoned FetchingEnvelopes cache"
+            !herder.scp_driver.has_tx_set(&hash),
+            "#2069: unsolicited tx set must not appear in scp_driver cache"
         );
     }
 
@@ -6024,10 +6020,10 @@ mod tests {
             "#2069: hash-mismatch tx set must be rejected by the tracker"
         );
 
-        // The FetchingEnvelopes cache must NOT contain the hash.
+        // The scp_driver must NOT contain the hash.
         assert!(
-            !herder.fetching_envelopes.has_cached_tx_set(&expected_hash),
-            "#2069: hash-mismatch tx set must not poison FetchingEnvelopes cache"
+            !herder.scp_driver.has_tx_set(&expected_hash),
+            "#2069: hash-mismatch tx set must not appear in scp_driver cache"
         );
 
         // The original pending request must still be active (not cleared).
