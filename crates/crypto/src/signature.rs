@@ -515,4 +515,53 @@ mod tests {
         };
         assert!(!verify_ed25519_signed_payload(&sig, &signed_payload));
     }
+
+    #[test]
+    fn test_verify_ed25519_signed_payload_malformed_signature_length() {
+        use stellar_xdr::curr::{DecoratedSignature, SignatureHint, Uint256};
+
+        let secret = SecretKey::generate();
+        let pubkey_bytes = *secret.public_key().as_bytes();
+        let payload = b"test payload";
+
+        let signed_payload = stellar_xdr::curr::SignerKeyEd25519SignedPayload {
+            ed25519: Uint256(pubkey_bytes),
+            payload: payload.as_slice().try_into().unwrap(),
+        };
+
+        // Compute correct hint
+        let pubkey_hint = [
+            pubkey_bytes[28],
+            pubkey_bytes[29],
+            pubkey_bytes[30],
+            pubkey_bytes[31],
+        ];
+        let len = payload.len();
+        let payload_hint = [
+            payload[len - 4],
+            payload[len - 3],
+            payload[len - 2],
+            payload[len - 1],
+        ];
+        let xor_hint = [
+            pubkey_hint[0] ^ payload_hint[0],
+            pubkey_hint[1] ^ payload_hint[1],
+            pubkey_hint[2] ^ payload_hint[2],
+            pubkey_hint[3] ^ payload_hint[3],
+        ];
+
+        // Too short (32 bytes instead of 64)
+        let short_sig = DecoratedSignature {
+            hint: SignatureHint(xor_hint),
+            signature: stellar_xdr::curr::Signature(vec![0xAB; 32].try_into().unwrap()),
+        };
+        assert!(!verify_ed25519_signed_payload(&short_sig, &signed_payload));
+
+        // Empty signature
+        let empty_sig = DecoratedSignature {
+            hint: SignatureHint(xor_hint),
+            signature: stellar_xdr::curr::Signature(vec![].try_into().unwrap()),
+        };
+        assert!(!verify_ed25519_signed_payload(&empty_sig, &signed_payload));
+    }
 }

@@ -3120,18 +3120,13 @@ fn has_hashx_signature(
 }
 
 fn has_signed_payload_signature(
-    tx_hash: &Hash256,
+    _tx_hash: &Hash256,
     signatures: &[DecoratedSignature],
     payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
 ) -> bool {
-    let mut data = Vec::with_capacity(32 + payload.payload.len());
-    data.extend_from_slice(&tx_hash.0);
-    data.extend_from_slice(&payload.payload);
-    let payload_hash = Hash256::hash(&data);
-
-    signatures.iter().any(|sig| {
-        henyey_tx::validation::verify_signature_with_raw_key(&payload_hash, sig, &payload.ed25519.0)
-    })
+    signatures
+        .iter()
+        .any(|sig| henyey_crypto::verify_ed25519_signed_payload(sig, payload))
 }
 
 impl Default for TransactionQueue {
