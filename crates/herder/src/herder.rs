@@ -6171,6 +6171,143 @@ mod tests {
              clear the slot's fully_validated flag"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #2135: Closing-gate replay variant of the drain-path regression test.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Proves that envelopes replayed from the closing gate in `ledger_closed`
+    /// take the `is_current_ledger` validation path (not apply-lag), just like
+    /// drained pending envelopes.
+    ///
+    /// The closing gate buffers envelopes that arrive during the close window
+    /// (between externalization and `ledger_closed`). When `ledger_closed`
+    /// replays them (herder.rs:2082-2101), LCL has advanced, so
+    /// `lcl_seq + 1 == slot_index` → `is_current_ledger = true` →
+    /// `ValueValidation::Valid`. No `apply_lag` is recorded and
+    /// `fully_validated` is preserved.
+    ///
+    /// This emulates stellar-core's post-apply timing: `safelyProcessSCPQueue`
+    /// is posted to the main thread after `processExternalized` applies the
+    /// ledger (HerderImpl.cpp:1194), so queued envelopes naturally see the
+    /// advanced LCL.
+    ///
+    /// Preconditions:
+    /// - No LedgerManager: validation uses the tracking-state fallback
+    ///   (`lcl_seq = consensus_index - 1`). Sufficient because we test
+    ///   validation *path selection*, not full production sequencing.
+    /// - Direct `process_scp_envelope_with_tx_set` bypasses SCP-envelope
+    ///   signature verification (the StellarValue signature IS verified).
+    #[test]
+    fn test_closing_gate_replay_avoids_apply_lag_path() {
+        let (herder, _local_secret) = make_validator_herder();
+
+        // Peer that will send the EXTERNALIZE.
+        let peer_secret = SecretKey::from_seed(&[2u8; 32]);
+        let peer_public = peer_secret.public_key();
+        let peer_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*peer_public.as_bytes()),
+        ));
+
+        // Set tracking: consensus_index = 100 (next slot to close).
+        // This makes the tracking-state fallback yield lcl_seq = 99.
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.consensus_index = 100;
+            ts.is_tracking = true;
+            // consensus_close_time = 0 (default) so close_time=1 > 0 passes.
+        }
+
+        // Activate closing gate for slot 100, mirroring production behavior
+        // in advance_tracking_slot (herder.rs:1759-1763).
+        {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 100;
+            gate.buffer.clear();
+        }
+
+        // Create a properly signed StellarValue with cached tx_set.
+        let value = make_valid_value_with_cached_tx_set(&herder, &peer_secret);
+
+        // Construct EXTERNALIZE envelope for slot 100.
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: peer_node_id,
+                slot_index: 100,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot { counter: 1, value },
+                    n_h: 1,
+                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                }),
+            },
+            // Envelope signature not verified by SCP (bypassed in this test).
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        // Process the envelope — it should be deferred by the closing gate.
+        let result = herder.process_scp_envelope_with_tx_set(envelope);
+        assert_eq!(
+            result,
+            EnvelopeState::Deferred,
+            "envelope for gated slot must be deferred by closing gate"
+        );
+
+        // Gate-path assertion: confirm envelope was buffered.
+        {
+            let gate = herder.closing_gate.lock().unwrap();
+            assert_eq!(
+                gate.buffer.len(),
+                1,
+                "closing gate must have buffered exactly one envelope"
+            );
+        }
+
+        // Precondition: no deferred causes before replay.
+        assert_eq!(
+            herder.scp_driver.deferred_slot_count(),
+            0,
+            "precondition: no deferred slots before gate replay"
+        );
+
+        // ledger_closed(99): LCL = 99, replays the gate buffer.
+        // The replayed EXTERNALIZE is processed through:
+        //   process_scp_envelope_with_tx_set → scp.receive_envelope →
+        //   validate_value(100, ...) → validate_value_against_local_state:
+        //   lcl_seq=99, is_current_ledger=true → ValueValidation::Valid.
+        herder.ledger_closed(99, &[], &[], 0);
+
+        // Gate-cleared assertion: proves the replay path was exercised.
+        {
+            let gate = herder.closing_gate.lock().unwrap();
+            assert_eq!(
+                gate.slot, 0,
+                "closing gate must be opened (slot=0) after ledger_closed"
+            );
+            assert!(
+                gate.buffer.is_empty(),
+                "closing gate buffer must be empty after replay"
+            );
+        }
+
+        // KEY ASSERTION: No apply_lag recorded — the is_current_ledger path
+        // was taken, returning ValueValidation::Valid (not MaybeValidDeferred).
+        assert_eq!(
+            herder.scp_driver.deferred_slot_count(),
+            0,
+            "gate-replayed envelope must NOT record apply_lag — is_current_ledger \
+             path must be taken when LCL = N and slot = N+1"
+        );
+
+        // KEY ASSERTION: fully_validated is preserved — MaybeValidDeferred
+        // would have cleared it (via SCP's ballot protocol), but
+        // FullyValidated leaves it untouched.
+        assert!(
+            herder.scp.is_slot_fully_validated(100),
+            "gate-replayed envelope must preserve fully_validated — the \
+             is_current_ledger path returns FullyValidated which does not \
+             clear the slot's fully_validated flag"
+        );
+    }
 }
 
 #[cfg(test)]
