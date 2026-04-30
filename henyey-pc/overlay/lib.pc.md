@@ -12,7 +12,7 @@ and the local node identity. Orchestrates all overlay sub-modules.
 ```
 auth, ban_manager, codec, connection, error, flood,
 flow_control, item_fetcher, manager, message_handlers,
-metrics, peer, peer_manager, survey, tx_adverts, tx_demands
+metrics, peer, peer_manager, survey
 ```
 
 ---
