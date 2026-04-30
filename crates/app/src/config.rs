@@ -500,6 +500,12 @@ pub struct QueryConfig {
     #[serde(default)]
     pub port: Option<u16>,
 
+    /// Bind address for the query server. When `None`, inherits `[http].address`.
+    /// Set explicitly by the compat translation (from `PUBLIC_HTTP_PORT`) or
+    /// via the native `[query].address` TOML key.
+    #[serde(default)]
+    pub address: Option<String>,
+
     /// Number of historical ledger snapshots to retain for point-in-time queries.
     /// Maps to stellar-core's `QUERY_SNAPSHOT_LEDGERS`.
     #[serde(default = "default_query_snapshot_ledgers")]
@@ -515,6 +521,7 @@ impl Default for QueryConfig {
     fn default() -> Self {
         Self {
             port: None,
+            address: None,
             snapshot_ledgers: default_query_snapshot_ledgers(),
             thread_pool_size: default_query_thread_pool_size(),
         }

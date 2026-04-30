@@ -187,6 +187,7 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     let http_port = config.http.port;
     let http_address = config.http.address.clone();
     let query_port = config.query.port;
+    let query_address = config.query.address.clone();
     let compat_http_enabled = config.compat_http.enabled;
     let compat_http_port = config.compat_http.port;
     let compat_http_address = config.compat_http.address.clone();
@@ -232,7 +233,8 @@ pub async fn run_node(config: AppConfig, options: RunOptions) -> anyhow::Result<
     // This isolates query I/O from the main consensus runtime, preventing
     // slow queries from starving SCP, ledger close, or peer messaging.
     let query_handle = if let Some(port) = query_port {
-        let query_server = QueryServer::new(port, http_address.clone(), app.clone());
+        let resolved_address = query_address.unwrap_or_else(|| http_address.clone());
+        let query_server = QueryServer::new(port, resolved_address, app.clone());
         let thread_pool_size = query_thread_pool_size;
         Some(spawn_query_server_on_dedicated_runtime(
             query_server,
