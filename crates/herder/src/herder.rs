@@ -4141,7 +4141,38 @@ mod tests {
 
     #[test]
     fn test_nomination_timeout_requires_started() {
-        let (herder, secret) = make_validator_herder();
+        // Use a 2-node quorum so that nomination doesn't immediately cascade
+        // to externalization (which would stop nomination and cancel the timer).
+        let seed = [7u8; 32];
+        let secret_for_herder = SecretKey::from_seed(&seed);
+        let public = secret_for_herder.public_key();
+        let local_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*public.as_bytes()),
+        ));
+
+        let other_secret = SecretKey::from_seed(&[8u8; 32]);
+        let other_public = other_secret.public_key();
+        let other_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*other_public.as_bytes()),
+        ));
+
+        let quorum_set = ScpQuorumSet {
+            threshold: 2,
+            validators: vec![local_node_id.clone(), other_node_id.clone()]
+                .try_into()
+                .unwrap(),
+            inner_sets: vec![].try_into().unwrap(),
+        };
+
+        let config = HerderConfig {
+            is_validator: true,
+            node_public_key: public,
+            local_quorum_set: Some(quorum_set),
+            ..HerderConfig::default()
+        };
+
+        let herder = Herder::with_secret_key(config, secret_for_herder);
+        let secret = SecretKey::from_seed(&seed);
         let slot = 1u64;
 
         assert!(herder.get_nomination_timeout(slot).is_none());

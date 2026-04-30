@@ -193,6 +193,40 @@ impl Slot {
         }
     }
 
+    /// Consolidated slot-level bookkeeping after any protocol interaction.
+    ///
+    /// INVARIANT: Every public Slot method that calls into nomination or ballot
+    /// protocol code MUST call this method exactly once before returning.
+    /// This is the single extension point for slot-level side effects that
+    /// need to fire after local self-envelope emission.
+    ///
+    /// Operations run in fixed order:
+    /// 1. Propagate `fully_validated` clearing (consume-once flag from ballot).
+    /// 2. Stop nomination if ballot confirmed commit (consume-once flag).
+    /// 3. Detect externalization and stop timers (idempotent).
+    /// 4. Update v-blocking membership (idempotent, short-circuits if set).
+    ///
+    /// Excluded paths that do NOT call this method:
+    /// - `set_state_from_envelope`: state restoration, no advance_slot/emission.
+    /// - `restore_fully_validated`: re-emits already-recorded envelopes only.
+    /// - `force_externalize`: catchup-only direct externalization.
+    fn run_post_emit_bookkeeping<D: SCPDriver>(&mut self, driver: &Arc<D>) {
+        // 1. Consume needs_clear_slot_validation from ballot.
+        self.propagate_ballot_clear_slot_validation();
+
+        // 2. Consume needs_stop_nomination from ballot.
+        if self.ballot.take_needs_stop_nomination() {
+            self.nomination.stop();
+            driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
+        }
+
+        // 3. Externalization detection (idempotent).
+        self.maybe_record_externalization(driver);
+
+        // 4. V-blocking update (idempotent).
+        self.maybe_set_got_v_blocking();
+    }
+
     /// Test-only: directly set the `fully_validated` flag.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn test_set_fully_validated(&mut self, validated: bool) {
@@ -310,10 +344,6 @@ impl Slot {
     ) -> EnvelopeState {
         let node_id = envelope.statement.node_id.clone();
 
-        // Check if this is the first message from this node
-        // stellar-core checks getLatestMessage(nodeID) which checks ballot then nomination
-        let prev = self.has_latest_message_from(&node_id);
-
         // Process based on statement type
         let result = match &envelope.statement.pledges {
             ScpStatementPledges::Nominate(_) => self.process_nomination_envelope(&envelope, driver),
@@ -326,27 +356,14 @@ impl Slot {
 
         if result.is_valid() {
             self.envelopes.entry(node_id).or_default().push(envelope);
-
-            // If this is the first valid message from this node,
-            // check if we now have a v-blocking set (matching stellar-core)
-            if !prev {
-                self.maybe_set_got_v_blocking();
-            }
         }
 
         // Check if we need to transition from nomination to ballot
         self.check_nomination_to_ballot(driver);
 
-        // Check if we've externalized
-        self.maybe_record_externalization(driver);
-
-        // Processing an external envelope can trigger local emission (ballot
-        // via advance_slot → emit_current_state, or nomination via
-        // self-processing). If the external node's `prev` was true the
-        // first-message check above was skipped, so the local node's first
-        // latest message would not have triggered maybe_set_got_v_blocking.
-        // Call unconditionally; it short-circuits when already set.
-        self.maybe_set_got_v_blocking();
+        // Consolidated bookkeeping: v-blocking, externalization, validation
+        // clearing, nomination stopping — all in one call.
+        self.run_post_emit_bookkeeping(driver);
 
         result
     }
@@ -384,15 +401,8 @@ impl Slot {
         // because there are no incoming peer envelopes to trigger process_envelope.
         self.check_nomination_to_ballot(driver);
 
-        // Check if the ballot protocol already externalized (possible for
-        // solo validators where the entire SCP round completes synchronously).
-        self.maybe_record_externalization(driver);
-
-        // Local emission (nomination or ballot via check_nomination_to_ballot)
-        // may have recorded the first latest message from the local node.
-        // Update v-blocking to match stellar-core's self-envelope processing
-        // through Slot::processEnvelope(envW, self=true).
-        self.maybe_set_got_v_blocking();
+        // Consolidated bookkeeping: externalization, v-blocking, validation, etc.
+        self.run_post_emit_bookkeeping(driver);
 
         // stellar-core always sets up the nomination timer after nominate() succeeds
         // in reaching the main logic (i.e., didn't return early due to
@@ -444,8 +454,7 @@ impl Slot {
         let composite = self.nomination.latest_composite().cloned();
         let ctx = slot_ctx!(self, driver);
         let result = self.ballot.bump_timeout(&ctx, composite.as_ref());
-        self.propagate_ballot_clear_slot_validation();
-        self.maybe_set_got_v_blocking();
+        self.run_post_emit_bookkeeping(driver);
         result
     }
 
@@ -590,38 +599,26 @@ impl Slot {
         // advance_slot, mirroring stellar-core BallotProtocol.cpp:208-211.
         let result = self.ballot.process_envelope(envelope, &ctx, validation);
 
-        // Also clear slot-level fully_validated (propagates to nomination)
-        // to match Slot::set_fully_validated behavior.
+        // Clear slot-level fully_validated for MaybeValid external envelopes.
+        // This matches stellar-core's Slot::setFullyValidated(false) inside
+        // processEnvelope for external (non-self) envelopes.
         //
         // Use the same `clears_fully_validated()` gate as the ballot
         // protocol so the henyey-specific `MaybeValidDeferred` variant
         // does not poison the slot's fully_validated flag. See the
-        // enum doc comment on `ValidationLevel` and issues #1795 /
-        // #1798.
+        // enum doc comment on `ValidationLevel` and issues #1795 / #1798.
         if result != EnvelopeState::Invalid
             && validation.clears_fully_validated()
             && self.externalized_value.is_none()
         {
             self.fully_validated = false;
             self.nomination.set_fully_validated(false);
-            // Propagate to ballot for consistency with Slot::set_fully_validated;
-            // the ballot clears its own flag independently at ballot/mod.rs:706-708
-            // but adding it here prevents future asymmetry bugs.
             self.ballot.set_fully_validated(false);
         }
 
-        // Check if set_confirm_commit signaled that nomination should stop
-        // (matches stellar-core mSlot.stopNomination() call inside setConfirmCommit)
-        if self.ballot.take_needs_stop_nomination() {
-            self.nomination.stop();
-            driver.stop_timer(self.slot_index, crate::driver::SCPTimerType::Nomination);
-        }
-
-        // Check if local self-emission (via advance_slot → emit_current_state)
-        // validated a self-envelope as MaybeValid/MaybeValidDeferred and needs
-        // the slot-level fully_validated cleared. Matches stellar-core
-        // mSlot.setFullyValidated(false) inside processEnvelope(self).
-        self.propagate_ballot_clear_slot_validation();
+        // Remaining bookkeeping (stop nomination, propagate self-emission
+        // validation clearing, externalization, v-blocking) is handled by
+        // the parent's run_post_emit_bookkeeping() call.
 
         result
     }
@@ -649,9 +646,8 @@ impl Slot {
             let ctx = slot_ctx!(self, driver);
             self.ballot.bump(&ctx, composite.clone(), false);
 
-            // Propagate slot-level fully_validated clearing if the initial
-            // bump → emit_current_state validated the composite as MaybeValid.
-            self.propagate_ballot_clear_slot_validation();
+            // Remaining bookkeeping (validation clearing, v-blocking, etc.)
+            // handled by the parent's run_post_emit_bookkeeping() call.
         }
     }
 
@@ -848,8 +844,7 @@ impl Slot {
         self.sync_composite_candidate();
         let ctx = slot_ctx!(self, driver);
         let result = self.ballot.abandon_ballot(counter, &ctx);
-        self.propagate_ballot_clear_slot_validation();
-        self.maybe_set_got_v_blocking();
+        self.run_post_emit_bookkeeping(driver);
         result
     }
 
@@ -873,8 +868,7 @@ impl Slot {
     ) -> bool {
         let ctx = slot_ctx!(self, driver);
         let result = self.ballot.bump_state(&ctx, value, counter);
-        self.propagate_ballot_clear_slot_validation();
-        self.maybe_set_got_v_blocking();
+        self.run_post_emit_bookkeeping(driver);
         result
     }
 
@@ -885,8 +879,7 @@ impl Slot {
     pub fn force_bump_state<D: SCPDriver>(&mut self, driver: &Arc<D>, value: Value) -> bool {
         let ctx = slot_ctx!(self, driver);
         let result = self.ballot.bump(&ctx, value, true);
-        self.propagate_ballot_clear_slot_validation();
-        self.maybe_set_got_v_blocking();
+        self.run_post_emit_bookkeeping(driver);
         result
     }
 
