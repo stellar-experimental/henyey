@@ -31,16 +31,17 @@
 //! # Caching
 //!
 //! The manager maintains an in-memory cache of recently accessed buckets.
-//! The cache uses a simple eviction policy (random eviction when full).
-//! For production use, consider a more sophisticated LRU policy.
+//! The cache uses random-two-choice eviction (via `RandomEvictionCache` from
+//! `henyey-crypto`), matching stellar-core's general caching philosophy.
 //!
 //! # Thread Safety
 //!
-//! The manager uses `RwLock` for the cache, making it safe for concurrent
-//! reads with exclusive writes. File operations are atomic (write to temp,
-//! then rename).
+//! The manager uses `RwLock` for the cache. Read-only operations (`exists()`,
+//! `len()`) use read locks for concurrent access. Mutation operations
+//! (`get()`, `put()`, `remove()`, `clear()`) require write locks. The
+//! high-frequency `bucket_exists()` path uses only read locks.
+//! File operations are atomic (write to temp, then rename).
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -48,6 +49,7 @@ use stellar_xdr::curr::{LedgerEntry, LedgerKey, Limits, WriteXdr};
 
 use henyey_common::fs_utils::durable_rename;
 use henyey_common::Hash256;
+use henyey_crypto::RandomEvictionCache;
 
 use crate::bucket::Bucket;
 use crate::entry::BucketEntry;
@@ -174,16 +176,17 @@ pub(crate) fn promote_temp_to_canonical(
 ///
 /// # Cache Behavior
 ///
-/// The manager caches buckets in memory up to `max_cache_size`. When the
-/// cache is full, a random entry is evicted. All cache operations are
-/// thread-safe via `RwLock`.
+/// The manager caches buckets in memory up to the configured capacity. When the
+/// cache is full, random-two-choice eviction removes the less-recently-used of
+/// two randomly selected entries. All cache operations are thread-safe via
+/// `RwLock` — read-only checks (`exists`, `len`) use read locks while mutations
+/// (`get`, `put`, `remove`, `clear`) require write locks.
 pub struct BucketManager {
     /// Directory where bucket files are stored.
     bucket_dir: PathBuf,
     /// Cache of loaded buckets, keyed by content hash.
-    cache: RwLock<HashMap<Hash256, Arc<Bucket>>>,
-    /// Maximum number of buckets to keep in cache.
-    max_cache_size: usize,
+    /// Uses random-two-choice eviction matching stellar-core's caching philosophy.
+    cache: RwLock<RandomEvictionCache<Hash256, Arc<Bucket>>>,
     /// Whether to persist/load disk indexes alongside bucket files.
     persist_index: bool,
     /// Tracks completed merges for deduplication/reattachment.
@@ -207,15 +210,14 @@ impl BucketManager {
 
         Ok(Self {
             bucket_dir,
-            cache: RwLock::new(HashMap::new()),
-            max_cache_size,
+            cache: RwLock::new(RandomEvictionCache::new(max_cache_size)),
             persist_index,
             finished_merges: RwLock::new(BucketMergeMap::new()),
         })
     }
 
     fn cached_bucket(&self, hash: &Hash256) -> Option<Arc<Bucket>> {
-        self.cache.read().unwrap().get(hash).cloned()
+        self.cache.write().unwrap().get(hash).cloned()
     }
 
     /// Create a new BucketManager with the given directory.
@@ -518,8 +520,8 @@ impl BucketManager {
             return true; // Sentinel hashes always "exist" (no file needed)
         }
 
-        // Check cache
-        if self.cached_bucket(hash).is_some() {
+        // Check cache (read lock only — exists() doesn't bump recency)
+        if self.cache.read().unwrap().exists(hash) {
             return true;
         }
 
@@ -645,29 +647,17 @@ impl BucketManager {
 
     /// Add a bucket to the cache.
     fn add_to_cache(&self, hash: Hash256, bucket: Arc<Bucket>) {
-        let mut cache = self.cache.write().unwrap();
-
-        // Evict if cache is full (simple LRU would be better)
-        if cache.len() >= self.max_cache_size {
-            // Remove a random entry (not ideal, but simple)
-            if let Some(key) = cache.keys().next().cloned() {
-                cache.remove(&key);
-            }
-        }
-
-        cache.insert(hash, bucket);
+        self.cache.write().unwrap().put(hash, bucket);
     }
 
     /// Clear the bucket cache.
     pub fn clear_cache(&self) {
-        let mut cache = self.cache.write().unwrap();
-        cache.clear();
+        self.cache.write().unwrap().clear();
     }
 
     /// Get the number of cached buckets.
     pub fn cache_size(&self) -> usize {
-        let cache = self.cache.read().unwrap();
-        cache.len()
+        self.cache.read().unwrap().len()
     }
 
     /// List all bucket files in the directory.
@@ -697,8 +687,7 @@ impl BucketManager {
     pub fn delete_bucket(&self, hash: &Hash256) -> Result<()> {
         // Remove from cache
         {
-            let mut cache = self.cache.write().unwrap();
-            cache.remove(hash);
+            self.cache.write().unwrap().remove(hash);
         }
 
         // Delete canonical .bucket.xdr file
@@ -1399,10 +1388,11 @@ impl BucketManager {
 
 impl std::fmt::Debug for BucketManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cache = self.cache.read().unwrap();
         f.debug_struct("BucketManager")
             .field("bucket_dir", &self.bucket_dir)
-            .field("cache_size", &self.cache_size())
-            .field("max_cache_size", &self.max_cache_size)
+            .field("cache_size", &cache.len())
+            .field("cache_capacity", &cache.capacity())
             .finish()
     }
 }

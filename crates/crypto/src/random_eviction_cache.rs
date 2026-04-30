@@ -119,6 +119,48 @@ impl<K: Eq + Hash + Clone, V> RandomEvictionCache<K, V> {
         self.keys.len()
     }
 
+    /// Returns true if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Returns the configured capacity of the cache.
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Removes a key from the cache, returning its value if present.
+    ///
+    /// Does NOT bump the generation counter — removal is not an access event.
+    /// Uses the same swap-remove technique as `evict_one()` to maintain
+    /// `key_index` consistency.
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let entry = self.map.remove(key)?;
+        let victim_idx = entry.key_index;
+
+        // Swap-remove from keys vec.
+        let last_idx = self.keys.len() - 1;
+        if victim_idx != last_idx {
+            self.keys.swap(victim_idx, last_idx);
+            // Update the swapped entry's key_index.
+            let swapped_key = &self.keys[victim_idx];
+            self.map.get_mut(swapped_key).unwrap().key_index = victim_idx;
+        }
+        self.keys.pop();
+
+        Some(entry.value)
+    }
+
+    /// Removes all entries from the cache.
+    ///
+    /// Preserves the `generation` counter and `capacity` so that
+    /// access-generation monotonicity is maintained across clear-then-reuse
+    /// cycles.
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.keys.clear();
+    }
+
     /// Randomly pick two entries and evict the less-recently-used one.
     ///
     /// Uses strict `<` for the comparison, matching stellar-core:
@@ -335,5 +377,131 @@ mod tests {
         assert!(cache.exists(&"A"));
         assert!(cache.exists(&"B"));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_remove_existing_key() {
+        let mut cache = RandomEvictionCache::new(10);
+        cache.put("A", 1);
+        cache.put("B", 2);
+        cache.put("C", 3);
+
+        assert_eq!(cache.remove(&"B"), Some(2));
+        assert_eq!(cache.len(), 2);
+        assert!(!cache.exists(&"B"));
+        assert!(cache.exists(&"A"));
+        assert!(cache.exists(&"C"));
+        // Can still get remaining entries
+        assert_eq!(cache.get(&"A"), Some(&1));
+        assert_eq!(cache.get(&"C"), Some(&3));
+    }
+
+    #[test]
+    fn test_remove_missing_key() {
+        let mut cache: RandomEvictionCache<&str, i32> = RandomEvictionCache::new(10);
+        cache.put("A", 1);
+        assert_eq!(cache.remove(&"Z"), None);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_after_eviction() {
+        let mut cache = RandomEvictionCache::with_seed(3, 42);
+        cache.put("A", 1);
+        cache.put("B", 2);
+        cache.put("C", 3);
+        // This triggers eviction of one entry
+        cache.put("D", 4);
+        assert_eq!(cache.len(), 3);
+
+        // Remove one of the remaining entries
+        let remaining: Vec<&str> = ["A", "B", "C", "D"]
+            .iter()
+            .copied()
+            .filter(|k| cache.exists(k))
+            .collect();
+        let removed = cache.remove(&remaining[0]);
+        assert!(removed.is_some());
+        assert_eq!(cache.len(), 2);
+
+        // Remaining entries are still accessible
+        for &key in &remaining[1..] {
+            assert!(cache.exists(&key));
+        }
+    }
+
+    #[test]
+    fn test_remove_does_not_corrupt_indices() {
+        // Stress test: interleave removes and inserts, verify consistency.
+        let capacity = 20;
+        let mut cache = RandomEvictionCache::with_seed(capacity, 77);
+
+        for i in 0..100u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_le_bytes());
+            cache.put(key, i);
+
+            // Remove every 5th entry
+            if i % 5 == 3 && i >= 5 {
+                let mut remove_key = [0u8; 32];
+                remove_key[..4].copy_from_slice(&(i - 3).to_le_bytes());
+                cache.remove(&remove_key);
+            }
+
+            assert!(cache.len() <= capacity);
+        }
+
+        // Verify all entries in the cache are retrievable.
+        let final_len = cache.len();
+        let mut found = 0;
+        for i in 0..100u32 {
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&i.to_le_bytes());
+            if cache.get(&key).is_some() {
+                found += 1;
+            }
+        }
+        assert_eq!(found, final_len);
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut cache = RandomEvictionCache::new(10);
+        cache.put("A", 1);
+        cache.put("B", 2);
+        cache.put("C", 3);
+
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert!(cache.is_empty());
+        assert!(!cache.exists(&"A"));
+        assert_eq!(cache.get(&"A"), None);
+    }
+
+    #[test]
+    fn test_clear_then_reuse() {
+        let mut cache = RandomEvictionCache::new(5);
+        cache.put("A", 1);
+        cache.put("B", 2);
+
+        cache.clear();
+
+        // Insert new entries after clear — should work normally
+        cache.put("X", 10);
+        cache.put("Y", 20);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&"X"), Some(&10));
+        assert_eq!(cache.get(&"Y"), Some(&20));
+        // Old entries gone
+        assert!(!cache.exists(&"A"));
+    }
+
+    #[test]
+    fn test_capacity_accessor() {
+        let cache: RandomEvictionCache<&str, i32> = RandomEvictionCache::new(42);
+        assert_eq!(cache.capacity(), 42);
+
+        let cache2: RandomEvictionCache<&str, i32> = RandomEvictionCache::new(0);
+        assert_eq!(cache2.capacity(), 0);
     }
 }
