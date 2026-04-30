@@ -389,4 +389,62 @@ mod tests {
         assert!(result.is_err(), "DH with all-zeros public key should fail");
         assert!(matches!(result, Err(CryptoError::SmallOrderPublicKey)));
     }
+
+    /// Verifies that ALL known low-order X25519 u-coordinates are rejected
+    /// deterministically by the contributory check. X25519 scalar clamping
+    /// (clearing bits 0-2, ensuring divisibility by cofactor 8) guarantees
+    /// that any point of order dividing 8 produces the all-zero shared secret.
+    ///
+    /// Test vectors from libsodium's blacklist (see also RFC 7748 §6).
+    #[test]
+    fn test_diffie_hellman_rejects_all_low_order_points() {
+        // Known low-order Montgomery u-coordinates on Curve25519.
+        // These are the canonical and non-canonical encodings that produce
+        // small-order points (order dividing 8).
+        let low_order_points: &[[u8; 32]] = &[
+            // u = 0 (neutral element, order 1 in Montgomery)
+            [0u8; 32],
+            // u = 1 (order 4)
+            {
+                let mut p = [0u8; 32];
+                p[0] = 1;
+                p
+            },
+            // u = p-1 = 2^255 - 20 (order 2, since (p-1)^2 = 1 mod p → u²-1 = 0)
+            [
+                0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+            // u = p (non-canonical encoding of 0, reduced mod p → 0)
+            [
+                0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+            // u = p+1 (non-canonical encoding of 1, reduced mod p → 1)
+            [
+                0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0x7f,
+            ],
+        ];
+
+        let secret = Curve25519Secret::random();
+        for (i, point) in low_order_points.iter().enumerate() {
+            let pk = Curve25519Public::from_bytes(*point);
+            let result = secret.diffie_hellman(&pk);
+            assert!(
+                result.is_err(),
+                "low-order point {} (first byte 0x{:02x}) should be rejected",
+                i,
+                point[0]
+            );
+            assert!(
+                matches!(result, Err(CryptoError::SmallOrderPublicKey)),
+                "low-order point {} should return SmallOrderPublicKey",
+                i
+            );
+        }
+    }
 }

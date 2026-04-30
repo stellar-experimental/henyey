@@ -431,6 +431,47 @@ mod tests {
         let ciphertext = seal_to_public_key(&public, plaintext).unwrap();
         assert_eq!(ciphertext.len(), plaintext.len() + SEALED_BOX_OVERHEAD);
     }
+
+    /// Tests that the Ed25519 open path also correctly rejects malformed
+    /// ciphertexts of various lengths, mirroring test_malformed_ciphertext_lengths
+    /// for the Curve25519 path.
+    #[test]
+    fn test_malformed_ciphertext_lengths_ed25519_path() {
+        let secret = EdSecretKey::generate();
+
+        // All lengths below SEALED_BOX_OVERHEAD (48) must fail
+        for len in [0, 1, 16, 31, 32, 33, 47] {
+            let ciphertext = vec![0x42u8; len];
+            let result = open_from_secret_key(&secret, &ciphertext);
+            assert!(result.is_err(), "ciphertext of length {} should fail", len);
+            assert!(
+                matches!(result, Err(CryptoError::DecryptionFailed)),
+                "ciphertext of length {} should return DecryptionFailed",
+                len
+            );
+        }
+    }
+
+    /// Tests that a ciphertext at the minimum overhead size (48 bytes) with a
+    /// valid-looking ephemeral key but invalid auth tag is rejected.
+    #[test]
+    fn test_minimum_length_ciphertext_auth_failure() {
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let sk_bytes = secret.to_bytes();
+
+        // Use a valid (non-small-order) ephemeral public key so we pass the
+        // contributory check, then append a bogus 16-byte tag.
+        let ephemeral = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let ephemeral_pk = x25519_dalek::PublicKey::from(&ephemeral);
+
+        let mut ciphertext = Vec::with_capacity(48);
+        ciphertext.extend_from_slice(ephemeral_pk.as_bytes());
+        ciphertext.extend_from_slice(&[0xAA; 16]); // bogus poly1305 tag
+
+        let result = open_from_curve25519_secret_key(&sk_bytes, &ciphertext);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(CryptoError::DecryptionFailed)));
+    }
 }
 
 #[cfg(test)]
