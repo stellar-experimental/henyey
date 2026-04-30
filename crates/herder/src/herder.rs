@@ -1754,6 +1754,16 @@ impl Herder {
         let should_advance = {
             let mut ts = tracked_write(LOCK_TRACKING_STATE, &self.tracking_state);
             if externalized_slot >= ts.consensus_index {
+                // Activate the closing gate BEFORE publishing the new
+                // consensus_index. This ensures no envelope can observe
+                // the advanced index without also seeing the gate, closing
+                // the theoretical TOCTOU window (issue #2122).
+                {
+                    let mut gate = self.closing_gate.lock().unwrap();
+                    gate.slot = externalized_slot + 1;
+                    gate.buffer.clear();
+                }
+
                 ts.is_tracking = true;
                 ts.consensus_index = externalized_slot + 1;
                 ts.consensus_close_time = close_time;
@@ -1764,17 +1774,6 @@ impl Herder {
         };
 
         if should_advance {
-            // Activate the closing gate for the next slot. Fresh envelopes
-            // arriving for this slot between now and `ledger_closed` would
-            // see consensus_index == slot_index but LCL hasn't advanced yet,
-            // triggering a spurious MaybeValidDeferred. The gate buffers them
-            // until LCL catches up (issue #2122).
-            {
-                let mut gate = self.closing_gate.lock().unwrap();
-                gate.slot = externalized_slot + 1;
-                gate.buffer.clear();
-            }
-
             self.pending_envelopes
                 .set_current_slot(externalized_slot + 1);
 
