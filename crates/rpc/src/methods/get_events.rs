@@ -1,5 +1,6 @@
 //! Handler for the `getEvents` JSON-RPC method.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -241,6 +242,11 @@ fn parse_event_filters(
         }
     }
 
+    // Deduplicate contract_ids preserving insertion order (first occurrence kept).
+    // Exact string equality — no normalization or decoding.
+    let mut seen = HashSet::with_capacity(contract_ids.len());
+    contract_ids.retain(|id| seen.insert(id.clone()));
+
     Ok((event_type, contract_ids, topic_filters))
 }
 
@@ -266,10 +272,13 @@ fn parse_topic_filters(
                     MAX_TOPIC_SEGMENTS
                 )));
             }
-            let alt_strings: Vec<String> = alternatives
+            let mut alt_strings: Vec<String> = alternatives
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
+            // Deduplicate alternatives preserving insertion order.
+            let mut seen = HashSet::with_capacity(alt_strings.len());
+            alt_strings.retain(|s| seen.insert(s.clone()));
             if alt_strings.iter().any(|s| s == "**") {
                 break;
             }
@@ -426,6 +435,72 @@ mod tests {
         let arr = make_filters(filters).unwrap();
         let result = parse_event_filters(Some(&arr));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dedup_contract_ids_within_filter() {
+        let filters = json!([{"contractIds": ["A", "B", "A", "C", "B"]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, contract_ids, _) = parse_event_filters(Some(&arr)).unwrap();
+        assert_eq!(contract_ids, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn test_dedup_contract_ids_across_filters() {
+        let filters = json!([
+            {"contractIds": ["A", "B"]},
+            {"contractIds": ["B", "C", "A"]}
+        ]);
+        let arr = make_filters(filters).unwrap();
+        let (_, contract_ids, _) = parse_event_filters(Some(&arr)).unwrap();
+        assert_eq!(contract_ids, vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn test_dedup_topic_alternatives() {
+        let filters = json!([{"topics": [["X", "Y", "X", "Z"]]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, _, topics) = parse_event_filters(Some(&arr)).unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0], vec!["X", "Y", "Z"]);
+    }
+
+    #[test]
+    fn test_dedup_topic_wildcard_star() {
+        // Duplicate "*" values should collapse to one
+        let filters = json!([{"topics": [["*", "A", "*"]]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, _, topics) = parse_event_filters(Some(&arr)).unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0], vec!["*", "A"]);
+    }
+
+    #[test]
+    fn test_dedup_topic_double_star_duplicated() {
+        // Duplicated "**" should still trigger break after dedup
+        let filters = json!([{"topics": [["topic1"], ["**", "**"]]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, _, topics) = parse_event_filters(Some(&arr)).unwrap();
+        // Only first segment captured; "**" position triggers break
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0], vec!["topic1"]);
+    }
+
+    #[test]
+    fn test_dedup_contract_ids_preserves_order() {
+        let filters = json!([{"contractIds": ["C", "A", "B", "A", "C"]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, contract_ids, _) = parse_event_filters(Some(&arr)).unwrap();
+        // First occurrence order: C, A, B
+        assert_eq!(contract_ids, vec!["C", "A", "B"]);
+    }
+
+    #[test]
+    fn test_dedup_mixed_wildcard_and_concrete() {
+        let filters = json!([{"topics": [["*", "A", "B", "*"]]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, _, topics) = parse_event_filters(Some(&arr)).unwrap();
+        assert_eq!(topics[0], vec!["*", "A", "B"]);
     }
 
     #[test]
