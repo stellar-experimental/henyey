@@ -3599,14 +3599,11 @@ name = "test"
         config.overlay.preferred_peers_only = true;
 
         let result = config.validate();
-        // Should not fail on preferred_peer_keys or preferred_peers_only
-        if let Err(e) = &result {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("preferred_peer_keys"),
-                "unexpected preferred_peer_keys error: {msg}"
-            );
-        }
+        assert!(
+            result.is_ok(),
+            "validation should pass with valid preferred_peer_keys: {:?}",
+            result.unwrap_err()
+        );
     }
 
     #[test]
