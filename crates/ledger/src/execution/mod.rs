@@ -610,6 +610,8 @@ pub struct TransactionExecutor {
     /// Prevents re-restoration of an entry that was restored and then deleted
     /// within the same cluster/ledger. Mirrors stellar-core's `entryWasRestored()`.
     hot_archive_restored_keys: std::collections::HashSet<LedgerKey>,
+    /// Optional invariant manager for runtime integrity checks.
+    invariant_manager: Option<std::sync::Arc<henyey_invariant::InvariantManager>>,
 }
 
 impl TransactionExecutor {
@@ -641,6 +643,7 @@ impl TransactionExecutor {
             ttl_key_cache: None,
             frozen_key_config: context.frozen_key_config.clone(),
             hot_archive_restored_keys: std::collections::HashSet::new(),
+            invariant_manager: None,
         }
     }
 
@@ -711,6 +714,17 @@ impl TransactionExecutor {
     /// Get a reference to the module cache, if set.
     pub fn module_cache(&self) -> Option<&PersistentModuleCache> {
         self.module_cache.as_ref()
+    }
+
+    /// Set the invariant manager for runtime integrity checks.
+    ///
+    /// When set, each successful operation's delta is checked against all enabled
+    /// invariants. Strict invariant failures panic; non-strict failures log.
+    pub fn set_invariant_manager(
+        &mut self,
+        manager: std::sync::Arc<henyey_invariant::InvariantManager>,
+    ) {
+        self.invariant_manager = Some(manager);
     }
 
     /// Configure meta extension flags for the executor.

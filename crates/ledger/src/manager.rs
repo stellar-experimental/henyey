@@ -1286,6 +1286,10 @@ pub struct LedgerManager {
     /// builds pay nothing.
     #[cfg(any(test, feature = "test-utils"))]
     snapshot_count: std::sync::atomic::AtomicU64,
+
+    /// Optional invariant manager for runtime integrity checks.
+    /// Shared with all executors created by this manager.
+    invariant_manager: Option<Arc<henyey_invariant::InvariantManager>>,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -1323,12 +1327,26 @@ impl LedgerManager {
             finished_merges: None,
             #[cfg(any(test, feature = "test-utils"))]
             snapshot_count: std::sync::atomic::AtomicU64::new(0),
+            invariant_manager: None,
         }
     }
 
     /// Get the network ID.
     pub fn network_id(&self) -> &NetworkId {
         &self.network_id
+    }
+
+    /// Set the invariant manager for runtime integrity checks.
+    ///
+    /// Once set, all executors created by this manager will run invariant checks
+    /// after each successful operation apply.
+    pub fn set_invariant_manager(&mut self, manager: Arc<henyey_invariant::InvariantManager>) {
+        self.invariant_manager = Some(manager);
+    }
+
+    /// Get a reference to the invariant manager, if set.
+    pub fn invariant_manager(&self) -> Option<&Arc<henyey_invariant::InvariantManager>> {
+        self.invariant_manager.as_ref()
     }
 
     /// Test-only: total number of `create_snapshot()` invocations since
@@ -3784,6 +3802,9 @@ impl LedgerCloseContext<'_> {
             }
             if let Some(ref ha) = hot_archive {
                 executor_ref.set_hot_archive(ha.clone());
+            }
+            if let Some(ref inv) = self.manager.invariant_manager {
+                executor_ref.set_invariant_manager(inv.clone());
             }
         } else {
             // Subsequent ledgers: advance the executor, preserving offers

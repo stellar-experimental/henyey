@@ -572,6 +572,26 @@ impl TransactionExecutor {
                             }
                         }
 
+                        // Run invariant checks on the operation delta.
+                        if let Some(ref invariant_mgr) = self.invariant_manager {
+                            let inv_delta = henyey_invariant::OperationDelta {
+                                created: delta_slice.created(),
+                                updated: delta_slice.updated(),
+                                update_states: delta_slice.update_states(),
+                                deleted: delta_slice.deleted(),
+                                delete_states: delta_slice.delete_states(),
+                                header_current: None,
+                                header_previous: None,
+                                network_id: &self.network_id.0 .0,
+                            };
+                            invariant_mgr.check_on_operation_apply(
+                                op,
+                                &op_result,
+                                &inv_delta,
+                                &op_events_final,
+                            );
+                        }
+
                         if all_success {
                             op_changes.push(op_changes_local);
                             op_events.push(op_events_final);

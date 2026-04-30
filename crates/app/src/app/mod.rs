@@ -868,6 +868,31 @@ impl App {
             Arc::new(std::sync::RwLock::new(henyey_bucket::BucketMergeMap::new()));
         ledger_manager.set_merge_map(finished_merges);
 
+        // Construct and wire InvariantManager if checks are configured.
+        if !config.invariants.checks.is_empty() || config.invariants.extra_checks {
+            let mut inv_mgr = henyey_invariant::InvariantManager::new();
+            // Register all built-in invariants.
+            inv_mgr.register(std::sync::Arc::new(
+                henyey_invariant::AccountSubEntriesCountIsValid,
+            ));
+            inv_mgr.register(std::sync::Arc::new(henyey_invariant::LedgerEntryIsValid));
+            inv_mgr.register(std::sync::Arc::new(
+                henyey_invariant::SponsorshipCountIsValid,
+            ));
+            // Enable invariants matching configured patterns.
+            for pattern in &config.invariants.checks {
+                if let Err(e) = inv_mgr.enable(pattern) {
+                    tracing::warn!(pattern = %pattern, error = %e, "Failed to enable invariant");
+                }
+            }
+            ledger_manager.set_invariant_manager(std::sync::Arc::new(inv_mgr));
+            tracing::info!(
+                checks = ?config.invariants.checks,
+                extra_checks = config.invariants.extra_checks,
+                "InvariantManager enabled"
+            );
+        }
+
         let ledger_manager = Arc::new(ledger_manager);
         tracing::info!("Ledger manager initialized");
 

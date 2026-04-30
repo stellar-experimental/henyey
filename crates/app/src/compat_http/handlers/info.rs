@@ -64,6 +64,10 @@ pub(crate) async fn compat_info_handler(
             .quorum_info_for_info()
             .map(|q| serde_json::to_value(q).unwrap_or_default())
             .unwrap_or_else(|| serde_json::json!({})),
+        invariant_failures: app
+            .ledger_manager()
+            .invariant_manager()
+            .map(|mgr| serde_json::to_value(mgr.get_json_info()).unwrap_or_default()),
     };
 
     Json(CompatInfoWrapper { info })
@@ -92,6 +96,9 @@ struct CompatInfoResponse {
     /// Quorum info — always present in stellar-core's output.
     /// Empty object `{}` when no quorum data is available.
     quorum: serde_json::Value,
+    /// Invariant failure info — only present when InvariantManager is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    invariant_failures: Option<serde_json::Value>,
 }
 
 /// Ledger info with stellar-core's camelCase field names.
@@ -155,6 +162,7 @@ mod tests {
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec!["Catching up: Applying buckets 50.0%".into()],
                 quorum: serde_json::json!({}),
+                invariant_failures: None,
             },
         };
 
@@ -245,6 +253,7 @@ mod tests {
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec![],
                 quorum: serde_json::json!({}),
+                invariant_failures: None,
             },
         };
 
@@ -280,6 +289,7 @@ mod tests {
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec![],
                 quorum: serde_json::json!({}),
+                invariant_failures: None,
             },
         };
 
@@ -319,6 +329,7 @@ mod tests {
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec![],
                 quorum: serde_json::json!({}),
+                invariant_failures: None,
             },
         };
 
@@ -398,6 +409,7 @@ mod tests {
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec![],
                 quorum: serde_json::json!({}),
+                invariant_failures: None,
             },
         };
 
@@ -457,6 +469,7 @@ mod tests {
                 network: "Test SDF Network ; September 2015".into(),
                 status: vec![],
                 quorum: serde_json::to_value(&snapshot).unwrap(),
+                invariant_failures: None,
             },
         };
 

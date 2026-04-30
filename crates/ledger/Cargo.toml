@@ -12,6 +12,7 @@ henyey-common.workspace = true
 henyey-crypto.workspace = true
 henyey-bucket.workspace = true
 henyey-tx.workspace = true
+henyey-invariant.workspace = true
 soroban-env-host-p25.workspace = true
 
 # Serialization

@@ -18,6 +18,7 @@ members = [
     "crates/work",
     "crates/historywork",
     "crates/rpc",
+    "crates/invariant",
 ]
 # Soroban-env crates from crates.io are NOT workspace members.
 # They are referenced as workspace dependencies with version pins below.
@@ -58,6 +59,7 @@ henyey-overlay = { path = "crates/overlay" }
 henyey-scp = { path = "crates/scp" }
 henyey-simulation = { path = "crates/simulation" }
 henyey-herder = { path = "crates/herder" }
+henyey-invariant = { path = "crates/invariant" }
 henyey-ledger = { path = "crates/ledger" }
 henyey-tx = { path = "crates/tx" }
 henyey-work = { path = "crates/work" }

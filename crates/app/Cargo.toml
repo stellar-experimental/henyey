@@ -28,6 +28,7 @@ henyey-overlay.workspace = true
 henyey-scp.workspace = true
 henyey-herder.workspace = true
 henyey-ledger.workspace = true
+henyey-invariant.workspace = true
 henyey-tx.workspace = true
 henyey-work.workspace = true
 

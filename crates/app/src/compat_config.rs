@@ -91,9 +91,10 @@ const SUPPORTED_KEYS: &[&str] = &[
     "PEER_FLOOD_READING_CAPACITY_BYTES",
     "FLOW_CONTROL_SEND_MORE_BATCH_SIZE_BYTES",
     // Invariant-check compat keys: validated by `validate_invariant_compat_keys`
-    // and rejected if non-default. See [AUDIT-213] / issue #2102.
+    // and translated into InvariantConfig. See [AUDIT-213] / issue #2102.
     "INVARIANT_CHECKS",
     "INVARIANT_EXTRA_CHECKS",
+    "STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY",
 ];
 
 /// Valid stellar-core keys that henyey intentionally does not support.
@@ -116,10 +117,6 @@ const UNSUPPORTED_KNOWN_KEYS: &[&str] = &[
     "LOG_FILE_PATH",
     "BUCKETLIST_DB_MEMORY_FOR_CACHING",
     "BACKFILL_STELLAR_ASSET_EVENTS",
-    // Tuning knob for the (absent) InvariantManager subsystem. Has no
-    // independent security meaning, so we silently accept any value rather
-    // than reject like INVARIANT_CHECKS / INVARIANT_EXTRA_CHECKS.
-    "STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY",
 ];
 
 /// Recognized keys within `[[VALIDATORS]]` entries.
@@ -677,35 +674,27 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         threshold_level,
     });
 
-    // Validate (and reject if non-default) compat invariant-check keys.
-    // henyey has no InvariantManager subsystem, so any non-default request
-    // is fail-closed rather than silently dropped. See issue #2102.
+    // Validate and translate invariant-check compat keys.
     validate_invariant_compat_keys(table, config.node.is_validator)?;
+    translate_invariant_config(table, &mut config);
 
     warn_unrecognized_keys(table);
 
     Ok(config)
 }
 
-/// Validate compat invariant-check keys and reject any non-default value.
+/// Validate compat invariant-check keys.
 ///
-/// henyey has no InvariantManager subsystem, so the three stellar-core
-/// invariant-check keys cannot be honored. This helper enforces a
-/// fail-closed posture for the two keys with security meaning
-/// (`INVARIANT_CHECKS`, `INVARIANT_EXTRA_CHECKS`); the tuning knob
-/// `STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY` is handled at the
-/// `UNSUPPORTED_KNOWN_KEYS` layer instead and accepted silently.
+/// The three stellar-core invariant-check keys (`INVARIANT_CHECKS`,
+/// `INVARIANT_EXTRA_CHECKS`, `STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY`) are
+/// now supported and translated into henyey's `InvariantConfig`. This function
+/// validates types and enforces the validator+extra_checks constraint.
 ///
 /// Type errors fire unconditionally (even when the value is logically
 /// equivalent to a default) to prevent `INVARIANT_CHECKS = ""` and
 /// similar wrong-typed configs from sneaking through as accepted.
 ///
 /// `is_validator` is taken from the already-parsed `config.node.is_validator`.
-/// If `NODE_IS_VALIDATOR` was wrong-typed, the caller will pass the default
-/// `is_validator = false` (since `get_bool` returned `None`) and we dispatch
-/// to the watcher branch with henyey-flavored wording. The wrong-typed
-/// `NODE_IS_VALIDATOR` is itself a separate compat-config bug, out of
-/// scope here.
 fn validate_invariant_compat_keys(
     table: &toml::map::Map<String, toml::Value>,
     is_validator: bool,
@@ -718,33 +707,15 @@ fn validate_invariant_compat_keys(
                 value
             )
         })?;
-        // Per-element type check fires before the empty-vs-non-empty rule
-        // (it is also a wrong-typed config).
-        let mut checks: Vec<&str> = Vec::with_capacity(arr.len());
         for elem in arr {
-            let s = elem.as_str().ok_or_else(|| {
+            elem.as_str().ok_or_else(|| {
                 anyhow::anyhow!(
                     "INVARIANT_CHECKS must be an array of strings, got element: {}",
                     elem
                 )
             })?;
-            checks.push(s);
         }
-        if !checks.is_empty() {
-            anyhow::bail!(
-                "INVARIANT_CHECKS=[{}] is not supported by henyey: it requires the \
-                 InvariantManager subsystem (not yet implemented; tracked in the henyey \
-                 issue tracker as a deferred follow-up). Remove this line from the \
-                 config to start without these checks, or run stellar-core if you \
-                 require them. Requested checks: {}",
-                checks
-                    .iter()
-                    .map(|s| format!("\"{s}\""))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                checks.join(", ")
-            );
-        }
+        // Checks are now supported — translated in translate_invariant_config().
     }
 
     // INVARIANT_EXTRA_CHECKS: boolean, default false.
@@ -752,32 +723,44 @@ fn validate_invariant_compat_keys(
         let b = value.as_bool().ok_or_else(|| {
             anyhow::anyhow!("INVARIANT_EXTRA_CHECKS must be a boolean, got: {}", value)
         })?;
-        if b {
-            if is_validator {
-                // Verbatim wording from stellar-core Config.cpp:2003-2004 so
-                // operators switching binaries see an identical diagnostic.
-                anyhow::bail!(
-                    "Invalid configuration: INVARIANT_EXTRA_CHECKS cannot be \
-                     enabled on a validator node (NODE_IS_VALIDATOR=true)"
-                );
-            } else {
-                anyhow::bail!(
-                    "INVARIANT_EXTRA_CHECKS=true is not supported by henyey: it \
-                     requires the InvariantManager subsystem (not yet implemented; \
-                     tracked in the henyey issue tracker as a deferred follow-up). \
-                     Remove this line from the config to start without these \
-                     checks, or run stellar-core if you require them."
-                );
-            }
+        if b && is_validator {
+            // Verbatim wording from stellar-core Config.cpp:2003-2004 so
+            // operators switching binaries see an identical diagnostic.
+            anyhow::bail!(
+                "Invalid configuration: INVARIANT_EXTRA_CHECKS cannot be \
+                 enabled on a validator node (NODE_IS_VALIDATOR=true)"
+            );
         }
     }
 
-    // STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY is a tuning knob for the
-    // absent InvariantManager. It has no independent security meaning, so
-    // it lives in `UNSUPPORTED_KNOWN_KEYS` (logged at info) rather than
-    // being rejected here.
+    // STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY is a tuning knob translated
+    // in translate_invariant_config().
 
     Ok(())
+}
+
+/// Translate stellar-core invariant config keys into henyey's `InvariantConfig`.
+fn translate_invariant_config(table: &toml::map::Map<String, toml::Value>, config: &mut AppConfig) {
+    if let Some(value) = table.get("INVARIANT_CHECKS") {
+        if let Some(arr) = value.as_array() {
+            config.invariants.checks = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+    }
+
+    if let Some(value) = table.get("INVARIANT_EXTRA_CHECKS") {
+        if let Some(b) = value.as_bool() {
+            config.invariants.extra_checks = b;
+        }
+    }
+
+    if let Some(value) = table.get("STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY") {
+        if let Some(n) = value.as_integer() {
+            config.invariants.snapshot_frequency_secs = n as u64;
+        }
+    }
 }
 
 /// Result of classifying config keys as supported, unsupported-known, or unknown.
@@ -3288,10 +3271,9 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
     }
 
     #[test]
-    fn test_invariant_freq_unsupported_known() {
-        // `STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY` is a tuning knob for
-        // the absent InvariantManager. Any value must translate without
-        // error and classify as `unsupported`, not `unknown`.
+    fn test_invariant_freq_supported() {
+        // `STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY` is now a supported key
+        // translated into InvariantConfig.
         for value in ["300", "100", "0", "9999", "604800"] {
             let toml_str = format!(
                 "{}\nSTATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY = {}\n",
@@ -3299,17 +3281,13 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
                 value
             );
             let raw: toml::Value = toml::from_str(&toml_str).unwrap();
-            assert!(
-                translate_stellar_core_config(&raw).is_ok(),
-                "value {value} should translate"
+            let config = translate_stellar_core_config(&raw)
+                .unwrap_or_else(|e| panic!("value {value} should translate: {e}"));
+            assert_eq!(
+                config.invariants.snapshot_frequency_secs,
+                value.parse::<u64>().unwrap()
             );
             let classified = classify_keys(raw.as_table().unwrap());
-            assert!(
-                classified
-                    .unsupported
-                    .contains(&"STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY".to_string()),
-                "value {value} should classify as unsupported, not unknown"
-            );
             assert!(
                 !classified
                     .unknown
@@ -3320,26 +3298,15 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
     }
 
     #[test]
-    fn test_invariant_checks_non_empty_rejected() {
+    fn test_invariant_checks_non_empty_accepted() {
+        // Non-empty INVARIANT_CHECKS is now supported and translated.
         let toml_str = format!(
             "{}\nINVARIANT_CHECKS = [\"ConservationOfLumens\"]\n",
             minimal_compat_toml()
         );
         let raw: toml::Value = toml::from_str(&toml_str).unwrap();
-        let err = translate_stellar_core_config(&raw).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("INVARIANT_CHECKS"),
-            "expected INVARIANT_CHECKS in error, got: {msg}"
-        );
-        assert!(
-            msg.contains("ConservationOfLumens"),
-            "expected requested-check name in error, got: {msg}"
-        );
-        assert!(
-            msg.contains("InvariantManager"),
-            "expected InvariantManager mention in error, got: {msg}"
-        );
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.invariants.checks, vec!["ConservationOfLumens"]);
     }
 
     #[test]
@@ -3366,25 +3333,16 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
     }
 
     #[test]
-    fn test_invariant_extra_checks_true_rejected_watcher() {
-        // Watcher path: stellar-core would honor this, but henyey rejects
-        // it because we have no InvariantManager. Diagnostic must NOT
-        // contain the validator-specific phrase.
+    fn test_invariant_extra_checks_true_accepted_watcher() {
+        // Watcher path: INVARIANT_EXTRA_CHECKS=true is now accepted
+        // for non-validator nodes.
         let toml_str = format!(
             "{}\nNODE_IS_VALIDATOR = false\nINVARIANT_EXTRA_CHECKS = true\n",
             minimal_compat_toml()
         );
         let raw: toml::Value = toml::from_str(&toml_str).unwrap();
-        let err = translate_stellar_core_config(&raw).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("INVARIANT_EXTRA_CHECKS=true is not supported by henyey"),
-            "expected henyey-specific watcher wording, got: {msg}"
-        );
-        assert!(
-            !msg.contains("cannot be enabled on a validator node"),
-            "watcher diagnostic should not use the validator wording, got: {msg}"
-        );
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert!(config.invariants.extra_checks);
     }
 
     #[test]
@@ -3445,12 +3403,8 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_invariant_keys_correctly_classified() {
-        // Verifies the three keys are placed in the correct buckets by
-        // `classify_keys`:
-        // - INVARIANT_CHECKS, INVARIANT_EXTRA_CHECKS are in SUPPORTED_KEYS
-        //   → classified as "handled" (NOT in `unknown`, NOT in `unsupported`).
-        // - STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY is in
-        //   UNSUPPORTED_KNOWN_KEYS → in `unsupported`, NOT in `unknown`.
+        // All three invariant keys are now in SUPPORTED_COMPAT_KEYS
+        // (translated into InvariantConfig).
         let toml_str = r#"
             NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
             INVARIANT_CHECKS = []
@@ -3460,43 +3414,22 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
         let raw: toml::Value = toml::from_str(toml_str).unwrap();
         let classified = classify_keys(raw.as_table().unwrap());
 
-        // Security keys: handled, so absent from both unsupported and unknown.
-        assert!(
-            !classified
-                .unsupported
-                .contains(&"INVARIANT_CHECKS".to_string()),
-            "INVARIANT_CHECKS should not be in unsupported (it's in SUPPORTED_KEYS)"
-        );
-        assert!(
-            !classified
-                .unsupported
-                .contains(&"INVARIANT_EXTRA_CHECKS".to_string()),
-            "INVARIANT_EXTRA_CHECKS should not be in unsupported"
-        );
-        assert!(
-            !classified.unknown.contains(&"INVARIANT_CHECKS".to_string()),
-            "INVARIANT_CHECKS should not be in unknown"
-        );
-        assert!(
-            !classified
-                .unknown
-                .contains(&"INVARIANT_EXTRA_CHECKS".to_string()),
-            "INVARIANT_EXTRA_CHECKS should not be in unknown"
-        );
-
-        // Tuning knob: in UNSUPPORTED_KNOWN_KEYS, so in `unsupported`.
-        assert!(
-            classified
-                .unsupported
-                .contains(&"STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY".to_string()),
-            "STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY should be in unsupported"
-        );
-        assert!(
-            !classified
-                .unknown
-                .contains(&"STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY".to_string()),
-            "STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY must NOT be in unknown"
-        );
+        // All three keys: handled (in SUPPORTED_COMPAT_KEYS), so absent from both
+        // unsupported and unknown.
+        for key in [
+            "INVARIANT_CHECKS",
+            "INVARIANT_EXTRA_CHECKS",
+            "STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY",
+        ] {
+            assert!(
+                !classified.unsupported.contains(&key.to_string()),
+                "{key} should not be in unsupported (it's in SUPPORTED_KEYS)"
+            );
+            assert!(
+                !classified.unknown.contains(&key.to_string()),
+                "{key} should not be in unknown"
+            );
+        }
     }
 
     #[test]
@@ -3520,9 +3453,9 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
     #[test]
     fn test_audit_finding_reproducer() {
         // Verbatim TOML body from issue #2102's "Reachability and Attack
-        // Vector" section. The closing test for the audit finding: this
-        // exact config used to silently translate (with the integrity
-        // layer erased) and must now fail-closed.
+        // Vector" section. Now that we have InvariantManager, this config
+        // translates successfully for a watcher (non-validator). The
+        // validator case still rejects INVARIANT_EXTRA_CHECKS=true.
         let toml_str = r#"
             NETWORK_PASSPHRASE = "Public Global Stellar Network ; September 2015"
             DATABASE = "sqlite3://stellar.db"
@@ -3531,17 +3464,28 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY = 1
         "#;
         let raw: toml::Value = toml::from_str(toml_str).unwrap();
-        // Format detection still triggers (NETWORK_PASSPHRASE alone would
-        // suffice; INVARIANT_CHECKS independently trips it now too).
         assert!(is_stellar_core_format(&raw));
-        let err = translate_stellar_core_config(&raw).unwrap_err();
-        // INVARIANT_CHECKS is checked before INVARIANT_EXTRA_CHECKS, so we
-        // expect to see the INVARIANT_CHECKS rejection first. Either is
-        // acceptable for this test (both should reject).
+        // Watcher: succeeds now.
+        let config = translate_stellar_core_config(&raw).unwrap();
+        assert_eq!(config.invariants.checks.len(), 2);
+        assert!(config.invariants.extra_checks);
+        assert_eq!(config.invariants.snapshot_frequency_secs, 1);
+
+        // Validator + INVARIANT_EXTRA_CHECKS=true: still rejected.
+        let toml_str_validator = r#"
+            NETWORK_PASSPHRASE = "Public Global Stellar Network ; September 2015"
+            DATABASE = "sqlite3://stellar.db"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            NODE_IS_VALIDATOR = true
+            INVARIANT_CHECKS = ["ConservationOfLumens"]
+            INVARIANT_EXTRA_CHECKS = true
+        "#;
+        let raw_v: toml::Value = toml::from_str(toml_str_validator).unwrap();
+        let err = translate_stellar_core_config(&raw_v).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("INVARIANT_CHECKS") || msg.contains("INVARIANT_EXTRA_CHECKS"),
-            "expected an invariant-related error, got: {msg}"
+            msg.contains("INVARIANT_EXTRA_CHECKS cannot be enabled on a validator node"),
+            "validator + extra_checks must still reject, got: {msg}"
         );
     }
 

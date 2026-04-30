@@ -195,6 +195,10 @@ pub struct AppConfig {
     #[serde(default)]
     pub rpc: RpcConfig,
 
+    /// Runtime invariant check configuration.
+    #[serde(default)]
+    pub invariants: InvariantConfig,
+
     /// Build metadata (programmatically set, not from TOML).
     #[serde(skip)]
     pub build: BuildMetadata,
@@ -1373,6 +1377,52 @@ fn default_max_tx_query_ops() -> u32 {
     5_000_000
 }
 
+/// Runtime invariant check configuration.
+///
+/// Invariants are read-only checks that run after each operation apply to detect
+/// ledger corruption early. Maps to stellar-core's `INVARIANT_CHECKS`,
+/// `INVARIANT_EXTRA_CHECKS`, and `STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY`.
+///
+/// # Parity
+///
+/// - `checks`: maps to `INVARIANT_CHECKS` (array of regex patterns)
+/// - `extra_checks`: maps to `INVARIANT_EXTRA_CHECKS` (bool)
+/// - `snapshot_frequency_secs`: maps to `STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY`
+///   (default 300s in stellar-core, Config.cpp:364)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvariantConfig {
+    /// Invariant check patterns to enable (regex, full-match semantics).
+    /// Each pattern is matched against registered invariant names.
+    /// An empty list means no invariants are enabled.
+    #[serde(default)]
+    pub checks: Vec<String>,
+
+    /// Enable extra invariant checks (typically more expensive).
+    /// Cannot be true when `node.is_validator` is true (matches stellar-core).
+    #[serde(default)]
+    pub extra_checks: bool,
+
+    /// Frequency in seconds for state snapshot invariant checks.
+    /// 0 disables snapshot checks. Default: 300 (stellar-core default).
+    #[serde(default = "default_snapshot_frequency_secs")]
+    pub snapshot_frequency_secs: u64,
+}
+
+impl Default for InvariantConfig {
+    fn default() -> Self {
+        Self {
+            checks: Vec::new(),
+            extra_checks: false,
+            snapshot_frequency_secs: default_snapshot_frequency_secs(),
+        }
+    }
+}
+
+fn default_snapshot_frequency_secs() -> u64 {
+    300
+}
+
 /// Build-time metadata populated by the binary crate's `build.rs`.
 ///
 /// These values are not read from TOML; they are set programmatically
@@ -1574,6 +1624,7 @@ impl AppConfig {
             testing: TestingConfig::default(),
             maintenance: MaintenanceAppConfig::default(),
             rpc: RpcConfig::default(),
+            invariants: InvariantConfig::default(),
             build: BuildMetadata::default(),
             is_compat_config: false,
             validator_weight_config: None,
@@ -1649,6 +1700,7 @@ impl AppConfig {
             testing: TestingConfig::default(),
             maintenance: MaintenanceAppConfig::default(),
             rpc: RpcConfig::default(),
+            invariants: InvariantConfig::default(),
             build: BuildMetadata::default(),
             is_compat_config: false,
             validator_weight_config: None,
