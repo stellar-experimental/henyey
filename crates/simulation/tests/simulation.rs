@@ -19,17 +19,21 @@ async fn test_partition_and_recovery() {
     let mut sim = Topologies::core3(SimulationMode::OverLoopback);
     sim.start_all_nodes().await;
 
-    let _ = sim
-        .crank_until(|s| s.have_all_externalized(5, 2), Duration::from_secs(20))
-        .await;
+    assert!(
+        sim.crank_until(|s| s.have_all_externalized(5, 2), Duration::from_secs(20))
+            .await,
+        "nodes should externalize to ledger 5 before partitioning"
+    );
 
     let ids = sim.node_ids();
     let node2 = ids[2].clone();
     sim.partition(&node2);
 
-    let _ = sim
-        .crank_until(|s| s.ledger_seq(&ids[0]) >= 8, Duration::from_secs(20))
-        .await;
+    assert!(
+        sim.crank_until(|s| s.ledger_seq(&ids[0]) >= 8, Duration::from_secs(20))
+            .await,
+        "non-partitioned nodes should advance to ledger 8"
+    );
     assert!(sim.ledger_seq(&node2) < 8);
 
     sim.heal_partition(&node2);
@@ -44,9 +48,11 @@ async fn test_deterministic_replay() {
     async fn run_once() -> Vec<[u8; 32]> {
         let mut sim = Topologies::core3(SimulationMode::OverLoopback);
         sim.start_all_nodes().await;
-        let _ = sim
-            .crank_until(|s| s.have_all_externalized(11, 2), Duration::from_secs(30))
-            .await;
+        assert!(
+            sim.crank_until(|s| s.have_all_externalized(11, 2), Duration::from_secs(30))
+                .await,
+            "nodes should externalize at least 10 ledgers for replay"
+        );
         sim.ledger_hashes().into_iter().map(|h| h.0).collect()
     }
 
