@@ -2691,6 +2691,40 @@ memory_for_caching_mb = 256
         );
     }
 
+    #[test]
+    fn test_validation_query_port_collision_with_http() {
+        let mut config = AppConfig::default();
+        config.http.enabled = true;
+        config.query.port = Some(config.http.port);
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("http.port")
+                && err.contains("query.port")
+                && err.contains("must be different"),
+            "Expected http/query collision error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_all_listeners_distinct_ports_passes() {
+        let mut config = AppConfig::default();
+        config.http.enabled = true;
+        config.http.port = 8080;
+        config.compat_http.enabled = true;
+        config.compat_http.port = 11626;
+        config.query.port = Some(11627);
+        config.rpc.enabled = true;
+        config.rpc.port = 8000;
+        config.overlay.peer_port = 11625;
+        assert!(
+            config.validate().is_ok(),
+            "All listeners on distinct ports should pass"
+        );
+    }
+
     // --- RPC port collision tests ---
 
     #[test]
