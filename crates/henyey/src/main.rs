@@ -3838,4 +3838,44 @@ passphrase = "Test SDF Network ; September 2015"
             "Expected archive-related error, got: {msg}"
         );
     }
+
+    #[test]
+    fn test_check_config_rejects_malformed_env_override() {
+        // Regression test: cmd_check_config must apply env overrides and fail
+        // on malformed values (caught in review-fix round 1 of #2145).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("valid.toml");
+        std::fs::write(
+            &path,
+            r#"
+[network]
+passphrase = "Test SDF Network ; September 2015"
+
+[[history.archives]]
+name = "sdf1"
+url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
+"#,
+        )
+        .unwrap();
+
+        // Save and set a malformed env var.
+        let key = "RS_STELLAR_CORE_NODE_VALIDATOR";
+        let original = std::env::var(key).ok();
+        std::env::set_var(key, "not_a_bool");
+
+        let result = cmd_check_config(&path, false);
+
+        // Restore env var.
+        match original {
+            Some(val) => std::env::set_var(key, val),
+            None => std::env::remove_var(key),
+        }
+
+        let err = result.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RS_STELLAR_CORE_NODE_VALIDATOR"),
+            "Expected env override error, got: {msg}"
+        );
+    }
 }
