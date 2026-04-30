@@ -21,11 +21,12 @@ use anyhow::{ensure, Context, Result};
 use henyey_app::App;
 use henyey_common::Hash256;
 use henyey_ledger::{LedgerCloseData, LedgerClosePerf, TransactionSetVariant};
+use henyey_tx::envelope_utils::envelope_soroban_data;
 use stellar_xdr::curr::{
     ConfigSettingEntry, ContractDataDurability, ContractId, ContractIdPreimage,
     ContractIdPreimageFromAddress, ExtensionPoint, Hash, LedgerEntry, LedgerEntryData,
     LedgerEntryExt, LedgerKey, LedgerKeyContractData, LedgerUpgrade, Limits, OperationBody,
-    ScAddress, ScVal, TransactionEnvelope, TransactionExt, Uint256, WriteXdr,
+    ScAddress, ScVal, TransactionEnvelope, Uint256, WriteXdr,
 };
 use tracing::{debug, info, warn};
 
@@ -1531,26 +1532,24 @@ impl ApplyLoad {
             .map(|xdr| xdr.len() as u64)
             .unwrap_or(0);
 
-        // Extract Soroban resources if available.
-        match tx {
-            TransactionEnvelope::Tx(env) => {
-                if let TransactionExt::V1(soroban_data) = &env.tx.ext {
-                    let resources = &soroban_data.resources;
-                    [
-                        1,
-                        resources.instructions as u64,
-                        tx_size,
-                        resources.disk_read_bytes as u64,
-                        resources.write_bytes as u64,
-                        resources.footprint.read_only.len() as u64
-                            + resources.footprint.read_write.len() as u64,
-                        resources.footprint.read_write.len() as u64,
-                    ]
-                } else {
-                    [1, 0, tx_size, 0, 0, 0, 0]
-                }
-            }
-            _ => [1, 0, tx_size, 0, 0, 0, 0],
+        // Use the shared envelope utility to extract Soroban data, which correctly
+        // handles both Tx and TxFeeBump (unwrapping the inner tx). Note: tx_size
+        // intentionally uses the outer envelope size for fee-bumps since that's
+        // what counts against the per-ledger byte budget.
+        if let Some(soroban_data) = envelope_soroban_data(tx) {
+            let resources = &soroban_data.resources;
+            [
+                1,
+                resources.instructions as u64,
+                tx_size,
+                resources.disk_read_bytes as u64,
+                resources.write_bytes as u64,
+                resources.footprint.read_only.len() as u64
+                    + resources.footprint.read_write.len() as u64,
+                resources.footprint.read_write.len() as u64,
+            ]
+        } else {
+            [1, 0, tx_size, 0, 0, 0, 0]
         }
     }
 
@@ -1897,5 +1896,115 @@ mod tests {
         // the logic directly by verifying the constants.
         assert_eq!(SAC_TX_INSTRUCTIONS, 30_000_000);
         assert_eq!(BATCH_TRANSFER_TX_INSTRUCTIONS, 100_000_000);
+    }
+
+    #[test]
+    fn test_estimate_tx_resources_fee_bump_soroban() {
+        use stellar_xdr::curr::{
+            ContractId, FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
+            LedgerFootprint, Memo, MuxedAccount, Operation, Preconditions, ScSymbol,
+            SequenceNumber, SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
+            Transaction, TransactionEnvelope, TransactionExt, TransactionV1Envelope, VecM,
+        };
+
+        // Build a Soroban tx with known resources.
+        let soroban_resources = SorobanResources {
+            footprint: LedgerFootprint {
+                read_only: vec![
+                    LedgerKey::ContractData(LedgerKeyContractData {
+                        contract: ScAddress::Contract(ContractId(Hash([0; 32]))),
+                        key: ScVal::Void,
+                        durability: ContractDataDurability::Persistent,
+                    }),
+                    LedgerKey::ContractData(LedgerKeyContractData {
+                        contract: ScAddress::Contract(ContractId(Hash([1; 32]))),
+                        key: ScVal::Void,
+                        durability: ContractDataDurability::Persistent,
+                    }),
+                ]
+                .try_into()
+                .unwrap(),
+                read_write: vec![LedgerKey::ContractData(LedgerKeyContractData {
+                    contract: ScAddress::Contract(ContractId(Hash([2; 32]))),
+                    key: ScVal::Void,
+                    durability: ContractDataDurability::Persistent,
+                })]
+                .try_into()
+                .unwrap(),
+            },
+            instructions: 1000,
+            disk_read_bytes: 2000,
+            write_bytes: 3000,
+        };
+
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: soroban_resources,
+            resource_fee: 100,
+        };
+
+        let inner_tx = Transaction {
+            source_account: MuxedAccount::Ed25519(Uint256([0; 32])),
+            fee: 1000,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                        contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                        function_name: ScSymbol("test".try_into().unwrap()),
+                        args: VecM::default(),
+                    }),
+                    auth: VecM::default(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V1(soroban_data),
+        };
+
+        let inner_envelope = TransactionV1Envelope {
+            tx: inner_tx,
+            signatures: vec![].try_into().unwrap(),
+        };
+
+        // Wrap in a fee-bump envelope.
+        let fee_bump_env = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([3; 32])),
+                fee: 2000,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_envelope.clone()),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let result = ApplyLoad::estimate_tx_resources(&fee_bump_env);
+
+        // Verify exact values.
+        let expected_tx_size = fee_bump_env
+            .to_xdr(Limits::none())
+            .map(|xdr| xdr.len() as u64)
+            .unwrap();
+
+        assert_eq!(result[0], 1); // transaction count
+        assert_eq!(result[1], 1000); // instructions
+        assert_eq!(result[2], expected_tx_size); // outer envelope size
+        assert_eq!(result[3], 2000); // disk_read_bytes
+        assert_eq!(result[4], 3000); // write_bytes
+        assert_eq!(result[5], 3); // read_only(2) + read_write(1) = 3
+        assert_eq!(result[6], 1); // read_write entries
+
+        // Also verify that a plain Tx envelope gives the same resource values.
+        let plain_env = TransactionEnvelope::Tx(inner_envelope);
+        let plain_result = ApplyLoad::estimate_tx_resources(&plain_env);
+        assert_eq!(plain_result[1], 1000);
+        assert_eq!(plain_result[3], 2000);
+        assert_eq!(plain_result[4], 3000);
+        assert_eq!(plain_result[5], 3);
+        assert_eq!(plain_result[6], 1);
     }
 }
