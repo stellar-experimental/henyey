@@ -2807,10 +2807,12 @@ fn cmd_sample_config() -> anyhow::Result<()> {
 /// Validate a configuration file.
 ///
 /// Parses the file using `load_config_file` (which handles stellar-core compat
-/// format detection and env overrides), then optionally runs semantic validation.
+/// format detection), applies env overrides, then optionally runs semantic
+/// validation.
 fn cmd_check_config(path: &std::path::Path, validate: bool) -> anyhow::Result<()> {
-    let config = load_config_file(path)
+    let mut config = load_config_file(path)
         .with_context(|| format!("Failed to load config: {}", path.display()))?;
+    config.apply_env_overrides()?;
 
     if validate {
         config
