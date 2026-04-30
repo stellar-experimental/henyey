@@ -4615,12 +4615,12 @@ mod tests {
     ///
     /// In the real parallel path:
     /// - Fees are pre-deducted on the main delta by `pre_deduct_soroban_fees`
-    /// - `pre_apply_arc` is called with `deduct_fee=false` (fees already handled)
+    /// - `pre_apply_arc` is called with `FeeMode::Skip` (fees already handled)
     /// - The executor sees post-fee-deduction balances
-    /// - On body failure, rollback doesn't re-add fee (deduct_fee=false)
+    /// - On body failure, rollback doesn't re-add fee (FeeMode::Skip)
     ///
     /// We simulate this by setting balance=0 (as if fee was already deducted from
-    /// original 50), using deduct_fee=false, and verifying rollback integrity.
+    /// original 50), using FeeMode::Skip, and verifying rollback integrity.
     #[test]
     fn test_execute_with_pre_apply_result_partial_fee_failing_body() {
         use henyey_crypto::{sign_hash, SecretKey};
@@ -4728,27 +4728,27 @@ mod tests {
 
         let tx_arc = Arc::new(envelope);
 
-        // Phase 1: pre_apply_arc with deduct_fee=false — matching the real parallel path.
+        // Phase 1: pre_apply_arc with FeeMode::Skip — matching the real parallel path.
         // In production, fees are already on the main delta; the cluster executor
         // doesn't re-deduct them.
         let pre_result = executor
-            .pre_apply_arc(&snapshot, &tx_arc, base_fee, Some([0u8; 32]), false)
+            .pre_apply_arc(&snapshot, &tx_arc, base_fee, Some([0u8; 32]), FeeMode::Skip)
             .expect("pre_apply_arc should not error");
 
         let pre = pre_result.expect("pre_apply_arc should succeed (not validation failure)");
 
-        // With deduct_fee=false, fee is computed but not deducted.
+        // With FeeMode::Skip, fee is computed but not deducted.
         // fee = fee_to_charge(100) = min(200, 100*1) = 100 (the computed fee, uncapped).
         // In the real parallel path, the actual charged amount (50) was set by
-        // pre_deduct_soroban_fees. Here we verify the deduct_fee=false path.
-        assert_eq!(pre.deduct_fee, false);
+        // pre_deduct_soroban_fees. Here we verify the FeeMode::Skip path.
+        assert_eq!(pre.fee_mode, FeeMode::Skip);
 
         // Verify state after pre_apply: balance still 0 (no deduction), seq bumped to 2.
         {
             let acc = executor.state.get_account(&source_id).unwrap();
             assert_eq!(
                 acc.balance, 0,
-                "balance must remain 0 (deduct_fee=false, no deduction)"
+                "balance must remain 0 (FeeMode::Skip, no deduction)"
             );
             assert_eq!(acc.seq_num.0, 2, "seq_num must be bumped to 2");
         }

@@ -598,8 +598,23 @@ pub fn execute_soroban_parallel_phase(
 
     // Use externally pre-charged fees if provided (from unified fee pass),
     // otherwise pre-deduct Soroban fees from the delta internally.
+    let total_soroban_txs: usize = phase
+        .stages
+        .iter()
+        .flat_map(|s| s.iter())
+        .map(|c| c.len())
+        .sum();
+
     let pre_charged_fees = match fee_source {
         SorobanFeeSource::ExternallyPrecharged(ext) => {
+            if ext.len() != total_soroban_txs {
+                return Err(crate::LedgerError::Internal(format!(
+                    "SorobanFeeSource::ExternallyPrecharged length mismatch: \
+                     got {} fees but phase has {} transactions",
+                    ext.len(),
+                    total_soroban_txs,
+                )));
+            }
             // Fees already deducted on delta and fee pool already recorded by caller.
             ext
         }
