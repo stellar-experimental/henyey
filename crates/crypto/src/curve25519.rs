@@ -390,27 +390,33 @@ mod tests {
         assert!(matches!(result, Err(CryptoError::SmallOrderPublicKey)));
     }
 
-    /// Verifies that ALL known low-order X25519 u-coordinates are rejected
-    /// deterministically by the contributory check. X25519 scalar clamping
-    /// (clearing bits 0-2, ensuring divisibility by cofactor 8) guarantees
-    /// that any point of order dividing 8 produces the all-zero shared secret.
+    /// Verifies that low-order X25519 u-coordinates that produce all-zero shared
+    /// secrets are rejected deterministically by the contributory check.
     ///
-    /// Test vectors from libsodium's blacklist (see also RFC 7748 §6).
+    /// The `was_contributory()` check (matching stellar-core's `crypto_scalarmult`
+    /// return-code semantics) catches inputs whose clamped scalar multiplication
+    /// yields the identity point. This includes the canonical zero, u=1 (order 4),
+    /// p-1 (order 2), and their non-canonical encodings (p, p+1).
+    ///
+    /// Note: libsodium's *separate* blacklist includes additional order-4 and
+    /// order-8 points (0xe0eb... and 0x5f51...) that do NOT produce all-zero
+    /// shared secrets under clamped multiplication — those are NOT rejected by
+    /// the contributory check, matching stellar-core behavior.
     #[test]
     fn test_diffie_hellman_rejects_all_low_order_points() {
         // Known low-order Montgomery u-coordinates on Curve25519.
         // These are the canonical and non-canonical encodings that produce
         // small-order points (order dividing 8).
         let low_order_points: &[[u8; 32]] = &[
-            // u = 0 (neutral element, order 1 in Montgomery)
+            // u = 0 (neutral element / point at infinity, order 1)
             [0u8; 32],
-            // u = 1 (order 4)
+            // u = 1 (order 4 — clamped scalar × this point = identity)
             {
                 let mut p = [0u8; 32];
                 p[0] = 1;
                 p
             },
-            // u = p-1 = 2^255 - 20 (order 2, since (p-1)^2 = 1 mod p → u²-1 = 0)
+            // u = p-1 = 2^255 - 20 (order 2)
             [
                 0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
