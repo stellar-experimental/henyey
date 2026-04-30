@@ -272,7 +272,7 @@ impl FetchingEnvelopes {
         self.stats.write().tx_sets_received += 1;
 
         // Notify the fetcher and get waiting envelopes
-        let waiting = self.tx_set_fetcher.recv(&Hash(hash.0));
+        let waiting = self.tx_set_fetcher.recv(&Hash(hash.0)).unwrap_or_default();
 
         debug!(
             "Received TxSet {}, {} envelopes waiting",
@@ -307,7 +307,7 @@ impl FetchingEnvelopes {
             );
             // Stop tracking this hash so fetching envelopes that depend on it
             // eventually time out rather than wait forever
-            self.quorum_set_fetcher.recv(&Hash(hash.0));
+            let _ = self.quorum_set_fetcher.recv(&Hash(hash.0));
             return false;
         }
 
@@ -317,7 +317,10 @@ impl FetchingEnvelopes {
         self.qs_cache_put(hash, Arc::new(quorum_set));
 
         // Notify the fetcher and get waiting envelopes
-        let waiting = self.quorum_set_fetcher.recv(&Hash(hash.0));
+        let waiting = self
+            .quorum_set_fetcher
+            .recv(&Hash(hash.0))
+            .unwrap_or_default();
 
         debug!(
             "Received QuorumSet {}, {} envelopes waiting",
@@ -523,7 +526,7 @@ impl FetchingEnvelopes {
     pub fn on_tx_set_accepted(&self, hash: &Hash256) {
         // Stop the fetcher from re-requesting this hash and collect
         // any envelopes that were waiting on the fetcher path.
-        let fetcher_waiting = self.tx_set_fetcher.recv(&Hash(hash.0));
+        let fetcher_waiting = self.tx_set_fetcher.recv(&Hash(hash.0)).unwrap_or_default();
         for env in fetcher_waiting {
             self.check_and_move_to_ready(env);
         }

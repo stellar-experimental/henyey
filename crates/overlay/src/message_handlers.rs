@@ -192,14 +192,26 @@ impl MessageDispatcher {
             from_peer
         );
 
-        // Cache it (random-two-choice eviction, matching stellar-core's RandomEvictionCache)
+        // Atomically check and accept — discards unsolicited items (defense in depth,
+        // matching stellar-core PendingEnvelopes::recvTxSet).
+        let envelopes = match self.tx_set_fetcher.recv(&hash) {
+            Some(envs) => envs,
+            None => {
+                trace!(
+                    "Discarding unsolicited {} {} from {} (no active fetch)",
+                    label,
+                    hex::encode(hash.0),
+                    from_peer
+                );
+                return;
+            }
+        };
+
+        // Cache only solicited responses
         {
             let mut cache = self.tx_set_cache.lock().unwrap();
             cache.put(hash.clone(), data.clone());
         }
-
-        // Notify fetcher
-        let envelopes = self.tx_set_fetcher.recv(&hash);
 
         // Invoke callbacks
         if let Some(ref callback) = self.on_tx_set {
@@ -248,14 +260,25 @@ impl MessageDispatcher {
             from_peer
         );
 
-        // Cache it (random-two-choice eviction, matching stellar-core's RandomEvictionCache)
+        // Atomically check and accept — discards unsolicited items (defense in depth,
+        // matching stellar-core PendingEnvelopes::recvSCPQuorumSet).
+        let envelopes = match self.quorum_set_fetcher.recv(&hash) {
+            Some(envs) => envs,
+            None => {
+                trace!(
+                    "Discarding unsolicited ScpQuorumSet {} from {} (no active fetch)",
+                    hex::encode(hash.0),
+                    from_peer
+                );
+                return;
+            }
+        };
+
+        // Cache only solicited responses
         {
             let mut cache = self.quorum_set_cache.lock().unwrap();
             cache.put(hash.clone(), quorum_set.clone());
         }
-
-        // Notify fetcher
-        let envelopes = self.quorum_set_fetcher.recv(&hash);
 
         // Invoke callbacks
         if let Some(ref callback) = self.on_quorum_set {

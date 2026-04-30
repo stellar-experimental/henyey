@@ -135,14 +135,16 @@ fn test_recv_clears_tracker() {
 
     assert!(fetcher.is_tracking(&hash));
 
-    // Receive the item - should clear tracker
+    // Receive the item - should remove tracker and return waiting envelopes
     let waiting = fetcher.recv(&hash);
-    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting.unwrap().len(), 1);
 
-    // Tracker is now empty (still exists but no waiting envelopes)
-    // Let's check by trying to receive again
+    // Tracker is now removed from the map
+    assert!(!fetcher.is_tracking(&hash));
+
+    // Second recv returns None (tracker already removed)
     let waiting2 = fetcher.recv(&hash);
-    assert!(waiting2.is_empty());
+    assert!(waiting2.is_none());
 }
 
 #[test]

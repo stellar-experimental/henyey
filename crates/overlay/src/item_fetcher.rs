@@ -479,46 +479,40 @@ impl ItemFetcher {
 
     /// Called when an item is received.
     ///
-    /// Returns the envelopes that were waiting for this item.
+    /// Atomically removes the tracker from the map and returns the waiting
+    /// envelopes. Returns `None` if no tracker exists (unsolicited item).
+    ///
+    /// By removing the tracker, `is_tracking()` becomes authoritative: it
+    /// returns `false` immediately after receive, preventing duplicate
+    /// processing by any caller.
     // SECURITY: fetch tracker state bounded by authenticated peer count and flow control windows
-    pub fn recv(&self, item_hash: &Hash) -> Vec<ScpEnvelope> {
+    pub fn recv(&self, item_hash: &Hash) -> Option<Vec<ScpEnvelope>> {
         let mut trackers = self.trackers.lock().unwrap();
 
-        if let Some(tracker) = trackers.get_mut(item_hash) {
-            trace!(
-                "Recv {:?} {} : {}",
-                self.item_type,
-                hex::encode(item_hash.0),
-                tracker.len()
-            );
+        let tracker = trackers.remove(item_hash)?;
 
-            let duration = tracker.get_duration();
-            debug!(
-                "Fetched {:?} {} in {:?}",
-                self.item_type,
-                hex::encode(item_hash.0),
-                duration
-            );
+        trace!(
+            "Recv {:?} {} : {}",
+            self.item_type,
+            hex::encode(item_hash.0),
+            tracker.len()
+        );
 
-            // Drain all waiting envelopes
-            let envelopes: Vec<ScpEnvelope> = tracker
-                .waiting_envelopes
-                .drain(..)
-                .map(|(_, env)| env)
-                .collect();
+        let duration = tracker.get_duration();
+        debug!(
+            "Fetched {:?} {} in {:?}",
+            self.item_type,
+            hex::encode(item_hash.0),
+            duration
+        );
 
-            tracker.reset_last_seen_slot_index();
-            tracker.cancel();
+        let envelopes: Vec<ScpEnvelope> = tracker
+            .waiting_envelopes
+            .into_iter()
+            .map(|(_, env)| env)
+            .collect();
 
-            envelopes
-        } else {
-            trace!(
-                "Recv untracked {:?} {}",
-                self.item_type,
-                hex::encode(item_hash.0)
-            );
-            Vec::new()
-        }
+        Some(envelopes)
     }
 
     /// Get items that need to be requested from peers.
@@ -818,7 +812,7 @@ mod tests {
 
         fetcher.fetch(hash.clone(), &env);
 
-        let envelopes = fetcher.recv(&hash);
+        let envelopes = fetcher.recv(&hash).expect("should be tracking");
 
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].statement.slot_index, 100);
