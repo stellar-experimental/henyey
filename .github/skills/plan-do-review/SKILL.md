@@ -57,9 +57,6 @@ If still empty, **stop** with a message: "No eligible issues found for auto-sele
 Otherwise, set `$ISSUE` to the selected issue number and announce:
 "Auto-selected issue #$ISSUE: <title>".
 
-**Set `$ORIGINAL_ISSUE` = `$ISSUE`** (preserved for redirect comments if
-blocker-ancestor resolution changes the target).
-
 **Set `$AUTO_SELECTED` = `true`** when the issue was auto-selected (no argument
 provided), or `false` when an explicit issue number was given.
 
@@ -164,7 +161,7 @@ Extract:
 
 ### Resume from Prior Run
 
-Before blocker resolution or readiness triage, check whether a previous
+Before the dependency check or readiness triage, check whether a previous
 invocation already made progress on this issue. Scan the comments for
 `## 📝 Proposal Draft (Round N/M)` and `## 🔍 Critic Response (Round N/M)`
 headers.
@@ -202,14 +199,12 @@ Resolution and Readiness Triage below.
 > restart picks up where the last one left off, making forward progress
 > even across multiple session crashes.
 
-### Blocker-Ancestor Resolution
+### Dependency Check
 
-Before triaging readiness, check whether the issue is **blocked by** another
-open issue. If it is, walk up the dependency chain and switch to the first
-unblocked ancestor so that useful work gets done instead of bailing with
-`not-ready`.
+Before triaging readiness, check whether the issue has **unmet dependencies**
+(is blocked by another open issue).
 
-**Procedure** (start with `visited = {}`, `depth = 0`):
+**Procedure:**
 
 1. Read the current issue's body and comments. Using your understanding of the
    text, identify any issue numbers that this issue is **blocked by** — look
@@ -220,40 +215,27 @@ unblocked ancestor so that useful work gets done instead of bailing with
 
 2. For each candidate blocker, fetch it:
    ```bash
-   gh issue view <N> --json number,state,title,body,comments
+   gh issue view <N> --json number,state
    ```
    Filter to only **open** issues. If no open blockers remain, the current
-   issue is not actually blocked — continue with it as the target.
+   issue is not actually blocked — continue to Readiness Triage.
 
-3. If open blocker(s) exist, pick the **first** one (by order of mention in
-   the body/comments). Add the current `$ISSUE` to `visited`, set
-   `$ISSUE = <blocker number>`, increment `depth`, and go back to step 1.
+3. If any open blocker(s) exist, the issue has unmet dependencies. **Stop**:
+   1. Add the `not-ready` label:
+      ```bash
+      gh issue edit $ISSUE --add-label "not-ready"
+      ```
+   2. Post a comment listing the blockers:
+      ```bash
+      gh issue comment $ISSUE --body "Marking as not-ready: blocked by open issue(s) #X, #Y. Will be retried once dependencies are resolved."
+      ```
+   3. Unassign yourself:
+      ```bash
+      gh issue edit $ISSUE --remove-assignee @me
+      ```
+   4. **Stop.** Do not proceed to Readiness Triage or Step 2.
 
-4. **Cycle detection**: if the blocker is already in `visited`, skip it and
-   try the next blocker. If all blockers are in `visited`, the current issue
-   is in a dependency cycle — fall through to Readiness Triage as-is.
-
-5. **Depth cap**: if `depth >= 10`, stop walking and fall through to
-   Readiness Triage for the current issue.
-
-**When the target changes** (i.e., `$ISSUE != $ORIGINAL_ISSUE` after
-resolution):
-
-1. Post a redirect comment on the **original** issue:
-   ```bash
-   gh issue comment $ORIGINAL_ISSUE --body "⏩ This issue is blocked by #$ISSUE. Working on #$ISSUE first."
-   ```
-2. Assign yourself to the new target issue:
-   ```bash
-   gh issue edit $ISSUE --add-assignee @me
-   ```
-3. Unassign yourself from the original issue (the loop script or caller
-   assigned you):
-   ```bash
-   gh issue edit $ORIGINAL_ISSUE --remove-assignee @me
-   ```
-
-Now continue with `$ISSUE` (which may have changed) into Readiness Triage.
+If no unmet dependencies, continue into Readiness Triage.
 
 ---
 
@@ -908,8 +890,8 @@ Guidelines for deferred-work issues:
   in the Dependencies section with "Blocked by #NNN" and a short reason. If
   multiple deferred items form a sequence (e.g., Phase 1 → Phase 2 → Phase 3),
   each later phase must list the earlier one as a blocker. An issue with no
-  prerequisites should say "None". This is critical for the blocker-ancestor
-  resolution in this skill to work correctly.
+  prerequisites should say "None". This is critical for the dependency check
+  in this skill to work correctly.
 
 Update the completion comment's "What was deferred" section to include the
 newly created issue links (edit the comment or post a follow-up).
@@ -925,16 +907,12 @@ the monitor-loop rebuilding `main`, not from this target. Leaving them
 behind is the dominant disk-pressure driver on the shared `~/data/`
 volume (observed 68 such dirs totalling ~500 GB on 2026-04-22).
 
-Remove the per-issue build targets for the current and original issue
-numbers (they may differ if blocker-ancestor resolution redirected the
-run):
+Remove the per-issue build targets:
 
 ```bash
-for N in "$ISSUE" "$ORIGINAL_ISSUE"; do
-  [ -n "$N" ] || continue
-  rm -rf "$HOME/data/pdr-$N" 2>/dev/null || true
-  rm -rf "$HOME/data/pdr-$N-target" 2>/dev/null || true
-done
+N="$ISSUE"
+rm -rf "$HOME/data/pdr-$N" 2>/dev/null || true
+rm -rf "$HOME/data/pdr-$N-target" 2>/dev/null || true
 ```
 
 **Do not run this cleanup before Step 5.** The target dir is still
