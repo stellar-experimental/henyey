@@ -842,4 +842,198 @@ mod tests {
             "no temp files should remain"
         );
     }
+
+    /// Regression test for #2097: publish staging must use `<bucket_dir>/tmp/`,
+    /// not the system temp directory.
+    #[tokio::test]
+    async fn test_publish_staging_uses_bucket_dir_tmp() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_dir = dir.path().join("db");
+        let db_path = db_dir.join("henyey.sqlite");
+        let custom_bucket_dir = dir.path().join("custom-buckets");
+        let log_file = dir.path().join("put-sources.log");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&custom_bucket_dir).unwrap();
+
+        // Archive put command logs the {0} source path to a file.
+        let put_cmd = format!("echo {{0}} >> {}", log_file.display());
+        let mkdir_cmd = "true".to_string(); // no-op
+
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(&db_path)
+            .bucket_directory(&custom_bucket_dir)
+            .validator(true)
+            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
+            .build();
+        config.history.archives = vec![crate::config::HistoryArchiveEntry {
+            name: "staging-test".to_string(),
+            url: "file:///unused".to_string(),
+            get_enabled: false,
+            put_enabled: true,
+            put: Some(put_cmd),
+            mkdir: Some(mkdir_cmd),
+        }];
+
+        let app = Arc::new(App::new(config.clone()).await.unwrap());
+        app.set_self_arc().await;
+        assert_eq!(app.bucket_manager.bucket_dir(), custom_bucket_dir.as_path());
+
+        // Build genesis bucket list
+        let passphrase = app.config.network.passphrase.clone();
+        let genesis_entries = App::build_genesis_entries(&passphrase, 0, TOTAL_COINS);
+        let live_probe_header = make_header(
+            1,
+            Hash256::ZERO,
+            Hash256::ZERO,
+            Hash256::ZERO,
+            Hash256::ZERO,
+        );
+        let mut probe_bucket_list = BucketList::new();
+        probe_bucket_list.set_bucket_dir(custom_bucket_dir.clone());
+        probe_bucket_list
+            .add_batch(
+                1,
+                0,
+                stellar_xdr::curr::BucketListType::Live,
+                genesis_entries.clone(),
+                vec![],
+                vec![],
+            )
+            .unwrap();
+        let live_hash = probe_bucket_list.hash();
+        let hot_archive = HotArchiveBucketList::new();
+        let combined_hash = combined_bucket_hash(live_hash, hot_archive.hash());
+
+        let live_header = LedgerHeader {
+            bucket_list_hash: Hash(live_hash.0),
+            ..live_probe_header
+        };
+        let mut bucket_list =
+            App::create_genesis_bucket_list(&custom_bucket_dir, genesis_entries, &live_header)
+                .unwrap();
+        bucket_list.set_ledger_seq(CHECKPOINT);
+        let has = build_history_archive_state(
+            CHECKPOINT,
+            &bucket_list,
+            Some(&hot_archive),
+            Some(passphrase.clone()),
+        )
+        .unwrap();
+        let has_json = has.to_json().unwrap();
+
+        let empty_result = empty_tx_result(1);
+        let empty_result_hash = Hash256::hash(
+            &empty_result
+                .tx_result_set
+                .to_xdr(Limits::none())
+                .expect("empty result xdr"),
+        );
+
+        // Seed ledger headers, tx history, results for checkpoint
+        let mut previous_header_hash = Hash256::ZERO;
+        let mut checkpoint_header = None;
+        let mut checkpoint_header_hash = Hash256::ZERO;
+        let mut headers_and_history = Vec::new();
+        for seq in 1..=CHECKPOINT {
+            let tx_entry = empty_tx_history(seq, previous_header_hash);
+            let tx_hash = if seq == 1 {
+                Hash256::ZERO
+            } else {
+                henyey_history::verify::compute_tx_set_hash(&TransactionSetVariant::Classic(
+                    tx_entry.tx_set.clone(),
+                ))
+                .unwrap()
+            };
+            let result_entry = empty_tx_result(seq);
+            let result_hash = if seq == 1 {
+                Hash256::ZERO
+            } else {
+                empty_result_hash
+            };
+            let header = make_header(
+                seq,
+                previous_header_hash,
+                tx_hash,
+                result_hash,
+                combined_hash,
+            );
+            let header_xdr = header.to_xdr(Limits::none()).unwrap();
+            previous_header_hash = henyey_ledger::compute_header_hash(&header).unwrap();
+            if seq == CHECKPOINT {
+                checkpoint_header_hash = previous_header_hash;
+                checkpoint_header = Some(header.clone());
+            }
+            headers_and_history.push((header, header_xdr, tx_entry, result_entry));
+        }
+
+        app.db_blocking("seed-staging-test", {
+            let bucket_levels = bucket_levels(&bucket_list);
+            let has_json = has_json.clone();
+            let headers_and_history = headers_and_history.clone();
+            move |db| {
+                db.with_connection(|conn| {
+                    for (header, header_xdr, tx_entry, result_entry) in &headers_and_history {
+                        conn.store_ledger_header(header, header_xdr)?;
+                        conn.store_tx_history_entry(header.ledger_seq, tx_entry)?;
+                        conn.store_tx_result_entry(header.ledger_seq, result_entry)?;
+                    }
+                    conn.set_last_closed_ledger(CHECKPOINT)?;
+                    conn.store_bucket_list(CHECKPOINT, &bucket_levels)?;
+                    conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
+                    conn.enqueue_publish(CHECKPOINT, &has_json)?;
+                    Ok::<_, henyey_db::DbError>(())
+                })
+                .map_err(Into::into)
+            }
+        })
+        .await
+        .unwrap();
+
+        app.ledger_manager
+            .initialize(
+                bucket_list,
+                hot_archive,
+                checkpoint_header.expect("checkpoint header"),
+                checkpoint_header_hash,
+            )
+            .unwrap();
+
+        // Trigger publish and wait for completion
+        app.maybe_publish_history().await;
+        wait_for_publish_queue_to_drain(&app).await;
+
+        // Verify: log file must exist and contain at least one source path
+        let log_contents = std::fs::read_to_string(&log_file)
+            .expect("put command log file should exist (publish must have run)");
+        let paths: Vec<&str> = log_contents.lines().filter(|l| !l.is_empty()).collect();
+        assert!(
+            !paths.is_empty(),
+            "publish must have uploaded at least one file"
+        );
+
+        // Every source path must start with <bucket_dir>/tmp/
+        let expected_prefix = custom_bucket_dir.join("tmp");
+        for path in &paths {
+            assert!(
+                path.starts_with(expected_prefix.to_str().unwrap()),
+                "staging path {:?} does not start with {:?}",
+                path,
+                expected_prefix
+            );
+        }
+
+        // Staging directory should be cleaned up after successful publish
+        let tmp_dir = custom_bucket_dir.join("tmp");
+        if tmp_dir.exists() {
+            let remaining: Vec<_> = std::fs::read_dir(&tmp_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(
+                remaining.is_empty(),
+                "staging dir should be empty after publish, found: {:?}",
+                remaining.iter().map(|e| e.path()).collect::<Vec<_>>()
+            );
+        }
+    }
 }

@@ -549,6 +549,177 @@ mod tests {
     use std::io::Read;
     use stellar_xdr::curr::ReadXdr;
 
+    /// Regression test for #2097: CLI publish staging must use `<bucket_dir>/tmp/`,
+    /// not the system temp directory.
+    #[tokio::test]
+    async fn test_cmd_publish_staging_uses_bucket_dir_tmp() {
+        use henyey_db::queries::{
+            BucketListQueries, HistoryQueries, LedgerQueries, PublishQueueQueries, StateQueries,
+        };
+        use henyey_db::schema::state_keys;
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, Limits, StellarValue, StellarValueExt,
+            TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
+            TransactionHistoryResultEntryExt, TransactionResultSet, TransactionSet, VecM, WriteXdr,
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("db").join("henyey.sqlite");
+        let bucket_dir = dir.path().join("buckets");
+        let log_file = dir.path().join("put-sources.log");
+        std::fs::create_dir_all(dir.path().join("db")).unwrap();
+        std::fs::create_dir_all(&bucket_dir).unwrap();
+
+        let put_cmd = format!("echo {{0}} >> {}", log_file.display());
+
+        const CHECKPOINT: u32 = 63;
+        const TOTAL_COINS: i64 = 100_000_000_000_000_000;
+
+        let passphrase = "Test SDF Network ; September 2015".to_string();
+
+        // Build an empty bucket list (no genesis entries needed — we just need
+        // consistent hashes between bucket list and headers).
+        let mut bucket_list = BucketList::new();
+        bucket_list.set_bucket_dir(bucket_dir.clone());
+        let bucket_list_hash = bucket_list.hash();
+
+        // Seed the database
+        let db = henyey_db::Database::open(&db_path).unwrap();
+
+        let mut previous_header_hash = Hash256::ZERO;
+        db.with_connection(|conn| {
+            for seq in 1..=CHECKPOINT {
+                let tx_entry = TransactionHistoryEntry {
+                    ledger_seq: seq,
+                    tx_set: TransactionSet {
+                        previous_ledger_hash: Hash(previous_header_hash.0),
+                        txs: VecM::default(),
+                    },
+                    ext: TransactionHistoryEntryExt::V0,
+                };
+                let tx_hash = henyey_history::verify::compute_tx_set_hash(
+                    &henyey_ledger::TransactionSetVariant::Classic(tx_entry.tx_set.clone()),
+                )
+                .unwrap();
+                let result_entry = TransactionHistoryResultEntry {
+                    ledger_seq: seq,
+                    tx_result_set: TransactionResultSet {
+                        results: VecM::default(),
+                    },
+                    ext: TransactionHistoryResultEntryExt::V0,
+                };
+                let result_hash =
+                    Hash256::hash(&result_entry.tx_result_set.to_xdr(Limits::none()).unwrap());
+
+                let header = LedgerHeader {
+                    ledger_version: 24,
+                    previous_ledger_hash: Hash(previous_header_hash.0),
+                    scp_value: StellarValue {
+                        tx_set_hash: Hash(tx_hash.0),
+                        close_time: stellar_xdr::curr::TimePoint(seq as u64),
+                        upgrades: VecM::default(),
+                        ext: StellarValueExt::Basic,
+                    },
+                    tx_set_result_hash: Hash(result_hash.0),
+                    bucket_list_hash: Hash(bucket_list_hash.0),
+                    ledger_seq: seq,
+                    total_coins: TOTAL_COINS,
+                    fee_pool: 0,
+                    inflation_seq: 0,
+                    id_pool: seq as u64,
+                    base_fee: 100,
+                    base_reserve: 5_000_000,
+                    max_tx_set_size: 100,
+                    skip_list: [Hash([0; 32]), Hash([0; 32]), Hash([0; 32]), Hash([0; 32])],
+                    ext: LedgerHeaderExt::V0,
+                };
+                let header_xdr = header.to_xdr(Limits::none()).unwrap();
+                previous_header_hash = compute_header_hash(&header).unwrap();
+
+                conn.store_ledger_header(&header, &header_xdr)?;
+                conn.store_tx_history_entry(seq, &tx_entry)?;
+                conn.store_tx_result_entry(seq, &result_entry)?;
+            }
+
+            conn.set_last_closed_ledger(CHECKPOINT)?;
+
+            let bucket_levels: Vec<(Hash256, Hash256)> = bucket_list
+                .levels()
+                .iter()
+                .map(|level| (level.curr.hash(), level.snap.hash()))
+                .collect();
+            conn.store_bucket_list(CHECKPOINT, &bucket_levels)?;
+
+            // Store HAS in state (needed by cmd_publish_history)
+            let has = henyey_history::publish::build_history_archive_state(
+                CHECKPOINT,
+                &bucket_list,
+                None,
+                Some(passphrase.clone()),
+            )
+            .unwrap();
+            let has_json = has.to_json().unwrap();
+            conn.set_state(state_keys::HISTORY_ARCHIVE_STATE, &has_json)?;
+            conn.enqueue_publish(CHECKPOINT, &has_json)?;
+
+            Ok(())
+        })
+        .unwrap();
+
+        // Build AppConfig with command archive
+        let mut config = henyey_app::config::ConfigBuilder::new()
+            .database_path(&db_path)
+            .bucket_directory(&bucket_dir)
+            .validator(true)
+            .node_seed("SAFTEV5U6QDFE2DRMSD7HBE76XG7SQZJD6VIUTHIXTJGO77RUQYVURLA")
+            .build();
+        config.history.archives = vec![henyey_app::config::HistoryArchiveEntry {
+            name: "staging-test".to_string(),
+            url: "file:///unused".to_string(),
+            get_enabled: false,
+            put_enabled: true,
+            put: Some(put_cmd),
+            mkdir: Some("true".to_string()),
+        }];
+
+        // Run publish with force=true to ensure it publishes
+        cmd_publish_history(config, true).await.unwrap();
+
+        // Verify: log file must exist and contain at least one source path
+        let log_contents = std::fs::read_to_string(&log_file)
+            .expect("put command log file should exist (publish must have run)");
+        let paths: Vec<&str> = log_contents.lines().filter(|l| !l.is_empty()).collect();
+        assert!(
+            !paths.is_empty(),
+            "publish must have uploaded at least one file"
+        );
+
+        // Every source path must start with <bucket_dir>/tmp/
+        let expected_prefix = bucket_dir.join("tmp");
+        for path in &paths {
+            assert!(
+                path.starts_with(expected_prefix.to_str().unwrap()),
+                "staging path {:?} does not start with {:?}",
+                path,
+                expected_prefix
+            );
+        }
+
+        // Staging directory should be cleaned up after successful publish
+        let tmp_dir = bucket_dir.join("tmp");
+        if tmp_dir.exists() {
+            let remaining: Vec<_> = std::fs::read_dir(&tmp_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .collect();
+            assert!(
+                remaining.is_empty(),
+                "staging dir should be empty after publish, found: {:?}",
+                remaining.iter().map(|e| e.path()).collect::<Vec<_>>()
+            );
+        }
+    }
+
     #[test]
     fn test_write_scp_history_file_uses_record_marks() {
         use flate2::read::GzDecoder;
