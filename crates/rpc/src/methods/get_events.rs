@@ -38,9 +38,9 @@ pub async fn handle(
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
 
-    // Parse filters
-    let (event_type, contract_ids, topic_filters) =
-        parse_event_filters(params.get("filters").and_then(|v| v.as_array()))?;
+    // Parse filters — validate top-level type before extracting array.
+    let filters_array = validate_filters_field(params.get("filters"))?;
+    let (event_type, contract_ids, topic_filters) = parse_event_filters(filters_array)?;
 
     // Parse pagination
     let pagination = params.get("pagination");
@@ -190,6 +190,22 @@ type ContractIdFilters = Vec<String>;
 type TopicFilters = Vec<Vec<String>>;
 type EventFilters = (EventTypeFilter, ContractIdFilters, TopicFilters);
 
+/// Validate the top-level `filters` field type.
+///
+/// Returns the extracted array if present and valid, `None` if absent or null,
+/// or an error if the value is present but not an array.
+fn validate_filters_field(
+    val: Option<&serde_json::Value>,
+) -> Result<Option<&Vec<serde_json::Value>>, JsonRpcError> {
+    match val {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(None),
+        Some(v) => Ok(Some(v.as_array().ok_or_else(|| {
+            JsonRpcError::invalid_params("'filters' must be an array")
+        })?)),
+    }
+}
+
 /// Parse event filter parameters from the JSON-RPC request.
 ///
 /// Returns `(event_type, contract_ids, topic_filters)`.
@@ -212,33 +228,63 @@ fn parse_event_filters(
     }
 
     for filter in filter_array {
-        if let Some(t) = filter.get("type").and_then(|v| v.as_str()) {
-            event_type = Some(match t {
-                "contract" => "contract",
-                "system" => "system",
-                other => {
+        if !filter.is_object() {
+            return Err(JsonRpcError::invalid_params(
+                "each filter must be an object",
+            ));
+        }
+
+        // Type field: optional, but must be a string if present.
+        if let Some(type_val) = filter.get("type") {
+            if !type_val.is_null() {
+                let t = type_val.as_str().ok_or_else(|| {
+                    JsonRpcError::invalid_params("filter 'type' must be a string")
+                })?;
+                event_type = Some(match t {
+                    "contract" => "contract",
+                    "system" => "system",
+                    other => {
+                        return Err(JsonRpcError::invalid_params(format!(
+                            "unsupported event type: '{}' (allowed: contract, system)",
+                            other,
+                        )));
+                    }
+                });
+            }
+        }
+
+        // ContractIds field: optional, but must be an array of strings if present.
+        if let Some(cids_val) = filter.get("contractIds") {
+            if !cids_val.is_null() {
+                let cids = cids_val.as_array().ok_or_else(|| {
+                    JsonRpcError::invalid_params("filter 'contractIds' must be an array")
+                })?;
+                if cids.len() > MAX_CONTRACT_IDS_PER_FILTER {
                     return Err(JsonRpcError::invalid_params(format!(
-                        "unsupported event type: '{}' (allowed: contract, system)",
-                        other,
+                        "too many contractIds per filter: max {} allowed",
+                        MAX_CONTRACT_IDS_PER_FILTER
                     )));
                 }
-            });
-        }
-
-        if let Some(cids) = filter.get("contractIds").and_then(|v| v.as_array()) {
-            if cids.len() > MAX_CONTRACT_IDS_PER_FILTER {
-                return Err(JsonRpcError::invalid_params(format!(
-                    "too many contractIds per filter: max {} allowed",
-                    MAX_CONTRACT_IDS_PER_FILTER
-                )));
+                let ids: Vec<String> = cids
+                    .iter()
+                    .map(|v| {
+                        v.as_str().map(String::from).ok_or_else(|| {
+                            JsonRpcError::invalid_params("contractIds elements must be strings")
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                contract_ids.extend(ids);
             }
-            contract_ids.extend(cids.iter().filter_map(|v| v.as_str().map(String::from)));
         }
 
-        // Topics is an array of arrays: [["topic1_a", "topic1_b"], ["*"], ...]
-        // Each inner array is OR alternatives for that position.
-        if let Some(topics_arr) = filter.get("topics").and_then(|v| v.as_array()) {
-            parse_topic_filters(topics_arr, &mut topic_filters)?;
+        // Topics field: optional, but must be an array of arrays of strings if present.
+        if let Some(topics_val) = filter.get("topics") {
+            if !topics_val.is_null() {
+                let topics_arr = topics_val.as_array().ok_or_else(|| {
+                    JsonRpcError::invalid_params("filter 'topics' must be an array")
+                })?;
+                parse_topic_filters(topics_arr, &mut topic_filters)?;
+            }
         }
     }
 
@@ -265,25 +311,30 @@ fn parse_topic_filters(
         )));
     }
     for topic_set in topics_arr {
-        if let Some(alternatives) = topic_set.as_array() {
-            if alternatives.len() > MAX_TOPIC_SEGMENTS {
-                return Err(JsonRpcError::invalid_params(format!(
-                    "too many alternatives per topic segment: max {} allowed",
-                    MAX_TOPIC_SEGMENTS
-                )));
-            }
-            let mut alt_strings: Vec<String> = alternatives
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            // Deduplicate alternatives preserving insertion order.
-            let mut seen = HashSet::with_capacity(alt_strings.len());
-            alt_strings.retain(|s| seen.insert(s.clone()));
-            if alt_strings.iter().any(|s| s == "**") {
-                break;
-            }
-            topic_filters.push(alt_strings);
+        let alternatives = topic_set.as_array().ok_or_else(|| {
+            JsonRpcError::invalid_params("each topic segment must be an array of strings")
+        })?;
+        if alternatives.len() > MAX_TOPIC_SEGMENTS {
+            return Err(JsonRpcError::invalid_params(format!(
+                "too many alternatives per topic segment: max {} allowed",
+                MAX_TOPIC_SEGMENTS
+            )));
         }
+        let mut alt_strings: Vec<String> = alternatives
+            .iter()
+            .map(|v| {
+                v.as_str().map(String::from).ok_or_else(|| {
+                    JsonRpcError::invalid_params("topic filter elements must be strings")
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        // Deduplicate alternatives preserving insertion order.
+        let mut seen = HashSet::with_capacity(alt_strings.len());
+        alt_strings.retain(|s| seen.insert(s.clone()));
+        if alt_strings.iter().any(|s| s == "**") {
+            break;
+        }
+        topic_filters.push(alt_strings);
     }
     Ok(())
 }
@@ -587,5 +638,195 @@ mod tests {
             XdrFormat::Json,
         );
         assert!(result.is_err());
+    }
+
+    // === Strict type validation regression tests ===
+
+    #[test]
+    fn test_validate_filters_field_non_array() {
+        let val = json!(123);
+        assert!(validate_filters_field(Some(&val)).is_err());
+
+        let val = json!("string");
+        assert!(validate_filters_field(Some(&val)).is_err());
+
+        let val = json!({"key": "value"});
+        assert!(validate_filters_field(Some(&val)).is_err());
+    }
+
+    #[test]
+    fn test_validate_filters_field_null_and_absent() {
+        // null treated as absent
+        let val = json!(null);
+        assert_eq!(validate_filters_field(Some(&val)).unwrap(), None);
+        // absent
+        assert_eq!(validate_filters_field(None).unwrap(), None);
+    }
+
+    #[test]
+    fn test_validate_filters_field_valid_array() {
+        let val = json!([]);
+        assert!(validate_filters_field(Some(&val)).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_parse_filters_non_object_filter_entry() {
+        let filters = json!([123]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+
+        let filters = json!([null]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+
+        let filters = json!(["string"]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_non_string_type() {
+        let filters = json!([{"type": 123}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+
+        let filters = json!([{"type": ["array"]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_null_type_treated_as_absent() {
+        let filters = json!([{"type": null}]);
+        let arr = make_filters(filters).unwrap();
+        let (event_type, _, _) = parse_event_filters(Some(&arr)).unwrap();
+        assert!(event_type.is_none());
+    }
+
+    #[test]
+    fn test_parse_filters_non_array_contract_ids() {
+        let filters = json!([{"contractIds": "not_array"}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+
+        let filters = json!([{"contractIds": 123}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_null_contract_ids_treated_as_absent() {
+        let filters = json!([{"contractIds": null}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, contract_ids, _) = parse_event_filters(Some(&arr)).unwrap();
+        assert!(contract_ids.is_empty());
+    }
+
+    #[test]
+    fn test_parse_filters_non_string_contract_id_element() {
+        let filters = json!([{"contractIds": ["valid", 123]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+
+        let filters = json!([{"contractIds": [null]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+
+        let filters = json!([{"contractIds": [{"obj": true}]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_non_array_topics_field() {
+        let filters = json!([{"topics": "not_array"}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+
+        let filters = json!([{"topics": 123}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_null_topics_treated_as_absent() {
+        let filters = json!([{"topics": null}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, _, topics) = parse_event_filters(Some(&arr)).unwrap();
+        assert!(topics.is_empty());
+    }
+
+    #[test]
+    fn test_parse_filters_non_array_topic_segment() {
+        let filters = json!([{"topics": ["not_an_array"]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+
+        let filters = json!([{"topics": [123]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_non_string_topic_element() {
+        let filters = json!([{"topics": [[123]]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+
+        let filters = json!([{"topics": [["valid", null]]}]);
+        let arr = make_filters(filters).unwrap();
+        let result = parse_event_filters(Some(&arr));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_filters_empty_arrays_valid() {
+        // Empty contractIds array is valid
+        let filters = json!([{"contractIds": []}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, contract_ids, _) = parse_event_filters(Some(&arr)).unwrap();
+        assert!(contract_ids.is_empty());
+
+        // Empty topics array is valid
+        let filters = json!([{"topics": []}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, _, topics) = parse_event_filters(Some(&arr)).unwrap();
+        assert!(topics.is_empty());
+
+        // Empty inner topic segment (matches nothing)
+        let filters = json!([{"topics": [[]]}]);
+        let arr = make_filters(filters).unwrap();
+        let (_, _, topics) = parse_event_filters(Some(&arr)).unwrap();
+        assert_eq!(topics.len(), 1);
+        assert!(topics[0].is_empty());
+    }
+
+    #[test]
+    fn test_parse_filters_error_priority_type_before_contract_ids() {
+        // Both type and contractIds are invalid; type error should fire first
+        let filters = json!([{"type": 123, "contractIds": 456}]);
+        let arr = make_filters(filters).unwrap();
+        let err = parse_event_filters(Some(&arr)).unwrap_err();
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("type"),
+            "Expected type error first, got: {}",
+            msg
+        );
     }
 }
