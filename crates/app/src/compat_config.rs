@@ -533,35 +533,33 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
         None
     };
 
-    if let Some(qs_table) = table.get("QUORUM_SET").and_then(|v| v.as_table()) {
-        if let Some(validators) = qs_table.get("VALIDATORS").and_then(|v| v.as_array()) {
+    if let Some(qs_val) = table.get("QUORUM_SET") {
+        let qs_table = qs_val.as_table().ok_or_else(|| {
+            anyhow::anyhow!("QUORUM_SET: expected table, got {}", qs_val.type_str())
+        })?;
+        if let Some(raw_validators) = get_string_array(qs_table, "VALIDATORS")
+            .map_err(|e| anyhow::anyhow!("[QUORUM_SET] {e}"))?
+        {
             let mut keys: Vec<String> = Vec::new();
-            for v in validators {
-                if let Some(s) = v.as_str() {
-                    if s == "$self" {
-                        // "$self" refers to the node's own key — resolve it from NODE_SEED
-                        let seed_str = config.node.node_seed.as_ref().ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Cannot resolve $self in [QUORUM_SET]: NODE_SEED not set"
-                            )
-                        })?;
-                        let secret =
-                            henyey_crypto::SecretKey::from_strkey(seed_str).map_err(|e| {
-                                anyhow::anyhow!(
-                                    "Cannot resolve $self in [QUORUM_SET]: invalid NODE_SEED: {}",
-                                    e
-                                )
-                            })?;
-                        keys.push(secret.public_key().to_strkey());
-                    } else {
-                        keys.push(s.to_string());
-                    }
+            for s in &raw_validators {
+                if s == "$self" {
+                    // "$self" refers to the node's own key — resolve it from NODE_SEED
+                    let seed_str = config.node.node_seed.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("Cannot resolve $self in [QUORUM_SET]: NODE_SEED not set")
+                    })?;
+                    let secret = henyey_crypto::SecretKey::from_strkey(seed_str).map_err(|e| {
+                        anyhow::anyhow!(
+                            "Cannot resolve $self in [QUORUM_SET]: invalid NODE_SEED: {}",
+                            e
+                        )
+                    })?;
+                    keys.push(secret.public_key().to_strkey());
+                } else {
+                    keys.push(s.clone());
                 }
             }
             // [QUORUM_SET] always overrides [[VALIDATORS]]-generated quorum set.
-            if !keys.is_empty() {
-                config.node.quorum_set.validators = keys;
-            }
+            config.node.quorum_set.validators = keys;
         }
         // Parse THRESHOLD_PERCENT and apply it to the quorum set config.
         // stellar-core default is 67 if not specified.
@@ -3774,6 +3772,85 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
         assert_eq!(
             config.overlay.known_peers,
             vec!["peer1.example.com", "peer2.example.com:11625"]
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_validators_non_string_element_rejected() {
+        let toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/test.db"
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = ["GABCDEF", 42]
+            "#,
+        )
+        .unwrap();
+        let err = translate_stellar_core_config(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("VALIDATORS[1]"),
+            "expected error about VALIDATORS[1], got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_validators_non_array_rejected() {
+        let toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/test.db"
+            [QUORUM_SET]
+            VALIDATORS = "not-an-array"
+            "#,
+        )
+        .unwrap();
+        let err = translate_stellar_core_config(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("VALIDATORS"),
+            "expected error mentioning VALIDATORS, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_non_table_rejected() {
+        let toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/test.db"
+            QUORUM_SET = "not-a-table"
+            "#,
+        )
+        .unwrap();
+        let err = translate_stellar_core_config(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("QUORUM_SET"),
+            "expected error mentioning QUORUM_SET, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_quorum_set_empty_validators_overrides() {
+        // With [QUORUM_SET] VALIDATORS = [], the override should set an empty
+        // validator list rather than preserving any prior value.
+        let toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
+            NODE_SEED = "SDQVDISRYN2JXBS7ICL7QJAEKB3HWBJFP2QECXG7GZICAHBK4UNJCWK2 self"
+            NODE_IS_VALIDATOR = true
+            UNSAFE_QUORUM = true
+            FAILURE_SAFETY = 0
+            [QUORUM_SET]
+            THRESHOLD_PERCENT = 100
+            VALIDATORS = []
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&toml).unwrap();
+        assert!(
+            config.node.quorum_set.validators.is_empty(),
+            "expected empty validators after VALIDATORS = [], got: {:?}",
+            config.node.quorum_set.validators
         );
     }
 }
