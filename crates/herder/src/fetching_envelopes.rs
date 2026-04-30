@@ -66,7 +66,8 @@ pub struct FetchingConfig {
     pub quorum_set_fetcher_config: ItemFetcherConfig,
     /// Maximum slots to track.
     pub max_slots: usize,
-    /// Maximum quorum sets to cache. Once exceeded, an arbitrary entry is evicted.
+    /// Maximum quorum sets to cache. Uses random-two-choice eviction (matching
+    /// stellar-core's `RandomEvictionCache`). Must be at least 1.
     pub max_quorum_set_cache: usize,
 }
 
@@ -139,6 +140,10 @@ impl FetchingEnvelopes {
     /// (ScpDriver) for tx_set presence. This eliminates the former shadow
     /// cache that could be poisoned (#2066).
     pub fn new(config: FetchingConfig, has_tx_set_fn: HasTxSetFn) -> Self {
+        assert!(
+            config.max_quorum_set_cache >= 1,
+            "max_quorum_set_cache must be at least 1"
+        );
         let qs_cache = RandomEvictionCache::new(config.max_quorum_set_cache);
         Self {
             tx_set_fetcher: ItemFetcher::new(ItemType::TxSet, config.tx_set_fetcher_config.clone()),
@@ -1728,6 +1733,66 @@ mod tests {
             result,
             RecvResult::Fetching,
             "envelope should be fetching since QS-A was evicted"
+        );
+    }
+
+    /// Test: an already-fetching envelope whose quorum set is evicted
+    /// re-starts fetching when check_and_move_to_ready runs.
+    #[test]
+    fn test_refetch_after_eviction_during_fetching() {
+        let mut config = FetchingConfig::default();
+        config.max_quorum_set_cache = 1;
+
+        let tx_hash = Hash256::from_bytes([0xAA; 32]);
+        let qs_hash = Hash256::from_bytes([0x01; 32]);
+
+        // tx_set NOT available initially
+        let available = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let avail_clone = available.clone();
+        let target = tx_hash;
+        let fetching = FetchingEnvelopes::new(
+            config,
+            Box::new(move |hash| {
+                *hash == target && avail_clone.load(std::sync::atomic::Ordering::Relaxed)
+            }),
+        );
+
+        // Insert envelope — needs both tx_set and quorum_set
+        let envelope = make_envelope_with_deps(100, 1, tx_hash, qs_hash);
+        let result = fetching.recv_envelope(envelope);
+        assert_eq!(result, RecvResult::Fetching);
+
+        // Deliver quorum-set so only tx_set is missing
+        fetching.cache_quorum_set(qs_hash, make_sane_quorum_set());
+        // Envelope stays fetching (tx_set still missing)
+        assert_eq!(fetching.fetching_count(), 1);
+
+        // Evict the quorum set by inserting a different one (capacity=1)
+        let other_hash = Hash256::from_bytes([0x02; 32]);
+        fetching.cache_quorum_set(other_hash, make_sane_quorum_set());
+        assert!(!fetching.has_quorum_set(&qs_hash), "QS-A should be evicted");
+
+        // Now make tx_set available and notify — this triggers check_and_move_to_ready
+        available.store(true, std::sync::atomic::Ordering::Relaxed);
+        fetching.on_tx_set_accepted(&tx_hash);
+
+        // Envelope should still be fetching because QS was evicted
+        // The re-fetch path should have been triggered
+        assert_eq!(
+            fetching.fetching_count(),
+            1,
+            "envelope should remain fetching until quorum set is re-delivered"
+        );
+        assert_eq!(fetching.ready_count(), 0);
+
+        // Re-deliver the quorum set — now envelope should become ready
+        fetching.cache_quorum_set(qs_hash, make_sane_quorum_set());
+        // on_tx_set_accepted again to trigger recheck
+        fetching.on_tx_set_accepted(&tx_hash);
+        assert_eq!(
+            fetching.ready_count(),
+            1,
+            "envelope should be ready after re-delivery of evicted quorum set"
         );
     }
 }
