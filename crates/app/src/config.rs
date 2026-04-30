@@ -2091,6 +2091,12 @@ impl AppConfig {
                  (set a fixed port or omit query.port to disable)"
             );
         }
+        if self.overlay.peer_port == 0 {
+            anyhow::bail!(
+                "overlay.peer_port must not be 0 (ephemeral) \
+                 (set a fixed port for peer connections)"
+            );
+        }
 
         // Validate RPC config
         if self.rpc.enabled {
@@ -2729,6 +2735,36 @@ memory_for_caching_mb = 256
         assert!(
             config.validate().is_ok(),
             "Disabled compat_http with port 0 should pass"
+        );
+    }
+
+    #[test]
+    fn test_validation_peer_port_zero_rejected() {
+        let mut config = AppConfig::default();
+        config.overlay.peer_port = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overlay.peer_port must not be 0"),
+            "Expected peer port zero error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_peer_port_zero_rejected_standalone() {
+        // peer_port = 0 is rejected even in standalone mode (unconditional).
+        let mut config = AppConfig::default();
+        config.overlay.peer_port = 0;
+        config.testing.run_standalone = true;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overlay.peer_port must not be 0"),
+            "Expected peer port zero error even in standalone, got: {}",
+            err
         );
     }
 

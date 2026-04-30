@@ -265,6 +265,12 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
 
     // --- Overlay ---
     if let Some(port) = get_u16(table, "PEER_PORT") {
+        if port == 0 {
+            anyhow::bail!(
+                "PEER_PORT must not be 0 \
+                 (stellar-core enforces minimum port of 1; set a valid port)"
+            );
+        }
         config.overlay.peer_port = port;
     }
     if let Some(peers) = get_string_array(table, "KNOWN_PEERS")
@@ -3859,6 +3865,27 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             config.node.quorum_set.validators.is_empty(),
             "expected empty validators after VALIDATORS = [], got: {:?}",
             config.node.quorum_set.validators
+        );
+    }
+
+    #[test]
+    fn test_compat_config_peer_port_zero_rejected() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            HTTP_PORT = 11626
+            DATABASE = "sqlite3:///tmp/stellar-core.db"
+            PEER_PORT = 0
+            "#,
+        )
+        .unwrap();
+        let result = translate_stellar_core_config(&core_toml);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("PEER_PORT must not be 0"),
+            "Expected PEER_PORT=0 rejection at translation time, got: {}",
+            err
         );
     }
 }
