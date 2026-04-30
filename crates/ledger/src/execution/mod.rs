@@ -94,7 +94,7 @@ pub use result_mapping::build_tx_result_pair;
 pub(crate) use tx_set::pre_deduct_all_fees_on_delta;
 pub use tx_set::{
     compute_state_size_window_entry, execute_soroban_parallel_phase, execute_transaction_set,
-    execute_transaction_set_with_fee_mode, run_transactions_on_executor, RunTransactionsParams,
+    run_transactions_on_executor, FeeStrategy, RunTransactionsParams, SorobanFeeSource,
 };
 
 use apply::{RestoredEntries, AUTHORIZED_FLAG};
@@ -109,11 +109,20 @@ pub struct HotArchiveLookupImpl {
     hot_archive: std::sync::Arc<parking_lot::RwLock<Option<HotArchiveBucketList>>>,
 }
 
+/// How the executor handles fee deduction during pre_apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FeeMode {
+    /// Deduct the fee from the source account during pre_apply.
+    Deduct,
+    /// Skip fee deduction (fees handled externally or not applicable).
+    Skip,
+}
+
 pub struct TransactionExecutionRequest {
     pub tx_envelope: Arc<TransactionEnvelope>,
     pub base_fee: u32,
     pub soroban_prng_seed: Option<[u8; 32]>,
-    pub deduct_fee: bool,
+    pub fee_mode: FeeMode,
 }
 
 impl TransactionExecutionRequest {
@@ -121,13 +130,13 @@ impl TransactionExecutionRequest {
         tx_envelope: &TransactionEnvelope,
         base_fee: u32,
         soroban_prng_seed: Option<[u8; 32]>,
-        deduct_fee: bool,
+        fee_mode: FeeMode,
     ) -> Self {
         Self {
             tx_envelope: Arc::new(tx_envelope.clone()),
             base_fee,
             soroban_prng_seed,
-            deduct_fee,
+            fee_mode,
         }
     }
 }
@@ -486,7 +495,7 @@ pub(super) struct PreApplyResult {
     // Config carried forward
     pub(super) soroban_prng_seed: Option<[u8; 32]>,
     pub(super) base_fee: u32,
-    pub(super) deduct_fee: bool,
+    pub(super) fee_mode: FeeMode,
 
     // Timing
     pub(super) validation_us: u64,
@@ -535,8 +544,8 @@ pub(super) struct PreApplySnapshot {
     pub(super) fee_entries: DeltaEntries,
     pub(super) seq_entries: DeltaEntries,
     pub(super) signer_entries: DeltaEntries,
-    /// Whether to deduct the fee after rollback (true for non-fee-bump inner txs).
-    pub(super) deduct_fee: bool,
+    /// Whether to re-add the fee to the delta after rollback.
+    pub(super) fee_mode: FeeMode,
     /// The fee amount to re-add to the delta after rollback.
     pub(super) fee: i64,
 }
@@ -1665,7 +1674,7 @@ impl TransactionExecutor {
             tx_envelope,
             base_fee,
             soroban_prng_seed,
-            true,
+            FeeMode::Deduct,
         )
     }
 
@@ -1776,7 +1785,7 @@ impl TransactionExecutor {
 
     /// Execute a transaction with configurable fee deduction.
     ///
-    /// When `deduct_fee` is false, fee validation still occurs but no fee
+    /// When `fee_mode` is `FeeMode::Skip`, fee validation still occurs but no fee
     /// processing changes are applied to the state or delta.
     ///
     pub fn execute_transaction_with_fee_mode(
@@ -1785,7 +1794,7 @@ impl TransactionExecutor {
         tx_envelope: &TransactionEnvelope,
         base_fee: u32,
         soroban_prng_seed: Option<[u8; 32]>,
-        deduct_fee: bool,
+        fee_mode: FeeMode,
     ) -> Result<TransactionExecutionResult> {
         self.execute_transaction_with_arc(
             snapshot,
@@ -1793,7 +1802,7 @@ impl TransactionExecutor {
                 tx_envelope,
                 base_fee,
                 soroban_prng_seed,
-                deduct_fee,
+                fee_mode,
             ),
         )
     }
@@ -1814,7 +1823,7 @@ impl TransactionExecutor {
         tx_envelope: &Arc<TransactionEnvelope>,
         base_fee: u32,
         soroban_prng_seed: Option<[u8; 32]>,
-        deduct_fee: bool,
+        fee_mode: FeeMode,
     ) -> Result<std::result::Result<PreApplyResult, TransactionExecutionResult>> {
         let tx_timing_start = std::time::Instant::now();
 
@@ -1929,7 +1938,7 @@ impl TransactionExecutor {
         let mut fee_created = Vec::new();
         let mut fee_updated = Vec::new();
         let mut fee_deleted = Vec::new();
-        let fee_changes = if !deduct_fee || fee == 0 {
+        let fee_changes = if fee_mode == FeeMode::Skip || fee == 0 {
             empty_entry_changes()
         } else {
             let delta_before_fee = delta_snapshot(&self.state);
@@ -1977,7 +1986,7 @@ impl TransactionExecutor {
         // For fee bump transactions, stellar-core's FeeBumpTransactionFrame::apply()
         // ALWAYS calls removeOneTimeSignerKeyFromFeeSource() which removes any PreAuthTx
         // signer matching the fee bump outer hash from the fee source account. This happens
-        // in both single-phase (deduct_fee=true) and two-phase (deduct_fee=false) modes.
+        // in both single-phase (FeeMode::Deduct) and two-phase (FeeMode::Skip) modes.
         //
         // In two-phase mode, the STATE/UPDATED pair is captured in fee_bump_wrapper_changes
         // for metadata. In single-phase mode, the signer removal still happens but the
@@ -2125,7 +2134,7 @@ impl TransactionExecutor {
             },
             soroban_prng_seed,
             base_fee,
-            deduct_fee,
+            fee_mode,
             validation_us,
             fee_seq_us,
             tx_timing_start,
@@ -2198,7 +2207,7 @@ impl TransactionExecutor {
             tx_envelope,
             base_fee,
             soroban_prng_seed,
-            deduct_fee,
+            fee_mode,
         } = request;
 
         // Phase 1: Pre-apply (validate, charge fees, remove signers, bump seq)
@@ -2207,7 +2216,7 @@ impl TransactionExecutor {
             &tx_envelope,
             base_fee,
             soroban_prng_seed,
-            deduct_fee,
+            fee_mode,
         )? {
             Ok(pre) => pre,
             Err(early_result) => return Ok(early_result),
@@ -2990,7 +2999,7 @@ pub(crate) fn fee_source_account_id(env: &TransactionEnvelope) -> AccountId {
 /// Computed during the pre-deduction pass (matching stellar-core `processFeesSeqNums`)
 /// and consumed during cluster execution to provide fee metadata without
 /// re-deducting fees.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PreChargedFee {
     /// The fee actually charged (min(balance, computed_fee)).
     pub charged_fee: i64,

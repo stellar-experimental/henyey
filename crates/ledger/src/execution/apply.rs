@@ -27,8 +27,8 @@ use super::meta::*;
 use super::result_mapping::*;
 use super::signatures::*;
 use super::{
-    DeltaSlice, OperationExecutionRequest, PreApplyResult, PreApplySnapshot, RefundableFeeTracker,
-    TransactionExecutionResult, TransactionExecutor, TxExecTimings,
+    DeltaSlice, FeeMode, OperationExecutionRequest, PreApplyResult, PreApplySnapshot,
+    RefundableFeeTracker, TransactionExecutionResult, TransactionExecutor, TxExecTimings,
 };
 
 pub(super) const AUTHORIZED_FLAG: u32 = TrustLineFlags::AuthorizedFlag as u32;
@@ -247,7 +247,7 @@ impl TransactionExecutor {
             signer_entries,
             soroban_prng_seed,
             base_fee,
-            deduct_fee,
+            fee_mode,
             validation_us,
             fee_seq_us,
             tx_timing_start,
@@ -624,7 +624,7 @@ impl TransactionExecutor {
                 fee_entries,
                 seq_entries,
                 signer_entries,
-                deduct_fee,
+                fee_mode,
                 fee,
             };
             self.rollback_failed_tx(
@@ -838,7 +838,7 @@ impl TransactionExecutor {
         // rollback() restores the delta from the snapshot taken BEFORE fee deduction,
         // so we must explicitly re-add this transaction's fee to preserve it.
         // This ensures failed transactions still contribute their fees to the fee pool.
-        if pre_apply.deduct_fee && pre_apply.fee > 0 {
+        if pre_apply.fee_mode == FeeMode::Deduct && pre_apply.fee > 0 {
             self.state.delta_mut().add_fee(pre_apply.fee);
         }
         restore_delta_entries(

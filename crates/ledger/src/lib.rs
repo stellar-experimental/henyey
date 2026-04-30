@@ -94,8 +94,8 @@ pub use config_upgrade::{ConfigUpgradeSetFrame, ConfigUpgradeValidity};
 pub use delta::{EntryChange, LedgerDelta};
 pub use error::LedgerError;
 pub use execution::{
-    compute_state_size_window_entry, execute_soroban_parallel_phase, LedgerAdvanceParams,
-    SorobanContext, SorobanNetworkInfo,
+    compute_state_size_window_entry, execute_soroban_parallel_phase, FeeMode, FeeStrategy,
+    LedgerAdvanceParams, SorobanContext, SorobanFeeSource, SorobanNetworkInfo,
 };
 pub use header::{
     calculate_skip_values, close_time, compute_header_hash, create_next_header,

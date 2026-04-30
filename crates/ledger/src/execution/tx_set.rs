@@ -12,15 +12,44 @@ use super::*;
 /// Result of a parallel cluster execution: (result, elapsed_us, cluster_index).
 type ClusterThreadResult = (Result<(TxSetResult, LedgerDelta, i64)>, u64, usize);
 
+/// How the tx-set orchestrator sources fee information before executing transaction bodies.
+///
+/// # Invariants
+/// - `PreChargeInternally`: The orchestrator calls `process_fee_only` for each TX
+///   and records the fee pool delta itself. The executor runs with `FeeMode::Skip`.
+/// - `ExternallyPrecharged`: The slice length MUST equal the transaction count and
+///   be in the same order. Validated at runtime (returns error on mismatch).
+///   The caller MUST have already deducted fees on the delta and recorded the fee
+///   pool delta. The executor runs with `FeeMode::Skip`.
+/// - `NoFees`: No fee deduction occurs anywhere. The executor runs with `FeeMode::Skip`.
+///   Valid for test harnesses and offline replay contexts that skip fee processing.
+#[derive(Clone, Debug)]
+pub enum FeeStrategy<'a> {
+    /// Pre-charge fees internally via process_fee_only before executing bodies.
+    PreChargeInternally,
+    /// Fees were already deducted externally; use the provided records.
+    ExternallyPrecharged(&'a [PreChargedFee]),
+    /// No fee charging — executor runs with FeeMode::Skip.
+    NoFees,
+}
+
+/// Fee source for the Soroban parallel phase.
+#[derive(Clone, Debug)]
+pub enum SorobanFeeSource {
+    /// Fees already deducted externally; use provided records.
+    ExternallyPrecharged(Vec<PreChargedFee>),
+    /// Pre-deduct Soroban fees internally from the delta.
+    DeductInternally,
+}
+
 pub struct RunTransactionsParams<'a> {
     pub executor: &'a mut TransactionExecutor,
     pub snapshot: &'a SnapshotHandle,
     pub transactions: &'a [TxWithFee],
     pub base_fee: u32,
     pub soroban_base_prng_seed: [u8; 32],
-    pub deduct_fee: bool,
+    pub fee_strategy: FeeStrategy<'a>,
     pub delta: &'a mut LedgerDelta,
-    pub external_pre_charged: Option<&'a [PreChargedFee]>,
 }
 
 /// Execute a full transaction set.
@@ -34,23 +63,6 @@ pub fn execute_transaction_set(
     context: &LedgerContext,
     delta: &mut LedgerDelta,
     soroban: SorobanContext<'_>,
-) -> Result<TxSetResult> {
-    execute_transaction_set_with_fee_mode(snapshot, transactions, context, delta, soroban, true)
-}
-
-/// Execute a full transaction set with configurable fee deduction.
-///
-/// # Arguments
-///
-/// * `soroban` - Soroban execution context (config, PRNG seed, module cache, etc.)
-/// * `deduct_fee` - Whether to deduct fees from source accounts.
-pub fn execute_transaction_set_with_fee_mode(
-    snapshot: &SnapshotHandle,
-    transactions: &[TxWithFee],
-    context: &LedgerContext,
-    delta: &mut LedgerDelta,
-    soroban: SorobanContext<'_>,
-    deduct_fee: bool,
 ) -> Result<TxSetResult> {
     let id_pool = snapshot.header().id_pool;
     let mut executor =
@@ -79,23 +91,22 @@ pub fn execute_transaction_set_with_fee_mode(
         transactions,
         base_fee: context.base_fee,
         soroban_base_prng_seed: soroban.base_prng_seed,
-        deduct_fee,
+        fee_strategy: FeeStrategy::PreChargeInternally,
         delta,
-        external_pre_charged: None,
     })
 }
 
 /// Execute transactions on a pre-configured executor, apply results to delta.
 ///
 /// This is the core transaction execution loop, separated from executor
-/// creation/setup so it can be used both by the free function
-/// `execute_transaction_set_with_fee_mode` (which creates a fresh executor)
-/// and by `LedgerCloseContext::apply_transactions` (which reuses a persistent
-/// executor across ledger closes to avoid reloading ~911K offers).
+/// creation/setup so it can be used both by `execute_transaction_set`
+/// (which creates a fresh executor) and by `LedgerCloseContext::apply_transactions`
+/// (which reuses a persistent executor across ledger closes to avoid reloading ~911K offers).
 ///
-/// When `external_pre_charged` is `Some`, fees have already been pre-deducted
-/// on the delta by `pre_deduct_all_fees_on_delta`. The internal fee loop is
-/// skipped and the provided fee changes are used for transaction meta.
+/// The `fee_strategy` field determines how fees are sourced:
+/// - `PreChargeInternally`: fees are pre-charged via `process_fee_only` before body execution.
+/// - `ExternallyPrecharged`: fees were already deducted on the delta by caller.
+/// - `NoFees`: no fee processing occurs.
 pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result<TxSetResult> {
     let RunTransactionsParams {
         executor,
@@ -103,9 +114,8 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
         transactions,
         base_fee,
         soroban_base_prng_seed,
-        deduct_fee,
+        fee_strategy,
         delta,
-        external_pre_charged,
     } = params;
     let ledger_seq = executor.ledger_seq;
     let protocol_version = executor.protocol_version;
@@ -113,24 +123,30 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
     prefetch_classic_keys(executor, snapshot, transactions)?;
 
     // Pre-deduct fees before executing any TX body.
-    // When external_pre_charged is provided (parallel path), fees were already
-    // deducted on the delta by pre_deduct_all_fees_on_delta. Otherwise, deduct
-    // fees using the executor's internal state (sequential path).
-    let pre_fee_results: Vec<PreChargedFee> = if let Some(ext) = external_pre_charged {
-        ext.to_vec()
-    } else if deduct_fee {
-        let mut results = Vec::with_capacity(transactions.len());
-        for (tx, tx_base_fee) in transactions.iter() {
-            let tx_fee = tx_base_fee.unwrap_or(base_fee);
-            let (fee_changes, charged_fee) = executor.process_fee_only(snapshot, tx, tx_fee)?;
-            results.push(PreChargedFee {
-                charged_fee,
-                fee_changes,
-            });
+    let pre_fee_results: Vec<PreChargedFee> = match fee_strategy {
+        FeeStrategy::ExternallyPrecharged(ext) => {
+            if ext.len() != transactions.len() {
+                return Err(crate::LedgerError::Internal(format!(
+                    "ExternallyPrecharged fees count ({}) != transaction count ({})",
+                    ext.len(),
+                    transactions.len()
+                )));
+            }
+            ext.to_vec()
         }
-        results
-    } else {
-        Vec::new()
+        FeeStrategy::PreChargeInternally => {
+            let mut results = Vec::with_capacity(transactions.len());
+            for (tx, tx_base_fee) in transactions.iter() {
+                let tx_fee = tx_base_fee.unwrap_or(base_fee);
+                let (fee_changes, charged_fee) = executor.process_fee_only(snapshot, tx, tx_fee)?;
+                results.push(PreChargedFee {
+                    charged_fee,
+                    fee_changes,
+                });
+            }
+            results
+        }
+        FeeStrategy::NoFees => Vec::new(),
     };
     let has_pre_charged = !pre_fee_results.is_empty();
 
@@ -157,8 +173,8 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
         let tx_fee = tx_base_fee.unwrap_or(base_fee);
         // Compute per-transaction PRNG seed: subSha256(basePrngSeed, txIndex)
         let tx_prng_seed = sub_sha256(&soroban_base_prng_seed, tx_index as u32);
-        // Execute with deduct_fee=false — fees were already pre-deducted above
-        // (when deduct_fee=true) or not needed (when deduct_fee=false from caller).
+        // Execute with FeeMode::Skip — fees were already pre-deducted above
+        // (PreChargeInternally/ExternallyPrecharged) or not needed (NoFees).
         // For protocol 24+, the body always executes after fee pre-deduction,
         // matching stellar-core's behavior where feeToPay=0 in applying mode.
         let mut result = executor.execute_transaction_with_arc(
@@ -167,12 +183,12 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
                 tx_envelope: Arc::clone(tx),
                 base_fee: tx_fee,
                 soroban_prng_seed: Some(tx_prng_seed),
-                deduct_fee: false,
+                fee_mode: FeeMode::Skip,
             },
         )?;
 
-        // When fees were pre-charged (parallel path), the executor runs with
-        // deduct_fee=false so early validation failures (e.g. TxNoAccount)
+        // When fees were pre-charged, the executor runs with
+        // FeeMode::Skip so early validation failures (e.g. TxNoAccount)
         // report fee_charged=0. Override with the actual pre-charged amount
         // so the result matches the fee already deducted on the delta.
         if has_pre_charged {
@@ -256,9 +272,9 @@ pub fn run_transactions_on_executor(params: RunTransactionsParams<'_>) -> Result
     executor.apply_to_delta(delta)?;
 
     // Add fees to fee pool.
-    // When external_pre_charged is provided, the caller already recorded the
+    // When fees were externally precharged, the caller already recorded the
     // fee pool delta on the main delta, so we only record for internal fees.
-    if external_pre_charged.is_none() && deduct_fee {
+    if matches!(fee_strategy, FeeStrategy::PreChargeInternally) {
         let total_fees = executor.total_fees();
         delta.record_fee_pool_delta(total_fees);
     }
@@ -431,7 +447,7 @@ pub(super) enum PreParallelResult {
 ///
 /// 1. Creates a single `TransactionExecutor` using the main delta's state.
 /// 2. For each Soroban TX (across all stages/clusters, in flattened order):
-///    runs `pre_apply_arc` with `deduct_fee: false` (fees already on delta).
+///    runs `pre_apply_arc` with `FeeMode::Skip` (fees already on delta).
 /// 3. Transfers all classic mutations (sequence bumps, signer removals) to
 ///    the main delta via `apply_to_delta`.
 /// 4. Returns per-TX results consumed by `execute_single_cluster`.
@@ -516,7 +532,7 @@ fn pre_parallel_apply(
                     tx,
                     tx_fee,
                     Some(tx_prng_seed),
-                    false, // deduct_fee=false — fees already on delta
+                    FeeMode::Skip, // fees already on delta
                 )?;
 
                 match pre_result {
@@ -552,9 +568,9 @@ fn pre_parallel_apply(
 ///
 /// The classic phase must be executed separately before calling this function.
 ///
-/// When `external_pre_charged` is `Some`, fees have already been pre-deducted
-/// on the delta by `pre_deduct_all_fees_on_delta`. The internal fee deduction
-/// is skipped and the provided fee changes are used.
+/// When `fee_source` is `SorobanFeeSource::ExternallyPrecharged`, fees have
+/// already been pre-deducted on the delta by `pre_deduct_all_fees_on_delta`.
+/// The internal fee deduction is skipped and the provided fee changes are used.
 pub fn execute_soroban_parallel_phase(
     snapshot: &SnapshotHandle,
     phase: &crate::close::SorobanPhaseStructure,
@@ -562,7 +578,7 @@ pub fn execute_soroban_parallel_phase(
     context: &LedgerContext,
     delta: &mut LedgerDelta,
     soroban: SorobanContext<'_>,
-    external_pre_charged: Option<Vec<PreChargedFee>>,
+    fee_source: SorobanFeeSource,
 ) -> Result<TxSetResult> {
     let mut all_results: Vec<TransactionExecutionResult> = Vec::new();
     let mut all_tx_results: Vec<TransactionResultPair> = Vec::new();
@@ -582,22 +598,25 @@ pub fn execute_soroban_parallel_phase(
 
     // Use externally pre-charged fees if provided (from unified fee pass),
     // otherwise pre-deduct Soroban fees from the delta internally.
-    let pre_charged_fees = if let Some(ext) = external_pre_charged {
-        // Fees already deducted on delta and fee pool already recorded by caller.
-        ext
-    } else {
-        let (fees, total_pre_deducted) = pre_deduct_soroban_fees(
-            snapshot,
-            phase,
-            context.base_fee,
-            context.network_id,
-            context.sequence,
-            delta,
-        )?;
-        if total_pre_deducted != 0 {
-            delta.record_fee_pool_delta(total_pre_deducted);
+    let pre_charged_fees = match fee_source {
+        SorobanFeeSource::ExternallyPrecharged(ext) => {
+            // Fees already deducted on delta and fee pool already recorded by caller.
+            ext
         }
-        fees
+        SorobanFeeSource::DeductInternally => {
+            let (fees, total_pre_deducted) = pre_deduct_soroban_fees(
+                snapshot,
+                phase,
+                context.base_fee,
+                context.network_id,
+                context.sequence,
+                delta,
+            )?;
+            if total_pre_deducted != 0 {
+                delta.record_fee_pool_delta(total_pre_deducted);
+            }
+            fees
+        }
     };
     let soroban_base_prng_seed = soroban.base_prng_seed;
 
@@ -947,7 +966,7 @@ fn soroban_write_footprint(tx: &TransactionEnvelope) -> Option<Vec<LedgerKey>> {
 /// Execute a single cluster of transactions independently.
 ///
 /// Creates its own `TransactionExecutor` and `LedgerDelta`.
-/// Fees are NOT deducted by the executor (deduct_fee=false) because they
+/// Fees are NOT deducted by the executor (FeeMode::Skip) because they
 /// were pre-deducted from the main delta by `pre_deduct_soroban_fees`.
 /// Returns `(TxSetResult, per_cluster_delta, total_fees)`.
 pub(super) fn execute_single_cluster(
@@ -1080,7 +1099,7 @@ pub(super) fn execute_single_cluster(
                     tx_envelope: Arc::clone(tx),
                     base_fee: tx_fee,
                     soroban_prng_seed: Some(tx_prng_seed),
-                    deduct_fee: false,
+                    fee_mode: FeeMode::Skip,
                 },
             )?
         };
@@ -1100,7 +1119,7 @@ pub(super) fn execute_single_cluster(
 
         // Override fee_charged and fee_changes from pre-deduction.
         // The executor computed fee_refund correctly (based on resource consumption),
-        // but fee_charged=0 because deduct_fee=false. We use the pre-charged values.
+        // but fee_charged=0 because FeeMode::Skip. We use the pre-charged values.
         let result_build_start = std::time::Instant::now();
         result.fee_charged = pre.charged_fee.saturating_sub(result.fee_refund);
         result.fee_changes = Some(pre.fee_changes.clone());

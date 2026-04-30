@@ -892,7 +892,7 @@ fn build_extend_ttl_tx(
 async fn test_parallel_soroban_multi_cluster_execution() {
     use henyey_ledger::{
         execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
-        SorobanContext, SorobanPhaseStructure,
+        SorobanContext, SorobanFeeSource, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
@@ -944,7 +944,7 @@ async fn test_parallel_soroban_multi_cluster_execution() {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
         },
-        None,
+        SorobanFeeSource::DeductInternally,
     )
     .expect("execute parallel phase");
 
@@ -977,7 +977,7 @@ async fn test_parallel_soroban_multi_cluster_execution() {
 async fn test_parallel_soroban_matches_sequential() {
     use henyey_ledger::{
         execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
-        SorobanContext, SorobanPhaseStructure,
+        SorobanContext, SorobanFeeSource, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
@@ -1028,7 +1028,7 @@ async fn test_parallel_soroban_matches_sequential() {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
         },
-        None,
+        SorobanFeeSource::DeductInternally,
     )
     .expect("parallel");
 
@@ -1059,7 +1059,7 @@ async fn test_parallel_soroban_matches_sequential() {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
         },
-        None,
+        SorobanFeeSource::DeductInternally,
     )
     .expect("sequential");
 
@@ -1116,7 +1116,7 @@ async fn test_parallel_soroban_matches_sequential() {
 async fn test_parallel_soroban_deterministic() {
     use henyey_ledger::{
         execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
-        SorobanContext, SorobanPhaseStructure,
+        SorobanContext, SorobanFeeSource, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
@@ -1164,7 +1164,7 @@ async fn test_parallel_soroban_deterministic() {
                 emit_soroban_tx_meta_ext_v1: false,
                 enable_soroban_diagnostic_events: false,
             },
-            None,
+            SorobanFeeSource::DeductInternally,
         )
         .expect("execute");
 
@@ -1205,7 +1205,7 @@ async fn test_parallel_soroban_deterministic() {
 async fn test_parallel_soroban_from_spawn_blocking() {
     use henyey_ledger::{
         execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
-        SorobanContext, SorobanPhaseStructure,
+        SorobanContext, SorobanFeeSource, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
@@ -1253,7 +1253,7 @@ async fn test_parallel_soroban_from_spawn_blocking() {
                 emit_soroban_tx_meta_ext_v1: false,
                 enable_soroban_diagnostic_events: false,
             },
-            None,
+            SorobanFeeSource::DeductInternally,
         )
         .expect("execute parallel phase from spawn_blocking");
 
@@ -1281,7 +1281,7 @@ async fn test_parallel_soroban_from_spawn_blocking() {
 async fn test_parallel_soroban_spawn_blocking_matches_worker() {
     use henyey_ledger::{
         execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
-        SorobanContext, SorobanPhaseStructure,
+        SorobanContext, SorobanFeeSource, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
@@ -1324,7 +1324,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
             offer_store: None,
             enable_soroban_diagnostic_events: false,
         },
-        None,
+        SorobanFeeSource::DeductInternally,
     )
     .expect("worker path");
 
@@ -1362,7 +1362,7 @@ async fn test_parallel_soroban_spawn_blocking_matches_worker() {
                 emit_soroban_tx_meta_ext_v1: false,
                 enable_soroban_diagnostic_events: false,
             },
-            None,
+            SorobanFeeSource::DeductInternally,
         )
         .expect("spawn_blocking path");
         (result, delta)
@@ -2310,7 +2310,7 @@ fn test_clawback_claimable_balance_not_issuer_error_code() {
 ///   (TX 1 incorrectly succeeds with higher available balance)
 #[test]
 fn test_classic_fees_deducted_upfront_before_tx_execution() {
-    use henyey_ledger::execution::{execute_transaction_set_with_fee_mode, SorobanContext};
+    use henyey_ledger::execution::{execute_transaction_set, SorobanContext};
     use henyey_ledger::LedgerDelta;
 
     let secret = SecretKey::from_seed(&[77u8; 32]);
@@ -2382,10 +2382,8 @@ fn test_classic_fees_deducted_upfront_before_tx_execution() {
         enable_soroban_diagnostic_events: false,
     };
 
-    let result = execute_transaction_set_with_fee_mode(
-        &snapshot, &tx_set, &context, &mut delta, soroban, true,
-    )
-    .expect("execute tx set");
+    let result = execute_transaction_set(&snapshot, &tx_set, &context, &mut delta, soroban)
+        .expect("execute tx set");
 
     // TX 0: With upfront fee deduction (3 × 100 = 300), available = 500 - 300 = 200.
     // Payment of 200 should succeed (exactly enough).
@@ -3081,7 +3079,7 @@ fn test_op_source_merged_in_prior_tx_returns_bad_auth() {
 /// check saw an account with master_weight=0, no signers, no sigs → txBAD_AUTH.
 #[test]
 fn test_pre_auth_tx_signer_checked_before_removal() {
-    use henyey_ledger::execution::{execute_transaction_set_with_fee_mode, SorobanContext};
+    use henyey_ledger::execution::{execute_transaction_set, SorobanContext};
     use henyey_ledger::LedgerDelta;
 
     let secret = SecretKey::from_seed(&[42u8; 32]);
@@ -3238,10 +3236,8 @@ fn test_pre_auth_tx_signer_checked_before_removal() {
         enable_soroban_diagnostic_events: false,
     };
 
-    let result = execute_transaction_set_with_fee_mode(
-        &snapshot, &tx_set, &context, &mut delta, soroban, true,
-    )
-    .expect("execute tx set");
+    let result = execute_transaction_set(&snapshot, &tx_set, &context, &mut delta, soroban)
+        .expect("execute tx set");
 
     // TX 1 (SetOptions): must succeed.
     assert!(
@@ -3449,7 +3445,7 @@ fn test_fee_bump_soroban_checks_inner_signatures() {
 /// as fee_charged, not 0.
 ///
 /// When fees are pre-deducted on the delta, `run_transactions_on_executor` calls
-/// the executor with `deduct_fee=false`. Early validation failures like
+/// the executor with `FeeMode::Skip`. Early validation failures like
 /// TxNoAccount construct a `failed_result` with `fee_charged=0`. The fix
 /// overrides fee_charged with the pre-charged amount when `has_pre_charged` is
 /// true, so the result hash matches the fee already deducted on the delta.
@@ -3458,7 +3454,7 @@ fn test_fee_bump_soroban_checks_inner_signatures() {
 /// subsequent TX got TxNoAccount with wrong fee_charged).
 #[test]
 fn test_pre_charged_fee_override_on_validation_failure() {
-    use henyey_ledger::execution::{run_transactions_on_executor, PreChargedFee};
+    use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy, PreChargedFee};
     use henyey_ledger::LedgerDelta;
 
     // Source account that DOES exist (needed for fee pre-charging to make sense).
@@ -3532,9 +3528,8 @@ fn test_pre_charged_fee_override_on_validation_failure() {
         transactions: &transactions,
         base_fee,
         soroban_base_prng_seed: [0u8; 32],
-        deduct_fee: false,
+        fee_strategy: FeeStrategy::ExternallyPrecharged(&pre_charged),
         delta: &mut delta,
-        external_pre_charged: Some(&pre_charged),
     })
     .expect("run_transactions_on_executor");
 
@@ -3567,7 +3562,7 @@ fn test_pre_charged_fee_override_on_validation_failure() {
 /// A transaction with partial fee should still have its body applied.
 #[test]
 fn test_partial_fee_precharge_still_applies_body() {
-    use henyey_ledger::execution::{run_transactions_on_executor, PreChargedFee};
+    use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy, PreChargedFee};
     use henyey_ledger::LedgerDelta;
 
     let secret = SecretKey::from_seed(&[77u8; 32]);
@@ -3637,9 +3632,8 @@ fn test_partial_fee_precharge_still_applies_body() {
         transactions: &transactions,
         base_fee,
         soroban_base_prng_seed: [0u8; 32],
-        deduct_fee: false,
+        fee_strategy: FeeStrategy::ExternallyPrecharged(&pre_charged),
         delta: &mut delta,
-        external_pre_charged: Some(&pre_charged),
     })
     .expect("run_transactions_on_executor");
 
@@ -3657,8 +3651,8 @@ fn test_partial_fee_precharge_still_applies_body() {
 }
 
 /// Regression test for AUDIT-577 Finding 2: MAX_SEQ_NUM_TO_APPLY was only
-/// populated when deduct_fee=true. The external pre-charged path (parallel
-/// Soroban) passes deduct_fee=false, so AccountMerge protection was missing.
+/// populated when FeeMode::Deduct. The external pre-charged path (parallel
+/// Soroban) passes FeeMode::Skip, so AccountMerge protection was missing.
 ///
 /// When a TX's sequence number is at or above starting_seq (ledger_seq << 32),
 /// AccountMerge must be blocked with SeqnumTooFar. Before the fix, the
@@ -3666,7 +3660,7 @@ fn test_partial_fee_precharge_still_applies_body() {
 /// would incorrectly succeed.
 #[test]
 fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
-    use henyey_ledger::execution::{run_transactions_on_executor, PreChargedFee};
+    use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy, PreChargedFee};
     use henyey_ledger::LedgerDelta;
     use stellar_xdr::curr::AccountMergeResult;
 
@@ -3730,7 +3724,7 @@ fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
         .load_orderbook_offers(&snapshot)
         .expect("load offers");
 
-    // Pre-charge with deduct_fee=false (the parallel path).
+    // Pre-charge with FeeMode::Skip (the parallel path).
     let pre_charged = vec![PreChargedFee {
         charged_fee: 100,
         fee_changes: LedgerEntryChanges(vec![].try_into().unwrap()),
@@ -3745,9 +3739,8 @@ fn test_audit_577_max_seq_num_to_apply_with_pre_charged() {
         transactions: &transactions,
         base_fee,
         soroban_base_prng_seed: [0u8; 32],
-        deduct_fee: false,
+        fee_strategy: FeeStrategy::ExternallyPrecharged(&pre_charged),
         delta: &mut delta,
-        external_pre_charged: Some(&pre_charged),
     })
     .expect("run_transactions_on_executor");
 
@@ -4171,7 +4164,7 @@ fn test_audit_005_fee_bump_inner_hash_for_signer_removal() {
 /// The parallel path correctly had `pre.charged_fee.saturating_sub(result.fee_refund)`.
 #[test]
 fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
-    use henyey_ledger::execution::{run_transactions_on_executor, PreChargedFee};
+    use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy, PreChargedFee};
     use henyey_ledger::LedgerDelta;
 
     let secret = SecretKey::from_seed(&[55u8; 32]);
@@ -4293,9 +4286,8 @@ fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
         transactions: &transactions,
         base_fee,
         soroban_base_prng_seed: [0u8; 32],
-        deduct_fee: false,
+        fee_strategy: FeeStrategy::ExternallyPrecharged(&pre_charged),
         delta: &mut delta,
-        external_pre_charged: Some(&pre_charged),
     })
     .expect("run_transactions_on_executor");
 
@@ -4337,7 +4329,7 @@ fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
 async fn test_audit_095_pre_parallel_apply_globalizes_seq_bumps() {
     use henyey_ledger::{
         execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
-        SorobanContext, SorobanPhaseStructure,
+        SorobanContext, SorobanFeeSource, SorobanPhaseStructure,
     };
 
     let network_id = NetworkId::testnet();
@@ -4395,7 +4387,7 @@ async fn test_audit_095_pre_parallel_apply_globalizes_seq_bumps() {
             emit_soroban_tx_meta_ext_v1: false,
             enable_soroban_diagnostic_events: false,
         },
-        None,
+        SorobanFeeSource::DeductInternally,
     )
     .expect("execute parallel phase");
 

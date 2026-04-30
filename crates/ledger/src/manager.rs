@@ -3873,9 +3873,10 @@ impl LedgerCloseContext<'_> {
                     transactions: classic_txs,
                     base_fee: self.prev_header.base_fee,
                     soroban_base_prng_seed: soroban_base_prng_seed.0,
-                    deduct_fee: false,
+                    fee_strategy: crate::execution::FeeStrategy::ExternallyPrecharged(
+                        &classic_pre_charged,
+                    ),
                     delta: self.ltx.current_delta_mut(),
-                    external_pre_charged: Some(&classic_pre_charged),
                 })?
             };
             self.timing_classic_exec_us = classic_start.elapsed().as_micros() as u64;
@@ -3912,7 +3913,7 @@ impl LedgerCloseContext<'_> {
                         .config
                         .enable_soroban_diagnostic_events,
                 },
-                Some(soroban_pre_charged),
+                crate::execution::SorobanFeeSource::ExternallyPrecharged(soroban_pre_charged),
             )?;
             self.timing_soroban_exec_us = soroban_start.elapsed().as_micros() as u64;
 
@@ -3949,9 +3950,8 @@ impl LedgerCloseContext<'_> {
                 transactions: &prepared.all_txs,
                 base_fee: self.prev_header.base_fee,
                 soroban_base_prng_seed: soroban_base_prng_seed.0,
-                deduct_fee: true,
+                fee_strategy: crate::execution::FeeStrategy::PreChargeInternally,
                 delta: self.ltx.current_delta_mut(),
-                external_pre_charged: None,
             })?
         };
 
