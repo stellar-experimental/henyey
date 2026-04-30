@@ -274,48 +274,7 @@ pub(super) fn has_signed_payload_match(
     sig: &stellar_xdr::curr::DecoratedSignature,
     signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
 ) -> bool {
-    let pubkey_hint = [
-        signed_payload.ed25519.0[28],
-        signed_payload.ed25519.0[29],
-        signed_payload.ed25519.0[30],
-        signed_payload.ed25519.0[31],
-    ];
-    let payload_hint = if signed_payload.payload.len() >= 4 {
-        let len = signed_payload.payload.len();
-        [
-            signed_payload.payload[len - 4],
-            signed_payload.payload[len - 3],
-            signed_payload.payload[len - 2],
-            signed_payload.payload[len - 1],
-        ]
-    } else {
-        let mut hint = [0u8; 4];
-        for (i, &byte) in signed_payload.payload.iter().enumerate() {
-            if i < 4 {
-                hint[i] = byte;
-            }
-        }
-        hint
-    };
-    let expected_hint = [
-        pubkey_hint[0] ^ payload_hint[0],
-        pubkey_hint[1] ^ payload_hint[1],
-        pubkey_hint[2] ^ payload_hint[2],
-        pubkey_hint[3] ^ payload_hint[3],
-    ];
-
-    if sig.hint.0 != expected_hint {
-        return false;
-    }
-
-    let ed_sig = match henyey_crypto::Signature::try_from(&sig.signature) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    // Use cached verification matching stellar-core's verifyEd25519SignedPayload
-    // which routes through PubKeyUtils::verifySig (SignatureUtils.cpp:60).
-    henyey_crypto::verify_from_raw_key(&signed_payload.ed25519.0, &signed_payload.payload, &ed_sig)
-        .is_ok()
+    henyey_crypto::verify_ed25519_signed_payload(sig, signed_payload)
 }
 
 /// Check extra signers against the signature tracker.
@@ -620,58 +579,9 @@ pub(super) fn has_signed_payload_signature(
     signatures: &[stellar_xdr::curr::DecoratedSignature],
     signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
 ) -> bool {
-    // The hint for signed payloads is XOR of pubkey hint and payload hint.
-    // See SignatureUtils::getSignedPayloadHint in stellar-core.
-    let pubkey_hint = [
-        signed_payload.ed25519.0[28],
-        signed_payload.ed25519.0[29],
-        signed_payload.ed25519.0[30],
-        signed_payload.ed25519.0[31],
-    ];
-    let payload_hint = if signed_payload.payload.len() >= 4 {
-        let len = signed_payload.payload.len();
-        [
-            signed_payload.payload[len - 4],
-            signed_payload.payload[len - 3],
-            signed_payload.payload[len - 2],
-            signed_payload.payload[len - 1],
-        ]
-    } else {
-        // For shorter payloads, stellar-core getHint copies from the beginning
-        let mut hint = [0u8; 4];
-        for (i, &byte) in signed_payload.payload.iter().enumerate() {
-            if i < 4 {
-                hint[i] = byte;
-            }
-        }
-        hint
-    };
-    let expected_hint = [
-        pubkey_hint[0] ^ payload_hint[0],
-        pubkey_hint[1] ^ payload_hint[1],
-        pubkey_hint[2] ^ payload_hint[2],
-        pubkey_hint[3] ^ payload_hint[3],
-    ];
-
-    signatures.iter().any(|sig| {
-        // Check hint first (XOR of pubkey hint and payload hint)
-        if sig.hint.0 != expected_hint {
-            return false;
-        }
-
-        // Use cached verification matching stellar-core's verifyEd25519SignedPayload
-        // which routes through PubKeyUtils::verifySig (SignatureUtils.cpp:60).
-        let ed_sig = match henyey_crypto::Signature::try_from(&sig.signature) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        henyey_crypto::verify_from_raw_key(
-            &signed_payload.ed25519.0,
-            &signed_payload.payload,
-            &ed_sig,
-        )
-        .is_ok()
-    })
+    signatures
+        .iter()
+        .any(|sig| henyey_crypto::verify_ed25519_signed_payload(sig, signed_payload))
 }
 
 /// Compute subSha256(baseSeed, index) as used by stellar-core for PRNG seeds.

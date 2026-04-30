@@ -287,57 +287,13 @@ fn verify_ed25519(sig: &DecoratedSignature, signer: &Signer, contents_hash: &Has
 /// Verify an Ed25519 signed payload signature.
 ///
 /// Per CAP-0040, the signature is verified against the raw payload bytes.
-/// The hint is XOR of pubkey hint and payload hint.
+/// Delegates to [`henyey_crypto::verify_ed25519_signed_payload`].
 fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> bool {
     let SignerKey::Ed25519SignedPayload(signed_payload) = &signer.key else {
         return false;
     };
 
-    // The hint for signed payloads is XOR of pubkey hint and payload hint.
-    // See SignatureUtils::getSignedPayloadHint in stellar-core.
-    let pubkey_hint = [
-        signed_payload.ed25519.0[28],
-        signed_payload.ed25519.0[29],
-        signed_payload.ed25519.0[30],
-        signed_payload.ed25519.0[31],
-    ];
-    let payload_hint = if signed_payload.payload.len() >= 4 {
-        let len = signed_payload.payload.len();
-        [
-            signed_payload.payload[len - 4],
-            signed_payload.payload[len - 3],
-            signed_payload.payload[len - 2],
-            signed_payload.payload[len - 1],
-        ]
-    } else {
-        // For shorter payloads, stellar-core getHint copies from the beginning
-        let mut hint = [0u8; 4];
-        for (i, &byte) in signed_payload.payload.iter().enumerate() {
-            if i < 4 {
-                hint[i] = byte;
-            }
-        }
-        hint
-    };
-    let expected_hint = [
-        pubkey_hint[0] ^ payload_hint[0],
-        pubkey_hint[1] ^ payload_hint[1],
-        pubkey_hint[2] ^ payload_hint[2],
-        pubkey_hint[3] ^ payload_hint[3],
-    ];
-
-    if sig.hint.0 != expected_hint {
-        return false;
-    }
-
-    let Ok(ed_sig) = Signature::try_from(&sig.signature) else {
-        return false;
-    };
-
-    // Use cached verification matching stellar-core's verifyEd25519SignedPayload
-    // which routes through PubKeyUtils::verifySig (SignatureUtils.cpp:60).
-    henyey_crypto::verify_from_raw_key(&signed_payload.ed25519.0, &signed_payload.payload, &ed_sig)
-        .is_ok()
+    henyey_crypto::verify_ed25519_signed_payload(sig, signed_payload)
 }
 
 /// Collect all signers for an account including the master key.
