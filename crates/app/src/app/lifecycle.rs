@@ -13,7 +13,11 @@ impl App {
     /// Run the main event loop.
     ///
     /// This starts all subsystems and runs until shutdown is signaled.
-    pub async fn run(&self) -> anyhow::Result<()> {
+    ///
+    /// `fallback_catchup` controls behavior when no ledger state is found:
+    /// - [`FallbackCatchup::Allow`]: perform catchup from history archives (Full/Validator mode).
+    /// - [`FallbackCatchup::Skip`]: proceed without catchup (Watcher mode).
+    pub async fn run(&self, fallback_catchup: FallbackCatchup) -> anyhow::Result<()> {
         tracing::info!("Starting main event loop");
 
         // Start overlay network if not already started.
@@ -30,45 +34,52 @@ impl App {
         let current_ledger = self.get_current_ledger().await?;
 
         if current_ledger == 0 {
-            // This shouldn't happen if run_cmd did catchup, but handle it just
-            // in case (RunMode::Watcher skips startup catchup, so we can
-            // legitimately reach here with no persisted state).
-            tracing::info!("No ledger state, running catchup first");
+            match fallback_catchup {
+                FallbackCatchup::Allow => {
+                    // This shouldn't happen if run_cmd did catchup, but handle it
+                    // as a safety net for Full/Validator mode.
+                    tracing::info!("No ledger state, running catchup first");
 
-            // We're inside `App::run()` which is itself called from a
-            // `tokio::spawn` task (see run_cmd::run_node). Calling
-            // spawn_blocking here risks the deadlock class from #1713 if the
-            // blocking pool is saturated. Use the Deferred finalizer pattern
-            // exactly as the event-loop recovery path does: receive a
-            // ready-to-spawn persist job, then spawn and drive it to
-            // completion.
-            let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
-            let finalize = super::persist::CatchupFinalizer::deferred(
-                self.db.clone(),
-                self.ledger_manager.clone(),
-                persist_tx,
-            );
-            // Honor the operator's configured CATCHUP_COMPLETE /
-            // CATCHUP_RECENT policy on this no-state-startup fallback,
-            // matching the explicit run_cmd path. See #2104.
-            let mode = self.live_catchup_mode();
-            let _result = self
-                .catchup_with_mode(CatchupTarget::Current, mode, finalize)
-                .await?;
-            if let Ok(ready) = persist_rx.try_recv() {
-                // Drive the persist task to completion before continuing.
-                // The persist task aborts the process on failure, so we only
-                // observe success here.
-                let pending = ready.spawn();
-                if let Err(e) = pending.handle.await {
-                    anyhow::bail!("startup catchup persist task failed: {e}");
+                    // We're inside `App::run()` which is itself called from a
+                    // `tokio::spawn` task (see run_cmd::run_node). Calling
+                    // spawn_blocking here risks the deadlock class from #1713 if
+                    // the blocking pool is saturated. Use the Deferred finalizer
+                    // pattern exactly as the event-loop recovery path does.
+                    let (persist_tx, mut persist_rx) = tokio::sync::oneshot::channel();
+                    let finalize = super::persist::CatchupFinalizer::deferred(
+                        self.db.clone(),
+                        self.ledger_manager.clone(),
+                        persist_tx,
+                    );
+                    // Honor the operator's configured CATCHUP_COMPLETE /
+                    // CATCHUP_RECENT policy on this no-state-startup fallback,
+                    // matching the explicit run_cmd path. See #2104.
+                    let mode = self.live_catchup_mode();
+                    let _result = self
+                        .catchup_with_mode(CatchupTarget::Current, mode, finalize)
+                        .await?;
+                    if let Ok(ready) = persist_rx.try_recv() {
+                        // Drive the persist task to completion before continuing.
+                        // The persist task aborts the process on failure, so we
+                        // only observe success here.
+                        let pending = ready.spawn();
+                        if let Err(e) = pending.handle.await {
+                            anyhow::bail!("startup catchup persist task failed: {e}");
+                        }
+                    }
+
+                    // Refresh overlay dynamic state after fallback catchup — the
+                    // protocol may have advanced during catchup.
+                    self.refresh_overlay_query_window().await;
+                    self.refresh_max_tx_size_bytes().await;
+                }
+                FallbackCatchup::Skip => {
+                    // Watcher mode: no persisted state, proceeding without catchup.
+                    // The node will observe SCP/overlay traffic and receive its
+                    // first ledger via the out-of-sync recovery path.
+                    tracing::info!("Watcher mode: no persisted state, proceeding without catchup");
                 }
             }
-
-            // Refresh overlay dynamic state after fallback catchup — the
-            // protocol may have advanced during catchup.
-            self.refresh_overlay_query_window().await;
-            self.refresh_max_tx_size_bytes().await;
         }
 
         // Bootstrap herder with current ledger
@@ -81,13 +92,15 @@ impl App {
         // Populate the initial bucket snapshot for the query server.
         self.update_bucket_snapshot();
 
-        // Signal query server readiness — matches stellar-core's
-        // `ApplicationImpl::start()` calling `setReady()` after
-        // `loadLastKnownLedger()`. Release ordering ensures the snapshot
-        // written above is visible to any thread that observes `true`
-        // via Acquire load.
-        self.query_is_ready
-            .store(true, std::sync::atomic::Ordering::Release);
+        // Signal query server readiness only when we have actual ledger state.
+        // For no-state watchers (current_ledger == 0 + FallbackCatchup::Skip),
+        // readiness is deferred until the first successful ledger close to avoid
+        // serving 500 errors from empty bucket snapshots. Matches stellar-core's
+        // `setReady()` which is only called after `loadLastKnownLedger()` succeeds.
+        if self.ledger_manager.is_initialized() {
+            self.query_is_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
 
         // Wait a short time for initial peer connections, then request SCP state
         self.clock.sleep(Duration::from_millis(500)).await;

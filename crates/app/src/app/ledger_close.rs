@@ -2580,6 +2580,18 @@ impl App {
         // Update bucket snapshots for the query server.
         self.update_bucket_snapshot();
 
+        // Flip query readiness on first successful ledger close. This covers
+        // watchers that start with no state and receive their first ledger via
+        // SCP — they skip readiness in App::run() to avoid serving 500 errors
+        // from empty bucket snapshots.
+        if !self
+            .query_is_ready
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.query_is_ready
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         // Clean up stale pending tx_set requests for slots we've now closed.
         // This prevents stale requests (from old SCP state responses) from
         // lingering and causing timeout → DontHave → recovery loops.

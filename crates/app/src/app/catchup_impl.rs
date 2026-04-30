@@ -2293,6 +2293,16 @@ impl App {
                     // the state restored by catchup.
                     self.update_bucket_snapshot();
 
+                    // Flip query readiness after recovery catchup completes
+                    // (covers watchers that started with no state).
+                    if !self
+                        .query_is_ready
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        self.query_is_ready
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
+
                     let last_processed_slot_snapshot = *self.last_processed_slot.read().await;
                     let herder_state_snapshot = self.herder.state();
                     tracing::info!(

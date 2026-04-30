@@ -42,7 +42,7 @@ use serde::Serialize;
 use tokio::signal;
 use tokio::sync::broadcast;
 
-use crate::app::{App, AppState, CatchupTarget, RestoreResult};
+use crate::app::{App, AppState, CatchupTarget, FallbackCatchup, RestoreResult};
 use crate::compat_http::CompatServer;
 use crate::config::AppConfig;
 use crate::http::{QueryServer, StatusServer};
@@ -475,8 +475,13 @@ async fn run_main_loop(app: Arc<App>, options: RunOptions) -> anyhow::Result<()>
 
     // Start the main run loop in the background so we can optionally wait for sync.
     tracing::info!("Starting main run loop");
+    let fallback_catchup = if options.mode == RunMode::Watcher {
+        FallbackCatchup::Skip
+    } else {
+        FallbackCatchup::Allow
+    };
     let run_app = Arc::clone(&app);
-    let run_handle = tokio::spawn(async move { run_app.run().await });
+    let run_handle = tokio::spawn(async move { run_app.run(fallback_catchup).await });
     if options.wait_for_sync {
         wait_for_sync(&app).await;
     }

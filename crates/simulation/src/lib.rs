@@ -946,7 +946,10 @@ impl Simulation {
         let status = Arc::new(tokio::sync::RwLock::new(None));
         let status_clone = Arc::clone(&status);
         let handle = tokio::spawn(async move {
-            let result = app_clone.run().await.map_err(|e| e.to_string());
+            let result = app_clone
+                .run(henyey_app::FallbackCatchup::Allow)
+                .await
+                .map_err(|e| e.to_string());
             *status_clone.write().await = Some(result.clone());
             result.map_err(anyhow::Error::msg)
         });

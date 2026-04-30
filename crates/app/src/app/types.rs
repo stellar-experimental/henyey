@@ -23,6 +23,29 @@ use crate::survey::SurveyPhase;
 // ── Re-exported peer type enum ───────────────────────────────────────
 pub(super) use henyey_common::StoredPeerType;
 
+// ── Startup policy ─────────────────────────────────────────────────────
+
+/// Controls whether [`App::run()`](super::App::run) performs fallback catchup
+/// when no ledger state is found at startup.
+///
+/// When `App::run()` discovers that `get_current_ledger() == 0` (ledger manager
+/// uninitialized), this policy determines whether it should catch up from
+/// history archives or proceed directly to the event loop without state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackCatchup {
+    /// Allow fallback catchup if ledger state is missing.
+    ///
+    /// Used by Full and Validator modes where the node must have local ledger
+    /// state before serving queries or participating in consensus.
+    Allow,
+    /// Skip fallback catchup — proceed to the event loop without state.
+    ///
+    /// Used by Watcher mode where the node observes SCP/overlay traffic without
+    /// requiring local ledger state. The node will eventually receive its first
+    /// ledger via SCP externalize and the out-of-sync recovery path.
+    Skip,
+}
+
 // ── Application state ──────────────────────────────────────────────────
 
 /// Application lifecycle state.
