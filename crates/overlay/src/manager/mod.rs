@@ -1235,8 +1235,8 @@ impl OverlayManager {
     ///
     /// The `_lcl_seq` parameter is accepted for parity with the upstream
     /// signature `(uint32_t ledgerSeq, uint32_t lclSeq)` but is unused here
-    /// because survey cleanup and per-peer TxAdverts cleanup are handled
-    /// separately by the app layer in Rust.
+    /// because survey cleanup and per-peer advert state are handled
+    /// by the app layer (`tx_flooding.rs`).
     pub fn clear_ledgers_below(&self, ledger_seq: u32, _lcl_seq: u32) {
         self.last_closed_ledger.store(ledger_seq, Ordering::Relaxed);
         self.flood_gate.clear_below(ledger_seq);

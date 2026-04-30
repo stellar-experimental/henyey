@@ -47,8 +47,6 @@ flowchart TD
 | `MessageDispatcher` | Handles `GetTxSet`, `ScpQuorumset`, `DontHave`, and related fetch protocol messages with caches. |
 | `PeerManager` | SQLite-backed peer address store with type tracking and exponential backoff. |
 | `BanManager` | In-memory plus optional SQLite ban list with permanent and timed bans. |
-| `TxAdverts` | Queues and batches `FloodAdvert` transaction hashes for pull-mode flooding. |
-| `TxDemandsManager` | Schedules `FloodDemand` retries and records transaction pull latency. |
 | `SurveyManager` | Manages the collect/report lifecycle for time-sliced overlay surveys. |
 | `OverlayMetrics` | Atomic counters and timers for overlay activity, throttling, flooding, and pull latency. |
 | `ConnectionFactory` | Transport abstraction used by `OverlayManager` for real TCP or in-process loopback tests. |
@@ -137,8 +135,7 @@ let overlay = OverlayManager::new_with_connection_factory(config, local_node, fa
 | `peer.rs` | Authenticated peer lifecycle, handshake ordering, and per-peer stats. |
 | `peer_manager.rs` | SQLite peer database, type promotion, and exponential backoff scheduling. |
 | `survey.rs` | Survey state machine, limiter, and collected/finalized topology data. |
-| `tx_adverts.rs` | Pull-mode advertisement batching, retry queues, and history cache. |
-| `tx_demands.rs` | Demand scheduling, retry/backoff policy, and pull latency tracking. |
+| `survey.rs` | Survey state machine, limiter, and collected/finalized topology data. |
 
 ## Design Notes
 
@@ -146,6 +143,7 @@ let overlay = OverlayManager::new_with_connection_factory(config, local_node, fa
 - PEERS exchange is asymmetric: only the acceptor sends `PEERS`, and duplicate or wrong-direction `PEERS` messages cause the connection to be dropped to match stellar-core.
 - Flow control is enforced in the hot path with `CapacityGuard`; a peer that sends flood traffic after exhausting granted credit is dropped immediately.
 - Watcher mode is intentionally narrow in this crate: non-validators still participate in transaction pull-mode flooding and only survey traffic is filtered at the overlay layer.
+- Transaction advert/demand scheduling (the equivalent of stellar-core's `TxAdverts` and `TxDemandsManager`) is owned by the app crate (`tx_flooding.rs`). The overlay crate handles FloodAdvert/FloodDemand transport and flow control only.
 
 ## stellar-core Mapping
 
@@ -162,8 +160,6 @@ let overlay = OverlayManager::new_with_connection_factory(config, local_node, fa
 | `message_handlers.rs` | Fetch-related handlers in `src/overlay/Peer.cpp` |
 | `ban_manager.rs` | `src/overlay/BanManager.h`, `BanManagerImpl.h`, `BanManagerImpl.cpp` |
 | `peer_manager.rs` | `src/overlay/PeerManager.h`, `PeerManager.cpp`, `RandomPeerSource.h`, `RandomPeerSource.cpp` |
-| `tx_adverts.rs` | `src/overlay/TxAdverts.h`, `TxAdverts.cpp` |
-| `tx_demands.rs` | `src/overlay/TxDemandsManager.h`, `TxDemandsManager.cpp` |
 | `survey.rs` | `src/overlay/SurveyManager.h`, `SurveyManager.cpp`, `SurveyDataManager.h`, `SurveyDataManager.cpp`, `SurveyMessageLimiter.*` |
 | `metrics.rs` | `src/overlay/OverlayMetrics.h`, `OverlayMetrics.cpp` |
 | `loopback.rs` | `src/overlay/LoopbackPeer.h` (test support) |

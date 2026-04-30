@@ -89,8 +89,6 @@ mod peer;
 mod peer_manager;
 pub mod query_policy;
 mod survey;
-mod tx_adverts;
-mod tx_demands;
 
 // Re-export public types
 pub use auth::{AuthCert, AuthCertExt, AuthContext, AuthState};
@@ -122,11 +120,6 @@ pub use peer_manager::{
 pub use survey::{
     CollectingNodeData, CollectingPeerData, SurveyConfig, SurveyManager, SurveyManagerStats,
     SurveyPhase, TimeSlicedNodeData, TimeSlicedPeerData, SURVEY_THROTTLE_TIMEOUT_MULT,
-};
-pub use tx_adverts::{TxAdverts, TxAdvertsConfig, TxAdvertsStats, TX_ADVERT_VECTOR_MAX_SIZE};
-pub use tx_demands::{
-    CleanupResult, DemandStatus, PeerDemandResult, TxDemandsConfig, TxDemandsManager,
-    TxDemandsStats, TxKnownStatus, TxPullLatency, MAX_RETRY_COUNT, TX_DEMAND_VECTOR_MAX_SIZE,
 };
 
 use std::collections::HashSet;

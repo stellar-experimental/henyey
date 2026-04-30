@@ -223,8 +223,8 @@ Source file references use the format `file.rs:line`.
 | `SURVEY_RESPONSE` (17) | ✅ | Survey subsystem (`survey.rs`) |
 | `SEND_MORE` (18) | ✅ | Flow control (`flow_control.rs`) |
 | `SEND_MORE_EXTENDED` (19) | ✅ | Flow control with byte capacity (`flow_control.rs`) |
-| `FLOOD_ADVERT` (20) | ✅ | Pull-mode flooding (`tx_adverts.rs`) |
-| `FLOOD_DEMAND` (21) | ✅ | Pull-mode flooding (`tx_demands.rs`) |
+| `FLOOD_ADVERT` (20) | ✅ | Pull-mode flooding (app `tx_flooding.rs`) |
+| `FLOOD_DEMAND` (21) | ✅ | Pull-mode flooding (app `tx_flooding.rs`) |
 | `TIME_SLICED_SURVEY_REQUEST` (22) | ✅ | Survey subsystem (`survey.rs`) |
 | `TIME_SLICED_SURVEY_RESPONSE` (23) | ✅ | Survey subsystem (`survey.rs`) |
 | `TIME_SLICED_SURVEY_START_COLLECTING` (24) | ✅ | Survey subsystem (`survey.rs`) |
@@ -338,30 +338,30 @@ Source file references use the format `file.rs:line`.
 
 ### 3.9 Transaction Flooding Protocol (Spec §9)
 
-**Source files:** `flood.rs`, `tx_adverts.rs`, `tx_demands.rs`, `manager.rs`
+**Source files:** `flood.rs`, app crate `tx_flooding.rs`, `manager.rs`
 
 #### 9.1 Pull Mode (FloodAdvert → FloodDemand → Transaction)
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| Pull mode as default flooding mechanism | ✅ | Pull mode used for all transaction flooding (`tx_adverts.rs:1`) |
-| FloodAdvert contains transaction hash(es) | ✅ | `FloodAdvert` with hash vector (`tx_adverts.rs:50+`) |
-| FloodDemand contains requested hash(es) | ✅ | `FloodDemand` with hash vector (`tx_demands.rs:50+`) |
+| Pull mode as default flooding mechanism | ✅ | Pull mode used for all transaction flooding (app `tx_flooding.rs`) |
+| FloodAdvert contains transaction hash(es) | ✅ | `FloodAdvert` with hash vector (app `tx_flooding.rs`) |
+| FloodDemand contains requested hash(es) | ✅ | `FloodDemand` with hash vector (app `tx_flooding.rs`) |
 | Transaction sent in response to demand | ✅ | Demand-response path in `manager.rs` |
-| Advert batching interval = 100ms | ✅ | `ADVERT_BATCH_INTERVAL_MS: u64 = 100` (`tx_adverts.rs:20`) |
-| Maximum adverts per batch | ✅ | Batch size limited (`tx_adverts.rs:25`) |
+| Advert batching interval = 100ms | ✅ | Advert period configured in app (app `tx_flooding.rs`) |
+| Maximum adverts per batch | ✅ | Batch size limited (app `tx_flooding.rs`) |
 
 #### 9.2 Demand Scheduling
 
 | Requirement | Status | Evidence |
 |-------------|--------|----------|
-| Demand scheduling interval = 500ms | ✅ | `DEMAND_SCHEDULE_INTERVAL_MS: u64 = 500` (`tx_demands.rs:20`) |
-| Round-robin across peers for demands | ✅ | Peer rotation in demand scheduling (`tx_demands.rs:200+`) |
-| Track which peer advertised which hash | ✅ | Per-hash peer tracking (`tx_demands.rs:100+`) |
-| Retry demands from alternate peers | ✅ | Retry logic with peer fallback (`tx_demands.rs:300+`) |
-| Maximum 15 retries | ✅ | `MAX_RETRIES: u32 = 15` (`tx_demands.rs:22`) |
-| Exponential backoff on retry | ✅ | Backoff calculation (`tx_demands.rs:310`) |
-| Demand timeout before retry | ✅ | Timeout tracked per outstanding demand (`tx_demands.rs:250`) |
+| Demand scheduling interval = 500ms | ✅ | Demand period configured in app (app `tx_flooding.rs`) |
+| Round-robin across peers for demands | ✅ | Peer rotation in demand scheduling (app `tx_flooding.rs`) |
+| Track which peer advertised which hash | ✅ | Per-hash peer tracking (app `tx_flooding.rs`) |
+| Retry demands from alternate peers | ✅ | Retry logic with peer fallback (app `tx_flooding.rs`) |
+| Maximum 15 retries | ✅ | `MAX_RETRY_COUNT: usize = 15` (app `tx_flooding.rs`) |
+| Exponential backoff on retry | ✅ | Backoff calculation (app `tx_flooding.rs`) |
+| Demand timeout before retry | ✅ | Timeout tracked per outstanding demand (app `tx_flooding.rs`) |
 
 #### 9.3 Flood Deduplication
 

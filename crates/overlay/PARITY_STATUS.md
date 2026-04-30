@@ -17,8 +17,7 @@
 | ItemFetcher / Tracker | Full | Fetch lifecycle, retry, envelope tracking |
 | BanManager | Full | In-memory + SQLite persistence, auto-ban escalation, time-limited bans |
 | PeerManager | Full | SQLite persistence, backoff, type tracking, direction-filtered queries |
-| TxAdverts | Partial | Queuing and batching complete; ops-flood ledger helper absent |
-| TxDemandsManager | Full | Demand scheduling, pull latency |
+| TxAdverts / TxDemandsManager | N/A | Advert/demand scheduling owned by app crate (`tx_flooding.rs`); overlay handles transport only |
 | SurveyManager | Partial | Survey flow complete; JSON summary and limiter behavior simplified |
 | OverlayMetrics | Full | Counters and timers for all message types |
 | PeerBareAddress | Full | Mapped to PeerAddress in lib.rs |
@@ -49,8 +48,8 @@
 | `SurveyMessageLimiter.h` / `SurveyMessageLimiter.cpp` | `survey.rs` | Simplified implementation |
 | `TCPPeer.h` / `TCPPeer.cpp` | `peer.rs`, `connection.rs`, `codec.rs` | Split across modules |
 | `Tracker.h` / `Tracker.cpp` | `item_fetcher.rs` | Merged into ItemFetcher |
-| `TxAdverts.h` / `TxAdverts.cpp` | `tx_adverts.rs` | Full match |
-| `TxDemandsManager.h` / `TxDemandsManager.cpp` | `tx_demands.rs` | Full match |
+| `TxAdverts.h` / `TxAdverts.cpp` | App crate `tx_flooding.rs` | Moved to app layer |
+| `TxDemandsManager.h` / `TxDemandsManager.cpp` | App crate `tx_flooding.rs` | Moved to app layer |
 
 ## Component Mapping
 
@@ -168,8 +167,8 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `recvSCPQuorumSet()` | (in MessageDispatcher) | Full |
 | `recvSCPMessage()` | (in manager via broadcast) | Full |
 | `recvGetSCPState()` | (in manager via broadcast) | Full |
-| `recvFloodAdvert()` | (in manager via TxAdverts) | Full |
-| `recvFloodDemand()` | (in manager via TxDemands) | Full |
+| `recvFloodAdvert()` | (in manager, forwarded to app) | Full |
+| `recvFloodDemand()` | (in manager, forwarded to app) | Full |
 | `recvSurveyRequestMessage()` | (in manager via SurveyManager) | Full |
 | `recvSurveyResponseMessage()` | (in manager via SurveyManager) | Full |
 | `recvSurveyStartCollectingMessage()` | (in manager) | Full |
@@ -178,8 +177,8 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `sendGetQuorumSet()` | `PeerSender::send()` | Full |
 | `sendGetScpState()` | `PeerSender::send()` | Full |
 | `sendErrorAndDrop()` | (in manager error handling) | Full |
-| `sendTxDemand()` | (via TxDemandsManager) | Full |
-| `sendAdvert()` | (via TxAdverts) | Full |
+| `sendTxDemand()` | (scheduled by app layer) | Full |
+| `sendAdvert()` | (scheduled by app layer) | Full |
 | `sendSendMore()` | `send_more()` / `send_more_extended()` | Full |
 | `sendDontHave()` | (in manager message dispatch) | Full |
 | `sendPeers()` | (in manager advertiser) | Full |
@@ -205,10 +204,6 @@ Corresponds to: `Peer.h`, `TCPPeer.h`
 | `endMessageProcessing()` | `FlowControl::end_message_processing()` | Full |
 | `process()` (query throttle) | `QueryRateLimiter::check()` via `QueryKind` enum (GetTxSet, GetScpQuorumSet, GetScpState with fixed max=10) | Full |
 | `canRead()` | `FlowControl::can_read()` | Full |
-| `retryAdvert()` | `TxAdverts::retry_incoming_advert()` | Full |
-| `hasAdvert()` | `TxAdverts::has_adverts()` | Full |
-| `popAdvert()` | `TxAdverts::pop_incoming_advert()` | Full |
-| `clearBelow()` | `TxAdverts::clear_below()` | Full |
 | `isConnected()` | `is_connected()` | Full |
 | `isAuthenticated()` | `is_ready()` | Full |
 | `PeerMetrics` struct | `PeerStats` struct | Full |
@@ -373,42 +368,6 @@ Corresponds to: `OverlayMetrics.h`
 | `OverlayMetrics()` | `OverlayMetrics::new()` | Full |
 | All meter/timer/counter fields | Matching Counter/Timer fields | Full |
 
-### TxAdverts (`tx_adverts.rs`)
-
-Corresponds to: `TxAdverts.h`
-
-| stellar-core | Rust | Status |
-|--------------|------|--------|
-| `TxAdverts()` | `TxAdverts::new()` | Full |
-| `size()` | `size()` | Full |
-| `popIncomingAdvert()` | `pop_incoming_advert()` | Full |
-| `queueOutgoingAdvert()` | `queue_outgoing_advert()` | Full |
-| `queueIncomingAdvert()` | `queue_incoming_advert()` | Full |
-| `retryIncomingAdvert()` | `retry_incoming_advert()` | Full |
-| `getMaxAdvertSize()` | (via config) | Full |
-| `seenAdvert()` | `seen_advert()` | Full |
-| `clearBelow()` | `clear_below()` | Full |
-| `start()` | `set_send_callback()` | Full |
-| `shutdown()` | `shutdown()` | Full |
-| `getOpsFloodLedger()` | N/A | None |
-
-### TxDemandsManager (`tx_demands.rs`)
-
-Corresponds to: `TxDemandsManager.h`
-
-| stellar-core | Rust | Status |
-|--------------|------|--------|
-| `TxDemandsManager()` | `TxDemandsManager::new()` | Full |
-| `recordTxPullLatency()` | `record_tx_received()` | Full |
-| `recvTxDemand()` | Handled in app crate (`App::handle_flood_demand`) | N/A (overlay layer) |
-| `start()` | `start()` | Full |
-| `shutdown()` | `shutdown()` | Full |
-| `startDemandTimer()` | (timer-based via caller) | Full |
-| `demand()` | `process_adverts()` | Full |
-| `getMaxDemandSize()` | (via config) | Full |
-| `demandStatus()` | `demand_status()` | Full |
-| `retryDelayDemand()` | `retry_delay()` | Full |
-
 ### SurveyManager (`survey.rs`)
 
 Corresponds to: `SurveyManager.h`, `SurveyDataManager.h`, `SurveyMessageLimiter.h`
@@ -515,7 +474,6 @@ Features not yet implemented. These ARE counted against parity %.
 | `OverlayManagerImpl::updateSizeCounters()` | Low | Metrics for pending/auth sizes |
 | `OverlayManagerImpl::availableOutboundAuthenticatedSlots()` | Low | Slot availability check |
 | `SurveyManager::getMsgSummary()` | Low | Survey message logging |
-| `TxAdverts::getOpsFloodLedger()` | Low | Ops-based flood rate calculation |
 
 ## Architectural Differences
 
@@ -558,14 +516,12 @@ Features not yet implemented. These ARE counted against parity %.
 | TCPPeer / framing | 4 TEST_CASE / 5 SECTION | 18 #[test] (codec.rs) + 5 (connection.rs) | Good framing coverage; fewer end-to-end socket scenarios |
 | SurveyManager | 5 TEST_CASE / 7 SECTION | 20 #[test] | Good unit coverage |
 | SurveyMessageLimiter | 1 TEST_CASE / 10 SECTION | Included in 20 `survey.rs` tests | Core limiter paths covered |
-| TxAdverts | 1 TEST_CASE / 5 SECTION | 9 #[test] | Good coverage |
 | OverlayManager | 4 TEST_CASE / 0 SECTION | 36 #[test] | Strong unit coverage for startup, peer rotation, and bookkeeping |
 | OverlayTopology | 2 TEST_CASE / 7 SECTION | 0 | Not covered |
 | MessageDispatcher | N/A | 10 #[test] | Rust-specific; includes audit-002 cache bound tests |
 | Metrics | N/A | 12 #[test] | Rust-specific |
 | Auth | Covered indirectly in `OverlayTests.cpp` | 24 #[test] | Strong direct unit coverage |
 | Codec | Covered by `TCPPeerTests.cpp` and `OverlayTests.cpp` | 18 #[test] | Good coverage |
-| TxDemands | Covered indirectly by pull-mode overlay tests | 19 #[test] | Good direct unit coverage |
 
 ### Test Gaps
 
@@ -578,7 +534,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 | Category | Count |
 |----------|-------|
-| Implemented (Full) | 283 |
-| Gaps (None + Partial) | 25 |
-| Intentional Omissions | 11 |
-| **Parity** | **283 / (283 + 25) = 92%** |
+| Implemented (Full) | 259 |
+| Gaps (None + Partial) | 24 |
+| Intentional Omissions | 10 |
+| **Parity** | **259 / (259 + 24) = 92%** |

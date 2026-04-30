@@ -14,7 +14,7 @@ The overlay crate implements henyey's peer-to-peer networking layer. It manages 
 
 ## Architecture
 
-The overlay is organized around `OverlayManager` (in `manager.pc.md`), which orchestrates peer connections and message routing. Each peer is represented by a `Peer` state machine backed by `Connection` (transport) and `Auth` (authenticated key exchange). Flow control (`FlowControl`) applies back-pressure via message-count and byte-count capacity tracking. Transaction propagation uses a pull-mode protocol (`Flood` -> `TxAdverts` -> `TxDemands`), while SCP items are fetched on-demand via `ItemFetcher`. The `Survey` module enables network-wide topology data collection. `MessageHandlers` dispatches incoming messages to the appropriate subsystem, and `Metrics` tracks all overlay counters and timers.
+The overlay is organized around `OverlayManager` (in `manager.pc.md`), which orchestrates peer connections and message routing. Each peer is represented by a `Peer` state machine backed by `Connection` (transport) and `Auth` (authenticated key exchange). Flow control (`FlowControl`) applies back-pressure via message-count and byte-count capacity tracking. Transaction propagation uses a pull-mode protocol with FloodAdvert/FloodDemand transport handled here (scheduling owned by app crate), while SCP items are fetched on-demand via `ItemFetcher`. The `Survey` module enables network-wide topology data collection. `MessageHandlers` dispatches incoming messages to the appropriate subsystem, and `Metrics` tracks all overlay counters and timers.
 
 ## All Files
 
@@ -35,5 +35,3 @@ The overlay is organized around `OverlayManager` (in `manager.pc.md`), which orc
 | [peer.pc.md](peer.pc.md) | Peer state machine with lifecycle and connection metadata |
 | [peer_manager.pc.md](peer_manager.pc.md) | Peer address persistence with failure tracking and back-off |
 | [survey.pc.md](survey.pc.md) | Network topology survey with phase-based lifecycle |
-| [tx_adverts.pc.md](tx_adverts.pc.md) | Transaction hash advert batching for pull-mode flooding |
-| [tx_demands.pc.md](tx_demands.pc.md) | Pull-mode demand cycle with retry and backoff logic |
