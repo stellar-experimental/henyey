@@ -1387,6 +1387,65 @@ async fn get_transactions_query_budget_exceeded_returns_error_code() {
     );
 }
 
+/// Verify that a status-filtered getTransactions query also respects the
+/// VM-step budget and returns -32002 when exceeded.
+#[tokio::test]
+async fn get_transactions_query_budget_exceeded_with_status_filter() {
+    let app = FakeRpcApp::builder()
+        .ledger_seq(10)
+        .max_tx_query_ops(1000)
+        .build();
+    let h = FakeRpcTestHarness::start(app).await;
+    seed_ledger_header(h.app.database(), 2, 1_700_000_002);
+    seed_ledger_header(h.app.database(), 10, 1_700_000_010);
+
+    // Seed 100 failed transactions. Querying with status "FAILED" exercises
+    // the status-filtered query path from #2094 — the filter matches and the
+    // scan consumes enough VM opcodes to exceed the tight budget.
+    let body = valid_envelope_bytes();
+    let result = valid_result_pair_bytes();
+    let meta = valid_meta_bytes();
+    for i in 0..100u32 {
+        let tx_id = format!("tx_status_budget_{i:04}");
+        h.app
+            .database()
+            .with_connection(|conn| {
+                conn.store_transaction(&StoreTxParams {
+                    ledger_seq: 2,
+                    tx_index: i,
+                    tx_id: &tx_id,
+                    body: &body,
+                    result: &result,
+                    meta: Some(&meta),
+                    status: TxStatus::Failed,
+                })
+            })
+            .unwrap();
+    }
+
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "budget-exceeded-status",
+            "method": "getTransactions",
+            "params": {
+                "startLedger": 2,
+                "status": "FAILED",
+                "pagination": { "limit": 100 }
+            }
+        }))
+        .await;
+
+    assert_eq!(status, 200, "HTTP status should be 200 for JSON-RPC errors");
+    assert!(resp.get("result").is_none(), "should not have a result");
+    let error = &resp["error"];
+    assert_eq!(
+        error["code"].as_i64().unwrap(),
+        -32002,
+        "expected QUERY_BUDGET_EXCEEDED error code"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // getEvents budget truncation and pagination tests
 // ---------------------------------------------------------------------------
