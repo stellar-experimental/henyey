@@ -400,40 +400,43 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
 
     // --- History archives ---
     // stellar-core format: [HISTORY.name] with get="cmd {0}" sub-tables
-    if let Some(history_table) = table.get("HISTORY").and_then(|v| v.as_table()) {
+    if let Some(history_table) = get_table_strict(table, "HISTORY")
+        .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
+    {
         let mut archives = Vec::new();
         for (name, entry) in history_table {
-            if let Some(entry_table) = entry.as_table() {
-                let get_cmd = entry_table
-                    .get("get")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+            let entry_table = entry.as_table().ok_or_else(|| {
+                anyhow::anyhow!("HISTORY.{}: expected table, got {}", name, entry.type_str())
+            })?;
+            let get_cmd = entry_table
+                .get("get")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
-                // Extract URL from curl command template:
-                // "curl -sf https://example.com/{0} -o {1}" → "https://example.com"
-                let url = get_cmd
-                    .as_ref()
-                    .and_then(|cmd| extract_url_from_curl_cmd(cmd))
-                    .unwrap_or_default();
+            // Extract URL from curl command template:
+            // "curl -sf https://example.com/{0} -o {1}" → "https://example.com"
+            let url = get_cmd
+                .as_ref()
+                .and_then(|cmd| extract_url_from_curl_cmd(cmd))
+                .unwrap_or_default();
 
-                let put_cmd = entry_table
-                    .get("put")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let mkdir_cmd = entry_table
-                    .get("mkdir")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+            let put_cmd = entry_table
+                .get("put")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mkdir_cmd = entry_table
+                .get("mkdir")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
-                archives.push(HistoryArchiveEntry {
-                    name: name.clone(),
-                    url,
-                    get_enabled: get_cmd.is_some(),
-                    put_enabled: put_cmd.is_some(),
-                    put: put_cmd,
-                    mkdir: mkdir_cmd,
-                });
-            }
+            archives.push(HistoryArchiveEntry {
+                name: name.clone(),
+                url,
+                get_enabled: get_cmd.is_some(),
+                put_enabled: put_cmd.is_some(),
+                put: put_cmd,
+                mkdir: mkdir_cmd,
+            });
         }
         if !archives.is_empty() {
             config.history = HistoryConfig { archives };
@@ -450,61 +453,58 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     // Track validator metadata for building ValidatorWeightConfig later.
     let mut validator_entries: Vec<(String, String, Option<String>, Option<String>)> = Vec::new(); // (pubkey, name, home_domain, quality)
     let has_manual_quorum_set = table.contains_key("QUORUM_SET");
-    let has_validators_section = table
-        .get("VALIDATORS")
-        .and_then(|v| v.as_array())
-        .map_or(false, |a| !a.is_empty());
+    let validators_array = get_array_of_tables_strict(table, "VALIDATORS")
+        .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?;
+    let has_validators_section = validators_array.as_ref().map_or(false, |a| !a.is_empty());
 
-    if let Some(validators) = table.get("VALIDATORS").and_then(|v| v.as_array()) {
+    if let Some(validators) = &validators_array {
         let mut validator_keys = Vec::new();
         let mut validator_addresses = Vec::new();
-        for (i, val) in validators.iter().enumerate() {
-            if let Some(val_table) = val.as_table() {
-                let key = val_table
-                    .get("PUBLIC_KEY")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("[[VALIDATORS]] entry {} missing or invalid PUBLIC_KEY", i)
-                    })?;
-                let name = val_table
-                    .get("NAME")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("validator")
-                    .to_string();
-                let home_domain = val_table
-                    .get("HOME_DOMAIN")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let quality_str = val_table
-                    .get("QUALITY")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+        for (i, val_table) in validators.iter().enumerate() {
+            let key = val_table
+                .get("PUBLIC_KEY")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("[[VALIDATORS]] entry {} missing or invalid PUBLIC_KEY", i)
+                })?;
+            let name = val_table
+                .get("NAME")
+                .and_then(|v| v.as_str())
+                .unwrap_or("validator")
+                .to_string();
+            let home_domain = val_table
+                .get("HOME_DOMAIN")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let quality_str = val_table
+                .get("QUALITY")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
-                validator_keys.push(key.to_string());
-                validator_entries.push((key.to_string(), name.clone(), home_domain, quality_str));
+            validator_keys.push(key.to_string());
+            validator_entries.push((key.to_string(), name.clone(), home_domain, quality_str));
 
-                // Extract ADDRESS for peer discovery (e.g., "core-testnet1.stellar.org")
-                if let Some(addr) = val_table.get("ADDRESS").and_then(|v| v.as_str()) {
-                    let peer_addr = if addr.contains(':') {
-                        addr.to_string()
-                    } else {
-                        // Default Stellar peer port
-                        format!("{addr}:11625")
-                    };
-                    validator_addresses.push(peer_addr);
-                }
-                // Also extract inline HISTORY from validators
-                if let Some(hist_cmd) = val_table.get("HISTORY").and_then(|v| v.as_str()) {
-                    if let Some(url) = extract_url_from_curl_cmd(hist_cmd) {
-                        config.history.archives.push(HistoryArchiveEntry {
-                            name,
-                            url,
-                            get_enabled: true,
-                            put_enabled: false,
-                            put: None,
-                            mkdir: None,
-                        });
-                    }
+            // Extract ADDRESS for peer discovery (e.g., "core-testnet1.stellar.org")
+            if let Some(addr) = val_table.get("ADDRESS").and_then(|v| v.as_str()) {
+                let peer_addr = if addr.contains(':') {
+                    addr.to_string()
+                } else {
+                    // Default Stellar peer port
+                    format!("{addr}:11625")
+                };
+                validator_addresses.push(peer_addr);
+            }
+            // Also extract inline HISTORY from validators
+            if let Some(hist_cmd) = val_table.get("HISTORY").and_then(|v| v.as_str()) {
+                if let Some(url) = extract_url_from_curl_cmd(hist_cmd) {
+                    config.history.archives.push(HistoryArchiveEntry {
+                        name,
+                        url,
+                        get_enabled: true,
+                        put_enabled: false,
+                        put: None,
+                        mkdir: None,
+                    });
                 }
             }
         }
@@ -682,7 +682,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     validate_invariant_compat_keys(table, config.node.is_validator)?;
     translate_invariant_config(table, &mut config);
 
-    warn_unrecognized_keys(table);
+    warn_unrecognized_keys(table).map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?;
 
     Ok(config)
 }
@@ -794,7 +794,7 @@ impl UnrecognizedKeys {
 }
 
 /// Classify all keys in a stellar-core config table.
-fn classify_keys(table: &toml::map::Map<String, toml::Value>) -> UnrecognizedKeys {
+fn classify_keys(table: &toml::map::Map<String, toml::Value>) -> Result<UnrecognizedKeys, String> {
     let supported: HashSet<&str> = SUPPORTED_KEYS.iter().copied().collect();
     let unsupported_set: HashSet<&str> = UNSUPPORTED_KNOWN_KEYS.iter().copied().collect();
 
@@ -814,14 +814,12 @@ fn classify_keys(table: &toml::map::Map<String, toml::Value>) -> UnrecognizedKey
     // Sub-table: [[VALIDATORS]]
     let val_supported: HashSet<&str> = VALIDATOR_SUPPORTED_KEYS.iter().copied().collect();
     let val_unsupported: HashSet<&str> = VALIDATOR_UNSUPPORTED_KEYS.iter().copied().collect();
-    if let Some(validators) = table.get("VALIDATORS").and_then(|v| v.as_array()) {
-        for (i, val) in validators.iter().enumerate() {
-            if let Some(val_table) = val.as_table() {
-                for key in val_table.keys() {
-                    let k = key.as_str();
-                    if !val_supported.contains(k) && !val_unsupported.contains(k) {
-                        result.validator_unknown.push((i, key.clone()));
-                    }
+    if let Some(validators) = get_array_of_tables_strict(table, "VALIDATORS")? {
+        for (i, val_table) in validators.iter().enumerate() {
+            for key in val_table.keys() {
+                let k = key.as_str();
+                if !val_supported.contains(k) && !val_unsupported.contains(k) {
+                    result.validator_unknown.push((i, key.clone()));
                 }
             }
         }
@@ -829,7 +827,7 @@ fn classify_keys(table: &toml::map::Map<String, toml::Value>) -> UnrecognizedKey
 
     // Sub-table: [QUORUM_SET]
     let qs_recognized: HashSet<&str> = QUORUM_SET_KEYS.iter().copied().collect();
-    if let Some(qs_table) = table.get("QUORUM_SET").and_then(|v| v.as_table()) {
+    if let Some(qs_table) = get_table_strict(table, "QUORUM_SET")? {
         for key in qs_table.keys() {
             if !qs_recognized.contains(key.as_str()) {
                 result.quorum_set_unknown.push(key.clone());
@@ -839,19 +837,20 @@ fn classify_keys(table: &toml::map::Map<String, toml::Value>) -> UnrecognizedKey
 
     // Sub-table: [HISTORY.*]
     let hist_recognized: HashSet<&str> = HISTORY_ENTRY_KEYS.iter().copied().collect();
-    if let Some(history_table) = table.get("HISTORY").and_then(|v| v.as_table()) {
+    if let Some(history_table) = get_table_strict(table, "HISTORY")? {
         for (name, entry) in history_table {
-            if let Some(entry_table) = entry.as_table() {
-                for key in entry_table.keys() {
-                    if !hist_recognized.contains(key.as_str()) {
-                        result.history_unknown.push((name.clone(), key.clone()));
-                    }
+            let entry_table = entry.as_table().ok_or_else(|| {
+                format!("HISTORY.{}: expected table, got {}", name, entry.type_str())
+            })?;
+            for key in entry_table.keys() {
+                if !hist_recognized.contains(key.as_str()) {
+                    result.history_unknown.push((name.clone(), key.clone()));
                 }
             }
         }
     }
 
-    result
+    Ok(result)
 }
 
 /// Parse `[[HOME_DOMAINS]]` entries into a domain→quality map.
@@ -1031,8 +1030,8 @@ fn parse_node_id(pubkey: &str) -> anyhow::Result<stellar_xdr::curr::NodeId> {
 /// Classifies each top-level key as supported, unsupported-but-known, or
 /// unknown, and emits appropriate log messages. Also validates sub-table
 /// keys within `[[VALIDATORS]]`, `[QUORUM_SET]`, and `[HISTORY.*]`.
-fn warn_unrecognized_keys(table: &toml::map::Map<String, toml::Value>) {
-    let classified = classify_keys(table);
+fn warn_unrecognized_keys(table: &toml::map::Map<String, toml::Value>) -> Result<(), String> {
+    let classified = classify_keys(table)?;
 
     if !classified.unsupported.is_empty() {
         tracing::info!(
@@ -1066,6 +1065,7 @@ fn warn_unrecognized_keys(table: &toml::map::Map<String, toml::Value>) {
             "Unknown key in [HISTORY.{name}] entry (check for typos)"
         );
     }
+    Ok(())
 }
 
 /// Extract a base URL from a stellar-core curl command template.
@@ -1283,6 +1283,46 @@ fn get_bool_strict(
     val.as_bool()
         .map(|b| Some(b))
         .ok_or_else(|| format!("{key}: expected boolean, got {}", val.type_str()))
+}
+
+/// Returns the value for `key` as a table reference, erroring if present but
+/// not a table. Matches stellar-core's fail-fast behavior for structured config
+/// sections like `[HISTORY]`.
+fn get_table_strict<'a>(
+    table: &'a toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Result<Option<&'a toml::map::Map<String, toml::Value>>, String> {
+    let val = match table.get(key) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    val.as_table()
+        .map(Some)
+        .ok_or_else(|| format!("{key}: expected table, got {}", val.type_str()))
+}
+
+/// Returns the value for `key` as an array of table references, erroring if the
+/// key is present but not an array, or if any element is not a table. Matches
+/// stellar-core's fail-fast behavior for `[[VALIDATORS]]`-style sections.
+fn get_array_of_tables_strict<'a>(
+    table: &'a toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Result<Option<Vec<&'a toml::map::Map<String, toml::Value>>>, String> {
+    let val = match table.get(key) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let arr = val
+        .as_array()
+        .ok_or_else(|| format!("{key}: expected array, got {}", val.type_str()))?;
+    let mut result = Vec::with_capacity(arr.len());
+    for (i, elem) in arr.iter().enumerate() {
+        let t = elem
+            .as_table()
+            .ok_or_else(|| format!("{key}[{i}]: expected table, got {}", elem.type_str()))?;
+        result.push(t);
+    }
+    Ok(Some(result))
 }
 
 #[cfg(test)]
@@ -2100,7 +2140,7 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
         )
         .unwrap();
         let table = core_toml.as_table().unwrap();
-        let classified = classify_keys(table);
+        let classified = classify_keys(table).unwrap();
         assert!(
             classified.is_empty(),
             "All supported keys should produce no warnings: {classified:?}"
@@ -2119,7 +2159,7 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
         )
         .unwrap();
         let table = core_toml.as_table().unwrap();
-        let classified = classify_keys(table);
+        let classified = classify_keys(table).unwrap();
         // UNSAFE_QUORUM and FAILURE_SAFETY are now supported (actively translated).
         assert_eq!(classified.unsupported.len(), 1);
         assert!(classified.unsupported.contains(&"FORCE_SCP".to_string()));
@@ -2137,7 +2177,7 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
         )
         .unwrap();
         let table = core_toml.as_table().unwrap();
-        let classified = classify_keys(table);
+        let classified = classify_keys(table).unwrap();
         assert_eq!(classified.unknown.len(), 2);
         assert!(classified.unknown.contains(&"HTPP_PORT".to_string()));
         assert!(classified.unknown.contains(&"TOTALLY_MADE_UP".to_string()));
@@ -2156,7 +2196,7 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
         )
         .unwrap();
         let table = core_toml.as_table().unwrap();
-        let classified = classify_keys(table);
+        let classified = classify_keys(table).unwrap();
         assert!(classified.unknown.is_empty(), "Top-level should be clean");
         assert_eq!(classified.validator_unknown.len(), 1);
         assert_eq!(
@@ -2178,7 +2218,7 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
         )
         .unwrap();
         let table = core_toml.as_table().unwrap();
-        let classified = classify_keys(table);
+        let classified = classify_keys(table).unwrap();
         assert_eq!(classified.quorum_set_unknown.len(), 1);
         assert_eq!(classified.quorum_set_unknown[0], "INNER_QUORUM_SETS");
     }
@@ -2195,7 +2235,7 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
         )
         .unwrap();
         let table = core_toml.as_table().unwrap();
-        let classified = classify_keys(table);
+        let classified = classify_keys(table).unwrap();
         assert_eq!(classified.history_unknown.len(), 1);
         assert_eq!(
             classified.history_unknown[0],
@@ -2211,7 +2251,7 @@ get="curl -sf http://localhost:1570/{0} -o {1}"
         let fixture = include_str!("compat_http/test_fixtures/ssc_generated_config.cfg");
         let raw: toml::Value = toml::from_str(fixture).unwrap();
         let table = raw.as_table().unwrap();
-        let classified = classify_keys(table);
+        let classified = classify_keys(table).unwrap();
         // The SSC fixture has EXPERIMENTAL_BUCKETLIST_DB, COMMANDS, etc.
         assert!(
             classified.unknown.is_empty(),
@@ -3291,7 +3331,7 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
                 config.invariants.snapshot_frequency_secs,
                 value.parse::<u64>().unwrap()
             );
-            let classified = classify_keys(raw.as_table().unwrap());
+            let classified = classify_keys(raw.as_table().unwrap()).unwrap();
             assert!(
                 !classified
                     .unknown
@@ -3416,7 +3456,7 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             STATE_SNAPSHOT_INVARIANT_LEDGER_FREQUENCY = 300
         "#;
         let raw: toml::Value = toml::from_str(toml_str).unwrap();
-        let classified = classify_keys(raw.as_table().unwrap());
+        let classified = classify_keys(raw.as_table().unwrap()).unwrap();
 
         // All three keys: handled (in SUPPORTED_COMPAT_KEYS), so absent from both
         // unsupported and unknown.
@@ -3886,6 +3926,173 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             err.contains("PEER_PORT must not be 0"),
             "Expected PEER_PORT=0 rejection at translation time, got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn test_history_wrong_type_rejected() {
+        let toml_str = r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            NODE_IS_VALIDATOR = false
+            HISTORY = 42
+        "#;
+        let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = translate_stellar_core_config(&parsed).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("HISTORY") && msg.contains("expected table"),
+            "Expected HISTORY type error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_history_entry_wrong_type_rejected() {
+        let toml_str = r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            NODE_IS_VALIDATOR = false
+
+            [HISTORY]
+            good = { get = "curl -sf http://example.com/{0} -o {1}" }
+            bad = 42
+        "#;
+        let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = translate_stellar_core_config(&parsed).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("HISTORY.bad") && msg.contains("expected table"),
+            "Expected HISTORY entry type error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validators_wrong_type_rejected() {
+        let toml_str = r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            NODE_IS_VALIDATOR = false
+            VALIDATORS = "not an array"
+        "#;
+        let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+        let err = translate_stellar_core_config(&parsed).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("VALIDATORS") && msg.contains("expected array"),
+            "Expected VALIDATORS type error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validators_entry_wrong_type_mixed_rejected() {
+        // TOML [[VALIDATORS]] always produces array-of-tables, so we need to
+        // test with raw toml::Value manipulation for mixed entries.
+        let mut val: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            NODE_IS_VALIDATOR = false
+            "#,
+        )
+        .unwrap();
+        // Inject VALIDATORS as an array with a valid table then a non-table
+        let table = val.as_table_mut().unwrap();
+        table.insert(
+            "VALIDATORS".to_string(),
+            toml::Value::Array(vec![
+                toml::Value::Table({
+                    let mut t = toml::map::Map::new();
+                    t.insert(
+                        "PUBLIC_KEY".to_string(),
+                        toml::Value::String(
+                            "GCGB2S2KBER43AGH5QINNPFMXNLW6WFASTDPQ6KRFGMLEZMURQ2KZOR".to_string(),
+                        ),
+                    );
+                    t.insert("NAME".to_string(), toml::Value::String("good".to_string()));
+                    t
+                }),
+                toml::Value::Integer(42),
+            ]),
+        );
+        let toml_str = toml::to_string(&val).unwrap();
+        let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
+        let err = translate_stellar_core_config(&parsed).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("VALIDATORS[1]") && msg.contains("expected table"),
+            "Expected VALIDATORS entry type error at index 1, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_history_empty_table_valid() {
+        let toml_str = r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            NODE_IS_VALIDATOR = false
+
+            [HISTORY]
+        "#;
+        let parsed: toml::Value = toml::from_str(toml_str).unwrap();
+        let config = translate_stellar_core_config(&parsed).unwrap();
+        assert!(config.history.archives.is_empty());
+    }
+
+    #[test]
+    fn test_validators_empty_array_valid() {
+        // TOML doesn't allow [[VALIDATORS]] to produce an empty array directly,
+        // so we use raw Value manipulation.
+        let mut val: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            NODE_SEED = "SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH"
+            NODE_IS_VALIDATOR = false
+            "#,
+        )
+        .unwrap();
+        val.as_table_mut()
+            .unwrap()
+            .insert("VALIDATORS".to_string(), toml::Value::Array(vec![]));
+        let toml_str = toml::to_string(&val).unwrap();
+        let parsed: toml::Value = toml::from_str(&toml_str).unwrap();
+        // Should succeed without error
+        translate_stellar_core_config(&parsed).unwrap();
+    }
+
+    #[test]
+    fn test_classify_keys_rejects_validators_wrong_type() {
+        let mut val: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            "#,
+        )
+        .unwrap();
+        val.as_table_mut().unwrap().insert(
+            "VALIDATORS".to_string(),
+            toml::Value::String("bad".to_string()),
+        );
+        let err = classify_keys(val.as_table().unwrap()).unwrap_err();
+        assert!(
+            err.contains("VALIDATORS") && err.contains("expected array"),
+            "Expected VALIDATORS type error from classify_keys, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_classify_keys_rejects_history_wrong_type() {
+        let mut val: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            "#,
+        )
+        .unwrap();
+        val.as_table_mut()
+            .unwrap()
+            .insert("HISTORY".to_string(), toml::Value::Integer(99));
+        let err = classify_keys(val.as_table().unwrap()).unwrap_err();
+        assert!(
+            err.contains("HISTORY") && err.contains("expected table"),
+            "Expected HISTORY type error from classify_keys, got: {err}"
         );
     }
 }
