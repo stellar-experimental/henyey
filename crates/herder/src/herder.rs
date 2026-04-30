@@ -2602,7 +2602,9 @@ impl Herder {
             return false;
         }
 
-        let Some(gen) = prepared.generalized_tx_set() else {
+        // Builder invariant: on protocol >= V20, we should always produce
+        // a generalized tx set. A legacy set here indicates a construction bug.
+        if !prepared.is_generalized() {
             warn!(
                 tx_set_hash = %tx_set.hash(),
                 ledger_version = header.ledger_version,
@@ -2610,12 +2612,11 @@ impl Herder {
                  protocol >= 20; rejecting (construction bug)"
             );
             return false;
-        };
+        }
 
         // Step 2: content validation against the same snapshot used to build
         // the set. Parity: stellar-core `checkValidInternal` step.
-        crate::tx_set_utils::check_tx_set_valid(
-            gen,
+        prepared.check_valid(
             header,
             close_time_offset,
             NetworkId(self.scp_driver.network_id()),

@@ -422,14 +422,21 @@ impl TransactionSet {
     /// This corresponds to upstream `TxSetXDRFrame::prepareForApply()`.
     /// The `_network_id` parameter is intentionally retained (unused) to
     /// preserve API shape parity with upstream `prepareForApply(Application&)`.
-    pub fn prepare_for_apply(&self, _network_id: NetworkId) -> std::result::Result<Self, String> {
-        match &self.body {
+    ///
+    /// Returns a [`PreparedTransactionSet`] — the only way to construct one,
+    /// enforcing at the type level that structural validation has passed.
+    pub fn prepare_for_apply(
+        &self,
+        _network_id: NetworkId,
+    ) -> std::result::Result<PreparedTransactionSet, String> {
+        let inner = match &self.body {
             TxSetBody::Generalized(gen) => Self::prepare_generalized_for_apply(gen),
             TxSetBody::Legacy {
                 previous_ledger_hash,
                 transactions,
             } => Self::prepare_legacy_for_apply(*previous_ledger_hash, transactions),
-        }
+        }?;
+        Ok(PreparedTransactionSet(inner))
     }
 
     /// Validate and prepare a generalized transaction set for application.
@@ -503,6 +510,100 @@ impl TransactionSet {
                 transactions: transactions.to_vec(),
             },
         })
+    }
+}
+
+/// A transaction set that has passed structural validation via
+/// [`TransactionSet::prepare_for_apply`].
+///
+/// Guarantees (enforced by construction):
+/// - XDR structure is well-formed (`validate_generalized_tx_set_xdr_structure`)
+/// - Transactions are sorted by hash within each phase
+/// - Per-phase transaction type correctness (classic vs soroban)
+/// - Fee map well-formedness
+/// - No cross-phase duplicate source accounts
+/// - Hash matches canonical XDR encoding
+///
+/// Only constructable via [`TransactionSet::prepare_for_apply`].
+///
+/// Parity: corresponds to stellar-core's `ApplicableTxSetFrame` which is
+/// returned by `TxSetXDRFrame::prepareForApply()` (TxSetFrame.cpp:1096-1117).
+#[derive(Debug, Clone)]
+pub struct PreparedTransactionSet(TransactionSet);
+
+impl PreparedTransactionSet {
+    /// The content-addressed hash of this prepared transaction set.
+    pub fn hash(&self) -> &Hash256 {
+        self.0.hash()
+    }
+
+    /// Whether this is a generalized (protocol 20+) transaction set.
+    pub fn is_generalized(&self) -> bool {
+        self.0.is_generalized()
+    }
+
+    /// Access the inner generalized transaction set, if this is one.
+    ///
+    /// This is `pub(crate)` to allow `check_valid` implementation in
+    /// `tx_set_utils.rs` without exposing escape hatches to external callers.
+    pub(crate) fn generalized_tx_set(&self) -> Option<&GeneralizedTransactionSet> {
+        self.0.generalized_tx_set()
+    }
+
+    /// Content validation against a ledger snapshot.
+    ///
+    /// Parity: corresponds to `ApplicableTxSetFrame::checkValid()`
+    /// (TxSetFrame.cpp:2064-2082).
+    ///
+    /// Behavior:
+    /// - Generalized set on protocol >= V20: full content validation
+    /// - Generalized set on protocol < V20: returns `false` (not valid pre-V20)
+    /// - Legacy set on protocol >= V20: returns `false` (not valid post-V20)
+    /// - Legacy set on protocol < V20: returns `true` (fully validated by
+    ///   `prepare_for_apply`)
+    pub fn check_valid(
+        &self,
+        lcl_header: &stellar_xdr::curr::LedgerHeader,
+        close_time_offset: u64,
+        network_id: NetworkId,
+        soroban_info: Option<&henyey_ledger::SorobanNetworkInfo>,
+        fee_balance_provider: Option<&dyn FeeBalanceProvider>,
+        account_provider: Option<&dyn AccountProvider>,
+    ) -> bool {
+        use henyey_common::protocol::{protocol_version_starts_from, ProtocolVersion};
+
+        let is_v20_plus =
+            protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V20);
+
+        match (self.is_generalized(), is_v20_plus) {
+            (true, true) => {
+                // Generalized set on V20+: full content validation
+                let gen = self.generalized_tx_set().expect(
+                    "is_generalized() returned true but generalized_tx_set() returned None",
+                );
+                crate::tx_set_utils::check_tx_set_valid(
+                    gen,
+                    lcl_header,
+                    close_time_offset,
+                    network_id,
+                    soroban_info,
+                    fee_balance_provider,
+                    account_provider,
+                )
+            }
+            (true, false) => {
+                // Generalized set on pre-V20: reject
+                false
+            }
+            (false, true) => {
+                // Legacy set on V20+: reject
+                false
+            }
+            (false, false) => {
+                // Legacy set on pre-V20: already validated by prepare_for_apply
+                true
+            }
+        }
     }
 }
 
@@ -1747,6 +1848,136 @@ mod tests {
             err.contains("Soroban transaction found in classic phase"),
             "should reject soroban in classic phase, got: {}",
             err
+        );
+    }
+
+    // =========================================================================
+    // PreparedTransactionSet::check_valid — protocol/format compatibility
+    // =========================================================================
+
+    /// A well-formed empty generalized set prepared and validated on V22.
+    /// Uses V22 because V23+ requires parallel Soroban phases (V1).
+    #[test]
+    fn test_check_valid_accepts_empty_generalized_on_v22() {
+        use stellar_xdr::curr::{
+            Hash, LedgerHeader, LedgerHeaderExt, StellarValue, StellarValueExt, TimePoint, VecM,
+        };
+
+        let gen = make_gen_tx_set(vec![
+            TransactionPhase::V0(vec![].try_into().unwrap()),
+            TransactionPhase::V0(vec![].try_into().unwrap()),
+        ]);
+        let tx_set = TransactionSet {
+            hash: Hash256::ZERO,
+            body: TxSetBody::Generalized(gen),
+        };
+        let prepared = tx_set.prepare_for_apply(NetworkId::testnet()).unwrap();
+
+        let header = LedgerHeader {
+            ledger_version: 22,
+            max_tx_set_size: 100,
+            base_fee: 100,
+            previous_ledger_hash: Hash([0u8; 32]),
+            scp_value: StellarValue {
+                tx_set_hash: Hash([0u8; 32]),
+                close_time: TimePoint(100),
+                upgrades: VecM::default(),
+                ext: StellarValueExt::Basic,
+            },
+            tx_set_result_hash: Hash([0u8; 32]),
+            bucket_list_hash: Hash([0u8; 32]),
+            ledger_seq: 10,
+            total_coins: 1_000_000_000_000,
+            skip_list: [
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+                Hash([0u8; 32]),
+            ],
+            ext: LedgerHeaderExt::V0,
+            ..Default::default()
+        };
+
+        // soroban_info must be Some — check_tx_set_valid rejects empty Soroban
+        // phase when config is unavailable.
+        let soroban_info = henyey_ledger::SorobanNetworkInfo::default();
+
+        assert!(
+            prepared.check_valid(
+                &header,
+                0,
+                NetworkId::testnet(),
+                Some(&soroban_info),
+                None,
+                None
+            ),
+            "empty generalized set on V22 should pass check_valid"
+        );
+    }
+
+    /// Generalized set on protocol < V20 must be rejected by check_valid.
+    #[test]
+    fn test_check_valid_rejects_generalized_on_pre_v20() {
+        use stellar_xdr::curr::{LedgerHeader, LedgerHeaderExt};
+
+        let gen = make_gen_tx_set(vec![
+            TransactionPhase::V0(vec![].try_into().unwrap()),
+            TransactionPhase::V0(vec![].try_into().unwrap()),
+        ]);
+        let tx_set = TransactionSet {
+            hash: Hash256::ZERO,
+            body: TxSetBody::Generalized(gen),
+        };
+        let prepared = tx_set.prepare_for_apply(NetworkId::testnet()).unwrap();
+
+        let mut header = LedgerHeader::default();
+        header.ledger_version = 19;
+        header.ext = LedgerHeaderExt::V0;
+
+        assert!(
+            !prepared.check_valid(&header, 0, NetworkId::testnet(), None, None, None),
+            "generalized set on protocol 19 should be rejected by check_valid"
+        );
+    }
+
+    /// Legacy set on protocol >= V20 must be rejected by check_valid.
+    #[test]
+    fn test_check_valid_rejects_legacy_on_v20_plus() {
+        use stellar_xdr::curr::{LedgerHeader, LedgerHeaderExt};
+
+        let mut txs = vec![make_tx_envelope(1, 100)];
+        sort_txs_by_hash(&mut txs);
+        let tx_set = TransactionSet::new(Hash256::ZERO, txs);
+        let prepared = tx_set.prepare_for_apply(NetworkId::testnet()).unwrap();
+
+        let mut header = LedgerHeader::default();
+        header.ledger_version = 24;
+        header.ext = LedgerHeaderExt::V0;
+
+        assert!(
+            !prepared.check_valid(&header, 0, NetworkId::testnet(), None, None, None),
+            "legacy set on protocol 24 should be rejected by check_valid"
+        );
+    }
+
+    /// Legacy set on protocol < V20 is accepted by check_valid (fully validated
+    /// by prepare_for_apply).
+    #[test]
+    fn test_check_valid_accepts_legacy_on_pre_v20() {
+        use stellar_xdr::curr::{LedgerHeader, LedgerHeaderExt};
+
+        let mut txs = vec![make_tx_envelope(1, 100)];
+        sort_txs_by_hash(&mut txs);
+        let tx_set = TransactionSet::new(Hash256::ZERO, txs);
+        let prepared = tx_set.prepare_for_apply(NetworkId::testnet()).unwrap();
+
+        let mut header = LedgerHeader::default();
+        header.ledger_version = 19;
+        header.ext = LedgerHeaderExt::V0;
+
+        assert!(
+            prepared.check_valid(&header, 0, NetworkId::testnet(), None, None, None),
+            "legacy set on protocol 19 should pass check_valid"
         );
     }
 }

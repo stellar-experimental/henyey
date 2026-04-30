@@ -1520,6 +1520,12 @@ fn collect_phase_txs(phase: &TransactionPhase) -> Vec<&TransactionEnvelope> {
 /// 4. Per-TX content validation (time bounds, fees) via `get_invalid_tx_list_with_fee_map`
 ///
 /// For Phase 1, `fee_balance_provider` may be `None` to skip per-account balance checks.
+///
+/// Note: cross-phase duplicate-source-account checking is performed by
+/// `prepare_for_apply` (in `tx_set.rs`), NOT by this function.
+///
+/// **Prefer [`PreparedTransactionSet::check_valid()`]** for production call sites.
+/// This function is `pub(crate)` for unit testing only.
 pub(crate) fn check_tx_set_valid(
     gen_tx_set: &GeneralizedTransactionSet,
     lcl_header: &LedgerHeader,

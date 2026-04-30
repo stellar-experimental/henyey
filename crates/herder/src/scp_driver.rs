@@ -676,37 +676,32 @@ impl ScpDriver {
             }
         };
 
-        // For generalized tx sets, run full content validation
-        let result = if let Some(gen) = prepared.generalized_tx_set() {
-            if let Some(lm) = self.ledger_manager.get() {
-                let lcl_header = lm.current_header();
+        // For generalized tx sets, run full content validation.
+        // For legacy sets, prepare_for_apply already validated structure;
+        // check_valid handles the protocol/format compatibility logic.
+        let result = if let Some(lm) = self.ledger_manager.get() {
+            let lcl_header = lm.current_header();
 
-                // Skip content validation when protocol < 20: generalized tx sets
-                // are not expected at those versions, so check_tx_set_valid would
-                // unconditionally reject them. This occurs in simulation environments
-                // that start at protocol 0 before upgrading to protocol 24+.
-                if !protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V20) {
-                    true
-                } else {
-                    let soroban_info = lm.soroban_network_info();
-                    crate::tx_set_utils::check_tx_set_valid(
-                        gen,
-                        &lcl_header,
-                        close_time_offset,
-                        network_id,
-                        soroban_info.as_ref(),
-                        None, // fee balance checks skipped in SCP path — snapshot
-                        // staleness causes false rejects
-                        None, // account validation skipped in SCP path — snapshot
-                              // staleness causes false rejects
-                    )
-                }
-            } else {
-                // No ledger manager — can't validate, assume valid
+            // Skip validation entirely when protocol < 20: generalized tx sets
+            // are not expected at those versions. This occurs in simulation
+            // environments that start at protocol 0 before upgrading to 24+.
+            if !protocol_version_starts_from(lcl_header.ledger_version, ProtocolVersion::V20) {
                 true
+            } else {
+                let soroban_info = lm.soroban_network_info();
+                prepared.check_valid(
+                    &lcl_header,
+                    close_time_offset,
+                    network_id,
+                    soroban_info.as_ref(),
+                    None, // fee balance checks skipped in SCP path — snapshot
+                    // staleness causes false rejects
+                    None, // account validation skipped in SCP path — snapshot
+                          // staleness causes false rejects
+                )
             }
         } else {
-            // Legacy tx sets — already validated by prepare_for_apply
+            // No ledger manager — can't validate, assume valid
             true
         };
 
