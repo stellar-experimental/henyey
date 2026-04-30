@@ -29,6 +29,7 @@ use crate::config::{
     HistoryArchiveEntry, HistoryConfig, ValidationThresholdLevel,
 };
 use henyey_herder::{ValidatorEntryInfo, ValidatorQuality, ValidatorWeightConfig};
+use henyey_overlay::PeerAddress;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -276,12 +277,20 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     if let Some(peers) = get_string_array(table, "KNOWN_PEERS")
         .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
     {
-        config.overlay.known_peers = peers;
+        config.overlay.known_peers = peers
+            .iter()
+            .map(|s| s.parse::<PeerAddress>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Invalid KNOWN_PEERS entry: {}", e))?;
     }
     if let Some(peers) = get_string_array(table, "PREFERRED_PEERS")
         .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
     {
-        config.overlay.preferred_peers = peers;
+        config.overlay.preferred_peers = peers
+            .iter()
+            .map(|s| s.parse::<PeerAddress>())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Invalid PREFERRED_PEERS entry: {}", e))?;
     }
     if let Some(keys) = get_string_array(table, "PREFERRED_PEER_KEYS")
         .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
@@ -486,13 +495,15 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
 
             // Extract ADDRESS for peer discovery (e.g., "core-testnet1.stellar.org")
             if let Some(addr) = val_table.get("ADDRESS").and_then(|v| v.as_str()) {
-                let peer_addr = if addr.contains(':') {
+                let peer_str = if addr.contains(':') {
                     addr.to_string()
                 } else {
                     // Default Stellar peer port
                     format!("{addr}:11625")
                 };
-                validator_addresses.push(peer_addr);
+                if let Ok(peer_addr) = peer_str.parse::<PeerAddress>() {
+                    validator_addresses.push(peer_addr);
+                }
             }
             // Also extract inline HISTORY from validators
             if let Some(hist_cmd) = val_table.get("HISTORY").and_then(|v| v.as_str()) {
@@ -1530,7 +1541,10 @@ mod tests {
 
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert_eq!(config.overlay.known_peers.len(), 2);
-        assert_eq!(config.overlay.known_peers[0], "core1.stellar.org:11625");
+        assert_eq!(
+            config.overlay.known_peers[0],
+            PeerAddress::new("core1.stellar.org", 11625)
+        );
     }
 
     #[test]
@@ -1558,11 +1572,11 @@ mod tests {
         assert_eq!(config.overlay.known_peers.len(), 2);
         assert_eq!(
             config.overlay.known_peers[0],
-            "core-testnet1.stellar.org:11625"
+            PeerAddress::new("core-testnet1.stellar.org", 11625)
         );
         assert_eq!(
             config.overlay.known_peers[1],
-            "core-testnet2.stellar.org:11625"
+            PeerAddress::new("core-testnet2.stellar.org", 11625)
         );
     }
 
@@ -1585,7 +1599,7 @@ mod tests {
         assert_eq!(config.overlay.known_peers.len(), 1);
         assert_eq!(
             config.overlay.known_peers[0],
-            "explicit-peer.stellar.org:11625"
+            PeerAddress::new("explicit-peer.stellar.org", 11625)
         );
     }
 
@@ -1988,11 +2002,11 @@ mod tests {
         assert!(config
             .overlay
             .known_peers
-            .contains(&"core-testnet1.stellar.org:11625".to_string()));
+            .contains(&PeerAddress::new("core-testnet1.stellar.org", 11625)));
         assert_eq!(config.overlay.preferred_peers.len(), 1);
         assert_eq!(
             config.overlay.preferred_peers[0],
-            "core-testnet1.stellar.org:11625"
+            PeerAddress::new("core-testnet1.stellar.org", 11625)
         );
 
         // --- Database ---
@@ -3817,7 +3831,10 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
         let config = translate_stellar_core_config(&toml).unwrap();
         assert_eq!(
             config.overlay.known_peers,
-            vec!["peer1.example.com", "peer2.example.com:11625"]
+            vec![
+                PeerAddress::new("peer1.example.com", 11625),
+                PeerAddress::new("peer2.example.com", 11625),
+            ]
         );
     }
 

@@ -1072,13 +1072,7 @@ impl App {
         let mut overlay_config = if !self.config.overlay.known_peers.is_empty() {
             // Explicit peers configured — start from empty defaults
             OverlayManagerConfig {
-                known_peers: self
-                    .config
-                    .overlay
-                    .known_peers
-                    .iter()
-                    .map(|s| crate::config::parse_peer_address(s).expect("validated at startup"))
-                    .collect(),
+                known_peers: self.config.overlay.known_peers.clone(),
                 ..OverlayManagerConfig::default()
             }
         } else if self.config.is_compat_config {
@@ -1115,13 +1109,7 @@ impl App {
 
         // Convert preferred peers
         if !self.config.overlay.preferred_peers.is_empty() {
-            overlay_config.preferred_peers = self
-                .config
-                .overlay
-                .preferred_peers
-                .iter()
-                .map(|s| crate::config::parse_peer_address(s).expect("validated at startup"))
-                .collect();
+            overlay_config.preferred_peers = self.config.overlay.preferred_peers.clone();
         }
 
         // Convert preferred peer keys (node-ID-based preference)

@@ -372,10 +372,38 @@ impl OverlayConfig {
     }
 }
 
+/// Default Stellar peer port (11625).
+pub const DEFAULT_PEER_PORT: u16 = 11625;
+
+/// Error returned when parsing a peer address string fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerAddressParseError(String);
+
+impl std::fmt::Display for PeerAddressParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PeerAddressParseError {}
+
 /// Address of a peer on the network.
 ///
 /// Represents a network endpoint that can be used to connect to a Stellar node.
 /// The host can be either an IP address or a hostname.
+///
+/// # Parsing
+///
+/// `PeerAddress` implements [`FromStr`] which validates:
+/// - Host must be non-empty and contain only alphanumeric, `.`, or `-`
+///   (matching stellar-core's `PeerBareAddress::resolve()` regex)
+/// - If host looks like a numeric IPv4 address, it must parse as valid `Ipv4Addr`
+/// - Port (if present) must be a valid u16 in range 1..=65535
+/// - If no port is specified, defaults to 11625
+///
+/// # Serialization
+///
+/// Always serialized as `"host:port"` (port is always included).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerAddress {
     /// IP address or hostname of the peer.
@@ -465,6 +493,87 @@ impl From<std::net::SocketAddr> for PeerAddress {
             host: addr.ip().to_string(),
             port: addr.port(),
         }
+    }
+}
+
+impl std::str::FromStr for PeerAddress {
+    type Err = PeerAddressParseError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if value.is_empty() {
+            return Err(PeerAddressParseError("address is empty".to_string()));
+        }
+        if value.chars().any(|c| c.is_whitespace()) {
+            return Err(PeerAddressParseError(
+                "address contains whitespace".to_string(),
+            ));
+        }
+        let parts: Vec<&str> = value.split(':').collect();
+        let host = parts[0];
+        let port = match parts.len() {
+            1 => DEFAULT_PEER_PORT,
+            2 => {
+                if parts[1].is_empty() {
+                    return Err(PeerAddressParseError("port part is empty".to_string()));
+                }
+                let p: u16 = parts[1]
+                    .parse()
+                    .map_err(|_| PeerAddressParseError(format!("invalid port \"{}\"", parts[1])))?;
+                if p == 0 {
+                    return Err(PeerAddressParseError("port must be > 0".to_string()));
+                }
+                p
+            }
+            _ => {
+                return Err(PeerAddressParseError(
+                    "too many ':' separators (IPv6 is not supported)".to_string(),
+                ))
+            }
+        };
+
+        if host.is_empty() {
+            return Err(PeerAddressParseError("host part is empty".to_string()));
+        }
+        // Match stellar-core's PeerBareAddress::resolve() regex: [[:alnum:].-]+
+        if !host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        {
+            return Err(PeerAddressParseError(format!(
+                "host \"{}\" contains invalid characters (only alphanumeric, '.', '-' allowed)",
+                host
+            )));
+        }
+        // If host looks like a numeric IPv4 candidate (only digits and dots),
+        // validate it as a proper IPv4 address (matching stellar-core's numeric_host branch).
+        if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            if host.parse::<std::net::Ipv4Addr>().is_err() {
+                return Err(PeerAddressParseError(format!(
+                    "host \"{}\" looks like IPv4 but is not valid",
+                    host
+                )));
+            }
+        }
+
+        Ok(PeerAddress::new(host, port))
+    }
+}
+
+impl serde::Serialize for PeerAddress {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PeerAddress {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let s = <String as serde::Deserialize>::deserialize(deserializer)?;
+        s.parse::<PeerAddress>().map_err(serde::de::Error::custom)
     }
 }
 
@@ -688,6 +797,55 @@ mod tests {
         let addr = PeerAddress::new("127.0.0.1", 11625);
         assert_eq!(addr.to_socket_addr(), "127.0.0.1:11625");
         assert_eq!(addr.to_string(), "127.0.0.1:11625");
+    }
+
+    #[test]
+    fn test_peer_address_from_str_valid() {
+        let addr: PeerAddress = "stellar.example.com".parse().unwrap();
+        assert_eq!(addr.host, "stellar.example.com");
+        assert_eq!(addr.port, DEFAULT_PEER_PORT);
+
+        let addr: PeerAddress = "stellar.example.com:1234".parse().unwrap();
+        assert_eq!(addr.host, "stellar.example.com");
+        assert_eq!(addr.port, 1234);
+
+        let addr: PeerAddress = "127.0.0.1:65535".parse().unwrap();
+        assert_eq!(addr.host, "127.0.0.1");
+        assert_eq!(addr.port, 65535);
+
+        let addr: PeerAddress = "peer:1".parse().unwrap();
+        assert_eq!(addr.host, "peer");
+        assert_eq!(addr.port, 1);
+    }
+
+    #[test]
+    fn test_peer_address_from_str_invalid() {
+        assert!("".parse::<PeerAddress>().is_err());
+        assert!(" ".parse::<PeerAddress>().is_err());
+        assert!("host :1234".parse::<PeerAddress>().is_err());
+        assert!("host:0".parse::<PeerAddress>().is_err());
+        assert!("host:abc".parse::<PeerAddress>().is_err());
+        assert!(":1234".parse::<PeerAddress>().is_err());
+        assert!("host:".parse::<PeerAddress>().is_err());
+        assert!("host:1:2".parse::<PeerAddress>().is_err());
+        assert!("foo/bar:11625".parse::<PeerAddress>().is_err());
+        assert!("[::1]:11625".parse::<PeerAddress>().is_err());
+        assert!("host_name:11625".parse::<PeerAddress>().is_err());
+        assert!("256.256.256.256".parse::<PeerAddress>().is_err());
+    }
+
+    #[test]
+    fn test_peer_address_serde_roundtrip() {
+        let addr = PeerAddress::new("core.stellar.org", 11625);
+        let json = serde_json::to_string(&addr).unwrap();
+        assert_eq!(json, "\"core.stellar.org:11625\"");
+        let parsed: PeerAddress = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, addr);
+
+        // Deserialization validates
+        let result: std::result::Result<PeerAddress, _> =
+            serde_json::from_str("\"invalid host!:1234\"");
+        assert!(result.is_err());
     }
 
     #[test]

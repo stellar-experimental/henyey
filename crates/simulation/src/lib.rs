@@ -13,7 +13,9 @@ use henyey_app::{App, AppConfig, SimulationDebugStats};
 use henyey_clock::RealClock;
 use henyey_common::{Hash256, NetworkId};
 use henyey_crypto::SecretKey;
-use henyey_overlay::{ConnectionFactory, LoopbackConnectionFactory, TcpConnectionFactory};
+use henyey_overlay::{
+    ConnectionFactory, LoopbackConnectionFactory, PeerAddress, TcpConnectionFactory,
+};
 use stellar_xdr::curr::{
     AccountId, Asset, CreateAccountOp, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
     PublicKey, SequenceNumber, Transaction, TransactionEnvelope, TransactionExt,
@@ -1006,13 +1008,15 @@ impl Simulation {
         .await
     }
 
-    fn known_peers_for(&self, node_id: &str, port_map: &HashMap<String, u16>) -> Vec<String> {
+    fn known_peers_for(&self, node_id: &str, port_map: &HashMap<String, u16>) -> Vec<PeerAddress> {
         self.loopback
             .links()
             .into_iter()
             .filter_map(|(a, b)| {
                 if a == node_id && a < b {
-                    port_map.get(&b).map(|port| format!("127.0.0.1:{}", port))
+                    port_map
+                        .get(&b)
+                        .map(|port| PeerAddress::new("127.0.0.1", *port))
                 } else {
                     None
                 }

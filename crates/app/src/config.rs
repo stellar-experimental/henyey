@@ -64,71 +64,16 @@ use std::path::{Path, PathBuf};
 
 use crate::maintainer;
 
-/// Default Stellar peer port.
-const DEFAULT_PEER_PORT: u16 = 11625;
-
-/// Parse a peer address string in `host:port` or `host` format.
+/// Parse a peer address string into a `PeerAddress`.
 ///
-/// Validation rules:
-/// - No whitespace allowed anywhere in the string
-/// - At most one `:` separator (IPv6 is intentionally unsupported)
-/// - Host part must be non-empty and contain only alphanumeric, `.`, or `-`
-///   (matching stellar-core's `PeerBareAddress::resolve()` regex)
-/// - If host looks like a numeric IPv4 address (digits and dots only), it must
-///   parse as a valid `Ipv4Addr`
-/// - Port (if present) must be a valid u16 in range 1..=65535
-/// - If no port is specified, defaults to 11625
+/// Delegates to `PeerAddress::from_str`. Kept as a convenience for the HTTP
+/// `/connect` endpoint and other sites that accept runtime string input.
+///
+/// See [`PeerAddress`] for validation rules.
 pub(crate) fn parse_peer_address(value: &str) -> Result<PeerAddress, String> {
-    if value.is_empty() {
-        return Err("address is empty".to_string());
-    }
-    if value.chars().any(|c| c.is_whitespace()) {
-        return Err("address contains whitespace".to_string());
-    }
-    let parts: Vec<&str> = value.split(':').collect();
-    let host = parts[0];
-    let port = match parts.len() {
-        1 => DEFAULT_PEER_PORT,
-        2 => {
-            if parts[1].is_empty() {
-                return Err("port part is empty".to_string());
-            }
-            let p: u16 = parts[1]
-                .parse()
-                .map_err(|_| format!("invalid port \"{}\"", parts[1]))?;
-            if p == 0 {
-                return Err("port must be > 0".to_string());
-            }
-            p
-        }
-        _ => return Err("too many ':' separators (IPv6 is not supported)".to_string()),
-    };
-
-    if host.is_empty() {
-        return Err("host part is empty".to_string());
-    }
-    // Match stellar-core's PeerBareAddress::resolve() regex: [[:alnum:].-]+
-    if !host
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    {
-        return Err(format!(
-            "host \"{}\" contains invalid characters (only alphanumeric, '.', '-' allowed)",
-            host
-        ));
-    }
-    // If host looks like a numeric IPv4 candidate (only digits and dots),
-    // validate it as a proper IPv4 address (matching stellar-core's numeric_host branch).
-    if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        if host.parse::<std::net::Ipv4Addr>().is_err() {
-            return Err(format!(
-                "host \"{}\" looks like IPv4 but is not valid",
-                host
-            ));
-        }
-    }
-
-    Ok(PeerAddress::new(host, port))
+    value
+        .parse()
+        .map_err(|e: henyey_overlay::PeerAddressParseError| e.to_string())
 }
 
 /// Main application configuration.
@@ -984,11 +929,11 @@ pub struct OverlayConfig {
 
     /// Known peers to connect to on startup.
     #[serde(default)]
-    pub known_peers: Vec<String>,
+    pub known_peers: Vec<PeerAddress>,
 
     /// Preferred peers that should always be connected.
     #[serde(default)]
-    pub preferred_peers: Vec<String>,
+    pub preferred_peers: Vec<PeerAddress>,
 
     /// Preferred peer public keys (G... format) for node-ID-based preference.
     ///
@@ -1679,9 +1624,9 @@ impl AppConfig {
             },
             overlay: OverlayConfig {
                 known_peers: vec![
-                    "core-testnet1.stellar.org:11625".to_string(),
-                    "core-testnet2.stellar.org:11625".to_string(),
-                    "core-testnet3.stellar.org:11625".to_string(),
+                    PeerAddress::new("core-testnet1.stellar.org", 11625),
+                    PeerAddress::new("core-testnet2.stellar.org", 11625),
+                    PeerAddress::new("core-testnet3.stellar.org", 11625),
                 ],
                 ..Default::default()
             },
@@ -1755,9 +1700,9 @@ impl AppConfig {
             },
             overlay: OverlayConfig {
                 known_peers: vec![
-                    "core-live-a.stellar.org:11625".to_string(),
-                    "core-live-b.stellar.org:11625".to_string(),
-                    "core-live-c.stellar.org:11625".to_string(),
+                    PeerAddress::new("core-live-a.stellar.org", 11625),
+                    PeerAddress::new("core-live-b.stellar.org", 11625),
+                    PeerAddress::new("core-live-c.stellar.org", 11625),
                 ],
                 ..Default::default()
             },
@@ -1926,8 +1871,11 @@ impl AppConfig {
             ("overlay.preferred_peers", &self.overlay.preferred_peers),
         ] {
             for entry in peers {
-                if let Err(e) = parse_peer_address(entry) {
-                    anyhow::bail!("Invalid {field} entry \"{entry}\": {e}");
+                if entry.host.is_empty() {
+                    anyhow::bail!("Invalid {field} entry: host is empty");
+                }
+                if entry.port == 0 {
+                    anyhow::bail!("Invalid {field} entry \"{entry}\": port must be > 0");
                 }
             }
         }
@@ -2313,8 +2261,8 @@ impl ConfigBuilder {
     }
 
     /// Add a known peer.
-    pub fn add_known_peer(mut self, peer: impl Into<String>) -> Self {
-        self.config.overlay.known_peers.push(peer.into());
+    pub fn add_known_peer(mut self, peer: PeerAddress) -> Self {
+        self.config.overlay.known_peers.push(peer);
         self
     }
 
@@ -4206,7 +4154,11 @@ name = "test"
     #[test]
     fn test_validate_rejects_malformed_known_peers() {
         let mut config = AppConfig::testnet();
-        config.overlay.known_peers = vec!["valid-host:11625".into(), "".into()];
+        // Programmatically create an invalid PeerAddress (port=0)
+        config.overlay.known_peers = vec![
+            PeerAddress::new("valid-host", 11625),
+            PeerAddress::new("host", 0),
+        ];
         let result = config.validate();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -4219,7 +4171,8 @@ name = "test"
     #[test]
     fn test_validate_rejects_malformed_preferred_peers() {
         let mut config = AppConfig::testnet();
-        config.overlay.preferred_peers = vec!["host:abc".into()];
+        // Programmatically create an invalid PeerAddress (empty host)
+        config.overlay.preferred_peers = vec![PeerAddress::new("", 11625)];
         let result = config.validate();
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -4233,10 +4186,10 @@ name = "test"
     fn test_validate_accepts_valid_peers() {
         let mut config = AppConfig::testnet();
         config.overlay.known_peers = vec![
-            "core-live-a.stellar.org:11625".into(),
-            "peer.example.com".into(),
+            PeerAddress::new("core-live-a.stellar.org", 11625),
+            PeerAddress::new("peer.example.com", 11625),
         ];
-        config.overlay.preferred_peers = vec!["preferred.example.com:11625".into()];
+        config.overlay.preferred_peers = vec![PeerAddress::new("preferred.example.com", 11625)];
         assert!(config.validate().is_ok());
     }
 }

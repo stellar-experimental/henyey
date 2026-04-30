@@ -356,18 +356,14 @@ impl App {
             .db_blocking("store-config-peers", move |db| {
                 let now = current_epoch_seconds();
                 for addr in &known_peers {
-                    let peer =
-                        crate::config::parse_peer_address(addr).expect("validated at startup");
                     let record =
                         henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Outbound);
-                    db.store_peer(&peer.host, peer.port, record)?;
+                    db.store_peer(&addr.host, addr.port, record)?;
                 }
                 for addr in &preferred_peers {
-                    let peer =
-                        crate::config::parse_peer_address(addr).expect("validated at startup");
                     let record =
                         henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Preferred);
-                    db.store_peer(&peer.host, peer.port, record)?;
+                    db.store_peer(&addr.host, addr.port, record)?;
                 }
                 Ok(())
             })
@@ -471,15 +467,11 @@ impl App {
                 // Build peer list from config
                 let mut peers = Vec::new();
                 for addr in &known_peers_config {
-                    let peer =
-                        crate::config::parse_peer_address(addr).expect("validated at startup");
-                    peers.push(peer);
+                    peers.push(addr.clone());
                 }
                 for addr in &preferred_peers_config {
-                    let peer =
-                        crate::config::parse_peer_address(addr).expect("validated at startup");
                     // upsert_peer_type inline
-                    let existing = db.load_peer(&peer.host, peer.port)?;
+                    let existing = db.load_peer(&addr.host, addr.port)?;
                     let record = match existing {
                         Some(existing) => henyey_db::queries::PeerRecord::new(
                             existing.next_attempt,
@@ -490,8 +482,8 @@ impl App {
                             henyey_db::queries::PeerRecord::new(now, 0, StoredPeerType::Preferred)
                         }
                     };
-                    db.store_peer(&peer.host, peer.port, record)?;
-                    peers.push(peer);
+                    db.store_peer(&addr.host, addr.port, record)?;
+                    peers.push(addr.clone());
                 }
 
                 // Load persisted peers
@@ -530,14 +522,10 @@ impl App {
                 // Build advertised outbound
                 let mut advertised_outbound = Vec::new();
                 for addr in &known_peers_config {
-                    let peer =
-                        crate::config::parse_peer_address(addr).expect("validated at startup");
-                    advertised_outbound.push(peer);
+                    advertised_outbound.push(addr.clone());
                 }
                 for addr in &preferred_peers_config {
-                    let peer =
-                        crate::config::parse_peer_address(addr).expect("validated at startup");
-                    advertised_outbound.push(peer);
+                    advertised_outbound.push(addr.clone());
                 }
                 let adv_outbound_filter = henyey_db::queries::PeerFilter {
                     max_failures: PEER_MAX_FAILURES_TO_SEND,
