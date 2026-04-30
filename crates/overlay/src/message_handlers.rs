@@ -23,7 +23,7 @@ use crate::{
     item_fetcher::{ItemFetcher, ItemType, PendingRequest},
     PeerId,
 };
-use std::collections::HashMap;
+use henyey_crypto::RandomEvictionCache;
 use std::sync::{Arc, Mutex};
 use stellar_xdr::curr::{
     DontHave, GeneralizedTransactionSet, Hash, MessageType, ScpEnvelope, ScpQuorumSet,
@@ -64,18 +64,6 @@ impl TxSetData {
     }
 }
 
-/// Evict a random entry from the map if it is at or above the given capacity.
-/// Matches stellar-core's random eviction strategy (RandomEvictionCache).
-fn evict_if_full<V>(map: &mut HashMap<Hash, V>, max_size: usize) {
-    if map.len() >= max_size {
-        // Pick a random key to evict using a simple hash of the first key found.
-        // This is not cryptographically random but sufficient for cache eviction.
-        if let Some(key) = map.keys().next().cloned() {
-            map.remove(&key);
-        }
-    }
-}
-
 /// Handler for overlay protocol messages.
 ///
 /// Coordinates message handling, item fetching, and callback dispatch.
@@ -84,10 +72,10 @@ pub struct MessageDispatcher {
     tx_set_fetcher: Arc<ItemFetcher>,
     /// Fetcher for quorum sets.
     quorum_set_fetcher: Arc<ItemFetcher>,
-    /// Cache of received transaction sets.
-    tx_set_cache: Arc<Mutex<HashMap<Hash, TxSetData>>>,
-    /// Cache of received quorum sets.
-    quorum_set_cache: Arc<Mutex<HashMap<Hash, ScpQuorumSet>>>,
+    /// Cache of received transaction sets (random-two-choice eviction, matching stellar-core).
+    tx_set_cache: Arc<Mutex<RandomEvictionCache<Hash, TxSetData>>>,
+    /// Cache of received quorum sets (random-two-choice eviction, matching stellar-core).
+    quorum_set_cache: Arc<Mutex<RandomEvictionCache<Hash, ScpQuorumSet>>>,
     /// Callback when TxSet is received.
     on_tx_set: Option<TxSetCallback>,
     /// Callback when QuorumSet is received.
@@ -102,8 +90,8 @@ impl MessageDispatcher {
         Self {
             tx_set_fetcher: Arc::new(ItemFetcher::with_defaults(ItemType::TxSet)),
             quorum_set_fetcher: Arc::new(ItemFetcher::with_defaults(ItemType::QuorumSet)),
-            tx_set_cache: Arc::new(Mutex::new(HashMap::new())),
-            quorum_set_cache: Arc::new(Mutex::new(HashMap::new())),
+            tx_set_cache: Arc::new(Mutex::new(RandomEvictionCache::new(MAX_CACHE_SIZE))),
+            quorum_set_cache: Arc::new(Mutex::new(RandomEvictionCache::new(MAX_CACHE_SIZE))),
             on_tx_set: None,
             on_quorum_set: None,
             on_envelopes_ready: None,
@@ -168,7 +156,7 @@ impl MessageDispatcher {
 
         // Check if we have this TxSet cached
         {
-            let cache = self.tx_set_cache.lock().unwrap();
+            let mut cache = self.tx_set_cache.lock().unwrap();
             if let Some(tx_set) = cache.get(hash) {
                 match tx_set {
                     TxSetData::Legacy(ts) => {
@@ -204,11 +192,10 @@ impl MessageDispatcher {
             from_peer
         );
 
-        // Cache it (bounded to MAX_CACHE_SIZE, matching stellar-core's RandomEvictionCache)
+        // Cache it (random-two-choice eviction, matching stellar-core's RandomEvictionCache)
         {
             let mut cache = self.tx_set_cache.lock().unwrap();
-            evict_if_full(&mut cache, MAX_CACHE_SIZE);
-            cache.insert(hash.clone(), data.clone());
+            cache.put(hash.clone(), data.clone());
         }
 
         // Notify fetcher
@@ -236,7 +223,7 @@ impl MessageDispatcher {
 
         // Check if we have this QuorumSet cached
         {
-            let cache = self.quorum_set_cache.lock().unwrap();
+            let mut cache = self.quorum_set_cache.lock().unwrap();
             if let Some(qs) = cache.get(hash) {
                 return Some(StellarMessage::ScpQuorumset(qs.clone()));
             }
@@ -261,11 +248,10 @@ impl MessageDispatcher {
             from_peer
         );
 
-        // Cache it (bounded to MAX_CACHE_SIZE, matching stellar-core's RandomEvictionCache)
+        // Cache it (random-two-choice eviction, matching stellar-core's RandomEvictionCache)
         {
             let mut cache = self.quorum_set_cache.lock().unwrap();
-            evict_if_full(&mut cache, MAX_CACHE_SIZE);
-            cache.insert(hash.clone(), quorum_set.clone());
+            cache.put(hash.clone(), quorum_set.clone());
         }
 
         // Notify fetcher
@@ -350,42 +336,40 @@ impl MessageDispatcher {
         self.quorum_set_fetcher.get_pending_requests(peers)
     }
 
-    /// Check if a TxSet is cached.
+    /// Check if a TxSet is cached (does not update recency).
     pub fn has_tx_set(&self, hash: &Hash) -> bool {
         let cache = self.tx_set_cache.lock().unwrap();
-        cache.contains_key(hash)
+        cache.exists(hash)
     }
 
-    /// Check if a QuorumSet is cached.
+    /// Check if a QuorumSet is cached (does not update recency).
     pub fn has_quorum_set(&self, hash: &Hash) -> bool {
         let cache = self.quorum_set_cache.lock().unwrap();
-        cache.contains_key(hash)
+        cache.exists(hash)
     }
 
-    /// Get a cached TxSet.
+    /// Get a cached TxSet (updates recency, matching stellar-core's maybeGet).
     pub fn get_tx_set(&self, hash: &Hash) -> Option<TxSetData> {
-        let cache = self.tx_set_cache.lock().unwrap();
+        let mut cache = self.tx_set_cache.lock().unwrap();
         cache.get(hash).cloned()
     }
 
-    /// Get a cached QuorumSet.
+    /// Get a cached QuorumSet (updates recency, matching stellar-core's maybeGet).
     pub fn get_quorum_set(&self, hash: &Hash) -> Option<ScpQuorumSet> {
-        let cache = self.quorum_set_cache.lock().unwrap();
+        let mut cache = self.quorum_set_cache.lock().unwrap();
         cache.get(hash).cloned()
     }
 
-    /// Store a TxSet in the cache, evicting a random entry if at capacity.
+    /// Store a TxSet in the cache, evicting via random-two-choice if at capacity.
     pub fn cache_tx_set(&self, hash: Hash, data: TxSetData) {
         let mut cache = self.tx_set_cache.lock().unwrap();
-        evict_if_full(&mut cache, MAX_CACHE_SIZE);
-        cache.insert(hash, data);
+        cache.put(hash, data);
     }
 
-    /// Store a QuorumSet in the cache, evicting a random entry if at capacity.
+    /// Store a QuorumSet in the cache, evicting via random-two-choice if at capacity.
     pub fn cache_quorum_set(&self, hash: Hash, quorum_set: ScpQuorumSet) {
         let mut cache = self.quorum_set_cache.lock().unwrap();
-        evict_if_full(&mut cache, MAX_CACHE_SIZE);
-        cache.insert(hash, quorum_set);
+        cache.put(hash, quorum_set);
     }
 
     /// Get statistics.
