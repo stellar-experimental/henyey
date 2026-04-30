@@ -132,6 +132,7 @@ pub mod envelope_utils;
 mod error;
 mod events;
 pub(crate) mod fee_bump;
+pub mod fees;
 mod frame;
 pub mod frozen_keys;
 pub(crate) mod live_execution;
@@ -203,6 +204,9 @@ pub use fee_bump::{
     verify_inner_signatures, wrap_inner_result_in_fee_bump, FeeBumpError, FeeBumpFrame,
     FeeBumpMutableTransactionResult,
 };
+
+// Re-export fee newtypes
+pub use fees::{FeeRate, InclusionFee, ResourceFee, TotalFee};
 
 // Re-export live execution types
 pub use live_execution::{

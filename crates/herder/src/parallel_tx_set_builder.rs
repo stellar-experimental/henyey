@@ -503,7 +503,7 @@ fn detect_conflicts(txs: &[HashedTx]) -> Vec<BitSet> {
 
 /// Inclusion fee for a transaction (fee - minimum resource fee).
 fn tx_inclusion_fee(tx: &TransactionEnvelope) -> i64 {
-    crate::tx_set_utils::envelope_inclusion_fee(tx)
+    crate::tx_set_utils::envelope_inclusion_fee(tx).as_i64()
 }
 
 /// Build parallel Soroban phase for a fixed stage count.
@@ -2109,7 +2109,7 @@ mod stellar_core_parity_tests {
             .iter()
             .flat_map(|s| s.iter())
             .flat_map(|c| c.iter())
-            .map(|tx| crate::tx_set_utils::envelope_inclusion_fee(tx.envelope()))
+            .map(|tx| crate::tx_set_utils::envelope_inclusion_fee(tx.envelope()).as_i64())
             .min()
             .unwrap_or(LEDGER_BASE_FEE)
     }

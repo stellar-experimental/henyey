@@ -2030,7 +2030,7 @@ impl ScpDriver {
         tx_set
             .iter_transactions()
             // Saturate to prevent wrapping on adversarial fee values.
-            .map(|env| crate::tx_set_utils::envelope_inclusion_fee(env))
+            .map(|env| crate::tx_set_utils::envelope_inclusion_fee(env).as_i64())
             .fold(0i64, i64::saturating_add)
     }
 
@@ -2069,7 +2069,7 @@ impl ScpDriver {
             // Saturate to prevent wrapping on adversarial fee values.
             return tx_set
                 .iter_transactions()
-                .map(|env| crate::tx_set_utils::envelope_fee(env))
+                .map(|env| crate::tx_set_utils::envelope_fee(env).as_i64())
                 .fold(0i64, i64::saturating_add);
         };
         let stellar_xdr::curr::GeneralizedTransactionSet::V1(set_v1) = gen;
@@ -2090,13 +2090,15 @@ impl ScpDriver {
     fn tx_applying_fee(env: &stellar_xdr::curr::TransactionEnvelope, base_fee: Option<i64>) -> i64 {
         let full_fee = crate::tx_set_utils::envelope_fee(env);
         let Some(bf) = base_fee else {
-            return full_fee;
+            return full_fee.as_i64();
         };
         let inclusion_fee = crate::tx_set_utils::envelope_inclusion_fee(env);
-        let resource_fee = full_fee.saturating_sub(inclusion_fee);
+        let resource_fee = full_fee.saturating_sub_inclusion(inclusion_fee);
         let num_ops = std::cmp::max(1, crate::tx_set_utils::envelope_num_ops(env) as i64);
         let adjusted_fee = bf.saturating_mul(num_ops);
-        resource_fee.saturating_add(std::cmp::min(inclusion_fee, adjusted_fee))
+        resource_fee
+            .as_i64()
+            .saturating_add(std::cmp::min(inclusion_fee.as_i64(), adjusted_fee))
     }
 
     /// Get number of operations from a transaction envelope.

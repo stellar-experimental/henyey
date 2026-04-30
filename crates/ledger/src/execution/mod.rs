@@ -1711,12 +1711,12 @@ impl TransactionExecutor {
         if frame.is_fee_bump() {
             tracing::debug!(
                 is_fee_bump = true,
-                total_fee = frame.total_fee(),
+                total_fee = frame.total_fee().as_i64(),
                 inner_fee = frame.inner_fee(),
-                inclusion_fee = frame.inclusion_fee(),
+                inclusion_fee = frame.inclusion_fee().as_i64(),
                 base_fee = base_fee,
                 operation_count = frame.operation_count(),
-                min_inclusion_fee = frame.min_inclusion_fee(base_fee as i64),
+                min_inclusion_fee = frame.min_inclusion_fee(base_fee as i64).as_i64(),
                 fee_charged = fee,
                 "Fee bump transaction fee calculation"
             );
@@ -1840,6 +1840,7 @@ impl TransactionExecutor {
                 .unwrap_or((0, 0));
                 pre_frame
                     .declared_soroban_resource_fee()
+                    .as_i64()
                     .saturating_sub(non_refundable_fee)
             } else {
                 0
@@ -1925,7 +1926,7 @@ impl TransactionExecutor {
                 0,
             )
             .unwrap_or((0, 0));
-            let declared_fee = frame.declared_soroban_resource_fee();
+            let declared_fee = frame.declared_soroban_resource_fee().as_i64();
             let max_refundable_fee = declared_fee.saturating_sub(non_refundable_fee);
             Some(RefundableFeeTracker::new(
                 non_refundable_fee,

@@ -543,7 +543,7 @@ pub fn apply_fee_only(
     delta: &mut TxChangeLog,
     _source_account: &AccountEntry,
 ) -> Result<()> {
-    let fee = frame.total_fee();
+    let fee = frame.total_fee().as_i64();
     delta.add_fee(fee);
     Ok(())
 }

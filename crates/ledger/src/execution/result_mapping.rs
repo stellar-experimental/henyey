@@ -156,7 +156,7 @@ pub fn build_tx_result_pair(
                 let adjusted_fee = base_fee * std::cmp::max(1, num_inner_ops);
                 if frame.is_soroban() {
                     // For Soroban transactions, include the declared resource fee
-                    let resource_fee = frame.declared_soroban_resource_fee();
+                    let resource_fee = frame.declared_soroban_resource_fee().as_i64();
                     let inner_fee = frame.inner_fee() as i64;
                     let inclusion_fee = inner_fee - resource_fee;
                     let computed_fee = resource_fee + std::cmp::min(inclusion_fee, adjusted_fee);

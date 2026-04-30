@@ -214,16 +214,16 @@ fn summary_for_set(
         if let Some(base) = base_fee {
             let adjusted = base.saturating_mul(frame.operation_count().max(1) as i64);
             let resource_fee = if frame.is_soroban() {
-                frame.declared_soroban_resource_fee()
+                frame.declared_soroban_resource_fee().as_i64()
             } else {
                 0
             };
-            total_fees += resource_fee + frame.inclusion_fee().min(adjusted);
+            total_fees += resource_fee + frame.inclusion_fee().as_i64().min(adjusted);
         } else {
-            total_fees += frame.total_fee();
+            total_fees += frame.total_fee().as_i64();
         }
 
-        total_inclusion_fees += frame.inclusion_fee();
+        total_inclusion_fees += frame.inclusion_fee().as_i64();
 
         if frame.is_soroban() {
             soroban_ops += frame.operation_count() as i64;

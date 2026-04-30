@@ -310,7 +310,7 @@ impl FeeBumpFrame {
     }
 
     /// Get the declared Soroban resource fee.
-    pub fn declared_soroban_resource_fee(&self) -> i64 {
+    pub fn declared_soroban_resource_fee(&self) -> crate::fees::ResourceFee {
         self.inner_frame.declared_soroban_resource_fee()
     }
 
@@ -353,26 +353,26 @@ pub fn validate_fee_bump(
     let outer_min_inclusion_fee = frame.frame().min_inclusion_fee(context.base_fee as i64);
     let outer_inclusion_fee = frame.frame().inclusion_fee();
 
-    if outer_inclusion_fee < outer_min_inclusion_fee {
+    if outer_inclusion_fee.as_i64() < outer_min_inclusion_fee.as_i64() {
         return Err(FeeBumpError::InsufficientOuterFee {
             outer_fee: frame.outer_fee(),
-            required_min: outer_min_inclusion_fee,
+            required_min: outer_min_inclusion_fee.as_i64(),
         });
     }
 
     let inner_inclusion_fee = frame.inner_frame().inclusion_fee();
-    if inner_inclusion_fee >= 0 {
+    if inner_inclusion_fee.as_i64() >= 0 {
         let inner_min_inclusion_fee = frame
             .inner_frame()
             .min_inclusion_fee(context.base_fee as i64);
-        let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
-        let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
+        let v1 = outer_inclusion_fee.as_i64() as i128 * inner_min_inclusion_fee.as_i64() as i128;
+        let v2 = inner_inclusion_fee.as_i64() as i128 * outer_min_inclusion_fee.as_i64() as i128;
         if v1 < v2 {
-            let required_outer = ((v2 + inner_min_inclusion_fee as i128 - 1)
-                / inner_min_inclusion_fee as i128) as i64;
+            let required_outer = ((v2 + inner_min_inclusion_fee.as_i64() as i128 - 1)
+                / inner_min_inclusion_fee.as_i64() as i128) as i64;
             return Err(FeeBumpError::InsufficientOuterFee {
                 outer_fee: frame.outer_fee(),
-                required_min: std::cmp::max(outer_min_inclusion_fee, required_outer),
+                required_min: std::cmp::max(outer_min_inclusion_fee.as_i64(), required_outer),
             });
         }
     } else {
@@ -385,7 +385,7 @@ pub fn validate_fee_bump(
     // Validate Soroban resource_fee upper bound (XDRProvidesValidFee).
     // stellar-core: TransactionFrame.cpp:1773
     if frame.inner_frame().is_soroban() {
-        let resource_fee = frame.inner_frame().declared_soroban_resource_fee();
+        let resource_fee = frame.inner_frame().declared_soroban_resource_fee().as_i64();
         if resource_fee < 0 || resource_fee > crate::validation::MAX_RESOURCE_FEE {
             return Err(FeeBumpError::InvalidInnerTxType);
         }

@@ -458,8 +458,11 @@ pub fn validate_fee(
     let required = frame.min_inclusion_fee(context.base_fee as i64);
     let provided = frame.inclusion_fee();
 
-    if provided < required {
-        return Err(ValidationError::InsufficientFee { required, provided });
+    if provided.as_i64() < required.as_i64() {
+        return Err(ValidationError::InsufficientFee {
+            required: required.as_i64(),
+            provided: provided.as_i64(),
+        });
     }
 
     Ok(())
@@ -793,7 +796,7 @@ pub fn validate_full(
 
     // Check account balance can cover fee
     let available_balance = source_account.balance;
-    let fee = frame.total_fee();
+    let fee = frame.total_fee().as_i64();
     if available_balance < fee {
         errors.push(ValidationError::InsufficientBalance);
     }
@@ -1060,7 +1063,7 @@ pub fn check_valid_pre_seq_num_with_config(
     // 1b. XDRProvidesValidFee: Soroban txs must have resource_fee in [0, MAX_RESOURCE_FEE].
     // stellar-core: TransactionFrame.cpp:1763-1779
     if frame.is_soroban() {
-        let resource_fee = frame.declared_soroban_resource_fee();
+        let resource_fee = frame.declared_soroban_resource_fee().as_i64();
         if resource_fee < 0 || resource_fee > MAX_RESOURCE_FEE {
             return Err(PreSeqNumError::Malformed(
                 "Soroban resource fee out of valid range".to_string(),
@@ -1112,7 +1115,9 @@ pub fn check_valid_pre_seq_num_with_config(
 
         // 4c. Resource fee bound (non-fee-bump only)
         // stellar-core commonValidPreSeqNum:1376-1393
-        if !frame.is_fee_bump() && frame.declared_soroban_resource_fee() > frame.total_fee() {
+        if !frame.is_fee_bump()
+            && frame.declared_soroban_resource_fee().as_i64() > frame.total_fee().as_i64()
+        {
             return Err(PreSeqNumError::SorobanInvalid(
                 "soroban resource fee exceeds full transaction fee".to_string(),
             ));

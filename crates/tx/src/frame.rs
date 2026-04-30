@@ -319,22 +319,25 @@ impl TransactionFrame {
     }
 
     /// Get the total fee (for fee bump, this is the outer fee).
-    pub fn total_fee(&self) -> i64 {
-        match &*self.envelope {
+    pub fn total_fee(&self) -> crate::fees::TotalFee {
+        let raw = match &*self.envelope {
             TransactionEnvelope::TxV0(env) => env.tx.fee as i64,
             TransactionEnvelope::Tx(env) => env.tx.fee as i64,
             TransactionEnvelope::TxFeeBump(env) => env.tx.fee,
-        }
+        };
+        crate::fees::TotalFee::new(raw)
     }
 
     /// Get the declared Soroban resource fee (0 for non-Soroban).
-    pub fn declared_soroban_resource_fee(&self) -> i64 {
-        if !self.is_soroban() {
-            return 0;
-        }
-        self.soroban_data()
-            .map(|data| data.resource_fee)
-            .unwrap_or(0)
+    pub fn declared_soroban_resource_fee(&self) -> crate::fees::ResourceFee {
+        let raw = if !self.is_soroban() {
+            0
+        } else {
+            self.soroban_data()
+                .map(|data| data.resource_fee)
+                .unwrap_or(0)
+        };
+        crate::fees::ResourceFee::new(raw)
     }
 
     /// Get the inclusion fee (total fee minus Soroban resource fee).
@@ -343,16 +346,16 @@ impl TransactionFrame {
     /// `declared_soroban_resource_fee() <= total_fee()` before relying on this
     /// value for fee arithmetic.  A negative result is possible for fee-bump
     /// inner transactions (p23+) where the outer envelope covers the shortfall.
-    pub fn inclusion_fee(&self) -> i64 {
+    pub fn inclusion_fee(&self) -> crate::fees::InclusionFee {
         if self.is_soroban() {
             let resource_fee = self.declared_soroban_resource_fee();
-            if resource_fee < 0 {
+            if resource_fee.as_i64() < 0 {
                 panic!("TransactionFrame::inclusion_fee: negative resource fee");
             }
-            return self.total_fee() - resource_fee;
+            return self.total_fee().wrapping_sub_resource(resource_fee);
         }
 
-        self.total_fee()
+        crate::fees::InclusionFee::new(self.total_fee().as_i64())
     }
 
     /// Get the refundable fee for Soroban transactions.
@@ -372,7 +375,7 @@ impl TransactionFrame {
         // The refundable fee is the Soroban resource fee.
         // The inclusion fee is non-refundable; the resource fee covers compute,
         // storage, and other costs that may be partially refunded.
-        let resource_fee = self.declared_soroban_resource_fee();
+        let resource_fee = self.declared_soroban_resource_fee().as_i64();
         if resource_fee > 0 {
             Some(resource_fee)
         } else {
@@ -418,8 +421,10 @@ impl TransactionFrame {
     /// Returns `base_fee * max(1, resource_operation_count())` using
     /// saturating arithmetic.  Matches stellar-core's
     /// `getMinInclusionFee()` (`TransactionUtils.cpp`).
-    pub fn min_inclusion_fee(&self, base_fee: i64) -> i64 {
-        base_fee.saturating_mul(std::cmp::max(1, self.resource_operation_count() as i64))
+    pub fn min_inclusion_fee(&self, base_fee: i64) -> crate::fees::InclusionFee {
+        crate::fees::InclusionFee::new(
+            base_fee.saturating_mul(std::cmp::max(1, self.resource_operation_count() as i64)),
+        )
     }
 
     /// Fee to charge when applying this transaction.
@@ -431,12 +436,13 @@ impl TransactionFrame {
     /// /*applying=*/true)` and
     /// `FeeBumpTransactionFrame::getFee(header, baseFee, /*applying=*/true)`.
     pub fn fee_to_charge(&self, base_fee: i64) -> i64 {
-        let adjusted_fee = self.min_inclusion_fee(base_fee);
+        let adjusted_fee = self.min_inclusion_fee(base_fee).as_i64();
         if self.is_soroban() {
             self.declared_soroban_resource_fee()
-                .saturating_add(std::cmp::min(self.inclusion_fee(), adjusted_fee))
+                .as_i64()
+                .saturating_add(std::cmp::min(self.inclusion_fee().as_i64(), adjusted_fee))
         } else {
-            std::cmp::min(self.inclusion_fee(), adjusted_fee)
+            std::cmp::min(self.inclusion_fee().as_i64(), adjusted_fee)
         }
     }
 
@@ -1070,24 +1076,24 @@ mod tests {
     fn test_inclusion_fee_classic() {
         let envelope = create_test_transaction();
         let frame = TransactionFrame::from_owned(envelope);
-        assert_eq!(frame.declared_soroban_resource_fee(), 0);
-        assert_eq!(frame.inclusion_fee(), frame.total_fee());
+        assert_eq!(frame.declared_soroban_resource_fee().as_i64(), 0);
+        assert_eq!(frame.inclusion_fee().as_i64(), frame.total_fee().as_i64());
     }
 
     #[test]
     fn test_inclusion_fee_soroban() {
         let envelope = create_soroban_transaction_with_fees(200, 1000);
         let frame = TransactionFrame::from_owned(envelope);
-        assert_eq!(frame.declared_soroban_resource_fee(), 200);
-        assert_eq!(frame.inclusion_fee(), 800);
+        assert_eq!(frame.declared_soroban_resource_fee().as_i64(), 200);
+        assert_eq!(frame.inclusion_fee().as_i64(), 800);
     }
 
     #[test]
     fn test_inclusion_fee_fee_bump_soroban() {
         let envelope = create_fee_bump_soroban(600, 150, 900);
         let frame = TransactionFrame::from_owned(envelope);
-        assert_eq!(frame.declared_soroban_resource_fee(), 150);
-        assert_eq!(frame.inclusion_fee(), 750);
+        assert_eq!(frame.declared_soroban_resource_fee().as_i64(), 150);
+        assert_eq!(frame.inclusion_fee().as_i64(), 750);
     }
 
     /// When resource_fee > total_fee, inclusion_fee returns a negative value.
@@ -1099,10 +1105,10 @@ mod tests {
         // Create a Soroban tx with resource_fee=500, total_fee=200
         let envelope = create_soroban_transaction_with_fees(500, 200);
         let frame = TransactionFrame::from_owned(envelope);
-        assert_eq!(frame.declared_soroban_resource_fee(), 500);
-        assert_eq!(frame.total_fee(), 200);
+        assert_eq!(frame.declared_soroban_resource_fee().as_i64(), 500);
+        assert_eq!(frame.total_fee().as_i64(), 200);
         // inclusion_fee = 200 - 500 = -300 (negative, must be caught by validation)
-        assert_eq!(frame.inclusion_fee(), -300);
+        assert_eq!(frame.inclusion_fee().as_i64(), -300);
     }
 
     /// Test TransactionFrame::with_network creates frame with network ID.
@@ -1233,7 +1239,7 @@ mod tests {
     fn test_total_fee() {
         let envelope = create_test_transaction();
         let frame = TransactionFrame::from_owned(envelope);
-        assert_eq!(frame.total_fee(), 100);
+        assert_eq!(frame.total_fee().as_i64(), 100);
     }
 
     #[test]
@@ -1306,14 +1312,14 @@ mod tests {
     fn test_declared_soroban_resource_fee_zero_for_classic() {
         let envelope = create_test_transaction();
         let frame = TransactionFrame::from_owned(envelope);
-        assert_eq!(frame.declared_soroban_resource_fee(), 0);
+        assert_eq!(frame.declared_soroban_resource_fee().as_i64(), 0);
     }
 
     #[test]
     fn test_declared_soroban_resource_fee_for_soroban() {
         let envelope = create_soroban_transaction_with_fees(300, 500);
         let frame = TransactionFrame::from_owned(envelope);
-        assert_eq!(frame.declared_soroban_resource_fee(), 300);
+        assert_eq!(frame.declared_soroban_resource_fee().as_i64(), 300);
     }
 
     #[test]
@@ -2003,9 +2009,9 @@ mod tests {
     fn test_min_inclusion_fee_classic() {
         // Regular 1-op classic tx: min_inclusion_fee = 100 * 1 = 100
         let frame = TransactionFrame::from_owned(create_test_transaction());
-        assert_eq!(frame.min_inclusion_fee(100), 100);
-        assert_eq!(frame.min_inclusion_fee(200), 200);
-        assert_eq!(frame.min_inclusion_fee(0), 0);
+        assert_eq!(frame.min_inclusion_fee(100).as_i64(), 100);
+        assert_eq!(frame.min_inclusion_fee(200).as_i64(), 200);
+        assert_eq!(frame.min_inclusion_fee(0).as_i64(), 0);
     }
 
     #[test]
@@ -2013,7 +2019,7 @@ mod tests {
         // Fee-bump: resource_operation_count = inner_ops + 1 = 2
         let frame = TransactionFrame::from_owned(create_classic_fee_bump(100, 500));
         assert_eq!(frame.resource_operation_count(), 2);
-        assert_eq!(frame.min_inclusion_fee(100), 200); // 100 * 2
+        assert_eq!(frame.min_inclusion_fee(100).as_i64(), 200); // 100 * 2
     }
 
     #[test]
@@ -2021,14 +2027,14 @@ mod tests {
         // Soroban: 1 op, resource_operation_count = 1
         let frame = TransactionFrame::from_owned(create_soroban_transaction_with_fees(50, 200));
         assert_eq!(frame.resource_operation_count(), 1);
-        assert_eq!(frame.min_inclusion_fee(100), 100);
+        assert_eq!(frame.min_inclusion_fee(100).as_i64(), 100);
     }
 
     #[test]
     fn test_min_inclusion_fee_saturating() {
         let frame = TransactionFrame::from_owned(create_test_transaction());
         // Should saturate instead of overflowing
-        assert_eq!(frame.min_inclusion_fee(i64::MAX), i64::MAX);
+        assert_eq!(frame.min_inclusion_fee(i64::MAX).as_i64(), i64::MAX);
     }
 
     #[test]

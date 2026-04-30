@@ -89,19 +89,20 @@ impl HashedTx {
 /// Get the declared fee from a transaction envelope.
 ///
 /// For fee-bump transactions, returns the outer (bumped) fee.
-pub(crate) fn envelope_fee(env: &TransactionEnvelope) -> i64 {
-    match env {
+pub(crate) fn envelope_fee(env: &TransactionEnvelope) -> henyey_tx::TotalFee {
+    let raw = match env {
         TransactionEnvelope::TxV0(e) => e.tx.fee as i64,
         TransactionEnvelope::Tx(e) => e.tx.fee as i64,
         TransactionEnvelope::TxFeeBump(e) => e.tx.fee,
-    }
+    };
+    henyey_tx::TotalFee::new(raw)
 }
 
 /// Get the fee bid used for transaction ordering and surge pricing.
 ///
 /// For Soroban transactions this is the inclusion fee (full fee minus resource fee),
 /// matching stellar-core `TransactionFrameBase::getInclusionFee()`.
-pub(crate) fn envelope_inclusion_fee(env: &TransactionEnvelope) -> i64 {
+pub(crate) fn envelope_inclusion_fee(env: &TransactionEnvelope) -> henyey_tx::InclusionFee {
     let resource_fee = match env {
         TransactionEnvelope::TxV0(_) => 0,
         TransactionEnvelope::Tx(env) => match &env.tx.ext {
@@ -115,7 +116,7 @@ pub(crate) fn envelope_inclusion_fee(env: &TransactionEnvelope) -> i64 {
             },
         },
     };
-    envelope_fee(env).saturating_sub(resource_fee)
+    envelope_fee(env).saturating_sub_resource(henyey_tx::ResourceFee::new(resource_fee))
 }
 
 /// Get the number of operations from a transaction envelope.
@@ -893,7 +894,7 @@ fn get_invalid_hashed_core(
         // Transaction passed basic validation — accumulate fee for fee source.
         if fee_balance_provider.is_some() {
             let fee_source = frame.fee_source_account_id();
-            let full_fee = frame.total_fee();
+            let full_fee = frame.total_fee().as_i64();
             let entry = account_fee_map.entry(fee_source.clone()).or_insert(0i64);
             // Saturating add to avoid overflow (matches stellar-core).
             *entry = entry.saturating_add(full_fee);
@@ -1211,13 +1212,13 @@ fn get_min_inclusion_fee(
     env: &TransactionEnvelope,
     lcl_base_fee: u32,
     component_base_fee: Option<i64>,
-) -> i64 {
+) -> henyey_tx::InclusionFee {
     let effective_base_fee = match component_base_fee {
         Some(bf) => std::cmp::max(lcl_base_fee as i64, bf),
         None => lcl_base_fee as i64,
     };
     let num_ops = std::cmp::max(1, envelope_num_ops(env) as i64);
-    effective_base_fee.saturating_mul(num_ops)
+    henyey_tx::InclusionFee::new(effective_base_fee.saturating_mul(num_ops))
 }
 
 /// Validate the classic (non-Soroban) transaction phase.
@@ -3049,7 +3050,7 @@ mod tests {
     fn test_envelope_fee_bump_returns_outer_fee() {
         let inner = make_multi_op_envelope(2, 200);
         let fee_bump = make_fee_bump_envelope(inner, 500);
-        assert_eq!(envelope_fee(&fee_bump), 500);
+        assert_eq!(envelope_fee(&fee_bump).as_i64(), 500);
     }
 
     #[test]
@@ -3057,7 +3058,7 @@ mod tests {
         // Classic fee-bump: no resource_fee, so inclusion_fee = full fee
         let inner = make_multi_op_envelope(2, 200);
         let fee_bump = make_fee_bump_envelope(inner, 500);
-        assert_eq!(envelope_inclusion_fee(&fee_bump), 500);
+        assert_eq!(envelope_inclusion_fee(&fee_bump).as_i64(), 500);
     }
 
     // ========================================================================

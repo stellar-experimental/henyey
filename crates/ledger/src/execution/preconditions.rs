@@ -133,7 +133,7 @@ impl TransactionExecutor {
             let outer_min_inclusion_fee = frame.min_inclusion_fee(base_fee as i64);
             let outer_inclusion_fee = frame.inclusion_fee();
 
-            if outer_inclusion_fee < outer_min_inclusion_fee {
+            if outer_inclusion_fee.as_i64() < outer_min_inclusion_fee.as_i64() {
                 return Ok(Err(fee_bump_outer_fail(
                     TransactionResultCode::TxInsufficientFee,
                     "Insufficient fee",
@@ -149,8 +149,8 @@ impl TransactionExecutor {
                         let inner_frame =
                             TransactionFrame::from_owned_with_network(inner_env, self.network_id);
                         (
-                            inner_frame.inclusion_fee(),
-                            inner_frame.min_inclusion_fee(base_fee as i64),
+                            inner_frame.inclusion_fee().as_i64(),
+                            inner_frame.min_inclusion_fee(base_fee as i64).as_i64(),
                             inner_frame.is_soroban(),
                         )
                     }
@@ -159,8 +159,8 @@ impl TransactionExecutor {
             };
 
             if inner_inclusion_fee >= 0 {
-                let v1 = outer_inclusion_fee as i128 * inner_min_inclusion_fee as i128;
-                let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee as i128;
+                let v1 = outer_inclusion_fee.as_i64() as i128 * inner_min_inclusion_fee as i128;
+                let v2 = inner_inclusion_fee as i128 * outer_min_inclusion_fee.as_i64() as i128;
                 if v1 < v2 {
                     return Ok(Err(fee_bump_outer_fail(
                         TransactionResultCode::TxInsufficientFee,
@@ -189,7 +189,9 @@ impl TransactionExecutor {
             // Parity: stellar-core TransactionFrame.cpp commonValidPreSeqNum —
             // for p23+ non-fee-bump txs, rejects when sorobanData.resourceFee > getFullFee().
             // Fee-bump inner txs skip this check (handled by the fee-bump branch above).
-            if frame.is_soroban() && frame.declared_soroban_resource_fee() > frame.total_fee() {
+            if frame.is_soroban()
+                && frame.declared_soroban_resource_fee().as_i64() > frame.total_fee().as_i64()
+            {
                 return Ok(Err(pre_seq_fail(
                     TransactionResultCode::TxSorobanInvalid,
                     "Soroban resource fee exceeds full transaction fee",

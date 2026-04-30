@@ -415,14 +415,14 @@ impl QueuedTransaction {
 
     /// Extract full fee, inclusion fee, and operation count from the envelope.
     fn extract_fees_and_ops(envelope: &TransactionEnvelope) -> Result<(u64, i64, u32)> {
-        let fee = crate::tx_set_utils::envelope_fee(envelope);
+        let fee = crate::tx_set_utils::envelope_fee(envelope).as_i64();
         if fee < 0 {
             return Err(HerderError::Internal(format!(
                 "Negative declared fee for transaction: {}",
                 fee
             )));
         }
-        let inclusion_fee = crate::tx_set_utils::envelope_inclusion_fee(envelope);
+        let inclusion_fee = crate::tx_set_utils::envelope_inclusion_fee(envelope).as_i64();
         if inclusion_fee < 0 {
             return Err(HerderError::Internal(format!(
                 "Negative inclusion fee for transaction: {}",
@@ -3323,7 +3323,7 @@ mod tests {
     }
 
     fn envelope_fee(envelope: &TransactionEnvelope) -> u64 {
-        crate::tx_set_utils::envelope_fee(envelope) as u64
+        crate::tx_set_utils::envelope_fee(envelope).as_i64() as u64
     }
 
     fn envelope_seq(envelope: &TransactionEnvelope) -> i64 {
