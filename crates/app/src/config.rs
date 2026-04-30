@@ -72,7 +72,8 @@ const DEFAULT_PEER_PORT: u16 = 11625;
 /// Validation rules:
 /// - No whitespace allowed anywhere in the string
 /// - At most one `:` separator (IPv6 is intentionally unsupported)
-/// - Host part must be non-empty
+/// - Host part must be non-empty and contain only alphanumeric, `.`, or `-`
+///   (matching stellar-core's `PeerBareAddress::resolve()` regex)
 /// - Port (if present) must be a valid u16 in range 1..=65535
 /// - If no port is specified, defaults to 11625
 pub(crate) fn parse_peer_address(value: &str) -> Result<PeerAddress, String> {
@@ -83,25 +84,39 @@ pub(crate) fn parse_peer_address(value: &str) -> Result<PeerAddress, String> {
         return Err("address contains whitespace".to_string());
     }
     let parts: Vec<&str> = value.split(':').collect();
-    match parts.len() {
-        1 => Ok(PeerAddress::new(parts[0], DEFAULT_PEER_PORT)),
+    let host = parts[0];
+    let port = match parts.len() {
+        1 => DEFAULT_PEER_PORT,
         2 => {
-            if parts[0].is_empty() {
-                return Err("host part is empty".to_string());
-            }
             if parts[1].is_empty() {
                 return Err("port part is empty".to_string());
             }
-            let port: u16 = parts[1]
+            let p: u16 = parts[1]
                 .parse()
                 .map_err(|_| format!("invalid port \"{}\"", parts[1]))?;
-            if port == 0 {
+            if p == 0 {
                 return Err("port must be > 0".to_string());
             }
-            Ok(PeerAddress::new(parts[0], port))
+            p
         }
-        _ => Err("too many ':' separators (IPv6 is not supported)".to_string()),
+        _ => return Err("too many ':' separators (IPv6 is not supported)".to_string()),
+    };
+
+    if host.is_empty() {
+        return Err("host part is empty".to_string());
     }
+    // Match stellar-core's PeerBareAddress::resolve() regex: [[:alnum:].-]+
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return Err(format!(
+            "host \"{}\" contains invalid characters (only alphanumeric, '.', '-' allowed)",
+            host
+        ));
+    }
+
+    Ok(PeerAddress::new(host, port))
 }
 
 /// Main application configuration.
@@ -3952,6 +3967,13 @@ name = "test"
         // Too many colons (IPv6-like)
         assert!(parse_peer_address("host:1:2").is_err());
         assert!(parse_peer_address("::1").is_err());
+
+        // Invalid hostname characters (matching stellar-core PeerBareAddress regex)
+        assert!(parse_peer_address("foo/bar:11625").is_err());
+        assert!(parse_peer_address("[::1]:11625").is_err());
+        assert!(parse_peer_address("host_name:11625").is_err());
+        assert!(parse_peer_address("host@name:11625").is_err());
+        assert!(parse_peer_address("héllo:11625").is_err());
     }
 
     #[test]
