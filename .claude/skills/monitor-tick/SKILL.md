@@ -688,15 +688,16 @@ SCP, quorum, herder_state, histogram p99 alerts, and ratio checks.
 
 If they differ (origin/main is ahead):
 
-1. **Cool-down guard**: if node uptime is `< 30m` AND `CRASH_RECOVERY=no` (i.e.
+1. **Cool-down guard**: if node uptime is `< 60m` AND `CRASH_RECOVERY=no` (i.e.
    the previous tick deployed cleanly), SKIP DEPLOY this tick. Report:
-   `DEPLOY DEFERRED (cool-down: uptime=<X>m < 30m)`. Rationale: every restart
+   `DEPLOY DEFERRED (cool-down: uptime=<X>m < 60m)`. Rationale: every restart
    costs ~1-2m of validation downtime + brief peer reconnect. Deploying multiple
    commits within minutes thrashes the validator without giving each version
-   time to surface issues. The 30m floor was set by operator (#1944). Crash-
-   recovery restarts are exempt because they're not voluntary deploys. Urgent
-   fixes can override by killing the node manually before the next tick — the
-   normal startup path will pick up the latest origin/main.
+   time to surface issues. The 60m floor was raised from the original 30m
+   (#1944) on 2026-04-30 after observing too many quick-cycle deploys per day.
+   Crash-recovery restarts are exempt because they're not voluntary deploys.
+   Urgent fixes can override by killing the node manually before the next
+   tick — the normal startup path will pick up the latest origin/main.
 2. Check CI status on origin/main: `gh run list --branch main --limit 3 --json conclusion --jq '.[].conclusion'`.
    If any recent run has conclusion `failure`, do NOT deploy — route the failure
    through check (11) and wait.
