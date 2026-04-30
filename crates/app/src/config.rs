@@ -3560,4 +3560,75 @@ name = "test"
             );
         }
     }
+
+    #[test]
+    fn test_validation_rejects_invalid_preferred_peer_keys() {
+        // Completely invalid string
+        let mut config = AppConfig::default();
+        config.overlay.preferred_peer_keys = vec!["not-a-valid-key".to_string()];
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid preferred_peer_keys entry"),
+            "expected error about invalid preferred_peer_keys"
+        );
+
+        // Valid G... prefix but truncated (invalid checksum/length)
+        let mut config = AppConfig::default();
+        config.overlay.preferred_peer_keys = vec!["GAAAAAA".to_string()];
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid preferred_peer_keys entry"),
+            "expected error about invalid preferred_peer_keys for truncated key"
+        );
+    }
+
+    #[test]
+    fn test_validation_accepts_valid_preferred_peer_keys() {
+        let mut config = AppConfig::default();
+        // Known valid public key (all-A with valid checksum)
+        config.overlay.preferred_peer_keys =
+            vec!["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF".to_string()];
+        config.overlay.preferred_peers_only = true;
+
+        let result = config.validate();
+        // Should not fail on preferred_peer_keys or preferred_peers_only
+        if let Err(e) = &result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("preferred_peer_keys"),
+                "unexpected preferred_peer_keys error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_preferred_peer_keys_parsing_consistency() {
+        // The validate() path uses henyey_crypto::PublicKey::from_strkey() (stricter: curve check).
+        // The start_overlay() path uses henyey_overlay::PeerId::from_strkey() (strkey only).
+        // Any key passing the stricter validate() must also pass the lifecycle path.
+        let key_str = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+        // Validate path (henyey_crypto::PublicKey)
+        let crypto_key = henyey_crypto::PublicKey::from_strkey(key_str)
+            .expect("valid key must pass crypto::PublicKey::from_strkey");
+
+        // Lifecycle path (henyey_overlay::PeerId)
+        let peer_id = henyey_overlay::PeerId::from_strkey(key_str)
+            .expect("valid key must pass PeerId::from_strkey");
+
+        // Both paths must produce the same raw key bytes
+        assert_eq!(
+            crypto_key.as_bytes(),
+            peer_id.as_bytes(),
+            "crypto::PublicKey and overlay::PeerId must decode to the same bytes"
+        );
+    }
 }
