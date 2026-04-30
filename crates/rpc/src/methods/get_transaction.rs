@@ -12,10 +12,7 @@ pub async fn handle(
     ctx: &Arc<RpcContext>,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, JsonRpcError> {
-    let hash = params
-        .get("hash")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcError::invalid_params("missing 'hash' parameter"))?;
+    let hash = util::require_str(&params, "hash")?;
 
     let format = util::parse_format(&params)?;
 

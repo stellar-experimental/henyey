@@ -25,19 +25,13 @@ pub async fn handle(
     let lctx = util::LedgerContext::from_app(ctx).await?;
 
     // Parse parameters
-    let start_ledger = params
-        .get("startLedger")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+    let start_ledger = util::param_u32(&params, "startLedger")?;
 
-    let pagination = params.get("pagination");
-    let cursor_str = pagination
-        .and_then(|p| p.get("cursor"))
-        .and_then(|v| v.as_str());
-    let limit = pagination
-        .and_then(|p| p.get("limit"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+    let pagination = util::param_object(&params, "pagination")?;
+    let empty_obj = serde_json::Value::Null;
+    let pag = pagination.unwrap_or(&empty_obj);
+    let cursor_str = util::param_str(pag, "cursor")?;
+    let limit = util::param_u32(pag, "limit")?;
 
     // Validate and resolve pagination.
     // getLedgers cursor is a plain ledger sequence (not a TOID).

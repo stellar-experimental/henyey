@@ -26,7 +26,7 @@ pub async fn handle(
     let lctx = util::LedgerContext::from_app(ctx).await?;
 
     // Parse optional status filter
-    let status_filter = match params.get("status").and_then(|v| v.as_str()) {
+    let status_filter = match util::param_str(&params, "status")? {
         Some("SUCCESS") => Some(henyey_db::TxStatus::Success),
         Some("FAILED") => Some(henyey_db::TxStatus::Failed),
         Some(other) => {
@@ -39,19 +39,13 @@ pub async fn handle(
     };
 
     // Parse parameters
-    let start_ledger = params
-        .get("startLedger")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+    let start_ledger = util::param_u32(&params, "startLedger")?;
 
-    let pagination = params.get("pagination");
-    let cursor = pagination
-        .and_then(|p| p.get("cursor"))
-        .and_then(|v| v.as_str());
-    let limit = pagination
-        .and_then(|p| p.get("limit"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+    let pagination = util::param_object(&params, "pagination")?;
+    let empty_obj = serde_json::Value::Null;
+    let pag = pagination.unwrap_or(&empty_obj);
+    let cursor = util::param_str(pag, "cursor")?;
+    let limit = util::param_u32(pag, "limit")?;
 
     // Validate pagination
     let (effective_start, effective_cursor, effective_limit) = util::validate_pagination(

@@ -27,31 +27,24 @@ pub async fn handle(
 
     let lctx = util::LedgerContext::from_app(ctx).await?;
 
-    let start_ledger = params
-        .get("startLedger")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
+    let start_ledger = util::param_u32(&params, "startLedger")?
         .ok_or_else(|| JsonRpcError::invalid_params("missing 'startLedger' parameter"))?;
 
-    let end_ledger = params
-        .get("endLedger")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+    let end_ledger = util::param_u32(&params, "endLedger")?;
 
     // Parse filters — validate top-level type before extracting array.
     let filters_array = validate_filters_field(params.get("filters"))?;
     let (event_type, contract_ids, topic_filters) = parse_event_filters(filters_array)?;
 
     // Parse pagination
-    let pagination = params.get("pagination");
-    let limit = pagination
-        .and_then(|p| p.get("limit"))
-        .and_then(|v| v.as_u64())
+    let pagination = util::param_object(&params, "pagination")?;
+    let empty_obj = serde_json::Value::Null;
+    let pag = pagination.unwrap_or(&empty_obj);
+    let limit = util::param_u32(pag, "limit")?
+        .map(|v| v as u64)
         .unwrap_or(DEFAULT_EVENTS_LIMIT)
         .min(MAX_EVENTS_LIMIT) as u32;
-    let cursor = pagination
-        .and_then(|p| p.get("cursor"))
-        .and_then(|v| v.as_str());
+    let cursor = util::param_str(pag, "cursor")?;
 
     // Convert borrowed cursor to owned for the blocking closure
     let cursor_owned = cursor.map(String::from);

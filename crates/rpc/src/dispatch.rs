@@ -4,6 +4,7 @@ use crate::context::RpcContext;
 use crate::error::JsonRpcError;
 use crate::methods;
 use crate::types::JsonRpcResponse;
+use crate::util;
 
 /// Dispatch a JSON-RPC method call to the appropriate handler.
 pub async fn dispatch(
@@ -18,13 +19,28 @@ pub async fn dispatch(
         "getLatestLedger" => methods::latest_ledger::handle(ctx).await,
         "getVersionInfo" => methods::version_info::handle(ctx).await,
         "getFeeStats" => methods::fee_stats::handle(ctx).await,
-        "getLedgerEntries" => methods::get_ledger_entries::handle(ctx, params).await,
-        "getTransaction" => methods::get_transaction::handle(ctx, params).await,
-        "getTransactions" => methods::get_transactions::handle(ctx, params).await,
-        "getLedgers" => methods::get_ledgers::handle(ctx, params).await,
-        "getEvents" => methods::get_events::handle(ctx, params).await,
-        "sendTransaction" => methods::send_transaction::handle(ctx, params).await,
-        "simulateTransaction" => crate::simulate::handle(ctx, params).await,
+        "getLedgerEntries"
+        | "getTransaction"
+        | "getTransactions"
+        | "getLedgers"
+        | "getEvents"
+        | "sendTransaction"
+        | "simulateTransaction" => {
+            if let Err(e) = util::require_params_object(&params) {
+                Err(e)
+            } else {
+                match method {
+                    "getLedgerEntries" => methods::get_ledger_entries::handle(ctx, params).await,
+                    "getTransaction" => methods::get_transaction::handle(ctx, params).await,
+                    "getTransactions" => methods::get_transactions::handle(ctx, params).await,
+                    "getLedgers" => methods::get_ledgers::handle(ctx, params).await,
+                    "getEvents" => methods::get_events::handle(ctx, params).await,
+                    "sendTransaction" => methods::send_transaction::handle(ctx, params).await,
+                    "simulateTransaction" => crate::simulate::handle(ctx, params).await,
+                    _ => unreachable!(),
+                }
+            }
+        }
         _ => Err(JsonRpcError::method_not_found(method)),
     };
 

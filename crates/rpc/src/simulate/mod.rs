@@ -311,10 +311,7 @@ pub async fn handle(
 
     let format = util::parse_format(&params)?;
 
-    let tx_b64 = params
-        .get("transaction")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcError::invalid_params("missing 'transaction' parameter"))?;
+    let tx_b64 = util::require_str(&params, "transaction")?;
 
     let tx_bytes = BASE64
         .decode(tx_b64)
@@ -358,17 +355,13 @@ pub async fn handle(
     }
 
     // Parse authMode parameter
-    let auth_mode_str = params
-        .get("authMode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let auth_mode_str = util::param_str(&params, "authMode")?.unwrap_or("");
 
     // Parse resourceConfig parameter
-    let instruction_leeway: u32 = params
-        .get("resourceConfig")
-        .and_then(|v| v.get("instructionLeeway"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
+    let resource_config = util::param_object(&params, "resourceConfig")?;
+    let empty_obj = serde_json::Value::Null;
+    let rc = resource_config.unwrap_or(&empty_obj);
+    let instruction_leeway: u32 = util::param_u32(rc, "instructionLeeway")?.unwrap_or(0);
 
     let sim = SimulationContext::from_app(&*ctx.app)?;
 

@@ -16,10 +16,7 @@ pub async fn handle(
 ) -> Result<serde_json::Value, JsonRpcError> {
     let format = util::parse_format(&params)?;
 
-    let tx_b64 = params
-        .get("transaction")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcError::invalid_params("missing 'transaction' parameter"))?;
+    let tx_b64 = util::require_str(&params, "transaction")?;
 
     let tx_bytes = BASE64
         .decode(tx_b64)

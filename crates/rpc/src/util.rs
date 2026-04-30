@@ -217,11 +217,104 @@ pub(crate) enum XdrFormat {
     Json,
 }
 
+// ---------------------------------------------------------------------------
+// Strict parameter extraction helpers
+// ---------------------------------------------------------------------------
+//
+// Henyey RPC rule: for optional parameters, JSON `null` is treated as
+// equivalent to the field being absent (use default). Required parameters
+// reject `null` with a "missing" error. Any other type mismatch returns
+// invalid_params (-32602).
+
+/// Extract an optional string parameter.
+/// Returns `Ok(None)` if the key is absent or `null`.
+/// Returns `Err(invalid_params)` if the key exists with a non-string type.
+pub(crate) fn param_str<'a>(
+    params: &'a serde_json::Value,
+    key: &str,
+) -> Result<Option<&'a str>, JsonRpcError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| JsonRpcError::invalid_params(format!("'{key}' must be a string"))),
+    }
+}
+
+/// Extract a required string parameter.
+/// Returns `Err(invalid_params "missing ...")` if absent or `null`.
+/// Returns `Err(invalid_params "... must be a string")` if wrong type.
+pub(crate) fn require_str<'a>(
+    params: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a str, JsonRpcError> {
+    match params.get(key) {
+        None | Some(&serde_json::Value::Null) => Err(JsonRpcError::invalid_params(format!(
+            "missing '{key}' parameter"
+        ))),
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| JsonRpcError::invalid_params(format!("'{key}' must be a string"))),
+    }
+}
+
+/// Extract an optional u32 parameter.
+/// Returns `Ok(None)` if the key is absent or `null`.
+/// Returns `Err(invalid_params)` if: wrong type, negative, or > `u32::MAX`.
+pub(crate) fn param_u32(
+    params: &serde_json::Value,
+    key: &str,
+) -> Result<Option<u32>, JsonRpcError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(None),
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| {
+                JsonRpcError::invalid_params(format!("'{key}' must be a non-negative integer"))
+            })?;
+            u32::try_from(n).map(Some).map_err(|_| {
+                JsonRpcError::invalid_params(format!(
+                    "'{key}' exceeds maximum value ({})",
+                    u32::MAX
+                ))
+            })
+        }
+    }
+}
+
+/// Extract an optional sub-object parameter.
+/// Returns `Ok(None)` if the key is absent or `null`.
+/// Returns `Err(invalid_params)` if the key exists with a non-object type.
+pub(crate) fn param_object<'a>(
+    params: &'a serde_json::Value,
+    key: &str,
+) -> Result<Option<&'a serde_json::Value>, JsonRpcError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(v) if v.is_null() => Ok(None),
+        Some(v) if v.is_object() => Ok(Some(v)),
+        Some(_) => Err(JsonRpcError::invalid_params(format!(
+            "'{key}' must be an object"
+        ))),
+    }
+}
+
+/// Validate that the top-level params value is an object (or null, treated as empty object).
+/// Returns `Err(invalid_params)` if params is an array, string, number, or bool.
+pub(crate) fn require_params_object(params: &serde_json::Value) -> Result<(), JsonRpcError> {
+    match params {
+        serde_json::Value::Object(_) | serde_json::Value::Null => Ok(()),
+        _ => Err(JsonRpcError::invalid_params("params must be an object")),
+    }
+}
+
 /// Parse the `"xdrFormat"` parameter from JSON-RPC params.
 ///
 /// Accepted values: `"xdr"` (default), `"json"`.
 pub(crate) fn parse_format(params: &serde_json::Value) -> Result<XdrFormat, JsonRpcError> {
-    let val = params.get("xdrFormat").and_then(|v| v.as_str());
+    let val = param_str(params, "xdrFormat")?;
 
     match val {
         None | Some("xdr") => Ok(XdrFormat::Base64),
@@ -1547,5 +1640,212 @@ mod tests {
             }
             other => panic!("expected XdrParse, got: {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // Strict parameter extraction helper tests
+    // =========================================================================
+
+    #[test]
+    fn test_param_str_absent() {
+        let params = serde_json::json!({});
+        assert_eq!(param_str(&params, "key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_param_str_null() {
+        let params = serde_json::json!({"key": null});
+        assert_eq!(param_str(&params, "key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_param_str_valid() {
+        let params = serde_json::json!({"key": "hello"});
+        assert_eq!(param_str(&params, "key").unwrap(), Some("hello"));
+    }
+
+    #[test]
+    fn test_param_str_wrong_type_int() {
+        let params = serde_json::json!({"key": 42});
+        let err = param_str(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_param_str_wrong_type_bool() {
+        let params = serde_json::json!({"key": true});
+        let err = param_str(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_param_str_wrong_type_array() {
+        let params = serde_json::json!({"key": [1, 2, 3]});
+        let err = param_str(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_require_str_absent() {
+        let params = serde_json::json!({});
+        let err = require_str(&params, "key").unwrap_err();
+        assert!(err.message.contains("missing"));
+    }
+
+    #[test]
+    fn test_require_str_null() {
+        let params = serde_json::json!({"key": null});
+        let err = require_str(&params, "key").unwrap_err();
+        assert!(err.message.contains("missing"));
+    }
+
+    #[test]
+    fn test_require_str_valid() {
+        let params = serde_json::json!({"key": "value"});
+        assert_eq!(require_str(&params, "key").unwrap(), "value");
+    }
+
+    #[test]
+    fn test_require_str_wrong_type() {
+        let params = serde_json::json!({"key": 123});
+        let err = require_str(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_param_u32_absent() {
+        let params = serde_json::json!({});
+        assert_eq!(param_u32(&params, "key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_param_u32_null() {
+        let params = serde_json::json!({"key": null});
+        assert_eq!(param_u32(&params, "key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_param_u32_valid() {
+        let params = serde_json::json!({"key": 42});
+        assert_eq!(param_u32(&params, "key").unwrap(), Some(42));
+    }
+
+    #[test]
+    fn test_param_u32_max() {
+        let params = serde_json::json!({"key": u32::MAX as u64});
+        assert_eq!(param_u32(&params, "key").unwrap(), Some(u32::MAX));
+    }
+
+    #[test]
+    fn test_param_u32_overflow() {
+        let params = serde_json::json!({"key": (u32::MAX as u64) + 1});
+        let err = param_u32(&params, "key").unwrap_err();
+        assert!(err.message.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn test_param_u32_wrong_type_string() {
+        let params = serde_json::json!({"key": "42"});
+        let err = param_u32(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be a non-negative integer"));
+    }
+
+    #[test]
+    fn test_param_u32_wrong_type_negative() {
+        let params = serde_json::json!({"key": -1});
+        let err = param_u32(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be a non-negative integer"));
+    }
+
+    #[test]
+    fn test_param_u32_wrong_type_float() {
+        let params = serde_json::json!({"key": 1.5});
+        let err = param_u32(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be a non-negative integer"));
+    }
+
+    #[test]
+    fn test_param_object_absent() {
+        let params = serde_json::json!({});
+        assert_eq!(param_object(&params, "key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_param_object_null() {
+        let params = serde_json::json!({"key": null});
+        assert_eq!(param_object(&params, "key").unwrap(), None);
+    }
+
+    #[test]
+    fn test_param_object_valid() {
+        let params = serde_json::json!({"key": {"nested": true}});
+        assert!(param_object(&params, "key").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_param_object_wrong_type_array() {
+        let params = serde_json::json!({"key": [1, 2]});
+        let err = param_object(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be an object"));
+    }
+
+    #[test]
+    fn test_param_object_wrong_type_string() {
+        let params = serde_json::json!({"key": "not_object"});
+        let err = param_object(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be an object"));
+    }
+
+    #[test]
+    fn test_param_object_wrong_type_int() {
+        let params = serde_json::json!({"key": 42});
+        let err = param_object(&params, "key").unwrap_err();
+        assert!(err.message.contains("must be an object"));
+    }
+
+    #[test]
+    fn test_require_params_object_valid() {
+        let params = serde_json::json!({"key": "value"});
+        assert!(require_params_object(&params).is_ok());
+    }
+
+    #[test]
+    fn test_require_params_object_null() {
+        let params = serde_json::Value::Null;
+        assert!(require_params_object(&params).is_ok());
+    }
+
+    #[test]
+    fn test_require_params_object_array() {
+        let params = serde_json::json!([1, 2, 3]);
+        let err = require_params_object(&params).unwrap_err();
+        assert!(err.message.contains("params must be an object"));
+    }
+
+    #[test]
+    fn test_require_params_object_string() {
+        let params = serde_json::json!("hello");
+        let err = require_params_object(&params).unwrap_err();
+        assert!(err.message.contains("params must be an object"));
+    }
+
+    #[test]
+    fn test_require_params_object_number() {
+        let params = serde_json::json!(42);
+        let err = require_params_object(&params).unwrap_err();
+        assert!(err.message.contains("params must be an object"));
+    }
+
+    #[test]
+    fn test_parse_format_wrong_type_rejects() {
+        let params = serde_json::json!({"xdrFormat": 123});
+        let err = parse_format(&params).unwrap_err();
+        assert!(err.message.contains("must be a string"));
+    }
+
+    #[test]
+    fn test_parse_format_null_defaults_to_base64() {
+        let params = serde_json::json!({"xdrFormat": null});
+        assert_eq!(parse_format(&params).unwrap(), XdrFormat::Base64);
     }
 }
