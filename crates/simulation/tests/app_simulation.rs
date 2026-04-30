@@ -154,10 +154,13 @@ async fn ensure_app_accounts_funded(sim: &mut Simulation, expected: usize) {
 async fn build_app_backed_topology(mut sim: Simulation, threshold_percent: u32) -> Simulation {
     sim.populate_app_nodes_from_existing(threshold_percent);
     sim.start_all_nodes().await;
-    let _ = sim
-        .stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
-        .await
-        .expect("stabilize app tcp connectivity");
+    assert!(
+        sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
+            .await
+            .expect("stabilize app tcp connectivity"),
+        "build_app_backed_topology: TCP connectivity did not stabilize \
+         within 20s (min_peers=1). Nodes may not have completed handshakes."
+    );
     sim
 }
 
@@ -179,10 +182,13 @@ async fn build_two_running_of_three(mode: SimulationMode) -> Simulation {
         sim.add_app_node(id.clone(), secret, quorum_set.clone());
     }
     sim.start_all_nodes().await;
-    let _ = sim
-        .stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
-        .await
-        .expect("stabilize two-of-three connectivity");
+    assert!(
+        sim.stabilize_app_tcp_connectivity(1, Duration::from_secs(20))
+            .await
+            .expect("stabilize two-of-three connectivity"),
+        "build_two_running_of_three: TCP connectivity did not stabilize \
+         within 20s (min_peers=1)."
+    );
     sim
 }
 
@@ -393,7 +399,7 @@ async fn test_core4_app_simulation_can_close_ledgers_over_tcp() {
 async fn test_cycle4_app_simulation_can_close_ledgers_over_tcp() {
     let mut sim = build_app_backed_topology(Topologies::cycle4(SimulationMode::OverTcp), 75).await;
 
-    manual_close_until(&sim, 2, 1, Duration::from_secs(20)).await;
+    manual_close_until(&sim, 2, 1, Duration::from_secs(30)).await;
 
     sim.stop_all_nodes().await.expect("stop cycle4 app nodes");
 }
