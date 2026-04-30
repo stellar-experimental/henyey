@@ -729,6 +729,13 @@ impl ScpDriver {
         self.tx_tracker.is_cached(hash)
     }
 
+    /// Check if a tx set is cached AND refresh its LRU recency.
+    /// Used by FetchingEnvelopes callback to prevent eviction of tx-sets
+    /// still referenced by buffered envelopes waiting on other dependencies.
+    pub fn has_tx_set_and_touch(&self, hash: &Hash256) -> bool {
+        self.tx_tracker.is_cached_and_touch(hash)
+    }
+
     /// Number of tx sets currently cached in the tracker. Test-only — used
     /// to assert that nomination paths cache (or skip caching) the freshly
     /// built tx set.

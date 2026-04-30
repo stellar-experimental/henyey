@@ -214,6 +214,17 @@ impl TxSetTracker {
         self.cache.contains_key(hash)
     }
 
+    /// Check if a tx set is cached, and refresh its LRU touch_seq if so.
+    /// This prevents eviction of tx-sets still referenced by buffered envelopes.
+    pub fn is_cached_and_touch(&self, hash: &Hash256) -> bool {
+        if let Some(mut entry) = self.cache.get_mut(hash) {
+            entry.touch_seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
     // --- Validity cache ---
 
     /// Check if a validity result is cached.
@@ -620,5 +631,49 @@ mod tests {
 
         assert!(!tracker.is_cached(&hash));
         assert_eq!(tracker.sizes().cache, 0);
+    }
+
+    /// Regression test for #2070 review round 1: is_cached_and_touch refreshes
+    /// LRU recency, preventing eviction of tx-sets still referenced by
+    /// buffered envelopes.
+    #[test]
+    fn test_is_cached_and_touch_prevents_eviction() {
+        let tracker = TxSetTracker::new(2);
+
+        // Store two tx sets with explicit hashes.
+        let hash_a = Hash256::from_bytes([0xAA; 32]);
+        let hash_b = Hash256::from_bytes([0xBB; 32]);
+        let ts_a = TransactionSet::with_hash(Hash256::default(), hash_a, Vec::new());
+        let ts_b = TransactionSet::with_hash(Hash256::default(), hash_b, Vec::new());
+        tracker.store(ts_a);
+        tracker.store(ts_b);
+
+        assert!(tracker.is_cached(&hash_a));
+        assert!(tracker.is_cached(&hash_b));
+
+        // Touch hash_a to refresh its recency.
+        assert!(tracker.is_cached_and_touch(&hash_a));
+
+        // Store a third tx set — should evict hash_b (oldest), not hash_a.
+        let hash_c = Hash256::from_bytes([0xCC; 32]);
+        let ts_c = TransactionSet::with_hash(Hash256::default(), hash_c, Vec::new());
+        tracker.store(ts_c);
+
+        assert!(
+            tracker.is_cached(&hash_a),
+            "touched entry must survive eviction"
+        );
+        assert!(
+            !tracker.is_cached(&hash_b),
+            "untouched entry should be evicted"
+        );
+        assert!(tracker.is_cached(&hash_c));
+    }
+
+    #[test]
+    fn test_is_cached_and_touch_returns_false_for_missing() {
+        let tracker = TxSetTracker::new(10);
+        let hash = Hash256::from_bytes([0xDD; 32]);
+        assert!(!tracker.is_cached_and_touch(&hash));
     }
 }

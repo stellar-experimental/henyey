@@ -415,7 +415,7 @@ impl Herder {
         let pending_envelopes = PendingEnvelopes::new(pending_config);
         let scp_driver_for_fetching = Arc::clone(&scp_driver);
         let fetching_envelopes = FetchingEnvelopes::with_defaults(Box::new(move |hash| {
-            scp_driver_for_fetching.has_tx_set(hash)
+            scp_driver_for_fetching.has_tx_set_and_touch(hash)
         }));
 
         // Pre-cache the local quorum set in fetching_envelopes so envelopes
@@ -2843,9 +2843,9 @@ impl Herder {
         self.scp_driver.trim_stale_caches(keep_after_slot);
     }
 
-    /// Trim stale fetching caches while preserving tx_sets for future slots.
-    /// Called after catchup to release memory while keeping tx_sets needed for
-    /// buffered ledgers that will be applied after catchup completes.
+    /// Trim stale fetching caches (quorum-set cache and slot tracking).
+    /// Called after catchup to release memory for slots that are no longer
+    /// relevant. Tx-set retention is handled by ScpDriver's cache.
     pub fn trim_fetching_caches(&self, keep_after_slot: SlotIndex) {
         self.fetching_envelopes.trim_stale(keep_after_slot);
     }
