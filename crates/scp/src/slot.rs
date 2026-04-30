@@ -2130,4 +2130,178 @@ mod tests {
             "got_v_blocking should remain false when self is not in quorum set"
         );
     }
+
+    // ==================== Timeout/Abandon self-emission validation tests ====================
+    // Regression tests for #2089: propagate_ballot_clear_slot_validation after
+    // bump_ballot_on_timeout and abandon_ballot.
+
+    use crate::driver::ValidationLevel;
+
+    /// Helper: create a validator slot with a seeded PREPARE ballot at counter=1.
+    /// Uses a sane quorum set (required for `is_statement_sane` in emit_current_state).
+    fn slot_with_prepare_ballot() -> (Slot, NodeId) {
+        use crate::test_utils::make_quorum_set as make_qs;
+
+        let node = make_node_id(1);
+        let qs = Arc::new(make_qs(vec![node.clone()], 1));
+        let mut slot = Slot::new(1, node.clone(), qs.clone(), true);
+
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let prep = stellar_xdr::curr::ScpStatementPrepare {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
+            ballot: stellar_xdr::curr::ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node.clone(),
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(prep),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        slot.set_state_from_envelope(&envelope);
+        assert!(
+            slot.is_fully_validated(),
+            "validator slot starts fully_validated"
+        );
+        assert_eq!(slot.ballot().current_ballot().map(|b| b.counter), Some(1));
+        (slot, node)
+    }
+
+    #[test]
+    fn test_bump_ballot_on_timeout_clears_fully_validated_maybe_valid() {
+        let (mut slot, _node) = slot_with_prepare_ballot();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValid)
+                .build(),
+        );
+
+        let result = slot.bump_ballot_on_timeout(&driver);
+        assert!(result, "bump_ballot_on_timeout should return true");
+        assert!(
+            slot.ballot().current_ballot().map(|b| b.counter).unwrap() > 1,
+            "ballot counter should have advanced"
+        );
+        assert!(
+            !slot.is_fully_validated(),
+            "MaybeValid self-emission via timeout must clear fully_validated"
+        );
+    }
+
+    #[test]
+    fn test_bump_ballot_on_timeout_clears_fully_validated_maybe_valid_deferred() {
+        let (mut slot, _node) = slot_with_prepare_ballot();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValidDeferred)
+                .build(),
+        );
+
+        let result = slot.bump_ballot_on_timeout(&driver);
+        assert!(result, "bump_ballot_on_timeout should return true");
+        assert!(
+            slot.ballot().current_ballot().map(|b| b.counter).unwrap() > 1,
+            "ballot counter should have advanced"
+        );
+        assert!(
+            !slot.is_fully_validated(),
+            "MaybeValidDeferred self-emission via timeout must clear fully_validated"
+        );
+    }
+
+    #[test]
+    fn test_bump_ballot_on_timeout_preserves_fully_validated_when_fully_validated() {
+        let (mut slot, _node) = slot_with_prepare_ballot();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::FullyValidated)
+                .build(),
+        );
+
+        let result = slot.bump_ballot_on_timeout(&driver);
+        assert!(result, "bump_ballot_on_timeout should return true");
+        assert!(
+            slot.ballot().current_ballot().map(|b| b.counter).unwrap() > 1,
+            "ballot counter should have advanced"
+        );
+        assert!(
+            slot.is_fully_validated(),
+            "FullyValidated self-emission must NOT clear fully_validated"
+        );
+    }
+
+    #[test]
+    fn test_abandon_ballot_clears_fully_validated_maybe_valid() {
+        let (mut slot, _node) = slot_with_prepare_ballot();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValid)
+                .build(),
+        );
+
+        let result = slot.abandon_ballot(&driver, 5);
+        assert!(result, "abandon_ballot should return true");
+        assert_eq!(
+            slot.ballot().current_ballot().map(|b| b.counter),
+            Some(5),
+            "ballot counter should be 5"
+        );
+        assert!(
+            !slot.is_fully_validated(),
+            "MaybeValid self-emission via abandon must clear fully_validated"
+        );
+    }
+
+    #[test]
+    fn test_abandon_ballot_clears_fully_validated_maybe_valid_deferred() {
+        let (mut slot, _node) = slot_with_prepare_ballot();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValidDeferred)
+                .build(),
+        );
+
+        let result = slot.abandon_ballot(&driver, 5);
+        assert!(result, "abandon_ballot should return true");
+        assert_eq!(
+            slot.ballot().current_ballot().map(|b| b.counter),
+            Some(5),
+            "ballot counter should be 5"
+        );
+        assert!(
+            !slot.is_fully_validated(),
+            "MaybeValidDeferred self-emission via abandon must clear fully_validated"
+        );
+    }
+
+    #[test]
+    fn test_abandon_ballot_preserves_fully_validated_when_fully_validated() {
+        let (mut slot, _node) = slot_with_prepare_ballot();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::FullyValidated)
+                .build(),
+        );
+
+        let result = slot.abandon_ballot(&driver, 5);
+        assert!(result, "abandon_ballot should return true");
+        assert_eq!(
+            slot.ballot().current_ballot().map(|b| b.counter),
+            Some(5),
+            "ballot counter should be 5"
+        );
+        assert!(
+            slot.is_fully_validated(),
+            "FullyValidated self-emission must NOT clear fully_validated"
+        );
+    }
 }
