@@ -542,12 +542,12 @@ process watches for `ready`-labeled issues and handles the fix.
    Attached: <yes|no>
    Env:      ~/data/monitor-loop.env
 
-   To run ticks every 10 minutes via an external cron (recommended —
+   To run ticks every 20 minutes via an external cron (recommended —
    survives across Claude sessions), add this crontab line:
-     */10 * * * * cd /home/tomer/henyey-1 && claude -p '/monitor-tick' >> /tmp/monitor-tick.log 2>&1
+     3,23,43 * * * * cd /home/tomer/henyey-1 && claude -p '/monitor-tick' >> /tmp/monitor-tick.log 2>&1
 
    Or, to run ticks inside this Claude session only:
-     /loop 10m /monitor-tick
+     /loop 20m /monitor-tick
    ════════════════════════════════
    ```
 

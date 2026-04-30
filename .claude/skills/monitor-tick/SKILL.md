@@ -5,9 +5,11 @@ description: One tick of the henyey mainnet monitor — checks, metrics scan, de
 
 # Monitor Tick
 
-One invocation of the monitor loop. Intended to be called on a ~10-minute
+One invocation of the monitor loop. Intended to be called on a ~20-minute
 cadence by an external orchestrator (crontab, systemd timer, CI) via
-`claude -p '/monitor-tick'`, or by a Claude-internal `/loop 10m /monitor-tick`.
+`claude -p '/monitor-tick'`, or by a Claude-internal `/loop 20m /monitor-tick`.
+The 60m deploy cool-down (check 10) is sized so each deployed binary gets
+~3 ticks of observation before the next deploy is eligible.
 
 ## Preconditions
 
