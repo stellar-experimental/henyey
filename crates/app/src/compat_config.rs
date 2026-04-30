@@ -3831,8 +3831,10 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
 
     #[test]
     fn test_quorum_set_empty_validators_overrides() {
-        // With [QUORUM_SET] VALIDATORS = [], the override should set an empty
-        // validator list rather than preserving any prior value.
+        // With [[VALIDATORS]] present AND [QUORUM_SET] VALIDATORS = [], the
+        // manual override should clear the auto-generated validator list.
+        // Before the fix, `if !keys.is_empty()` would skip the override,
+        // preserving the auto-generated quorum set from [[VALIDATORS]].
         let toml: toml::Value = toml::from_str(
             r#"
             NETWORK_PASSPHRASE = "Standalone Network ; February 2017"
@@ -3840,6 +3842,12 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
             NODE_IS_VALIDATOR = true
             UNSAFE_QUORUM = true
             FAILURE_SAFETY = 0
+
+            [[VALIDATORS]]
+            NAME = "self"
+            PUBLIC_KEY = "GDKXE2OZMJIPOSLNA6N6F2BVCI3O6GDRAG2MIF5U3M3FZPXEOAKNQH6I"
+            HOME_DOMAIN = "test.org"
+
             [QUORUM_SET]
             THRESHOLD_PERCENT = 100
             VALIDATORS = []
