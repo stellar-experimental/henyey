@@ -4,13 +4,16 @@
 //! stellar-core's `gVerifySigCache`. Within a TX the same signature is verified
 //! 2+N times (N = num ops); across flood→apply each TX signature is verified
 //! twice. The cache reduces all repeated verifications to a HashMap lookup.
+//!
+//! The cache uses random-two-choice eviction matching stellar-core's
+//! `RandomEvictionCache` to resist adversarial cache-churn attacks.
 
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, VecDeque};
-use std::sync::RwLock;
+use std::sync::Mutex;
 
 use crate::error::CryptoError;
 use crate::keys::{PublicKey, SecretKey, Signature};
+use crate::random_eviction_cache::RandomEvictionCache;
 use henyey_common::Hash256;
 
 /// Default capacity for the signature verification cache, matching stellar-core's
@@ -23,43 +26,10 @@ const SIG_CACHE_CAPACITY: usize = 250_000;
 /// global `gVerifySigCache` which persists across the validator lifetime so that
 /// signatures verified during flood/nomination get cache hits during apply.
 ///
-/// Uses RwLock to allow parallel cache lookups from concurrent cluster threads.
-/// Only cache inserts require exclusive access.
-static SIG_VERIFY_CACHE: Lazy<RwLock<SigVerifyCache>> =
-    Lazy::new(|| RwLock::new(SigVerifyCache::new(SIG_CACHE_CAPACITY)));
-
-struct SigVerifyCache {
-    map: HashMap<[u8; 32], bool>,
-    order: VecDeque<[u8; 32]>,
-    capacity: usize,
-}
-
-impl SigVerifyCache {
-    fn new(capacity: usize) -> Self {
-        Self {
-            map: HashMap::with_capacity(capacity),
-            order: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    fn get(&self, key: &[u8; 32]) -> Option<bool> {
-        self.map.get(key).copied()
-    }
-
-    fn insert(&mut self, key: [u8; 32], value: bool) {
-        if self.map.contains_key(&key) {
-            return;
-        }
-        if self.map.len() >= self.capacity {
-            if let Some(old) = self.order.pop_front() {
-                self.map.remove(&old);
-            }
-        }
-        self.map.insert(key, value);
-        self.order.push_back(key);
-    }
-}
+/// Uses Mutex matching stellar-core's `gVerifySigCacheMutex` since every access
+/// mutates state (generation counter for LRU tracking).
+static SIG_VERIFY_CACHE: Lazy<Mutex<RandomEvictionCache<[u8; 32], bool>>> =
+    Lazy::new(|| Mutex::new(RandomEvictionCache::new(SIG_CACHE_CAPACITY)));
 
 fn compute_cache_key(pubkey: &[u8; 32], sig: &[u8; 64], hash: &[u8; 32]) -> [u8; 32] {
     use blake2::Digest as _;
@@ -97,12 +67,12 @@ pub fn verify_hash_from_raw_key(
 ) -> Result<(), CryptoError> {
     let cache_key = compute_cache_key(pubkey_bytes, signature.as_bytes(), hash.as_bytes());
 
-    // Check cache — no decompression needed (read lock for parallel access)
+    // Check cache (mutex held only for lookup, not verification)
     {
-        let cache = SIG_VERIFY_CACHE
-            .read()
+        let mut cache = SIG_VERIFY_CACHE
+            .lock()
             .expect("signature cache lock poisoned");
-        if let Some(result) = cache.get(&cache_key) {
+        if let Some(&result) = cache.get(&cache_key) {
             return if result {
                 Ok(())
             } else {
@@ -115,12 +85,12 @@ pub fn verify_hash_from_raw_key(
     let public_key = PublicKey::from_bytes(pubkey_bytes)?;
     let result = public_key.verify(hash.as_bytes(), signature);
 
-    // Store result in cache (write lock only for inserts)
+    // Store result in cache
     {
         let mut cache = SIG_VERIFY_CACHE
-            .write()
+            .lock()
             .expect("signature cache lock poisoned");
-        cache.insert(cache_key, result.is_ok());
+        cache.put(cache_key, result.is_ok());
     }
 
     result

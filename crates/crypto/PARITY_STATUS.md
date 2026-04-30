@@ -19,7 +19,7 @@
 | StrKey Encoding | Partial | Core encode/decode via `stellar_strkey`; missing size/convert utils |
 | Short Hash (SipHash) | Full | initialize, computeHash, xdrComputeHash, seed |
 | SignerKey Utilities | None | No crate-local constructors; transaction code builds XDR directly |
-| Signature Verification Cache | Partial | BLAKE2-keyed FIFO cache; missing clear/seed/flush APIs |
+| Signature Verification Cache | Full | Random-two-choice eviction cache matching stellar-core's `RandomEvictionCache`; missing clear/seed/flush APIs |
 | Key/Logging Utilities | None | toShortString, logKey, random helpers |
 | Error Types | Full | `CryptoError` enum covers all upstream failure modes |
 
@@ -264,8 +264,8 @@ Features not yet implemented. These ARE counted against parity %.
 
 3. **Signature verification cache**
    - **stellar-core**: Maintains a process-wide `RandomEvictionCache<Hash, bool>` that caches verification results keyed by BLAKE2 hash of (key, sig, data), with hit/miss counters and seed/clear/flush management APIs
-   - **Rust**: Maintains a process-wide `SigVerifyCache` with a 250K-entry FIFO eviction policy, keyed by BLAKE2 hash of (pubkey, sig, hash). Missing: clear API, seed API, and hit/miss counter flushing
-   - **Rationale**: Core caching mechanism is implemented for performance; management APIs not yet needed
+   - **Rust**: Maintains a process-wide `RandomEvictionCache<[u8; 32], bool>` with the same 250K-entry capacity and random-two-choice eviction policy (matching `RandomEvictionCache.h`), keyed by BLAKE2 hash of (pubkey, sig, hash). Hit tracking updates last-access generation on lookups. Missing: clear API, seed API, and hit/miss counter flushing
+   - **Rationale**: Core caching mechanism with matching eviction policy for DoS resistance; management APIs not yet needed
 
 4. **Key type template system**
    - **stellar-core**: Uses `KeyFunctions<T>` template specializations to provide generic StrKey encode/decode for `PublicKey`, `SecretKey`, and `SignerKey`

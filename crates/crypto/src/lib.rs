@@ -52,6 +52,7 @@ mod error;
 mod hash;
 mod keys;
 mod random;
+pub(crate) mod random_eviction_cache;
 mod sealed_box;
 mod short_hash;
 mod signature;
