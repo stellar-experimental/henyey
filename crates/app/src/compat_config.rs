@@ -270,15 +270,17 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
     if let Some(port) = get_u16(table, "PEER_PORT") {
         config.overlay.peer_port = port;
     }
-    if let Some(peers) = get_string_array(table, "KNOWN_PEERS") {
+    if let Some(peers) = get_string_array(table, "KNOWN_PEERS")
+        .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
+    {
         config.overlay.known_peers = peers;
     }
-    if let Some(peers) = get_string_array(table, "PREFERRED_PEERS") {
+    if let Some(peers) = get_string_array(table, "PREFERRED_PEERS")
+        .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
+    {
         config.overlay.preferred_peers = peers;
     }
-    // PREFERRED_PEER_KEYS: security-sensitive — strict parsing to avoid
-    // silently dropping entries under PREFERRED_PEERS_ONLY mode.
-    if let Some(keys) = get_string_array_strict(table, "PREFERRED_PEER_KEYS")
+    if let Some(keys) = get_string_array(table, "PREFERRED_PEER_KEYS")
         .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
     {
         config.overlay.preferred_peer_keys = keys;
@@ -325,10 +327,7 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
             );
         }
     }
-    // SURVEYOR_KEYS: security-sensitive — strict validation instead of
-    // get_string_array (which silently drops non-string elements and could
-    // leave the list empty, widening survey access to the full quorum).
-    if let Some(keys) = get_string_array_strict(table, "SURVEYOR_KEYS")
+    if let Some(keys) = get_string_array(table, "SURVEYOR_KEYS")
         .map_err(|e| anyhow::anyhow!("Compat config error: {}", e))?
     {
         config.overlay.surveyor_keys = keys;
@@ -1259,29 +1258,10 @@ fn get_f64(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<f64
     }
 }
 
-fn get_string_array(table: &toml::map::Map<String, toml::Value>, key: &str) -> Option<Vec<String>> {
-    let val = table.get(key)?;
-    match val.as_array() {
-        Some(arr) => Some(
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect(),
-        ),
-        None => {
-            tracing::warn!(
-                key,
-                actual_type = val.type_str(),
-                "Compat config key has wrong type (expected array)"
-            );
-            None
-        }
-    }
-}
-
-/// Like `get_string_array` but returns an error if any element is not a string.
-/// Use for security-sensitive fields where silent element drops would widen
-/// attack surface (e.g., `PREFERRED_PEER_KEYS` under `PREFERRED_PEERS_ONLY`).
-fn get_string_array_strict(
+/// Parses a TOML array of strings. Returns an error if the value is not an
+/// array or if any element is not a string — matching stellar-core's fail-fast
+/// `readArray<std::string>` behavior.
+fn get_string_array(
     table: &toml::map::Map<String, toml::Value>,
     key: &str,
 ) -> Result<Option<Vec<String>>, String> {
@@ -3758,5 +3738,98 @@ NODE_SEED="SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH self"
         let config = translate_stellar_core_config(&core_toml).unwrap();
         assert_eq!(config.query.port, None);
         assert_eq!(config.query.address, None);
+    }
+
+    #[test]
+    fn test_known_peers_rejects_non_string_element() {
+        let toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/test.db"
+            KNOWN_PEERS = ["valid-peer.example.com", 42]
+            "#,
+        )
+        .unwrap();
+        let err = translate_stellar_core_config(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("KNOWN_PEERS[1]"),
+            "expected error about KNOWN_PEERS[1], got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_preferred_peers_rejects_non_string_element() {
+        let toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/test.db"
+            PREFERRED_PEERS = [true, "valid-peer.example.com"]
+            "#,
+        )
+        .unwrap();
+        let err = translate_stellar_core_config(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("PREFERRED_PEERS[0]"),
+            "expected error about PREFERRED_PEERS[0], got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_known_peers_rejects_non_array_type() {
+        let toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/test.db"
+            KNOWN_PEERS = "not-an-array"
+            "#,
+        )
+        .unwrap();
+        let err = translate_stellar_core_config(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("KNOWN_PEERS"),
+            "expected error mentioning KNOWN_PEERS, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_malformed_known_peers_does_not_fall_back_to_validator_addresses() {
+        // If KNOWN_PEERS has non-string elements, the config must error —
+        // not silently produce an empty list that triggers the validator-address
+        // fallback.
+        let toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/test.db"
+            KNOWN_PEERS = [42]
+
+            [[VALIDATORS]]
+            NAME = "v1"
+            PUBLIC_KEY = "GBCR5OVQ54S2EKHLBZMK6VYMTXZHXN3T45Y6PRX4PX4FXDMJJGY4FD42"
+            ADDRESS = "validator1.example.com"
+            "#,
+        )
+        .unwrap();
+        let err = translate_stellar_core_config(&toml).unwrap_err();
+        assert!(
+            err.to_string().contains("KNOWN_PEERS[0]"),
+            "expected error about KNOWN_PEERS[0], got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_known_peers_valid_string_array() {
+        let toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            DATABASE = "sqlite3:///tmp/test.db"
+            KNOWN_PEERS = ["peer1.example.com", "peer2.example.com:11625"]
+            "#,
+        )
+        .unwrap();
+        let config = translate_stellar_core_config(&toml).unwrap();
+        assert_eq!(
+            config.overlay.known_peers,
+            vec!["peer1.example.com", "peer2.example.com:11625"]
+        );
     }
 }
