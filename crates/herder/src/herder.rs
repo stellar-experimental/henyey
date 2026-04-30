@@ -7606,6 +7606,216 @@ mod advance_tracking_slot_tests {
         );
     }
 
+    // ── Cross-phase duplicate-source test helpers ────────────────────────
+
+    /// Classic `CreateAccount` envelope (same shape as `tx_set.rs` tests).
+    fn make_classic_envelope(seed: u8, fee: u32) -> stellar_xdr::curr::TransactionEnvelope {
+        use stellar_xdr::curr::{
+            CreateAccountOp, DecoratedSignature, Memo, MuxedAccount, Operation, OperationBody,
+            Preconditions, SequenceNumber, SignatureHint, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256,
+        };
+        let source = MuxedAccount::Ed25519(Uint256([seed; 32]));
+        let dest = stellar_xdr::curr::AccountId(
+            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(Uint256([seed.wrapping_add(1); 32])),
+        );
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: source,
+                fee,
+                seq_num: SequenceNumber(seed as i64),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![Operation {
+                    source_account: None,
+                    body: OperationBody::CreateAccount(CreateAccountOp {
+                        destination: dest,
+                        starting_balance: 1_000_000_000,
+                    }),
+                }]
+                .try_into()
+                .unwrap(),
+                ext: TransactionExt::V0,
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    /// Soroban `InvokeHostFunction` envelope (same shape as `tx_set.rs` tests).
+    fn make_soroban_envelope_for_phase(
+        seed: u8,
+        fee: u32,
+    ) -> stellar_xdr::curr::TransactionEnvelope {
+        use stellar_xdr::curr::{
+            ContractDataDurability, ContractId, DecoratedSignature, Hash, HostFunction,
+            InvokeContractArgs, InvokeHostFunctionOp, LedgerFootprint, LedgerKey,
+            LedgerKeyContractData, Memo, MuxedAccount, Operation, OperationBody, Preconditions,
+            ScAddress, ScSymbol, ScVal, SequenceNumber, SignatureHint, SorobanResources,
+            SorobanTransactionData, SorobanTransactionDataExt, Transaction, TransactionEnvelope,
+            TransactionExt, TransactionV1Envelope, Uint256, VecM,
+        };
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                    function_name: ScSymbol("test".try_into().unwrap()),
+                    args: VecM::default(),
+                }),
+                auth: VecM::default(),
+            }),
+        };
+        let soroban_data = SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: VecM::default(),
+                    read_write: vec![LedgerKey::ContractData(LedgerKeyContractData {
+                        contract: ScAddress::Contract(ContractId(Hash([0u8; 32]))),
+                        key: ScVal::Bool(true),
+                        durability: ContractDataDurability::Persistent,
+                    })]
+                    .try_into()
+                    .unwrap(),
+                },
+                instructions: 5000,
+                disk_read_bytes: 1024,
+                write_bytes: 512,
+            },
+            resource_fee: 50,
+        };
+        TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx: Transaction {
+                source_account: MuxedAccount::Ed25519(Uint256([seed; 32])),
+                fee,
+                seq_num: SequenceNumber(seed as i64),
+                cond: Preconditions::None,
+                memo: Memo::None,
+                operations: vec![op].try_into().unwrap(),
+                ext: TransactionExt::V1(soroban_data),
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: stellar_xdr::curr::Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        })
+    }
+
+    /// Build a 2-phase generalized tx set: V0 classic + V1 parallel Soroban.
+    /// `classic_seed` and `soroban_seed` control the source-account ED25519 key.
+    fn make_two_phase_tx_set(classic_seed: u8, soroban_seed: u8) -> TransactionSet {
+        use stellar_xdr::curr::{
+            DependentTxCluster, GeneralizedTransactionSet, Hash, ParallelTxExecutionStage,
+            ParallelTxsComponent, TransactionPhase, TransactionSetV1, TxSetComponent,
+            TxSetComponentTxsMaybeDiscountedFee,
+        };
+
+        let classic_tx = make_classic_envelope(classic_seed, 200);
+        let soroban_tx = make_soroban_envelope_for_phase(soroban_seed, 200);
+
+        // Phase 0: classic V0 with one component
+        let classic_phase = TransactionPhase::V0(
+            vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                TxSetComponentTxsMaybeDiscountedFee {
+                    base_fee: Some(100),
+                    txs: vec![classic_tx].try_into().unwrap(),
+                },
+            )]
+            .try_into()
+            .unwrap(),
+        );
+
+        // Phase 1: Soroban V1 parallel (single stage, single cluster)
+        let soroban_phase = TransactionPhase::V1(ParallelTxsComponent {
+            base_fee: Some(100),
+            execution_stages: vec![ParallelTxExecutionStage(
+                vec![DependentTxCluster(vec![soroban_tx].try_into().unwrap())]
+                    .try_into()
+                    .unwrap(),
+            )]
+            .try_into()
+            .unwrap(),
+        });
+
+        let gen = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![classic_phase, soroban_phase].try_into().unwrap(),
+        });
+
+        let hash = gen
+            .to_xdr(stellar_xdr::curr::Limits::none())
+            .map(|bytes| Hash256::hash(&bytes))
+            .expect("XDR encoding");
+
+        TransactionSet::new_generalized(hash, gen)
+    }
+
+    fn make_test_soroban_info() -> henyey_ledger::SorobanNetworkInfo {
+        henyey_ledger::SorobanNetworkInfo {
+            ledger_max_instructions: 1_000_000,
+            ledger_max_read_ledger_entries: 100,
+            ledger_max_read_bytes: 100_000,
+            ledger_max_write_ledger_entries: 50,
+            ledger_max_write_bytes: 50_000,
+            ledger_max_dependent_tx_clusters: 4,
+            ledger_max_tx_size_bytes: 1_000_000,
+            ledger_max_tx_count: 100,
+            ..Default::default()
+        }
+    }
+
+    // ── Cross-phase duplicate-source tests ───────────────────────────────
+
+    /// Regression test: a 2-phase tx set where the same source account appears
+    /// in both the classic and Soroban phases must be rejected by the builder
+    /// path. Exercises `prepare_for_apply` → `check_no_duplicate_source_accounts`
+    /// through `self_validate_nomination_tx_set`.
+    ///
+    /// Parity: stellar-core `TxSetFrame.cpp:2139-2157`.
+    #[test]
+    fn test_self_validate_rejects_cross_phase_duplicate_source() {
+        let herder = make_herder_for_self_validate_tests();
+        // Same seed (42) in both phases → duplicate source account
+        let tx_set = make_two_phase_tx_set(42, 42);
+        let header = v24_header();
+        let soroban_info = make_test_soroban_info();
+
+        assert!(
+            !herder
+                .self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,),
+            "tx set with same source in classic and Soroban phases must be rejected"
+        );
+    }
+
+    /// Control: identical structure to the rejection test above, but with
+    /// distinct source accounts across phases. Must pass self-validation,
+    /// proving the rejection above is specifically the duplicate-source check.
+    ///
+    /// Note: `snapshot_providers: None` skips stateful checks (sequence numbers,
+    /// fee affordability) — this is acceptable because the test targets the
+    /// structural `prepare_for_apply` → `check_no_duplicate_source_accounts`
+    /// integration, not stateful validation.
+    #[test]
+    fn test_self_validate_accepts_cross_phase_distinct_sources() {
+        let herder = make_herder_for_self_validate_tests();
+        // Different seeds (42 classic, 43 Soroban) → no duplicate
+        let tx_set = make_two_phase_tx_set(42, 43);
+        let header = v24_header();
+        let soroban_info = make_test_soroban_info();
+
+        assert!(
+            herder.self_validate_nomination_tx_set(&tx_set, &header, 0, Some(&soroban_info), None,),
+            "tx set with distinct sources across phases must pass self-validation"
+        );
+    }
+
     /// Integration test: `build_nomination_value` on a v24 LedgerManager with
     /// an empty queue produces a valid tx set, passes self-validation, caches
     /// it, and returns `Some(_)`. Confirms the new self-validation gate does
