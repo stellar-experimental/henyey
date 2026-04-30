@@ -1,5 +1,6 @@
 //! Handler for the `getLedgerEntries` JSON-RPC method.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -39,7 +40,11 @@ pub async fn handle(
         )));
     }
 
-    // Decode base64 XDR keys, keeping the original base64 strings
+    // Decode base64 XDR keys, deduplicating by decoded LedgerKey.
+    // SECURITY: Dedup prevents duplicate-key amplification attacks where an
+    // attacker submits 200 copies of the same key to force repeated I/O and
+    // serialization work. First-occurrence order is preserved.
+    let mut seen_keys: HashSet<LedgerKey> = HashSet::with_capacity(keys_array.len());
     let mut ledger_keys = Vec::with_capacity(keys_array.len());
     for (i, key_val) in keys_array.iter().enumerate() {
         let key_str = key_val
@@ -51,7 +56,9 @@ pub async fn handle(
         let key = LedgerKey::from_xdr(&key_bytes, Limits::none()).map_err(|e| {
             JsonRpcError::invalid_params(format!("keys[{}]: invalid XDR: {}", i, e))
         })?;
-        ledger_keys.push((key_str.to_string(), key));
+        if seen_keys.insert(key.clone()) {
+            ledger_keys.push((key_str.to_string(), key));
+        }
     }
 
     // Get bucket list snapshot
@@ -68,17 +75,17 @@ pub async fn handle(
     // concurrency bounding — the permit survives async timeout cancellation.
     let snapshot_results = util::bounded_blocking(&ctx.bucket_io_semaphore, move || {
         #[allow(clippy::type_complexity)]
-        let mut results: Vec<(String, Option<(LedgerEntry, Option<u32>)>)> =
+        let mut results: Vec<(String, LedgerKey, Option<(LedgerEntry, Option<u32>)>)> =
             Vec::with_capacity(ledger_keys.len());
-        for (key_b64, key) in &ledger_keys {
-            let entry = snapshot.load_result(key)?;
+        for (key_b64, key) in ledger_keys {
+            let entry = snapshot.load_result(&key)?;
             match entry {
                 Some(entry) => {
                     let live_until = lookup_ttl(&snapshot, &entry)?;
-                    results.push((key_b64.clone(), Some((entry, live_until))));
+                    results.push((key_b64, key, Some((entry, live_until))));
                 }
                 None => {
-                    results.push((key_b64.clone(), None));
+                    results.push((key_b64, key, None));
                 }
             }
         }
@@ -99,7 +106,7 @@ pub async fn handle(
 
     // Build JSON response from snapshot results
     let mut result_entries = Vec::new();
-    for (key_b64, entry_with_ttl) in &snapshot_results {
+    for (key_b64, decoded_key, entry_with_ttl) in &snapshot_results {
         let Some((entry, live_until)) = entry_with_ttl else {
             continue;
         };
@@ -112,10 +119,7 @@ pub async fn handle(
                 obj.insert("key".into(), json!(key_b64));
             }
             XdrFormat::Json => {
-                // Re-decode the key for JSON output
-                let key_bytes = BASE64.decode(key_b64).unwrap();
-                let key = LedgerKey::from_xdr(&key_bytes, Limits::none()).unwrap();
-                util::insert_xdr_field(&mut obj, "key", &key, format)?;
+                util::insert_xdr_field(&mut obj, "key", decoded_key, format)?;
             }
         }
 
@@ -190,5 +194,108 @@ fn lookup_ttl(
         Ok(Some(ttl_data.live_until_ledger_seq))
     } else {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        AccountId, LedgerKeyAccount, LedgerKeyContractCode, PublicKey, Uint256, WriteXdr,
+    };
+
+    /// Encode a LedgerKey to base64 for use in test request params.
+    fn key_to_b64(key: &LedgerKey) -> String {
+        BASE64.encode(key.to_xdr(Limits::none()).unwrap())
+    }
+
+    fn account_key(byte: u8) -> LedgerKey {
+        LedgerKey::Account(LedgerKeyAccount {
+            account_id: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([byte; 32]))),
+        })
+    }
+
+    fn contract_code_key(byte: u8) -> LedgerKey {
+        LedgerKey::ContractCode(LedgerKeyContractCode {
+            hash: stellar_xdr::curr::Hash([byte; 32]),
+        })
+    }
+
+    /// Simulates the key-decoding + dedup logic from `handle()` and returns
+    /// the deduplicated keys vec. This mirrors the exact dedup code path.
+    fn decode_and_dedup(keys_b64: &[&str]) -> Vec<(String, LedgerKey)> {
+        let mut seen_keys: HashSet<LedgerKey> = HashSet::with_capacity(keys_b64.len());
+        let mut ledger_keys = Vec::with_capacity(keys_b64.len());
+        for key_str in keys_b64 {
+            let key_bytes = BASE64.decode(key_str).unwrap();
+            let key = LedgerKey::from_xdr(&key_bytes, Limits::none()).unwrap();
+            if seen_keys.insert(key.clone()) {
+                ledger_keys.push((key_str.to_string(), key));
+            }
+        }
+        ledger_keys
+    }
+
+    #[test]
+    fn test_dedup_all_identical_keys() {
+        let key = account_key(1);
+        let b64 = key_to_b64(&key);
+        let keys: Vec<&str> = vec![&b64; 200];
+
+        let result = decode_and_dedup(&keys);
+        assert_eq!(result.len(), 1, "200 identical keys must collapse to 1");
+        assert_eq!(result[0].1, key);
+    }
+
+    #[test]
+    fn test_dedup_all_unique_keys() {
+        let keys: Vec<LedgerKey> = (0..5).map(|i| account_key(i)).collect();
+        let b64s: Vec<String> = keys.iter().map(|k| key_to_b64(k)).collect();
+        let refs: Vec<&str> = b64s.iter().map(|s| s.as_str()).collect();
+
+        let result = decode_and_dedup(&refs);
+        assert_eq!(result.len(), 5, "all unique keys must be preserved");
+        for (i, (_, k)) in result.iter().enumerate() {
+            assert_eq!(*k, keys[i]);
+        }
+    }
+
+    #[test]
+    fn test_dedup_mixed_preserves_first_occurrence_order() {
+        let k1 = account_key(1);
+        let k2 = account_key(2);
+        let k3 = contract_code_key(3);
+
+        let b1 = key_to_b64(&k1);
+        let b2 = key_to_b64(&k2);
+        let b3 = key_to_b64(&k3);
+
+        // Order: k1, k2, k1, k3, k2, k3
+        let keys = vec![
+            b1.as_str(),
+            b2.as_str(),
+            b1.as_str(),
+            b3.as_str(),
+            b2.as_str(),
+            b3.as_str(),
+        ];
+
+        let result = decode_and_dedup(&keys);
+        assert_eq!(result.len(), 3, "3 unique keys from 6 inputs");
+        assert_eq!(result[0].1, k1, "first occurrence order preserved");
+        assert_eq!(result[1].1, k2);
+        assert_eq!(result[2].1, k3);
+    }
+
+    #[test]
+    fn test_dedup_preserves_first_base64_string() {
+        let key = account_key(42);
+        let b64 = key_to_b64(&key);
+
+        // Even if same key is submitted multiple times, first base64 string wins
+        let keys = vec![b64.as_str(), b64.as_str(), b64.as_str()];
+        let result = decode_and_dedup(&keys);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, b64, "first base64 string must be preserved");
     }
 }

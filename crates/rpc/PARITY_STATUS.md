@@ -96,7 +96,7 @@ Corresponds to: scoped data query RPC methods.
 
 | Scoped capability | Rust | Status |
 |-------------------|------|--------|
-| `getLedgerEntries` | `get_ledger_entries::handle()` | Full |
+| `getLedgerEntries` | `get_ledger_entries::handle()` | Full | Henyey deduplicates keys by decoded `LedgerKey` before lookup — duplicate keys in the request produce a single response entry. Upstream Soroban RPC does not deduplicate. This is an intentional hardening divergence that only affects adversarial/malformed requests. |
 | `getTransaction` | `get_transaction::handle()` | Full |
 | `getTransactions` | `get_transactions::handle()` | Full | Henyey adds a 10 MiB DB load budget (`max_tx_load_bytes`) that may return fewer transactions than the requested limit. Not present in stellar-core RPC. |
 | `getLedgers` | `get_ledgers::handle()` | Full | Henyey adds a 10 MiB DB load budget (`max_ledger_meta_load_bytes`) that may return fewer ledgers than the requested limit. Not present in stellar-core RPC. |
