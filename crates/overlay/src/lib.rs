@@ -109,6 +109,9 @@ pub use item_fetcher::{
     Tracker,
 };
 pub use loopback::LoopbackConnectionFactory;
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub use manager::TestPeerReceiver;
 pub use manager::{OverlayManager, OverlayMessage, OverlayStats, PeerSnapshot};
 pub use message_handlers::{MessageDispatcher, MessageDispatcherStats, TxSetData};
 pub use metrics::{Counter, OverlayMetrics, OverlayMetricsSnapshot, Timer, TimerSnapshot};

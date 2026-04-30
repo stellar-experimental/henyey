@@ -45,5 +45,8 @@ stellar-strkey.workspace = true
 # Database
 rusqlite.workspace = true
 
+[features]
+test-utils = []
+
 [dev-dependencies]
 tempfile.workspace = true

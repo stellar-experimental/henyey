@@ -1844,4 +1844,174 @@ mod tests {
         };
         let _ = collect_adverts_for_peers(&queue, &mut budget, &peer_ids, &adverts);
     }
+
+    // ── handle_flood_demand regression tests ─────────────────────────────
+
+    /// Helper: create a test App with overlay started, no port binding, no seed peers.
+    async fn create_test_app_with_overlay() -> (crate::app::App, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("test.db"))
+            .build();
+        config.overlay.known_peers.clear();
+        config.is_compat_config = true;
+        let app = crate::app::App::new(config).await.unwrap();
+        app.start_overlay().await.unwrap();
+        (app, dir)
+    }
+
+    /// Regression test for commit 2b8d4801: handle_flood_demand must only send
+    /// Transaction messages for known hashes, must NOT send DontHave for
+    /// banned/unknown hashes, and must continue processing past misses.
+    #[tokio::test]
+    async fn test_handle_flood_demand_mixed_hashes() {
+        let (app, _dir) = create_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+
+        // Inject a test peer with plenty of channel capacity.
+        let peer_id = make_peer_id(42);
+        let mut receiver = overlay.inject_test_peer(peer_id.clone(), 16);
+
+        // Insert two known transactions into the queue.
+        let mut env1 = make_envelope(100, 1);
+        set_source(&mut env1, 1);
+        let hash1 = Hash256::hash_xdr(&env1);
+        assert!(app.herder.tx_queue().insert_for_test(env1.clone()));
+
+        let mut env2 = make_envelope(200, 1);
+        set_source(&mut env2, 2);
+        let hash2 = Hash256::hash_xdr(&env2);
+        assert!(app.herder.tx_queue().insert_for_test(env2.clone()));
+
+        // Create a hash to ban.
+        let mut env_banned = make_envelope(300, 1);
+        set_source(&mut env_banned, 3);
+        let banned_hash = Hash256::hash_xdr(&env_banned);
+        // Insert then ban so the banned set contains it.
+        assert!(app.herder.tx_queue().insert_for_test(env_banned));
+        app.herder.tx_queue().ban(&[banned_hash]);
+
+        // Create an unknown hash (never inserted).
+        let unknown_hash = Hash256::from_bytes([0xAA; 32]);
+
+        // Build demand: [known_1, banned, unknown, known_2]
+        let demand = FloodDemand {
+            tx_hashes: TxDemandVector(
+                vec![
+                    Hash(*hash1.as_bytes()),
+                    Hash(*banned_hash.as_bytes()),
+                    Hash(*unknown_hash.as_bytes()),
+                    Hash(*hash2.as_bytes()),
+                ]
+                .try_into()
+                .unwrap(),
+            ),
+        };
+
+        app.handle_flood_demand(&peer_id, demand).await;
+
+        // First message must be Transaction(env1).
+        let msg1 = receiver
+            .try_recv()
+            .expect("expected first Transaction message");
+        match msg1 {
+            StellarMessage::Transaction(ref tx_env) => {
+                assert_eq!(
+                    Hash256::hash_xdr(tx_env),
+                    hash1,
+                    "first msg should be known_1"
+                );
+            }
+            other => panic!("expected Transaction, got {:?}", other.name()),
+        }
+
+        // Second message must be Transaction(env2) — proves continuation past banned/unknown.
+        let msg2 = receiver
+            .try_recv()
+            .expect("expected second Transaction message");
+        match msg2 {
+            StellarMessage::Transaction(ref tx_env) => {
+                assert_eq!(
+                    Hash256::hash_xdr(tx_env),
+                    hash2,
+                    "second msg should be known_2"
+                );
+            }
+            other => panic!("expected Transaction, got {:?}", other.name()),
+        }
+
+        // No more messages — no DontHave, no spurious output.
+        assert!(
+            receiver.try_recv().is_none(),
+            "channel should be empty after processing demand"
+        );
+
+        app.shutdown();
+    }
+
+    /// Regression test: handle_flood_demand stops sending when the peer's
+    /// outbound channel is full (backpressure via try_send).
+    #[tokio::test]
+    async fn test_handle_flood_demand_channel_full_stops() {
+        let (app, _dir) = create_test_app_with_overlay().await;
+        let overlay = app.overlay().await.unwrap();
+
+        // Inject a peer with capacity for only 1 message.
+        let peer_id = make_peer_id(99);
+        let mut receiver = overlay.inject_test_peer(peer_id.clone(), 1);
+
+        // Insert 3 known transactions.
+        let mut env1 = make_envelope(100, 1);
+        set_source(&mut env1, 10);
+        let hash1 = Hash256::hash_xdr(&env1);
+        assert!(app.herder.tx_queue().insert_for_test(env1.clone()));
+
+        let mut env2 = make_envelope(200, 1);
+        set_source(&mut env2, 11);
+        let hash2 = Hash256::hash_xdr(&env2);
+        assert!(app.herder.tx_queue().insert_for_test(env2));
+
+        let mut env3 = make_envelope(300, 1);
+        set_source(&mut env3, 12);
+        let hash3 = Hash256::hash_xdr(&env3);
+        assert!(app.herder.tx_queue().insert_for_test(env3));
+
+        // Demand all 3 known hashes.
+        let demand = FloodDemand {
+            tx_hashes: TxDemandVector(
+                vec![
+                    Hash(*hash1.as_bytes()),
+                    Hash(*hash2.as_bytes()),
+                    Hash(*hash3.as_bytes()),
+                ]
+                .try_into()
+                .unwrap(),
+            ),
+        };
+
+        app.handle_flood_demand(&peer_id, demand).await;
+
+        // Only the first should have been sent (channel capacity = 1).
+        let msg = receiver
+            .try_recv()
+            .expect("expected one Transaction message");
+        match msg {
+            StellarMessage::Transaction(ref tx_env) => {
+                assert_eq!(
+                    Hash256::hash_xdr(tx_env),
+                    hash1,
+                    "should be first known hash"
+                );
+            }
+            other => panic!("expected Transaction, got {:?}", other.name()),
+        }
+
+        // Channel was full after the first send — remaining hashes not sent.
+        assert!(
+            receiver.try_recv().is_none(),
+            "no more messages should be sent after channel-full break"
+        );
+
+        app.shutdown();
+    }
 }

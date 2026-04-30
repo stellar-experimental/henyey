@@ -1529,6 +1529,78 @@ pub struct OverlayStats {
     pub flood_stats: FloodGateStats,
 }
 
+// ── Test utilities (cross-crate) ─────────────────────────────────────────
+
+/// A receiver for messages sent to an injected test peer.
+///
+/// Wraps the internal outbound channel and extracts `StellarMessage` payloads,
+/// hiding the crate-internal `OutboundMessage` enum from downstream test code.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub struct TestPeerReceiver {
+    rx: tokio::sync::mpsc::Receiver<OutboundMessage>,
+}
+
+#[cfg(feature = "test-utils")]
+impl TestPeerReceiver {
+    /// Receive the next `StellarMessage`. Returns `None` on channel close or `Shutdown`.
+    pub async fn recv(&mut self) -> Option<StellarMessage> {
+        match self.rx.recv().await? {
+            OutboundMessage::Send(msg) | OutboundMessage::Flood(msg) => Some(msg),
+            OutboundMessage::Shutdown => None,
+        }
+    }
+
+    /// Non-blocking try_recv. Returns `None` if channel is empty, closed, or Shutdown.
+    pub fn try_recv(&mut self) -> Option<StellarMessage> {
+        match self.rx.try_recv().ok()? {
+            OutboundMessage::Send(msg) | OutboundMessage::Flood(msg) => Some(msg),
+            OutboundMessage::Shutdown => None,
+        }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+impl OverlayManager {
+    /// Inject a synthetic peer into this overlay's peer map for testing.
+    ///
+    /// Returns a [`TestPeerReceiver`] that receives all messages sent to this peer
+    /// via `try_send_to`. The peer uses synthetic metadata (127.0.0.1:11625, Inbound)
+    /// and default flow control.
+    ///
+    /// # Panics
+    /// Panics if `channel_capacity` is 0.
+    #[doc(hidden)]
+    pub fn inject_test_peer(&self, peer_id: PeerId, channel_capacity: usize) -> TestPeerReceiver {
+        assert!(channel_capacity > 0, "channel_capacity must be > 0");
+
+        use crate::flow_control::{FlowControl, FlowControlConfig};
+        use crate::peer::PeerStats;
+
+        let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(channel_capacity);
+        let handle = PeerHandle {
+            outbound_tx,
+            stats: Arc::new(PeerStats::default()),
+            flow_control: Arc::new(FlowControl::new(FlowControlConfig::default())),
+        };
+        self.peers.insert(peer_id.clone(), handle);
+        self.peer_info_cache.insert(
+            peer_id.clone(),
+            crate::peer::PeerInfo {
+                peer_id,
+                address: "127.0.0.1:11625".parse().unwrap(),
+                direction: crate::connection::ConnectionDirection::Inbound,
+                version_string: String::new(),
+                overlay_version: 0,
+                ledger_version: 0,
+                connected_at: std::time::Instant::now(),
+                original_address: None,
+            },
+        );
+        TestPeerReceiver { rx: outbound_rx }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
