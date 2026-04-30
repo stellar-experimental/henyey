@@ -69,6 +69,7 @@ use crate::surge_pricing::{
 use crate::tx_queue_limiter::TxQueueLimiter;
 use crate::Result;
 use henyey_tx::envelope_sequence_number;
+use henyey_tx::FeeRate;
 use rand::Rng;
 
 pub mod arb_flood_damping;
@@ -364,12 +365,10 @@ pub struct QueuedTransaction {
     pub received_at: Instant,
     /// Declared fee per operation used for queue-admission minimum fee checks.
     pub fee_per_op: u64,
-    /// Number of operations in the transaction.
-    pub op_count: u32,
+    /// Fee rate (bundles inclusion_fee + op_count) for surge pricing and replacement decisions.
+    pub fee_rate: FeeRate,
     /// Declared full fee.
     pub total_fee: u64,
-    /// Inclusion fee used for surge pricing and replacement decisions.
-    pub inclusion_fee: i64,
     /// Whether this transaction contains DEX operations (cached at admission).
     pub is_dex: bool,
 }
@@ -379,24 +378,23 @@ impl QueuedTransaction {
     pub fn new(envelope: TransactionEnvelope) -> Result<Self> {
         let hash = Hash256::hash_xdr(&envelope);
 
-        let (total_fee, inclusion_fee, op_count) = Self::extract_fees_and_ops(&envelope)?;
+        let (total_fee, fee_rate) = Self::extract_fees_and_ops(&envelope)?;
         // `fee_per_op` is the inclusion-fee per op, used by
         // `ordered_hashes_by_fee` for ranking.  Using inclusion fee (not
         // total fee) matches the rest of the queue's fee-rate metrics
-        // (`fee_rate_cmp`, `better_fee_ratio`, etc.) and stellar-core's
-        // `computePerOpFee`, which calls `tx.getInclusionFee()`
-        // (`stellar-core/src/herder/TxSetFrame.cpp:213-223`). For classic
-        // (non-Soroban) txs, `inclusion_fee == total_fee`, so this is a
-        // no-op in the classic path.
+        // and stellar-core's `computePerOpFee`, which calls
+        // `tx.getInclusionFee()` (`stellar-core/src/herder/TxSetFrame.cpp:213-223`).
+        // For classic (non-Soroban) txs, `inclusion_fee == total_fee`,
+        // so this is a no-op in the classic path.
         //
         // `extract_fees_and_ops` already rejects negative inclusion fees;
         // `inclusion_fee >= 0` is invariant here.
-        let fee_per_op = if op_count > 0 {
+        let fee_per_op = if fee_rate.op_count() > 0 {
             debug_assert!(
-                inclusion_fee >= 0,
+                fee_rate.inclusion_fee().as_i64() >= 0,
                 "inclusion_fee must be non-negative here"
             );
-            inclusion_fee as u64 / op_count as u64
+            fee_rate.inclusion_fee().as_i64() as u64 / fee_rate.op_count() as u64
         } else {
             0
         };
@@ -407,14 +405,13 @@ impl QueuedTransaction {
             hash,
             received_at: Instant::now(),
             fee_per_op,
-            op_count,
+            fee_rate,
             total_fee,
-            inclusion_fee,
         })
     }
 
-    /// Extract full fee, inclusion fee, and operation count from the envelope.
-    fn extract_fees_and_ops(envelope: &TransactionEnvelope) -> Result<(u64, i64, u32)> {
+    /// Extract full fee and fee rate from the envelope.
+    fn extract_fees_and_ops(envelope: &TransactionEnvelope) -> Result<(u64, FeeRate)> {
         let fee = crate::tx_set_utils::envelope_fee(envelope).as_i64();
         if fee < 0 {
             return Err(HerderError::Internal(format!(
@@ -422,15 +419,27 @@ impl QueuedTransaction {
                 fee
             )));
         }
-        let inclusion_fee = crate::tx_set_utils::envelope_inclusion_fee(envelope).as_i64();
-        if inclusion_fee < 0 {
+        let inclusion_fee = crate::tx_set_utils::envelope_inclusion_fee(envelope);
+        if inclusion_fee.as_i64() < 0 {
             return Err(HerderError::Internal(format!(
                 "Negative inclusion fee for transaction: {}",
-                inclusion_fee
+                inclusion_fee.as_i64()
             )));
         }
         let ops = crate::tx_set_utils::envelope_num_ops(envelope) as u32;
-        Ok((fee as u64, inclusion_fee, ops))
+        Ok((fee as u64, FeeRate::new(inclusion_fee, ops)))
+    }
+
+    /// Get the operation count.
+    #[inline]
+    pub fn op_count(&self) -> u32 {
+        self.fee_rate.op_count()
+    }
+
+    /// Get the inclusion fee as i64.
+    #[inline]
+    pub fn inclusion_fee_i64(&self) -> i64 {
+        self.fee_rate.inclusion_fee().as_i64()
     }
 
     fn sequence_number(&self) -> i64 {
@@ -454,12 +463,7 @@ impl QueuedTransaction {
 
     /// Compare this transaction's fee rate against a FeeEntry (from the index).
     fn is_better_than_entry(&self, entry: &FeeEntry) -> bool {
-        match fee_rate_cmp(
-            self.inclusion_fee,
-            self.op_count,
-            entry.inclusion_fee,
-            entry.op_count,
-        ) {
+        match self.fee_rate.cmp_rate(&entry.fee_rate) {
             Ordering::Greater => true,
             Ordering::Less => false,
             Ordering::Equal => self.hash.0 < entry.hash.0,
@@ -506,62 +510,48 @@ const FEE_MULTIPLIER: u64 = 10;
 /// Spec: HERDER_SPEC §16 — TRANSACTION_QUEUE_TIMEOUT_LEDGERS = 4.
 const DEFAULT_PENDING_DEPTH: u32 = 4;
 
-pub(super) fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64, i64, u32)> {
+pub(super) fn envelope_fee_per_op(envelope: &TransactionEnvelope) -> Option<(u64, FeeRate)> {
     QueuedTransaction::extract_fees_and_ops(envelope)
         .ok()
-        .map(|(_, inclusion_fee, op_count)| {
-            let per_op = if op_count > 0 {
-                inclusion_fee as u64 / op_count as u64
+        .map(|(_, fee_rate)| {
+            let per_op = if fee_rate.op_count() > 0 {
+                fee_rate.inclusion_fee().as_i64() as u64 / fee_rate.op_count() as u64
             } else {
                 0
             };
-            (per_op, inclusion_fee, op_count)
+            (per_op, fee_rate)
         })
 }
 
-/// Compare fee rates via cross-multiplication, matching stellar-core's
-/// `feeRate3WayCompare(int64_t, uint32_t, int64_t, uint32_t)`.
-///
-/// Asserts that fees are non-negative (stellar-core's `bigMultiply`
-/// release-asserts the same at `numeric.cpp:129`).
-pub(crate) fn fee_rate_cmp(a_fee: i64, a_ops: u32, b_fee: i64, b_ops: u32) -> Ordering {
-    assert!(a_fee >= 0, "fee_rate_cmp: negative fee {a_fee}");
-    assert!(b_fee >= 0, "fee_rate_cmp: negative fee {b_fee}");
-    let left = (a_fee as i128) * (b_ops as i128);
-    let right = (b_fee as i128) * (a_ops as i128);
-    left.cmp(&right)
-}
-
 fn better_fee_ratio(new_tx: &QueuedTransaction, old_tx: &QueuedTransaction) -> bool {
-    match fee_rate_cmp(
-        new_tx.inclusion_fee,
-        new_tx.op_count,
-        old_tx.inclusion_fee,
-        old_tx.op_count,
-    ) {
+    match new_tx.fee_rate.cmp_rate(&old_tx.fee_rate) {
         Ordering::Greater => true,
         Ordering::Less => false,
         Ordering::Equal => new_tx.hash.0 < old_tx.hash.0,
     }
 }
 
-fn compute_better_fee(evicted_fee: i64, evicted_ops: u32, tx_ops: u32) -> i64 {
-    if evicted_ops == 0 {
+fn compute_better_fee(evicted: &FeeRate, tx_ops: u32) -> i64 {
+    if evicted.op_count() == 0 {
         return 0;
     }
-    let numerator = (evicted_fee as i128).saturating_mul(tx_ops as i128);
-    let denominator = evicted_ops as i128;
+    let numerator = (evicted.inclusion_fee().as_i64() as i128).saturating_mul(tx_ops as i128);
+    let denominator = evicted.op_count() as i128;
     let base = numerator / denominator;
     let candidate = base.saturating_add(1);
     i64::try_from(candidate).unwrap_or(i64::MAX)
 }
 
-fn min_inclusion_fee_to_beat(evicted: (i64, u32), tx: &QueuedTransaction) -> i64 {
-    if evicted.1 == 0 {
+fn min_inclusion_fee_to_beat(evicted: Option<&FeeRate>, tx_fee_rate: &FeeRate) -> i64 {
+    let evicted = match evicted {
+        Some(e) => e,
+        None => return 0,
+    };
+    if evicted.op_count() == 0 {
         return 0;
     }
-    if fee_rate_cmp(evicted.0, evicted.1, tx.inclusion_fee, tx.op_count) != Ordering::Less {
-        compute_better_fee(evicted.0, evicted.1, tx.op_count)
+    if evicted.cmp_rate(tx_fee_rate) != Ordering::Less {
+        compute_better_fee(evicted, tx_fee_rate.op_count())
     } else {
         0
     }
@@ -570,12 +560,11 @@ fn min_inclusion_fee_to_beat(evicted: (i64, u32), tx: &QueuedTransaction) -> i64
 /// Check if a fee-bump transaction can replace an existing transaction.
 /// For replace-by-fee to work, the new fee must be at least FEE_MULTIPLIER times the old fee rate.
 /// Returns Ok(()) if replacement is allowed, or Err(min_fee) if the fee is insufficient.
-fn can_replace_by_fee(
-    new_fee: i64,
-    new_ops: u32,
-    old_fee: i64,
-    old_ops: u32,
-) -> std::result::Result<(), i64> {
+fn can_replace_by_fee(new: &FeeRate, old: &FeeRate) -> std::result::Result<(), i64> {
+    let new_fee = new.inclusion_fee().as_i64();
+    let new_ops = new.op_count();
+    let old_fee = old.inclusion_fee().as_i64();
+    let old_ops = old.op_count();
     // newFee / newOps >= FEE_MULTIPLIER * oldFee / oldOps
     // Cross-multiply to avoid division:
     // newFee * oldOps >= FEE_MULTIPLIER * oldFee * newOps
@@ -617,12 +606,11 @@ pub(super) struct SelectedTxs {
 }
 
 /// Entry in the fee-ordered index. Sorted ascending by fee rate (using
-/// cross-multiplication via `fee_rate_cmp`), with reverse-hash tie-break
+/// cross-multiplication via `FeeRate::cmp_rate`), with reverse-hash tie-break
 /// to match the existing `ensure_queue_capacity` eviction semantics.
 #[derive(Clone, Eq, PartialEq, Debug)]
 struct FeeEntry {
-    inclusion_fee: i64,
-    op_count: u32,
+    fee_rate: FeeRate,
     hash: Hash256,
     is_dex: bool,
 }
@@ -630,8 +618,7 @@ struct FeeEntry {
 impl FeeEntry {
     fn from_queued(tx: &QueuedTransaction) -> Self {
         Self {
-            inclusion_fee: tx.inclusion_fee,
-            op_count: tx.op_count,
+            fee_rate: tx.fee_rate,
             hash: tx.hash,
             is_dex: tx.is_dex,
         }
@@ -640,13 +627,9 @@ impl FeeEntry {
 
 impl Ord for FeeEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        fee_rate_cmp(
-            self.inclusion_fee,
-            self.op_count,
-            other.inclusion_fee,
-            other.op_count,
-        )
-        .then_with(|| other.hash.0.cmp(&self.hash.0))
+        self.fee_rate
+            .cmp_rate(&other.fee_rate)
+            .then_with(|| other.hash.0.cmp(&self.hash.0))
     }
 }
 
@@ -1103,11 +1086,11 @@ fn account_id_from_fee_source_key(key: &[u8]) -> AccountId {
 /// without holding the store lock.
 struct EvictionThresholds {
     /// Lane eviction thresholds for classic queue admission.
-    classic_lane_fees: RwLock<Vec<(i64, u32)>>,
+    classic_lane_fees: RwLock<Vec<Option<FeeRate>>>,
     /// Lane eviction thresholds for Soroban queue admission.
-    soroban_lane_fees: RwLock<Vec<(i64, u32)>>,
+    soroban_lane_fees: RwLock<Vec<Option<FeeRate>>>,
     /// Eviction threshold for global queue limits.
-    global_fees: RwLock<(i64, u32)>,
+    global_fees: RwLock<Option<FeeRate>>,
 }
 
 impl EvictionThresholds {
@@ -1115,7 +1098,7 @@ impl EvictionThresholds {
         Self {
             classic_lane_fees: RwLock::new(Vec::new()),
             soroban_lane_fees: RwLock::new(Vec::new()),
-            global_fees: RwLock::new((0, 0)),
+            global_fees: RwLock::new(None),
         }
     }
 
@@ -1123,7 +1106,7 @@ impl EvictionThresholds {
     fn reset_all(&self) {
         self.classic_lane_fees.write().clear();
         self.soroban_lane_fees.write().clear();
-        *self.global_fees.write() = (0, 0);
+        *self.global_fees.write() = None;
     }
 
     /// Reset only Soroban lane thresholds.
@@ -1692,12 +1675,7 @@ impl TransactionQueue {
                     return Err(TxQueueResult::TryAgainLater);
                 }
 
-                if let Err(_min_fee) = can_replace_by_fee(
-                    queued.inclusion_fee,
-                    queued.op_count,
-                    current_tx.inclusion_fee,
-                    current_tx.op_count,
-                ) {
+                if let Err(_min_fee) = can_replace_by_fee(&queued.fee_rate, &current_tx.fee_rate) {
                     return Err(TxQueueResult::FeeTooLow);
                 }
 
@@ -1739,7 +1717,7 @@ impl TransactionQueue {
     fn record_lane_evictions(
         &self,
         lane_config: &dyn SurgePricingLaneConfig,
-        lane_fees_lock: &RwLock<Vec<(i64, u32)>>,
+        lane_fees_lock: &RwLock<Vec<Option<FeeRate>>>,
         evictions: Vec<(QueuedTransaction, bool)>,
         pending_evictions: &mut HashSet<Hash256>,
         pending_eviction_list: &mut Vec<QueuedTransaction>,
@@ -1752,12 +1730,12 @@ impl TransactionQueue {
             {
                 let mut lane_fees = lane_fees_lock.write();
                 if lane_fees.len() != lane_config.lane_limits().len() {
-                    lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+                    lane_fees.resize(lane_config.lane_limits().len(), None);
                 }
                 if evicted_due_to_lane_limit {
-                    lane_fees[lane] = (evicted.inclusion_fee, evicted.op_count);
+                    lane_fees[lane] = Some(evicted.fee_rate);
                 } else {
-                    lane_fees[GENERIC_LANE] = (evicted.inclusion_fee, evicted.op_count);
+                    lane_fees[GENERIC_LANE] = Some(evicted.fee_rate);
                 }
             }
             pending_eviction_list.push(evicted);
@@ -1771,19 +1749,25 @@ impl TransactionQueue {
     fn fee_below_lane_threshold(
         &self,
         lane_config: &dyn SurgePricingLaneConfig,
-        lane_fees: &mut Vec<(i64, u32)>,
+        lane_fees: &mut Vec<Option<FeeRate>>,
         envelope: &stellar_xdr::curr::TransactionEnvelope,
         queued: &QueuedTransaction,
     ) -> bool {
         let lane = lane_config.get_lane(envelope);
         if lane_fees.len() != lane_config.lane_limits().len() {
-            lane_fees.resize(lane_config.lane_limits().len(), (0, 0));
+            lane_fees.resize(lane_config.lane_limits().len(), None);
         }
         let global_fee = *self.eviction_thresholds.global_fees.read();
-        let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane], queued);
-        min_fee = min_fee.max(min_inclusion_fee_to_beat(lane_fees[GENERIC_LANE], queued));
+        let mut min_fee = min_inclusion_fee_to_beat(lane_fees[lane].as_ref(), &queued.fee_rate);
+        min_fee = min_fee.max(min_inclusion_fee_to_beat(
+            lane_fees[GENERIC_LANE].as_ref(),
+            &queued.fee_rate,
+        ));
         if self.config.max_queue_ops.is_some() {
-            min_fee = min_fee.max(min_inclusion_fee_to_beat(global_fee, queued));
+            min_fee = min_fee.max(min_inclusion_fee_to_beat(
+                global_fee.as_ref(),
+                &queued.fee_rate,
+            ));
         }
         min_fee > 0
     }
@@ -1829,7 +1813,7 @@ impl TransactionQueue {
 
         if self.config.max_queue_ops.is_some() {
             let global_fee = *self.eviction_thresholds.global_fees.read();
-            if min_inclusion_fee_to_beat(global_fee, candidate.queued) > 0 {
+            if min_inclusion_fee_to_beat(global_fee.as_ref(), &candidate.queued.fee_rate) > 0 {
                 return Err(TxQueueResult::FeeTooLow);
             }
         }
@@ -1942,7 +1926,7 @@ impl TransactionQueue {
                     continue;
                 }
                 let mut global_fee = self.eviction_thresholds.global_fees.write();
-                *global_fee = (evicted.inclusion_fee, evicted.op_count);
+                *global_fee = Some(evicted.fee_rate);
                 pending_eviction_list.push(evicted);
             }
         }
@@ -2012,8 +1996,8 @@ impl TransactionQueue {
         // function `frame.resource_operation_count()` calls (returning
         // inner+1 for fee-bumps), so we don't need to construct a frame.
         let required_inclusion_fee =
-            lcl_base_fee.saturating_mul(std::cmp::max(1i64, queued.op_count as i64));
-        if queued.inclusion_fee < required_inclusion_fee {
+            lcl_base_fee.saturating_mul(std::cmp::max(1i64, queued.op_count() as i64));
+        if queued.inclusion_fee_i64() < required_inclusion_fee {
             return TxQueueResult::FeeTooLow;
         }
 
@@ -2872,7 +2856,7 @@ impl TransactionQueue {
 
                 let candidate = BroadcastCandidate {
                     hash: tx.hash,
-                    op_count: tx.op_count,
+                    op_count: tx.op_count(),
                     is_dex: tx.is_dex,
                 };
                 visitor(&candidate).into()
@@ -7212,7 +7196,7 @@ mod tests {
 
         // Verify fee=100 was evicted (lowest fee)
         let store = queue.store.read();
-        let fees: Vec<i64> = store.values().map(|tx| tx.inclusion_fee).collect();
+        let fees: Vec<i64> = store.values().map(|tx| tx.inclusion_fee_i64()).collect();
         assert!(
             !fees.contains(&100),
             "lowest-fee tx should have been evicted"
@@ -7262,7 +7246,7 @@ mod tests {
 
         // Verify the new tx is the one in the queue
         let store = queue.store.read();
-        let remaining: Vec<i64> = store.values().map(|tx| tx.inclusion_fee).collect();
+        let remaining: Vec<i64> = store.values().map(|tx| tx.inclusion_fee_i64()).collect();
         assert_eq!(remaining, vec![50]);
         store.assert_consistent();
     }
@@ -7295,7 +7279,7 @@ mod tests {
             let mut store = queue.store.write();
             // Find the high-fee tx and backdate it
             for tx in store.values_mut() {
-                if tx.inclusion_fee == 1000 {
+                if tx.inclusion_fee_i64() == 1000 {
                     tx.received_at = std::time::Instant::now() - std::time::Duration::from_secs(10);
                 }
             }
@@ -7309,7 +7293,7 @@ mod tests {
 
         // Verify: expired high-fee (1000) was evicted, live low-fee (10) and new mid (500) remain
         let store = queue.store.read();
-        let mut fees: Vec<i64> = store.values().map(|tx| tx.inclusion_fee).collect();
+        let mut fees: Vec<i64> = store.values().map(|tx| tx.inclusion_fee_i64()).collect();
         fees.sort();
         assert_eq!(
             fees,
@@ -8851,78 +8835,29 @@ mod eviction_queue_tests {
 }
 
 #[cfg(test)]
-mod fee_rate_cmp_tests {
-    use super::fee_rate_cmp;
-    use std::cmp::Ordering;
-
-    #[test]
-    fn test_fee_rate_cmp_equal_rates() {
-        // 100/2 == 200/4
-        assert_eq!(fee_rate_cmp(100, 2, 200, 4), Ordering::Equal);
-    }
-
-    #[test]
-    fn test_fee_rate_cmp_greater() {
-        // 300/2 > 100/2
-        assert_eq!(fee_rate_cmp(300, 2, 100, 2), Ordering::Greater);
-    }
-
-    #[test]
-    fn test_fee_rate_cmp_less() {
-        // 100/2 < 300/2
-        assert_eq!(fee_rate_cmp(100, 2, 300, 2), Ordering::Less);
-    }
-
-    #[test]
-    fn test_fee_rate_cmp_zero_fee() {
-        assert_eq!(fee_rate_cmp(0, 1, 100, 1), Ordering::Less);
-        assert_eq!(fee_rate_cmp(100, 1, 0, 1), Ordering::Greater);
-        assert_eq!(fee_rate_cmp(0, 1, 0, 1), Ordering::Equal);
-    }
-
-    #[test]
-    fn test_fee_rate_cmp_cross_multiply_no_overflow() {
-        // Large values that would overflow u64 multiplication but fit in i128.
-        let large_fee = i64::MAX;
-        assert_eq!(fee_rate_cmp(large_fee, 1, large_fee, 1), Ordering::Equal);
-        // large_fee/2 vs large_fee/1 → large_fee*1 vs large_fee*2 → Less
-        assert_eq!(fee_rate_cmp(large_fee, 2, large_fee, 1), Ordering::Less);
-    }
-
-    #[test]
-    #[should_panic(expected = "fee_rate_cmp: negative fee")]
-    fn test_fee_rate_cmp_panics_on_negative_a_fee() {
-        // Matches stellar-core's releaseAssertOrThrow in bigMultiply.
-        fee_rate_cmp(-1, 1, 100, 1);
-    }
-
-    #[test]
-    #[should_panic(expected = "fee_rate_cmp: negative fee")]
-    fn test_fee_rate_cmp_panics_on_negative_b_fee() {
-        fee_rate_cmp(100, 1, -1, 1);
-    }
-}
-
 #[cfg(test)]
-mod inclusion_fee_i64_tests {
+mod fee_rate_tests {
     use super::*;
+    use henyey_tx::{FeeRate, InclusionFee};
 
     #[test]
     fn test_compute_better_fee_i64_max_saturation() {
-        // Near i64::MAX values should saturate rather than overflow.
-        let result = compute_better_fee(i64::MAX, 1, 2);
+        let rate = FeeRate::new(InclusionFee::new(i64::MAX), 1);
+        let result = compute_better_fee(&rate, 2);
         assert_eq!(result, i64::MAX);
     }
 
     #[test]
     fn test_compute_better_fee_normal() {
         // evicted_fee=100, evicted_ops=2, tx_ops=4 → base = 200, candidate = 201
-        assert_eq!(compute_better_fee(100, 2, 4), 201);
+        let rate = FeeRate::new(InclusionFee::new(100), 2);
+        assert_eq!(compute_better_fee(&rate, 4), 201);
     }
 
     #[test]
     fn test_compute_better_fee_zero_evicted_ops() {
-        assert_eq!(compute_better_fee(100, 0, 4), 0);
+        let rate = FeeRate::new(InclusionFee::new(100), 0);
+        assert_eq!(compute_better_fee(&rate, 4), 0);
     }
 
     #[test]
@@ -8931,13 +8866,13 @@ mod inclusion_fee_i64_tests {
             envelope: Arc::new(make_dummy_envelope(200, 1)),
             hash: Hash256::from_bytes([0u8; 32]),
             total_fee: 200,
-            inclusion_fee: 200,
-            op_count: 1,
+            fee_rate: FeeRate::new(InclusionFee::new(200), 1),
             fee_per_op: 200,
             received_at: std::time::Instant::now(),
             is_dex: false,
         };
-        assert_eq!(min_inclusion_fee_to_beat((100, 1), &tx), 0);
+        let evicted = FeeRate::new(InclusionFee::new(100), 1);
+        assert_eq!(min_inclusion_fee_to_beat(Some(&evicted), &tx.fee_rate), 0);
     }
 
     #[test]
@@ -8946,31 +8881,37 @@ mod inclusion_fee_i64_tests {
             envelope: Arc::new(make_dummy_envelope(50, 1)),
             hash: Hash256::from_bytes([0u8; 32]),
             total_fee: 50,
-            inclusion_fee: 50,
-            op_count: 1,
+            fee_rate: FeeRate::new(InclusionFee::new(50), 1),
             fee_per_op: 50,
             received_at: std::time::Instant::now(),
             is_dex: false,
         };
-        let result = min_inclusion_fee_to_beat((100, 1), &tx);
+        let evicted = FeeRate::new(InclusionFee::new(100), 1);
+        let result = min_inclusion_fee_to_beat(Some(&evicted), &tx.fee_rate);
         assert_eq!(result, 101);
     }
 
     #[test]
     fn test_can_replace_by_fee_sufficient() {
-        assert!(can_replace_by_fee(1000, 1, 100, 1).is_ok());
+        let new = FeeRate::new(InclusionFee::new(1000), 1);
+        let old = FeeRate::new(InclusionFee::new(100), 1);
+        assert!(can_replace_by_fee(&new, &old).is_ok());
     }
 
     #[test]
     fn test_can_replace_by_fee_insufficient() {
-        let result = can_replace_by_fee(999, 1, 100, 1);
+        let new = FeeRate::new(InclusionFee::new(999), 1);
+        let old = FeeRate::new(InclusionFee::new(100), 1);
+        let result = can_replace_by_fee(&new, &old);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_can_replace_by_fee_i64_boundary() {
         let large = i64::MAX / 20;
-        assert!(can_replace_by_fee(large * 10, 1, large, 1).is_ok());
+        let new = FeeRate::new(InclusionFee::new(large * 10), 1);
+        let old = FeeRate::new(InclusionFee::new(large), 1);
+        assert!(can_replace_by_fee(&new, &old).is_ok());
     }
 
     fn make_dummy_envelope(fee: u32, ops: u32) -> TransactionEnvelope {

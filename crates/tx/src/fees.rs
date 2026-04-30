@@ -162,7 +162,11 @@ impl fmt::Display for ResourceFee {
 ///
 /// Comparison uses cross-multiplication to avoid integer division:
 /// `a.inclusion_fee * b.op_count` vs `b.inclusion_fee * a.op_count`
-#[derive(Debug, Clone, Copy)]
+///
+/// **`Eq`/`PartialEq` is structural** (both fields must match). Two `FeeRate`
+/// values with the same fee-per-op ratio but different absolute values are NOT
+/// equal. Use [`cmp_rate`](Self::cmp_rate) for rate-based ordering.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct FeeRate {
     inclusion_fee: InclusionFee,
     op_count: u32,

@@ -262,9 +262,7 @@ impl TransactionQueue {
             txs.sort_by(|a, b| {
                 a.sequence_number()
                     .cmp(&b.sequence_number())
-                    .then_with(|| {
-                        fee_rate_cmp(b.inclusion_fee, b.op_count, a.inclusion_fee, a.op_count)
-                    })
+                    .then_with(|| b.fee_rate.cmp_rate(&a.fee_rate))
                     .then_with(|| a.hash.0.cmp(&b.hash.0))
             });
 
@@ -594,7 +592,7 @@ fn build_soroban_phase_with_base_fee(
             soroban_txs
                 .iter()
                 .filter_map(|htx| {
-                    envelope_fee_per_op(htx.envelope()).map(|(per_op, _, _)| per_op as i64)
+                    envelope_fee_per_op(htx.envelope()).map(|(per_op, _)| per_op as i64)
                 })
                 .min()
                 .or(Some(ledger_base_fee))
@@ -640,9 +638,7 @@ fn compute_soroban_base_fee(
             .iter()
             .flat_map(|stage| stage.iter())
             .flat_map(|cluster| cluster.iter())
-            .filter_map(|htx| {
-                envelope_fee_per_op(htx.envelope()).map(|(per_op, _, _)| per_op as i64)
-            })
+            .filter_map(|htx| envelope_fee_per_op(htx.envelope()).map(|(per_op, _)| per_op as i64))
             .min();
         min_fee.or(Some(ledger_base_fee))
     } else {
@@ -675,7 +671,7 @@ fn build_classic_phase(
             } else {
                 GENERIC_LANE
             };
-            if let Some((per_op, _, _)) = envelope_fee_per_op(htx.envelope()) {
+            if let Some((per_op, _)) = envelope_fee_per_op(htx.envelope()) {
                 let lane_fee = &mut lowest_lane_fee[lane];
                 let fee = per_op as i64;
                 if fee < *lane_fee {

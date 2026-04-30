@@ -60,7 +60,8 @@ use henyey_tx::envelope_utils::{
 };
 use stellar_xdr::curr::TransactionEnvelope;
 
-use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
+use crate::tx_queue::QueuedTransaction;
+use henyey_tx::FeeRate;
 
 /// Lane index for generic (non-specialized) transactions.
 pub(crate) const GENERIC_LANE: usize = 0;
@@ -301,8 +302,7 @@ impl EvictionExclusion {
 /// with tie-breaking based on a deterministic hash to ensure consistent ordering.
 #[derive(Clone)]
 pub(crate) struct QueueEntry {
-    inclusion_fee: i64,
-    op_count: u32,
+    fee_rate: FeeRate,
     tie_breaker: [u8; 32],
     hash: [u8; 32],
     pub(crate) tx: QueuedTransaction,
@@ -318,8 +318,7 @@ impl QueueEntry {
             }
         }
         Self {
-            inclusion_fee: tx.inclusion_fee,
-            op_count: tx.op_count,
+            fee_rate: tx.fee_rate,
             tie_breaker,
             hash: tx.hash.0,
             tx,
@@ -343,12 +342,7 @@ impl PartialOrd for QueueEntry {
 
 impl Ord for QueueEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        let ord = fee_rate_cmp(
-            self.inclusion_fee,
-            self.op_count,
-            other.inclusion_fee,
-            other.op_count,
-        );
+        let ord = self.fee_rate.cmp_rate(&other.fee_rate);
         if ord != Ordering::Equal {
             return ord;
         }
@@ -765,13 +759,7 @@ impl SurgePricingPriorityQueue {
                 break (evict_lane, entry);
             };
 
-            if fee_rate_cmp(
-                entry.inclusion_fee,
-                entry.op_count,
-                tx.inclusion_fee,
-                tx.op_count,
-            ) != Ordering::Less
-            {
+            if entry.fee_rate.cmp_rate(&tx.fee_rate) != Ordering::Less {
                 return None;
             }
 
@@ -903,8 +891,7 @@ mod tests {
             envelope: Arc::new(envelope),
             hash: henyey_common::Hash256::from_bytes([1u8; 32]),
             total_fee: 100,
-            inclusion_fee: 100,
-            op_count: 1,
+            fee_rate: FeeRate::new(henyey_tx::InclusionFee::new(100), 1),
             fee_per_op: 100,
             received_at: std::time::Instant::now(),
             is_dex: false,

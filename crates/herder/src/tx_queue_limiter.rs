@@ -20,7 +20,8 @@ use crate::surge_pricing::{
     DexLimitingLaneConfig, FloodLaneConfig, QueueEntry, SorobanGenericLaneConfig,
     SurgePricingLaneConfig, SurgePricingPriorityQueue, VisitTxResult, GENERIC_LANE,
 };
-use crate::tx_queue::{fee_rate_cmp, QueuedTransaction};
+use crate::tx_queue::QueuedTransaction;
+use henyey_tx::FeeRate;
 
 /// Returned when flood traversal APIs are used without an initialized flood queue
 /// (`txs_to_flood` is missing). Use [`TxQueueLimiter::new_flood`] for dedicated flood
@@ -58,21 +59,32 @@ fn scale_resource(resource: &Resource, multiplier: i64) -> Resource {
 /// Computes the minimum fee needed to beat a previously evicted transaction.
 ///
 /// Returns 0 if the new transaction already has a better fee rate than the evicted one.
-fn compute_better_fee(evicted_fee: i64, evicted_ops: u32, new_fee: i64, new_ops: u32) -> i64 {
-    if evicted_ops == 0 {
+fn compute_better_fee(evicted_fee: &FeeRate, new_fee_rate: &FeeRate) -> i64 {
+    if evicted_fee.op_count() == 0 {
         return 0;
     }
 
     // Check if new transaction already beats the evicted one (strictly)
-    if fee_rate_cmp(evicted_fee, evicted_ops, new_fee, new_ops) == std::cmp::Ordering::Less {
+    if evicted_fee.cmp_rate(new_fee_rate) == std::cmp::Ordering::Less {
         return 0;
     }
 
     // Need to beat evicted fee rate: new_fee / new_ops > evicted_fee / evicted_ops
     // Rearranging: new_fee > evicted_fee * new_ops / evicted_ops
     // Add 1 to ensure strictly greater
-    let required_fee = (evicted_fee as i128 * new_ops as i128 / evicted_ops as i128) + 1;
+    let required_fee = (evicted_fee.inclusion_fee().as_i64() as i128
+        * new_fee_rate.op_count() as i128
+        / evicted_fee.op_count() as i128)
+        + 1;
     required_fee.min(i64::MAX as i128) as i64
+}
+
+/// Wrapper that handles `Option<&FeeRate>` — returns 0 for `None`.
+fn compute_better_fee_opt(evicted: Option<&FeeRate>, new_fee_rate: &FeeRate) -> i64 {
+    match evicted {
+        Some(e) => compute_better_fee(e, new_fee_rate),
+        None => 0,
+    }
 }
 
 /// Resource-aware transaction queue limiter.
@@ -111,8 +123,8 @@ pub struct TxQueueLimiter {
     lane_config: Option<Box<dyn SurgePricingLaneConfig + Send + Sync>>,
     /// Transaction queue for flood ordering (highest fee first)
     txs_to_flood: Option<SurgePricingPriorityQueue>,
-    /// Maximum evicted inclusion fee per lane (fee, ops)
-    lane_evicted_inclusion_fee: Vec<(i64, u32)>,
+    /// Maximum evicted fee rate per lane
+    lane_evicted_inclusion_fee: Vec<Option<FeeRate>>,
 }
 
 impl TxQueueLimiter {
@@ -223,7 +235,7 @@ impl TxQueueLimiter {
     /// Reset eviction state tracking.
     pub fn reset_eviction_state(&mut self) {
         if let Some(ref txs) = self.txs {
-            self.lane_evicted_inclusion_fee = vec![(0, 0); txs.get_num_lanes()];
+            self.lane_evicted_inclusion_fee = vec![None; txs.get_num_lanes()];
         } else {
             self.lane_evicted_inclusion_fee.clear();
         }
@@ -320,30 +332,22 @@ impl TxQueueLimiter {
             .lane_evicted_inclusion_fee
             .get(lane)
             .cloned()
-            .unwrap_or((0, 0));
+            .unwrap_or(None);
         let evicted_generic_fee = self
             .lane_evicted_inclusion_fee
             .get(GENERIC_LANE)
             .cloned()
-            .unwrap_or((0, 0));
+            .unwrap_or(None);
 
-        let min_fee_to_beat_lane = compute_better_fee(
-            evicted_lane_fee.0,
-            evicted_lane_fee.1,
-            new_tx.inclusion_fee,
-            new_tx.op_count,
-        );
-        let min_fee_to_beat_generic = compute_better_fee(
-            evicted_generic_fee.0,
-            evicted_generic_fee.1,
-            new_tx.inclusion_fee,
-            new_tx.op_count,
-        );
+        let min_fee_to_beat_lane =
+            compute_better_fee_opt(evicted_lane_fee.as_ref(), &new_tx.fee_rate);
+        let min_fee_to_beat_generic =
+            compute_better_fee_opt(evicted_generic_fee.as_ref(), &new_tx.fee_rate);
         let min_inclusion_fee = min_fee_to_beat_lane.max(min_fee_to_beat_generic);
 
         if min_inclusion_fee > 0 {
             let resource_fee_discount =
-                (new_tx.total_fee as i64).saturating_sub(new_tx.inclusion_fee);
+                (new_tx.total_fee as i64).saturating_sub(new_tx.inclusion_fee_i64());
             return (
                 false,
                 min_inclusion_fee.saturating_add(resource_fee_discount),
@@ -355,7 +359,7 @@ impl TxQueueLimiter {
             self.lane_config
                 .as_ref()
                 .map(|c| c.tx_resources(&old.envelope, ledger_version))
-                .unwrap_or_else(|| Resource::new(vec![old.op_count as i64]))
+                .unwrap_or_else(|| Resource::new(vec![old.op_count() as i64]))
         });
 
         // Parity: update the generic lane limit to stay in sync after upgrades
@@ -403,7 +407,7 @@ impl TxQueueLimiter {
             .lane_config
             .as_ref()
             .map(|c| c.tx_resources(&tx_to_fit.envelope, ledger_version))
-            .unwrap_or_else(|| Resource::new(vec![tx_to_fit.op_count as i64]));
+            .unwrap_or_else(|| Resource::new(vec![tx_to_fit.op_count() as i64]));
 
         for (tx, evicted_due_to_lane_limit) in txs_to_evict {
             let evict_lane = self
@@ -414,10 +418,10 @@ impl TxQueueLimiter {
 
             if *evicted_due_to_lane_limit {
                 // Record in the specific lane
-                self.lane_evicted_inclusion_fee[evict_lane] = (tx.inclusion_fee, tx.op_count);
+                self.lane_evicted_inclusion_fee[evict_lane] = Some(tx.fee_rate);
             } else {
                 // Record in generic lane
-                self.lane_evicted_inclusion_fee[GENERIC_LANE] = (tx.inclusion_fee, tx.op_count);
+                self.lane_evicted_inclusion_fee[GENERIC_LANE] = Some(tx.fee_rate);
             }
 
             evict(tx);
@@ -538,8 +542,7 @@ mod tests {
             envelope: Arc::new(envelope),
             hash: Hash256::from_bytes(hash),
             total_fee: fee,
-            inclusion_fee: fee as i64,
-            op_count: ops,
+            fee_rate: FeeRate::new(henyey_tx::InclusionFee::new(fee as i64), ops),
             fee_per_op: if ops > 0 { fee / ops as u64 } else { 0 },
             received_at: std::time::Instant::now(),
             is_dex: false,
@@ -696,14 +699,18 @@ mod tests {
     #[test]
     fn test_compute_better_fee() {
         // New tx is strictly better - no fee needed
-        assert_eq!(compute_better_fee(100, 10, 200, 10), 0);
+        let evicted = FeeRate::new(henyey_tx::InclusionFee::new(100), 10);
+        let new_rate = FeeRate::new(henyey_tx::InclusionFee::new(200), 10);
+        assert_eq!(compute_better_fee(&evicted, &new_rate), 0);
 
         // Evicted has better rate - need higher fee
-        let min_fee = compute_better_fee(100, 10, 50, 10);
+        let new_rate2 = FeeRate::new(henyey_tx::InclusionFee::new(50), 10);
+        let min_fee = compute_better_fee(&evicted, &new_rate2);
         assert!(min_fee > 50);
 
         // Edge case: zero ops in evicted
-        assert_eq!(compute_better_fee(100, 0, 50, 10), 0);
+        let evicted_zero = FeeRate::new(henyey_tx::InclusionFee::new(100), 0);
+        assert_eq!(compute_better_fee(&evicted_zero, &new_rate2), 0);
     }
 
     /// Regression test for #1496: equal fee rates must NOT return 0.
@@ -713,7 +720,9 @@ mod tests {
         // tx1: fee=200, ops=2 → rate=100
         // tx2: fee=300, ops=3 → rate=100 (equal)
         // Before fix: returned 0 (admitted). After fix: returns positive fee.
-        let min_fee = compute_better_fee(200, 2, 300, 3);
+        let evicted = FeeRate::new(henyey_tx::InclusionFee::new(200), 2);
+        let new_rate = FeeRate::new(henyey_tx::InclusionFee::new(300), 3);
+        let min_fee = compute_better_fee(&evicted, &new_rate);
         assert!(
             min_fee > 0,
             "Equal fee rates must require a higher fee, got {}",
@@ -725,6 +734,8 @@ mod tests {
     fn test_compute_better_fee_accepts_strictly_higher_rate() {
         // tx1: fee=200, ops=2 → rate=100
         // tx2: fee=301, ops=3 → rate=100.33 (strictly better)
-        assert_eq!(compute_better_fee(200, 2, 301, 3), 0);
+        let evicted = FeeRate::new(henyey_tx::InclusionFee::new(200), 2);
+        let new_rate = FeeRate::new(henyey_tx::InclusionFee::new(301), 3);
+        assert_eq!(compute_better_fee(&evicted, &new_rate), 0);
     }
 }

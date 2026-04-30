@@ -18,6 +18,7 @@
 use crate::tx_set_utils::HashedTx;
 use henyey_common::types::Hash256;
 use henyey_tx::envelope_utils::envelope_soroban_data;
+use henyey_tx::{FeeRate, InclusionFee};
 use stellar_xdr::curr::{
     DependentTxCluster, GeneralizedTransactionSet, Hash, LedgerKey, Limits,
     ParallelTxExecutionStage, ParallelTxsComponent, TransactionEnvelope, TransactionPhase,
@@ -528,8 +529,10 @@ fn build_with_stage_count(
         let b_fee = tx_inclusion_fee(txs[b].envelope());
         let a_ops = (crate::tx_set_utils::envelope_num_ops(txs[a].envelope()) as u32).max(1);
         let b_ops = (crate::tx_set_utils::envelope_num_ops(txs[b].envelope()) as u32).max(1);
+        let b_rate = FeeRate::new(InclusionFee::new(b_fee), b_ops);
+        let a_rate = FeeRate::new(InclusionFee::new(a_fee), a_ops);
         // Descending fee rate: compare b vs a
-        match crate::tx_queue::fee_rate_cmp(b_fee, b_ops, a_fee, a_ops) {
+        match b_rate.cmp_rate(&a_rate) {
             std::cmp::Ordering::Equal => {
                 // Use precomputed hashes for determinism
                 txs[a].hash().0.cmp(&txs[b].hash().0)
@@ -1664,10 +1667,10 @@ mod tests {
 
     /// Regression test: a Soroban envelope with `fee < resource_fee` produces a
     /// negative inclusion fee. Before the fix, `as u64` wrapping caused the
-    /// negative-fee tx to sort as highest-fee. Now `fee_rate_cmp` panics on
+    /// negative-fee tx to sort as highest-fee. Now `FeeRate::cmp_rate` panics on
     /// negative fees, matching stellar-core's `releaseAssertOrThrow`.
     #[test]
-    #[should_panic(expected = "fee_rate_cmp: negative fee")]
+    #[should_panic(expected = "FeeRate::cmp_rate: negative fee")]
     fn test_negative_inclusion_fee_panics_in_sort() {
         // fee=50, resource_fee=100 → inclusion_fee = 50 - 100 = -50
         let negative_fee_tx =
