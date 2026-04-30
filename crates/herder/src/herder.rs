@@ -6064,6 +6064,113 @@ mod tests {
             "#2069: hash-mismatch must not clear the original pending request"
         );
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #2120: Drain-path regression test — post-drain envelopes take the
+    // is_current_ledger validation path (not apply-lag).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Proves the key behavioral consequence of draining pending envelopes
+    /// in `ledger_closed` (post-apply) rather than `advance_tracking_slot`
+    /// (pre-apply): after `ledger_closed(N)`, a drained EXTERNALIZE for
+    /// slot N+1 sees `lcl_seq = N` → `is_current_ledger = true` →
+    /// `ValueValidation::Valid`. No `apply_lag` is recorded in
+    /// `deferred_slots`, and `fully_validated` is preserved.
+    ///
+    /// If the drain had happened pre-apply (with LCL still at N-1),
+    /// `slot_index != lcl_seq + 1` would route to
+    /// `validate_past_or_future_value` → `MaybeValidDeferred` with
+    /// `apply_lag = true`, clearing `fully_validated`.
+    ///
+    /// Preconditions:
+    /// - No LedgerManager: validation uses the tracking-state fallback
+    ///   (`lcl_seq = consensus_index - 1`).
+    /// - Direct `pending_envelopes.add()` bypasses envelope signature
+    ///   verification (the StellarValue signature IS verified).
+    #[test]
+    fn test_post_drain_envelope_avoids_apply_lag_path() {
+        let (herder, _local_secret) = make_validator_herder();
+
+        // Peer that will send the EXTERNALIZE.
+        let peer_secret = SecretKey::from_seed(&[2u8; 32]);
+        let peer_public = peer_secret.public_key();
+        let peer_node_id = XdrNodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+            stellar_xdr::curr::Uint256(*peer_public.as_bytes()),
+        ));
+
+        // Set tracking: consensus_index = 100 (next slot to close).
+        // This makes the tracking-state fallback yield lcl_seq = 99.
+        {
+            let mut ts = herder.tracking_state.write();
+            ts.consensus_index = 100;
+            ts.is_tracking = true;
+            // consensus_close_time = 0 (default) so close_time=1 > 0 passes.
+        }
+        herder.pending_envelopes.set_current_slot(100);
+
+        // Create a properly signed StellarValue with cached tx_set.
+        let value = make_valid_value_with_cached_tx_set(&herder, &peer_secret);
+
+        // Construct EXTERNALIZE envelope for slot 100.
+        let envelope = ScpEnvelope {
+            statement: ScpStatement {
+                node_id: peer_node_id,
+                slot_index: 100,
+                pledges: ScpStatementPledges::Externalize(ScpStatementExternalize {
+                    commit: ScpBallot { counter: 1, value },
+                    n_h: 1,
+                    commit_quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                }),
+            },
+            // Envelope signature not verified by SCP (bypassed in this test).
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        };
+
+        // Buffer the envelope as pending for slot 100.
+        herder.pending_envelopes.add(100, envelope);
+        assert_eq!(herder.pending_envelopes.slot_count(), 1);
+
+        // Precondition: slot 100 has no deferred causes yet.
+        assert_eq!(
+            herder.scp_driver.deferred_slot_count(),
+            0,
+            "precondition: no deferred slots before drain"
+        );
+
+        // ledger_closed(99): LCL = 99, drains pending for slot <= 100.
+        // The drained EXTERNALIZE is processed through:
+        //   process_scp_envelope → process_scp_envelope_with_tx_set →
+        //   scp.receive_envelope → validate_value(100, ...) →
+        //   validate_value_against_local_state: lcl_seq=99, is_current_ledger=true
+        //   → ValueValidation::Valid (no apply_lag recorded).
+        herder.ledger_closed(99, &[], &[], 0);
+
+        // The envelope was drained.
+        assert_eq!(
+            herder.pending_envelopes.slot_count(),
+            0,
+            "pending envelopes must be drained by ledger_closed"
+        );
+
+        // KEY ASSERTION: No apply_lag recorded — the is_current_ledger path
+        // was taken, returning ValueValidation::Valid (not MaybeValidDeferred).
+        assert_eq!(
+            herder.scp_driver.deferred_slot_count(),
+            0,
+            "post-drain envelope must NOT record apply_lag — is_current_ledger \
+             path must be taken when LCL = N and slot = N+1"
+        );
+
+        // KEY ASSERTION: fully_validated is preserved — MaybeValidDeferred
+        // would have cleared it (via SCP's ballot protocol), but
+        // FullyValidated leaves it untouched.
+        assert!(
+            herder.scp.is_slot_fully_validated(100),
+            "post-drain envelope must preserve fully_validated — the \
+             is_current_ledger path returns FullyValidated which does not \
+             clear the slot's fully_validated flag"
+        );
+    }
 }
 
 #[cfg(test)]
