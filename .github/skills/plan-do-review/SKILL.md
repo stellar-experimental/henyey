@@ -378,7 +378,7 @@ Increment `proposal_round`.
 tmpfile=$(mktemp)
 {
   printf '## 📝 Proposal Draft (Round %s/%s)\n\n' "$proposal_round" "$max_proposal_rounds"
-  cat /tmp/pdr-$ISSUE/proposal_r$proposal_round.md
+  cat data/pdr-$ISSUE/proposal_r$proposal_round.md
   printf '\n\n---\n\n*Submitting to adversarial critic for review…*\n'
   printf '\n---\n\n*Created by `/plan-do-review` skill (%s, model: %s)*\n' "$HARNESS" "$MODEL"
 } > "$tmpfile"
@@ -516,7 +516,7 @@ tmpfile=$(mktemp)
 {
   printf '## 🔍 Critic Response (Round %s/%s)\n\n' "$proposal_round" "$max_proposal_rounds"
   printf '<details>\n<summary>Full critique (click to expand)</summary>\n\n'
-  cat /tmp/pdr-$ISSUE/critic_r$proposal_round.md
+  cat data/pdr-$ISSUE/critic_r$proposal_round.md
   printf '\n\n</details>\n\n'
   printf '**Verdict: %s**\n\n' "$verdict"
   # If REVISE, append the numbered feedback items outside the <details> block
@@ -561,7 +561,7 @@ comment:
 tmpfile=$(mktemp)
 {
   printf '## Converged Proposal (Round %s/%s)\n\n' "$proposal_round" "$max_proposal_rounds"
-  cat /tmp/pdr-$ISSUE/proposal_final.md
+  cat data/pdr-$ISSUE/proposal_final.md
   printf '\n\n---\n\n*This proposal was refined through %s round(s) of adversarial review using the `plan-do-review` skill.*\n' "$proposal_round"
   printf '\n---\n\n*Skill: `/plan-do-review` | Harness: %s | Model: %s*\n' "$HARNESS" "$MODEL"
 } > "$tmpfile"
@@ -737,7 +737,7 @@ The review-fix agent prompt must include the full review-fix skill protocol.
 Read the review-fix skill template to assemble the prompt:
 
 ```bash
-cat .claude/skills/review-fix/SKILL.md
+cat .github/skills/review-fix/SKILL.md
 ```
 
 Substitute `$COMMIT` with the actual commit hash and set `$MODE = review`.
@@ -752,7 +752,7 @@ This commit implements the proposal from GitHub issue #{issue_number}.
 Follow the review-fix skill instructions below exactly. Mode is review
 (do NOT make changes). Produce the full structured report.
 
-{contents of .claude/skills/review-fix/SKILL.md}
+{contents of .github/skills/review-fix/SKILL.md}
 ```
 
 ### 4b: Process Review Result
@@ -771,7 +771,7 @@ tmpfile=$(mktemp)
 {
   printf '## 🔬 Review-Fix Report (Round %s/%s)\n\n' "$review_round" "$max_review_rounds"
   printf '<details>\n<summary>Full review report (click to expand)</summary>\n\n'
-  cat /tmp/pdr-$ISSUE/review_r$review_round.md
+  cat data/pdr-$ISSUE/review_r$review_round.md
   printf '\n\n</details>\n\n'
   printf '**Verdict: %s**\n\n' "$verdict"
   # If not SOUND, append the key issues outside the <details> block.
