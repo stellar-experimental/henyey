@@ -14,7 +14,7 @@
 | Hex Encoding | None | Intentionally omitted; call sites use the `hex` crate directly |
 | Random Generation | Full | CSPRNG via OsRng |
 | Curve25519 ECDH | Full | Key exchange, shared key derivation |
-| Sealed Box Encryption | Full | Encrypt/decrypt via crypto_box |
+| Sealed Box Encryption | Full | Direct X25519+HSalsa20+XSalsa20-Poly1305 implementation |
 | Ed25519 Keys & Signatures | Partial | Generate, sign, verify, StrKey; missing isZero, ==, < |
 | StrKey Encoding | Partial | Core encode/decode via `stellar_strkey`; missing size/convert utils |
 | Short Hash (SipHash) | Full | initialize, computeHash, xdrComputeHash, seed |
@@ -98,7 +98,7 @@ Corresponds to: `Curve25519.h`
 | `curve25519DerivePublic(secret)` | `Curve25519Secret::derive_public()` | Full |
 | `curve25519DeriveSharedKey(sec, lpub, rpub, first)` | `Curve25519Secret::derive_shared_key(sec, lpub, rpub, first)` | Full |
 | `hash<Curve25519Public>::operator()` | `Hash for Curve25519Public` | Full |
-| `crypto_scalarmult` contributory check (reject small-order) | `Curve25519Secret::diffie_hellman` + `check_public_key_contributory` | Full |
+| `crypto_scalarmult` contributory check (reject small-order) | `Curve25519Secret::diffie_hellman` + `was_contributory()` in sealed_box | Full |
 
 ### sealed_box.rs (`sealed_box.rs`)
 
@@ -108,7 +108,7 @@ Corresponds to: `Curve25519.h` (encrypt/decrypt portion)
 |--------------|------|--------|
 | `curve25519Encrypt<N>(pub, bin)` | `seal_to_public_key(pub, &[u8])` / `seal_to_curve25519_public_key(&[u8;32], &[u8])` | Full |
 | `curve25519Decrypt(sec, pub, enc)` | `open_from_secret_key(sec, &[u8])` / `open_from_curve25519_secret_key(&[u8;32], &[u8])` | Full |
-| Small-order Curve25519 key rejection | `check_public_key_contributory` + `ContributoryPublicKey` newtype | Full |
+| Small-order Curve25519 key rejection | `was_contributory()` check on DH result in `derive_shared_key` | Full |
 | `crypto_scalarmult` contributory check (via `was_contributory`) | `Curve25519Secret::diffie_hellman` | Full |
 
 ### keys.rs (`keys.rs`)
@@ -254,7 +254,7 @@ Features not yet implemented. These ARE counted against parity %.
 
 1. **No libsodium dependency**
    - **stellar-core**: Uses libsodium (C library) for all cryptographic operations
-   - **Rust**: Uses pure Rust crates (`ed25519-dalek`, `sha2`, `blake2`, `hmac`, `siphasher`, `crypto_box`, `x25519-dalek`)
+   - **Rust**: Uses pure Rust crates (`ed25519-dalek`, `sha2`, `blake2`, `hmac`, `siphasher`, `crypto_secretbox`, `salsa20`, `x25519-dalek`)
    - **Rationale**: Eliminates C FFI, enables reproducible builds, and provides Rust memory safety guarantees
 
 2. **XDR hashing approach**

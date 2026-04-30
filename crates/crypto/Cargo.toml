@@ -25,8 +25,9 @@ blake2.workspace = true
 # HMAC for message authentication
 hmac.workspace = true
 
-# Sealed box encryption for surveys (X25519 + XSalsa20-Poly1305)
-crypto_box.workspace = true
+# Sealed box encryption for surveys (XSalsa20-Poly1305)
+crypto_secretbox.workspace = true
+salsa20.workspace = true
 
 # Random number generation - pure Rust
 rand.workspace = true

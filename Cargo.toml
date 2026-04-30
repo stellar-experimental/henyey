@@ -70,7 +70,8 @@ x25519-dalek = { version = "2", default-features = false, features = ["static_se
 sha2 = { version = "0.10", default-features = false, features = ["std"] }
 blake2 = "0.10"
 hmac = "0.12"
-crypto_box = { version = "0.9", features = ["seal"] }
+crypto_secretbox = "0.1"
+salsa20 = "0.10"
 
 # Random number generation - pure Rust
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }

@@ -4,18 +4,25 @@
 //! message to a recipient's public key without revealing the sender's identity.
 //! The primary use case in Stellar is encrypting survey response payloads.
 //!
-//! # How It Works
+//! # Protocol
 //!
-//! Sealed boxes use X25519 key exchange combined with XSalsa20-Poly1305
-//! authenticated encryption:
+//! Implements libsodium's `crypto_box_seal` / `crypto_box_seal_open` protocol:
 //!
-//! 1. An ephemeral keypair is generated for each encryption
-//! 2. X25519 key exchange derives a shared secret
-//! 3. XSalsa20-Poly1305 encrypts and authenticates the message
-//! 4. The ephemeral public key is prepended to the ciphertext
+//! 1. An ephemeral X25519 keypair is generated for each encryption
+//! 2. X25519 Diffie-Hellman derives a raw shared secret
+//! 3. HSalsa20 derives a symmetric key from the shared secret
+//! 4. Blake2b-24 derives a nonce from `ephemeral_pk || recipient_pk`
+//! 5. XSalsa20-Poly1305 encrypts and authenticates the message
+//! 6. The ephemeral public key is prepended to the ciphertext
 //!
 //! This provides confidentiality and authenticity, but not sender authentication
 //! (the sender is anonymous).
+//!
+//! # Wire Format
+//!
+//! `[ephemeral_pk: 32 bytes][ciphertext + poly1305 tag: plaintext.len() + 16 bytes]`
+//!
+//! Compatible with libsodium and stellar-core's `crypto_box_seal`.
 //!
 //! # Ed25519 to Curve25519 Conversion
 //!
@@ -40,34 +47,91 @@
 //! assert_eq!(decrypted, plaintext);
 //! ```
 
-use crypto_box::{PublicKey as CurvePublicKey, SecretKey as CurveSecretKey};
+use blake2::digest::consts::U24;
+use blake2::{Blake2b, Digest};
+use crypto_secretbox::aead::Aead;
+use crypto_secretbox::{KeyInit, XSalsa20Poly1305};
 use rand::rngs::OsRng;
+use salsa20::cipher::consts::U10;
+use salsa20::hsalsa;
+use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::Zeroize;
 
-use crate::curve25519::{check_public_key_contributory, ContributoryPublicKey};
 use crate::CryptoError;
 #[cfg(test)]
-use crate::{PublicKey, SecretKey};
+use crate::{PublicKey as EdPublicKey, SecretKey as EdSecretKey};
 
-fn seal(validated_pk: &ContributoryPublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let mut rng = OsRng;
-    CurvePublicKey::from(validated_pk.0)
-        .seal(&mut rng, plaintext)
-        .map_err(|_| CryptoError::EncryptionFailed)
+/// Overhead added to plaintext: 32-byte ephemeral public key + 16-byte Poly1305 tag.
+pub const SEALED_BOX_OVERHEAD: usize = 32 + 16;
+
+/// Performs X25519 DH, checks the result is contributory, and derives the
+/// XSalsa20 symmetric key via HSalsa20 (standard NaCl crypto_box key derivation).
+fn derive_shared_key(
+    our_secret: &StaticSecret,
+    their_public: &PublicKey,
+) -> Result<[u8; 32], CryptoError> {
+    let shared = our_secret.diffie_hellman(their_public);
+    if !shared.was_contributory() {
+        return Err(CryptoError::SmallOrderPublicKey);
+    }
+    let mut raw = shared.to_bytes();
+    let key: [u8; 32] = hsalsa::<U10>(&raw.into(), &[0u8; 16].into()).into();
+    raw.zeroize();
+    Ok(key)
 }
 
-fn open(curve_sk: CurveSecretKey, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    // Sealed-box ciphertext: [ephemeral_pk: 32 bytes][encrypted: ...]
-    if ciphertext.len() < 32 {
+/// Derives the sealed-box nonce: Blake2b-24(ephemeral_pk || recipient_pk).
+fn derive_seal_nonce(ephemeral_pk: &[u8; 32], recipient_pk: &[u8; 32]) -> [u8; 24] {
+    let mut hasher = Blake2b::<U24>::new();
+    hasher.update(ephemeral_pk);
+    hasher.update(recipient_pk);
+    hasher.finalize().into()
+}
+
+fn seal(recipient_pk: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let ephemeral_secret = StaticSecret::random_from_rng(OsRng);
+    let recipient_public = PublicKey::from(*recipient_pk);
+    let ephemeral_public = PublicKey::from(&ephemeral_secret);
+    let ephemeral_pk_bytes = ephemeral_public.to_bytes();
+
+    let mut sym_key = derive_shared_key(&ephemeral_secret, &recipient_public)?;
+    let nonce = derive_seal_nonce(&ephemeral_pk_bytes, recipient_pk);
+
+    let cipher = XSalsa20Poly1305::new((&sym_key).into());
+    sym_key.zeroize();
+
+    let encrypted = cipher
+        .encrypt((&nonce).into(), plaintext)
+        .map_err(|_| CryptoError::EncryptionFailed)?;
+
+    let mut out = Vec::with_capacity(32 + encrypted.len());
+    out.extend_from_slice(&ephemeral_pk_bytes);
+    out.extend_from_slice(&encrypted);
+    Ok(out)
+}
+
+fn open(recipient_secret: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    // Minimum: 32-byte ephemeral_pk + 16-byte poly1305 tag
+    if ciphertext.len() < SEALED_BOX_OVERHEAD {
         return Err(CryptoError::DecryptionFailed);
     }
+
     let ephemeral_pk: [u8; 32] = ciphertext[..32].try_into().unwrap();
-    // Pre-check: uses a random scalar (not the recipient's key) to catch
-    // small-order ephemeral keys that would produce an all-zero shared secret.
-    // The actual DH with the recipient's key happens inside unseal().
-    let _validated =
-        check_public_key_contributory(&ephemeral_pk).map_err(|_| CryptoError::DecryptionFailed)?;
-    curve_sk
-        .unseal(ciphertext)
+    let ephemeral_public = PublicKey::from(ephemeral_pk);
+
+    let secret = StaticSecret::from(*recipient_secret);
+    let recipient_public = PublicKey::from(&secret);
+    let recipient_pk_bytes = recipient_public.to_bytes();
+
+    let mut sym_key =
+        derive_shared_key(&secret, &ephemeral_public).map_err(|_| CryptoError::DecryptionFailed)?;
+    let nonce = derive_seal_nonce(&ephemeral_pk, &recipient_pk_bytes);
+
+    let cipher = XSalsa20Poly1305::new((&sym_key).into());
+    sym_key.zeroize();
+
+    cipher
+        .decrypt((&nonce).into(), &ciphertext[32..])
         .map_err(|_| CryptoError::DecryptionFailed)
 }
 
@@ -81,12 +145,10 @@ fn open(curve_sk: CurveSecretKey, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoEr
 /// Returns [`CryptoError::EncryptionFailed`] if encryption fails (rare, typically
 /// only on RNG failure).
 #[cfg(test)]
-fn seal_to_public_key(recipient: &PublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+fn seal_to_public_key(recipient: &EdPublicKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     // Ed25519-to-Curve25519 conversion always produces contributory points
-    seal(
-        &ContributoryPublicKey(recipient.to_curve25519_bytes()),
-        plaintext,
-    )
+    let curve_pk = recipient.to_curve25519_bytes();
+    seal(&curve_pk, plaintext)
 }
 
 /// Encrypts a payload to a Curve25519 public key.
@@ -95,13 +157,16 @@ fn seal_to_public_key(recipient: &PublicKey, plaintext: &[u8]) -> Result<Vec<u8>
 ///
 /// # Errors
 ///
+/// Returns [`CryptoError::SmallOrderPublicKey`] if the recipient key is small-order.
 /// Returns [`CryptoError::EncryptionFailed`] if encryption fails.
 pub fn seal_to_curve25519_public_key(
     recipient: &[u8; 32],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    let validated = check_public_key_contributory(recipient)?;
-    seal(&validated, plaintext)
+    seal(recipient, plaintext).map_err(|e| match e {
+        CryptoError::SmallOrderPublicKey => CryptoError::SmallOrderPublicKey,
+        _ => CryptoError::EncryptionFailed,
+    })
 }
 
 /// Decrypts a sealed payload using the recipient's Ed25519 secret key.
@@ -115,11 +180,12 @@ pub fn seal_to_curve25519_public_key(
 /// - The wrong key was used
 /// - The ciphertext is malformed
 #[cfg(test)]
-fn open_from_secret_key(recipient: &SecretKey, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    open(
-        CurveSecretKey::from(recipient.to_curve25519_bytes()),
-        ciphertext,
-    )
+fn open_from_secret_key(
+    recipient: &EdSecretKey,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let curve_sk = recipient.to_curve25519_bytes();
+    open(&curve_sk, ciphertext)
 }
 
 /// Decrypts a sealed payload using a Curve25519 secret key.
@@ -133,7 +199,7 @@ pub fn open_from_curve25519_secret_key(
     recipient: &[u8; 32],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
-    open(CurveSecretKey::from(*recipient), ciphertext)
+    open(recipient, ciphertext)
 }
 
 #[cfg(test)]
@@ -145,7 +211,7 @@ mod tests {
     #[test]
     fn test_seal_open_ed25519_roundtrip_g3() {
         // Encrypt with Ed25519 public key, decrypt with Ed25519 secret key.
-        let secret = SecretKey::generate();
+        let secret = EdSecretKey::generate();
         let public = secret.public_key();
         let plaintext = b"survey response payload";
 
@@ -183,9 +249,9 @@ mod tests {
     #[test]
     fn test_decryption_with_wrong_key_fails_g3() {
         // Encrypting to one key and decrypting with another must fail.
-        let secret_a = SecretKey::generate();
+        let secret_a = EdSecretKey::generate();
         let public_a = secret_a.public_key();
-        let secret_b = SecretKey::generate();
+        let secret_b = EdSecretKey::generate();
 
         let plaintext = b"secret data";
         let ciphertext = seal_to_public_key(&public_a, plaintext).unwrap();
@@ -198,7 +264,7 @@ mod tests {
     #[test]
     fn test_tampered_ciphertext_fails_g3() {
         // Authenticated encryption should reject tampered ciphertext.
-        let secret = SecretKey::generate();
+        let secret = EdSecretKey::generate();
         let public = secret.public_key();
         let plaintext = b"integrity-protected data";
 
@@ -218,7 +284,7 @@ mod tests {
     #[test]
     fn test_empty_plaintext_roundtrip_g3() {
         // Edge case: empty plaintext should still work.
-        let secret = SecretKey::generate();
+        let secret = EdSecretKey::generate();
         let public = secret.public_key();
         let plaintext = b"";
 
@@ -230,7 +296,7 @@ mod tests {
     #[test]
     fn test_large_plaintext_roundtrip_g3() {
         // Survey responses can be large. Test with a realistic payload size.
-        let secret = SecretKey::generate();
+        let secret = EdSecretKey::generate();
         let public = secret.public_key();
         let plaintext = vec![0xABu8; 4096]; // 4 KB payload
 
@@ -243,7 +309,7 @@ mod tests {
     fn test_each_encryption_produces_different_ciphertext_g3() {
         // Sealed boxes use ephemeral keys, so encrypting the same plaintext twice
         // should produce different ciphertexts (non-deterministic).
-        let secret = SecretKey::generate();
+        let secret = EdSecretKey::generate();
         let public = secret.public_key();
         let plaintext = b"same payload";
 
@@ -294,5 +360,75 @@ mod tests {
             result.is_err(),
             "open with small-order ephemeral key should fail"
         );
+    }
+
+    // ---- New tests ----
+
+    #[test]
+    fn test_deterministic_vector_wire_compatibility() {
+        // This vector was captured from the crypto_box 0.9.x implementation
+        // to prove wire-format compatibility with libsodium's crypto_box_seal.
+        let recipient_secret: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+
+        let sealed_hex = "64b101b1d0be5a8704bd078f9895001fc03e8e9f9522f188dd128d9846d4846673c0fedc538f220290c003c4b9e4d2688b427b23374e4a5d00068691c238293e5bc754ff6824";
+        let sealed = hex::decode(sealed_hex).unwrap();
+        let plaintext = b"test sealed box vector";
+
+        let decrypted = open_from_curve25519_secret_key(&recipient_secret, &sealed).unwrap();
+        assert_eq!(decrypted, plaintext.as_slice());
+    }
+
+    #[test]
+    fn test_nonce_derivation() {
+        // Verify nonce derivation matches expected output for known inputs
+        let ephemeral_pk: [u8; 32] = [
+            0x64, 0xb1, 0x01, 0xb1, 0xd0, 0xbe, 0x5a, 0x87, 0x04, 0xbd, 0x07, 0x8f, 0x98, 0x95,
+            0x00, 0x1f, 0xc0, 0x3e, 0x8e, 0x9f, 0x95, 0x22, 0xf1, 0x88, 0xdd, 0x12, 0x8d, 0x98,
+            0x46, 0xd4, 0x84, 0x66,
+        ];
+        let recipient_pk: [u8; 32] = [
+            0x07, 0xa3, 0x7c, 0xbc, 0x14, 0x20, 0x93, 0xc8, 0xb7, 0x55, 0xdc, 0x1b, 0x10, 0xe8,
+            0x6c, 0xb4, 0x26, 0x37, 0x4a, 0xd1, 0x6a, 0xa8, 0x53, 0xed, 0x0b, 0xdf, 0xc0, 0xb2,
+            0xb8, 0x6d, 0x1c, 0x7c,
+        ];
+        let expected_nonce: [u8; 24] = [
+            0x8f, 0x16, 0xb4, 0x75, 0x15, 0xc4, 0xd2, 0xd7, 0x20, 0x91, 0xfe, 0x20, 0x5e, 0x3a,
+            0x60, 0x1f, 0x02, 0x91, 0xc7, 0xe2, 0x9b, 0x2f, 0xbd, 0x2c,
+        ];
+
+        let nonce = derive_seal_nonce(&ephemeral_pk, &recipient_pk);
+        assert_eq!(nonce, expected_nonce);
+    }
+
+    #[test]
+    fn test_malformed_ciphertext_lengths() {
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let sk_bytes = secret.to_bytes();
+
+        // All lengths below SEALED_BOX_OVERHEAD (48) must fail
+        for len in [0, 1, 16, 31, 32, 33, 47] {
+            let ciphertext = vec![0x42u8; len];
+            let result = open_from_curve25519_secret_key(&sk_bytes, &ciphertext);
+            assert!(result.is_err(), "ciphertext of length {} should fail", len);
+            assert!(
+                matches!(result, Err(CryptoError::DecryptionFailed)),
+                "ciphertext of length {} should return DecryptionFailed",
+                len
+            );
+        }
+    }
+
+    #[test]
+    fn test_overhead_constant() {
+        let secret = EdSecretKey::generate();
+        let public = secret.public_key();
+        let plaintext = b"measure overhead";
+
+        let ciphertext = seal_to_public_key(&public, plaintext).unwrap();
+        assert_eq!(ciphertext.len(), plaintext.len() + SEALED_BOX_OVERHEAD);
     }
 }
