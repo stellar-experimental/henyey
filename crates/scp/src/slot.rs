@@ -2299,6 +2299,307 @@ mod tests {
         );
     }
 
+    // ==================== Validation clearing matrix tests (#2132) ====================
+    // Tests for propagate_ballot_clear_slot_validation via bump_state, force_bump_state,
+    // and nominate (nomination→ballot transition). Each scenario × 3 validation levels.
+
+    /// Helper: create a validator slot with a 2-of-2 quorum and PREPARE ballot at counter=1.
+    /// Uses a 2-node quorum (threshold=2) so PREPARE cannot advance to EXTERNALIZE.
+    fn slot_with_prepare_ballot_2node() -> (Slot, Value) {
+        use crate::test_utils::make_quorum_set as make_qs;
+
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let qs = Arc::new(make_qs(vec![node1.clone(), node2.clone()], 2));
+        let mut slot = Slot::new(1, node1.clone(), qs.clone(), true);
+
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        let prep = stellar_xdr::curr::ScpStatementPrepare {
+            quorum_set_hash: crate::quorum::hash_quorum_set(&qs).into(),
+            ballot: stellar_xdr::curr::ScpBallot {
+                counter: 1,
+                value: value.clone(),
+            },
+            prepared: None,
+            prepared_prime: None,
+            n_c: 0,
+            n_h: 0,
+        };
+        let statement = stellar_xdr::curr::ScpStatement {
+            node_id: node1,
+            slot_index: 1,
+            pledges: ScpStatementPledges::Prepare(prep),
+        };
+        let envelope = ScpEnvelope {
+            statement,
+            signature: stellar_xdr::curr::Signature(Vec::new().try_into().unwrap_or_default()),
+        };
+        slot.set_state_from_envelope(&envelope);
+        assert!(slot.is_fully_validated());
+        assert_eq!(slot.ballot().current_ballot().map(|b| b.counter), Some(1));
+        (slot, value)
+    }
+
+    /// Helper: create a validator slot with a 2-of-2 quorum and NO ballot.
+    fn slot_without_ballot_2node() -> (Slot, Value) {
+        use crate::test_utils::make_quorum_set as make_qs;
+
+        let node1 = make_node_id(1);
+        let node2 = make_node_id(2);
+        let qs = Arc::new(make_qs(vec![node1.clone(), node2.clone()], 2));
+        let slot = Slot::new(1, node1, qs, true);
+
+        let value: Value = vec![1, 2, 3].try_into().unwrap();
+        assert!(slot.is_fully_validated());
+        assert!(slot.ballot().current_ballot().is_none());
+        (slot, value)
+    }
+
+    /// Shared assertion helper for validation-clearing tests.
+    fn assert_validation_clearing(
+        slot: &Slot,
+        op_result: bool,
+        expected_counter: u32,
+        expect_fully_validated: bool,
+        label: &str,
+    ) {
+        assert!(op_result, "{}: operation must succeed", label);
+        assert_eq!(
+            slot.ballot().current_ballot().map(|b| b.counter),
+            Some(expected_counter),
+            "{}: counter mismatch",
+            label
+        );
+        assert!(!slot.is_externalized(), "{}: must not externalize", label);
+        assert_eq!(
+            slot.is_fully_validated(),
+            expect_fully_validated,
+            "{}: fully_validated mismatch",
+            label
+        );
+    }
+
+    // --- Scenario A: bump_state (existing ballot) ---
+
+    #[test]
+    fn test_bump_state_clears_fully_validated_maybe_valid() {
+        let (mut slot, value) = slot_with_prepare_ballot_2node();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValid)
+                .build(),
+        );
+        let result = slot.bump_state(&driver, value, 5);
+        assert_validation_clearing(&slot, result, 5, false, "bump_state/MaybeValid");
+    }
+
+    #[test]
+    fn test_bump_state_clears_fully_validated_maybe_valid_deferred() {
+        let (mut slot, value) = slot_with_prepare_ballot_2node();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValidDeferred)
+                .build(),
+        );
+        let result = slot.bump_state(&driver, value, 5);
+        assert_validation_clearing(&slot, result, 5, false, "bump_state/MaybeValidDeferred");
+    }
+
+    #[test]
+    fn test_bump_state_preserves_fully_validated_when_fully_validated() {
+        let (mut slot, value) = slot_with_prepare_ballot_2node();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::FullyValidated)
+                .build(),
+        );
+        let result = slot.bump_state(&driver, value, 5);
+        assert_validation_clearing(&slot, result, 5, true, "bump_state/FullyValidated");
+    }
+
+    // --- Scenario B: force_bump_state (existing ballot) ---
+
+    #[test]
+    fn test_force_bump_state_existing_ballot_clears_fully_validated_maybe_valid() {
+        let (mut slot, value) = slot_with_prepare_ballot_2node();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValid)
+                .build(),
+        );
+        let result = slot.force_bump_state(&driver, value);
+        assert_validation_clearing(
+            &slot,
+            result,
+            2,
+            false,
+            "force_bump_state(existing)/MaybeValid",
+        );
+    }
+
+    #[test]
+    fn test_force_bump_state_existing_ballot_clears_fully_validated_maybe_valid_deferred() {
+        let (mut slot, value) = slot_with_prepare_ballot_2node();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValidDeferred)
+                .build(),
+        );
+        let result = slot.force_bump_state(&driver, value);
+        assert_validation_clearing(
+            &slot,
+            result,
+            2,
+            false,
+            "force_bump_state(existing)/MaybeValidDeferred",
+        );
+    }
+
+    #[test]
+    fn test_force_bump_state_existing_ballot_preserves_fully_validated() {
+        let (mut slot, value) = slot_with_prepare_ballot_2node();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::FullyValidated)
+                .build(),
+        );
+        let result = slot.force_bump_state(&driver, value);
+        assert_validation_clearing(
+            &slot,
+            result,
+            2,
+            true,
+            "force_bump_state(existing)/FullyValidated",
+        );
+    }
+
+    // --- Scenario C: force_bump_state (no ballot) ---
+
+    #[test]
+    fn test_force_bump_state_no_ballot_clears_fully_validated_maybe_valid() {
+        let (mut slot, value) = slot_without_ballot_2node();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValid)
+                .build(),
+        );
+        let result = slot.force_bump_state(&driver, value);
+        assert_validation_clearing(
+            &slot,
+            result,
+            1,
+            false,
+            "force_bump_state(no ballot)/MaybeValid",
+        );
+    }
+
+    #[test]
+    fn test_force_bump_state_no_ballot_clears_fully_validated_maybe_valid_deferred() {
+        let (mut slot, value) = slot_without_ballot_2node();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValidDeferred)
+                .build(),
+        );
+        let result = slot.force_bump_state(&driver, value);
+        assert_validation_clearing(
+            &slot,
+            result,
+            1,
+            false,
+            "force_bump_state(no ballot)/MaybeValidDeferred",
+        );
+    }
+
+    #[test]
+    fn test_force_bump_state_no_ballot_preserves_fully_validated() {
+        let (mut slot, value) = slot_without_ballot_2node();
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::FullyValidated)
+                .build(),
+        );
+        let result = slot.force_bump_state(&driver, value);
+        assert_validation_clearing(
+            &slot,
+            result,
+            1,
+            true,
+            "force_bump_state(no ballot)/FullyValidated",
+        );
+    }
+
+    // --- Scenario D: nominate (nomination→ballot transition) ---
+
+    #[test]
+    fn test_nominate_transition_clears_fully_validated_maybe_valid() {
+        let (mut slot, value) = slot_without_ballot_2node();
+        slot.nomination_mut()
+            .set_latest_composite_for_test(Some(value.clone()));
+        assert!(
+            slot.ballot().current_ballot().is_none(),
+            "precondition: no ballot"
+        );
+
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValid)
+                .build(),
+        );
+        let empty: Value = vec![].try_into().unwrap();
+        slot.nominate(value, &empty, false, &driver);
+
+        assert_validation_clearing(&slot, true, 1, false, "nominate(transition)/MaybeValid");
+    }
+
+    #[test]
+    fn test_nominate_transition_clears_fully_validated_maybe_valid_deferred() {
+        let (mut slot, value) = slot_without_ballot_2node();
+        slot.nomination_mut()
+            .set_latest_composite_for_test(Some(value.clone()));
+        assert!(
+            slot.ballot().current_ballot().is_none(),
+            "precondition: no ballot"
+        );
+
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::MaybeValidDeferred)
+                .build(),
+        );
+        let empty: Value = vec![].try_into().unwrap();
+        slot.nominate(value, &empty, false, &driver);
+
+        assert_validation_clearing(
+            &slot,
+            true,
+            1,
+            false,
+            "nominate(transition)/MaybeValidDeferred",
+        );
+    }
+
+    #[test]
+    fn test_nominate_transition_preserves_fully_validated() {
+        let (mut slot, value) = slot_without_ballot_2node();
+        slot.nomination_mut()
+            .set_latest_composite_for_test(Some(value.clone()));
+        assert!(
+            slot.ballot().current_ballot().is_none(),
+            "precondition: no ballot"
+        );
+
+        let driver = Arc::new(
+            MockDriverBuilder::new()
+                .validation_level(ValidationLevel::FullyValidated)
+                .build(),
+        );
+        let empty: Value = vec![].try_into().unwrap();
+        slot.nominate(value, &empty, false, &driver);
+
+        assert_validation_clearing(&slot, true, 1, true, "nominate(transition)/FullyValidated");
+    }
+
     // ==================== run_post_emit_bookkeeping regression tests ====================
     // Regression tests for #2092: centralized bookkeeping ensures nomination stop,
     // externalization capture, and v-blocking all fire from any public Slot method.

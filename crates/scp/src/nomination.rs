@@ -196,6 +196,16 @@ impl NominationProtocol {
         self.latest_composite.as_ref()
     }
 
+    /// Inject a composite value for test purposes.
+    ///
+    /// In production, `latest_composite` is derived from confirmed candidates
+    /// via `update_composite()`. This setter allows slot-level tests to exercise
+    /// the `check_nomination_to_ballot` path without building a full nomination flow.
+    #[cfg(test)]
+    pub(crate) fn set_latest_composite_for_test(&mut self, value: Option<Value>) {
+        self.latest_composite = value;
+    }
+
     /// Get the last envelope constructed by this node.
     pub fn get_last_envelope(&self) -> Option<&ScpEnvelope> {
         self.last_envelope.as_ref()
