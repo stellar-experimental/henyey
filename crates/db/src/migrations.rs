@@ -34,7 +34,7 @@ use tracing::info;
 /// This should be incremented whenever a new migration is added.
 /// The database initialization and migration system uses this to
 /// determine if upgrades are needed.
-pub(crate) const CURRENT_VERSION: i32 = 9;
+pub(crate) const CURRENT_VERSION: i32 = 10;
 
 /// Represents a single database migration.
 ///
@@ -167,6 +167,15 @@ const MIGRATIONS: &[Migration] = &[
             CREATE INDEX IF NOT EXISTS events_topic1_id ON events(topic1, id);
         "#,
         description: "Add topic1+id index for efficient topic-filtered event queries",
+    },
+    Migration {
+        from_version: 9,
+        to_version: 10,
+        upgrade_sql: r#"
+            CREATE INDEX IF NOT EXISTS txhistory_status_ledger ON txhistory(status, ledgerseq, txindex);
+        "#,
+        description:
+            "Add status+ledger+txindex index for efficient status-filtered transaction queries",
     },
 ];
 
@@ -383,7 +392,7 @@ mod tests {
     #[test]
     fn test_migration_8_to_9_adds_topic1_id_index() {
         let conn = Connection::open_in_memory().unwrap();
-        // Set up a minimal v8 schema with the events table
+        // Set up a minimal v8 schema with the events and txhistory tables
         conn.execute_batch(
             r#"
             CREATE TABLE storestate (statename TEXT PRIMARY KEY, state TEXT);
@@ -404,6 +413,16 @@ mod tests {
             );
             CREATE INDEX events_ledger ON events(ledgerseq);
             CREATE INDEX events_contract ON events(contract_id, ledgerseq);
+            CREATE TABLE txhistory (
+                txid TEXT PRIMARY KEY,
+                ledgerseq INTEGER NOT NULL,
+                txindex INTEGER NOT NULL,
+                txbody BLOB NOT NULL,
+                txresult BLOB NOT NULL,
+                txmeta BLOB,
+                status INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX txhistory_ledger ON txhistory(ledgerseq);
             "#,
         )
         .unwrap();
@@ -424,6 +443,57 @@ mod tests {
             index_exists,
             "events_topic1_id index should exist after migration"
         );
+        assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_migration_9_to_10_adds_status_ledger_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Set up a minimal v9 schema with the txhistory table
+        conn.execute_batch(
+            r#"
+            CREATE TABLE storestate (statename TEXT PRIMARY KEY, state TEXT);
+            CREATE TABLE txhistory (
+                txid TEXT PRIMARY KEY,
+                ledgerseq INTEGER NOT NULL,
+                txindex INTEGER NOT NULL,
+                txbody BLOB NOT NULL,
+                txresult BLOB NOT NULL,
+                txmeta BLOB,
+                status INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX txhistory_ledger ON txhistory(ledgerseq);
+            "#,
+        )
+        .unwrap();
+        set_schema_version(&conn, 9).unwrap();
+
+        // Apply migration
+        run_migrations(&conn).unwrap();
+
+        // Verify index exists
+        let index_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_index_list('txhistory') WHERE name = 'txhistory_status_ledger'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            index_exists,
+            "txhistory_status_ledger index should exist after migration"
+        );
+
+        // Verify index column order: status, ledgerseq, txindex
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_index_info('txhistory_status_ledger') ORDER BY seqno")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(columns, vec!["status", "ledgerseq", "txindex"]);
+
         assert_eq!(get_schema_version(&conn).unwrap(), CURRENT_VERSION);
     }
 }

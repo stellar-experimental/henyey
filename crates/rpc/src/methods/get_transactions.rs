@@ -80,6 +80,7 @@ pub async fn handle(
     // On pruning race (require_close_times fails), fall back to batch_close_times
     // and skip records with missing headers rather than returning a 500.
     let tx_load_budget = ctx.app.config().rpc.max_tx_load_bytes;
+    let tx_query_ops = ctx.app.config().rpc.max_tx_query_ops;
     let (records, close_time_cache) = util::blocking_db(ctx, move |db| {
         db.with_connection(|conn| {
             use henyey_db::{HistoryQueries, LedgerQueries};
@@ -90,6 +91,7 @@ pub async fn handle(
                 effective_limit,
                 status_filter,
                 tx_load_budget,
+                tx_query_ops,
             )?;
             let seqs: Vec<u32> = records
                 .iter()
@@ -113,6 +115,13 @@ pub async fn handle(
     })
     .await
     .map_err(|e| {
+        use crate::util::DbAccessError;
+        if let DbAccessError::Db(henyey_db::DbError::QueryBudgetExceeded) = &e {
+            return JsonRpcError::query_budget_exceeded(
+                "query exceeded computational budget; narrow your filter criteria \
+                 or reduce the ledger range",
+            );
+        }
         tracing::warn!(error = ?e, "get_transactions DB error");
         JsonRpcError::internal("database error")
     })?;

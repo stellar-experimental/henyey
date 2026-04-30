@@ -1256,6 +1256,14 @@ pub struct RpcConfig {
     /// recommended for production).  Default: 5,000,000.
     #[serde(default = "default_max_event_query_ops")]
     pub max_event_query_ops: u32,
+
+    /// Maximum SQLite VM opcodes per `getTransactions` query.  When exceeded,
+    /// the query is interrupted and a "query budget exceeded" error is
+    /// returned.  This bounds worst-case scan work for status-filtered
+    /// queries over retained transaction history.  0 = unlimited (not
+    /// recommended for production).  Default: 5,000,000.
+    #[serde(default = "default_max_tx_query_ops")]
+    pub max_tx_query_ops: u32,
 }
 
 impl Default for RpcConfig {
@@ -1274,6 +1282,7 @@ impl Default for RpcConfig {
             max_tx_load_bytes: default_max_tx_load_bytes(),
             max_event_load_bytes: default_max_event_load_bytes(),
             max_event_query_ops: default_max_event_query_ops(),
+            max_tx_query_ops: default_max_tx_query_ops(),
         }
     }
 }
@@ -1300,6 +1309,12 @@ impl RpcConfig {
             tracing::warn!(
                 "rpc.max_event_query_ops is 0 (unlimited) — \
                  getEvents queries have no computational budget"
+            );
+        }
+        if self.max_tx_query_ops == 0 {
+            tracing::warn!(
+                "rpc.max_tx_query_ops is 0 (unlimited) — \
+                 getTransactions queries have no computational budget"
             );
         }
         Ok(())
@@ -1351,6 +1366,10 @@ fn default_max_event_load_bytes() -> usize {
 }
 
 fn default_max_event_query_ops() -> u32 {
+    5_000_000
+}
+
+fn default_max_tx_query_ops() -> u32 {
     5_000_000
 }
 

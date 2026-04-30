@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS txhistory (
     status INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS txhistory_ledger ON txhistory(ledgerseq);
+CREATE INDEX IF NOT EXISTS txhistory_status_ledger ON txhistory(status, ledgerseq, txindex);
 
 -- Transaction history entries (tx sets)
 CREATE TABLE IF NOT EXISTS txsets (

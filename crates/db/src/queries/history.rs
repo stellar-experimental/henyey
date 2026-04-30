@@ -159,6 +159,9 @@ pub trait HistoryQueries {
     ///
     /// If `start_tx_index` is `None`, starts from the beginning of `start_ledger`.
     /// If `status_filter` is `Some`, only returns transactions with that status.
+    /// If `max_query_ops` is non-zero, the query is interrupted after that many
+    /// SQLite VM opcodes, returning `DbError::QueryBudgetExceeded`.
+    #[allow(clippy::too_many_arguments)]
     fn load_transactions_in_range(
         &self,
         start_ledger: u32,
@@ -167,6 +170,7 @@ pub trait HistoryQueries {
         limit: u32,
         status_filter: Option<TxStatus>,
         max_total_bytes: usize,
+        max_query_ops: u32,
     ) -> Result<Vec<TxRecord>, DbError>;
 
     /// Deletes old transaction history entries with `ledgerseq <= max_ledger`.
@@ -176,6 +180,31 @@ pub trait HistoryQueries {
     /// tables (`txsets`, `txresults`) use the same count independently.
     /// Returns the total number of rows deleted across all tables.
     fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
+}
+
+/// RAII guard that clears the SQLite progress handler on drop.
+/// Ensures pooled connections are never left with a stale handler.
+struct TxProgressHandlerGuard<'a> {
+    conn: &'a Connection,
+}
+
+impl Drop for TxProgressHandlerGuard<'_> {
+    fn drop(&mut self) {
+        self.conn.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+fn is_tx_query_interrupted(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ffi::ErrorCode::OperationInterrupted,
+                ..
+            },
+            _
+        )
+    )
 }
 
 /// Builds the WHERE clause and bind values for transaction range queries.
@@ -193,14 +222,13 @@ fn build_tx_range_filter(
     let mut bind_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
     if let Some(tx_index) = start_tx_index {
-        // Cursor-based: resume after (start_ledger, tx_index)
+        // Cursor-based: resume after (start_ledger, tx_index) using row-value comparison.
+        // This allows SQLite to use composite indexes on (status, ledgerseq, txindex).
         conditions.push(format!(
-            "(ledgerseq > ?{idx1} OR (ledgerseq = ?{idx2} AND txindex > ?{idx3}))",
+            "(ledgerseq, txindex) > (?{idx1}, ?{idx2})",
             idx1 = bind_values.len() + 1,
             idx2 = bind_values.len() + 2,
-            idx3 = bind_values.len() + 3,
         ));
-        bind_values.push(Box::new(start_ledger));
         bind_values.push(Box::new(start_ledger));
         bind_values.push(Box::new(tx_index));
     } else {
@@ -385,6 +413,7 @@ impl HistoryQueries for Connection {
         Ok((tx_written, result_written))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn load_transactions_in_range(
         &self,
         start_ledger: u32,
@@ -393,6 +422,7 @@ impl HistoryQueries for Connection {
         limit: u32,
         status_filter: Option<TxStatus>,
         max_total_bytes: usize,
+        max_query_ops: u32,
     ) -> Result<Vec<TxRecord>, DbError> {
         let (where_clause, bind_values, limit_idx) = build_tx_range_filter(
             start_ledger,
@@ -410,37 +440,70 @@ impl HistoryQueries for Connection {
             where_clause, limit_idx,
         );
 
-        let mut stmt = self.prepare(&sql)?;
+        // Install progress handler if budget is configured.
+        let _guard = if max_query_ops > 0 {
+            let max_callbacks = (max_query_ops as u64).div_ceil(1000) as u32;
+            let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let counter_clone = counter.clone();
+            // Check every 1000 VM opcodes; interrupt when budget exceeded.
+            self.progress_handler(
+                1000,
+                Some(move || {
+                    let count = counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    count + 1 >= max_callbacks
+                }),
+            );
+            Some(TxProgressHandlerGuard { conn: self })
+        } else {
+            None
+        };
+
+        let mut stmt = match self.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) if is_tx_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+            Err(e) => return Err(e.into()),
+        };
         let params = rusqlite::params_from_iter(bind_values.iter().map(|v| v.as_ref()));
-        let mut rows = stmt.query(params)?;
+        let mut rows = match stmt.query(params) {
+            Ok(r) => r,
+            Err(e) if is_tx_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+            Err(e) => return Err(e.into()),
+        };
         let mut results = Vec::new();
         let mut cumulative_bytes: usize = 0;
 
-        while let Some(row) = rows.next()? {
-            let row_bytes: i64 = row.get(7)?;
-            let row_bytes = row_bytes.max(0) as usize;
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let row_bytes: i64 = row.get(7)?;
+                    let row_bytes = row_bytes.max(0) as usize;
 
-            if !results.is_empty() && cumulative_bytes + row_bytes > max_total_bytes {
-                break;
+                    if !results.is_empty() && cumulative_bytes + row_bytes > max_total_bytes {
+                        break;
+                    }
+
+                    let record = TxRecord {
+                        tx_id: row.get(0)?,
+                        ledger_seq: row.get(1)?,
+                        tx_index: row.get(2)?,
+                        body: row.get(3)?,
+                        result: row.get(4)?,
+                        meta: row.get(5)?,
+                        status: TxStatus::try_from(row.get::<_, i32>(6)?).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                6,
+                                rusqlite::types::Type::Integer,
+                                Box::new(e),
+                            )
+                        })?,
+                    };
+                    cumulative_bytes += row_bytes;
+                    results.push(record);
+                }
+                Ok(None) => break,
+                Err(e) if is_tx_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+                Err(e) => return Err(e.into()),
             }
-
-            let record = TxRecord {
-                tx_id: row.get(0)?,
-                ledger_seq: row.get(1)?,
-                tx_index: row.get(2)?,
-                body: row.get(3)?,
-                result: row.get(4)?,
-                meta: row.get(5)?,
-                status: TxStatus::try_from(row.get::<_, i32>(6)?).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        6,
-                        rusqlite::types::Type::Integer,
-                        Box::new(e),
-                    )
-                })?,
-            };
-            cumulative_bytes += row_bytes;
-            results.push(record);
         }
 
         Ok(results)
@@ -996,7 +1059,7 @@ mod tests {
         }
         // Budget 750 fits 2 rows (700) but not 3 (1050)
         let results = conn
-            .load_transactions_in_range(10, None, 11, 10, None, 750)
+            .load_transactions_in_range(10, None, 11, 10, None, 750, 0)
             .unwrap();
         assert_eq!(results.len(), 2);
     }
@@ -1007,7 +1070,7 @@ mod tests {
         // Single huge tx: 1000 bytes total, budget only 100
         insert_tx(&conn, 10, 0, 500, 200, Some(300), TxStatus::Success);
         let results = conn
-            .load_transactions_in_range(10, None, 11, 10, None, 100)
+            .load_transactions_in_range(10, None, 11, 10, None, 100, 0)
             .unwrap();
         assert_eq!(results.len(), 1, "first row must always be included");
     }
@@ -1021,7 +1084,7 @@ mod tests {
         }
         // Budget 400 fits 2 rows (300) but not 3 (450)
         let results = conn
-            .load_transactions_in_range(10, None, 11, 10, None, 400)
+            .load_transactions_in_range(10, None, 11, 10, None, 400, 0)
             .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results[0].meta.is_none());
@@ -1039,7 +1102,7 @@ mod tests {
         }
         // Budget fits 2 rows; filter to Failed only
         let results = conn
-            .load_transactions_in_range(10, None, 11, 10, Some(TxStatus::Failed), 750)
+            .load_transactions_in_range(10, None, 11, 10, Some(TxStatus::Failed), 750, 0)
             .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.status == TxStatus::Failed));
@@ -1055,7 +1118,7 @@ mod tests {
 
         // Budget fits 1 row
         let page1 = conn
-            .load_transactions_in_range(10, None, 12, 10, None, 350)
+            .load_transactions_in_range(10, None, 12, 10, None, 350, 0)
             .unwrap();
         assert_eq!(page1.len(), 1);
         assert_eq!(page1[0].ledger_seq, 10);
@@ -1063,7 +1126,7 @@ mod tests {
 
         // Resume from cursor (ledger 10, tx_index 0)
         let page2 = conn
-            .load_transactions_in_range(10, Some(0), 12, 10, None, 350)
+            .load_transactions_in_range(10, Some(0), 12, 10, None, 350, 0)
             .unwrap();
         assert_eq!(page2.len(), 1);
         assert_eq!(page2[0].ledger_seq, 10);
@@ -1071,7 +1134,7 @@ mod tests {
 
         // Resume from cursor (ledger 10, tx_index 1) — crosses ledger boundary
         let page3 = conn
-            .load_transactions_in_range(10, Some(1), 12, 10, None, 350)
+            .load_transactions_in_range(10, Some(1), 12, 10, None, 350, 0)
             .unwrap();
         assert_eq!(page3.len(), 1);
         assert_eq!(page3[0].ledger_seq, 11);
@@ -1087,7 +1150,7 @@ mod tests {
         }
         // Budget exactly 700 = 2 * 350 — second row should be included
         let results = conn
-            .load_transactions_in_range(10, None, 11, 10, None, 700)
+            .load_transactions_in_range(10, None, 11, 10, None, 700, 0)
             .unwrap();
         assert_eq!(
             results.len(),
@@ -1105,8 +1168,37 @@ mod tests {
         }
         // Budget large enough for all 5, but row limit is 2
         let results = conn
-            .load_transactions_in_range(10, None, 11, 2, None, 100_000)
+            .load_transactions_in_range(10, None, 11, 2, None, 100_000, 0)
             .unwrap();
         assert_eq!(results.len(), 2, "row limit should take precedence");
+    }
+
+    #[test]
+    fn test_query_budget_exceeded() {
+        let conn = setup_db();
+        // Insert many rows to ensure the query does significant work
+        for i in 0..100 {
+            insert_tx(&conn, 10, i, 100, 50, Some(200), TxStatus::Success);
+        }
+        // Use a very small budget (1000 opcodes = 1 callback check) to trigger interruption
+        let result = conn.load_transactions_in_range(10, None, 11, 100, None, 100_000, 1000);
+        assert!(
+            matches!(result, Err(DbError::QueryBudgetExceeded)),
+            "expected QueryBudgetExceeded, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_query_budget_zero_means_unlimited() {
+        let conn = setup_db();
+        for i in 0..5 {
+            insert_tx(&conn, 10, i, 100, 50, Some(200), TxStatus::Success);
+        }
+        // Budget 0 means no limit — should succeed
+        let results = conn
+            .load_transactions_in_range(10, None, 11, 10, None, 100_000, 0)
+            .unwrap();
+        assert_eq!(results.len(), 5);
     }
 }
