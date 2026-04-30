@@ -17,6 +17,7 @@
 
 use crate::tx_set_utils::HashedTx;
 use henyey_common::types::Hash256;
+use henyey_tx::envelope_utils::envelope_soroban_data;
 use stellar_xdr::curr::{
     DependentTxCluster, GeneralizedTransactionSet, Hash, LedgerKey, Limits,
     ParallelTxExecutionStage, ParallelTxsComponent, TransactionEnvelope, TransactionPhase,
@@ -421,23 +422,6 @@ fn ledger_key_bytes(key: &LedgerKey) -> Vec<u8> {
         .expect("LedgerKey XDR serialization should never fail")
 }
 
-/// Extract SorobanTransactionData from an envelope without constructing a TransactionFrame.
-fn soroban_data_from_envelope(
-    env: &TransactionEnvelope,
-) -> Option<&stellar_xdr::curr::SorobanTransactionData> {
-    let tx = match env {
-        TransactionEnvelope::TxV0(_) => return None,
-        TransactionEnvelope::Tx(e) => &e.tx,
-        TransactionEnvelope::TxFeeBump(e) => match &e.tx.inner_tx {
-            stellar_xdr::curr::FeeBumpTransactionInnerTx::Tx(inner) => &inner.tx,
-        },
-    };
-    match &tx.ext {
-        stellar_xdr::curr::TransactionExt::V0 => None,
-        stellar_xdr::curr::TransactionExt::V1(data) => Some(data),
-    }
-}
-
 /// Detect footprint conflicts between Soroban transactions.
 ///
 /// Two transactions conflict if:
@@ -455,7 +439,7 @@ fn detect_conflicts(txs: &[HashedTx]) -> Vec<BitSet> {
         std::collections::HashMap::new();
 
     for (tx_id, htx) in txs.iter().enumerate() {
-        if let Some(data) = soroban_data_from_envelope(htx.envelope()) {
+        if let Some(data) = envelope_soroban_data(htx.envelope()) {
             for key in data.resources.footprint.read_only.iter() {
                 let kb = ledger_key_bytes(key);
                 ro_key_txs.entry(kb).or_default().push(tx_id);
@@ -519,11 +503,11 @@ fn build_with_stage_count(
     let n = txs.len();
 
     // Build BuilderTx representations — extract instructions directly from
-    // envelopes via soroban_data_from_envelope() instead of constructing
-    // full TransactionFrame objects (which would clone each envelope).
+    // envelopes via envelope_soroban_data() instead of constructing full
+    // TransactionFrame objects (which would clone each envelope).
     let builder_txs: Vec<BuilderTx> = (0..n)
         .map(|id| {
-            let instructions = soroban_data_from_envelope(txs[id].envelope())
+            let instructions = envelope_soroban_data(txs[id].envelope())
                 .map(|d| d.resources.instructions)
                 .unwrap_or(0);
             BuilderTx {
@@ -1220,7 +1204,7 @@ mod tests {
         );
     }
 
-    /// Verify that `soroban_data_from_envelope` extracts the same instruction
+    /// Verify that `envelope_soroban_data` extracts the same instruction
     /// count from a fee-bump Soroban envelope as `TransactionFrame::soroban_data`.
     #[test]
     fn test_fee_bump_instruction_extraction_matches_frame() {
@@ -1253,13 +1237,13 @@ mod tests {
             signatures: Default::default(),
         });
 
-        // Extract via the optimized path (soroban_data_from_envelope).
-        let extracted = soroban_data_from_envelope(&fee_bump)
+        // Extract via the canonical path (envelope_soroban_data).
+        let extracted = envelope_soroban_data(&fee_bump)
             .map(|d| d.resources.instructions)
             .unwrap_or(0);
         assert_eq!(
             extracted, expected_instructions,
-            "soroban_data_from_envelope must extract instructions from fee-bump envelopes"
+            "envelope_soroban_data must extract instructions from fee-bump envelopes"
         );
     }
 
@@ -2646,12 +2630,8 @@ mod stellar_core_parity_tests {
     /// Extract the RO and RW ledger key sets from a transaction envelope's
     /// Soroban footprint, serialized to bytes for set operations.
     fn extract_footprint_keys(tx: &HashedTx) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-        let data = match tx.envelope() {
-            TransactionEnvelope::Tx(env) => match &env.tx.ext {
-                TransactionExt::V1(d) => d,
-                _ => return (vec![], vec![]),
-            },
-            _ => return (vec![], vec![]),
+        let Some(data) = envelope_soroban_data(tx.envelope()) else {
+            return (vec![], vec![]);
         };
         let ro: Vec<Vec<u8>> = data
             .resources
@@ -2672,13 +2652,84 @@ mod stellar_core_parity_tests {
 
     /// Extract instruction count from a transaction envelope.
     fn extract_instructions(tx: &HashedTx) -> u64 {
-        match tx.envelope() {
-            TransactionEnvelope::Tx(env) => match &env.tx.ext {
-                TransactionExt::V1(d) => d.resources.instructions as u64,
-                _ => 0,
+        envelope_soroban_data(tx.envelope())
+            .map(|d| d.resources.instructions as u64)
+            .unwrap_or(0)
+    }
+
+    /// Verify that `extract_footprint_keys` and `extract_instructions` correctly
+    /// handle fee-bump envelopes (not just `TransactionEnvelope::Tx`).
+    #[test]
+    fn test_extract_helpers_fee_bump_envelope() {
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx, Limits, WriteXdr,
+        };
+
+        let ro_keys = vec![10, 11];
+        let rw_keys = vec![20];
+        let expected_instructions: i32 = 99_000;
+
+        let mut account_id = 0u32;
+        let inner_tx = make_parity_tx(
+            &mut account_id,
+            expected_instructions,
+            &ro_keys,
+            &rw_keys,
+            500,
+        );
+        let inner_env = match inner_tx {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("expected Tx envelope"),
+        };
+
+        // Wrap in a fee-bump envelope.
+        let fee_bump = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source: MuxedAccount::Ed25519(Uint256([77; 32])),
+                fee: 2000,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+                ext: FeeBumpTransactionExt::V0,
             },
-            _ => 0,
-        }
+            signatures: Default::default(),
+        });
+
+        let htx = HashedTx::new(fee_bump);
+
+        // Verify extract_footprint_keys returns the inner tx's keys.
+        let (ro, rw) = extract_footprint_keys(&htx);
+        let expected_ro: Vec<Vec<u8>> = ro_keys
+            .iter()
+            .map(|&k| contract_data_key(k).to_xdr(Limits::none()).unwrap())
+            .collect();
+        let expected_rw: Vec<Vec<u8>> = rw_keys
+            .iter()
+            .map(|&k| contract_data_key(k).to_xdr(Limits::none()).unwrap())
+            .collect();
+        assert_eq!(ro, expected_ro, "RO keys must match inner tx footprint");
+        assert_eq!(rw, expected_rw, "RW keys must match inner tx footprint");
+
+        // Verify extract_instructions returns the inner tx's instruction count.
+        assert_eq!(
+            extract_instructions(&htx),
+            expected_instructions as u64,
+            "instructions must match inner tx"
+        );
+
+        // Negative case: non-Soroban envelope returns empty/zero.
+        let classic_tx = make_parity_tx(&mut account_id, 0, &[], &[], 100);
+        let non_soroban = match classic_tx {
+            TransactionEnvelope::Tx(mut env) => {
+                env.tx.ext = TransactionExt::V0;
+                TransactionEnvelope::Tx(env)
+            }
+            other => other,
+        };
+        let htx_classic = HashedTx::new(non_soroban);
+        let (ro_c, rw_c) = extract_footprint_keys(&htx_classic);
+        assert_eq!(ro_c, Vec::<Vec<u8>>::new());
+        assert_eq!(rw_c, Vec::<Vec<u8>>::new());
+        assert_eq!(extract_instructions(&htx_classic), 0);
     }
 
     /// Verify no two clusters within a stage have RW-RW or RO-RW footprint conflicts.
