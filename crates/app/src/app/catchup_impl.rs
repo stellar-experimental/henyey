@@ -2098,8 +2098,7 @@ impl App {
                         archive_latest,
                         "Buffered catchup skipped: target checkpoint not yet published"
                     );
-                    self.archive_confirmed_behind.store(true, Ordering::SeqCst);
-                    self.archive_checkpoint_cache.set_urgent(true);
+                    self.mark_archive_confirmed_behind();
                     self.arm_archive_behind_backoff(current_ledger).await;
                     return false;
                 }
@@ -2138,8 +2137,7 @@ impl App {
                         first_buffered,
                         "Skipping catchup: archive has no newer checkpoint"
                     );
-                    self.archive_confirmed_behind.store(true, Ordering::SeqCst);
-                    self.archive_checkpoint_cache.set_urgent(true);
+                    self.mark_archive_confirmed_behind();
                     self.arm_archive_behind_backoff(current_ledger).await;
                     return false;
                 }
@@ -2507,8 +2505,7 @@ impl App {
                         // and pollute the recently_caught_up flag (#1863).
                         // Don't arm archive_behind_until — the externalized
                         // path doesn't read it.
-                        self.archive_confirmed_behind.store(true, Ordering::SeqCst);
-                        self.archive_checkpoint_cache.set_urgent(true);
+                        self.mark_archive_confirmed_behind();
                         tracing::debug!(
                             current_ledger,
                             target_checkpoint,

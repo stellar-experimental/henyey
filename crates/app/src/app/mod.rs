@@ -1602,6 +1602,18 @@ impl App {
     /// This is the only production API for escalation — it couples the two
     /// signals that must always move together.  A raw counter bump without
     /// urgent mode is what caused the 5-minute wedge in #2073: the node
+    /// Mark the archive as confirmed behind AND activate urgent polling.
+    ///
+    /// Call this only from code paths that have **confirmed** the archive is
+    /// behind via a `Fresh`/`Stale` cache observation (not cold-cache or
+    /// escalation-only paths). These two signals are semantically coupled
+    /// (see #2073): setting `archive_confirmed_behind` without urgent polling
+    /// delays detection of newly published checkpoints by up to 60 s.
+    pub(super) fn mark_archive_confirmed_behind(&self) {
+        self.archive_confirmed_behind.store(true, Ordering::SeqCst);
+        self.archive_checkpoint_cache.set_urgent(true);
+    }
+
     /// was in catchup mode but still polling the archive at the 60 s
     /// normal cadence, delaying detection of the newly published
     /// checkpoint.
@@ -6857,6 +6869,39 @@ mod tests {
                 .load(Ordering::SeqCst),
             RECOVERY_ESCALATION_CATCHUP,
             "attempt counter must be raised to threshold"
+        );
+        // escalate_recovery_to_catchup must NOT set archive_confirmed_behind
+        // (escalation is a pre-confirmation path — see #2075).
+        assert!(
+            !app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "escalate_recovery_to_catchup must not set archive_confirmed_behind (#2075)"
+        );
+    }
+
+    /// The `mark_archive_confirmed_behind()` helper must set both the atomic
+    /// bool and activate urgent mode on the archive checkpoint cache.
+    #[tokio::test]
+    async fn test_mark_archive_confirmed_behind_sets_both_signals() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("rs-stellar-test.db");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(db_path)
+            .build();
+        let app = App::new(config).await.unwrap();
+
+        // Pre-conditions.
+        assert!(!app.archive_confirmed_behind.load(Ordering::SeqCst));
+        assert!(!app.archive_checkpoint_cache.is_urgent());
+
+        app.mark_archive_confirmed_behind();
+
+        assert!(
+            app.archive_confirmed_behind.load(Ordering::SeqCst),
+            "mark_archive_confirmed_behind must set archive_confirmed_behind"
+        );
+        assert!(
+            app.archive_checkpoint_cache.is_urgent(),
+            "mark_archive_confirmed_behind must activate urgent mode"
         );
     }
 

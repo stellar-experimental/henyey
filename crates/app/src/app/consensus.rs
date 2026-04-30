@@ -1241,18 +1241,7 @@ impl App {
                     // evaluation without waiting for the slower
                     // TriggerCatchup→validation→backoff pipeline.
                     //
-                    // Also enable urgent-mode on the cache unconditionally
-                    // (not gated on tx_set_all_peers_exhausted — #2073) so
-                    // the TTL drops to ~10 s and we detect newly-published
-                    // checkpoints within one recovery cycle.
-                    self.archive_confirmed_behind.store(true, Ordering::SeqCst);
-                    // Always poll aggressively when the archive has
-                    // confirmed it's behind the next checkpoint — this is
-                    // the detection bottleneck regardless of peer tx_set
-                    // state.  Previously gated on tx_set_all_peers_exhausted,
-                    // which delayed urgent-mode activation by up to 60s
-                    // (one full normal-TTL cycle).  See #2073.
-                    self.archive_checkpoint_cache.set_urgent(true);
+                    self.mark_archive_confirmed_behind();
                     tracing::debug!(
                         archive_latest = latest,
                         next_checkpoint = next_cp,
