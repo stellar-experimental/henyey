@@ -722,10 +722,11 @@ impl BallotProtocol {
         // mFullyValidated here, before advanceSlot, so that any
         // send_latest_envelope during advance_slot sees the correct state.
         //
-        // The henyey-specific `MaybeValidDeferred` variant does NOT
-        // clear (see the enum doc comment on `ValidationLevel` and
-        // issues #1795 / #1798). Using `clears_fully_validated()`
-        // keeps the distinction in the type system.
+        // The henyey-specific `MaybeValidDeferred` variant also clears
+        // (same as `MaybeValid`). Herder-side restoration mechanisms
+        // (`resolve_missing_tx_set` / `resolve_apply_lag_for_next_index`)
+        // restore `fully_validated` once the deferred condition resolves.
+        // See issues #1795 / #1798 / #2115.
         if validation.clears_fully_validated() {
             self.fully_validated = false;
         }
@@ -3468,13 +3469,14 @@ mod tests {
     }
 
     // =========================================================================
-    // Issues #1795 / #1798: MaybeValidDeferred must NOT clear fully_validated
+    // Issues #1795 / #1798: MaybeValidDeferred clears fully_validated
+    // with herder-side restoration
     // =========================================================================
     //
     // Root cause (both issues): henyey's SCP fast-path forwards a peer
     // envelope to the ballot protocol earlier than stellar-core's
     // PendingEnvelopes / processSCPQueue would, producing a "maybe
-    // valid" result the validator cannot recover from:
+    // valid" result before the node can fully validate:
     //
     //   - #1795: EXTERNALIZE forwarded before tx_set is fetched.
     //     `validate_value_against_local_state` returned
@@ -3489,12 +3491,13 @@ mod tests {
     //     `tracking_index == slot_index` branch returned
     //     `ValueValidation::MaybeValid`.
     //
-    // Either MaybeValid cleared Slot::fully_validated, suppressing
-    // local EXTERNALIZE emission forever (stellar-core parity:
-    // fully_validated is never restored once cleared). The fix is a
-    // shared `MaybeValidDeferred` level that signals "we couldn't
-    // fully validate because of a henyey-specific fast-path
-    // divergence" without triggering the ballot-layer clear.
+    // `MaybeValidDeferred` clears `fully_validated` (same as
+    // `MaybeValid`), transiently suppressing EXTERNALIZE emission.
+    // Herder-side restoration (`resolve_missing_tx_set` /
+    // `resolve_apply_lag_for_next_index` →
+    // `SCP::restore_slot_fully_validated`) restores `fully_validated`
+    // once the deferred condition resolves, allowing emission to
+    // proceed. See #2115.
 
     /// Driver that returns a configurable ValidationLevel.
     struct ConfigurableValidationDriver {

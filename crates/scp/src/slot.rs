@@ -599,14 +599,15 @@ impl Slot {
         // advance_slot, mirroring stellar-core BallotProtocol.cpp:208-211.
         let result = self.ballot.process_envelope(envelope, &ctx, validation);
 
-        // Clear slot-level fully_validated for MaybeValid external envelopes.
-        // This matches stellar-core's Slot::setFullyValidated(false) inside
-        // processEnvelope for external (non-self) envelopes.
+        // Clear slot-level fully_validated for MaybeValid/MaybeValidDeferred
+        // external envelopes. This matches stellar-core's
+        // Slot::setFullyValidated(false) inside processEnvelope for
+        // external (non-self) envelopes.
         //
-        // Use the same `clears_fully_validated()` gate as the ballot
-        // protocol so the henyey-specific `MaybeValidDeferred` variant
-        // does not poison the slot's fully_validated flag. See the
-        // enum doc comment on `ValidationLevel` and issues #1795 / #1798.
+        // Both `MaybeValid` and `MaybeValidDeferred` clear via
+        // `clears_fully_validated()`. For `MaybeValidDeferred`, herder-side
+        // restoration prevents permanent suppression. See issues
+        // #1795 / #1798 / #2115.
         if result != EnvelopeState::Invalid
             && validation.clears_fully_validated()
             && self.externalized_value.is_none()

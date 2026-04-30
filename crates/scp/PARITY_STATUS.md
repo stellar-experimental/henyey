@@ -308,10 +308,15 @@ stellar-core's `PendingEnvelopes` / `processSCPQueue` would:
    entirely.
 
 In both cases henyey uses `MaybeValidDeferred` to signal "we could not
-fully validate because of a fast-path divergence — do NOT clear
-`Slot::fully_validated`". The variant behaves identically to
-`MaybeValid` for all other SCP state transitions; the single behavioral
-difference is gated through `ValidationLevel::clears_fully_validated()`.
+fully validate because of a henyey-specific fast-path divergence."
+`MaybeValidDeferred` clears `Slot::fully_validated` immediately (same as
+`MaybeValid` — both return `true` from `clears_fully_validated()`).
+Paired herder-side restoration prevents permanent silence:
+`Herder::cache_tx_set` → `ScpDriver::resolve_missing_tx_set` →
+`SCP::restore_slot_fully_validated` (missing-tx-set case), and
+`Herder::ledger_closed` → `resolve_apply_lag_for_next_index` →
+`SCP::restore_slot_fully_validated` (apply-lag case). See issues
+#1795 / #1798 / #2096 / #2115.
 
 **No re-validation after tx_set arrival (#1796):** `ValidationLevel` is
 ephemeral — computed on-the-fly by `validate_statement_values`, used for
@@ -320,9 +325,11 @@ then discarded. No per-envelope validation state is stored in SCP.
 When the tx_set arrives after a `MaybeValidDeferred` EXTERNALIZE, there
 is no stored verdict to "upgrade" to `FullyValidated`. Re-feeding the
 same EXTERNALIZE to SCP would be rejected by `is_stale_ballot_statement`.
-Since both `MaybeValidDeferred` and `FullyValidated` return `false` from
-`clears_fully_validated()`, the slot end states (externalized,
-`fully_validated=true`, emission visibility) are identical.
+Since `MaybeValidDeferred` clears `fully_validated` (returns `true` from
+`clears_fully_validated()`), restoration is required to reach the same
+end state as `FullyValidated`. Once the herder-side restoration fires,
+the observable post-restoration state (`fully_validated=true`, emission
+visible) matches what `FullyValidated` would have produced.
 
 | `hashHelper()` (private) | Inlined in `compute_hash_node()` / `compute_value_hash()` | Full |
 
