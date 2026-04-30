@@ -5560,6 +5560,315 @@ mod tests {
     }
 
     #[test]
+    fn test_extra_signer_signed_payload_satisfied() {
+        use stellar_xdr::curr::SignerKeyEd25519SignedPayload;
+
+        let queue = TransactionQueue::with_defaults();
+
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let payload_secret = SecretKey::from_seed(&[10u8; 32]);
+        let pubkey_bytes = *payload_secret.public_key().as_bytes();
+        let payload_bytes = b"CAP-0040 test payload with enough bytes";
+
+        let signed_payload_signer = SignerKeyEd25519SignedPayload {
+            ed25519: Uint256(pubkey_bytes),
+            payload: payload_bytes.to_vec().try_into().unwrap(),
+        };
+        let extra_signer = SignerKey::Ed25519SignedPayload(signed_payload_signer.clone());
+
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: None,
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![extra_signer].try_into().unwrap(),
+        });
+
+        let operations: Vec<Operation> = vec![Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+                starting_balance: 1000000000,
+            }),
+        }];
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        // Sign the payload bytes with the correct key
+        let sig = payload_secret.sign(payload_bytes);
+
+        // Compute CAP-0040 XOR hint: pubkey_last4 XOR payload_last4
+        let pubkey_hint = [
+            pubkey_bytes[28],
+            pubkey_bytes[29],
+            pubkey_bytes[30],
+            pubkey_bytes[31],
+        ];
+        let plen = payload_bytes.len();
+        let payload_hint = [
+            payload_bytes[plen - 4],
+            payload_bytes[plen - 3],
+            payload_bytes[plen - 2],
+            payload_bytes[plen - 1],
+        ];
+        let xor_hint = [
+            pubkey_hint[0] ^ payload_hint[0],
+            pubkey_hint[1] ^ payload_hint[1],
+            pubkey_hint[2] ^ payload_hint[2],
+            pubkey_hint[3] ^ payload_hint[3],
+        ];
+
+        let decorated_sig = DecoratedSignature {
+            hint: SignatureHint(xor_hint),
+            signature: XdrSignature(sig.0.to_vec().try_into().unwrap()),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![decorated_sig].try_into().unwrap(),
+        });
+
+        assert_eq!(queue.try_add(envelope), TxQueueResult::Added);
+    }
+
+    #[test]
+    fn test_extra_signer_signed_payload_wrong_key_rejected() {
+        use henyey_tx::TxResultCode;
+        use stellar_xdr::curr::SignerKeyEd25519SignedPayload;
+
+        let queue = TransactionQueue::with_defaults();
+
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let signer_secret = SecretKey::from_seed(&[10u8; 32]);
+        let wrong_secret = SecretKey::from_seed(&[11u8; 32]);
+        let signer_pubkey_bytes = *signer_secret.public_key().as_bytes();
+        let payload_bytes = b"CAP-0040 test payload with enough bytes";
+
+        // The extra signer references signer_secret's public key
+        let signed_payload_signer = SignerKeyEd25519SignedPayload {
+            ed25519: Uint256(signer_pubkey_bytes),
+            payload: payload_bytes.to_vec().try_into().unwrap(),
+        };
+        let extra_signer = SignerKey::Ed25519SignedPayload(signed_payload_signer);
+
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: None,
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![extra_signer].try_into().unwrap(),
+        });
+
+        let operations: Vec<Operation> = vec![Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+                starting_balance: 1000000000,
+            }),
+        }];
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        // Sign with wrong key — hint will also be wrong (derived from wrong key)
+        let wrong_pubkey_bytes = *wrong_secret.public_key().as_bytes();
+        let sig = wrong_secret.sign(payload_bytes);
+        let wrong_hint = [
+            wrong_pubkey_bytes[28],
+            wrong_pubkey_bytes[29],
+            wrong_pubkey_bytes[30],
+            wrong_pubkey_bytes[31],
+        ];
+        let plen = payload_bytes.len();
+        let payload_hint = [
+            payload_bytes[plen - 4],
+            payload_bytes[plen - 3],
+            payload_bytes[plen - 2],
+            payload_bytes[plen - 1],
+        ];
+        let xor_hint = [
+            wrong_hint[0] ^ payload_hint[0],
+            wrong_hint[1] ^ payload_hint[1],
+            wrong_hint[2] ^ payload_hint[2],
+            wrong_hint[3] ^ payload_hint[3],
+        ];
+
+        let decorated_sig = DecoratedSignature {
+            hint: SignatureHint(xor_hint),
+            signature: XdrSignature(sig.0.to_vec().try_into().unwrap()),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![decorated_sig].try_into().unwrap(),
+        });
+
+        assert_eq!(
+            queue.try_add(envelope),
+            TxQueueResult::Invalid(Some(TxResultCode::TxBadAuth))
+        );
+    }
+
+    #[test]
+    fn test_extra_signer_signed_payload_bad_signature_rejected() {
+        use henyey_tx::TxResultCode;
+        use stellar_xdr::curr::SignerKeyEd25519SignedPayload;
+
+        let queue = TransactionQueue::with_defaults();
+
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let payload_secret = SecretKey::from_seed(&[10u8; 32]);
+        let pubkey_bytes = *payload_secret.public_key().as_bytes();
+        let payload_bytes = b"CAP-0040 test payload with enough bytes";
+
+        let signed_payload_signer = SignerKeyEd25519SignedPayload {
+            ed25519: Uint256(pubkey_bytes),
+            payload: payload_bytes.to_vec().try_into().unwrap(),
+        };
+        let extra_signer = SignerKey::Ed25519SignedPayload(signed_payload_signer);
+
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: None,
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![extra_signer].try_into().unwrap(),
+        });
+
+        let operations: Vec<Operation> = vec![Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+                starting_balance: 1000000000,
+            }),
+        }];
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        // Compute correct XOR hint (passes hint check)
+        let pubkey_hint = [
+            pubkey_bytes[28],
+            pubkey_bytes[29],
+            pubkey_bytes[30],
+            pubkey_bytes[31],
+        ];
+        let plen = payload_bytes.len();
+        let payload_hint = [
+            payload_bytes[plen - 4],
+            payload_bytes[plen - 3],
+            payload_bytes[plen - 2],
+            payload_bytes[plen - 1],
+        ];
+        let xor_hint = [
+            pubkey_hint[0] ^ payload_hint[0],
+            pubkey_hint[1] ^ payload_hint[1],
+            pubkey_hint[2] ^ payload_hint[2],
+            pubkey_hint[3] ^ payload_hint[3],
+        ];
+
+        // Create a valid-length but corrupted signature (64 bytes of garbage)
+        let mut bad_sig_bytes = [0xAA_u8; 64];
+        bad_sig_bytes[0] = 0xFF;
+
+        let decorated_sig = DecoratedSignature {
+            hint: SignatureHint(xor_hint),
+            signature: XdrSignature(bad_sig_bytes.to_vec().try_into().unwrap()),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: vec![decorated_sig].try_into().unwrap(),
+        });
+
+        assert_eq!(
+            queue.try_add(envelope),
+            TxQueueResult::Invalid(Some(TxResultCode::TxBadAuth))
+        );
+    }
+
+    #[test]
+    fn test_extra_signer_signed_payload_empty_payload_rejected() {
+        use henyey_tx::TxResultCode;
+        use stellar_xdr::curr::SignerKeyEd25519SignedPayload;
+
+        let queue = TransactionQueue::with_defaults();
+
+        let source = MuxedAccount::Ed25519(Uint256([1u8; 32]));
+        let payload_secret = SecretKey::from_seed(&[10u8; 32]);
+        let pubkey_bytes = *payload_secret.public_key().as_bytes();
+
+        // Empty payload — should be rejected structurally by check_valid_pre_seq_num_with_config
+        let signed_payload_signer = SignerKeyEd25519SignedPayload {
+            ed25519: Uint256(pubkey_bytes),
+            payload: vec![].try_into().unwrap(),
+        };
+        let extra_signer = SignerKey::Ed25519SignedPayload(signed_payload_signer);
+
+        let preconditions = Preconditions::V2(PreconditionsV2 {
+            time_bounds: None,
+            ledger_bounds: None,
+            min_seq_num: None,
+            min_seq_age: Duration(0),
+            min_seq_ledger_gap: 0,
+            extra_signers: vec![extra_signer].try_into().unwrap(),
+        });
+
+        let operations: Vec<Operation> = vec![Operation {
+            source_account: None,
+            body: OperationBody::CreateAccount(CreateAccountOp {
+                destination: AccountId(PublicKey::PublicKeyTypeEd25519(Uint256([2u8; 32]))),
+                starting_balance: 1000000000,
+            }),
+        }];
+
+        let tx = Transaction {
+            source_account: source,
+            fee: 200,
+            seq_num: SequenceNumber(1),
+            cond: preconditions,
+            memo: Memo::None,
+            operations: operations.try_into().unwrap(),
+            ext: TransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        assert_eq!(
+            queue.try_add(envelope),
+            TxQueueResult::Invalid(Some(TxResultCode::TxMalformed))
+        );
+    }
+
+    #[test]
     fn test_min_seq_age_allowed() {
         let queue = TransactionQueue::with_defaults();
         let network_id = NetworkId::testnet();
