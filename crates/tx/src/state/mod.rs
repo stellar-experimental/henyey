@@ -1565,6 +1565,30 @@ impl LedgerStateManager {
         }
     }
 
+    /// Record all delete-related metadata for a ledger key (non-offer entries).
+    ///
+    /// Bundles the shared delete protocol:
+    /// 1. `capture_op_snapshot_for_key` — must precede step 3
+    /// 2. `snapshot_last_modified_key` — must precede step 3
+    /// 3. `record_snapshot_delete` — reads from op_entry_snapshots (step 1)
+    /// 4. `clear_entry_sponsorship_metadata` — must precede type-map removal
+    /// 5. `remove_last_modified_key` — operates on separate map, safe before
+    ///    type-map removal
+    ///
+    /// Must be called AFTER the entry-type-specific snapshot is saved.
+    /// After this returns, the caller removes the entry from its type-specific
+    /// state map.
+    ///
+    /// NOT used by `delete_offer` — offers store metadata inline and handle
+    /// cleanup via `OfferStore::remove`.
+    fn record_delete_meta(&mut self, ledger_key: &LedgerKey) {
+        self.capture_op_snapshot_for_key(ledger_key);
+        self.snapshot_last_modified_key(ledger_key);
+        self.record_snapshot_delete(ledger_key);
+        self.clear_entry_sponsorship_metadata(ledger_key);
+        self.remove_last_modified_key(ledger_key);
+    }
+
     /// Record a flush update: resolve pre-state, set last_modified, and record delta.
     ///
     /// Common tail shared by every entry-type block in `flush_modified_entries`.
@@ -4422,5 +4446,71 @@ mod tests {
         } else {
             panic!("expected Trustline entry in delete_states");
         }
+    }
+
+    /// Regression test: delete_claimable_balance uses record_delete_meta helper
+    /// and preserves the pre-mutation snapshot as the delete pre-state.
+    #[test]
+    fn test_delete_claimable_balance_uses_snapshot_pre_state() {
+        let mut state = new_manager_with_offers(5_000_000, 100);
+
+        let balance_id = ClaimableBalanceId::ClaimableBalanceIdTypeV0(Hash([7u8; 32]));
+        let entry = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: create_test_account_id(1),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset: Asset::Native,
+            amount: 2_000_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.create_claimable_balance(entry);
+        state.commit();
+
+        // Start a new tx — snapshot_delta captures the committed state
+        state.snapshot_delta();
+
+        // Mutate the balance (simulates an op modifying before delete)
+        let modified = ClaimableBalanceEntry {
+            balance_id: balance_id.clone(),
+            claimants: vec![Claimant::ClaimantTypeV0(ClaimantV0 {
+                destination: create_test_account_id(1),
+                predicate: ClaimPredicate::Unconditional,
+            })]
+            .try_into()
+            .unwrap(),
+            asset: Asset::Native,
+            amount: 500_000,
+            ext: ClaimableBalanceEntryExt::V0,
+        };
+        state.update_claimable_balance(modified);
+
+        // Now delete — the delta should record the pre-mutation state (2_000_000)
+        state.delete_claimable_balance(&balance_id);
+
+        let delta = state.delta();
+        let delete_states = delta.delete_states();
+        let delete_state = delete_states
+            .iter()
+            .find(|e| matches!(&e.data, LedgerEntryData::ClaimableBalance(_)))
+            .expect("should have a delete state for claimable balance");
+
+        if let LedgerEntryData::ClaimableBalance(cb) = &delete_state.data {
+            assert_eq!(
+                cb.amount, 2_000_000,
+                "delete STATE must use snapshot amount (2_000_000), not mutated amount (500_000)"
+            );
+        } else {
+            panic!("expected ClaimableBalance entry in delete_states");
+        }
+
+        // Verify the entry is actually removed from state
+        assert!(
+            state.get_claimable_balance(&balance_id).is_none(),
+            "claimable balance should be removed after delete"
+        );
     }
 }

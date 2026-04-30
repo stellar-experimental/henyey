@@ -466,16 +466,8 @@ impl LedgerStateManager {
             let snapshot = self.ttl_entries.get(key_hash).cloned();
             self.ttl_snapshots.insert(key_hash.clone(), snapshot);
         }
-        self.capture_op_snapshot_for_key(&ledger_key);
-        self.snapshot_last_modified_key(&ledger_key);
-
-        // Record delete with snapshot pre-state (not current mutated state)
-        self.record_snapshot_delete(&ledger_key);
-
-        // Remove from state and track deletion
-        self.clear_entry_sponsorship_metadata(&ledger_key);
+        self.record_delete_meta(&ledger_key);
         self.ttl_entries.remove(key_hash);
-        self.remove_last_modified_key(&ledger_key);
         // Track this deletion to prevent reloading from bucket list
         self.deleted_ttl.insert(key_hash.clone());
     }

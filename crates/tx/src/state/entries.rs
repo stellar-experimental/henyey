@@ -534,16 +534,8 @@ impl LedgerStateManager {
             let snapshot = self.accounts.get(account_id).cloned();
             self.account_snapshots.insert(account_id.clone(), snapshot);
         }
-        self.capture_op_snapshot_for_key(&ledger_key);
-        self.snapshot_last_modified_key(&ledger_key);
-
-        // Record delete with snapshot pre-state (not current mutated state)
-        self.record_snapshot_delete(&ledger_key);
-
-        // Remove from state
-        self.clear_entry_sponsorship_metadata(&ledger_key);
+        self.record_delete_meta(&ledger_key);
         self.accounts.remove(account_id);
-        self.remove_last_modified_key(&ledger_key);
     }
 
     /// Get a trustline by account and asset (read-only).
@@ -801,16 +793,8 @@ impl LedgerStateManager {
             let snapshot = self.trustlines.get(&key).cloned();
             self.trustline_snapshots.insert(key.clone(), snapshot);
         }
-        self.capture_op_snapshot_for_key(&ledger_key);
-        self.snapshot_last_modified_key(&ledger_key);
-
-        // Record delete with snapshot pre-state (not current mutated state)
-        self.record_snapshot_delete(&ledger_key);
-
-        // Remove from state
-        self.clear_entry_sponsorship_metadata(&ledger_key);
+        self.record_delete_meta(&ledger_key);
         self.trustlines.remove(&key);
-        self.remove_last_modified_key(&ledger_key);
     }
 
     /// Delete a trustline entry by trustline asset.
@@ -830,16 +814,8 @@ impl LedgerStateManager {
             let snapshot = self.trustlines.get(&key).cloned();
             self.trustline_snapshots.insert(key.clone(), snapshot);
         }
-        self.capture_op_snapshot_for_key(&ledger_key);
-        self.snapshot_last_modified_key(&ledger_key);
-
-        // Record delete with snapshot pre-state (not current mutated state)
-        self.record_snapshot_delete(&ledger_key);
-
-        // Remove from state
-        self.clear_entry_sponsorship_metadata(&ledger_key);
+        self.record_delete_meta(&ledger_key);
         self.trustlines.remove(&key);
-        self.remove_last_modified_key(&ledger_key);
     }
 
     /// Get the top-N offer keys (cheapest first) for an asset pair.
@@ -1193,19 +1169,14 @@ impl LedgerStateManager {
         let key = (account_id.clone(), name.to_string());
         self.data_entries.ensure_snapshot_on_first(&key);
 
-        // Build ledger key from stored entry (Data constructs LedgerKey from entry fields).
-        // Clone the entry to avoid borrow checker issues.
+        // Build ledger key from stored entry (uses entry.data_name, not caller's &str).
         if let Some(entry) = self.data_entries.get(&key).cloned() {
             let ledger_key = LedgerKey::Data(LedgerKeyData {
                 account_id: account_id.clone(),
                 data_name: entry.data_name.clone(),
             });
-            self.capture_op_snapshot_for_key(&ledger_key);
-            self.snapshot_last_modified_key(&ledger_key);
-            self.record_snapshot_delete(&ledger_key);
-            self.clear_entry_sponsorship_metadata(&ledger_key);
+            self.record_delete_meta(&ledger_key);
             self.data_entries.remove_deleted(&key, false, false);
-            self.remove_last_modified_key(&ledger_key);
         }
     }
 
@@ -1294,12 +1265,8 @@ impl LedgerStateManager {
             durability,
         });
         self.contract_data.ensure_snapshot_on_first(&lookup_key);
-        self.capture_op_snapshot_for_key(&ledger_key);
-        self.snapshot_last_modified_key(&ledger_key);
-        self.record_snapshot_delete(&ledger_key);
-        self.clear_entry_sponsorship_metadata(&ledger_key);
+        self.record_delete_meta(&ledger_key);
         self.contract_data.remove_deleted(&lookup_key, true, false);
-        self.remove_last_modified_key(&ledger_key);
     }
 
     /// Get a contract code entry by hash (read-only).
@@ -1359,12 +1326,8 @@ impl LedgerStateManager {
         let key = hash.clone();
         let ledger_key = LedgerKey::ContractCode(LedgerKeyContractCode { hash: hash.clone() });
         self.contract_code.ensure_snapshot_on_first(&key);
-        self.capture_op_snapshot_for_key(&ledger_key);
-        self.snapshot_last_modified_key(&ledger_key);
-        self.record_snapshot_delete(&ledger_key);
-        self.clear_entry_sponsorship_metadata(&ledger_key);
+        self.record_delete_meta(&ledger_key);
         self.contract_code.remove_deleted(&key, true, false);
-        self.remove_last_modified_key(&ledger_key);
     }
 
     /// Get a claimable balance by ID (read-only).
@@ -1417,12 +1380,8 @@ impl LedgerStateManager {
             balance_id: balance_id.clone(),
         });
         self.claimable_balances.ensure_snapshot_on_first(&key);
-        self.capture_op_snapshot_for_key(&ledger_key);
-        self.snapshot_last_modified_key(&ledger_key);
-        self.record_snapshot_delete(&ledger_key);
-        self.clear_entry_sponsorship_metadata(&ledger_key);
+        self.record_delete_meta(&ledger_key);
         self.claimable_balances.remove_deleted(&key, false, false);
-        self.remove_last_modified_key(&ledger_key);
     }
 
     /// Update an existing claimable balance entry.
@@ -1511,12 +1470,8 @@ impl LedgerStateManager {
             liquidity_pool_id: pool_id.clone(),
         });
         self.liquidity_pools.ensure_snapshot_on_first(&key);
-        self.capture_op_snapshot_for_key(&ledger_key);
-        self.snapshot_last_modified_key(&ledger_key);
-        self.record_snapshot_delete(&ledger_key);
-        self.clear_entry_sponsorship_metadata(&ledger_key);
+        self.record_delete_meta(&ledger_key);
         self.liquidity_pools.remove_deleted(&key, false, true);
-        self.remove_last_modified_key(&ledger_key);
     }
 
     /// Get an entry by LedgerKey (read-only).
