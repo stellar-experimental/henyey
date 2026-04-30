@@ -1320,6 +1320,74 @@ async fn get_transactions_budget_oversized_first_row() {
 }
 
 // ---------------------------------------------------------------------------
+// getTransactions query-budget (max_tx_query_ops) tests
+// ---------------------------------------------------------------------------
+
+/// Verify that exceeding max_tx_query_ops returns JSON-RPC error -32002.
+#[tokio::test]
+async fn get_transactions_query_budget_exceeded_returns_error_code() {
+    // Budget of 1000 opcodes → div_ceil(1000/1000) = 1 callback → first
+    // progress-handler check interrupts the query.
+    let app = FakeRpcApp::builder()
+        .ledger_seq(10)
+        .max_tx_query_ops(1000)
+        .build();
+    let h = FakeRpcTestHarness::start(app).await;
+    seed_ledger_header(h.app.database(), 2, 1_700_000_002);
+    seed_ledger_header(h.app.database(), 10, 1_700_000_010);
+
+    // Seed 100 transactions — enough rows that even a simple range scan
+    // exceeds 1000 VM opcodes (validated by the unit test at
+    // crates/db/src/queries/history.rs:test_query_budget_exceeded).
+    let body = valid_envelope_bytes();
+    let result = valid_result_pair_bytes();
+    let meta = valid_meta_bytes();
+    for i in 0..100u32 {
+        let tx_id = format!("tx_budget_exceeded_{i:04}");
+        h.app
+            .database()
+            .with_connection(|conn| {
+                conn.store_transaction(&StoreTxParams {
+                    ledger_seq: 2,
+                    tx_index: i,
+                    tx_id: &tx_id,
+                    body: &body,
+                    result: &result,
+                    meta: Some(&meta),
+                    status: TxStatus::Success,
+                })
+            })
+            .unwrap();
+    }
+
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "budget-exceeded",
+            "method": "getTransactions",
+            "params": {
+                "startLedger": 2,
+                "pagination": { "limit": 100 }
+            }
+        }))
+        .await;
+
+    assert_eq!(status, 200, "HTTP status should be 200 for JSON-RPC errors");
+    assert!(resp.get("result").is_none(), "should not have a result");
+    let error = &resp["error"];
+    assert_eq!(
+        error["code"].as_i64().unwrap(),
+        -32002,
+        "expected QUERY_BUDGET_EXCEEDED error code"
+    );
+    let msg = error["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("budget"),
+        "error message should mention budget, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // getEvents budget truncation and pagination tests
 // ---------------------------------------------------------------------------
 

@@ -153,6 +153,7 @@ pub struct FakeRpcAppBuilder {
     max_tx_load_bytes: Option<usize>,
     max_event_load_bytes: Option<usize>,
     max_event_query_ops: Option<u32>,
+    max_tx_query_ops: Option<u32>,
 }
 
 impl Default for FakeRpcAppBuilder {
@@ -171,6 +172,7 @@ impl Default for FakeRpcAppBuilder {
             max_tx_load_bytes: None,
             max_event_load_bytes: None,
             max_event_query_ops: None,
+            max_tx_query_ops: None,
         }
     }
 }
@@ -258,6 +260,13 @@ impl FakeRpcAppBuilder {
         self
     }
 
+    /// Override the `getTransactions` SQLite VM-step budget (ops).
+    #[allow(dead_code)]
+    pub fn max_tx_query_ops(mut self, ops: u32) -> Self {
+        self.max_tx_query_ops = Some(ops);
+        self
+    }
+
     pub fn build(self) -> FakeRpcApp {
         let mut config = AppConfig::testnet();
         config.rpc.enabled = true;
@@ -273,6 +282,9 @@ impl FakeRpcAppBuilder {
         }
         if let Some(ops) = self.max_event_query_ops {
             config.rpc.max_event_query_ops = ops;
+        }
+        if let Some(ops) = self.max_tx_query_ops {
+            config.rpc.max_tx_query_ops = ops;
         }
 
         let ledger_manager = Arc::new(LedgerManager::new(
