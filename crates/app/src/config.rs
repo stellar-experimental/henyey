@@ -58,10 +58,51 @@
 use anyhow::Context;
 use henyey_common::BucketListDbConfig;
 use henyey_history::CatchupMode;
+use henyey_overlay::PeerAddress;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::maintainer;
+
+/// Default Stellar peer port.
+const DEFAULT_PEER_PORT: u16 = 11625;
+
+/// Parse a peer address string in `host:port` or `host` format.
+///
+/// Validation rules:
+/// - No whitespace allowed anywhere in the string
+/// - At most one `:` separator (IPv6 is intentionally unsupported)
+/// - Host part must be non-empty
+/// - Port (if present) must be a valid u16 in range 1..=65535
+/// - If no port is specified, defaults to 11625
+pub(crate) fn parse_peer_address(value: &str) -> Result<PeerAddress, String> {
+    if value.is_empty() {
+        return Err("address is empty".to_string());
+    }
+    if value.chars().any(|c| c.is_whitespace()) {
+        return Err("address contains whitespace".to_string());
+    }
+    let parts: Vec<&str> = value.split(':').collect();
+    match parts.len() {
+        1 => Ok(PeerAddress::new(parts[0], DEFAULT_PEER_PORT)),
+        2 => {
+            if parts[0].is_empty() {
+                return Err("host part is empty".to_string());
+            }
+            if parts[1].is_empty() {
+                return Err("port part is empty".to_string());
+            }
+            let port: u16 = parts[1]
+                .parse()
+                .map_err(|_| format!("invalid port \"{}\"", parts[1]))?;
+            if port == 0 {
+                return Err("port must be > 0".to_string());
+            }
+            Ok(PeerAddress::new(parts[0], port))
+        }
+        _ => Err("too many ':' separators (IPv6 is not supported)".to_string()),
+    }
+}
 
 /// Main application configuration.
 ///
@@ -1851,6 +1892,16 @@ impl AppConfig {
         for key in &self.overlay.preferred_peer_keys {
             if henyey_crypto::PublicKey::from_strkey(key).is_err() {
                 anyhow::bail!("Invalid preferred_peer_keys entry: {}", key);
+            }
+        }
+        for (field, peers) in [
+            ("overlay.known_peers", &self.overlay.known_peers),
+            ("overlay.preferred_peers", &self.overlay.preferred_peers),
+        ] {
+            for entry in peers {
+                if let Err(e) = parse_peer_address(entry) {
+                    anyhow::bail!("Invalid {field} entry \"{entry}\": {e}");
+                }
             }
         }
 
@@ -3851,5 +3902,92 @@ name = "test"
             peer_id.as_bytes(),
             "crypto::PublicKey and overlay::PeerId must decode to the same bytes"
         );
+    }
+
+    #[test]
+    fn test_parse_peer_address_valid() {
+        let addr = parse_peer_address("stellar.example.com").unwrap();
+        assert_eq!(addr.host, "stellar.example.com");
+        assert_eq!(addr.port, 11625);
+
+        let addr = parse_peer_address("stellar.example.com:1234").unwrap();
+        assert_eq!(addr.host, "stellar.example.com");
+        assert_eq!(addr.port, 1234);
+
+        let addr = parse_peer_address("127.0.0.1:65535").unwrap();
+        assert_eq!(addr.host, "127.0.0.1");
+        assert_eq!(addr.port, 65535);
+
+        let addr = parse_peer_address("peer:1").unwrap();
+        assert_eq!(addr.host, "peer");
+        assert_eq!(addr.port, 1);
+    }
+
+    #[test]
+    fn test_parse_peer_address_invalid() {
+        // Empty
+        assert!(parse_peer_address("").is_err());
+
+        // Whitespace
+        assert!(parse_peer_address(" ").is_err());
+        assert!(parse_peer_address("host :1234").is_err());
+        assert!(parse_peer_address("host: 1234").is_err());
+        assert!(parse_peer_address(" host").is_err());
+        assert!(parse_peer_address("host ").is_err());
+
+        // Port 0 (rejected like stellar-core)
+        assert!(parse_peer_address("host:0").is_err());
+
+        // Invalid port
+        assert!(parse_peer_address("host:abc").is_err());
+        assert!(parse_peer_address("host:99999").is_err());
+        assert!(parse_peer_address("host:-1").is_err());
+
+        // Empty host
+        assert!(parse_peer_address(":1234").is_err());
+
+        // Empty port
+        assert!(parse_peer_address("host:").is_err());
+
+        // Too many colons (IPv6-like)
+        assert!(parse_peer_address("host:1:2").is_err());
+        assert!(parse_peer_address("::1").is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_known_peers() {
+        let mut config = AppConfig::testnet();
+        config.overlay.known_peers = vec!["valid-host:11625".into(), "".into()];
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overlay.known_peers"),
+            "error should mention the field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_preferred_peers() {
+        let mut config = AppConfig::testnet();
+        config.overlay.preferred_peers = vec!["host:abc".into()];
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overlay.preferred_peers"),
+            "error should mention the field: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_valid_peers() {
+        let mut config = AppConfig::testnet();
+        config.overlay.known_peers = vec![
+            "core-live-a.stellar.org:11625".into(),
+            "peer.example.com".into(),
+        ];
+        config.overlay.preferred_peers = vec!["preferred.example.com:11625".into()];
+        assert!(config.validate().is_ok());
     }
 }

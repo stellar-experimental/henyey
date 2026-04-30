@@ -1077,7 +1077,7 @@ impl App {
                     .overlay
                     .known_peers
                     .iter()
-                    .filter_map(|s| Self::parse_peer_address(s))
+                    .map(|s| crate::config::parse_peer_address(s).expect("validated at startup"))
                     .collect(),
                 ..OverlayManagerConfig::default()
             }
@@ -1120,17 +1120,7 @@ impl App {
                 .overlay
                 .preferred_peers
                 .iter()
-                .filter_map(|s| {
-                    let parts: Vec<&str> = s.split(':').collect();
-                    match parts.len() {
-                        1 => Some(PeerAddress::new(parts[0], 11625)),
-                        2 => parts[1]
-                            .parse()
-                            .ok()
-                            .map(|port| PeerAddress::new(parts[0], port)),
-                        _ => None,
-                    }
-                })
+                .map(|s| crate::config::parse_peer_address(s).expect("validated at startup"))
                 .collect();
         }
 
