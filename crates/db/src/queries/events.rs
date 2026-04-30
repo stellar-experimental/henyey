@@ -3,25 +3,11 @@
 //! This module provides database operations for contract events,
 //! used by the `getEvents` RPC endpoint.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-
 use rusqlite::{params, Connection};
 use stellar_xdr::curr::ContractEventType;
 
+use super::{install_query_budget, is_query_interrupted};
 use crate::error::DbError;
-
-/// RAII guard that clears the SQLite progress handler on drop.
-/// Ensures pooled connections are never left with a stale handler.
-struct ProgressHandlerGuard<'a> {
-    conn: &'a Connection,
-}
-
-impl Drop for ProgressHandlerGuard<'_> {
-    fn drop(&mut self) {
-        self.conn.progress_handler(0, None::<fn() -> bool>);
-    }
-}
 
 /// A stored contract event record.
 #[derive(Debug, Clone)]
@@ -218,33 +204,16 @@ impl EventQueries for Connection {
         const COL_ROW_BYTES: usize = 13;
 
         // Install progress handler if budget is configured.
-        let _guard = if params.max_query_ops > 0 {
-            let budget = params.max_query_ops;
-            // Max callbacks before interrupt (use u64 to avoid overflow/off-by-one).
-            let max_callbacks = (budget as u64).div_ceil(1000) as u32;
-            let counter = Arc::new(AtomicU32::new(0));
-            let counter_clone = counter.clone();
-            // Check every 1000 VM opcodes; interrupt when budget exceeded.
-            self.progress_handler(
-                1000,
-                Some(move || {
-                    let count = counter_clone.fetch_add(1, Ordering::Relaxed);
-                    count + 1 >= max_callbacks
-                }),
-            );
-            Some(ProgressHandlerGuard { conn: self })
-        } else {
-            None
-        };
+        let _guard = install_query_budget(self, params.max_query_ops);
 
         let mut stmt = match self.prepare(&sql) {
             Ok(s) => s,
-            Err(e) if is_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+            Err(e) if is_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
             Err(e) => return Err(e.into()),
         };
         let mut rows = match stmt.query(params_refs.as_slice()) {
             Ok(r) => r,
-            Err(e) if is_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+            Err(e) if is_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
             Err(e) => return Err(e.into()),
         };
         let mut results = Vec::new();
@@ -297,7 +266,7 @@ impl EventQueries for Connection {
                     results.push(record);
                 }
                 Ok(None) => break,
-                Err(e) if is_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+                Err(e) if is_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -318,20 +287,6 @@ impl EventQueries for Connection {
         )?;
         Ok(deleted as u32)
     }
-}
-
-/// Check if a rusqlite error is an SQLITE_INTERRUPT (from progress handler).
-fn is_interrupted(err: &rusqlite::Error) -> bool {
-    matches!(
-        err,
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::OperationInterrupted,
-                ..
-            },
-            _
-        )
-    )
 }
 
 #[cfg(test)]

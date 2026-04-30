@@ -182,30 +182,7 @@ pub trait HistoryQueries {
     fn delete_old_tx_history(&self, max_ledger: u32, count: u32) -> Result<u32, DbError>;
 }
 
-/// RAII guard that clears the SQLite progress handler on drop.
-/// Ensures pooled connections are never left with a stale handler.
-struct TxProgressHandlerGuard<'a> {
-    conn: &'a Connection,
-}
-
-impl Drop for TxProgressHandlerGuard<'_> {
-    fn drop(&mut self) {
-        self.conn.progress_handler(0, None::<fn() -> bool>);
-    }
-}
-
-fn is_tx_query_interrupted(err: &rusqlite::Error) -> bool {
-    matches!(
-        err,
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ffi::ErrorCode::OperationInterrupted,
-                ..
-            },
-            _
-        )
-    )
-}
+use super::{install_query_budget, is_query_interrupted};
 
 /// Builds the WHERE clause and bind values for transaction range queries.
 ///
@@ -441,32 +418,17 @@ impl HistoryQueries for Connection {
         );
 
         // Install progress handler if budget is configured.
-        let _guard = if max_query_ops > 0 {
-            let max_callbacks = (max_query_ops as u64).div_ceil(1000) as u32;
-            let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let counter_clone = counter.clone();
-            // Check every 1000 VM opcodes; interrupt when budget exceeded.
-            self.progress_handler(
-                1000,
-                Some(move || {
-                    let count = counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    count + 1 >= max_callbacks
-                }),
-            );
-            Some(TxProgressHandlerGuard { conn: self })
-        } else {
-            None
-        };
+        let _guard = install_query_budget(self, max_query_ops);
 
         let mut stmt = match self.prepare(&sql) {
             Ok(s) => s,
-            Err(e) if is_tx_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+            Err(e) if is_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
             Err(e) => return Err(e.into()),
         };
         let params = rusqlite::params_from_iter(bind_values.iter().map(|v| v.as_ref()));
         let mut rows = match stmt.query(params) {
             Ok(r) => r,
-            Err(e) if is_tx_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+            Err(e) if is_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
             Err(e) => return Err(e.into()),
         };
         let mut results = Vec::new();
@@ -501,7 +463,7 @@ impl HistoryQueries for Connection {
                     results.push(record);
                 }
                 Ok(None) => break,
-                Err(e) if is_tx_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
+                Err(e) if is_query_interrupted(&e) => return Err(DbError::QueryBudgetExceeded),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -1200,5 +1162,31 @@ mod tests {
             .load_transactions_in_range(10, None, 11, 10, None, 100_000, 0)
             .unwrap();
         assert_eq!(results.len(), 5);
+    }
+
+    #[test]
+    fn test_query_budget_guard_cleanup_allows_connection_reuse() {
+        let conn = setup_db();
+        // Insert rows so the query does meaningful work
+        for i in 0..100 {
+            insert_tx(&conn, 10, i, 100, 50, Some(200), TxStatus::Success);
+        }
+
+        // First query: exceeds budget
+        let result = conn.load_transactions_in_range(10, None, 11, 100, None, 100_000, 1000);
+        assert!(
+            matches!(result, Err(DbError::QueryBudgetExceeded)),
+            "expected QueryBudgetExceeded, got {:?}",
+            result
+        );
+
+        // Second query on same connection: should work (handler cleared by guard drop)
+        let results = conn
+            .load_transactions_in_range(10, None, 11, 10, None, 100_000, 0)
+            .unwrap();
+        assert!(
+            !results.is_empty(),
+            "connection should be usable after budget exceeded"
+        );
     }
 }
