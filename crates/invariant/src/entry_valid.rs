@@ -43,7 +43,7 @@ impl Invariant for LedgerEntryIsValid {
         delta: &OperationDelta<'_>,
         _events: &[ContractEvent],
     ) -> Result<(), String> {
-        let curr_ledger_seq = delta.header_current.map(|h| h.ledger_seq).unwrap_or(0);
+        let curr_ledger_seq = delta.ledger_seq;
 
         if curr_ledger_seq > i32::MAX as u32 {
             return Err(format!(

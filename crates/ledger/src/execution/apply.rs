@@ -580,6 +580,8 @@ impl TransactionExecutor {
                                 update_states: delta_slice.update_states(),
                                 deleted: delta_slice.deleted(),
                                 delete_states: delta_slice.delete_states(),
+                                ledger_seq: self.ledger_seq,
+                                ledger_version: self.protocol_version,
                                 header_current: None,
                                 header_previous: None,
                                 network_id: &self.network_id.0 .0,

@@ -881,9 +881,9 @@ impl App {
             ));
             // Enable invariants matching configured patterns.
             for pattern in &config.invariants.checks {
-                if let Err(e) = inv_mgr.enable(pattern) {
-                    tracing::warn!(pattern = %pattern, error = %e, "Failed to enable invariant");
-                }
+                inv_mgr.enable(pattern).unwrap_or_else(|e| {
+                    panic!("Failed to enable invariant pattern '{}': {}", pattern, e);
+                });
             }
             ledger_manager.set_invariant_manager(std::sync::Arc::new(inv_mgr));
             tracing::info!(

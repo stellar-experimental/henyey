@@ -144,8 +144,7 @@ impl Invariant for SponsorshipCountIsValid {
     ) -> Result<(), String> {
         // Sponsorships only exist from protocol 14+.
         // henyey is P24+ so this always applies, but keep the guard for clarity.
-        let ledger_version = delta.header_current.map(|h| h.ledger_version).unwrap_or(24);
-        if ledger_version < 14 {
+        if delta.ledger_version < 14 {
             return Ok(());
         }
 

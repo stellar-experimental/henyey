@@ -47,6 +47,10 @@ pub struct OperationDelta<'a> {
     pub deleted: &'a [LedgerKey],
     /// Pre-states for deleted entries (parallel to `deleted`).
     pub delete_states: &'a [LedgerEntry],
+    /// Current ledger sequence number.
+    pub ledger_seq: u32,
+    /// Current protocol version.
+    pub ledger_version: u32,
     /// Current ledger header (after this operation's header mutations).
     /// `None` until ConservationOfLumens invariant is implemented.
     pub header_current: Option<&'a LedgerHeader>,
@@ -259,7 +263,7 @@ impl InvariantManager {
                         inv.name(),
                         inv.is_strict(),
                         &full_message,
-                        delta.header_current.map(|h| h.ledger_seq).unwrap_or(0),
+                        delta.ledger_seq,
                     );
                 }
             }
@@ -467,6 +471,8 @@ mod tests {
             update_states: &[],
             deleted: &[],
             delete_states: &[],
+            ledger_seq: 100,
+            ledger_version: 24,
             header_current: Some(&header),
             header_previous: Some(&prev_header),
             network_id: &network_id,
@@ -499,6 +505,8 @@ mod tests {
             update_states: &[],
             deleted: &[],
             delete_states: &[],
+            ledger_seq: 100,
+            ledger_version: 24,
             header_current: Some(&header),
             header_previous: Some(&prev_header),
             network_id: &network_id,
