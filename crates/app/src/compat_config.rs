@@ -501,9 +501,15 @@ pub fn translate_stellar_core_config(raw: &toml::Value) -> anyhow::Result<AppCon
                     // Default Stellar peer port
                     format!("{addr}:11625")
                 };
-                if let Ok(peer_addr) = peer_str.parse::<PeerAddress>() {
-                    validator_addresses.push(peer_addr);
-                }
+                let peer_addr = peer_str.parse::<PeerAddress>().map_err(|e| {
+                    anyhow::anyhow!(
+                        "Invalid ADDRESS '{}' in [[VALIDATORS]] entry '{}': {}",
+                        addr,
+                        name,
+                        e
+                    )
+                })?;
+                validator_addresses.push(peer_addr);
             }
             // Also extract inline HISTORY from validators
             if let Some(hist_cmd) = val_table.get("HISTORY").and_then(|v| v.as_str()) {
@@ -1600,6 +1606,27 @@ mod tests {
         assert_eq!(
             config.overlay.known_peers[0],
             PeerAddress::new("explicit-peer.stellar.org", 11625)
+        );
+    }
+
+    #[test]
+    fn test_malformed_validator_address_fails_fast() {
+        let core_toml: toml::Value = toml::from_str(
+            r#"
+            NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+            [[VALIDATORS]]
+            NAME = "badval"
+            PUBLIC_KEY = "GDKXE2OZMJIPOSLNA6N6F2BVCI3O777I2OOC4BV7VOYUEHYX7RTRYA7Y"
+            ADDRESS = ":invalid:address:"
+            "#,
+        )
+        .unwrap();
+
+        let err = translate_stellar_core_config(&core_toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid ADDRESS") && msg.contains("badval"),
+            "Expected error about invalid ADDRESS in validator 'badval', got: {msg}"
         );
     }
 
