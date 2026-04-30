@@ -598,14 +598,18 @@ Features not yet implemented. These ARE counted against parity %.
      back to `true` once the tx_set is cached (or apply catches up),
      producing identical slot end states: externalized,
      `fully_validated=true`, same emission visibility.
-   - **Long-term direction**: The remaining divergence is henyey's
-     async select! model allowing fresh envelope processing between
-     externalization and ledger close. Fully eliminating this window
-     would require serializing SCP envelope processing with ledger
-     close (gating `process_verified` while the close pipeline is
-     active) or delaying `consensus_index` update until post-apply.
-     Both require significant select! loop restructuring. Tracked as
-     a follow-up.
+   - **Closing gate** (#2122): The race window is now eliminated by a
+     `ClosingGate` (slot-scoped `Mutex` in `Herder`) that buffers
+     envelopes for the closing slot between externalization and
+     `ledger_closed`. The gate is set in `advance_tracking_slot` and
+     cleared at the start of `ledger_closed` (before pending drain),
+     replaying buffered envelopes after LCL has advanced. This mirrors
+     stellar-core's implicit serialization guarantee from the
+     single-threaded model without restructuring the async select! loop.
+     Error/panic paths in the close pipeline call `clear_closing_gate()`
+     to discard the buffer (replaying would re-trigger the same
+     `MaybeValidDeferred`). A new `EnvelopeState::Deferred` variant
+     signals the gate to callers without triggering side effects.
 
 8. **Error Handling**
    - **stellar-core**: C++ exceptions and integer result codes

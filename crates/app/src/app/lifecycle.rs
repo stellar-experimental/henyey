@@ -2089,6 +2089,11 @@ impl App {
                 }
             }
             EnvelopeState::Duplicate => {}
+            EnvelopeState::Deferred => {
+                // Envelope buffered by the closing gate — will be replayed
+                // from `ledger_closed` after LCL advances. No side effects.
+                tracing::trace!(slot, "SCP envelope deferred by closing gate");
+            }
             EnvelopeState::TooOld => {
                 tracing::debug!(slot, tracking, "SCP envelope rejected (TooOld)");
             }

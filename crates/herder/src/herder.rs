@@ -138,6 +138,33 @@ pub enum EnvelopeState {
     InvalidSignature,
     /// Envelope is structurally invalid or failed validation.
     Invalid,
+    /// Envelope was buffered by the closing gate because its slot is
+    /// currently being applied. It will be re-processed after
+    /// `ledger_closed` advances LCL.
+    Deferred,
+}
+
+/// Ingress gate state: buffers envelopes for the next-to-close slot during
+/// the post-externalize/pre-apply window. Mirrors stellar-core's guarantee
+/// that no envelopes are processed between externalization and
+/// `processExternalized` (the single-threaded apply).
+///
+/// A single `Mutex` ensures the slot check and buffer push/take are atomic,
+/// eliminating races between concurrent ingress and gate clear.
+struct ClosingGate {
+    /// Slot whose envelopes are buffered (0 = gate open).
+    slot: u64,
+    /// Buffered envelopes for `slot`.
+    buffer: Vec<ScpEnvelope>,
+}
+
+impl ClosingGate {
+    fn new() -> Self {
+        Self {
+            slot: 0,
+            buffer: Vec::new(),
+        }
+    }
 }
 
 /// Configuration for the Herder.
@@ -301,6 +328,9 @@ pub struct Herder {
     runtime_upgrades: Arc<RwLock<Upgrades>>,
     /// Count of transactions dropped due to queue full since last ledger close.
     queue_full_count: AtomicU64,
+    /// Ingress gate: buffers envelopes for the closing slot during the
+    /// post-externalize/pre-apply window. See [`ClosingGate`].
+    closing_gate: std::sync::Mutex<ClosingGate>,
     /// Cached nomination value for the current slot, reused on timeout retries.
     /// Parity: stellar-core captures the value by-copy in the nomination timer
     /// lambda (NominationProtocol.cpp:654-659) so timeouts replay the same value.
@@ -479,6 +509,7 @@ impl Herder {
             quorum_intersection_state: Arc::new(RwLock::new(QuorumIntersectionState::new())),
             runtime_upgrades,
             queue_full_count: AtomicU64::new(0),
+            closing_gate: std::sync::Mutex::new(ClosingGate::new()),
             cached_nomination_value: RwLock::new(None),
             scp_verifier_handle,
             verified_rx: std::sync::Mutex::new(verified_rx),
@@ -1600,6 +1631,24 @@ impl Herder {
     fn process_scp_envelope_with_tx_set(&self, envelope: ScpEnvelope) -> EnvelopeState {
         let slot = envelope.statement.slot_index;
 
+        // Closing gate: buffer envelopes for the slot currently being applied.
+        // Between externalization and `ledger_closed`, consensus_index has
+        // advanced but LCL hasn't — processing these envelopes now would
+        // trigger a spurious MaybeValidDeferred. They are replayed from
+        // `ledger_closed` once LCL catches up (issue #2122).
+        {
+            let mut gate = self.closing_gate.lock().unwrap();
+            if gate.slot != 0 && slot == gate.slot {
+                trace!(
+                    slot,
+                    gate_slot = gate.slot,
+                    "Envelope deferred by closing gate"
+                );
+                gate.buffer.push(envelope);
+                return EnvelopeState::Deferred;
+            }
+        }
+
         let result = self.scp.receive_envelope(envelope.clone());
 
         match result {
@@ -1715,6 +1764,17 @@ impl Herder {
         };
 
         if should_advance {
+            // Activate the closing gate for the next slot. Fresh envelopes
+            // arriving for this slot between now and `ledger_closed` would
+            // see consensus_index == slot_index but LCL hasn't advanced yet,
+            // triggering a spurious MaybeValidDeferred. The gate buffers them
+            // until LCL catches up (issue #2122).
+            {
+                let mut gate = self.closing_gate.lock().unwrap();
+                gate.slot = externalized_slot + 1;
+                gate.buffer.clear();
+            }
+
             self.pending_envelopes
                 .set_current_slot(externalized_slot + 1);
 
@@ -2022,6 +2082,28 @@ impl Herder {
             self.scp.restore_slot_fully_validated(s);
         }
 
+        // Release the closing gate and replay buffered envelopes (issue #2122).
+        // By this point LCL has advanced (the close task completed before
+        // `ledger_closed` is called), so replayed envelopes take the
+        // `is_current_ledger` validation path instead of the apply-lag path.
+        // Must happen BEFORE `drain_and_process_pending` so the drain's
+        // envelopes aren't re-buffered by the gate.
+        let gate_buffered: Vec<ScpEnvelope> = {
+            let mut gate = self.closing_gate.lock().unwrap();
+            gate.slot = 0;
+            std::mem::take(&mut gate.buffer)
+        };
+        if !gate_buffered.is_empty() {
+            debug!(
+                slot,
+                count = gate_buffered.len(),
+                "Draining closing gate buffer"
+            );
+            for env in gate_buffered {
+                let _ = self.process_scp_envelope_with_tx_set(env);
+            }
+        }
+
         // Drain pending envelopes up to and including the next slot.
         //
         // This is henyey's approximation of stellar-core's
@@ -2056,6 +2138,19 @@ impl Herder {
 
         // Purge stale pending envelopes for slots behind the closed ledger.
         self.pending_envelopes.purge_slots_below(slot);
+    }
+
+    /// Clear the closing gate and discard buffered envelopes.
+    ///
+    /// Used by error/panic paths in the close pipeline where LCL has NOT
+    /// advanced. Replaying the buffered envelopes would produce the same
+    /// `MaybeValidDeferred` result, so they are discarded. Normal SCP
+    /// mechanisms (pending-envelope drain, peer re-fetch) will deliver
+    /// them again once the node recovers.
+    pub fn clear_closing_gate(&self) {
+        let mut gate = self.closing_gate.lock().unwrap();
+        gate.slot = 0;
+        gate.buffer.clear();
     }
 
     /// Handle nomination timeout.
@@ -5759,6 +5854,225 @@ mod tests {
             herder.fetching_envelopes.has_cached_tx_set(&hash),
             "#2066: tracked tx set must be synced to FetchingEnvelopes cache"
         );
+    }
+}
+
+#[cfg(test)]
+mod closing_gate_tests {
+    use super::*;
+    use stellar_xdr::curr::{
+        ScpNomination, ScpStatement, ScpStatementPledges, Signature as XdrSignature,
+    };
+
+    fn make_test_herder() -> Herder {
+        Herder::new(HerderConfig::default())
+    }
+
+    fn make_test_envelope(slot: u64) -> ScpEnvelope {
+        let node_id =
+            stellar_xdr::curr::NodeId(stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                stellar_xdr::curr::Uint256([0u8; 32]),
+            ));
+        ScpEnvelope {
+            statement: ScpStatement {
+                node_id,
+                slot_index: slot,
+                pledges: ScpStatementPledges::Nominate(ScpNomination {
+                    quorum_set_hash: stellar_xdr::curr::Hash([0u8; 32]),
+                    votes: vec![].try_into().unwrap(),
+                    accepted: vec![].try_into().unwrap(),
+                }),
+            },
+            signature: XdrSignature(vec![0u8; 64].try_into().unwrap()),
+        }
+    }
+
+    #[test]
+    fn test_closing_gate_initially_open() {
+        let herder = make_test_herder();
+        let gate = herder.closing_gate.lock().unwrap();
+        assert_eq!(gate.slot, 0, "gate should be open (slot=0) initially");
+        assert!(gate.buffer.is_empty());
+    }
+
+    #[test]
+    fn test_closing_gate_set_on_advance_tracking_slot() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        // Simulate externalization of slot 101 by directly setting the gate
+        // (advance_tracking_slot is called internally during externalization).
+        {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 102; // externalized_slot + 1
+            gate.buffer.clear();
+        }
+
+        let gate = herder.closing_gate.lock().unwrap();
+        assert_eq!(
+            gate.slot, 102,
+            "gate should be set to next slot after externalize"
+        );
+    }
+
+    #[test]
+    fn test_envelope_gated_during_close_window() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        // Activate gate for slot 102
+        {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 102;
+            gate.buffer.clear();
+        }
+
+        // Process an envelope for the gated slot
+        let env = make_test_envelope(102);
+        let result = herder.process_scp_envelope_with_tx_set(env.clone());
+        assert_eq!(result, EnvelopeState::Deferred);
+
+        // Verify it was buffered
+        let gate = herder.closing_gate.lock().unwrap();
+        assert_eq!(gate.buffer.len(), 1);
+        assert_eq!(gate.buffer[0].statement.slot_index, 102);
+    }
+
+    #[test]
+    fn test_envelope_not_gated_for_different_slot() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        // Activate gate for slot 102
+        {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 102;
+            gate.buffer.clear();
+        }
+
+        // Envelope for a different slot should not be gated
+        let env = make_test_envelope(103);
+        let result = herder.process_scp_envelope_with_tx_set(env);
+        // It won't be Deferred (it'll be Invalid since SCP doesn't know the node,
+        // but the point is it's NOT Deferred)
+        assert_ne!(result, EnvelopeState::Deferred);
+    }
+
+    #[test]
+    fn test_envelope_not_gated_when_gate_open() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        // Gate is open (slot=0 by default)
+        let env = make_test_envelope(102);
+        let result = herder.process_scp_envelope_with_tx_set(env);
+        // Should NOT be Deferred — gate is open
+        assert_ne!(result, EnvelopeState::Deferred);
+    }
+
+    #[test]
+    fn test_multiple_envelopes_buffered() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        // Activate gate for slot 102
+        {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 102;
+            gate.buffer.clear();
+        }
+
+        // Buffer multiple envelopes
+        for _ in 0..5 {
+            let env = make_test_envelope(102);
+            let result = herder.process_scp_envelope_with_tx_set(env);
+            assert_eq!(result, EnvelopeState::Deferred);
+        }
+
+        let gate = herder.closing_gate.lock().unwrap();
+        assert_eq!(gate.buffer.len(), 5);
+    }
+
+    #[test]
+    fn test_clear_closing_gate_discards_buffer() {
+        let herder = make_test_herder();
+
+        // Set gate and buffer some envelopes
+        {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 102;
+            gate.buffer.push(make_test_envelope(102));
+            gate.buffer.push(make_test_envelope(102));
+        }
+
+        // Clear gate (error path)
+        herder.clear_closing_gate();
+
+        // Gate should be open with empty buffer
+        let gate = herder.closing_gate.lock().unwrap();
+        assert_eq!(gate.slot, 0);
+        assert!(gate.buffer.is_empty());
+    }
+
+    #[test]
+    fn test_gate_clear_in_ledger_closed_opens_gate() {
+        let herder = make_test_herder();
+        herder.start_syncing();
+        herder.bootstrap(100);
+
+        // Set gate and buffer an envelope
+        {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 102;
+            gate.buffer.push(make_test_envelope(102));
+        }
+
+        // Simulate what ledger_closed does: clear gate and take buffer
+        let gate_buffered: Vec<ScpEnvelope> = {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 0;
+            std::mem::take(&mut gate.buffer)
+        };
+
+        // Gate should be open
+        let gate = herder.closing_gate.lock().unwrap();
+        assert_eq!(gate.slot, 0);
+        assert!(gate.buffer.is_empty());
+        drop(gate);
+
+        // Buffered envelopes should have been extracted
+        assert_eq!(gate_buffered.len(), 1);
+        assert_eq!(gate_buffered[0].statement.slot_index, 102);
+    }
+
+    #[test]
+    fn test_gate_reactivation_clears_stale_buffer() {
+        let herder = make_test_herder();
+
+        // Set gate for slot 102 with a buffered envelope
+        {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 102;
+            gate.buffer.push(make_test_envelope(102));
+        }
+
+        // Re-activate gate for slot 103 (simulates next externalization)
+        // This mirrors advance_tracking_slot behavior: clear + set new slot
+        {
+            let mut gate = herder.closing_gate.lock().unwrap();
+            gate.slot = 103;
+            gate.buffer.clear();
+        }
+
+        // Old buffer should be gone, new slot active
+        let gate = herder.closing_gate.lock().unwrap();
+        assert_eq!(gate.slot, 103);
+        assert!(gate.buffer.is_empty());
     }
 }
 

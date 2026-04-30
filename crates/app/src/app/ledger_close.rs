@@ -1942,6 +1942,9 @@ impl App {
                         "Hash mismatch detected - cleared all buffered ledgers, will trigger catchup"
                     );
                 }
+                // Clear the closing gate — LCL hasn't advanced, so buffered
+                // envelopes would still hit the apply-lag path (issue #2122).
+                self.herder.clear_closing_gate();
                 return false;
             }
             Err(e) => {
@@ -1950,6 +1953,8 @@ impl App {
                     error = %e,
                     "Ledger close task panicked"
                 );
+                // Clear the closing gate — same rationale as hash mismatch above.
+                self.herder.clear_closing_gate();
                 return false;
             }
         };
