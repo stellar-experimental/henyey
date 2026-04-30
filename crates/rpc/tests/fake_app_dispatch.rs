@@ -641,3 +641,434 @@ async fn fake_get_ledger_entries_defensive_fallback() {
         "ready=true but no snapshot must return internal error, not server-not-ready"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Strict parameter type validation tests
+// ---------------------------------------------------------------------------
+//
+// These tests exercise the full dispatch path to verify that wrong-type
+// parameters are rejected with -32602 (invalid_params) at the endpoint level.
+
+/// Shared assertion: the request must produce a -32602 error whose message
+/// contains `expected_msg`.
+async fn assert_invalid_params(
+    h: &FakeRpcTestHarness,
+    method: &str,
+    params: serde_json::Value,
+    expected_msg: &str,
+) {
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "type-val",
+            "method": method,
+            "params": params
+        }))
+        .await;
+    assert_eq!(status, 200, "HTTP status for {method}");
+    assert!(
+        resp.get("error").is_some(),
+        "expected error for {method} with params {params}, got: {resp}"
+    );
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "expected -32602 for {method}, got: {}",
+        resp["error"]
+    );
+    let msg = resp["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains(expected_msg),
+        "for {method}: expected message containing '{expected_msg}', got '{msg}'"
+    );
+}
+
+/// Build a minimal valid Soroban InvokeHostFunction envelope (Wasm upload)
+/// that passes `extract_soroban_op()`, memo validation, and structural checks.
+fn valid_soroban_tx_b64() -> String {
+    use stellar_xdr::curr::{
+        HostFunction, InvokeHostFunctionOp, LedgerFootprint, Operation, OperationBody,
+        SorobanResources, SorobanTransactionData, SorobanTransactionDataExt,
+    };
+
+    let invoke_op = Operation {
+        source_account: None,
+        body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+            host_function: HostFunction::UploadContractWasm(vec![0u8; 10].try_into().unwrap()),
+            auth: vec![].try_into().unwrap(),
+        }),
+    };
+
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256([0u8; 32])),
+        fee: 100,
+        seq_num: SequenceNumber(1),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![invoke_op].try_into().unwrap(),
+        ext: TransactionExt::V1(SorobanTransactionData {
+            ext: SorobanTransactionDataExt::V0,
+            resources: SorobanResources {
+                footprint: LedgerFootprint {
+                    read_only: vec![].try_into().unwrap(),
+                    read_write: vec![].try_into().unwrap(),
+                },
+                instructions: 1_000_000,
+                disk_read_bytes: 1000,
+                write_bytes: 1000,
+            },
+            resource_fee: 10000,
+        }),
+    };
+    let env = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: vec![].try_into().unwrap(),
+    });
+    BASE64.encode(env.to_xdr(Limits::none()).unwrap())
+}
+
+// --- Group 1: Root params must be an object ---
+
+#[tokio::test]
+async fn fake_type_validation_root_params_object() {
+    let h = FakeRpcTestHarness::start_default().await;
+
+    let methods = [
+        "getLedgerEntries",
+        "getTransaction",
+        "getTransactions",
+        "getLedgers",
+        "getEvents",
+        "sendTransaction",
+        "simulateTransaction",
+    ];
+
+    let bad_params = [json!([1, 2, 3]), json!("a string"), json!(42), json!(true)];
+
+    for method in &methods {
+        for params in &bad_params {
+            assert_invalid_params(&h, method, params.clone(), "params must be an object").await;
+        }
+    }
+
+    // Positive: params: null passes the object gate (produces a different error)
+    for method in &methods {
+        let (status, resp) = h
+            .post_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": "null-params",
+                "method": method,
+                "params": null
+            }))
+            .await;
+        assert_eq!(status, 200);
+        // If there's an error, it must NOT be "params must be an object"
+        if let Some(err) = resp.get("error") {
+            let msg = err["message"].as_str().unwrap_or("");
+            assert!(
+                !msg.contains("params must be an object"),
+                "{method} with null params should pass object gate, got: {msg}"
+            );
+        }
+    }
+}
+
+// --- Group 2: Null field semantics ---
+
+#[tokio::test]
+async fn fake_type_validation_null_semantics() {
+    let h = FakeRpcTestHarness::start_default().await;
+
+    // require_str with null → "missing" error
+    assert_invalid_params(
+        &h,
+        "sendTransaction",
+        json!({"transaction": null}),
+        "missing 'transaction'",
+    )
+    .await;
+
+    assert_invalid_params(
+        &h,
+        "getTransaction",
+        json!({"hash": null}),
+        "missing 'hash'",
+    )
+    .await;
+
+    // Optional field with null passes type gate (pagination: null is fine)
+    let (status, resp) = h
+        .post_rpc(json!({
+            "jsonrpc": "2.0",
+            "id": "null-opt",
+            "method": "getTransactions",
+            "params": {"pagination": null}
+        }))
+        .await;
+    assert_eq!(status, 200);
+    // Should NOT fail with "must be an object" for pagination
+    if let Some(err) = resp.get("error") {
+        let msg = err["message"].as_str().unwrap_or("");
+        assert!(
+            !msg.contains("'pagination' must be an object"),
+            "null pagination should pass type gate, got: {msg}"
+        );
+    }
+}
+
+// --- Group 3: getTransactions ---
+
+#[tokio::test]
+async fn fake_type_validation_get_transactions() {
+    let h = FakeRpcTestHarness::start_default().await;
+
+    let cases: &[(&str, serde_json::Value, &str)] = &[
+        ("status as int", json!({"status": 123}), "must be a string"),
+        (
+            "startLedger as string",
+            json!({"startLedger": "abc"}),
+            "must be a non-negative integer",
+        ),
+        (
+            "startLedger overflow",
+            json!({"startLedger": 5_000_000_000_u64}),
+            "exceeds maximum value",
+        ),
+        (
+            "pagination as array",
+            json!({"pagination": [1, 2, 3]}),
+            "must be an object",
+        ),
+        (
+            "pagination.cursor as int",
+            json!({"pagination": {"cursor": 999}}),
+            "must be a string",
+        ),
+        (
+            "pagination.limit as string",
+            json!({"pagination": {"limit": "ten"}}),
+            "must be a non-negative integer",
+        ),
+        (
+            "pagination.limit overflow",
+            json!({"pagination": {"limit": 5_000_000_000_u64}}),
+            "exceeds maximum value",
+        ),
+        (
+            "xdrFormat as int",
+            json!({"xdrFormat": 42}),
+            "must be a string",
+        ),
+    ];
+
+    for (label, params, expected) in cases {
+        assert_invalid_params(&h, "getTransactions", params.clone(), expected).await;
+        let _ = label; // suppress unused warning in non-debug
+    }
+}
+
+// --- Group 4: getLedgers ---
+
+#[tokio::test]
+async fn fake_type_validation_get_ledgers() {
+    let h = FakeRpcTestHarness::start_default().await;
+
+    let cases: &[(&str, serde_json::Value, &str)] = &[
+        (
+            "startLedger as string",
+            json!({"startLedger": "abc"}),
+            "must be a non-negative integer",
+        ),
+        (
+            "startLedger overflow",
+            json!({"startLedger": 5_000_000_000_u64}),
+            "exceeds maximum value",
+        ),
+        (
+            "pagination as bool",
+            json!({"pagination": true}),
+            "must be an object",
+        ),
+        (
+            "pagination.cursor as int",
+            json!({"pagination": {"cursor": 123}}),
+            "must be a string",
+        ),
+        (
+            "pagination.limit as string",
+            json!({"pagination": {"limit": "ten"}}),
+            "must be a non-negative integer",
+        ),
+        (
+            "pagination.limit overflow",
+            json!({"pagination": {"limit": 5_000_000_000_u64}}),
+            "exceeds maximum value",
+        ),
+        (
+            "xdrFormat as array",
+            json!({"xdrFormat": [1]}),
+            "must be a string",
+        ),
+    ];
+
+    for (label, params, expected) in cases {
+        assert_invalid_params(&h, "getLedgers", params.clone(), expected).await;
+        let _ = label;
+    }
+}
+
+// --- Group 5: getEvents ---
+
+#[tokio::test]
+async fn fake_type_validation_get_events() {
+    let h = FakeRpcTestHarness::start_default().await;
+
+    let cases: &[(&str, serde_json::Value, &str)] = &[
+        (
+            "startLedger as string",
+            json!({"startLedger": "abc"}),
+            "must be a non-negative integer",
+        ),
+        (
+            "startLedger overflow",
+            json!({"startLedger": 5_000_000_000_u64}),
+            "exceeds maximum value",
+        ),
+        // Cases needing valid startLedger scaffolding
+        (
+            "endLedger as string",
+            json!({"startLedger": 1, "endLedger": "foo"}),
+            "must be a non-negative integer",
+        ),
+        (
+            "endLedger overflow",
+            json!({"startLedger": 1, "endLedger": 5_000_000_000_u64}),
+            "exceeds maximum value",
+        ),
+        (
+            "pagination as int",
+            json!({"startLedger": 1, "pagination": 42}),
+            "must be an object",
+        ),
+        (
+            "pagination.cursor as int",
+            json!({"startLedger": 1, "pagination": {"cursor": 123}}),
+            "must be a string",
+        ),
+        (
+            "pagination.limit as string",
+            json!({"startLedger": 1, "pagination": {"limit": "ten"}}),
+            "must be a non-negative integer",
+        ),
+        (
+            "pagination.limit overflow",
+            json!({"startLedger": 1, "pagination": {"limit": 5_000_000_000_u64}}),
+            "exceeds maximum value",
+        ),
+        (
+            "xdrFormat as object",
+            json!({"startLedger": 1, "xdrFormat": {}}),
+            "must be a string",
+        ),
+    ];
+
+    for (label, params, expected) in cases {
+        assert_invalid_params(&h, "getEvents", params.clone(), expected).await;
+        let _ = label;
+    }
+}
+
+// --- Group 6: getTransaction ---
+
+#[tokio::test]
+async fn fake_type_validation_get_transaction() {
+    let h = FakeRpcTestHarness::start_default().await;
+
+    assert_invalid_params(
+        &h,
+        "getTransaction",
+        json!({"hash": 12345}),
+        "must be a string",
+    )
+    .await;
+    assert_invalid_params(
+        &h,
+        "getTransaction",
+        json!({"hash": "abc123", "xdrFormat": 0}),
+        "must be a string",
+    )
+    .await;
+}
+
+// --- Group 7: sendTransaction ---
+
+#[tokio::test]
+async fn fake_type_validation_send_transaction() {
+    let h = FakeRpcTestHarness::start_default().await;
+
+    assert_invalid_params(
+        &h,
+        "sendTransaction",
+        json!({"transaction": 42}),
+        "must be a string",
+    )
+    .await;
+    assert_invalid_params(
+        &h,
+        "sendTransaction",
+        json!({"transaction": "validbase64", "xdrFormat": 99}),
+        "must be a string",
+    )
+    .await;
+}
+
+// --- Group 8: simulateTransaction ---
+
+#[tokio::test]
+async fn fake_type_validation_simulate_transaction() {
+    let h = FakeRpcTestHarness::start_default().await;
+
+    // Wrong type for transaction field
+    assert_invalid_params(
+        &h,
+        "simulateTransaction",
+        json!({"transaction": false}),
+        "must be a string",
+    )
+    .await;
+
+    // Cases that need a valid Soroban envelope to reach later param parsing
+    let valid_tx = valid_soroban_tx_b64();
+
+    assert_invalid_params(
+        &h,
+        "simulateTransaction",
+        json!({"transaction": valid_tx, "authMode": 999}),
+        "must be a string",
+    )
+    .await;
+
+    assert_invalid_params(
+        &h,
+        "simulateTransaction",
+        json!({"transaction": valid_tx, "resourceConfig": "nope"}),
+        "must be an object",
+    )
+    .await;
+
+    assert_invalid_params(
+        &h,
+        "simulateTransaction",
+        json!({"transaction": valid_tx, "resourceConfig": {"instructionLeeway": "big"}}),
+        "must be a non-negative integer",
+    )
+    .await;
+
+    assert_invalid_params(
+        &h,
+        "simulateTransaction",
+        json!({"transaction": valid_tx, "xdrFormat": 42}),
+        "must be a string",
+    )
+    .await;
+}
