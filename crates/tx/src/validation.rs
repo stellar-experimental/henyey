@@ -2877,4 +2877,186 @@ mod tests {
             "pre-seq-num must not reject malformed classic ops (issue #2063)"
         );
     }
+
+    // ── validate_fee Soroban regression tests (issue #2114) ──
+
+    /// Helper: create a Soroban TransactionFrame with the given fee and resource_fee.
+    fn create_soroban_frame(fee: u32, resource_fee: i64) -> TransactionFrame {
+        let source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let op = Operation {
+            source_account: None,
+            body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                    contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+                    function_name: ScSymbol(StringM::<32>::try_from("noop".to_string()).unwrap()),
+                    args: VecM::<ScVal>::default(),
+                }),
+                auth: VecM::default(),
+            }),
+        };
+
+        let tx = Transaction {
+            source_account: source,
+            fee,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![op].try_into().unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: vec![].try_into().unwrap(),
+                        read_write: vec![].try_into().unwrap(),
+                    },
+                    instructions: 100,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee,
+            }),
+        };
+
+        let envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+            tx,
+            signatures: VecM::default(),
+        });
+
+        TransactionFrame::from_owned(envelope)
+    }
+
+    /// Soroban tx with fee == resource_fee → inclusion_fee = 0, rejected.
+    #[test]
+    fn test_validate_fee_soroban_zero_inclusion_fee() {
+        // fee=500, resource_fee=500 → inclusion_fee = 0
+        let frame = create_soroban_frame(500, 500);
+        let context = LedgerContext::testnet(1, 1000); // base_fee=100
+
+        let result = validate_fee(&frame, &context);
+        assert!(
+            matches!(
+                result,
+                Err(ValidationError::InsufficientFee {
+                    required: 100,
+                    provided: 0
+                })
+            ),
+            "Soroban tx with zero inclusion fee must be rejected, got: {result:?}"
+        );
+    }
+
+    /// Soroban tx with inclusion_fee == base_fee → accepted.
+    #[test]
+    fn test_validate_fee_soroban_sufficient() {
+        // fee=600, resource_fee=500 → inclusion_fee = 100, base_fee=100
+        let frame = create_soroban_frame(600, 500);
+        let context = LedgerContext::testnet(1, 1000);
+
+        assert!(
+            validate_fee(&frame, &context).is_ok(),
+            "Soroban tx with inclusion_fee == base_fee should pass"
+        );
+    }
+
+    /// Soroban tx with inclusion_fee < base_fee (but > 0) → rejected.
+    #[test]
+    fn test_validate_fee_soroban_insufficient_inclusion_fee() {
+        // fee=550, resource_fee=500 → inclusion_fee = 50, base_fee=100
+        let frame = create_soroban_frame(550, 500);
+        let context = LedgerContext::testnet(1, 1000);
+
+        let result = validate_fee(&frame, &context);
+        assert!(
+            matches!(
+                result,
+                Err(ValidationError::InsufficientFee {
+                    required: 100,
+                    provided: 50
+                })
+            ),
+            "Soroban tx with inclusion_fee < base_fee must be rejected, got: {result:?}"
+        );
+    }
+
+    /// Fee-bump wrapping a Soroban inner tx with zero outer inclusion fee → rejected.
+    #[test]
+    fn test_validate_fee_fee_bump_soroban_zero_inclusion_fee() {
+        use stellar_xdr::curr::{
+            FeeBumpTransaction, FeeBumpTransactionEnvelope, FeeBumpTransactionExt,
+            FeeBumpTransactionInnerTx,
+        };
+
+        let inner_source = MuxedAccount::Ed25519(Uint256([0u8; 32]));
+        let outer_fee_source = MuxedAccount::Ed25519(Uint256([2u8; 32]));
+
+        let inner_tx = Transaction {
+            source_account: inner_source,
+            fee: 500,
+            seq_num: SequenceNumber(1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::InvokeContract(InvokeContractArgs {
+                        contract_address: ScAddress::Contract(ContractId(Hash([9u8; 32]))),
+                        function_name: ScSymbol(
+                            StringM::<32>::try_from("noop".to_string()).unwrap(),
+                        ),
+                        args: VecM::<ScVal>::default(),
+                    }),
+                    auth: VecM::default(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: TransactionExt::V1(SorobanTransactionData {
+                ext: SorobanTransactionDataExt::V0,
+                resources: SorobanResources {
+                    footprint: LedgerFootprint {
+                        read_only: vec![].try_into().unwrap(),
+                        read_write: vec![].try_into().unwrap(),
+                    },
+                    instructions: 100,
+                    disk_read_bytes: 0,
+                    write_bytes: 0,
+                },
+                resource_fee: 500,
+            }),
+        };
+
+        let inner_env = TransactionV1Envelope {
+            tx: inner_tx,
+            signatures: vec![].try_into().unwrap(),
+        };
+
+        // Outer fee = 500 = resource_fee. For fee-bump, resource_operation_count = inner_ops + 1 = 2.
+        // min_inclusion_fee = 100 * 2 = 200. inclusion_fee = total_fee - resource_fee = 500 - 500 = 0.
+        let fee_bump_tx = FeeBumpTransaction {
+            fee_source: outer_fee_source,
+            fee: 500,
+            inner_tx: FeeBumpTransactionInnerTx::Tx(inner_env),
+            ext: FeeBumpTransactionExt::V0,
+        };
+
+        let envelope = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: fee_bump_tx,
+            signatures: vec![].try_into().unwrap(),
+        });
+
+        let frame = TransactionFrame::from_owned(envelope);
+        let context = LedgerContext::testnet(1, 1000);
+
+        let result = validate_fee(&frame, &context);
+        assert!(
+            matches!(
+                result,
+                Err(ValidationError::InsufficientFee {
+                    required: 200,
+                    provided: 0
+                })
+            ),
+            "Fee-bump Soroban tx with zero inclusion fee must be rejected, got: {result:?}"
+        );
+    }
 }
