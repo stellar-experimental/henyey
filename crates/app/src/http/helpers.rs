@@ -9,13 +9,7 @@ use super::types::{ConnectParams, UpgradeItem};
 /// Parse connect endpoint parameters into a PeerAddress.
 pub(super) fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress, String> {
     if let Some(addr) = params.addr.as_ref() {
-        let (host, port) = addr
-            .split_once(':')
-            .ok_or_else(|| "addr must be host:port".to_string())?;
-        let port = port
-            .parse::<u16>()
-            .map_err(|_| "invalid port".to_string())?;
-        return Ok(PeerAddress::new(host.to_string(), port));
+        return crate::config::parse_peer_address(addr);
     }
 
     let Some(peer) = params.peer.as_ref() else {
@@ -24,7 +18,8 @@ pub(super) fn parse_connect_params(params: &ConnectParams) -> Result<PeerAddress
     let port = params
         .port
         .ok_or_else(|| "port must be provided".to_string())?;
-    Ok(PeerAddress::new(peer.to_string(), port))
+    // Validate as if it were "peer:port"
+    crate::config::parse_peer_address(&format!("{}:{}", peer, port))
 }
 
 /// Parse a peer_id or node parameter into a PeerId.

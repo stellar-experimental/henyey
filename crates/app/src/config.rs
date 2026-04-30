@@ -74,6 +74,8 @@ const DEFAULT_PEER_PORT: u16 = 11625;
 /// - At most one `:` separator (IPv6 is intentionally unsupported)
 /// - Host part must be non-empty and contain only alphanumeric, `.`, or `-`
 ///   (matching stellar-core's `PeerBareAddress::resolve()` regex)
+/// - If host looks like a numeric IPv4 address (digits and dots only), it must
+///   parse as a valid `Ipv4Addr`
 /// - Port (if present) must be a valid u16 in range 1..=65535
 /// - If no port is specified, defaults to 11625
 pub(crate) fn parse_peer_address(value: &str) -> Result<PeerAddress, String> {
@@ -114,6 +116,16 @@ pub(crate) fn parse_peer_address(value: &str) -> Result<PeerAddress, String> {
             "host \"{}\" contains invalid characters (only alphanumeric, '.', '-' allowed)",
             host
         ));
+    }
+    // If host looks like a numeric IPv4 candidate (only digits and dots),
+    // validate it as a proper IPv4 address (matching stellar-core's numeric_host branch).
+    if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        if host.parse::<std::net::Ipv4Addr>().is_err() {
+            return Err(format!(
+                "host \"{}\" looks like IPv4 but is not valid",
+                host
+            ));
+        }
     }
 
     Ok(PeerAddress::new(host, port))
@@ -3974,6 +3986,12 @@ name = "test"
         assert!(parse_peer_address("host_name:11625").is_err());
         assert!(parse_peer_address("host@name:11625").is_err());
         assert!(parse_peer_address("héllo:11625").is_err());
+
+        // Invalid numeric IPv4 (looks like IP but out of range)
+        assert!(parse_peer_address("256.256.256.256").is_err());
+        assert!(parse_peer_address("127.0.0.256:11625").is_err());
+        assert!(parse_peer_address("999.0.0.1").is_err());
+        assert!(parse_peer_address("1.2.3.4.5").is_err());
     }
 
     #[test]
