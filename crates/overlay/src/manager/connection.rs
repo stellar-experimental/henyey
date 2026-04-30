@@ -779,3 +779,283 @@ pub(super) async fn connect_to_explicit_peer(
 
     Ok(peer_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::{Connection, ConnectionDirection, Listener};
+    use crate::connection_factory::ConnectionFactory;
+    use crate::{LocalNode, OverlayConfig, OverlayError, PeerAddress, PeerEvent, PeerType, Result};
+    use async_trait::async_trait;
+    use henyey_crypto::SecretKey;
+    use std::sync::Arc;
+    use tokio::time::Instant;
+
+    // ---- Mock factories ----
+
+    /// A connection factory that returns an in-memory connection immediately,
+    /// but the remote end never sends any data (simulating a stalled HELLO).
+    /// The server half of the duplex is kept alive to avoid EOF.
+    struct StalledHelloFactory {
+        _server_half: tokio::sync::Mutex<Option<tokio::io::DuplexStream>>,
+    }
+
+    impl StalledHelloFactory {
+        fn new() -> Self {
+            Self {
+                _server_half: tokio::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ConnectionFactory for StalledHelloFactory {
+        async fn connect(&self, _addr: &PeerAddress, _timeout_secs: u64) -> Result<Connection> {
+            let (client, server) = tokio::io::duplex(8192);
+            *self._server_half.lock().await = Some(server);
+            Connection::from_io(
+                client,
+                "127.0.0.1:11625".parse().unwrap(),
+                ConnectionDirection::Outbound,
+            )
+        }
+
+        async fn bind(&self, _port: u16) -> Result<Listener> {
+            Err(OverlayError::ConnectionFailed("not used in test".into()))
+        }
+    }
+
+    /// A connection factory whose `connect()` sleeps for the given timeout
+    /// then returns `ConnectionTimeout`, simulating a stalled TCP SYN.
+    struct StalledConnectFactory;
+
+    #[async_trait]
+    impl ConnectionFactory for StalledConnectFactory {
+        async fn connect(&self, addr: &PeerAddress, timeout_secs: u64) -> Result<Connection> {
+            tokio::time::sleep(Duration::from_secs(timeout_secs)).await;
+            Err(OverlayError::ConnectionTimeout(addr.to_string()))
+        }
+
+        async fn bind(&self, _port: u16) -> Result<Listener> {
+            Err(OverlayError::ConnectionFailed("not used in test".into()))
+        }
+    }
+
+    /// Create a minimal OverlayManager with a custom factory and a peer_event
+    /// receiver for assertions.
+    fn setup_manager_with_factory(
+        factory: Arc<dyn ConnectionFactory>,
+    ) -> (
+        super::super::OverlayManager,
+        tokio::sync::mpsc::Receiver<PeerEvent>,
+    ) {
+        let mut config = OverlayConfig::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        config.peer_event_tx = Some(tx);
+        let local_node = LocalNode::new_testnet(SecretKey::generate());
+        let manager =
+            super::super::OverlayManager::new_with_connection_factory(config, local_node, factory)
+                .unwrap();
+        (manager, rx)
+    }
+
+    // ---- Tests ----
+
+    /// Verify that when TCP connects instantly but the remote never sends
+    /// HELLO, the connection fails at auth_timeout_secs (2s), not
+    /// connect_timeout_secs (10s).
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_hello_explicit_peer_uses_auth_timeout() {
+        let factory = Arc::new(StalledHelloFactory::new());
+        let (manager, mut peer_event_rx) = setup_manager_with_factory(factory);
+        let shared = manager.shared_state();
+
+        let addr = PeerAddress::new("10.0.0.1", 11625);
+        let timeouts = crate::OutboundTimeouts {
+            connect_secs: 10,
+            auth_secs: 2,
+        };
+
+        // Reserve a pending slot (connect_to_explicit_peer releases it on failure).
+        assert!(manager.outbound_pool.try_reserve());
+
+        let start = Instant::now();
+        let result = connect_to_explicit_peer(
+            &addr,
+            manager.local_node.clone(),
+            timeouts,
+            Arc::clone(&manager.outbound_pool),
+            shared.clone(),
+            manager.connection_factory.clone(),
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+
+        // Must fail with a timeout error.
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OverlayError::ConnectionTimeout(_)),
+            "expected ConnectionTimeout, got: {err}"
+        );
+
+        // Elapsed should be ~2s (auth timeout), not 10s (connect timeout).
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "elapsed {elapsed:?} < 2s"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "elapsed {elapsed:?} >= 5s — likely used connect_timeout_secs instead of auth_timeout_secs"
+        );
+
+        // Verify cleanup: pending slot released.
+        assert_eq!(manager.outbound_pool.pending_count(), 0);
+
+        // Verify cleanup: pending address reservation cleared.
+        let addr_key = format!("{}:{}", addr.host, addr.port);
+        assert!(
+            !shared
+                .pending_connections
+                .by_address
+                .contains_key(&addr_key),
+            "pending address reservation not cleared"
+        );
+
+        // Verify PeerEvent::Failed was emitted.
+        let event = peer_event_rx
+            .try_recv()
+            .expect("expected PeerEvent::Failed");
+        assert!(
+            matches!(event, PeerEvent::Failed(_, PeerType::Outbound)),
+            "expected Failed(_, Outbound), got: {event:?}"
+        );
+    }
+
+    /// Verify that when TCP connect stalls, the connection fails at
+    /// connect_timeout_secs (1s), not auth_timeout_secs (10s).
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_tcp_connect_explicit_peer_uses_connect_timeout() {
+        let factory = Arc::new(StalledConnectFactory);
+        let (manager, mut peer_event_rx) = setup_manager_with_factory(factory);
+        let shared = manager.shared_state();
+
+        let addr = PeerAddress::new("10.0.0.1", 11625);
+        let timeouts = crate::OutboundTimeouts {
+            connect_secs: 1,
+            auth_secs: 10,
+        };
+
+        assert!(manager.outbound_pool.try_reserve());
+
+        let start = Instant::now();
+        let result = connect_to_explicit_peer(
+            &addr,
+            manager.local_node.clone(),
+            timeouts,
+            Arc::clone(&manager.outbound_pool),
+            shared.clone(),
+            manager.connection_factory.clone(),
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, OverlayError::ConnectionTimeout(_)),
+            "expected ConnectionTimeout, got: {err}"
+        );
+
+        // Elapsed should be ~1s (connect timeout), not 10s (auth timeout).
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "elapsed {elapsed:?} < 1s"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "elapsed {elapsed:?} >= 5s — likely used auth_timeout_secs instead of connect_timeout_secs"
+        );
+
+        assert_eq!(manager.outbound_pool.pending_count(), 0);
+
+        let addr_key = format!("{}:{}", addr.host, addr.port);
+        assert!(
+            !shared
+                .pending_connections
+                .by_address
+                .contains_key(&addr_key),
+            "pending address reservation not cleared"
+        );
+
+        let event = peer_event_rx
+            .try_recv()
+            .expect("expected PeerEvent::Failed");
+        assert!(
+            matches!(event, PeerEvent::Failed(_, PeerType::Outbound)),
+            "expected Failed(_, Outbound), got: {event:?}"
+        );
+    }
+
+    /// Verify that `connect_to_discovered_peer` also uses auth_timeout_secs
+    /// for the handshake phase (not connect_timeout_secs).
+    #[tokio::test(start_paused = true)]
+    async fn test_stalled_hello_discovered_peer_uses_auth_timeout() {
+        let factory = Arc::new(StalledHelloFactory::new());
+        let (manager, mut peer_event_rx) = setup_manager_with_factory(factory);
+        let shared = manager.shared_state();
+
+        let addr = PeerAddress::new("10.0.0.2", 11625);
+        let timeouts = crate::OutboundTimeouts {
+            connect_secs: 10,
+            auth_secs: 2,
+        };
+
+        assert!(manager.outbound_pool.try_reserve());
+
+        let start = Instant::now();
+        OverlayManager::connect_to_discovered_peer(
+            addr.clone(),
+            manager.local_node.clone(),
+            timeouts,
+            Arc::clone(&manager.outbound_pool),
+            shared.clone(),
+            manager.connection_factory.clone(),
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+
+        // Elapsed should be ~2s (auth timeout), not 10s (connect timeout).
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "elapsed {elapsed:?} < 2s"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "elapsed {elapsed:?} >= 5s — likely used connect_timeout_secs instead of auth_timeout_secs"
+        );
+
+        // Verify cleanup: pending slot released.
+        assert_eq!(manager.outbound_pool.pending_count(), 0);
+
+        // Verify cleanup: pending address reservation cleared.
+        let addr_key = format!("{}:{}", addr.host, addr.port);
+        assert!(
+            !shared
+                .pending_connections
+                .by_address
+                .contains_key(&addr_key),
+            "pending address reservation not cleared"
+        );
+
+        // Verify PeerEvent::Failed was emitted.
+        let event = peer_event_rx
+            .try_recv()
+            .expect("expected PeerEvent::Failed");
+        assert!(
+            matches!(event, PeerEvent::Failed(_, PeerType::Outbound)),
+            "expected Failed(_, Outbound), got: {event:?}"
+        );
+    }
+}
