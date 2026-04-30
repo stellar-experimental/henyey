@@ -36,7 +36,7 @@
 //! ```
 
 use henyey_common::Hash256;
-use henyey_crypto::{PublicKey, Signature};
+use henyey_crypto::Signature;
 use std::collections::HashMap;
 use stellar_xdr::curr::{DecoratedSignature, Signer, SignerKey, SignerKeyType};
 
@@ -330,18 +330,14 @@ fn verify_ed25519_signed_payload(sig: &DecoratedSignature, signer: &Signer) -> b
         return false;
     }
 
-    let Ok(public_key) = PublicKey::from_bytes(&signed_payload.ed25519.0) else {
-        return false;
-    };
-
     let Ok(ed_sig) = Signature::try_from(&sig.signature) else {
         return false;
     };
 
-    // stellar-core verifies the signature against the raw payload bytes,
-    // not a hash. This is per CAP-0040 - the signed payload signer
-    // requires a valid signature of the payload from the ed25519 public key.
-    public_key.verify(&signed_payload.payload, &ed_sig).is_ok()
+    // Use cached verification matching stellar-core's verifyEd25519SignedPayload
+    // which routes through PubKeyUtils::verifySig (SignatureUtils.cpp:60).
+    henyey_crypto::verify_from_raw_key(&signed_payload.ed25519.0, &signed_payload.payload, &ed_sig)
+        .is_ok()
 }
 
 /// Collect all signers for an account including the master key.

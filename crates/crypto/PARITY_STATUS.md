@@ -137,7 +137,7 @@ Corresponds to: `SecretKey.h` (PubKeyUtils verification)
 
 | stellar-core | Rust | Status |
 |--------------|------|--------|
-| `PubKeyUtils::verifySig(key, sig, bin)` | `verify_hash_from_raw_key(&[u8;32], &Hash256, &Signature)` | Full |
+| `PubKeyUtils::verifySig(key, sig, bin)` | `verify_from_raw_key(&[u8;32], &[u8], &Signature)` / `verify_hash_from_raw_key` | Full |
 | `PubKeyUtils::clearVerifySigCache()` | -- | None |
 | `PubKeyUtils::seedVerifySigCache(seed)` | -- | None |
 | `PubKeyUtils::flushVerifySigCacheCounts(hits, misses)` | -- | None |

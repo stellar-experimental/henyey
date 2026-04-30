@@ -3095,19 +3095,14 @@ fn has_signed_payload_signature(
     signatures: &[DecoratedSignature],
     payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
 ) -> bool {
-    let pk = match henyey_crypto::PublicKey::from_bytes(&payload.ed25519.0) {
-        Ok(pk) => pk,
-        Err(_) => return false,
-    };
-
     let mut data = Vec::with_capacity(32 + payload.payload.len());
     data.extend_from_slice(&tx_hash.0);
     data.extend_from_slice(&payload.payload);
     let payload_hash = Hash256::hash(&data);
 
-    signatures
-        .iter()
-        .any(|sig| henyey_tx::validation::verify_signature_with_key(&payload_hash, sig, &pk))
+    signatures.iter().any(|sig| {
+        henyey_tx::validation::verify_signature_with_raw_key(&payload_hash, sig, &payload.ed25519.0)
+    })
 }
 
 impl Default for TransactionQueue {

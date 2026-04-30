@@ -880,11 +880,6 @@ fn has_signed_payload_signature(
     signatures: &[DecoratedSignature],
     signed_payload: &stellar_xdr::curr::SignerKeyEd25519SignedPayload,
 ) -> bool {
-    let pk = match PublicKey::from_bytes(&signed_payload.ed25519.0) {
-        Ok(pk) => pk,
-        Err(_) => return false,
-    };
-
     // The hint for signed payloads is XOR of pubkey hint and payload hint.
     // See SignatureUtils::getSignedPayloadHint in stellar-core.
     let pubkey_hint = [
@@ -924,14 +919,18 @@ fn has_signed_payload_signature(
             return false;
         }
 
-        // stellar-core verifies the signature against the raw payload bytes,
-        // not a hash. This is per CAP-0040 - the signed payload signer
-        // requires a valid signature of the payload from the ed25519 public key.
+        // Use cached verification matching stellar-core's verifyEd25519SignedPayload
+        // which routes through PubKeyUtils::verifySig (SignatureUtils.cpp:60).
         let ed_sig = match henyey_crypto::Signature::try_from(&sig.signature) {
             Ok(s) => s,
             Err(_) => return false,
         };
-        pk.verify(&signed_payload.payload, &ed_sig).is_ok()
+        henyey_crypto::verify_from_raw_key(
+            &signed_payload.ed25519.0,
+            &signed_payload.payload,
+            &ed_sig,
+        )
+        .is_ok()
     })
 }
 
