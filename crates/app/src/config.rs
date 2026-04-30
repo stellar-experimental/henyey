@@ -1321,6 +1321,11 @@ impl RpcConfig {
                  getTransactions queries have no computational budget"
             );
         }
+        if self.port == 0 {
+            return Err("rpc.port must not be 0 (ephemeral) when enabled \
+                 (set a fixed port or disable rpc)"
+                .to_string());
+        }
         Ok(())
     }
 }
@@ -1988,6 +1993,27 @@ impl AppConfig {
             }
         }
 
+        // Reject ephemeral port 0 on enabled servers (security: prevents
+        // accidental endpoint on unpredictable port — see #2088/#2123).
+        if self.http.enabled && self.http.port == 0 && !self.testing.run_standalone {
+            anyhow::bail!(
+                "http.port must not be 0 (ephemeral) in production \
+                 (set a fixed port, or use testing.run_standalone = true for standalone mode)"
+            );
+        }
+        if self.compat_http.enabled && self.compat_http.port == 0 {
+            anyhow::bail!(
+                "compat_http.port must not be 0 (ephemeral) when enabled \
+                 (set a fixed port or disable compat_http)"
+            );
+        }
+        if self.query.port == Some(0) {
+            anyhow::bail!(
+                "query.port must not be 0 (ephemeral) \
+                 (set a fixed port or omit query.port to disable)"
+            );
+        }
+
         // Validate RPC config
         if self.rpc.enabled {
             self.rpc.validate().map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -2559,6 +2585,152 @@ memory_for_caching_mb = 256
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Query port"));
+    }
+
+    // --- Port zero validation tests ---
+
+    #[test]
+    fn test_validation_http_port_zero_rejected() {
+        let mut config = AppConfig::default();
+        config.http.enabled = true;
+        config.http.port = 0;
+        config.testing.run_standalone = false;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("http.port must not be 0"),
+            "Expected http port zero error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_http_port_zero_allowed_standalone() {
+        let mut config = AppConfig::default();
+        config.http.enabled = true;
+        config.http.port = 0;
+        config.testing.run_standalone = true;
+        assert!(
+            config.validate().is_ok(),
+            "Standalone mode with http.port = 0 should pass"
+        );
+    }
+
+    #[test]
+    fn test_validation_http_port_zero_allowed_disabled() {
+        let mut config = AppConfig::default();
+        config.http.enabled = false;
+        config.http.port = 0;
+        assert!(
+            config.validate().is_ok(),
+            "Disabled http with port 0 should pass"
+        );
+    }
+
+    #[test]
+    fn test_validation_compat_http_port_zero_rejected() {
+        let mut config = AppConfig::default();
+        config.compat_http.enabled = true;
+        config.compat_http.port = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("compat_http.port must not be 0"),
+            "Expected compat_http port zero error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_compat_http_port_zero_allowed_disabled() {
+        let mut config = AppConfig::default();
+        config.compat_http.enabled = false;
+        config.compat_http.port = 0;
+        assert!(
+            config.validate().is_ok(),
+            "Disabled compat_http with port 0 should pass"
+        );
+    }
+
+    #[test]
+    fn test_validation_query_port_zero_rejected() {
+        let mut config = AppConfig::default();
+        config.query.port = Some(0);
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("query.port must not be 0"),
+            "Expected query port zero error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_rpc_port_zero_rejected() {
+        let mut config = AppConfig::default();
+        config.rpc.enabled = true;
+        config.rpc.port = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("rpc.port must not be 0"),
+            "Expected rpc port zero error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_rpc_port_zero_allowed_disabled() {
+        let mut config = AppConfig::default();
+        config.rpc.enabled = false;
+        config.rpc.port = 0;
+        assert!(
+            config.validate().is_ok(),
+            "Disabled rpc with port 0 should pass"
+        );
+    }
+
+    #[test]
+    fn test_validation_query_port_zero_networked_validator_precedence() {
+        // When query.port = Some(0) on a networked validator, the
+        // "cannot be set on networked validator" error should fire first.
+        let mut config = AppConfig::default();
+        config.node.is_validator = true;
+        config.node.node_seed =
+            Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
+        config.testing.run_standalone = false;
+        config.query.port = Some(0);
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("query.port cannot be set on a networked validator"),
+            "Expected networked validator error (precedence), got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_http_port_zero_collision_precedence() {
+        // When http.port = 0 and peer_port = 0, the collision error
+        // should fire before the port-0 error.
+        let mut config = AppConfig::default();
+        config.http.enabled = true;
+        config.http.port = 0;
+        config.overlay.peer_port = 0;
+        config.testing.run_standalone = false;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("peer port") && err.contains("must be different"),
+            "Expected collision error (precedence), got: {}",
+            err
+        );
     }
 
     // --- Maintenance config tests ---
