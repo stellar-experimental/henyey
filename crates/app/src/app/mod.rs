@@ -6339,6 +6339,59 @@ mod tests {
         );
     }
 
+    /// Regression for #2076: when the apply pass encounters a hash mismatch
+    /// (existing buffered entry has hash A, check_ledger_close returns hash B),
+    /// the existing entry must be preserved unchanged.
+    #[tokio::test]
+    async fn test_process_externalized_slots_apply_hash_mismatch_keeps_existing() {
+        let app = mk_test_app_for_pes_split().await;
+        app.herder.set_state(henyey_herder::HerderState::Tracking);
+
+        let n: u64 = 200;
+        let mismatch_slot = n + 1;
+        let hash_a = henyey_common::Hash256::from_bytes([0xAA; 32]);
+        let hash_b = henyey_common::Hash256::from_bytes([0xBB; 32]);
+
+        // Pre-seed buffer with hash_a, no tx_set.
+        {
+            let mut buf = app.syncing_ledgers.write().await;
+            buf.insert(
+                mismatch_slot as u32,
+                henyey_herder::LedgerCloseInfo {
+                    slot: mismatch_slot,
+                    close_time: 0,
+                    tx_set_hash: hash_a,
+                    tx_set: None,
+                    upgrades: Vec::new(),
+                    stellar_value_ext: stellar_xdr::curr::StellarValueExt::Basic,
+                },
+            );
+        }
+
+        // Externalize with hash_b (different hash) for the same slot.
+        let driver = app.herder.scp_driver();
+        let xdr = mk_stellar_value_xdr(hash_b.0);
+        driver.record_externalized(mismatch_slot, mk_value(xdr), None);
+
+        *app.last_processed_slot.write().await = n;
+
+        // Drive.
+        let _ = app.process_externalized_slots().await;
+
+        // The existing entry (hash_a) must be preserved — the apply pass
+        // should reject the incoming hash_b due to mismatch.
+        let buf = app.syncing_ledgers.read().await;
+        let entry = buf.get(&(mismatch_slot as u32)).expect("entry must exist");
+        assert_eq!(
+            entry.tx_set_hash, hash_a,
+            "hash mismatch in apply pass must keep existing hash"
+        );
+        assert!(
+            entry.tx_set.is_none(),
+            "existing entry had no tx_set and mismatch rejects the new one"
+        );
+    }
+
     /// All `PHASE_13_*` sub-phase constants are distinct and within a
     /// sensible range. Prevents accidental constant collision during
     /// future edits.

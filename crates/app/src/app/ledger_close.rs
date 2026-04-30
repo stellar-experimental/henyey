@@ -152,6 +152,72 @@ impl LedgerPersistInputs {
     }
 }
 
+/// Outcome of merging a `LedgerCloseInfo` into the `syncing_ledgers` buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MergeOutcome {
+    /// New entry inserted. `has_tx_set` indicates whether `tx_set` was present.
+    Inserted { has_tx_set: bool },
+    /// Existing entry upgraded with a `tx_set` (was None, now Some).
+    Upgraded,
+    /// Existing entry unchanged (already had a `tx_set` or new info didn't provide one).
+    Unchanged { has_tx_set: bool },
+    /// `tx_set_hash` mismatch — existing entry kept, new info rejected.
+    HashMismatch { existing_has_tx_set: bool },
+}
+
+impl MergeOutcome {
+    /// Whether a `tx_set` is present for this slot after the merge.
+    fn has_tx_set(&self) -> bool {
+        match self {
+            Self::Inserted { has_tx_set } => *has_tx_set,
+            Self::Upgraded => true,
+            Self::Unchanged { has_tx_set } => *has_tx_set,
+            Self::HashMismatch {
+                existing_has_tx_set,
+            } => *existing_has_tx_set,
+        }
+    }
+}
+
+/// Merge `info` into a buffer entry. Encapsulates the single merge policy for
+/// `syncing_ledgers`: hash-mismatch keeps existing, otherwise upgrade `tx_set`
+/// from None to Some, or insert if vacant.
+fn merge_into_buffer_entry(
+    slot: u32,
+    entry: std::collections::btree_map::Entry<'_, u32, henyey_herder::LedgerCloseInfo>,
+    info: henyey_herder::LedgerCloseInfo,
+) -> MergeOutcome {
+    match entry {
+        std::collections::btree_map::Entry::Occupied(mut e) => {
+            let existing = e.get_mut();
+            if existing.tx_set_hash != info.tx_set_hash {
+                tracing::warn!(
+                    slot,
+                    existing_hash = %existing.tx_set_hash.to_hex(),
+                    new_hash = %info.tx_set_hash.to_hex(),
+                    "merge_into_buffer_entry: tx_set_hash mismatch, keeping existing"
+                );
+                return MergeOutcome::HashMismatch {
+                    existing_has_tx_set: existing.tx_set.is_some(),
+                };
+            }
+            if existing.tx_set.is_none() && info.tx_set.is_some() {
+                existing.tx_set = info.tx_set;
+                MergeOutcome::Upgraded
+            } else {
+                MergeOutcome::Unchanged {
+                    has_tx_set: existing.tx_set.is_some(),
+                }
+            }
+        }
+        std::collections::btree_map::Entry::Vacant(e) => {
+            let has_tx_set = info.tx_set.is_some();
+            e.insert(info);
+            MergeOutcome::Inserted { has_tx_set }
+        }
+    }
+}
+
 impl App {
     pub(crate) fn externalized_iteration_window(
         last_processed: u64,
@@ -1348,16 +1414,18 @@ impl App {
                 }
 
                 if let Some(info) = self.herder.check_ledger_close(slot) {
-                    // Mirror legacy `missing_tx_set` semantics on the
-                    // post-apply state:
-                    //  - Occupied (had existing entry): missing iff
-                    //    existing had no tx_set AND info also has no
-                    //    tx_set (i.e. no upgrade available).
-                    //  - Vacant (no existing): missing iff info has no
-                    //    tx_set.
+                    // Predict whether tx_set will be missing after the apply
+                    // pass merges this plan into the buffer. Accounts for
+                    // hash-mismatch rejection: if hashes differ, the apply
+                    // will keep the existing entry unchanged.
                     let post_update_missing = match existing_entry {
-                        Some((_hash, existing_had_tx_set)) => {
-                            !(existing_had_tx_set || info.tx_set.is_some())
+                        Some((existing_hash, existing_had_tx_set)) => {
+                            if existing_hash != info.tx_set_hash {
+                                // Hash mismatch: apply will reject; post-state = existing
+                                !existing_had_tx_set
+                            } else {
+                                !(existing_had_tx_set || info.tx_set.is_some())
+                            }
                         }
                         None => info.tx_set.is_none(),
                     };
@@ -1416,22 +1484,13 @@ impl App {
                 let mut buffer =
                     tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
                 for plan in plans {
-                    match buffer.entry(plan.slot) {
-                        std::collections::btree_map::Entry::Occupied(mut entry) => {
-                            let existing_local = entry.get_mut();
-                            if existing_local.tx_set.is_none() && plan.info.tx_set.is_some() {
-                                existing_local.tx_set = plan.info.tx_set;
-                                tracing::info!(
-                                    slot = plan.slot,
-                                    "Updated buffered ledger with tx_set from check_ledger_close"
-                                );
-                            }
-                            // missing_tx_set already recorded from
-                            // pre-read state during iteration.
-                        }
-                        std::collections::btree_map::Entry::Vacant(entry) => {
-                            entry.insert(plan.info);
-                        }
+                    let outcome =
+                        merge_into_buffer_entry(plan.slot, buffer.entry(plan.slot), plan.info);
+                    if let MergeOutcome::Upgraded = outcome {
+                        tracing::info!(
+                            slot = plan.slot,
+                            "Updated buffered ledger with tx_set from check_ledger_close"
+                        );
                     }
                 }
             }
@@ -1572,31 +1631,17 @@ impl App {
     ) -> bool {
         let mut buffer =
             tracked_lock::tracked_write("syncing_ledgers", &self.syncing_ledgers).await;
-        match buffer.entry(slot) {
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let existing = entry.get_mut();
-                if existing.tx_set_hash != info.tx_set_hash {
-                    tracing::warn!(
-                        slot,
-                        existing_hash = %existing.tx_set_hash.to_hex(),
-                        new_hash = %info.tx_set_hash.to_hex(),
-                        "ensure_buffered_slot: tx_set_hash mismatch, keeping existing"
-                    );
-                    return existing.tx_set.is_some();
-                }
-                if existing.tx_set.is_none() && info.tx_set.is_some() {
-                    existing.tx_set = info.tx_set;
-                    tracing::debug!(slot, "ensure_buffered_slot: upgraded tx_set");
-                }
-                existing.tx_set.is_some()
-            }
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let has_tx_set = info.tx_set.is_some();
-                tracing::debug!(slot, has_tx_set, "ensure_buffered_slot: inserted new entry");
-                entry.insert(info);
-                has_tx_set
-            }
+        let outcome = merge_into_buffer_entry(slot, buffer.entry(slot), info);
+        if let MergeOutcome::Inserted { .. } = outcome {
+            tracing::debug!(
+                slot,
+                has_tx_set = outcome.has_tx_set(),
+                "ensure_buffered_slot: inserted new entry"
+            );
+        } else if let MergeOutcome::Upgraded = outcome {
+            tracing::debug!(slot, "ensure_buffered_slot: upgraded tx_set");
         }
+        outcome.has_tx_set()
     }
 
     /// Try to populate gap slots between `current_ledger` and the first
