@@ -50,7 +50,7 @@ use crate::{
 };
 use henyey_bucket::{BucketList, PendingMergeState, HAS_NEXT_STATE_INPUTS, HAS_NEXT_STATE_OUTPUT};
 use henyey_common::fs_utils::{
-    atomic_gzip_xdr_write_iter, atomic_gzip_xdr_write_slice, atomic_write_bytes, atomic_write_with,
+    atomic_gzip_copy, atomic_gzip_xdr_write_iter, atomic_gzip_xdr_write_slice, atomic_write_bytes,
 };
 use henyey_common::Hash256;
 use std::path::{Path, PathBuf};
@@ -58,9 +58,6 @@ use stellar_xdr::curr::{
     LedgerHeaderHistoryEntry, TransactionHistoryEntry, TransactionHistoryResultEntry, WriteXdr,
 };
 use tracing::{debug, info};
-
-/// Buffer size for gzip-compressing bucket files (64 KiB).
-const GZIP_COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Configuration for history publishing.
 #[derive(Debug, Clone)]
@@ -433,27 +430,8 @@ impl PublishManager {
         }
 
         if let Some(backing_path) = bucket.backing_file_path() {
-            // Disk-backed branch — out of scope for issue #2047.
-            // Streams the backing .bucket.xdr file through gzip via a 64KB
-            // read loop. A follow-up may evaluate using `atomic_gzip_copy`
-            // here.
-            use flate2::write::GzEncoder;
-            use flate2::Compression;
-            use std::io::{Read, Write};
-            atomic_write_with(path, |file| {
-                let mut encoder = GzEncoder::new(&mut *file, Compression::default());
-                let mut src = std::fs::File::open(backing_path)?;
-                let mut buf = [0u8; GZIP_COPY_BUFFER_SIZE];
-                loop {
-                    let n = src.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    encoder.write_all(&buf[..n])?;
-                }
-                encoder.finish()?;
-                Ok(())
-            })?;
+            // Disk-backed: stream the raw .bucket.xdr through gzip atomically.
+            atomic_gzip_copy(backing_path, path)?;
         } else {
             // In-memory branch — serialize entries via the shared helper.
             // BucketIter yields `Result<BucketEntry, BucketError>`; the
@@ -1277,6 +1255,83 @@ mod tests {
         let mut decoder = GzDecoder::new(file);
         let mut content = Vec::new();
         decoder.read_to_end(&mut content).unwrap();
+    }
+
+    #[test]
+    fn test_write_bucket_from_entries_disk_backed() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let temp = TempDir::new().unwrap();
+        let config = PublishConfig {
+            local_path: temp.path().to_path_buf(),
+            ..Default::default()
+        };
+        let manager = PublishManager::new(config);
+
+        // Create an in-memory bucket with entries, serialize to XDR bytes,
+        // then create a disk-backed bucket from those bytes.
+        let entries = vec![stellar_xdr::curr::BucketEntry::Liveentry(
+            stellar_xdr::curr::LedgerEntry {
+                last_modified_ledger_seq: 1,
+                data: stellar_xdr::curr::LedgerEntryData::Account(
+                    stellar_xdr::curr::AccountEntry {
+                        account_id: stellar_xdr::curr::AccountId(
+                            stellar_xdr::curr::PublicKey::PublicKeyTypeEd25519(
+                                stellar_xdr::curr::Uint256([1u8; 32]),
+                            ),
+                        ),
+                        balance: 100,
+                        seq_num: stellar_xdr::curr::SequenceNumber(1),
+                        num_sub_entries: 0,
+                        inflation_dest: None,
+                        flags: 0,
+                        home_domain: stellar_xdr::curr::String32::default(),
+                        thresholds: stellar_xdr::curr::Thresholds([1, 0, 0, 0]),
+                        signers: Vec::new().try_into().unwrap(),
+                        ext: stellar_xdr::curr::AccountEntryExt::V0,
+                    },
+                ),
+                ext: stellar_xdr::curr::LedgerEntryExt::V0,
+            },
+        )];
+        let in_memory_bucket = henyey_bucket::Bucket::from_entries(entries).unwrap();
+        let xdr_bytes = in_memory_bucket.to_xdr_bytes().unwrap();
+
+        // Create a disk-backed bucket from the serialized bytes.
+        let backing_path = temp.path().join("backing.bucket.xdr");
+        let disk_bucket =
+            henyey_bucket::Bucket::from_xdr_bytes_disk_backed(&xdr_bytes, &backing_path).unwrap();
+        assert!(
+            disk_bucket.backing_file_path().is_some(),
+            "bucket must be disk-backed"
+        );
+
+        // Write via the publish path.
+        let bucket_path = temp.path().join("bucket/00/00/00/bucket-disk.xdr.gz");
+        manager
+            .write_bucket_from_entries(&bucket_path, &disk_bucket)
+            .unwrap();
+
+        // Verify output exists and decompresses to the original XDR bytes.
+        assert!(bucket_path.exists());
+        let file = std::fs::File::open(&bucket_path).unwrap();
+        let mut decoder = GzDecoder::new(file);
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+        assert_eq!(decompressed, xdr_bytes);
+
+        // No temp files remain.
+        let parent = bucket_path.parent().unwrap();
+        let tmp_files: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(
+            tmp_files.is_empty(),
+            "no .tmp files should remain after successful write"
+        );
     }
 
     #[test]
