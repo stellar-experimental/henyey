@@ -4833,3 +4833,408 @@ fn test_post_seq_failure_removes_fee_bump_outer_signer() {
         "Inner source sequence should be bumped to 2"
     );
 }
+
+/// `FeeStrategy::ExternallyPrecharged` with fewer fees than transactions must
+/// return `LedgerError::Internal` with the length-mismatch message.
+#[test]
+fn test_fee_strategy_externally_precharged_too_short() {
+    use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy};
+    use henyey_ledger::LedgerDelta;
+
+    let secret = SecretKey::from_seed(&[77u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 100_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let base_fee: u32 = 100;
+
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let sig = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(2, 1_000, base_fee, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load offers");
+
+    let transactions = vec![(std::sync::Arc::new(envelope), None)];
+    let mut delta = LedgerDelta::new(2);
+
+    // Pass empty fee slice for 1 transaction — should trigger length mismatch.
+    let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
+        executor: &mut executor,
+        snapshot: &snapshot,
+        transactions: &transactions,
+        base_fee,
+        soroban_base_prng_seed: [0u8; 32],
+        fee_strategy: FeeStrategy::ExternallyPrecharged(&[]),
+        delta: &mut delta,
+    });
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("should fail with length mismatch"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ExternallyPrecharged fees count (0) != transaction count (1)"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// `FeeStrategy::ExternallyPrecharged` with more fees than transactions must
+/// return `LedgerError::Internal` with the length-mismatch message.
+#[test]
+fn test_fee_strategy_externally_precharged_too_long() {
+    use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy, PreChargedFee};
+    use henyey_ledger::LedgerDelta;
+
+    let secret = SecretKey::from_seed(&[78u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 100_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let base_fee: u32 = 100;
+
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let sig = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(2, 1_000, base_fee, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load offers");
+
+    let pre_charged = vec![
+        PreChargedFee {
+            charged_fee: 100,
+            fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+        },
+        PreChargedFee {
+            charged_fee: 100,
+            fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+        },
+    ];
+
+    let transactions = vec![(std::sync::Arc::new(envelope), None)];
+    let mut delta = LedgerDelta::new(2);
+
+    // Pass 2 fees for 1 transaction — should trigger length mismatch.
+    let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
+        executor: &mut executor,
+        snapshot: &snapshot,
+        transactions: &transactions,
+        base_fee,
+        soroban_base_prng_seed: [0u8; 32],
+        fee_strategy: FeeStrategy::ExternallyPrecharged(&pre_charged),
+        delta: &mut delta,
+    });
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("should fail with length mismatch"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("ExternallyPrecharged fees count (2) != transaction count (1)"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// `SorobanFeeSource::ExternallyPrecharged` with fewer fees than soroban
+/// transactions must return `LedgerError::Internal`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_soroban_fee_source_externally_precharged_too_short() {
+    use henyey_ledger::execution::PreChargedFee;
+    use henyey_ledger::{
+        execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
+        SorobanContext, SorobanFeeSource, SorobanPhaseStructure,
+    };
+
+    let network_id = NetworkId::testnet();
+
+    // Build two Soroban TXs → 2 total transactions in phase.
+    let (tx1, entries1) = build_extend_ttl_tx([33u8; 32], 2, [9u8; 32], 100, &network_id);
+    let (tx2, entries2) = build_extend_ttl_tx([44u8; 32], 2, [10u8; 32], 200, &network_id);
+
+    let mut builder = SnapshotBuilder::new(1);
+    for (key, entry) in entries1.into_iter().chain(entries2.into_iter()) {
+        builder = builder.add_entry(key, entry);
+    }
+    let snapshot = SnapshotHandle::new(builder.build_with_default_header());
+
+    // Phase with 2 transactions total (1 stage, 2 clusters of 1 tx each).
+    let phase = SorobanPhaseStructure {
+        base_fee: None,
+        stages: vec![vec![
+            vec![(std::sync::Arc::new(tx1), None)],
+            vec![(std::sync::Arc::new(tx2), None)],
+        ]],
+    };
+
+    let mut delta = LedgerDelta::new(1);
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+
+    // Only 1 fee for 2 transactions — should trigger length mismatch.
+    let fee_source = SorobanFeeSource::ExternallyPrecharged(vec![PreChargedFee {
+        charged_fee: 100,
+        fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+    }]);
+
+    let result = execute_soroban_parallel_phase(
+        &snapshot,
+        &phase,
+        0,
+        &context,
+        &mut delta,
+        SorobanContext {
+            config: SorobanConfig::default(),
+            base_prng_seed: [0u8; 32],
+            classic_events: ClassicEventConfig::default(),
+            module_cache: None,
+            hot_archive: None,
+            runtime_handle: None,
+            soroban_state: None,
+            offer_store: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
+        },
+        fee_source,
+    );
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("should fail with length mismatch"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SorobanFeeSource::ExternallyPrecharged length mismatch"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// `SorobanFeeSource::ExternallyPrecharged` with more fees than soroban
+/// transactions must return `LedgerError::Internal`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_soroban_fee_source_externally_precharged_too_long() {
+    use henyey_ledger::execution::PreChargedFee;
+    use henyey_ledger::{
+        execute_soroban_parallel_phase, LedgerDelta, SnapshotBuilder, SnapshotHandle,
+        SorobanContext, SorobanFeeSource, SorobanPhaseStructure,
+    };
+
+    let network_id = NetworkId::testnet();
+
+    // Build 1 Soroban TX but provide 2 fees.
+    let (tx1, entries1) = build_extend_ttl_tx([55u8; 32], 2, [11u8; 32], 100, &network_id);
+
+    let mut builder = SnapshotBuilder::new(1);
+    for (key, entry) in entries1.into_iter() {
+        builder = builder.add_entry(key, entry);
+    }
+    let snapshot = SnapshotHandle::new(builder.build_with_default_header());
+
+    // Phase with 1 transaction total.
+    let phase = SorobanPhaseStructure {
+        base_fee: None,
+        stages: vec![vec![vec![(std::sync::Arc::new(tx1), None)]]],
+    };
+
+    let mut delta = LedgerDelta::new(1);
+    let context = henyey_tx::LedgerContext::new(1, 1_000, 100, 5_000_000, 25, network_id);
+
+    // 2 fees for 1 transaction — should trigger length mismatch.
+    let fee_source = SorobanFeeSource::ExternallyPrecharged(vec![
+        PreChargedFee {
+            charged_fee: 100,
+            fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+        },
+        PreChargedFee {
+            charged_fee: 100,
+            fee_changes: stellar_xdr::curr::LedgerEntryChanges(vec![].try_into().unwrap()),
+        },
+    ]);
+
+    let result = execute_soroban_parallel_phase(
+        &snapshot,
+        &phase,
+        0,
+        &context,
+        &mut delta,
+        SorobanContext {
+            config: SorobanConfig::default(),
+            base_prng_seed: [0u8; 32],
+            classic_events: ClassicEventConfig::default(),
+            module_cache: None,
+            hot_archive: None,
+            runtime_handle: None,
+            soroban_state: None,
+            offer_store: None,
+            emit_soroban_tx_meta_ext_v1: false,
+            enable_soroban_diagnostic_events: false,
+        },
+        fee_source,
+    );
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("should fail with length mismatch"),
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("SorobanFeeSource::ExternallyPrecharged length mismatch"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// `FeeStrategy::NoFees` skips fee processing entirely: the result's
+/// `fee_processing` meta is empty and no fee pool delta is recorded.
+#[test]
+fn test_fee_strategy_no_fees_skips_fee_processing() {
+    use henyey_ledger::execution::{run_transactions_on_executor, FeeStrategy};
+    use henyey_ledger::LedgerDelta;
+
+    let secret = SecretKey::from_seed(&[79u8; 32]);
+    let source_id: AccountId = (&secret.public_key()).into();
+    let (source_key, source_entry) = create_account_entry(source_id.clone(), 1, 100_000_000);
+
+    let snapshot = SnapshotBuilder::new(1)
+        .add_entry(source_key, source_entry)
+        .build_with_default_header();
+    let snapshot = SnapshotHandle::new(snapshot);
+
+    let network_id = NetworkId::testnet();
+    let base_fee: u32 = 100;
+
+    // Simple self-payment so TX passes validation.
+    let payment_op = Operation {
+        source_account: None,
+        body: OperationBody::Payment(stellar_xdr::curr::PaymentOp {
+            destination: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+            asset: Asset::Native,
+            amount: 1,
+        }),
+    };
+    let tx = Transaction {
+        source_account: MuxedAccount::Ed25519(Uint256(*secret.public_key().as_bytes())),
+        fee: base_fee,
+        seq_num: SequenceNumber(2),
+        cond: Preconditions::None,
+        memo: Memo::None,
+        operations: vec![payment_op].try_into().unwrap(),
+        ext: TransactionExt::V0,
+    };
+    let mut envelope = TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx,
+        signatures: VecM::default(),
+    });
+    let sig = sign_envelope(&envelope, &secret, &network_id);
+    if let TransactionEnvelope::Tx(ref mut env) = envelope {
+        env.signatures = vec![sig].try_into().unwrap();
+    }
+
+    let context = henyey_tx::LedgerContext::new(2, 1_000, base_fee, 5_000_000, 25, network_id);
+    let mut executor = TransactionExecutor::new(
+        &context,
+        0,
+        SorobanConfig::default(),
+        ClassicEventConfig::default(),
+    );
+    executor
+        .load_orderbook_offers(&snapshot)
+        .expect("load offers");
+
+    let transactions = vec![(std::sync::Arc::new(envelope), None)];
+    let mut delta = LedgerDelta::new(2);
+
+    let result = run_transactions_on_executor(henyey_ledger::execution::RunTransactionsParams {
+        executor: &mut executor,
+        snapshot: &snapshot,
+        transactions: &transactions,
+        base_fee,
+        soroban_base_prng_seed: [0u8; 32],
+        fee_strategy: FeeStrategy::NoFees,
+        delta: &mut delta,
+    })
+    .expect("NoFees execution should succeed");
+
+    // fee_processing in the result meta should be empty (no fee ledger changes).
+    assert!(
+        result.tx_result_metas[0].fee_processing.0.is_empty(),
+        "fee_processing should be empty with NoFees, got: {:?}",
+        result.tx_result_metas[0].fee_processing
+    );
+
+    // No fee pool delta should have been recorded.
+    assert_eq!(
+        delta.fee_pool_delta(),
+        0,
+        "fee pool delta should be 0 with NoFees"
+    );
+}
