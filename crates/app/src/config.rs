@@ -1570,6 +1570,20 @@ impl Default for AppConfig {
     }
 }
 
+/// Read an environment variable, distinguishing "not set" from "not valid UTF-8".
+///
+/// Returns `Ok(None)` if the variable is not set, `Ok(Some(val))` if set and
+/// valid UTF-8, or an error if the value is not valid UTF-8.
+fn env_var_opt(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(val) => Ok(Some(val)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name}: value is not valid UTF-8")
+        }
+    }
+}
+
 impl AppConfig {
     /// Create a default testnet configuration.
     pub fn testnet() -> Self {
@@ -1746,52 +1760,66 @@ impl AppConfig {
     /// - RS_STELLAR_CORE_OVERLAY_PEER_PORT
     pub fn from_file_with_env(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let mut config = Self::from_file(path)?;
-        config.apply_env_overrides();
+        config.apply_env_overrides()?;
         Ok(config)
     }
 
     /// Apply environment variable overrides.
-    pub fn apply_env_overrides(&mut self) {
+    ///
+    /// Fails immediately with a descriptive error if any set env var contains
+    /// a value that cannot be parsed into the expected type. Unset variables
+    /// are silently skipped.
+    pub fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
         // Node overrides
-        if let Ok(val) = std::env::var("RS_STELLAR_CORE_NODE_NAME") {
+        if let Some(val) = env_var_opt("RS_STELLAR_CORE_NODE_NAME")? {
             self.node.name = val;
         }
-        if let Ok(val) = std::env::var("RS_STELLAR_CORE_NODE_SEED") {
+        if let Some(val) = env_var_opt("RS_STELLAR_CORE_NODE_SEED")? {
             self.node.node_seed = Some(val);
         }
-        if let Ok(val) = std::env::var("RS_STELLAR_CORE_NODE_VALIDATOR") {
-            self.node.is_validator = val.parse().unwrap_or(false);
+        if let Some(val) = env_var_opt("RS_STELLAR_CORE_NODE_VALIDATOR")? {
+            self.node.is_validator = val.parse::<bool>().with_context(|| {
+                format!(
+                    "RS_STELLAR_CORE_NODE_VALIDATOR: invalid boolean '{val}', \
+                     must be 'true' or 'false'"
+                )
+            })?;
         }
 
         // Network overrides
-        if let Ok(val) = std::env::var("RS_STELLAR_CORE_NETWORK_PASSPHRASE") {
+        if let Some(val) = env_var_opt("RS_STELLAR_CORE_NETWORK_PASSPHRASE")? {
             self.network.passphrase = val;
         }
 
         // Database overrides
-        if let Ok(val) = std::env::var("RS_STELLAR_CORE_DATABASE_PATH") {
+        if let Some(val) = env_var_opt("RS_STELLAR_CORE_DATABASE_PATH")? {
             self.database.path = PathBuf::from(val);
         }
 
         // Bucket overrides
-        if let Ok(val) = std::env::var("RS_STELLAR_CORE_BUCKETS_DIRECTORY") {
+        if let Some(val) = env_var_opt("RS_STELLAR_CORE_BUCKETS_DIRECTORY")? {
             self.buckets.directory = PathBuf::from(val);
         }
 
         // Overlay overrides
-        if let Ok(val) = std::env::var("RS_STELLAR_CORE_OVERLAY_PEER_PORT") {
-            if let Ok(port) = val.parse() {
-                self.overlay.peer_port = port;
-            }
+        if let Some(val) = env_var_opt("RS_STELLAR_CORE_OVERLAY_PEER_PORT")? {
+            self.overlay.peer_port = val.parse::<u16>().with_context(|| {
+                format!(
+                    "RS_STELLAR_CORE_OVERLAY_PEER_PORT: invalid port '{val}', \
+                     must be a valid u16 (0–65535)"
+                )
+            })?;
         }
 
         // Logging overrides
-        if let Ok(val) = std::env::var("RS_STELLAR_CORE_LOG_LEVEL") {
+        if let Some(val) = env_var_opt("RS_STELLAR_CORE_LOG_LEVEL")? {
             self.logging.level = val;
         }
-        if let Ok(val) = std::env::var("RS_STELLAR_CORE_LOG_FORMAT") {
+        if let Some(val) = env_var_opt("RS_STELLAR_CORE_LOG_FORMAT")? {
             self.logging.format = val;
         }
+
+        Ok(())
     }
 
     /// Returns true if this is a validator connected to a real network.
@@ -4191,5 +4219,148 @@ name = "test"
         ];
         config.overlay.preferred_peers = vec![PeerAddress::new("preferred.example.com", 11625)];
         assert!(config.validate().is_ok());
+    }
+
+    // --- Environment override tests ---
+    //
+    // These tests mutate process-global env vars, so they use a mutex to
+    // serialize and a guard to restore original values on exit (including panic).
+
+    use std::sync::Mutex;
+
+    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// RAII guard that restores an env var to its original state on drop.
+    struct EnvGuard {
+        vars: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(names: &[&str]) -> Self {
+            let vars = names
+                .iter()
+                .map(|&name| (name.to_owned(), std::env::var(name).ok()))
+                .collect();
+            Self { vars }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (name, original) in &self.vars {
+                match original {
+                    Some(val) => std::env::set_var(name, val),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_env_override_valid_bool_true() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_NODE_VALIDATOR"]);
+
+        std::env::set_var("RS_STELLAR_CORE_NODE_VALIDATOR", "true");
+        let mut config = AppConfig::default();
+        config.apply_env_overrides().unwrap();
+        assert!(config.node.is_validator);
+    }
+
+    #[test]
+    fn test_env_override_valid_bool_false() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_NODE_VALIDATOR"]);
+
+        std::env::set_var("RS_STELLAR_CORE_NODE_VALIDATOR", "false");
+        let mut config = AppConfig::default();
+        config.apply_env_overrides().unwrap();
+        assert!(!config.node.is_validator);
+    }
+
+    #[test]
+    fn test_env_override_invalid_bool() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_NODE_VALIDATOR"]);
+
+        std::env::set_var("RS_STELLAR_CORE_NODE_VALIDATOR", "tru");
+        let mut config = AppConfig::default();
+        let err = config.apply_env_overrides().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RS_STELLAR_CORE_NODE_VALIDATOR"),
+            "error should mention the env var name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_env_override_valid_port() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_OVERLAY_PEER_PORT"]);
+
+        std::env::set_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT", "8080");
+        let mut config = AppConfig::default();
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.overlay.peer_port, 8080);
+    }
+
+    #[test]
+    fn test_env_override_invalid_port() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_OVERLAY_PEER_PORT"]);
+
+        std::env::set_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT", "abc");
+        let mut config = AppConfig::default();
+        let err = config.apply_env_overrides().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RS_STELLAR_CORE_OVERLAY_PEER_PORT"),
+            "error should mention the env var name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_env_override_port_overflow() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_OVERLAY_PEER_PORT"]);
+
+        std::env::set_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT", "99999");
+        let mut config = AppConfig::default();
+        let err = config.apply_env_overrides().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("RS_STELLAR_CORE_OVERLAY_PEER_PORT"),
+            "error should mention the env var name: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_env_override_port_zero() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&["RS_STELLAR_CORE_OVERLAY_PEER_PORT"]);
+
+        // Port 0 is valid u16 — semantic validation happens in validate()
+        std::env::set_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT", "0");
+        let mut config = AppConfig::default();
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.overlay.peer_port, 0);
+    }
+
+    #[test]
+    fn test_env_override_unset_is_noop() {
+        let _lock = ENV_TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new(&[
+            "RS_STELLAR_CORE_NODE_VALIDATOR",
+            "RS_STELLAR_CORE_OVERLAY_PEER_PORT",
+        ]);
+
+        std::env::remove_var("RS_STELLAR_CORE_NODE_VALIDATOR");
+        std::env::remove_var("RS_STELLAR_CORE_OVERLAY_PEER_PORT");
+        let mut config = AppConfig::default();
+        let original_validator = config.node.is_validator;
+        let original_port = config.overlay.peer_port;
+        config.apply_env_overrides().unwrap();
+        assert_eq!(config.node.is_validator, original_validator);
+        assert_eq!(config.overlay.peer_port, original_port);
     }
 }

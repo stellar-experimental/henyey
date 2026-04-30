@@ -1287,24 +1287,26 @@ fn load_config(cli: &Cli, local: bool) -> anyhow::Result<AppConfig> {
             base.surge_pricing = overlay.surge_pricing;
             base.catchup = overlay.catchup;
         }
-        base.apply_env_overrides();
+        base.apply_env_overrides()?;
         base
     } else {
         match (&cli.config, cli.mainnet) {
             (Some(config_path), _) => {
                 tracing::info!(path = ?config_path, "Loading configuration from file");
-                load_config_file(config_path)?
+                let mut c = load_config_file(config_path)?;
+                c.apply_env_overrides()?;
+                c
             }
             (None, true) => {
                 tracing::info!("Using mainnet configuration");
                 let mut c = AppConfig::mainnet();
-                c.apply_env_overrides();
+                c.apply_env_overrides()?;
                 c
             }
             (None, false) => {
                 tracing::info!("Using testnet configuration (default)");
                 let mut c = AppConfig::testnet();
-                c.apply_env_overrides();
+                c.apply_env_overrides()?;
                 c
             }
         }
@@ -1319,6 +1321,9 @@ fn load_config(cli: &Cli, local: bool) -> anyhow::Result<AppConfig> {
 }
 
 /// Load a config file, auto-detecting stellar-core vs henyey format.
+///
+/// Note: does NOT apply env overrides — callers are responsible for calling
+/// `apply_env_overrides()` after loading to avoid double-application.
 fn load_config_file(path: &std::path::Path) -> anyhow::Result<AppConfig> {
     use henyey_app::compat_config;
 
@@ -1327,12 +1332,10 @@ fn load_config_file(path: &std::path::Path) -> anyhow::Result<AppConfig> {
 
     if compat_config::is_stellar_core_format(&raw) {
         tracing::info!("Detected stellar-core config format, translating");
-        let mut config = compat_config::translate_stellar_core_config(&raw)?;
-        config.apply_env_overrides();
+        let config = compat_config::translate_stellar_core_config(&raw)?;
         Ok(config)
     } else {
-        let mut config: AppConfig = toml::from_str(&content)?;
-        config.apply_env_overrides();
+        let config: AppConfig = toml::from_str(&content)?;
         Ok(config)
     }
 }
