@@ -1985,43 +1985,8 @@ impl AppConfig {
             );
         }
 
-        // HTTP port and peer port must not conflict
-        if self.http.enabled && self.http.port == self.overlay.peer_port {
-            anyhow::bail!(
-                "HTTP port ({}) and peer port ({}) must be different",
-                self.http.port,
-                self.overlay.peer_port
-            );
-        }
-
-        // Native HTTP and compat HTTP must not bind the same port
-        if self.http.enabled && self.compat_http.enabled && self.http.port == self.compat_http.port
-        {
-            anyhow::bail!(
-                "Native HTTP port ({}) and compat HTTP port ({}) must be different \
-                 (disable one or change the port)",
-                self.http.port,
-                self.compat_http.port
-            );
-        }
-
-        // Query server port must not conflict with other HTTP ports
-        if let Some(query_port) = self.query.port {
-            if self.http.enabled && query_port == self.http.port {
-                anyhow::bail!(
-                    "Query port ({}) and native HTTP port ({}) must be different",
-                    query_port,
-                    self.http.port
-                );
-            }
-            if self.compat_http.enabled && query_port == self.compat_http.port {
-                anyhow::bail!(
-                    "Query port ({}) and compat HTTP port ({}) must be different",
-                    query_port,
-                    self.compat_http.port
-                );
-            }
-        }
+        // Reject port collisions between all active listeners.
+        validate_port_collisions(self)?;
 
         if self.query.thread_pool_size == 0 {
             anyhow::bail!("query.thread_pool_size must be > 0");
@@ -2116,6 +2081,51 @@ impl AppConfig {
         let config = Self::testnet();
         toml::to_string_pretty(&config).unwrap_or_default()
     }
+}
+
+/// Validates that no two active listeners are configured on the same port.
+///
+/// Port-only comparison (not address+port) is intentional: `0.0.0.0` binds all
+/// interfaces, so any port shared with a more-specific address still causes a
+/// real bind failure. This conservative policy matches the behavior of the
+/// ad-hoc checks this replaces.
+fn validate_port_collisions(config: &AppConfig) -> anyhow::Result<()> {
+    // Collect all active (name, port) pairs. Insertion order determines which
+    // collision is reported first — matches the historical check order.
+    let mut listeners: Vec<(&str, u16)> = Vec::new();
+
+    // peer_port is always included (existing behavior: the pre-existing
+    // http-vs-peer_port check had no overlay-active guard).
+    listeners.push(("overlay.peer_port", config.overlay.peer_port));
+
+    if config.http.enabled {
+        listeners.push(("http.port", config.http.port));
+    }
+    if config.compat_http.enabled {
+        listeners.push(("compat_http.port", config.compat_http.port));
+    }
+    if let Some(query_port) = config.query.port {
+        listeners.push(("query.port", query_port));
+    }
+    if config.rpc.enabled {
+        listeners.push(("rpc.port", config.rpc.port));
+    }
+
+    // O(n²) with n ≤ 5 — trivial cost.
+    for i in 0..listeners.len() {
+        for j in (i + 1)..listeners.len() {
+            if listeners[i].1 == listeners[j].1 {
+                anyhow::bail!(
+                    "{} ({}) and {} ({}) must be different",
+                    listeners[i].0,
+                    listeners[i].1,
+                    listeners[j].0,
+                    listeners[j].1
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Compute the minimum acceptable threshold for a quorum set at the given
@@ -2657,7 +2667,12 @@ memory_for_caching_mb = 256
         config.compat_http.port = 11626;
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("compat HTTP"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("http.port") && err.contains("compat_http.port"),
+            "Expected http/compat_http collision error, got: {}",
+            err
+        );
     }
 
     #[test]
@@ -2668,7 +2683,131 @@ memory_for_caching_mb = 256
         config.query.port = Some(11627);
         let result = config.validate();
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Query port"));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("query.port") && err.contains("compat_http.port"),
+            "Expected query/compat_http collision error, got: {}",
+            err
+        );
+    }
+
+    // --- RPC port collision tests ---
+
+    #[test]
+    fn test_validation_rpc_port_collision_with_http() {
+        let mut config = AppConfig::default();
+        config.rpc.enabled = true;
+        config.rpc.port = config.http.port;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("http.port")
+                && err.contains("rpc.port")
+                && err.contains("must be different"),
+            "Expected http/rpc collision error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_rpc_port_collision_with_compat_http() {
+        let mut config = AppConfig::default();
+        config.rpc.enabled = true;
+        config.compat_http.enabled = true;
+        config.compat_http.port = 9999;
+        config.rpc.port = 9999;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("compat_http.port")
+                && err.contains("rpc.port")
+                && err.contains("must be different"),
+            "Expected compat_http/rpc collision error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_rpc_port_collision_with_query() {
+        let mut config = AppConfig::default();
+        config.rpc.enabled = true;
+        config.rpc.port = 9999;
+        config.query.port = Some(9999);
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("query.port")
+                && err.contains("rpc.port")
+                && err.contains("must be different"),
+            "Expected query/rpc collision error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_rpc_port_collision_with_peer_port() {
+        let mut config = AppConfig::default();
+        config.rpc.enabled = true;
+        config.rpc.port = config.overlay.peer_port;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overlay.peer_port")
+                && err.contains("rpc.port")
+                && err.contains("must be different"),
+            "Expected peer_port/rpc collision error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_rpc_port_collision_skipped_when_disabled() {
+        let mut config = AppConfig::default();
+        config.rpc.enabled = false;
+        config.rpc.port = config.http.port; // Would collide if enabled
+        assert!(
+            config.validate().is_ok(),
+            "Disabled RPC with colliding port should pass"
+        );
+    }
+
+    // --- Previously-missing port collision pairs ---
+
+    #[test]
+    fn test_validation_compat_http_port_collision_with_peer_port() {
+        let mut config = AppConfig::default();
+        config.compat_http.enabled = true;
+        config.compat_http.port = config.overlay.peer_port;
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overlay.peer_port")
+                && err.contains("compat_http.port")
+                && err.contains("must be different"),
+            "Expected peer_port/compat_http collision error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validation_query_port_collision_with_peer_port() {
+        let mut config = AppConfig::default();
+        config.query.port = Some(config.overlay.peer_port);
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overlay.peer_port")
+                && err.contains("query.port")
+                && err.contains("must be different"),
+            "Expected peer_port/query collision error, got: {}",
+            err
+        );
     }
 
     // --- Port zero validation tests ---
@@ -2841,7 +2980,7 @@ memory_for_caching_mb = 256
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(
-            err.contains("peer port") && err.contains("must be different"),
+            err.contains("overlay.peer_port") && err.contains("must be different"),
             "Expected collision error (precedence), got: {}",
             err
         );
@@ -3039,7 +3178,7 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
         config.node.node_seed =
             Some("SBXTJSLKQ2VZUEQNYU5EC6ZGQOONCX3JCFBK57R56YLYMUW76B2FMCJH".to_string());
         config.testing.run_standalone = true;
-        config.query.port = Some(11625);
+        config.query.port = Some(11630);
         let result = config.validate();
         assert!(
             result.is_ok(),
@@ -3051,7 +3190,7 @@ url = "https://history.stellar.org/prd/core-testnet/core_testnet_001"
     #[test]
     fn test_validation_query_port_on_watcher() {
         let mut config = AppConfig::default();
-        config.query.port = Some(11625);
+        config.query.port = Some(11630);
         let result = config.validate();
         assert!(
             result.is_ok(),
