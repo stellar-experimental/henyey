@@ -77,6 +77,8 @@ Metrics with the `stellar_` prefix that directly mirror stellar-core Medida coun
 | `QUORUM_DISAGREE` | `stellar_quorum_disagree` | gauge | Nodes disagreeing in latest slot |
 | `QUORUM_FAIL_AT` | `stellar_quorum_fail_at` | gauge | Peers that can fail before quorum loss (via `find_closest_v_blocking`, excludes self) |
 | `QUORUM_DELAYED` | `stellar_quorum_delayed` | gauge | Quorum set nodes lagging behind the local node (subset of agree) |
+| `LEDGER_INVARIANT_FAILURE_TOTAL` | `stellar_ledger_invariant_failure_total` | counter | `InvariantManagerImpl::handleInvariantFailure` |
+| `LEDGER_TRANSACTION_INTERNAL_ERROR_TOTAL` | `stellar_ledger_transaction_internal_error_total` | counter | `TransactionFrame::apply` txINTERNAL_ERROR path |
 
 ## 2. Derived / Approximate Equivalents
 
@@ -94,6 +96,11 @@ Metrics inspired by stellar-core but with different type, unit, or granularity.
 | `LEDGER_APPLY_SOROBAN_STAGES` | `stellar_ledger_apply_soroban_stages` | gauge | Parallel execution stage count (last close). |
 | `LEDGER_APPLY_SOROBAN_MAX_CLUSTERS` | `stellar_ledger_apply_soroban_max_clusters` | gauge | Max cluster count across stages (last close). |
 | `SOROBAN_CONFIG_*` | `stellar_soroban_config_*` | gauge | Soroban network configuration parameters (tx limits, ledger limits, fees). 20 metrics total. |
+| `LEDGER_AGE_CLOSED_SECONDS` | `stellar_ledger_age_closed_seconds` | histogram | Same semantics as stellar-core (wall-clock age at close), expanded buckets (1-60s vs core's 5/7/10/20s). |
+| `LEDGER_OPERATION_APPLY_SECONDS` | `stellar_ledger_operation_apply_seconds` | histogram | Broader scope than core: full op cycle (load+exec+invariant) vs core's exec-only. |
+| `LEDGER_TRANSACTION_APPLY_SECONDS` | `stellar_ledger_transaction_apply_seconds` | histogram | Same scope as core: ops+meta, excludes validation/fees/footprint. |
+| `LEDGER_MEMORY_QUEUED_LEDGERS` | `stellar_ledger_memory_queued_ledgers` | gauge | Measures `syncing_ledgers` depth (externalized slots waiting to close). |
+| `LEDGER_CATCHUP_DURATION_SECONDS` | `stellar_ledger_catchup_duration_seconds` | histogram | Wall-clock catchup duration. Records successful completions only. |
 
 ## 3. Henyey-Only Metrics
 

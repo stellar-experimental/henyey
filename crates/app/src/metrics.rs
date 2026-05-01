@@ -358,6 +358,10 @@ metric_catalog! {
             => "Age of cached archive checkpoint (seconds, 0 when cold)";
         ARCHIVE_CACHE_POPULATED = "henyey_archive_cache_populated"
             => "Whether the archive checkpoint cache has a value (1=populated, 0=cold)";
+
+        // Stage B: Ledger pipeline depth.
+        LEDGER_MEMORY_QUEUED_LEDGERS = "stellar_ledger_memory_queued_ledgers"
+            => "Externalized ledger slots buffered and waiting to close";
     }
 
     gauges_no_prereg {
@@ -452,6 +456,12 @@ metric_catalog! {
             => "Archive cache background refresh errors";
         ARCHIVE_CACHE_REFRESH_TIMEOUT_TOTAL = "henyey_archive_cache_refresh_timeout_total"
             => "Archive cache background refresh timeouts";
+
+        // Stage B: Invariant and transaction error counters.
+        LEDGER_INVARIANT_FAILURE_TOTAL = "stellar_ledger_invariant_failure_total"
+            => "Total invariant check failures";
+        LEDGER_TRANSACTION_INTERNAL_ERROR_TOTAL = "stellar_ledger_transaction_internal_error_total"
+            => "Total transactions resulting in txINTERNAL_ERROR";
     }
 
     counters_no_prereg {
@@ -565,6 +575,16 @@ metric_catalog! {
         // Phase 5: Archive cache histogram.
         ARCHIVE_CACHE_REFRESH_DURATION_SECONDS = "henyey_archive_cache_refresh_duration_seconds"
             => "Archive cache background refresh duration (seconds, including timeouts)";
+
+        // Stage B: Ledger age, catchup, and per-tx/op apply histograms.
+        LEDGER_AGE_CLOSED_SECONDS = "stellar_ledger_age_closed_seconds"
+            => "Wall-clock age of ledger at close (seconds since previous close)";
+        LEDGER_CATCHUP_DURATION_SECONDS = "stellar_ledger_catchup_duration_seconds"
+            => "Catchup wall-clock duration in seconds";
+        LEDGER_OPERATION_APPLY_SECONDS = "stellar_ledger_operation_apply_seconds"
+            => "Per-operation apply cycle duration in seconds";
+        LEDGER_TRANSACTION_APPLY_SECONDS = "stellar_ledger_transaction_apply_seconds"
+            => "Per-transaction apply duration in seconds (ops + meta, excludes validation/fees)";
     }
 }
 
@@ -578,6 +598,7 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     let ledger_seq = state.app.ledger_info().ledger_seq;
     let peer_count = state.app.peer_count().await;
     let pending_txs = state.app.pending_transaction_count() as u64;
+    let queued_ledgers = state.app.syncing_ledgers_count().await;
     let snap = state.app.metrics_snapshot();
 
     // Stellar-compatible gauges.
@@ -586,6 +607,9 @@ pub(crate) async fn refresh_gauges(state: &ServerState) {
     gauge!(PENDING_TRANSACTIONS).set(pending_txs as f64);
     gauge!(UPTIME_SECONDS).set(uptime as f64);
     gauge!(IS_VALIDATOR).set(if snap.is_validator { 1.0 } else { 0.0 });
+
+    // Stage B: Memory queued ledgers.
+    gauge!(LEDGER_MEMORY_QUEUED_LEDGERS).set(queued_ledgers as f64);
 
     // Meta stream counters — only set when active (matching current conditional behavior).
     if snap.meta_stream_bytes_total > 0 || snap.meta_stream_writes_total > 0 {
@@ -934,6 +958,16 @@ pub fn install_recorder() -> PrometheusHandle {
             &[0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0],
         )
         .expect("valid ledger close histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(LEDGER_AGE_CLOSED_SECONDS.to_string()),
+            &[1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0, 20.0, 30.0, 60.0],
+        )
+        .expect("valid ledger age closed histogram buckets")
+        .set_buckets_for_metric(
+            Matcher::Full(LEDGER_CATCHUP_DURATION_SECONDS.to_string()),
+            &[1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0],
+        )
+        .expect("valid catchup duration histogram buckets")
         .install_recorder()
         .expect("metrics recorder should install successfully");
     describe_metrics();

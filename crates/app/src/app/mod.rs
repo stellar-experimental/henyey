@@ -1559,6 +1559,11 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// Number of externalized ledgers buffered and waiting to close.
+    pub async fn syncing_ledgers_count(&self) -> usize {
+        self.syncing_ledgers.read().await.len()
+    }
+
     pub async fn add_peer(&self, addr: henyey_overlay::PeerAddress) -> anyhow::Result<bool> {
         let Some(overlay) = self.overlay().await else {
             anyhow::bail!("overlay not started")

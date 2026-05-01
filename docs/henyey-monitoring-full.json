@@ -167,11 +167,16 @@
     },
     {
       "id": 14,
-      "type": "text",
-      "title": "SLI (Ledger Age at Close) — Coming in Stage B",
-      "description": "Panels 15-17 of 10334. Requires stellar_ledger_age_closed_seconds histogram.",
+      "type": "timeseries",
+      "title": "SLI (Ledger Age at Close)",
+      "description": "Panels 15-17 of 10334. 99th percentile ledger age at close with SLI thresholds.",
       "gridPos": {"h": 3, "w": 9, "x": 15, "y": 4},
-      "options": {"mode": "markdown", "content": "**Coming in Stage B** — SLI panels require a `stellar_ledger_age_closed_seconds` histogram (age of ledger when it closed). This metric will be added in a follow-up PR."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\"}[5m]))", "legendFormat": "p99"},
+        {"expr": "histogram_quantile(0.50, rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\"}[5m]))", "legendFormat": "p50"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s", "thresholds": {"steps": [{"value": null, "color": "green"}, {"value": 5, "color": "yellow"}, {"value": 10, "color": "red"}]}}}
     },
     {
       "type": "row",
@@ -221,11 +226,13 @@
     },
     {
       "id": 18,
-      "type": "text",
-      "title": "Ledger Age Close (1m avg) — Coming in Stage B",
-      "description": "Panel 21 of 10334. Requires stellar_ledger_age_closed_seconds histogram.",
+      "type": "timeseries",
+      "title": "Ledger Age Close (1m avg)",
+      "description": "Panel 21 of 10334. Average ledger age at close over 1m window.",
       "gridPos": {"h": 6, "w": 8, "x": 0, "y": 13},
-      "options": {"mode": "markdown", "content": "**Coming in Stage B** — Requires `stellar_ledger_age_closed_seconds` histogram (ledger age at close time)."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "rate(stellar_ledger_age_closed_seconds_sum{instance=~\"$instance\"}[1m]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[1m])", "legendFormat": "{{instance}} avg"}],
+      "fieldConfig": {"defaults": {"unit": "s"}}
     },
     {
       "id": 19,
@@ -239,11 +246,17 @@
     },
     {
       "id": 20,
-      "type": "text",
-      "title": "% Closed Within $le s — Coming in Stage B",
-      "description": "Panel 23 of 10334. Requires histogram.",
+      "type": "timeseries",
+      "title": "% Closed Within $le s",
+      "description": "Panel 23 of 10334. Percentage of ledgers closed within 5s, 7s, 10s thresholds.",
       "gridPos": {"h": 6, "w": 8, "x": 16, "y": 13},
-      "options": {"mode": "markdown", "content": "**Coming in Stage B** — Requires `stellar_ledger_age_closed_seconds` histogram."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\",le=\"5\"}[5m]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[5m]) * 100", "legendFormat": "≤5s"},
+        {"expr": "rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\",le=\"7\"}[5m]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[5m]) * 100", "legendFormat": "≤7s"},
+        {"expr": "rate(stellar_ledger_age_closed_seconds_bucket{instance=~\"$instance\",le=\"10\"}[5m]) / rate(stellar_ledger_age_closed_seconds_count{instance=~\"$instance\"}[5m]) * 100", "legendFormat": "≤10s"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100}}
     },
     {
       "id": 21,
@@ -277,35 +290,75 @@
     },
     {
       "id": 24,
-      "type": "text",
-      "title": "Operation Apply Duration — Coming in Stage B",
-      "description": "Panel 27 of 10334. Per-op apply timing.",
+      "type": "timeseries",
+      "title": "Operation Apply Duration",
+      "description": "Panel 27 of 10334. Per-operation apply cycle duration (p50/p99).",
       "gridPos": {"h": 6, "w": 6, "x": 0, "y": 25},
-      "options": {"mode": "markdown", "content": "**Coming in Stage B** — Per-operation apply timing (`stellar_ledger_operation_apply_seconds`)."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, rate(stellar_ledger_operation_apply_seconds_bucket{instance=~\"$instance\"}[5m]))", "legendFormat": "p99"},
+        {"expr": "histogram_quantile(0.50, rate(stellar_ledger_operation_apply_seconds_bucket{instance=~\"$instance\"}[5m]))", "legendFormat": "p50"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
     },
     {
       "id": 25,
-      "type": "text",
-      "title": "Transaction Apply Duration — Coming in Stage B",
-      "description": "Panel 28 of 10334. Per-tx apply timing.",
+      "type": "timeseries",
+      "title": "Transaction Apply Duration",
+      "description": "Panel 28 of 10334. Per-transaction apply duration (p50/p99).",
       "gridPos": {"h": 6, "w": 6, "x": 6, "y": 25},
-      "options": {"mode": "markdown", "content": "**Coming in Stage B** — Per-transaction apply timing (`stellar_ledger_transaction_apply_seconds`)."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [
+        {"expr": "histogram_quantile(0.99, rate(stellar_ledger_transaction_apply_seconds_bucket{instance=~\"$instance\"}[5m]))", "legendFormat": "p99"},
+        {"expr": "histogram_quantile(0.50, rate(stellar_ledger_transaction_apply_seconds_bucket{instance=~\"$instance\"}[5m]))", "legendFormat": "p50"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "s"}}
     },
     {
       "id": 26,
-      "type": "text",
-      "title": "Invariant Failure — Coming in Stage B",
-      "description": "Panel 29 of 10334. Invariant failure counter.",
+      "type": "stat",
+      "title": "Invariant Failure",
+      "description": "Panel 29 of 10334. Total invariant check failures (should always be 0).",
       "gridPos": {"h": 6, "w": 6, "x": 12, "y": 25},
-      "options": {"mode": "markdown", "content": "**Coming in Stage B** — `stellar_ledger_invariant_failure_total` counter."}
+      "datasource": {"type": "prometheus", "uid": "000000001"},
+      "targets": [{"expr": "stellar_ledger_invariant_failure_total{instance=~\"$instance\"}", "legendFormat": "{{instance}}"}],
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"value": null, "color": "green"}, {"value": 1, "color": "red"}]}}}
     },
     {
       "id": 27,
-      "type": "text",
-      "title": "Memory Queued Ledgers / TX Error / Catchup — Coming in Stage B",
+      "type": "row",
+      "title": "Memory Queued / TX Error / Catchup",
       "description": "Panels 30-33 of 10334.",
       "gridPos": {"h": 6, "w": 6, "x": 18, "y": 25},
-      "options": {"mode": "markdown", "content": "**Coming in Stage B** — `stellar_ledger_memory_queued_ledgers`, `stellar_ledger_transaction_internal_error_total`, `stellar_ledger_catchup_duration_seconds`."}
+      "panels": [
+        {
+          "id": 270,
+          "type": "stat",
+          "title": "Memory Queued Ledgers",
+          "gridPos": {"h": 3, "w": 2, "x": 0, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [{"expr": "stellar_ledger_memory_queued_ledgers{instance=~\"$instance\"}", "legendFormat": ""}],
+          "fieldConfig": {"defaults": {"unit": "short"}}
+        },
+        {
+          "id": 271,
+          "type": "stat",
+          "title": "TX Internal Error Rate",
+          "gridPos": {"h": 3, "w": 2, "x": 2, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [{"expr": "rate(stellar_ledger_transaction_internal_error_total{instance=~\"$instance\"}[5m])", "legendFormat": ""}],
+          "fieldConfig": {"defaults": {"unit": "ops", "thresholds": {"steps": [{"value": null, "color": "green"}, {"value": 0.01, "color": "red"}]}}}
+        },
+        {
+          "id": 272,
+          "type": "stat",
+          "title": "Catchup Duration (median)",
+          "gridPos": {"h": 3, "w": 2, "x": 4, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "000000001"},
+          "targets": [{"expr": "histogram_quantile(0.5, rate(stellar_ledger_catchup_duration_seconds_bucket{instance=~\"$instance\"}[1h]))", "legendFormat": ""}],
+          "fieldConfig": {"defaults": {"unit": "s"}}
+        }
+      ]
     },
     {
       "id": 28,

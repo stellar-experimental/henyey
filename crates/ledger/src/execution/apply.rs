@@ -619,10 +619,14 @@ impl TransactionExecutor {
                         // to txINTERNAL_ERROR (not txNOT_SUPPORTED). The exception
                         // aborts all remaining operations.
                         failure = Some(TransactionResultCode::TxInternalError);
+                        metrics::counter!("stellar_ledger_transaction_internal_error_total")
+                            .increment(1);
                         break;
                     }
                 }
                 let op_elapsed_us = op_timing_start.elapsed().as_micros() as u64;
+                metrics::histogram!("stellar_ledger_operation_apply_seconds")
+                    .record(op_elapsed_us as f64 / 1_000_000.0);
                 let entry = op_type_timings.entry(op_type).or_insert((0u64, 0u32));
                 entry.0 += op_elapsed_us;
                 entry.1 += 1;
@@ -703,6 +707,11 @@ impl TransactionExecutor {
 
         let total_us = tx_timing_start.elapsed().as_micros() as u64;
         let meta_us = total_us - validation_us - fee_seq_us - footprint_us - ops_us;
+
+        // Stage B: per-transaction apply duration (ops + meta, excludes validation/fees/footprint).
+        let apply_duration_us = ops_us + meta_us;
+        metrics::histogram!("stellar_ledger_transaction_apply_seconds")
+            .record(apply_duration_us as f64 / 1_000_000.0);
 
         if total_us > SLOW_TX_LOG_THRESHOLD_US || frame.is_soroban() {
             // Build a compact string of per-op-type timings sorted by time desc

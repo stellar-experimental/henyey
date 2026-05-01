@@ -273,6 +273,7 @@ impl InvariantManager {
     /// Record a failure and handle according to strictness.
     fn on_invariant_failure(&self, name: &str, is_strict: bool, message: &str, ledger: u32) {
         self.failure_count.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!("stellar_ledger_invariant_failure_total").increment(1);
 
         {
             let mut info = self.failure_info.lock().unwrap();

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 stellar-xdr.workspace = true
 tracing.workspace = true
+metrics.workspace = true
 serde_json.workspace = true
 regex = "1"
 

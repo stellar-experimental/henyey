@@ -1320,6 +1320,12 @@ pub struct LedgerManager {
     /// Optional invariant manager for runtime integrity checks.
     /// Shared with all executors created by this manager.
     invariant_manager: Option<Arc<henyey_invariant::InvariantManager>>,
+
+    /// Wall-clock instant of the last `close_ledger()` entry.
+    ///
+    /// Used to compute `stellar_ledger_age_closed_seconds` — the time elapsed
+    /// between consecutive close_ledger calls, matching stellar-core's mLastClose.
+    last_close_wall_time: std::sync::Mutex<std::time::Instant>,
 }
 
 // Compile-time assertion: LedgerManager must be Send + Sync for spawn_blocking.
@@ -1358,6 +1364,7 @@ impl LedgerManager {
             #[cfg(any(test, feature = "test-utils"))]
             snapshot_count: std::sync::atomic::AtomicU64::new(0),
             invariant_manager: None,
+            last_close_wall_time: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
 
@@ -1892,6 +1899,16 @@ impl LedgerManager {
         close_data: LedgerCloseData,
         runtime_handle: Option<tokio::runtime::Handle>,
     ) -> Result<LedgerCloseResult> {
+        // Emit ledger age metric: time since last close_ledger entry.
+        let age_secs = self
+            .last_close_wall_time
+            .lock()
+            .unwrap()
+            .elapsed()
+            .as_secs_f64();
+        metrics::histogram!("stellar_ledger_age_closed_seconds").record(age_secs);
+        *self.last_close_wall_time.lock().unwrap() = std::time::Instant::now();
+
         let rss_before = get_rss_bytes();
         let begin_start = std::time::Instant::now();
         let mut ctx = self.begin_close(close_data)?;
