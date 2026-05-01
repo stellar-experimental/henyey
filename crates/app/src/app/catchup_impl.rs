@@ -61,6 +61,10 @@ impl App {
 
         self.set_state(AppState::CatchingUp).await;
 
+        // Start timing from the moment we enter CatchingUp state, matching
+        // stellar-core's LM_CATCHING_UP_STATE → LM_SYNCED_STATE window.
+        let catchup_timer = std::time::Instant::now();
+
         let progress = Arc::new(CatchupProgress::new());
 
         tracing::info!(?target, ?mode, "Starting catchup");
@@ -218,7 +222,6 @@ impl App {
             (None, None)
         };
         // Run catchup work
-        let catchup_timer = std::time::Instant::now();
         let output = self
             .run_catchup_work(
                 target_ledger,
