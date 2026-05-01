@@ -3058,7 +3058,7 @@ pub struct TxQueueStats {
     pub arb_tx_seen: u64,
     /// Total arbitrage transactions dropped by damping (monotonic).
     pub arb_tx_dropped: u64,
-    /// Pending transaction count bucketed by age (slot age 0, 1, 2, 3).
+    /// Pending transaction count bucketed by age (slot age 0, 1, 2, 3+).
     /// Matches stellar-core's `herder.pending.txs.age{0,1,2,3}` gauges.
     pub pending_txs_age: [usize; 4],
 }
@@ -10275,19 +10275,40 @@ mod broadcast_visitor_tests {
     #[test]
     fn test_stats_pending_txs_age_excludes_fee_source_only() {
         // A fee-bump TX creates an account_state entry for the fee-source
-        // with transaction=None. It should NOT inflate pending_txs_age[0].
+        // (when distinct from seq-source) with transaction=None.
+        // That entry should NOT inflate pending_txs_age[0].
         let queue = TransactionQueue::with_depths(TxQueueConfig::default(), 10, 4);
 
-        // Add a regular TX — this creates one pending entry (age 0).
-        let mut tx = make_test_envelope(200, 1);
-        set_source(&mut tx, 90);
-        assert_eq!(queue.try_add(tx), TxQueueResult::Added);
+        // Build a fee-bump: inner TX has seq-source seed=90, outer fee-source seed=91.
+        let mut inner = make_test_envelope(200, 1);
+        set_source(&mut inner, 90);
+        let inner_v1 = match inner {
+            TransactionEnvelope::Tx(env) => env,
+            _ => panic!("Expected Tx variant"),
+        };
+        let fee_source = MuxedAccount::Ed25519(Uint256([91u8; 32]));
+        let fee_bump = TransactionEnvelope::TxFeeBump(FeeBumpTransactionEnvelope {
+            tx: FeeBumpTransaction {
+                fee_source,
+                fee: 400,
+                inner_tx: FeeBumpTransactionInnerTx::Tx(inner_v1),
+                ext: FeeBumpTransactionExt::V0,
+            },
+            signatures: vec![DecoratedSignature {
+                hint: SignatureHint([0u8; 4]),
+                signature: Signature(vec![0u8; 64].try_into().unwrap()),
+            }]
+            .try_into()
+            .unwrap(),
+        });
+
+        assert_eq!(queue.try_add(fee_bump), TxQueueResult::Added);
 
         let stats = queue.stats();
-        // Only 1 pending tx, age bucket [0] should be 1
+        // Only 1 pending tx (on seq-source account 90), age bucket [0] = 1.
+        // The fee-source-only entry (account 91) should NOT be counted.
         assert_eq!(stats.pending_count, 1);
         assert_eq!(stats.pending_txs_age, [1, 0, 0, 0]);
-        // account_count should be 1 (not inflated by fee-source-only entries)
         assert_eq!(stats.account_count, 1);
     }
 

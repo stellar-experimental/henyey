@@ -231,7 +231,7 @@ metric_catalog! {
         HERDER_PENDING_TXS_AGE2 = "stellar_herder_pending_txs_age2"
             => "Pending transactions at age 2";
         HERDER_PENDING_TXS_AGE3 = "stellar_herder_pending_txs_age3"
-            => "Pending transactions at age 3";
+            => "Pending transactions at age 3+";
 
         // Clock drift gauges (Phase 2).
         DRIFT_MIN_SECONDS = "henyey_herder_drift_min_seconds"

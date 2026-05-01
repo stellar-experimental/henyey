@@ -547,7 +547,7 @@
         {"expr": "stellar_herder_pending_txs_age0{instance=~\"$instance\"}", "legendFormat": "age 0"},
         {"expr": "stellar_herder_pending_txs_age1{instance=~\"$instance\"}", "legendFormat": "age 1"},
         {"expr": "stellar_herder_pending_txs_age2{instance=~\"$instance\"}", "legendFormat": "age 2"},
-        {"expr": "stellar_herder_pending_txs_age3{instance=~\"$instance\"}", "legendFormat": "age 3"}
+        {"expr": "stellar_herder_pending_txs_age3{instance=~\"$instance\"}", "legendFormat": "age 3+"}
       ],
       "fieldConfig": {"defaults": {"unit": "short"}}
     },
