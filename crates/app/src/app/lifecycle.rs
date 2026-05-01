@@ -327,7 +327,7 @@ impl App {
                                     ?e,
                                     "persist_rx empty after successful close — unreachable"
                                 );
-                                debug_assert!(false, "success without persist send");
+                                panic!("success without persist send");
                             }
                         }
 

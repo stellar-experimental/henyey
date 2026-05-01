@@ -6,7 +6,7 @@
 //! until the previous persist completes.
 //!
 //! This module encapsulates the pipeline state and provides methods that
-//! enforce valid transitions with `debug_assert!` checks.
+//! enforce valid transitions with unconditional `assert!` checks.
 
 use super::types::{PendingLedgerClose, PendingPersist};
 
@@ -22,8 +22,10 @@ use super::types::{PendingLedgerClose, PendingPersist};
 ///
 /// # Invalid State
 ///
-/// `closing=Some, persisting=Some` — both active simultaneously — is prevented
-/// by the API. Every method that sets one field asserts the other is `None`.
+/// `closing=Some, persisting=Some` — both active simultaneously — is enforced
+/// by unconditional assertions. Every method that sets one field asserts the
+/// other is `None`. Note: fields are `pub(super)` so sibling modules can
+/// technically bypass these methods (see `drain_close_pipeline` test).
 ///
 /// # Transitions
 ///
@@ -64,10 +66,10 @@ impl ClosePipeline {
 
     /// Transition Idle → Closing.
     ///
-    /// # Panics (debug only)
+    /// # Panics
     /// Panics if the pipeline is not idle.
     pub fn start_close(&mut self, pending: PendingLedgerClose) {
-        debug_assert!(
+        assert!(
             self.is_idle(),
             "start_close: pipeline not idle (closing={}, persisting={})",
             self.closing.as_ref().map(|c| c.ledger_seq).unwrap_or(0),
@@ -78,7 +80,7 @@ impl ClosePipeline {
 
     /// Convenience: start a close only if `pending` is `Some`.
     ///
-    /// # Panics (debug only)
+    /// # Panics
     /// Panics if `pending` is `Some` and the pipeline is not idle.
     pub fn try_start_close(&mut self, pending: Option<PendingLedgerClose>) {
         if let Some(p) = pending {
@@ -103,15 +105,15 @@ impl ClosePipeline {
     /// Used after close completion (normal path) and after catchup
     /// completion (direct Idle → Persisting path).
     ///
-    /// # Panics (debug only)
+    /// # Panics
     /// Panics if a close or persist is already in progress.
     pub fn start_persist(&mut self, persist: PendingPersist) {
-        debug_assert!(
+        assert!(
             self.closing.is_none(),
             "start_persist: close still pending (seq={})",
             self.closing.as_ref().map(|c| c.ledger_seq).unwrap_or(0),
         );
-        debug_assert!(
+        assert!(
             self.persisting.is_none(),
             "start_persist: persist already pending (seq={})",
             self.persisting.as_ref().map(|p| p.ledger_seq).unwrap_or(0),
@@ -230,6 +232,14 @@ mod tests {
         let mut pipeline = ClosePipeline::new();
         pipeline.start_persist(dummy_persist(50));
         pipeline.start_persist(dummy_persist(51)); // should panic
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "start_persist: close still pending")]
+    async fn test_start_persist_panics_when_closing() {
+        let mut pipeline = ClosePipeline::new();
+        pipeline.start_close(dummy_close(100));
+        pipeline.start_persist(dummy_persist(101)); // should panic
     }
 
     #[tokio::test]
