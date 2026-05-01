@@ -444,3 +444,96 @@ async fn test_cancelled_before_start_not_panicked() {
     // Work should never have run
     assert!(log.lock().unwrap().is_empty());
 }
+
+// ============================================================================
+// Non-Blocking Retry Tests
+// ============================================================================
+
+/// A work item that retries with a long delay.
+struct SlowRetryWork {
+    name: String,
+    attempts: Arc<Mutex<u32>>,
+}
+
+#[async_trait::async_trait]
+impl Work for SlowRetryWork {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
+        let mut attempts = self.attempts.lock().unwrap();
+        *attempts += 1;
+        if *attempts == 1 {
+            WorkOutcome::Retry {
+                delay: Duration::from_secs(10),
+            }
+        } else {
+            WorkOutcome::Success
+        }
+    }
+}
+
+/// Verifies that a retry delay does NOT block other work from completing.
+///
+/// Regression test for #2192: before the fix, a 10-second retry delay would
+/// block the entire scheduler loop. With the DelayQueue-based approach, the
+/// independent work item completes immediately while the retry timer runs.
+#[tokio::test]
+async fn test_retry_does_not_block_other_completions() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let retry_attempts = Arc::new(Mutex::new(0u32));
+
+    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+        max_concurrency: 2,
+        retry_delay: Duration::from_millis(1),
+        event_tx: None,
+    });
+
+    // Work A: retries with a long 10-second delay
+    let a = scheduler.add_work(
+        Box::new(SlowRetryWork {
+            name: "slow-retry".to_string(),
+            attempts: Arc::clone(&retry_attempts),
+        }),
+        vec![],
+        1,
+    );
+
+    // Work B: independent, should complete immediately
+    let b = scheduler.add_work(
+        Box::new(LogWork {
+            name: "fast".to_string(),
+            log: Arc::clone(&log),
+        }),
+        vec![],
+        0,
+    );
+
+    // Cancel after 100ms — well before the 10s retry would expire.
+    // Before the fix, the scheduler would be stuck sleeping 10s and
+    // wouldn't respond to cancellation. Now it should cancel promptly.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_clone.cancel();
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        scheduler.run_until_done_with_cancel(cancel),
+    )
+    .await;
+    assert!(
+        result.is_ok(),
+        "scheduler should not block for 10s on retry"
+    );
+
+    // B should have completed before we cancelled
+    assert_eq!(scheduler.state(b), Some(WorkState::Success));
+    assert_eq!(log.lock().unwrap().as_slice(), ["fast"]);
+
+    // A should be cancelled (it was waiting for its 10s retry timer)
+    assert_eq!(scheduler.state(a), Some(WorkState::Cancelled));
+}

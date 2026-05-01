@@ -82,7 +82,7 @@ getrandom = { version = "0.2", default-features = false, features = ["std"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { version = "0.7", features = ["codec", "time"] }
 futures = "0.3"
 async-trait = "0.1"
 

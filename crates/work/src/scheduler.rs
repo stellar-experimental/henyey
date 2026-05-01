@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::time::DelayQueue;
 use tracing::{debug, error, info, warn};
+
+use futures::StreamExt as _;
 
 use crate::types::EventSender;
 use crate::{Work, WorkContext, WorkEvent, WorkId, WorkOutcome, WorkState};
@@ -430,6 +433,7 @@ impl WorkScheduler {
         let mut join_set = JoinSet::<WorkCompletion>::new();
         let mut running = RunningTasks::new();
         let mut queue = PendingQueue::new(self.pending_queue());
+        let mut retry_timers: DelayQueue<WorkId> = DelayQueue::new();
 
         let mut cancel_requested = false;
 
@@ -437,6 +441,8 @@ impl WorkScheduler {
             if !cancel_requested && cancel.is_cancelled() {
                 cancel_requested = true;
                 self.cancel_all();
+                // Discard pending retry timers — all work has been cancelled.
+                retry_timers.clear();
             }
 
             while running.len() < self.config.max_concurrency {
@@ -451,51 +457,88 @@ impl WorkScheduler {
                 }
             }
 
-            if running.is_empty() && queue.is_empty() {
+            if running.is_empty() && queue.is_empty() && retry_timers.is_empty() {
                 break;
             }
 
-            let join_result = if cancel_requested {
-                join_set.join_next().await
+            // Poll JoinSet, retry timers, and cancellation concurrently.
+            // This ensures retry delays never block completion handling.
+            if cancel_requested {
+                tokio::select! {
+                    result = join_set.join_next(), if !running.is_empty() => {
+                        let Some(join_result) = result else { break };
+                        self.handle_join_result(
+                            join_result, &mut running, &mut queue, &mut retry_timers,
+                        );
+                    }
+                    expired = retry_timers.next(), if !retry_timers.is_empty() => {
+                        if let Some(expired) = expired {
+                            let id = expired.into_inner();
+                            if self.state_or_pending(id) == WorkState::Pending {
+                                queue.push(id);
+                            }
+                        }
+                    }
+                    else => break,
+                }
             } else {
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         cancel_requested = true;
                         self.cancel_all();
+                        retry_timers.clear();
                         continue;
                     }
-                    result = join_set.join_next() => result,
-                }
-            };
-            let Some(join_result) = join_result else {
-                break;
-            };
-
-            match join_result {
-                Ok(completion) => {
-                    running.remove_by_work_id(completion.id);
-                    match self.handle_completion(completion) {
-                        CompletionAction::Done { completed_id } => {
-                            self.enqueue_dependents(completed_id, &mut queue, &running);
-                        }
-                        CompletionAction::Retry { id, delay } => {
-                            tokio::time::sleep(delay).await;
-                            queue.push(id);
-                        }
-                        CompletionAction::None => {}
+                    result = join_set.join_next(), if !running.is_empty() => {
+                        let Some(join_result) = result else { break };
+                        self.handle_join_result(
+                            join_result, &mut running, &mut queue, &mut retry_timers,
+                        );
                     }
-                }
-                Err(join_error) => {
-                    let task_id = join_error.id();
-                    let work_id = running
-                        .remove_by_task_id(task_id)
-                        .expect("all spawned tasks are tracked in RunningTasks");
-                    self.handle_join_error(work_id, join_error);
+                    expired = retry_timers.next(), if !retry_timers.is_empty() => {
+                        if let Some(expired) = expired {
+                            let id = expired.into_inner();
+                            if self.state_or_pending(id) == WorkState::Pending {
+                                queue.push(id);
+                            }
+                        }
+                    }
                 }
             }
         }
 
         info!("work scheduler finished");
+    }
+
+    /// Processes a single JoinSet result — either a successful completion or a join error.
+    fn handle_join_result(
+        &mut self,
+        join_result: Result<WorkCompletion, tokio::task::JoinError>,
+        running: &mut RunningTasks,
+        queue: &mut PendingQueue,
+        retry_timers: &mut DelayQueue<WorkId>,
+    ) {
+        match join_result {
+            Ok(completion) => {
+                running.remove_by_work_id(completion.id);
+                match self.handle_completion(completion) {
+                    CompletionAction::Done { completed_id } => {
+                        self.enqueue_dependents(completed_id, queue, running);
+                    }
+                    CompletionAction::Retry { id, delay } => {
+                        retry_timers.insert(id, delay);
+                    }
+                    CompletionAction::None => {}
+                }
+            }
+            Err(join_error) => {
+                let task_id = join_error.id();
+                let work_id = running
+                    .remove_by_task_id(task_id)
+                    .expect("all spawned tasks are tracked in RunningTasks");
+                self.handle_join_error(work_id, join_error);
+            }
+        }
     }
 
     /// Returns all work IDs that are currently in the Pending state.

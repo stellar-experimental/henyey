@@ -137,6 +137,9 @@ tracing::info!(success = metrics.success, total = metrics.total);
 - The crate intentionally uses a flat dependency graph rather than
   stellar-core's hierarchical `Work` tree, which keeps current catchup and
   history workflows simple.
+- Retry delays are managed via `tokio_util::time::DelayQueue`, which allows
+  multiple pending retries to run concurrently without blocking completion
+  handling or cancellation in the scheduler loop.
 
 ## stellar-core Mapping
 

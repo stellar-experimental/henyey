@@ -22,17 +22,7 @@ fn test_soroban_refund_event_after_all_txs() {
         ext: LedgerEntryExt::V0,
     };
 
-    let key_hash = {
-        use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::WriteXdr;
-
-        let mut hasher = Sha256::new();
-        let bytes = contract_key
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap_or_default();
-        hasher.update(&bytes);
-        Hash(hasher.finalize().into())
-    };
+    let key_hash: Hash = henyey_common::Hash256::hash_xdr(&contract_key).into();
     let ttl_entry = LedgerEntry {
         last_modified_ledger_seq: 1,
         data: LedgerEntryData::Ttl(TtlEntry {
@@ -818,16 +808,7 @@ fn build_extend_ttl_tx(
     };
 
     // TTL entry for the contract code
-    let key_hash = {
-        use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::WriteXdr;
-        let mut hasher = Sha256::new();
-        let bytes = contract_key
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap_or_default();
-        hasher.update(&bytes);
-        Hash(hasher.finalize().into())
-    };
+    let key_hash: Hash = henyey_common::Hash256::hash_xdr(&contract_key).into();
     let ttl_entry = LedgerEntry {
         last_modified_ledger_seq: 1,
         data: LedgerEntryData::Ttl(TtlEntry {
@@ -4186,17 +4167,7 @@ fn test_audit_007_sequential_soroban_fee_charged_subtracts_refund() {
         ext: LedgerEntryExt::V0,
     };
 
-    let key_hash = {
-        use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::WriteXdr;
-
-        let mut hasher = Sha256::new();
-        let bytes = contract_key
-            .to_xdr(stellar_xdr::curr::Limits::none())
-            .unwrap_or_default();
-        hasher.update(&bytes);
-        Hash(hasher.finalize().into())
-    };
+    let key_hash: Hash = henyey_common::Hash256::hash_xdr(&contract_key).into();
     let ttl_entry = LedgerEntry {
         last_modified_ledger_seq: 1,
         data: LedgerEntryData::Ttl(TtlEntry {

@@ -1167,10 +1167,7 @@ impl TransactionExecutor {
         dest_asset: &stellar_xdr::curr::Asset,
         path: &[stellar_xdr::curr::Asset],
     ) -> Result<()> {
-        use sha2::{Digest, Sha256};
-        use stellar_xdr::curr::{
-            Limits, LiquidityPoolConstantProductParameters, LiquidityPoolParameters,
-        };
+        use stellar_xdr::curr::{LiquidityPoolConstantProductParameters, LiquidityPoolParameters};
 
         // Build the full conversion path: send_asset -> path[0] -> ... -> dest_asset
         let mut assets: Vec<&stellar_xdr::curr::Asset> = vec![send_asset];
@@ -1201,11 +1198,9 @@ impl TransactionExecutor {
                 },
             );
 
-            if let Ok(xdr) = params.to_xdr(Limits::none()) {
-                let pool_id = PoolId(stellar_xdr::curr::Hash(Sha256::digest(&xdr).into()));
-                // Attempt to load - it's OK if the pool doesn't exist
-                let _ = self.load_liquidity_pool(snapshot, &pool_id);
-            }
+            let pool_id = PoolId(Hash256::hash_xdr(&params).into());
+            // Attempt to load - it's OK if the pool doesn't exist
+            let _ = self.load_liquidity_pool(snapshot, &pool_id);
         }
 
         Ok(())

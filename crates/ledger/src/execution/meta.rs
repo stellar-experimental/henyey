@@ -512,19 +512,14 @@ pub(super) fn build_entry_changes_with_hot_archive(
         /// Sort Soroban create indices by (associated_key_hash, type_order) so TTL
         /// entries appear immediately before their ContractData/ContractCode pair.
         fn sort_soroban_creates(indices: Vec<usize>, created: &[LedgerEntry]) -> Vec<usize> {
-            use sha2::{Digest, Sha256};
-
             fn associated_sort_key(entry: &LedgerEntry) -> (Vec<u8>, u8) {
                 match &entry.data {
                     stellar_xdr::curr::LedgerEntryData::Ttl(ttl) => (ttl.key_hash.0.to_vec(), 0),
                     stellar_xdr::curr::LedgerEntryData::ContractData(_)
                     | stellar_xdr::curr::LedgerEntryData::ContractCode(_) => {
                         let key = henyey_common::entry_to_key(entry);
-                        if let Ok(key_bytes) = key.to_xdr(Limits::none()) {
-                            let key_hash = Sha256::digest(&key_bytes);
-                            return (key_hash.to_vec(), 1);
-                        }
-                        (Vec::new(), 1)
+                        let key_hash = Hash256::hash_xdr(&key);
+                        (key_hash.as_bytes().to_vec(), 1)
                     }
                     _ => (Vec::new(), 2),
                 }
