@@ -46,7 +46,7 @@ All files below live in `/home/tomer/data/$MONITOR_SESSION_ID/`:
 
 | File | Purpose | Writer |
 |------|---------|--------|
-| `build_sha` | 40-char hex sha of the currently-deployed binary's source tree | check 10 (after successful build) and `monitor-loop` step 5 |
+| `build_sha` | Cache of deployed binary's source commit (authoritative source: runtime `/info.commit_hash`; seeded by build step) | check 10 (after successful build or runtime self-heal) and `monitor-loop` step 5 |
 | `last_ledger` | STUCK detection state (check 4) | check 4 |
 | `last_ledger_count` | STUCK confirmation counter (check 4) | check 4 |
 | `tick-history.jsonl` | daily-summary aggregation | tick epilogue |
@@ -869,11 +869,58 @@ else
 fi
 ```
 
+**Runtime cross-validation** — use the running binary's embedded commit hash
+as the authoritative source of truth. If `/info` reports a valid, locally-
+reachable commit hash, it overrides `BUILD_SHA_FILE` (which becomes a cache).
+
+```bash
+# Cross-validate: running binary's commit_hash is authoritative.
+running_hash=""
+if info_json=$(curl -sf "http://localhost:$MONITOR_ADMIN_PORT/info" 2>/dev/null); then
+  running_hash=$(printf '%s' "$info_json" \
+    | python3 -c 'import sys,json; print(json.load(sys.stdin).get("commit_hash",""))' 2>/dev/null)
+fi
+
+if [ -n "$running_hash" ] \
+   && printf '%s' "$running_hash" | grep -qE '^[0-9a-f]{40}$' \
+   && git cat-file -e "${running_hash}^{commit}" 2>/dev/null; then
+  # Binary reports a valid, locally-reachable commit hash — authoritative.
+  case "$deployed_sha_status" in
+    ok)
+      if [ "$deployed_sha" != "$running_hash" ]; then
+        # BUILD_SHA_FILE disagrees with binary. Trust binary, repair file.
+        printf '%s\n' "$running_hash" > "${BUILD_SHA_FILE}.tmp"
+        mv "${BUILD_SHA_FILE}.tmp" "$BUILD_SHA_FILE"
+        deployed_sha="$running_hash"
+        # deployed_sha_status stays "ok"
+      fi
+      ;;
+    invalid|missing-fresh)
+      # File bad/missing but binary knows its commit — repair and use.
+      printf '%s\n' "$running_hash" > "${BUILD_SHA_FILE}.tmp"
+      mv "${BUILD_SHA_FILE}.tmp" "$BUILD_SHA_FILE"
+      deployed_sha="$running_hash"
+      deployed_sha_status="ok"
+      ;;
+  esac
+fi
+# If /info unreachable, commit_hash absent/empty/malformed, or SHA not in
+# local git: no-op — fall through to existing logic unchanged.
+```
+
+| `/info` state | `commit_hash` field | `git cat-file -e` | Action |
+|---|---|---|---|
+| Unreachable | — | — | No-op |
+| Reachable | Missing/empty/malformed | — | No-op |
+| Reachable | Valid 40-char hex | Fails (not in local git) | No-op (prevents cache poisoning) |
+| Reachable | Valid 40-char hex | Succeeds, matches `deployed_sha` | No-op |
+| Reachable | Valid 40-char hex | Succeeds, differs from `deployed_sha` | Repair file, use runtime hash |
+
 | State | Meaning | Gate behavior |
 |-------|---------|---------------|
-| `ok` | File valid + reachable | Compare `deployed_sha` vs `origin/main` |
-| `missing-fresh` | No file, no other session state | Falls back to `HEAD` vs `origin/main` (today's behavior) |
-| `invalid` | File missing/corrupt/unreachable but session state exists | Force rebuild unconditionally |
+| `ok` | Valid commit known (from file or repaired from runtime) | Compare `deployed_sha` vs `origin/main` |
+| `missing-fresh` | No file, no runtime hash, no other session state | Falls back to `HEAD` vs `origin/main` |
+| `invalid` | File corrupt + runtime unavailable | Force rebuild unconditionally |
 
 Report `deployed_sha_status` in the tick's status line.
 

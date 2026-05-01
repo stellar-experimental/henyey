@@ -1454,6 +1454,17 @@ pub struct BuildMetadata {
     pub build_timestamp: String,
 }
 
+impl BuildMetadata {
+    /// Returns the commit hash if available (non-empty), or `None`.
+    pub fn commit_hash_opt(&self) -> Option<&str> {
+        if self.commit_hash.is_empty() {
+            None
+        } else {
+            Some(&self.commit_hash)
+        }
+    }
+}
+
 fn default_compat_http_port() -> u16 {
     11626
 }
@@ -4414,5 +4425,20 @@ name = "test"
         assert_eq!(config.overlay.peer_port, original.overlay.peer_port);
         assert_eq!(config.logging.level, original.logging.level);
         assert_eq!(config.network.passphrase, original.network.passphrase);
+    }
+
+    #[test]
+    fn test_build_metadata_commit_hash_opt_empty() {
+        let meta = BuildMetadata::default();
+        assert_eq!(meta.commit_hash_opt(), None);
+    }
+
+    #[test]
+    fn test_build_metadata_commit_hash_opt_present() {
+        let meta = BuildMetadata {
+            commit_hash: "a".repeat(40),
+            build_timestamp: "2024-01-01T00:00:00Z".to_string(),
+        };
+        assert_eq!(meta.commit_hash_opt(), Some("a".repeat(40).as_str()));
     }
 }

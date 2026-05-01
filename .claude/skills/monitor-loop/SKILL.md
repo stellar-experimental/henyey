@@ -513,8 +513,10 @@ process watches for `ready`-labeled issues and handles the fix.
    CARGO_TARGET_DIR=~/data/<session-id>/cargo-target cargo build --release -p henyey
    ```
    Immediately after the build succeeds, persist the deployed sha (atomic
-   write via tmp + mv) so `monitor-tick` check 10 has an authoritative
-   record from the very first tick:
+   write via tmp + mv) to seed the `build_sha` cache for `monitor-tick`
+   check 10. Note: the authoritative source of the deployed commit is the
+   running binary's `/info.commit_hash` endpoint; this file is a cache that
+   monitor-tick will self-heal if it ever disagrees with the runtime value.
    ```
    new_sha=$(git rev-parse HEAD)
    printf '%s\n' "$new_sha" > ~/data/<session-id>/build_sha.tmp
