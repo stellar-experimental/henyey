@@ -1999,4 +1999,82 @@ mod tests {
 
         app.shutdown();
     }
+
+    /// Regression test for commit e278dd5c (issue #2163): the overlay receive
+    /// layer must NOT reject a GeneralizedTxSet based on its phase base_fee
+    /// being below the current ledger base fee. stellar-core performs zero
+    /// content validation at the receive layer (Peer::recvGeneralizedTxSet).
+    #[tokio::test]
+    async fn test_handle_generalized_tx_set_accepts_low_base_fee() {
+        use stellar_xdr::curr::{
+            GeneralizedTransactionSet, Hash, ParallelTxsComponent, TransactionPhase,
+            TransactionSetV1, TxSetComponent, TxSetComponentTxsMaybeDiscountedFee,
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = crate::config::ConfigBuilder::new()
+            .database_path(dir.path().join("test.db"))
+            .build();
+        let app = crate::app::App::new(config).await.unwrap();
+
+        // Derive a fee strictly below the current ledger base fee.
+        let low_fee = (app.base_fee() as i64) - 1;
+        assert!(
+            low_fee >= 0,
+            "base_fee must be > 0 for this test to be meaningful"
+        );
+
+        // Construct a GeneralizedTransactionSet with base_fee below ledger fee
+        // in both phases. Empty tx vectors are valid here — the test only
+        // exercises the receive-layer acceptance path, not downstream semantic
+        // validation (phase-size consistency check passes: 0 == 0).
+        let gen_tx_set = GeneralizedTransactionSet::V1(TransactionSetV1 {
+            previous_ledger_hash: Hash([0u8; 32]),
+            phases: vec![
+                // Phase 0 (classic): V0 with low base_fee
+                TransactionPhase::V0(
+                    vec![TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                        TxSetComponentTxsMaybeDiscountedFee {
+                            base_fee: Some(low_fee),
+                            txs: vec![].try_into().unwrap(),
+                        },
+                    )]
+                    .try_into()
+                    .unwrap(),
+                ),
+                // Phase 1 (Soroban): V1 parallel with low base_fee
+                TransactionPhase::V1(ParallelTxsComponent {
+                    base_fee: Some(low_fee),
+                    execution_stages: vec![].try_into().unwrap(),
+                }),
+            ]
+            .try_into()
+            .unwrap(),
+        });
+
+        let hash = Hash256::hash_xdr(&gen_tx_set);
+
+        // Register the tx set hash as pending (simulates SCP requesting it).
+        app.herder.scp_driver().request_tx_set(hash, 100);
+
+        // Precondition: the tx set is needed.
+        assert!(
+            app.herder.scp_driver().needs_tx_set(&hash),
+            "tx set should be pending before handle"
+        );
+
+        // Act: receive the generalized tx set through the overlay layer.
+        app.handle_generalized_tx_set(gen_tx_set).await;
+
+        // Postconditions: the tx set was accepted and cached (not rejected by
+        // the removed base_fee pre-filter).
+        assert!(
+            !app.herder.scp_driver().needs_tx_set(&hash),
+            "tx set should no longer be pending after handle"
+        );
+        assert!(
+            app.herder.has_tx_set(&hash),
+            "tx set should be cached in the herder"
+        );
+    }
 }
