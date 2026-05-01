@@ -218,3 +218,193 @@ async fn test_metrics_snapshot() {
     assert_eq!(metrics.success, 1);
     assert_eq!(metrics.failed, 0);
 }
+
+// ============================================================================
+// Panic Recovery Tests
+// ============================================================================
+
+/// A work item that panics unconditionally.
+struct PanicWork {
+    name: String,
+}
+
+#[async_trait::async_trait]
+impl Work for PanicWork {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
+        panic!("intentional panic for testing");
+    }
+}
+
+/// A work item that waits for a signal, then panics.
+struct SignalPanicWork {
+    name: String,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Work for SignalPanicWork {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn run(&mut self, _ctx: &WorkContext) -> WorkOutcome {
+        self.signal.notified().await;
+        panic!("panic after signal");
+    }
+}
+
+/// Verifies that a panicking work item transitions to Failed and doesn't hang.
+#[tokio::test]
+async fn test_panic_recovery() {
+    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+        max_concurrency: 1,
+        retry_delay: Duration::from_millis(1),
+        event_tx: None,
+    });
+
+    let id = scheduler.add_work(
+        Box::new(PanicWork {
+            name: "panicker".to_string(),
+        }),
+        vec![],
+        0,
+    );
+
+    // Use timeout to detect hangs — the scheduler must complete, not wedge.
+    let result = tokio::time::timeout(Duration::from_secs(5), scheduler.run_until_done()).await;
+    assert!(result.is_ok(), "scheduler hung on panicked work item");
+
+    assert_eq!(scheduler.state(id), Some(WorkState::Failed));
+}
+
+/// Verifies that a panicking work item with retries still terminates (no retry
+/// after panic, since WorkOutcome::Failed is terminal).
+#[tokio::test]
+async fn test_panic_no_retry() {
+    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+        max_concurrency: 1,
+        retry_delay: Duration::from_millis(1),
+        event_tx: None,
+    });
+
+    let id = scheduler.add_work(
+        Box::new(PanicWork {
+            name: "panicker-with-retries".to_string(),
+        }),
+        vec![],
+        3, // 3 retries available, but panic is terminal
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(5), scheduler.run_until_done()).await;
+    assert!(result.is_ok(), "scheduler hung on panicked work item");
+
+    assert_eq!(scheduler.state(id), Some(WorkState::Failed));
+}
+
+/// Verifies that dependents of a panicked work item are blocked.
+#[tokio::test]
+async fn test_panic_blocks_dependents() {
+    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+        max_concurrency: 2,
+        retry_delay: Duration::from_millis(1),
+        event_tx: None,
+    });
+
+    let parent = scheduler.add_work(
+        Box::new(PanicWork {
+            name: "panicking-parent".to_string(),
+        }),
+        vec![],
+        0,
+    );
+
+    let child = scheduler.add_work(
+        Box::new(LogWork {
+            name: "child".to_string(),
+            log: Arc::new(Mutex::new(Vec::new())),
+        }),
+        vec![parent],
+        0,
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(5), scheduler.run_until_done()).await;
+    assert!(result.is_ok(), "scheduler hung");
+
+    assert_eq!(scheduler.state(parent), Some(WorkState::Failed));
+    assert_eq!(scheduler.state(child), Some(WorkState::Blocked));
+}
+
+/// Verifies that cancellation takes precedence over panic (if both happen).
+#[tokio::test]
+async fn test_cancel_then_panic() {
+    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+        max_concurrency: 1,
+        retry_delay: Duration::from_millis(1),
+        event_tx: None,
+    });
+
+    let signal = Arc::new(tokio::sync::Notify::new());
+
+    let id = scheduler.add_work(
+        Box::new(SignalPanicWork {
+            name: "cancel-then-panic".to_string(),
+            signal: Arc::clone(&signal),
+        }),
+        vec![],
+        0,
+    );
+
+    // Cancel the scheduler after a brief delay, then signal the panic
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    let signal_clone = Arc::clone(&signal);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel_clone.cancel();
+        // Small delay to let cancellation propagate, then signal the panic
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        signal_clone.notify_one();
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.run_until_done_with_cancel(cancel),
+    )
+    .await;
+    assert!(result.is_ok(), "scheduler hung");
+
+    // Cancellation should take precedence
+    assert_eq!(scheduler.state(id), Some(WorkState::Cancelled));
+}
+
+/// Regression test: normal retry still works after catch_unwind is in place.
+#[tokio::test]
+async fn test_retry_still_works_with_catch_unwind() {
+    let attempts = Arc::new(Mutex::new(0u32));
+
+    let mut scheduler = WorkScheduler::new(WorkSchedulerConfig {
+        max_concurrency: 1,
+        retry_delay: Duration::from_millis(1),
+        event_tx: None,
+    });
+
+    let id = scheduler.add_work(
+        Box::new(RetryWork {
+            name: "retry-regression".to_string(),
+            attempts: Arc::clone(&attempts),
+        }),
+        vec![],
+        2, // Allow 2 retries
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(5), scheduler.run_until_done()).await;
+    assert!(result.is_ok(), "scheduler hung");
+
+    // RetryWork succeeds on second attempt
+    assert_eq!(*attempts.lock().unwrap(), 2);
+    assert_eq!(scheduler.state(id), Some(WorkState::Success));
+}

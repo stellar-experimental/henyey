@@ -1,11 +1,13 @@
 //! Scheduler state, metrics, and execution engine.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
+use futures::FutureExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::types::EventSender;
 use crate::{Work, WorkContext, WorkEvent, WorkId, WorkOutcome, WorkState};
@@ -532,7 +534,22 @@ impl WorkScheduler {
                 attempt,
                 cancel_token,
             };
-            let outcome = work.run(&ctx).await;
+            // catch_unwind wraps only the run() future. On panic, the &mut
+            // borrow on `work` is released and we can still return it in
+            // WorkCompletion. Only effective in panic=unwind builds (dev/test);
+            // in release (panic=abort), panics terminate the process.
+            let outcome = match AssertUnwindSafe(work.run(&ctx)).catch_unwind().await {
+                Ok(outcome) => outcome,
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| panic.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("unknown panic");
+                    error!(work_id = id, name = %name, panic_msg = msg, "work item panicked");
+                    WorkOutcome::Failed(format!("task panicked: {msg}"))
+                }
+            };
             let _ = completion_tx
                 .send(WorkCompletion {
                     id,
