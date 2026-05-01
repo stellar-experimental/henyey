@@ -42,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=18
+TAP_PLAN=19
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -415,6 +415,31 @@ run_tests() {
     tap_ok "attach-mode: (deleted) stdout emits warning to stderr"
   else
     tap_not_ok "attach-mode: (deleted) stdout emits warning to stderr" "stderr='$stderr18'"
+  fi
+
+  # ── Test 19: Session dir exists → not wiped (no-op fall-through) ───────
+  # Source: scripts/lib/monitor-decisions.sh — check_session_wiped
+  # Verifies observable contract: when session dir already exists, function
+  # reports not-wiped regardless of hostile environment state.
+  data="$TEST_ROOT/t19/data"
+  proc="$TEST_ROOT/t19/proc"
+  session_id="sess1919"
+  mkdir -p "$data/$session_id" "$proc" "$TEST_ROOT/t19"
+  # Hostile env: stale env file (>7200s) that would trigger return 1 if checked
+  mock_env_file "$data/monitor-loop.env" 7201
+  # No matching proc entries (empty proc dir)
+
+  local exit_code19=0
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>"$TEST_ROOT/t19/stderr" || exit_code19=$?
+  local stderr19
+  stderr19=$(cat "$TEST_ROOT/t19/stderr")
+  if [[ "$exit_code19" -eq 0 && "$SESSION_WIPED" == "no" && "$SESSION_WIPED_PROCESS_ALIVE" == "no" \
+        && -d "$data/$session_id" && -z "$(find "$data/$session_id" -mindepth 1 2>/dev/null)" \
+        && -z "$stderr19" ]]; then
+    tap_ok "session-wipe: session dir exists → not wiped"
+  else
+    tap_not_ok "session-wipe: session dir exists → not wiped" \
+      "exit=$exit_code19 WIPED=$SESSION_WIPED ALIVE=$SESSION_WIPED_PROCESS_ALIVE stderr='$stderr19' contents='$(ls "$data/$session_id" 2>/dev/null)'"
   fi
 }
 
