@@ -30,6 +30,9 @@ pub struct RpcServerRunning {
     listener: tokio::net::TcpListener,
     router: Router,
     shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    app: Arc<dyn RpcAppHandle>,
+    fee_windows: Arc<FeeWindows>,
+    poller_shutdown: tokio::sync::broadcast::Receiver<()>,
 }
 
 impl RpcServerRunning {
@@ -39,7 +42,17 @@ impl RpcServerRunning {
             listener,
             router,
             mut shutdown_rx,
+            app,
+            fee_windows,
+            mut poller_shutdown,
         } = self;
+
+        // Spawn fee-window poller with panic observability.
+        // Deferred from bind() so a bind failure cannot orphan the task.
+        henyey_common::spawn_observed("rpc_fee_window_poller", async move {
+            fee_window_poller(app, fee_windows, &mut poller_shutdown).await;
+        });
+
         axum::serve(listener, router)
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.recv().await;
@@ -57,25 +70,17 @@ impl RpcServer {
         Self { port, app }
     }
 
-    /// Bind the TCP listener, construct the router, and spawn the fee-window
-    /// poller. Returns the bound server plus its [`SocketAddr`] so callers
-    /// can discover the kernel-assigned port when `port == 0`.
+    /// Bind the TCP listener and construct the router. Returns the bound
+    /// server plus its [`SocketAddr`] so callers can discover the
+    /// kernel-assigned port when `port == 0`.
     ///
-    /// The router is ready to serve requests; call
-    /// [`RpcServerRunning::serve`] to drive the event loop.
+    /// The fee-window poller is not spawned until [`RpcServerRunning::serve`]
+    /// is called, so a bind failure cannot orphan a background task.
     pub async fn bind(self) -> anyhow::Result<(RpcServerRunning, SocketAddr)> {
         let retention = self.app.config().rpc.retention_window;
         let fee_windows = Arc::new(FeeWindows::new(retention));
 
         let ctx = RpcContext::new(self.app.clone(), fee_windows.clone());
-
-        // Spawn background task to populate fee windows from DB
-        let poller_app = self.app.clone();
-        let poller_windows = fee_windows.clone();
-        let mut poller_shutdown = self.app.subscribe_shutdown();
-        tokio::spawn(async move {
-            fee_window_poller(poller_app, poller_windows, &mut poller_shutdown).await;
-        });
 
         let router = Router::new()
             .route("/", post(rpc_handler))
@@ -88,12 +93,16 @@ impl RpcServer {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
         let shutdown_rx = self.app.subscribe_shutdown();
+        let poller_shutdown = self.app.subscribe_shutdown();
 
         Ok((
             RpcServerRunning {
                 listener,
                 router,
                 shutdown_rx,
+                app: self.app,
+                fee_windows,
+                poller_shutdown,
             },
             bound,
         ))
