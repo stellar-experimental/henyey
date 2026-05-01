@@ -66,40 +66,17 @@ directory still exists. If not, this is a distinct (and severe) failure class
 out-of-band.
 
 ```bash
-SESSION_WIPED=no
-if [ ! -d "/home/tomer/data/$MONITOR_SESSION_ID" ]; then
-  # Identify our process by matching the expected binary path (not `comm`).
-  EXPECTED_BINARY="/home/tomer/data/$MONITOR_SESSION_ID/cargo-target/release/henyey"
-  OUR_PID=""
-  for p in /proc/[0-9]*; do
-    exe=$(readlink "$p/exe" 2>/dev/null || true)
-    if [ "$exe" = "$EXPECTED_BINARY" ] || [ "$exe" = "${EXPECTED_BINARY} (deleted)" ]; then
-      OUR_PID=$(basename "$p")
-      break
-    fi
-  done
-
-  if [ -n "$OUR_PID" ]; then
-    # Binary still running (inode alive despite unlinked path).
-    # Do NOT terminate — it may still be validating.
-    SESSION_WIPED=yes
-    SESSION_WIPED_PROCESS_ALIVE=yes
-  else
-    # No matching process. Check env freshness to avoid resurrecting stale session.
-    env_mtime=$(stat -c %Y /home/tomer/data/monitor-loop.env 2>/dev/null || echo 0)
-    env_age=$(( $(date +%s) - env_mtime ))
-    if [ "$env_age" -gt 7200 ]; then
-      echo "ERROR: session $MONITOR_SESSION_ID absent, no process, env stale (${env_age}s > 2h). Run /monitor-loop."
-      exit 1
-    fi
-    SESSION_WIPED=yes
-    SESSION_WIPED_PROCESS_ALIVE=no
-  fi
-
-  # Recreate minimal session structure for recovery.
-  mkdir -p /home/tomer/data/$MONITOR_SESSION_ID/{logs,cache,cargo-target,metrics}
-fi
+source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
+check_session_wiped "$HOME/data" "/proc" "$MONITOR_SESSION_ID" \
+  "$HOME/data/monitor-loop.env" || exit 1
 ```
+
+The `check_session_wiped` function (defined in `scripts/lib/monitor-decisions.sh`):
+- Sets `SESSION_WIPED` ("yes"/"no") and `SESSION_WIPED_PROCESS_ALIVE` ("yes"/"no")
+- Returns 0 if not wiped or wiped-and-recoverable (recovery dirs created)
+- Returns 1 if wiped, no process alive, env stale (>2h) — dirs NOT created, caller should exit
+- Scans `/proc/[0-9]*/exe` for a process matching the expected binary path (including `(deleted)` suffix)
+- On return 0 with SESSION_WIPED=yes: recreates `{logs,cache,cargo-target,metrics}` subdirs
 
 ### Recovery path when `SESSION_WIPED=yes`
 
@@ -139,18 +116,17 @@ fi
 
 After the session-dir check, independently verify that mainnet data exists
 (regardless of session-dir state). **Note:** The stale-env early-exit
-(line 75) terminates the tick before reaching this point — no wipe signal
+terminates the tick before reaching this point — no wipe signal
 is emitted in that case because no tick report is generated.
 
 ```bash
-MAINNET_WIPED=no
-if [ ! -d "/home/tomer/data/mainnet" ]; then
-  MAINNET_WIPED=yes
-fi
-# Note: if mainnet/ dir exists but mainnet.db is missing, defer to FRESH_START
-# logic — this is the expected state after a (3a) self-heal wipe.
-# MAINNET_WIPED only fires when the ENTIRE directory is gone.
+check_mainnet_wiped "$HOME/data"
 ```
+
+The `check_mainnet_wiped` function (from `scripts/lib/monitor-decisions.sh`):
+- Sets `MAINNET_WIPED` to "yes" if `$HOME/data/mainnet` directory is missing, "no" otherwise
+- If mainnet/ dir exists but mainnet.db is missing, defer to FRESH_START logic
+- MAINNET_WIPED only fires when the ENTIRE directory is gone
 
 ### Wipe-state composition
 

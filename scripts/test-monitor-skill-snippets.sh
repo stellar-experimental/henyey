@@ -2,24 +2,18 @@
 #
 # Smoke-test harness for monitor skill shell snippets.
 #
-# Validates the decision logic from .claude/skills/monitor-tick/SKILL.md and
-# .claude/skills/monitor-loop/SKILL.md using mock filesystems. This is
-# SEMANTIC testing of the logic's behavior, not literal shell equivalence —
-# some source patterns are approximated by equivalent parameterized logic.
+# Tests the shared decision logic library (scripts/lib/monitor-decisions.sh)
+# using mock filesystems. Also verifies that skill markdown files reference
+# the library (structural assertions replace old checksum tripwires).
 #
 # Usage:
 #   ./scripts/test-monitor-skill-snippets.sh              # run tests (warn on drift)
-#   ./scripts/test-monitor-skill-snippets.sh --strict     # fail on source drift
-#   ./scripts/test-monitor-skill-snippets.sh --update-checksums  # print new checksums
+#   ./scripts/test-monitor-skill-snippets.sh --strict     # fail on structural drift
 #
 # Output: TAP (Test Anything Protocol) on stdout, diagnostics on stderr.
 # Exit: 0 = all pass, 1 = any fail.
 #
 # Portability: GNU/Linux only (GNU stat -c, readlink, Bash 4+, symlinks).
-#
-# Drift detection: Checksums of fenced code blocks in cited skill sections.
-# This is a tripwire — it detects textual changes that may invalidate tests,
-# not semantic equivalence.
 #
 set -euo pipefail
 
@@ -27,13 +21,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEST_ROOT="$REPO_ROOT/data/test-monitor-snippets"
 
+# ── Source the shared library (single source of truth) ────────────────────────
+source "$SCRIPT_DIR/lib/monitor-decisions.sh"
+
 # ── Arguments ────────────────────────────────────────────────────────────────
 STRICT=false
-UPDATE_CHECKSUMS=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --strict)           STRICT=true; shift ;;
-    --update-checksums) UPDATE_CHECKSUMS=true; shift ;;
+    --strict) STRICT=true; shift ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -47,7 +42,7 @@ cleanup  # ensure fresh state
 mkdir -p "$TEST_ROOT"
 
 # ── TAP state ────────────────────────────────────────────────────────────────
-TAP_PLAN=16
+TAP_PLAN=18
 TAP_CURRENT=0
 TAP_FAILURES=0
 
@@ -69,187 +64,49 @@ tap_not_ok() {
   fi
 }
 
-# ── Drift Detection ─────────────────────────────────────────────────────────
-# Expected checksums of fenced code blocks in skill files.
-# Update with: ./scripts/test-monitor-skill-snippets.sh --update-checksums
-TICK_SESSION_WIPE_CKSUM="9ecf2096243bd256b679ea19966dafb5b6e27881c1a0055031bf194f4ba2b891"
-LOOP_ATTACH_CKSUM="c4d145a4cd8454034d9cbc900d16a8bb7b1dfc17da8493b07db3f6165a994504"
-LOOP_CLEANUP_CKSUM="64b10e52552c7c4e95e1f49aa6d1edd61b146212f87dfb39accfe08022ac3be4"
-TICK_MAINNET_WIPE_CKSUM="c3cf982ec9974d9fe61d31c28774d8463d1bf3d61f1168e20ddbc9e657cb9904"
+# ── Structural Assertions ────────────────────────────────────────────────────
+# Verify that skill markdown files reference the shared library.
+# Replaces old checksum-based drift detection.
 
-extract_fenced_block() {
-  # Extract the first fenced bash block from a line range of a file.
-  # Handles indented fences (common in markdown lists).
-  local file="$1" start="$2" end="$3"
-  sed -n "${start},${end}p" "$file" | sed -n '/^ *```bash/,/^ *```$/p' | sed '1d;$d'
-}
-
-compute_checksums() {
+check_skill_structure() {
   local tick_file="$REPO_ROOT/.claude/skills/monitor-tick/SKILL.md"
   local loop_file="$REPO_ROOT/.claude/skills/monitor-loop/SKILL.md"
-
-  local tick_hash loop_attach_hash loop_cleanup_hash tick_mainnet_hash
-  tick_hash=$(extract_fenced_block "$tick_file" 50 83 | sha256sum | cut -d' ' -f1)
-  loop_attach_hash=$(extract_fenced_block "$loop_file" 466 486 | sha256sum | cut -d' ' -f1)
-  loop_cleanup_hash=$(extract_fenced_block "$loop_file" 833 860 | sha256sum | cut -d' ' -f1)
-  tick_mainnet_hash=$(extract_fenced_block "$tick_file" 119 129 | sha256sum | cut -d' ' -f1)
-
-  if [[ "$UPDATE_CHECKSUMS" == "true" ]]; then
-    echo "# Updated checksums — paste into script:"
-    echo "TICK_SESSION_WIPE_CKSUM=\"$tick_hash\""
-    echo "LOOP_ATTACH_CKSUM=\"$loop_attach_hash\""
-    echo "LOOP_CLEANUP_CKSUM=\"$loop_cleanup_hash\""
-    echo "TICK_MAINNET_WIPE_CKSUM=\"$tick_mainnet_hash\""
-    exit 0
-  fi
-
   local drift=false
-  if [[ "$tick_hash" != "$TICK_SESSION_WIPE_CKSUM" ]]; then
-    echo "WARNING: monitor-tick:50-83 code block has changed (drift detected)" >&2
+
+  # monitor-tick must source the library and call its functions
+  if ! grep -q 'source.*scripts/lib/monitor-decisions.sh' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not source scripts/lib/monitor-decisions.sh" >&2
     drift=true
   fi
-  if [[ "$loop_attach_hash" != "$LOOP_ATTACH_CKSUM" ]]; then
-    echo "WARNING: monitor-loop:466-486 code block has changed (drift detected)" >&2
+  if ! grep -q 'check_session_wiped' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not call check_session_wiped" >&2
     drift=true
   fi
-  if [[ "$loop_cleanup_hash" != "$LOOP_CLEANUP_CKSUM" ]]; then
-    echo "WARNING: monitor-loop:833-860 code block has changed (drift detected)" >&2
+  if ! grep -q 'check_mainnet_wiped' "$tick_file"; then
+    echo "WARNING: monitor-tick/SKILL.md does not call check_mainnet_wiped" >&2
     drift=true
   fi
-  if [[ "$tick_mainnet_hash" != "$TICK_MAINNET_WIPE_CKSUM" ]]; then
-    echo "WARNING: monitor-tick:119-129 code block has changed (drift detected)" >&2
+
+  # monitor-loop must source the library and call its functions
+  if ! grep -q 'source.*scripts/lib/monitor-decisions.sh' "$loop_file"; then
+    echo "WARNING: monitor-loop/SKILL.md does not source scripts/lib/monitor-decisions.sh" >&2
+    drift=true
+  fi
+  if ! grep -q 'recover_session_from_stdout' "$loop_file"; then
+    echo "WARNING: monitor-loop/SKILL.md does not call recover_session_from_stdout" >&2
+    drift=true
+  fi
+  if ! grep -q 'cleanup_guard' "$loop_file"; then
+    echo "WARNING: monitor-loop/SKILL.md does not call cleanup_guard" >&2
     drift=true
   fi
 
   if [[ "$drift" == "true" && "$STRICT" == "true" ]]; then
-    echo "FATAL: Source drift detected in --strict mode. Run --update-checksums." >&2
+    echo "FATAL: Structural drift detected in --strict mode." >&2
     exit 1
   fi
 }
 
-# ── Decision Functions (parameterized mirrors of skill logic) ────────────────
-
-# Mirrors monitor-tick/SKILL.md:50-83
-# Sets: SESSION_WIPED, SESSION_WIPED_PROCESS_ALIVE
-# Side effect: creates recovery dirs if session dir missing
-check_session_wiped() {
-  local data_root="$1" proc_root="$2" session_id="$3"
-  SESSION_WIPED=no
-  SESSION_WIPED_PROCESS_ALIVE=no
-
-  if [[ ! -d "$data_root/$session_id" ]]; then
-    local expected_binary="$data_root/$session_id/cargo-target/release/henyey"
-    local our_pid=""
-
-    for p in "$proc_root"/[0-9]*; do
-      [[ -d "$p" ]] || continue
-      local exe
-      exe=$(readlink "$p/exe" 2>/dev/null || true)
-      if [[ "$exe" == "$expected_binary" || "$exe" == "$expected_binary (deleted)" ]]; then
-        our_pid=$(basename "$p")
-        break
-      fi
-    done
-
-    if [[ -n "$our_pid" ]]; then
-      SESSION_WIPED=yes
-      SESSION_WIPED_PROCESS_ALIVE=yes
-    else
-      SESSION_WIPED=yes
-      SESSION_WIPED_PROCESS_ALIVE=no
-    fi
-
-    # Recreate minimal session structure (unconditional when dir missing).
-    mkdir -p "$data_root/$session_id"/{logs,cache,cargo-target,metrics}
-  fi
-}
-
-# Mirrors monitor-tick/SKILL.md:71-76
-# Returns: 0 if fresh, 1 if stale (age > 7200s or file missing)
-check_env_freshness() {
-  local env_file="$1"
-  local env_mtime env_age
-  env_mtime=$(stat -c %Y "$env_file" 2>/dev/null || echo 0)
-  env_age=$(( $(date +%s) - env_mtime ))
-  if [[ "$env_age" -gt 7200 ]]; then
-    echo "ERROR: env stale (${env_age}s > 2h)" >&2
-    return 1
-  fi
-  return 0
-}
-
-# Mirrors monitor-loop/SKILL.md:466-485
-# Prints recovered session-id. Creates dirs + touches .alive only for (deleted) paths.
-# Returns 1 on malformed input.
-recover_session_from_stdout() {
-  local data_root="$1" proc_stdout="$2"
-
-  # Check for (deleted) suffix
-  if echo "$proc_stdout" | grep -q '(deleted)'; then
-    local original_path
-    original_path=$(echo "$proc_stdout" | sed 's/ (deleted)$//')
-    local session_id
-    session_id=$(echo "$original_path" | sed -n 's|.*/data/\([^/]*\)/.*|\1|p')
-    if [[ -z "$session_id" ]]; then
-      return 1
-    fi
-    mkdir -p "$data_root/$session_id"/{logs,cache,cargo-target,metrics}
-    touch "$data_root/$session_id/.alive"
-    echo "$session_id"
-    return 0
-  fi
-
-  # Normal path — extract session-id from stdout path
-  local session_id
-  session_id=$(echo "$proc_stdout" | sed -n 's|.*/data/\([^/]*\)/.*|\1|p')
-  if [[ -z "$session_id" ]]; then
-    return 1
-  fi
-  echo "$session_id"
-  return 0
-}
-
-# Mirrors monitor-loop/SKILL.md:833-860
-# Prints "SKIP <reason>" or "PASS".
-cleanup_guard() {
-  local data_root="$1" proc_root="$2" candidate="$3" active_session="$4" alive_threshold="$5"
-
-  # Layer 1: active session
-  if [[ "$candidate" == "$active_session" ]]; then
-    echo "SKIP active per monitor-loop.env"
-    return 0
-  fi
-
-  # Layer 2: .alive freshness
-  local alive_file="$data_root/$candidate/.alive"
-  if [[ -f "$alive_file" ]]; then
-    local alive_age
-    alive_age=$(( $(date +%s) - $(stat -c %Y "$alive_file") ))
-    if [[ "$alive_age" -lt "$alive_threshold" ]]; then
-      echo "SKIP .alive touched ${alive_age}s ago (< ${alive_threshold}s)"
-      return 0
-    fi
-  fi
-
-  # Layer 3: running process references this session
-  if find "$proc_root" -maxdepth 2 -name exe -exec readlink {} \; 2>/dev/null | grep -q "/data/$candidate/"; then
-    echo "SKIP running process uses this session"
-    return 0
-  fi
-
-  echo "PASS"
-  return 0
-}
-
-# Mirrors monitor-tick/SKILL.md:119-127
-# MAINNET_WIPED is independent of SESSION_WIPED (verified by truth table at :141-150)
-check_mainnet_wiped() {
-  local data_root="$1"
-  MAINNET_WIPED=no
-  if [[ ! -d "$data_root/mainnet" ]]; then
-    MAINNET_WIPED=yes
-  fi
-}
 
 # ── Mock Helpers ─────────────────────────────────────────────────────────────
 
@@ -292,14 +149,15 @@ run_tests() {
   local data proc session_id
 
   # ── Test 1: Session dir missing + process alive (exact binary) ──────────
-  # Source: .claude/skills/monitor-tick/SKILL.md:50-83
+  # Source: scripts/lib/monitor-decisions.sh — check_session_wiped
   data="$TEST_ROOT/t1/data"
   proc="$TEST_ROOT/t1/proc"
   session_id="sess1111"
   mkdir -p "$data" "$proc"
   mock_proc_entry "$proc" "1001" "$data/$session_id/cargo-target/release/henyey"
+  mock_env_file "$data/monitor-loop.env" 100
 
-  check_session_wiped "$data" "$proc" "$session_id"
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
   if [[ "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "yes" && -d "$data/$session_id/logs" ]]; then
     tap_ok "session-wipe: process alive (exact binary)"
   else
@@ -307,14 +165,15 @@ run_tests() {
   fi
 
   # ── Test 2: Session dir missing + process alive (deleted binary) ────────
-  # Source: .claude/skills/monitor-tick/SKILL.md:57-58,81-82
+  # Source: scripts/lib/monitor-decisions.sh — check_session_wiped
   data="$TEST_ROOT/t2/data"
   proc="$TEST_ROOT/t2/proc"
   session_id="sess2222"
   mkdir -p "$data" "$proc"
   mock_proc_entry "$proc" "2001" "$data/$session_id/cargo-target/release/henyey (deleted)"
+  mock_env_file "$data/monitor-loop.env" 100
 
-  check_session_wiped "$data" "$proc" "$session_id"
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
   if [[ "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "yes" && -d "$data/$session_id/metrics" ]]; then
     tap_ok "session-wipe: process alive (deleted binary)"
   else
@@ -322,7 +181,7 @@ run_tests() {
   fi
 
   # ── Test 3: Different binary path (not our session) ─────────────────────
-  # Source: .claude/skills/monitor-tick/SKILL.md:54-62
+  # Source: scripts/lib/monitor-decisions.sh — check_session_wiped
   data="$TEST_ROOT/t3/data"
   proc="$TEST_ROOT/t3/proc"
   session_id="sess3333"
@@ -332,48 +191,38 @@ run_tests() {
   # Create env file so freshness check passes
   mock_env_file "$data/monitor-loop.env" 100
 
-  check_session_wiped "$data" "$proc" "$session_id"
-  if [[ "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "no" ]]; then
-    # Verify it fell through to dead-process path (env check needed)
-    if check_env_freshness "$data/monitor-loop.env"; then
-      tap_ok "session-wipe: different binary not matched"
-    else
-      tap_not_ok "session-wipe: different binary not matched" "env check unexpectedly failed"
-    fi
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
+  if [[ "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "no" && -d "$data/$session_id/logs" ]]; then
+    tap_ok "session-wipe: different binary not matched"
   else
     tap_not_ok "session-wipe: different binary not matched" "WIPED=$SESSION_WIPED ALIVE=$SESSION_WIPED_PROCESS_ALIVE"
   fi
 
   # ── Test 4: Process dead + env fresh (100s) ────────────────────────────
-  # Source: .claude/skills/monitor-tick/SKILL.md:50-83
+  # Source: scripts/lib/monitor-decisions.sh — check_session_wiped
   data="$TEST_ROOT/t4/data"
   proc="$TEST_ROOT/t4/proc"
   session_id="sess4444"
   mkdir -p "$data" "$proc"
   mock_env_file "$data/monitor-loop.env" 100
 
-  check_session_wiped "$data" "$proc" "$session_id"
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
   if [[ "$SESSION_WIPED" == "yes" && "$SESSION_WIPED_PROCESS_ALIVE" == "no" && -d "$data/$session_id/cargo-target" ]]; then
-    if check_env_freshness "$data/monitor-loop.env"; then
-      tap_ok "session-wipe: dead process, env fresh"
-    else
-      tap_not_ok "session-wipe: dead process, env fresh" "env check failed"
-    fi
+    tap_ok "session-wipe: dead process, env fresh"
   else
     tap_not_ok "session-wipe: dead process, env fresh" "WIPED=$SESSION_WIPED ALIVE=$SESSION_WIPED_PROCESS_ALIVE"
   fi
 
   # ── Test 5: Process dead + env stale (7201s) ───────────────────────────
-  # Source: .claude/skills/monitor-tick/SKILL.md:71-76
+  # Source: scripts/lib/monitor-decisions.sh — check_session_wiped returns 1
   data="$TEST_ROOT/t5/data"
   proc="$TEST_ROOT/t5/proc"
   session_id="sess5555"
   mkdir -p "$data" "$proc"
   mock_env_file "$data/monitor-loop.env" 7201
 
-  check_session_wiped "$data" "$proc" "$session_id"
   local exit_code=0
-  check_env_freshness "$data/monitor-loop.env" 2>/dev/null || exit_code=$?
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_code=$?
   if [[ "$exit_code" -eq 1 ]]; then
     tap_ok "session-wipe: dead process, env stale (7201s)"
   else
@@ -381,29 +230,25 @@ run_tests() {
   fi
 
   # ── Test 6: Process dead + env at boundary (7200s) ─────────────────────
-  # Source: .claude/skills/monitor-tick/SKILL.md:73 (-gt 7200 means 7200 passes)
+  # Source: scripts/lib/monitor-decisions.sh — -gt 7200 means 7200 passes
   data="$TEST_ROOT/t6/data"
   proc="$TEST_ROOT/t6/proc"
   session_id="sess6666"
   mkdir -p "$data" "$proc"
   mock_env_file "$data/monitor-loop.env" 7200
 
-  check_session_wiped "$data" "$proc" "$session_id"
-  if check_env_freshness "$data/monitor-loop.env"; then
-    if [[ -d "$data/$session_id/logs" ]]; then
-      tap_ok "session-wipe: env at boundary (7200s passes)"
-    else
-      tap_not_ok "session-wipe: env at boundary (7200s passes)" "recovery dirs not created"
-    fi
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env"
+  if [[ "$SESSION_WIPED" == "yes" && -d "$data/$session_id/logs" ]]; then
+    tap_ok "session-wipe: env at boundary (7200s passes)"
   else
-    tap_not_ok "session-wipe: env at boundary (7200s passes)" "7200 should not be stale (-gt, not -ge)"
+    tap_not_ok "session-wipe: env at boundary (7200s passes)" "WIPED=$SESSION_WIPED dirs=$(ls "$data/$session_id" 2>/dev/null || echo missing)"
   fi
 
   # ── Test 7: Process dead + env file missing ────────────────────────────
-  # Source: .claude/skills/monitor-tick/SKILL.md:71 (stat fails → echo 0 → epoch age)
+  # Source: scripts/lib/monitor-decisions.sh — stat fails → epoch age → stale
   data="$TEST_ROOT/t7/data"
   mkdir -p "$data"
-  # No env file created
+  # No env file created — standalone check_env_freshness
   local exit_code7=0
   check_env_freshness "$data/monitor-loop.env" 2>/dev/null || exit_code7=$?
   if [[ "$exit_code7" -eq 1 ]]; then
@@ -542,10 +387,39 @@ run_tests() {
   else
     tap_not_ok "mainnet-wiped: independent of SESSION_WIPED, detects missing dir" "alone=$mainnet_result_alone combined=$mainnet_result_combined present=$mainnet_result_present"
   fi
+
+  # ── Test 17: Stale env + missing session dir → return 1 + NO dirs ──────
+  # Source: scripts/lib/monitor-decisions.sh — stale env aborts before mkdir
+  data="$TEST_ROOT/t17/data"
+  proc="$TEST_ROOT/t17/proc"
+  session_id="sess1717"
+  mkdir -p "$data" "$proc"
+  mock_env_file "$data/monitor-loop.env" 7201
+
+  local exit_code17=0
+  check_session_wiped "$data" "$proc" "$session_id" "$data/monitor-loop.env" 2>/dev/null || exit_code17=$?
+  if [[ "$exit_code17" -eq 1 && ! -d "$data/$session_id" ]]; then
+    tap_ok "session-wipe: stale env does NOT create recovery dirs"
+  else
+    tap_not_ok "session-wipe: stale env does NOT create recovery dirs" "exit=$exit_code17 dir_exists=$(test -d "$data/$session_id" && echo yes || echo no)"
+  fi
+
+  # ── Test 18: Deleted-stdout emits warning to stderr ────────────────────
+  # Source: scripts/lib/monitor-decisions.sh — recover_session_from_stdout
+  data="$TEST_ROOT/t18/data"
+  mkdir -p "$data"
+  local stdout_path18="$data/warntest/logs/monitor.log (deleted)"
+  local stderr18
+  stderr18=$(recover_session_from_stdout "$data" "$stdout_path18" 2>&1 >/dev/null)
+  if echo "$stderr18" | grep -q "WARNING.*stdout target deleted"; then
+    tap_ok "attach-mode: (deleted) stdout emits warning to stderr"
+  else
+    tap_not_ok "attach-mode: (deleted) stdout emits warning to stderr" "stderr='$stderr18'"
+  fi
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-compute_checksums
+check_skill_structure
 run_tests
 
 if [[ "$TAP_FAILURES" -gt 0 ]]; then

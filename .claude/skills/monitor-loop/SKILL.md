@@ -472,18 +472,21 @@ process watches for `ready`-labeled issues and handles the fix.
      `/home/tomer/data/ab12cd34/logs/monitor.log` → `<session-id>=ab12cd34`.
    - **Handle `(deleted)` paths**: If `readlink` returns a path with
      ` (deleted)` suffix (e.g., `/home/tomer/data/ab12cd34/logs/monitor.log (deleted)`),
-     the session directory was wiped while the process was running:
+     the session directory was wiped while the process was running.
+     Use the shared library function:
      ```bash
+     source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
      proc_stdout=$(readlink /proc/<pid>/fd/1)
-     if echo "$proc_stdout" | grep -q '(deleted)'; then
-       echo "WARNING: henyey stdout target deleted (out-of-band wipe). Process still alive."
-       original_path=$(echo "$proc_stdout" | sed 's/ (deleted)$//')
-       session_id=$(echo "$original_path" | sed 's|.*/data/\([^/]*\)/.*|\1|')
-       mkdir -p ~/data/$session_id/{logs,cache,cargo-target,metrics}
-       touch ~/data/$session_id/.alive
-       # Continue with recovered session_id — process is still running.
-     fi
+     session_id=$(recover_session_from_stdout "$HOME/data" "$proc_stdout") || {
+       echo "ERROR: could not recover session-id from stdout path"
+       exit 1
+     }
      ```
+     The `recover_session_from_stdout` function (from `scripts/lib/monitor-decisions.sh`):
+     - Detects `(deleted)` suffix, emits warning to stderr, strips suffix, extracts session-id
+     - Creates `{logs,cache,cargo-target,metrics}` subdirs and `.alive` for deleted paths
+     - For normal paths: just extracts session-id with no side effects
+     - Returns 1 on malformed input (no `/data/<segment>/` pattern found)
    - Verify the running binary:
      ```
      readlink /proc/<pid>/exe
@@ -839,33 +842,23 @@ When the OBSRVR Radar API reports `isValidating: false` or low
      incremental -type d` — these can be safely removed (apply layer 1 only).
 
    **Three-layer cleanup guard** — apply before deleting any subtree of a
-   candidate session directory:
+   candidate session directory. Use the shared library function:
    ```bash
-   # Layer 1: Never touch the active session from monitor-loop.env
+   source "$(git rev-parse --show-toplevel)/scripts/lib/monitor-decisions.sh"
    active_session=$(grep '^MONITOR_SESSION_ID=' ~/data/monitor-loop.env 2>/dev/null | cut -d= -f2)
-   if [ "$candidate" = "$active_session" ]; then
-     echo "SKIP $candidate — active per monitor-loop.env"
+   result=$(cleanup_guard "$HOME/data" "/proc" "$candidate" "$active_session" 3600)
+   if [[ "$result" != "PASS" ]]; then
+     echo "$result"
      continue
    fi
-
-   # Layer 2: Check .alive marker freshness (1h threshold)
-   alive_file="$HOME/data/$candidate/.alive"
-   if [ -f "$alive_file" ]; then
-     alive_age=$(( $(date +%s) - $(stat -c %Y "$alive_file") ))
-     if [ "$alive_age" -lt 3600 ]; then
-       echo "SKIP $candidate — .alive touched ${alive_age}s ago (< 1h)"
-       continue
-     fi
-   fi
-
-   # Layer 3: Check if any running process references this session
-   if ls -la /proc/*/exe 2>/dev/null | grep -q "/data/$candidate/"; then
-     echo "SKIP $candidate — running process uses this session"
-     continue
-   fi
-
    # All guards passed — safe to delete subtrees
    ```
+
+   The `cleanup_guard` function (from `scripts/lib/monitor-decisions.sh`):
+   - Layer 1: Refuses if candidate matches active_session (prints "SKIP active per monitor-loop.env")
+   - Layer 2: Refuses if `.alive` marker is fresher than threshold (prints "SKIP .alive touched Ns ago (< Ts)")
+   - Layer 3: Refuses if any running process exe links into candidate dir (prints "SKIP running process uses this session")
+   - Returns "PASS" only if all three layers pass
 
    **Threshold rationale**: Ticks run every ~20 min. A 1-hour `.alive`
    freshness window covers 3 missed ticks — enough to survive a single
